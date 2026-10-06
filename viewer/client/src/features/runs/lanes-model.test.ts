@@ -21,6 +21,8 @@
 
 import { describe, expect, it } from 'vitest';
 import type { ForeignSession, InboxItem, PlanDetail, PlanSummaryFull, RunState } from '@/lib/api';
+import { sessionRows } from '@/features/sessions/list';
+import { checkLabel, runFocusWords } from './check-words';
 import {
   isClaimed,
   isLiveRun,
@@ -203,6 +205,81 @@ describe('which lanes are running now', () => {
     // absence as "it did not say" and render nothing.
     const [without] = nowLanes([run({ phases: { '4': record() as never } })]);
     expect(without?.tasks).toBeUndefined();
+  });
+
+  it('draws exactly ONE lane for a run whose only live work is a baseline — labelled with its line and its clock (control-tower phase 105, #193)', () => {
+    // ai-builder-v7 P8, 2026-10-03 01:35Z: the record `pending`, no child, no
+    // active phase — and the console 9 lines into the phase's baseline.
+    const check = {
+      phase: 8,
+      purpose: 'baseline' as const,
+      command: 'pytest tests/unit',
+      index: 9,
+      total: 10,
+      startedAt: '2026-10-03T01:34:57.000Z',
+      commandStartedAt: '2026-10-03T01:44:00.000Z',
+      pid: 789,
+    };
+    const only = run({
+      activePhase: null,
+      phases: { '8': record({ phase: 8, status: 'pending', startedAt: undefined }) as never },
+      verifying: { '8': check },
+    } as never);
+    const lanes = nowLanes([only]);
+    expect(lanes).toHaveLength(1);
+    expect(lanes[0]).toMatchObject({ phase: 8, status: 'verifying', check, startedAt: check.startedAt });
+    expect(checkLabel(lanes[0]!.check!)).toBe('baseline 9/10 · pytest tests/unit');
+    expect(runFocusWords(only)).toBe('P8 baseline 9/10');
+    // The Sessions list draws it too, live, with the label.
+    const rows = sessionRows({ lanes });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'lane', live: true, note: 'baseline 9/10 · pytest tests/unit' });
+  });
+
+  it("draws a check whose phase has no record at all, and labels a Setup command as the baseline's setup", () => {
+    const lanes = nowLanes([
+      run({
+        phases: {},
+        verifying: {
+          '5': {
+            phase: 5,
+            purpose: 'baseline',
+            stage: 'setup',
+            command: 'npm ci',
+            index: 1,
+            total: 1,
+            startedAt: '2026-10-03T01:00:00.000Z',
+            commandStartedAt: '2026-10-03T01:00:00.000Z',
+            pid: 789,
+          },
+        },
+      } as never),
+    ]);
+    expect(lanes.map((lane) => [lane.phase, lane.status])).toEqual([[5, 'verifying']]);
+    expect(checkLabel(lanes[0]!.check!)).toBe('baseline setup 1/1 · npm ci');
+  });
+
+  it("keeps a running session's own word when its baseline runs beside it, and names the phase in the header", () => {
+    const check = {
+      phase: 4,
+      purpose: 'baseline' as const,
+      command: 'npm test',
+      index: 1,
+      total: 2,
+      startedAt: '2026-10-03T01:00:00.000Z',
+      commandStartedAt: '2026-10-03T01:00:00.000Z',
+      pid: 789,
+    };
+    const beside = run({
+      activePhase: 4,
+      phases: { '4': record() as never },
+      children: { '4': { pid: 9, phase: 4, sessionId: 's4', startedAt: '2026-08-20T09:30:00.000Z' } },
+      verifying: { '4': check },
+    } as never);
+    const lanes = nowLanes([beside]);
+    expect(lanes).toHaveLength(1);
+    expect(lanes[0]).toMatchObject({ phase: 4, status: 'running', check });
+    expect(runFocusWords(beside)).toBe('phase 4');
   });
 
   it('draws nothing for a run with no loop behind it', () => {

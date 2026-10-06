@@ -111,6 +111,7 @@ Do not turn on a flag I did not agree to, and do not start a phase run to
 "test" it — a run edits my repository.
 ```
 
+
 <div dir="rtl">
 
 ---
@@ -175,9 +176,14 @@ header is trustworthy only because nothing but the proxy can reach the port.
 [Phase Console](docs/console.md) · [متریک‌ها](docs/metrics.md) · [نصبِ دستی](docs/install.md) ·
 [نسخه‌بندی و انتشار](docs/releasing.md) · [مرجع](docs/reference.md)
 
-از ۵.۱ چند برنامه می‌توانند هم‌زمان روی یک مخزن کار کنند — یک چک‌اوت برای هر اجرا، یک شناسهٔ ردیابی در سراسرِ
-هرچه یک اجرا می‌کند، و یادداشت‌هایی که پیش از شروعِ یک فاز به آن می‌رسند؛ ۵.۰ `phase-console doctor`،
-[تصمیم‌هایی](docs/decisions.md) که اجرا با آن‌ها شروع می‌شود و رله را آورد — [docs/controls.md](docs/controls.md) (انگلیسی).
+۶.۱ فهرستِ کاملِ ایشوهای یک مخزن را روی یک میز می‌خواند — دسته، شدت و جایگاهِ هر ایشو در یک نقشه — به یک انتظار
+اجازه می‌دهد کاری روی ماشینی دیگر را نام ببرد (`unit:<host>/<unit>`) و تاریخ را فقط پشتوانه‌اش نگه دارد، و
+کارهایی را که فقط از شما برمی‌آید تا موعدشان برسد زیرِ *Coming up* (در راه) فهرست می‌کند.
+
+</div>
+
+
+<div dir="rtl">
 
 به Claude Code و `bash` و `git` نیاز دارد. کنسول علاوه بر آن Node ‏22.18+ (یا ‏23.6+) می‌خواهد و
 **هیچ وابستگیِ اجرایی** ندارد. انتشارها تگِ `vX.Y.Z` هستند با یک GitHub Release که تاربالِ بسته‌بندی‌شده را دارد، و دستی بریده می‌شوند —

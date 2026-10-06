@@ -12,7 +12,10 @@
  * the pid was producing commits. The relaunch deleted the orphan's own outcome
  * declaration before reading it. And Stop refused with "kill the pid yourself".
  *
- * Six cases, OR-1..OR-6, one per seam.
+ * Six cases, OR-1..OR-6, one per seam — and OR-7 (control-tower phase 110,
+ * #175): a child record from before launchers were recorded is still an
+ * orphan on the read path, and that park is journalled. The same-console rule
+ * itself is `orphan-same-console.test.ts` (OR-8..OR-11).
  */
 
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
@@ -320,4 +323,21 @@ test('OR-6: a recorded child whose process identity does not match is refused, n
   } finally {
     svc.close();
   }
+});
+
+test('OR-7: a child no launcher was recorded for is still an orphan on the read path — and the park is journalled (#175)', async () => {
+  const { clearRunFileCache, flushRunSaves, listRuns } = await import('../server/runner/state.ts');
+  const root = scratch();
+  // A record an older console wrote: a live session, and no word on who launched
+  // it. "I cannot tell" is never "it is mine" — the run is parked, as before.
+  const state = orphanedRun(root, { status: 'running', halt: null });
+  clearRunFileCache();
+  const [read] = listRuns(root, 'alpha', null);
+  assert.equal(read?.status, 'parked');
+  assert.equal(read?.halt?.kind, 'orphaned-session');
+  flushRunSaves();
+  const parks = journalOf(root, state.id).filter((line) => line.event === 'run.orphaned');
+  assert.equal(parks.length, 1, 'the park is a journal line, not a record edit nobody can date');
+  assert.deepEqual(parks[0]!.data?.pids, [process.pid]);
+  assert.equal(parks[0]!.data?.launcher, 'unknown', 'it says why it could not tell this console\'s own session from an orphan');
 });

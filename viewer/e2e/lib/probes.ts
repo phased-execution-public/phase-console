@@ -1,12 +1,14 @@
 /**
  * The measurements: what a person meets on a page, taken in a real layout engine.
  *
- * Seven classes, each a question `docs/design.md` §6 answers in prose and jsdom
+ * Eight classes, each a question `docs/design.md` §6 answers in prose and jsdom
  * cannot answer at all:
  *
  *   overflow        a box past the viewport's edge that no ancestor clips — the page slides sideways
  *   escape          a box past `<main>`'s edge that `<main>` CLIPS (`overflow-x-hidden`): invisible
  *                   to a screenshot, which is exactly why it has to be measured
+ *   squeezed        text a layout gave no width at all — a line's height and zero width while it
+ *                   holds characters (#203: a plan card's repo tag, squeezed to 0 px by its row)
  *   touch-present   §6.1's first question — is the control in the hit stack at all
  *   touch-wins      the second — does it WIN (`elementFromPoint`) at its centre and four corners,
  *                   owned only as `hit === el || el.contains(hit)`; an ancestor answering is a clip,
@@ -28,6 +30,7 @@ import type { Page } from '@playwright/test';
 export const FINDING_CLASSES = [
   'overflow',
   'escape',
+  'squeezed',
   'touch-present',
   'touch-wins',
   'touch-survives',
@@ -213,6 +216,26 @@ function install(): void {
     }
     for (const el of outermost(overflowing)) out.push({ cls: 'overflow', key: describe(el) });
     for (const el of outermost(escaping)) out.push({ cls: 'escape', key: describe(el) });
+
+    // squeezed: a box that holds characters of its own and was laid out a
+    // line tall and NO wide. A `truncate` in a row whose neighbours refuse to
+    // shrink gives way to exactly this, and nothing else measures it — it does
+    // not overflow and it does not escape, it is simply not there (#203: the
+    // repo tag on a plan card, gone whenever its estimate was a range). A box
+    // with no height is not drawn at all; a `sr-only` one is 1px on purpose.
+    const squeezed = new Set<Element>();
+    for (const el of document.body.querySelectorAll('*')) {
+      const text = [...el.childNodes].some(
+        (n) => n.nodeType === Node.TEXT_NODE && (n.textContent ?? '').trim(),
+      );
+      if (!text) continue;
+      const r = el.getBoundingClientRect();
+      if (r.height === 0 || r.width >= TOL) continue;
+      const d = cs(el).display;
+      if (d === 'none' || d === 'contents' || invisible(el)) continue;
+      squeezed.add(el);
+    }
+    for (const el of outermost(squeezed)) out.push({ cls: 'squeezed', key: describe(el) });
     if (!touch) return out;
 
     // While a modal layer is up the page behind it takes no pointer at all (the

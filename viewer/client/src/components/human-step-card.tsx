@@ -39,6 +39,7 @@ import {
   Bot,
   Building2,
   ChevronRight,
+  ClipboardCheck,
   Fingerprint,
   Hash,
   Lock,
@@ -102,6 +103,7 @@ const ICONS: Readonly<Record<string, LucideIcon>> = {
   terminal: Terminal,
   bot: Bot,
   mail: Mail,
+  'clipboard-check': ClipboardCheck,
 };
 
 /** The glyph an icon name draws, for the test that holds every kind to one. */
@@ -111,6 +113,7 @@ export function kindIcon(name: string): LucideIcon | undefined {
 
 /** A state's plain word, as the card's status says it. */
 const STATE_WORDS: Readonly<Record<string, string>> = {
+  upcoming: 'coming up',
   declared: 'waiting on you',
   notified: 'waiting on you',
   opened: 'opened',
@@ -128,6 +131,7 @@ const BIRTH_WORDS: Readonly<Record<string, string>> = {
 };
 
 const MOVE_WORDS: Readonly<Record<string, string>> = {
+  due: 'came due',
   notify: 'announced',
   remind: 'reminded',
   open: 'opened',
@@ -372,6 +376,35 @@ function DeviceCode({ code }: { code: string }) {
   );
 }
 
+/**
+ * What an operator act asks to be run, in its own words — on every row, so
+ * the queue reads as a list of commands a person can copy (control-tower
+ * phase 121, #182).
+ */
+function StepCommand({ command }: { command: string }) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-2" data-testid="step-command">
+      <code className="min-w-0 font-mono text-xs break-all text-ink select-all">{command}</code>
+      <CopyButton text={command} label="Copy command" size="sm" />
+    </div>
+  );
+}
+
+/** Not due yet: what the act waits on before it becomes a person's turn. */
+function DueLine({ dueWhen }: { dueWhen: string | undefined }) {
+  return (
+    <p data-testid="step-due" className="max-w-prose text-2xs text-ink-muted">
+      {dueWhen ? (
+        <>
+          Due when <code className="font-mono break-all text-ink">{dueWhen}</code> lands.
+        </>
+      ) : (
+        'Not due yet.'
+      )}
+    </p>
+  );
+}
+
 interface PrimaryProps {
   item: InboxItem;
   view: HumanStepView;
@@ -570,15 +603,30 @@ function Datums({ view, record }: { view: HumanStepView; record: HumanStepRecord
     rows.push(['Declared by', `${who}, ${stamp(record.declaredAt)}`]);
     rows.push([
       'For',
-      `${record.slug}, phase ${record.phase}${record.runId ? ` (run ${record.runId})` : ''}`,
+      // Phase 0 is the plan's own act, under its `## Operator errands` (phase 121).
+      `${record.slug}, ${record.phase ? `phase ${record.phase}` : 'the plan itself'}${record.runId ? ` (run ${record.runId})` : ''}`,
     ]);
   }
   rows.push([
     'What proves it',
     record?.proof || view.proof ? <code className="font-mono">{record?.proof ?? view.proof}</code> : '—',
   ]);
+  const dueWhen = record?.dueWhen ?? view.dueWhen;
+  if (dueWhen)
+    rows.push([
+      'Due when',
+      <>
+        <code className="font-mono">{dueWhen}</code>
+        {record?.dueAt ? ` landed, ${stamp(record.dueAt)}` : ' lands'}
+      </>,
+    ]);
   if (record)
-    rows.push(['The window', `${stamp(record.declaredAt)} until ${stamp(record.windowEnd ?? record.until)}`]);
+    rows.push([
+      'The window',
+      record.state === 'upcoming'
+        ? 'starts when it is due'
+        : `${stamp(record.dueAt ?? record.declaredAt)} until ${stamp(record.windowEnd ?? record.until)}`,
+    ]);
   if (record?.provenBy) rows.push(['Proven by', record.provenBy]);
   if (record?.note) rows.push(['Last word', record.note]);
   const moves = record?.moves ?? [];
@@ -654,6 +702,9 @@ export function HumanStepCard(props: HumanStepCardProps) {
 
 function StepRow({ item, view, perform, busy, className }: HumanStepCardProps & { view: HumanStepView }) {
   const [open, setOpen] = useState(false);
+  // An act born before it is due is shown, never pressed: the ledger refuses
+  // an open or a check until its due-when ref lands (control-tower phase 121).
+  const upcoming = view.state === 'upcoming';
   return (
     <div
       data-testid="human-step-row"
@@ -675,8 +726,12 @@ function StepRow({ item, view, perform, busy, className }: HumanStepCardProps & 
         )}
       </div>
       {view.code && <DeviceCode code={view.code} />}
+      {upcoming && !open && <DueLine dueWhen={view.dueWhen} />}
+      {view.kind === 'operator-act' && view.openCommand && !open && (
+        <StepCommand command={view.openCommand} />
+      )}
       <div className="flex flex-wrap items-center gap-1.5">
-        {!open && <PrimaryWithVerbs item={item} view={view} perform={perform} busy={busy} />}
+        {!open && !upcoming && <PrimaryWithVerbs item={item} view={view} perform={perform} busy={busy} />}
         <button
           type="button"
           aria-expanded={open}
@@ -714,6 +769,10 @@ function FullCard({
   const [secret, setSecret] = useState('');
   const state = record?.state ?? view.state;
   const live = isOpenState(state);
+  // Coming up (control-tower phase 121): open, but not yet a person's turn —
+  // nothing to open, check or snooze until its due-when ref lands.
+  const upcoming = state === 'upcoming';
+  const due = live && !upcoming;
   const opened = Math.max(record?.opened ?? 0, verbs.answer?.opened?.n ?? 0);
   const act = primaryActOf(view);
   const canOpen = Boolean(view.stepId && (view.openUrl || view.openCommand));
@@ -732,7 +791,7 @@ function FullCard({
       data-state={state}
       data-fold={view.fold ?? undefined}
       aria-current={pointed ? 'true' : undefined}
-      aria-label={`Your turn: ${KIND_META[view.kind].label}`}
+      aria-label={`${upcoming ? 'Coming up' : 'Your turn'}: ${KIND_META[view.kind].label}`}
       className={cn('flex min-w-0 flex-col gap-2.5', className)}
     >
       {!embedded && (
@@ -753,6 +812,8 @@ function FullCard({
           {view.title}
         </p>
       )}
+      {upcoming && <DueLine dueWhen={record?.dueWhen ?? view.dueWhen} />}
+      {view.kind === 'operator-act' && view.openCommand && <StepCommand command={view.openCommand} />}
       {view.lines.length > 0 && (
         <ol
           data-testid="step-lines"
@@ -801,18 +862,20 @@ function FullCard({
       )}
 
       <div className="flex flex-wrap items-center gap-1.5" data-testid="step-actions">
-        <PrimaryButton
-          item={item}
-          view={{ ...view, state }}
-          verbs={verbs}
-          perform={perform}
-          busy={busy}
-          secret={secret}
-          onSecretSent={() => setSecret('')}
-          size="lg"
-          className="min-h-(--tap-min)"
-        />
-        {canOpen && live && (
+        {!upcoming && (
+          <PrimaryButton
+            item={item}
+            view={{ ...view, state }}
+            verbs={verbs}
+            perform={perform}
+            busy={busy}
+            secret={secret}
+            onSecretSent={() => setSecret('')}
+            size="lg"
+            className="min-h-(--tap-min)"
+          />
+        )}
+        {canOpen && due && (
           <Button
             size="sm"
             data-testid="step-open-again"
@@ -822,12 +885,12 @@ function FullCard({
             Open again
           </Button>
         )}
-        {view.stepId && live && view.where === 'host' && view.openUrl && list?.can.openHost && (
+        {view.stepId && due && view.where === 'host' && view.openUrl && list?.can.openHost && (
           <Button size="sm" variant="ghost" data-testid="step-open-host" onClick={verbs.openOnMachine}>
             Open on the machine
           </Button>
         )}
-        {view.stepId && live && act !== 'check' && (
+        {view.stepId && due && act !== 'check' && (
           <Button
             size="sm"
             data-testid="step-check"
@@ -837,7 +900,7 @@ function FullCard({
             Check now
           </Button>
         )}
-        {view.stepId && live && (
+        {view.stepId && due && (
           <Button
             size="sm"
             variant="ghost"
@@ -899,7 +962,7 @@ function FullCard({
         </form>
       )}
 
-      {view.stepId && (
+      {view.stepId && !upcoming && (
         <p data-testid="step-status" className="flex flex-wrap gap-x-3 gap-y-0.5 text-2xs text-ink-muted">
           {statusParts(record ?? { opened }, opened, now).map((part, index) => (
             <span key={part.key} data-part={part.key}>

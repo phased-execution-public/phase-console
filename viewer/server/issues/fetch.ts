@@ -44,13 +44,21 @@ import { join } from 'node:path';
 
 import type { GitHubRemote } from './inventory.ts';
 import { shell } from '../shell.ts';
+import type { ISSUE_CATEGORIES, ISSUE_PLAN_STATES, ISSUE_SEVERITY_WORDS } from '../../shared/issues-model.js';
 
 /* ------------------------------------------------------------------ *
  * Caps and cadences. Every one of them is reported when it bites.
  * ------------------------------------------------------------------ */
 
-/** Issues fetched per repository. Beyond this the list is marked `truncated`. */
-export const ISSUE_PAGE_MAX = 100;
+/**
+ * Issues fetched per repository — the WHOLE list, up to this (control-tower
+ * phase 118). `gh issue list` pages GraphQL by itself, a hundred a page, so one
+ * call with this `--limit` is the whole list of any repository a person
+ * triages by hand; the cap only keeps a runaway repository from holding a
+ * request open. Beyond it the list is marked `truncated`, measured by asking
+ * for one more.
+ */
+export const ISSUE_LIST_CAP = 2000;
 
 /** Bodies are fetched one call each, so this bound is the one that costs money. */
 export const BODY_FETCH_MAX = 20;
@@ -82,8 +90,19 @@ export const RATE_LIMIT_BACKOFF_MS = 30 * 60_000;
 /** One `gh` call's budget. A slow network must not hold a request open. */
 export const GH_TIMEOUT_MS = 15_000;
 
-/** The fields asked for. Bounded on purpose: a body is a separate, on-demand call. */
-export const ISSUE_LIST_FIELDS = 'number,title,state,labels,assignees,updatedAt,url';
+/**
+ * The LIST call's budget. Two thousand issues are twenty-one GraphQL pages,
+ * which no single `issue view`'s budget covers; the refresh is a visible act
+ * whose outcome a person waits for, so it may take this long and no longer.
+ */
+export const GH_LIST_TIMEOUT_MS = 120_000;
+
+/**
+ * The fields asked for. Bounded on purpose: a body is a separate, on-demand
+ * call, and `comments` is never asked for — it answers every comment's whole
+ * body, which would turn a list of two thousand issues into a library.
+ */
+export const ISSUE_LIST_FIELDS = 'number,title,state,labels,assignees,author,createdAt,updatedAt,closedAt,url';
 
 /**
  * Why a repository's issues are not known.
@@ -103,8 +122,20 @@ export type Issue = {
   state: string;
   labels: string[];
   assignees: string[];
+  /** Who opened it — the login, never the object `gh` answers. Absent when `gh` named nobody. */
+  author?: string;
+  /** ISO 8601, as GitHub sent it. */
+  createdAt?: string;
   updatedAt: string;
+  /** ISO 8601, present only on a closed issue. */
+  closedAt?: string;
   url: string;
+  /**
+   * What the desk reads off this issue (control-tower phase 118) — category,
+   * severity and plan state, derived by `shared/issues-model.js` `triageOf`
+   * and joined on at read time like `provenance`: never cached.
+   */
+  triage?: IssueTriage;
   /** Present only once a body has been asked for. Plain text, never rendered. */
   body?: string;
   /** True when `body` was cut at `BODY_BYTES_MAX`. */
@@ -121,13 +152,20 @@ export type Issue = {
 /** Where a session-filed issue came from. The repository page's chip and its "filed by sessions" filter. */
 export type IssueProvenance = { slug: string; phase: number; runId?: string; draftId: string };
 
+/** `triageOf`'s answer, typed for the server. */
+export type IssueTriage = {
+  category: (typeof ISSUE_CATEGORIES)[number];
+  severity: (typeof ISSUE_SEVERITY_WORDS)[number];
+  plan: { state: (typeof ISSUE_PLAN_STATES)[number]; slug?: string; phases?: number[] };
+};
+
 export type IssueCache = {
   /** `owner/repo`. */
   nameWithOwner: string;
   /** Epoch ms of the last SUCCESSFUL fetch. Absent when there has never been one. */
   fetchedAt?: number;
   issues: Issue[];
-  /** True when the repository has more issues than `ISSUE_PAGE_MAX`. */
+  /** True when the repository has more issues than `ISSUE_LIST_CAP`. */
   truncated?: boolean;
 };
 
@@ -209,11 +247,11 @@ export function reasonFor(stderr: string): IssueReason {
   return 'failed';
 }
 
-/** One repository's issue list. Every failure is a reason, never a throw. */
+/** One repository's issue list — the whole of it, up to the cap. Every failure is a reason, never a throw. */
 export async function fetchIssues(
-  remote: GitHubRemote, run: GhRunner, limit = ISSUE_PAGE_MAX,
+  remote: GitHubRemote, run: GhRunner, limit = ISSUE_LIST_CAP,
 ): Promise<FetchOutcome> {
-  const capped = Math.max(1, Math.min(Math.floor(limit) || ISSUE_PAGE_MAX, ISSUE_PAGE_MAX));
+  const capped = Math.max(1, Math.min(Math.floor(limit) || ISSUE_LIST_CAP, ISSUE_LIST_CAP));
   // One over the cap, so "there are more" is measured rather than assumed: a
   // repository with exactly `capped` issues would otherwise always read as
   // truncated. The extra row is dropped before it is returned.
@@ -221,7 +259,7 @@ export async function fetchIssues(
     'issue', 'list',
     '--repo', remote.nameWithOwner,
     '--state', 'all',
-    '--limit', String(Math.min(capped + 1, ISSUE_PAGE_MAX + 1)),
+    '--limit', String(capped + 1),
     '--json', ISSUE_LIST_FIELDS,
   ];
   const answer = await run(args);
@@ -331,13 +369,25 @@ function normalizeIssue(row: unknown): Issue | null {
   const r = row as Record<string, unknown>;
   const number = Number(r.number);
   if (!Number.isSafeInteger(number) || number <= 0) return null;
+  // `gh` answers the author as an object (`{login, name, is_bot}`); the cache
+  // stores the login it read. Either shape reads back as the login.
+  const author = text(
+    r.author && typeof r.author === 'object' ? (r.author as Record<string, unknown>).login : r.author, 80,
+  );
+  const createdAt = text(r.createdAt, 40);
+  const closedAt = text(r.closedAt, 40);
   return {
     number,
     title: text(r.title, 400),
     state: text(r.state, 24) || 'OPEN',
     labels: names(r.labels, 'name'),
     assignees: names(r.assignees, 'login'),
+    // Absent rather than empty: an open issue has no close time, and an empty
+    // string would sort and render as a time that exists.
+    ...(author ? { author } : {}),
+    ...(createdAt ? { createdAt } : {}),
     updatedAt: text(r.updatedAt, 40),
+    ...(closedAt ? { closedAt } : {}),
     url: text(r.url, 400),
   };
 }

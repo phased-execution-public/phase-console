@@ -45,7 +45,10 @@ run's settings). The single exception is a run started with the **work branch + 
 options: for that run — and only that run — bare `git push` moves from the wall to an approval
 card, and `gh pr create` stays a card even under the `trusted` profile, so publishing the branch
 still takes one human tap — auto-grant never answers either card; only a `permission.destructive`
-exception in the plan's manifest lets the console answer one, and that answer is announced.
+exception in the plan's manifest, for the running phase, lets the console answer one, and that answer
+is announced. The answer is judged on the words the line RUNS (`runner/shell-reading.ts`), never on
+data — a quoted here-doc's body, an interpreter's `-c` payload, a quoted argument — and a push the row
+allows only in its bare form is refused at once, naming that form (control-tower phase 107).
 Force-pushes, `--force-with-lease` and `--delete` stay denied outright.
 Residual risk, stated plainly: with the console process dead its hook cannot ask, and that run's
 CLI-side deny list no longer contains bare `git push` — the destructive shapes still do.

@@ -114,8 +114,8 @@
 
 import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { copyFile, cp, lstat, mkdir, mkdtemp as mkdtempAsync, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { availableParallelism, loadavg, tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { DEFAULT_BASE_BRANCH, PUSH_ARGV } from '../../shared/landing-model.js';
 import { normalizeToken, SHARED_CHECKOUT_TOKEN } from '../../shared/scope.js';
@@ -125,7 +125,7 @@ import {
   DEFAULT_RETENTION, retentionOf, retentionTtlHours,
   type RadarState, type IsolationReclaim, type WorktreeRoot,
 } from '../../shared/worktree-model.js';
-import { shell } from '../shell.ts';
+import { shell, type ShellOptions, type ShellRun } from '../shell.ts';
 
 /** How long any one git invocation may take. A wedged merge must end. */
 const GIT_TIMEOUT_MS = 120_000;
@@ -953,27 +953,31 @@ export async function treeChanges(dir: string, from: string, to: string): Promis
  * was last written — whose work-in-progress a red came from (control-tower
  * phase 83, #103: P61's red was P62's 17 uncommitted files). Every untracked
  * file by name, both ends of a rename; a deleted path has no write time. Null
- * when git cannot answer.
+ * when git cannot answer. `untracked` marks a path git has never seen (`??`) —
+ * what a `Setup:` line, a test run's cache or an installer leaves, as opposed to
+ * a change to the work (control-tower phase 106, #191).
  */
 export async function uncommittedPaths(
   dir: string,
-): Promise<{ top: string; paths: { path: string; mtimeMs: number | null }[] } | null> {
+): Promise<{ top: string; paths: { path: string; mtimeMs: number | null; untracked?: true }[] } | null> {
   const top = await git(dir, ['rev-parse', '--show-toplevel']);
   const root = top.ok ? top.stdout.trim() : '';
   if (!root) return null;
   const out = await git(root, ['status', '--porcelain', '-z', '--untracked-files=all', '--ignore-submodules=all']);
   if (!out.ok) return null;
   const tokens = out.stdout.split('\0');
-  const names: string[] = [];
+  const names = new Map<string, boolean>();
   for (let i = 0; i < tokens.length; i++) {
     const entry = tokens[i];
     if (entry.length < 4) continue;
-    names.push(entry.slice(3));
+    const path = entry.slice(3);
+    names.set(path, (names.get(path) ?? true) && entry.startsWith('??'));
     // `R  new\0old` — a rename's (or copy's) source follows as its own token.
-    if (/[RC]/.test(entry.slice(0, 2)) && tokens[i + 1]) names.push(tokens[++i]);
+    if (/[RC]/.test(entry.slice(0, 2)) && tokens[i + 1]) names.set(tokens[++i], false);
   }
-  const paths = await Promise.all([...new Set(names)].map(async (path) => ({
+  const paths = await Promise.all([...names].map(async ([path, untracked]) => ({
     path, mtimeMs: await lstat(join(root, path)).then((info) => info.mtimeMs, () => null),
+    ...(untracked ? { untracked: true as const } : {}),
   })));
   return { top: root, paths };
 }
@@ -1157,7 +1161,7 @@ async function ensureExcluded(docsRoot: string): Promise<void> {
 
 async function ensureCheckout(
   root: string, at: CheckoutAt, opts?: CheckoutOpts,
-): Promise<WorktreeStep & { created?: boolean; base?: string; baseSha?: string }> {
+): Promise<WorktreeStep & { created?: boolean; base?: string; baseSha?: string; reseated?: Reseat }> {
   // Both halves read ONCE, here, from the discriminant — rather than asking
   // `'branch' in at` at each site. Exactly one of them is defined, and every
   // branch below is written against that pair, so the two shapes cannot drift
@@ -1263,10 +1267,20 @@ async function ensureCheckout(
         return { ok: true, created: false };
       } else {
         if (on === names.runBranch) return { ok: true, created: false };
+        // A detached HEAD on the trunk over a branch the trunk holds by a
+        // squash is #183's shape (control-tower phase 112): a clean one is
+        // re-seated on what landed — adopted, not refused — and a dirty one's
+        // refusal names that remedy, because "switch it back" alone sends a
+        // person to the one move that re-reddens every checkout-relative gate.
+        if (!on) {
+          const again = await reseatLandedBranch({ source: root, dir: names.integration, mount: '', runBranch: names.runBranch });
+          if (again.reseated) return { ok: true, created: false, reseated: again.reseated };
+        }
+        const remedy = on ? '' : await landedRemedy(root, names.integration, names.runBranch);
         return {
           ok: false,
           detail: `the console's own worktree at ${names.integration} is standing on `
-            + `${on ? `\`${on}\`` : 'a detached HEAD'}, not \`${names.runBranch}\` — switch it back `
+            + `${on ? `\`${on}\`` : 'a detached HEAD'}, not \`${names.runBranch}\`${remedy || ' —'} switch it back `
             + 'or remove it, and the run can have its checkout',
         };
       }
@@ -2887,11 +2901,14 @@ export async function ensureMirror(opts: {
   quarantined: Quarantined[];
   /** On `mount-occupied`: what stands at each mount, untouched, awaiting a person's word. */
   occupied?: ForeignMount[];
+  /** Mounts adopted by re-seating a squash-landed branch on what landed (control-tower phase 112, #183). */
+  reseated?: Reseat[];
 }> {
   const { names, mounts } = opts;
   const created: MirrorMount[] = [];
   const adopted: string[] = [];
   const quarantined: Quarantined[] = [];
+  const reseated: Reseat[] = [];
 
   // 🔴 THE ADOPTION MARKER (#139). The directory is this call's to remove
   // wholesale only when this call MADE it. The failure path used to `rm -rf`
@@ -2984,6 +3001,7 @@ export async function ensureMirror(opts: {
     const made = await ensureCheckout(mount.source, at);
     if (made.ok) {
       if (made.created) created.push(mount); else adopted.push(mount.rel);
+      if (made.reseated) reseated.push({ ...made.reseated, mount: mount.rel });
       continue;
     }
     const detail = `${mount.rel}: ${made.detail ?? 'git worktree add failed'}`;
@@ -3002,7 +3020,7 @@ export async function ensureMirror(opts: {
       (error as Error)?.message ?? 'could not write the mirror manifest');
   }
 
-  return { ok: true, created: created.map((mount) => mount.rel), adopted, quarantined };
+  return { ok: true, created: created.map((mount) => mount.rel), adopted, quarantined, ...(reseated.length ? { reseated } : {}) };
 }
 
 /**
@@ -3203,21 +3221,36 @@ async function mirrorVerdict(integration: string, runBranch: string): Promise<Mi
  */
 export async function reattachMirror(integration: string, runBranch: string): Promise<{
   ok: boolean; moved: string[]; detail?: string;
+  /** Mounts put on what LANDED rather than back on the old tip (control-tower phase 112, #183). */
+  reseated: Reseat[];
 }> {
+  const reseated: Reseat[] = [];
   const manifest = await readMirror(integration);
-  if (!manifest) return { ok: false, moved: [], detail: 'no mirror manifest' };
+  if (!manifest) return { ok: false, moved: [], reseated, detail: 'no mirror manifest' };
   const verdict = await mirrorVerdict(integration, runBranch);
-  if (verdict.ok) return { ok: true, moved: [] };
+  if (verdict.ok) return { ok: true, moved: [], reseated };
   if (verdict.refusal !== 'mirror-drifted') {
-    return { ok: false, moved: [], detail: verdict.refusal ?? 'the mirror is not standing' };
+    return { ok: false, moved: [], reseated, detail: verdict.refusal ?? 'the mirror is not standing' };
   }
   const moved: string[] = [];
   for (const rel of verdict.drifted ?? []) {
     const mount = manifest.mounts.find((m) => m.rel === rel);
-    if (!mount) return { ok: false, moved, detail: `${rel}: not in the manifest` };
+    if (!mount) return { ok: false, moved, reseated, detail: `${rel}: not in the manifest` };
     const dir = join(integration, rel);
     if (await isDirty(dir)) {
-      return { ok: false, moved, detail: `${rel}: the mount holds uncommitted work` };
+      return { ok: false, moved, reseated, detail: `${rel}: the mount holds uncommitted work` };
+    }
+    // A mount detached ON the trunk over a branch the trunk holds by a squash
+    // is #183's shape: switching it back to the pre-squash tip re-reddens every
+    // gate that compares the box with the checkout, so the branch is moved to
+    // what landed instead (`reseatLandedBranch`, which asks every fence again).
+    if (!manifest.detached && (await branchAt(mount.source, dir)) === undefined) {
+      const again = await reseatLandedBranch({ source: mount.source, dir, mount: rel, runBranch });
+      if (again.reseated) {
+        reseated.push(again.reseated);
+        moved.push(rel);
+        continue;
+      }
     }
     // A branch mount whose run branch is GONE was settled before a final
     // phase's §Verification (`settleIdleMirrorBranches`, control-tower phase
@@ -3231,11 +3264,11 @@ export async function reattachMirror(integration: string, runBranch: string): Pr
         : ['switch', '-c', runBranch];
     const out = await git(dir, args);
     if (!out.ok) {
-      return { ok: false, moved, detail: `${rel}: ${firstLine(out.stderr) || 'git switch failed'}` };
+      return { ok: false, moved, reseated, detail: `${rel}: ${firstLine(out.stderr) || 'git switch failed'}` };
     }
     moved.push(rel);
   }
-  return { ok: true, moved };
+  return { ok: true, moved, reseated };
 }
 
 /**
@@ -3433,6 +3466,262 @@ export async function restoreSettledMirror(
   return { restored, failed };
 }
 
+/* ------------------------------------------------------------------ *
+ * Settled means landed (control-tower phase 112, #184 #183)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where one repository's run branch stands against the trunk it lands on — the
+ * question a run's `finished` answers (control-tower phase 112, #184).
+ *
+ * A hub run settled `keep` and reported `run.finished {outstanding: []}` while
+ * its ROOT repository's `pe/<slug>` held the last two phases' docs, conflicting
+ * with `main` in six files and never pushed: "settled" meant the console had
+ * stopped, not that the work had landed. This is the proof that makes the word
+ * mean the second thing.
+ */
+export type LandingProof = {
+  /** Root-relative mount; `''` is the root (or the one repository of a run without a mirror). */
+  mount: string;
+  branch: string;
+  /** The commit proved: the branch's tip, or where a mount settled before the final verification stands. */
+  tip: string;
+  /** What it was proved against: `origin/<trunk>`, or `<trunk>` for a repository with no remote copy of it. */
+  into: string;
+  /**
+   * `contained` — the target already holds every change; `ahead` — landing it
+   * would change `files`; `conflicted` — merging it would conflict in `files`;
+   * `unknown` — git could not answer (`detail`). Only `contained` is landed.
+   */
+  state: 'contained' | 'ahead' | 'conflicted' | 'unknown';
+  /** How a `contained` branch is held: reachable from the target, or merging into it changes nothing. */
+  by?: 'ancestry' | 'content';
+  /** The paths behind an `ahead` or `conflicted` verdict, capped at `LANDING_FILE_CAP`. */
+  files: string[];
+  /** The tree `merge-tree --write-tree` wrote, when the merge was clean. */
+  tree?: string;
+  detail?: string;
+};
+
+/** How many paths a landing proof names — a card that lists 400 files lists none. */
+const LANDING_FILE_CAP = 20;
+
+/**
+ * The ref a landing is proved against: the trunk's REMOTE copy, because a
+ * branch merged into a local `main` nobody pushed has landed nowhere anyone
+ * else can see — and the fleet's own hygiene judges a branch by
+ * `origin/<trunk>` too. The local trunk only for a repository that has no
+ * remote copy of it at all. No `fetch`: the console never talks to a remote
+ * (`never-push.test.ts`), so the proof is as fresh as the last fetch a session,
+ * a person or a landing made.
+ */
+async function landingTarget(repo: string): Promise<{ ref: string; into: string } | null> {
+  const trunk = await defaultBranchOf(repo);
+  if (!trunk) return null;
+  return await refExists(repo, `refs/remotes/origin/${trunk}`)
+    ? { ref: `refs/remotes/origin/${trunk}`, into: `origin/${trunk}` }
+    : { ref: `refs/heads/${trunk}`, into: trunk };
+}
+
+/**
+ * Prove one commit against a landing target — TREE containment, never `git
+ * cherry` (whose patch-id matching misses a squash that also resolved a
+ * conflict, and calls a reverted change landed). Cheapest first:
+ *  - ancestry: `rev-list --count <target>..<tip>` is 0 — a fast-forward or a
+ *    true merge;
+ *  - content: `merge-tree --write-tree <target> <tip>` merges cleanly AND
+ *    writes `<target>^{tree}` — every change is already there under other
+ *    commits (a squash, a rebase, a cherry-pick).
+ * A clean merge that writes any other tree is `ahead`, naming the paths it
+ * would change (`diff --name-only` of the two trees); exit 1 with paths is
+ * `conflicted`, naming them. `merge-tree` writes loose objects only and moves
+ * no ref (its entry at the top of this file).
+ */
+async function proveLanding(
+  repo: string, tip: string, target: { ref: string; into: string },
+): Promise<Omit<LandingProof, 'mount' | 'branch'>> {
+  const base = { tip, into: target.into, files: [] as string[] };
+  const ahead = await git(repo, ['rev-list', '--count', `${target.ref}..${tip}`]);
+  if (ahead.ok && ahead.stdout.trim() === '0') return { ...base, state: 'contained', by: 'ancestry' };
+  const [merged, own] = await Promise.all([
+    git(repo, ['merge-tree', '--write-tree', '--name-only', target.ref, tip]),
+    git(repo, ['rev-parse', '--verify', '--quiet', `${target.ref}^{tree}`]),
+  ]);
+  const lines = merged.stdout.split('\n');
+  const tree = (lines[0] ?? '').trim();
+  const trunkTree = own.stdout.trim();
+  if (merged.ok && tree && own.ok) {
+    if (tree === trunkTree) return { ...base, state: 'contained', by: 'content', tree };
+    const changed = await git(repo, ['diff', '--name-only', trunkTree, tree]);
+    const files = changed.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+    return { ...base, state: 'ahead', tree, files: files.slice(0, LANDING_FILE_CAP) };
+  }
+  // Exit 1 IS the conflict answer: `<tree>`, the conflicted paths, a blank
+  // line, then git's prose — only the middle section is data (`radarPair`).
+  if (!merged.ok && lines.length > 1) {
+    const files: string[] = [];
+    for (const raw of lines.slice(1)) {
+      const line = raw.trim();
+      if (!line) break;
+      files.push(line);
+    }
+    if (files.length) return { ...base, state: 'conflicted', files: files.slice(0, LANDING_FILE_CAP) };
+  }
+  return {
+    ...base, state: 'unknown',
+    detail: firstLine(merged.stderr) || firstLine(ahead.stderr) || 'git could not merge the two trees in memory',
+  };
+}
+
+/**
+ * The landing proof for every repository a run owns a branch in: each mount
+ * of its mirror, the root's included, or the run's one repository.
+ *
+ * A repository where the branch does not exist holds nothing of the run's and
+ * is skipped — except a mount `settleIdleMirrorBranches` settled before the
+ * final phase's §Verification: its branch was deleted on a proof against the
+ * LOCAL trunk too, which is not a landing, so the commit the mount stands
+ * detached at is proved again here.
+ */
+export async function landingProofs(opts: {
+  root: string; runBranch: string;
+  /** Root-relative mounts; absent or empty for a run with one repository. */
+  mounts?: readonly string[];
+  /** The mirror, to read a settled mount's commit from. */
+  integration?: string;
+  /** Mounts the idle settle detached (`RunState.mirrorSettled.mounts`). */
+  settled?: readonly string[];
+}): Promise<LandingProof[]> {
+  const out: LandingProof[] = [];
+  for (const rel of opts.mounts?.length ? opts.mounts : ['']) {
+    const source = rel ? join(opts.root, rel) : opts.root;
+    let tip = await commitOf(source, `refs/heads/${opts.runBranch}`);
+    if (!tip && opts.integration && opts.settled?.includes(rel)) {
+      const dir = rel ? join(opts.integration, rel) : opts.integration;
+      if (existsSync(dir)) tip = await commitOf(dir, 'HEAD');
+    }
+    if (!tip) continue;
+    const target = await landingTarget(source);
+    out.push(target
+      ? { mount: rel, branch: opts.runBranch, ...(await proveLanding(source, tip, target)) }
+      : { mount: rel, branch: opts.runBranch, tip, into: '', state: 'unknown', files: [], detail: 'the repository names no trunk to land on' });
+  }
+  return out;
+}
+
+/** What re-seating one repository's run branch on what landed did. */
+export type Reseat = {
+  mount: string;
+  branch: string;
+  /** The tip the branch named before — the pre-squash commit, kept in the reflog and on this line. */
+  from: string;
+  /** The commit it names now: the landing target's. */
+  to: string;
+  into: string;
+  /** Always `content`: only a branch the trunk holds under OTHER commits is re-seated. */
+  by: 'content';
+  /** The tree the proof wrote — `<into>^{tree}`. */
+  tree?: string;
+};
+
+/**
+ * Is this run branch landed by a SQUASH — its own commits on no trunk, every
+ * change of theirs held by the trunk's tree? The one shape a re-seat repairs:
+ * a branch the trunk reaches by ancestry is merged with its own commits, and
+ * stays usable as it is.
+ */
+async function squashLanded(repo: string, runBranch: string): Promise<{
+  tip: string; target: { ref: string; into: string }; landed: string; tree?: string;
+} | null> {
+  const tip = await commitOf(repo, `refs/heads/${runBranch}`);
+  const target = tip ? await landingTarget(repo) : null;
+  if (!tip || !target) return null;
+  const proof = await proveLanding(repo, tip, target);
+  if (proof.state !== 'contained' || proof.by !== 'content') return null;
+  const landed = await commitOf(repo, target.ref);
+  return landed && landed !== tip ? { tip, target, landed, ...(proof.tree ? { tree: proof.tree } : {}) } : null;
+}
+
+/** Does `target` reach the commit `dir` stands at? */
+async function reachedBy(dir: string, ref: string): Promise<string | null> {
+  const head = await commitOf(dir, 'HEAD');
+  if (!head) return null;
+  const beyond = await git(dir, ['rev-list', '--count', `${ref}..${head}`]);
+  return beyond.ok && beyond.stdout.trim() === '0' ? head : null;
+}
+
+/**
+ * Re-seat a SQUASH-landed run branch on what landed (control-tower phase 112,
+ * #183).
+ *
+ * A release phase squash-merged `pe/<slug>`, CD deployed `main`, and the run's
+ * own mirror stayed on the pre-squash branch — so every gate that compares the
+ * box with the CHECKOUT (`task drift:*`) was structurally red in the run's own
+ * tree, and the session's only way out (detaching its mirror at `origin/main`)
+ * got the next boarding refused. Once the trunk holds every change of the
+ * branch by content, `git switch --no-track -C <branch> <target>` puts the
+ * branch where its work now lives. Four fences, each a reason to leave it:
+ *  - the proof: `squashLanded` — the branch holds commits the target does not,
+ *    and merging them into it changes nothing;
+ *  - the mount stands on the branch, or DETACHED at a commit the target reaches
+ *    (what #183's session did) — never on another branch;
+ *  - the mount holds no uncommitted work (`isDirty`): a switch that carries
+ *    somebody's edits onto another commit is a change to their work;
+ *  - git's own refusal, when the branch is checked out somewhere else.
+ * Nothing is lost: the old tip is named on the caller's journal line and stays
+ * in the reflog, and every change in it is on the target by the proof.
+ */
+export async function reseatLandedBranch(opts: {
+  source: string; dir: string; mount: string; runBranch: string;
+}): Promise<{ reseated?: Reseat; skipped?: string }> {
+  const landed = await squashLanded(opts.source, opts.runBranch);
+  if (!landed) return { skipped: 'not landed by a squash' };
+  const on = await branchAt(opts.source, opts.dir);
+  if (on !== undefined && on !== opts.runBranch) return { skipped: `the checkout stands on ${on}` };
+  if (on === undefined && !(await reachedBy(opts.dir, landed.target.ref))) {
+    return { skipped: `the checkout is detached at a commit ${landed.target.into} does not reach` };
+  }
+  if (await isDirty(opts.dir)) return { skipped: 'the checkout holds uncommitted work' };
+  const moved = await git(opts.dir, ['switch', '--no-track', '-C', opts.runBranch, landed.target.ref]);
+  if (!moved.ok) return { skipped: firstLine(moved.stderr) || 'git switch failed' };
+  return {
+    reseated: {
+      mount: opts.mount, branch: opts.runBranch, from: landed.tip, to: landed.landed,
+      into: landed.target.into, by: 'content', ...(landed.tree ? { tree: landed.tree } : {}),
+    },
+  };
+}
+
+/** `reseatLandedBranch` over every mount of a mirror; a detached-by-design mirror owns no branch to move. */
+export async function reseatLandedMounts(integration: string, runBranch: string): Promise<Reseat[]> {
+  const manifest = await readMirror(integration);
+  if (!manifest || manifest.detached) return [];
+  const out: Reseat[] = [];
+  for (const mount of manifest.mounts) {
+    const dir = join(integration, mount.rel);
+    if (!existsSync(dir)) continue;
+    const { reseated } = await reseatLandedBranch({ source: mount.source, dir, mount: mount.rel, runBranch });
+    if (reseated) out.push(reseated);
+  }
+  return out;
+}
+
+/**
+ * The way out a DETACHED checkout has when its branch is already landed by a
+ * squash and the commit it stands at is on the trunk — the sentence #183's
+ * refusal lacked. Empty when that is not the case: "switch it back or remove
+ * it" is then the whole truth.
+ */
+async function landedRemedy(repo: string, dir: string, runBranch: string): Promise<string> {
+  const landed = await squashLanded(repo, runBranch);
+  const head = landed ? await reachedBy(dir, landed.target.ref) : null;
+  if (!landed || !head) return '';
+  return `; it stands at ${head.slice(0, 12)}, which is on ${landed.target.into}, and \`${runBranch}\` is fully `
+    + `landed on ${landed.target.into} (a merge-tree proof) — so the console re-seats \`${runBranch}\` on `
+    + `${landed.target.into} by itself once this checkout is clean: commit or discard what it holds, then Continue. `
+    + 'Otherwise';
+}
+
 /**
  * Discard mounts THIS process created moments ago — the mirror's spelling of
  * `discardFreshTree`, with the same one justification: only for trees minted
@@ -3540,9 +3829,14 @@ export function holdsQuarantine(runDir: string): boolean {
  */
 export async function pruneMirror(opts: {
   integration: string; mounts: MirrorMount[];
-}): Promise<{ removed: string[]; kept: string[] }> {
+  /** When this prune ran, for the `stale-mounts/` folder it preserves untracked files in. Injected by tests. */
+  now?: number;
+}): Promise<{ removed: string[]; kept: string[]; preserved: PreservedUntracked[]; held: HeldMount[] }> {
   const removed: string[] = [];
   const kept: string[] = [];
+  const preserved: PreservedUntracked[] = [];
+  const held: HeldMount[] = [];
+  const stamp = new Date(opts.now ?? Date.now()).toISOString().replace(/[:.]/g, '-');
   // 🔴 Every worktree the mounts' repositories own, read once: the question
   // below is "is anything in here a repository the console did NOT make" — a
   // session's clone in a mount path, or in the empty directory of a submodule
@@ -3565,9 +3859,27 @@ export async function pruneMirror(opts: {
       kept.push(dir);
       continue;
     }
-    if (await isDirty(dir)) {
+    // 🔴 Untracked files alone never pin a mount (control-tower phase 112,
+    // #184): a verification run's caches, an empty data directory and a 4 KB
+    // report kept a hub run's mount — and with it the run branches `task
+    // hygiene` flags — until a hand check found them. They are MOVED under the
+    // run's own `stale-mounts/` (kept, never deleted, cleared by a person like
+    // any quarantined content), and the mount goes. A tracked edit is work:
+    // that mount is kept, and the paths are handed back for the errand.
+    const dirt = await dirtOf(dir);
+    if (!dirt || dirt.tracked.length) {
       kept.push(dir);
+      held.push({ mount: mount.rel, dir, paths: dirt?.tracked.slice(0, DIRTY_PATH_CAP) ?? [] });
       continue;
+    }
+    if (dirt.untracked.length) {
+      const moved = await preserveUntracked(opts.integration, mount.rel, dir, dirt.untracked, stamp);
+      if (!moved) {
+        kept.push(dir);
+        held.push({ mount: mount.rel, dir, paths: dirt.untracked.slice(0, DIRTY_PATH_CAP) });
+        continue;
+      }
+      preserved.push(moved);
     }
     const out = await removeTree(mount.source, dir);
     if (out.ok) {
@@ -3596,7 +3908,62 @@ export async function pruneMirror(opts: {
     // not there. The legacy in-tree copy went with the directory above.
     await rm(mirrorManifestPath(opts.integration), { force: true });
   }
-  return { removed, kept };
+  return { removed, kept, preserved, held };
+}
+
+/** Untracked files moved out of a mount before it went (control-tower phase 112, #184). */
+export type PreservedUntracked = {
+  /** Root-relative mount; `''` is the root. */
+  mount: string;
+  /** Where they are now: `<run>/stale-mounts/<stamp>/<mount>`. */
+  to: string;
+  /** What moved, as `git status` named it (a directory once, with its trailing slash dropped). */
+  paths: string[];
+};
+
+/** A mount the prune kept because it holds work — and the paths that are the work. */
+export type HeldMount = { mount: string; dir: string; paths: string[] };
+
+/**
+ * What a checkout holds outside its commits, split: tracked edits (work) and
+ * untracked paths (`??`). `null` when git cannot read it — which keeps the
+ * tree, for `isDirty`'s asymmetry. `-z`, so a path with a space or a quote is
+ * one path; a rename's second entry is its source and is skipped.
+ */
+async function dirtOf(dir: string): Promise<{ tracked: string[]; untracked: string[] } | null> {
+  if (!existsSync(dir)) return { tracked: [], untracked: [] };
+  const out = await git(dir, ['status', '--porcelain', '-z', '--ignore-submodules=all']);
+  if (!out.ok) return null;
+  const tracked: string[] = [];
+  const untracked: string[] = [];
+  const entries = out.stdout.split('\0');
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (entry.length < 4) continue;
+    const code = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (code === '??') untracked.push(path.replace(/\/$/, ''));
+    else tracked.push(path);
+    if (code[0] === 'R' || code[0] === 'C') i++;
+  }
+  return { tracked, untracked };
+}
+
+/** Move a mount's untracked paths under `<run>/stale-mounts/<stamp>/<mount>`; `null` if any move failed. */
+async function preserveUntracked(
+  integration: string, rel: string, dir: string, paths: readonly string[], stamp: string,
+): Promise<PreservedUntracked | null> {
+  const to = join(staleMountsDir(integration), stamp, rel || '_root');
+  try {
+    for (const path of paths) {
+      const into = join(to, path);
+      await mkdir(dirname(into), { recursive: true });
+      await rename(join(dir, path), into);
+    }
+  } catch {
+    return null;
+  }
+  return { mount: rel, to, paths: [...paths] };
 }
 
 /**
@@ -3666,10 +4033,16 @@ export async function pruneRun(
     /** Injected clock, for `ttl:<h>`. */
     now?: number;
   },
-): Promise<{ removed: string[]; kept: string[]; lockedForeign: ForeignLock[] }> {
+): Promise<{
+  removed: string[]; kept: string[]; lockedForeign: ForeignLock[];
+  /** A mirror's untracked files moved aside before their mounts went, and the mounts kept for work. */
+  preserved: PreservedUntracked[]; held: HeldMount[];
+}> {
   const removed: string[] = [];
   const kept: string[] = [];
   const lockedForeign: ForeignLock[] = [];
+  const preserved: PreservedUntracked[] = [];
+  const held: HeldMount[] = [];
   const locks = await lockIndex(root);
   const policy = opts.retention ?? DEFAULT_RETENTION;
   const failed = opts.failed ?? false;
@@ -3709,9 +4082,11 @@ export async function pruneRun(
     const names = laneNames({ ...opts, phase: 0 });
     const mirror = await mirrorShape(root, names.integration);
     if (mirror) {
-      const pruned = await pruneMirror({ integration: names.integration, mounts: mirror });
+      const pruned = await pruneMirror({ integration: names.integration, mounts: mirror, now });
       removed.push(...pruned.removed);
       kept.push(...pruned.kept);
+      preserved.push(...pruned.preserved);
+      held.push(...pruned.held);
     } else if (await isRegistered(root, names.integration)) {
       if (await isDirty(names.integration) || !(await mayRemove(names.integration))) {
         kept.push(names.integration);
@@ -3743,7 +4118,7 @@ export async function pruneRun(
     }
   }
 
-  return { removed, kept, lockedForeign };
+  return { removed, kept, lockedForeign, preserved, held };
 }
 
 /**
@@ -4693,22 +5068,77 @@ export async function checkouts(
  * hundred thousand `stat` calls every five minutes is a monitoring layer
  * that becomes the thing worth monitoring. A machine without `du`, or a
  * directory that has gone, answers `undefined` like every other probe.
+ *
+ * 🔴 And it is a number nobody acts on, so it never competes with the work
+ * (control-tower phase 112, #171). Measured on a hub console: three `du -sk`
+ * of one LIVE mirror's repositories ran at once at load 279 on 14 cores, one
+ * 42 s past its 30 s ceiling, and every read API timed out in that window; on
+ * a 14-repository mirror 1,419 of 1,419 scans hit the ceiling and answered
+ * nothing. So, in the order a "no" costs least:
+ *  - a `live` tree — a run is writing into it — is never handed to `du`;
+ *  - at most ONE `du` runs console-wide: a second caller answers `undefined`
+ *    at once rather than queueing a scan behind a scan;
+ *  - nothing is measured while the one-minute load exceeds twice the cores;
+ *  - a tree whose scan hit the ceiling is too large to measure in 30 s, and is
+ *    not asked again for `TREE_DISK_RETRY_MS` — retrying it on every poll was
+ *    the whole of the second measurement above;
+ *  - the ceiling walks the signals ladder (SIGCONT, SIGTERM to the group, then
+ *    SIGKILL) and the slot is held until it has, so a scan in uninterruptible disk
+ *    sleep is not joined by the next one.
+ * `exec` and `load` are seams for the tests; nothing else passes them.
  */
-export async function treeDisk(dir: string): Promise<number | undefined> {
-  if (!existsSync(dir)) return undefined;
-  const out = await shell('du', ['-sk', dir], {
-    channel: 'shell',
-    intent: 'tree-disk',
-    timeout: 30_000,
-    capture: { keep: 1024 * 1024, mode: 'head' },
-    env: { ...process.env, LC_ALL: 'C', BLOCKSIZE: '1024' },
-    // `du` warns and exits non-zero on any directory it cannot read, which is
-    // routine under a tree the operator owns differently.
-    expectFailure: true,
-  });
-  if (!out.ok) return undefined;
-  const kb = Number(out.stdout.trim().split(/\s+/)[0]);
-  return Number.isFinite(kb) ? kb * 1024 : undefined;
+export async function treeDisk(dir: string, opts: {
+  live?: boolean;
+  exec?: (file: string, argv: readonly string[], options: ShellOptions) => Promise<ShellRun>;
+  load?: () => { one: number; cpus: number };
+  now?: () => number;
+} = {}): Promise<number | undefined> {
+  if (opts.live || !existsSync(dir)) return undefined;
+  if (treeDiskBusy) return undefined;
+  const now = (opts.now ?? Date.now)();
+  const failedAt = treeDiskTooLarge.get(dir);
+  if (failedAt !== undefined && now - failedAt < TREE_DISK_RETRY_MS) return undefined;
+  const { one, cpus } = (opts.load ?? machineLoad)();
+  if (one > TREE_DISK_LOAD_FACTOR * Math.max(1, cpus)) return undefined;
+  treeDiskBusy = true;
+  try {
+    const out = await (opts.exec ?? shell)('du', ['-sk', dir], {
+      channel: 'shell',
+      intent: 'tree-disk',
+      timeout: TREE_DISK_TIMEOUT_MS,
+      ceiling: 'ladder',
+      capture: { keep: 1024 * 1024, mode: 'head' },
+      env: { ...process.env, LC_ALL: 'C', BLOCKSIZE: '1024' },
+      // `du` warns and exits non-zero on any directory it cannot read, which is
+      // routine under a tree the operator owns differently.
+      expectFailure: true,
+    });
+    if (out.timedOut) {
+      treeDiskTooLarge.set(dir, now);
+      return undefined;
+    }
+    treeDiskTooLarge.delete(dir);
+    if (!out.ok) return undefined;
+    const kb = Number(out.stdout.trim().split(/\s+/)[0]);
+    return Number.isFinite(kb) ? kb * 1024 : undefined;
+  } finally {
+    treeDiskBusy = false;
+  }
+}
+
+/** How long one `du` may run before the ladder ends it. */
+export const TREE_DISK_TIMEOUT_MS = 30_000;
+/** How long a tree that was too large to measure in time is left alone. */
+export const TREE_DISK_RETRY_MS = 6 * 60 * 60_000;
+/** Measurement waits while the one-minute load exceeds this many times the cores. */
+export const TREE_DISK_LOAD_FACTOR = 2;
+/** The one `du` the console may have in flight. */
+let treeDiskBusy = false;
+/** Trees whose last scan hit the ceiling, and when. */
+const treeDiskTooLarge = new Map<string, number>();
+
+function machineLoad(): { one: number; cpus: number } {
+  return { one: loadavg()[0] ?? 0, cpus: availableParallelism() };
 }
 
 /**
@@ -4849,14 +5279,17 @@ export async function probeRunGit(opts: {
   workRoot?: string;
   /** The console's managed directories (every worktree home), to tell our trees from an operator's. */
   stateRoot?: string | readonly string[];
+  /** The run is being driven: its trees keep no fresh `du` (#171) — `disk` is then unknown. */
+  live?: boolean;
 }): Promise<RunGitView> {
   const { root, branch, workRoot } = opts;
+  const runLive = opts.live ?? false;
   const at = new Date().toISOString();
   const base = await baseBranch(root);
   const registry = await checkouts(root, opts.stateRoot);
 
   for (const entry of registry) {
-    if (entry.managed && !entry.prunable) entry.disk = await treeDisk(entry.dir);
+    if (entry.managed && !entry.prunable) entry.disk = await treeDisk(entry.dir, { live: runLive });
   }
 
   const view: RunGitView = {
@@ -4878,7 +5311,7 @@ export async function probeRunGit(opts: {
   }
   if (workRoot) {
     const here = registry.find((entry) => entry.dir === realish(workRoot));
-    view.disk = here?.disk ?? await treeDisk(workRoot);
+    view.disk = here?.disk ?? await treeDisk(workRoot, { live: runLive });
   }
 
   // The participants: every branch that has a checkout right now, plus the
@@ -4918,7 +5351,10 @@ export async function probeMirrorGit(opts: {
   /** Root-relative paths of the mounted repositories. */
   mounts: readonly string[];
   stateRoot?: string | readonly string[];
+  /** See `probeRunGit`. */
+  live?: boolean;
 }): Promise<RunGitView> {
+  const runLive = opts.live ?? false;
   const view: RunGitView = {
     at: new Date().toISOString(),
     branch: opts.branch,
@@ -4928,14 +5364,14 @@ export async function probeMirrorGit(opts: {
     checkouts: [],
     radar: [],
   };
-  view.disk = await treeDisk(opts.workRoot);
+  view.disk = await treeDisk(opts.workRoot, { live: runLive });
 
   for (const rel of opts.mounts) {
     const source = join(opts.root, rel);
     const base = await baseBranch(source);
     const registry = await checkouts(source, opts.stateRoot);
     for (const entry of registry) {
-      if (entry.managed && !entry.prunable) entry.disk = await treeDisk(entry.dir);
+      if (entry.managed && !entry.prunable) entry.disk = await treeDisk(entry.dir, { live: runLive });
       view.checkouts.push({ ...entry, repo: rel });
     }
     if (base && await refExists(source, opts.branch)) {
@@ -5117,8 +5553,12 @@ export async function pushRef(
  * A clean checkout for a verification (control-tower phase 89)
  * ------------------------------------------------------------------ */
 
-/** The dependency directories a clean checkout borrows from the working tree, by name. */
-const BORROWED_DEPS = new Set(['node_modules', '.venv', 'venv']);
+/**
+ * The dependency directories a clean checkout borrows from the working tree,
+ * by name — and, since control-tower phase 106 (#191), the names an
+ * uncommitted path inside of which is never another phase's work.
+ */
+export const BORROWED_DEPS: ReadonlySet<string> = new Set(['node_modules', '.venv', 'venv']);
 /** How deep, and how many directories, the search for them may go. */
 const BORROW_DEPTH = 3;
 const BORROW_DIRS = 2_000;
@@ -5158,6 +5598,18 @@ export type ExportCheckout = {
  * Refused, with the reason, for a superproject (`.gitmodules`: a linked
  * worktree of one has EMPTY submodule directories, so a verification there
  * would read less than the commit) and when git cannot make one.
+ *
+ * A repository that is itself a SUBMODULE — every repository a superproject
+ * mirror mounts — is exported where it stands in its superproject's layout
+ * (control-tower phase 106, #191): at `<base>/<its path>`, with every other
+ * entry of the superproject's working tree along that path LINKED around it —
+ * the sibling repositories, the root's own files — and never its `.git`.
+ * ai-builder-v7's app-backend `verify:local` reads `../app-frontend`; in an
+ * export holding app-backend alone it was red by construction. The links are
+ * links, never copies, and the export alone is the commit: what a line reads
+ * of a sibling it reads as it stands in the working tree, exactly as in place.
+ * `remove` takes the links away one by one BEFORE anything is removed
+ * recursively, so nothing ever walks into a linked repository.
  */
 export async function exportCheckout(repo: string, head: string): Promise<ExportCheckout | { refused: string }> {
   const top = await git(repo, ['rev-parse', '--show-toplevel']);
@@ -5166,19 +5618,29 @@ export async function exportCheckout(repo: string, head: string): Promise<Export
   if (existsSync(join(root, '.gitmodules'))) {
     return { refused: 'the repository has submodules, and a clean checkout of it would hold none of their files' };
   }
+  const layout = await superprojectLayout(root);
   const base = await mkdtempAsync(join(tmpdir(), 'pc-verify-export-'));
-  const dir = join(base, 'tree');
+  const dir = layout ? join(base, layout.rel) : join(base, 'tree');
   const env = {
     ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb', GIT_TERMINAL_PROMPT: '0',
     // No hook of the repository's runs for a checkout the console makes to read.
     GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
   };
-  const made = await git(root, ['worktree', 'add', '--detach', dir, head], env);
+  const links: string[] = [];
   const remove = async (): Promise<void> => {
+    // The links first, each on its own and never recursively: a link to a
+    // sibling repository is removed, never what it points at.
+    for (const link of links.splice(0).reverse()) await rm(link, { force: true }).catch(() => {});
     const gone = await git(root, ['worktree', 'remove', '--force', dir]);
     await rm(base, { recursive: true, force: true });
     if (!gone.ok) await git(root, ['worktree', 'prune']);
   };
+  if (layout) {
+    // A layout that cannot be linked leaves the export standing alone; a line
+    // that then names a sibling it lacks is `environment` (`verify.ts`).
+    await overlaySiblings(layout.outer, layout.rel, base, links).catch(() => {});
+  }
+  const made = await git(root, ['worktree', 'add', '--detach', dir, head], env);
   if (!made.ok) {
     await remove();
     return { refused: firstLine(made.stderr) || `git could not check out ${head.slice(0, 12)}` };
@@ -5203,6 +5665,53 @@ export async function exportCheckout(repo: string, head: string): Promise<Export
     // Setup, or its line says what it lacked; the checkout still stands.
   }
   return { dir, head, borrowed, remove };
+}
+
+/**
+ * Where a repository stands in its OUTERMOST superproject — the root's working
+ * tree and the repository's path in it — or null for a repository that is
+ * nobody's submodule (control-tower phase 106, #191). Walked outward the way
+ * the scripts' `pe_docs_root` walks, one `--show-superproject-working-tree` per
+ * level, so a nested submodule stands in the whole layout, not the middle one.
+ */
+async function superprojectLayout(root: string): Promise<{ outer: string; rel: string } | null> {
+  let outer = '';
+  let at = root;
+  for (let depth = 0; depth < 8; depth += 1) {
+    const up = await git(at, ['rev-parse', '--show-superproject-working-tree']);
+    const next = up.ok ? up.stdout.trim() : '';
+    if (!next || next === at) break;
+    outer = next;
+    at = next;
+  }
+  if (!outer) return null;
+  const rel = relative(realish(outer), realish(root));
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
+  return { outer, rel };
+}
+
+/**
+ * Link the superproject's layout around a repository's export: at each level of
+ * `rel`, every entry of the superproject's working tree except the next step of
+ * the path — the sibling repositories, the root's own files — is linked into
+ * `base` at the same place. Never the superproject's `.git`. Every link made is
+ * pushed onto `links` as it is made, so `remove` can take each away before it
+ * removes anything recursively — even after a failure halfway.
+ */
+async function overlaySiblings(outer: string, rel: string, base: string, links: string[]): Promise<void> {
+  let from = outer;
+  let to = base;
+  for (const step of rel.split(sep).filter(Boolean)) {
+    await mkdir(to, { recursive: true });
+    for (const entry of await readdir(from)) {
+      if (entry === step || entry === '.git') continue;
+      const link = join(to, entry);
+      await symlink(join(from, entry), link);
+      links.push(link);
+    }
+    from = join(from, step);
+    to = join(to, step);
+  }
 }
 
 /** The working tree's dependency directories, repository-relative — never one inside another. */

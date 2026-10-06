@@ -62,11 +62,17 @@
  */
 
 import type { WatchStateWord } from '../shared/run-lifecycle.js';
+import { budgetClause } from '../shared/ci-refusal.js';
 import { waitBudgetEndOf } from './runner/wait-budget.ts';
 import { shell } from './shell.ts';
+import { parseUnitRef, UNIT_POLL_MS, type UnitTarget } from './watch-unit.ts';
 
-/** Every scheme this console will poll. The list is written here and nowhere else. */
-export const WATCH_SCHEMES = ['gh-run', 'gh-pr', 'date', 'lock', 'phase', 'verify', 'cmd'] as const;
+/**
+ * Every scheme this console will poll. The list is written here and nowhere
+ * else. `unit` (control-tower phase 121, #181) is a systemd unit on another
+ * machine, read over ssh (`watch-unit.ts`).
+ */
+export const WATCH_SCHEMES = ['gh-run', 'gh-pr', 'date', 'lock', 'phase', 'verify', 'cmd', 'unit'] as const;
 export type WatchScheme = (typeof WATCH_SCHEMES)[number];
 
 export type WatchRefTarget =
@@ -77,7 +83,9 @@ export type WatchRefTarget =
   | { kind: 'lock'; slug: string; phase: number; ref: string }
   | { kind: 'phase'; slug: string; phase: number; ref: string }
   | { kind: 'verify'; slug: string; phase: number; ref: string }
-  | { kind: 'cmd'; command: string; ref: string };
+  | { kind: 'cmd'; command: string; ref: string }
+  /** `unit:<host>/<unit>` — the host is a NAME the machine profile resolves, never an address. */
+  | UnitTarget;
 
 export type WatchState = {
   ref: string;
@@ -90,6 +98,57 @@ export type WatchState = {
    * probe that saw `MERGED` sets it.
    */
   mergeCommit?: string;
+  /**
+   * A `gh-run` GitHub never started (control-tower phase 111, #166): every
+   * failed job with no runner and no step, under the "job was not started"
+   * annotation. The verdict is then a wait, never a landing — there is no
+   * result to read — and the row keeps this, which the errand, the landing
+   * on room and the Tower's one-per-repository state all read.
+   */
+  notRun?: CiNotRun;
+  /**
+   * How a `unit:` ref's job ended (control-tower phase 121) — `Result=` and the
+   * exit time, which the wait history keeps (`recordUnitExit`). Only a landed
+   * `unit:` verdict carries it, and it never names the host's address or user.
+   */
+  unit?: { result: string; exitedAt?: string };
+};
+
+/** An Actions budget the token could read for a refused run's repository. */
+export type CiBudget = {
+  scope: 'repository' | 'organization';
+  /** `owner/name` for a repository budget, the organization's login for its own. */
+  name: string;
+  /** Dollars. */
+  amount: number;
+  consumed: number;
+  /** `prevent_further_usage` — the budget stops jobs at the limit rather than alerting. */
+  stops: boolean;
+};
+
+/** Why GitHub did not start a watched run — what the probe read (#166). */
+export type CiNotRun = {
+  /** One word (`CI_NOT_RUN_CAUSES`, `shared/ci-refusal.js`). */
+  cause: 'billing';
+  repo: string;
+  /** The workflow run id. */
+  run: string;
+  /** The run attempt the refusal was read on, when the jobs say. */
+  attempt?: number;
+  /** Failed jobs with no runner and no step. */
+  jobs: number;
+  /** GitHub's own sentence, from the first such job's annotation. */
+  annotation: string;
+  /** The Actions budgets naming this repository or its organization, repository first. */
+  budgets?: CiBudget[];
+  /** Why no budget could be read — the endpoint and its answer. */
+  unreadable?: string;
+  /**
+   * Every stopping budget read has room (true); one is spent (false); absent
+   * when nothing could be read. A landing is the move from false to true —
+   * room at first sight says the budget is not what refused the run.
+   */
+  headroom?: boolean;
 };
 
 /**
@@ -112,6 +171,8 @@ export const WATCH_POLL_MS: Readonly<Record<WatchScheme, number>> = Object.freez
   // A `git rev-parse` per ask; the lines themselves run only on a new head.
   verify: 120_000,
   cmd: 300_000,
+  // One `systemctl show` over the host's multiplexed ssh — a fixed cadence.
+  unit: UNIT_POLL_MS,
 });
 
 /**
@@ -398,6 +459,7 @@ export function parseWatchRef(ref: string): WatchRefTarget | null {
     const phase = Number(m[2]);
     return Number.isSafeInteger(phase) && phase > 0 ? { kind, slug: m[1], phase, ref } : null;
   }
+  if (ref.startsWith('unit:')) return parseUnitRef(ref);
   if (ref.startsWith('cmd:')) {
     // The conventional spelling quotes the command (`cmd:"npm test"`), because
     // that is what reads well in a `--watch` argument; the quotes are the
@@ -409,9 +471,50 @@ export function parseWatchRef(ref: string): WatchRefTarget | null {
   return null;
 }
 
-/** The seven shapes, in words — what a person needs beside a ref nothing can poll. */
+/**
+ * A declaration's BACKSTOP (control-tower phase 121, #181's cheaper variant):
+ * a `date:` beside at least one LIVE ref. The live refs wake the phase the
+ * moment one lands; the date — the latest, when there are several — only
+ * bounds the wait. Null when the declaration is a date alone (a clock) or has
+ * no date (nothing bounds it but the budget).
+ */
+export function backstopOf(refs: readonly string[]): { backstop: string; live: string[] } | null {
+  const targets = pollableRefs(refs);
+  const live = liveRefs(refs).map((target) => target.ref);
+  let latest: Extract<WatchRefTarget, { kind: 'date' }> | undefined;
+  for (const target of targets) {
+    if (target.kind === 'date' && (!latest || target.at > latest.at)) latest = target;
+  }
+  return latest && live.length ? { backstop: latest.ref, live } : null;
+}
+
+/**
+ * A backstop that PASSED with its live refs still out is not the thing the
+ * phase waited for: its landing says so — the date, and each live ref that has
+ * not landed with what it last read — so the resumed session is never told
+ * "the wait is over" about a job that is still running.
+ */
+export function backstopVerdict(
+  record: { declared?: { watch?: readonly string[] } | null; watchState?: { refs: readonly { ref: string; state: string; detail?: string }[] } | null },
+  target: WatchRefTarget,
+  verdict: WatchState,
+): WatchState {
+  if (target.kind !== 'date' || verdict.state !== 'landed') return verdict;
+  const pair = backstopOf(record.declared?.watch ?? []);
+  if (!pair || pair.backstop !== target.ref) return verdict;
+  const rows = record.watchState?.refs ?? [];
+  const out = pair.live.filter((ref) => rows.find((row) => row.ref === ref)?.state !== 'landed');
+  if (!out.length) return verdict;
+  const said = out.map((ref) => {
+    const detail = rows.find((row) => row.ref === ref)?.detail;
+    return `${ref} has NOT landed${detail ? ` (${detail})` : ''}`;
+  }).join('; ');
+  return { ...verdict, detail: `the backstop passed (${verdict.detail ?? new Date(target.at).toISOString()}) — ${said}`.slice(0, 400) };
+}
+
+/** The shapes, in words — what a person needs beside a ref nothing can poll. */
 export const WATCH_REF_SHAPES =
-  'gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>"';
+  'gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>" · unit:<host>/<unit>';
 
 /**
  * Why `parseWatchRef` would not poll this ref, or null when it would.
@@ -630,6 +733,30 @@ export function withLiveErrands<T extends { phases?: Record<string, unknown>; re
 }
 
 /** The pollable subset of a declared watch list, in declaration order, deduped. */
+/**
+ * The refs that WATCH something (control-tower phase 121, #40): every one the
+ * clock can poll but a `date:`, which is a clock of its own. A park on a spent
+ * wait budget is a wait only while one of these is out — a date alone would
+ * hold it, unannounced, until that instant, so it still files the errand.
+ */
+export function liveRefs(refs: readonly string[] | undefined | null): WatchRefTarget[] {
+  return pollableRefs(refs).filter((target) => target.kind !== 'date');
+}
+
+/**
+ * The live refs a park still waits on: `liveRefs`, less each one the watch
+ * clock has REFUSED — a refusal is final (the clock never asks that ref
+ * again), so a spent park whose live refs are all refused waits on nothing
+ * and is a person's again (control-tower phase 121).
+ */
+export function stillLiveRefs(record: {
+  watch?: readonly string[] | null;
+  watchState?: { refs?: readonly { ref: string; state: string }[] } | null;
+}): WatchRefTarget[] {
+  const refused = new Set((record.watchState?.refs ?? []).filter((row) => row.state === 'refused').map((row) => row.ref));
+  return liveRefs(record.watch).filter((target) => !refused.has(target.ref));
+}
+
 export function pollableRefs(refs: readonly string[] | undefined | null): WatchRefTarget[] {
   const seen = new Set<string>();
   const out: WatchRefTarget[] = [];
@@ -697,7 +824,14 @@ export function nextDueFor(
  * healer's resume and the runner's live-lane resume (`waitResumePrompt`,
  * cause `landed`) both say it.
  */
-export function landingDirective(landed: { detail?: string }): string {
+export function landingDirective(landed: { detail?: string; notRun?: CiNotRun }): string {
+  // A run GitHub never started, whose budget has room again (#166): there is
+  // nothing to read — the jobs never ran — so the act is the re-run, on the
+  // same ref, which reads the run's newest attempt.
+  if (landed.notRun) {
+    return `GitHub never started its jobs (billing), and the Actions budget has room again — re-run the failed jobs `
+      + `(\`${rerunCommand(landed.notRun)}\`), then declare waiting-external on the same ref: the watch follows the new attempt;`;
+  }
   const detail = (landed.detail ?? '').toLowerCase();
   if (detail.includes('cancelled') || detail.includes('canceled')) {
     return 'It was CANCELLED, so there is no result to read — decide whether to re-run it (`gh run rerun <id>`) or to proceed without it;';
@@ -765,6 +899,8 @@ export type WatchProbeDeps = {
   phaseDone?: (slug: string, phase: number) => { state: 'landed' | 'pending' | 'unknown'; detail?: string } | null;
   /** `verify:<slug>/<N>` — the declaring phase's red lines, re-run on a new head (`verify-watch.ts`). */
   verifyProbe?: (target: Extract<WatchRefTarget, { kind: 'verify' }>) => Promise<WatchState>;
+  /** `unit:<host>/<unit>` — one `systemctl show` over the host's ssh master (`watch-unit.ts` `UnitProber`). */
+  unitProbe?: (target: UnitTarget) => Promise<WatchState>;
 };
 
 /**
@@ -800,6 +936,12 @@ export async function probeWatchRef(
   if (target.kind === 'verify') {
     if (!opts.verifyProbe) return { ref: target.ref, state: 'unknown', detail: 'no verification oracle wired' };
     try { return await opts.verifyProbe(target); } catch (error) {
+      return { ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160) };
+    }
+  }
+  if (target.kind === 'unit') {
+    if (!opts.unitProbe) return { ref: target.ref, state: 'unknown', detail: 'no unit prober wired' };
+    try { return await opts.unitProbe(target); } catch (error) {
       return { ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160) };
     }
   }
@@ -852,6 +994,13 @@ function probeGh(
       const json = JSON.parse(run.stdout);
       if (target.kind === 'gh-run') {
         const detail = [json.status, json.conclusion].filter(Boolean).join(': ');
+        // A failure in seconds may be a run GitHub never started (#166): read
+        // its jobs before calling it red. Any read that fails keeps the plain
+        // verdict — this can only ever make the answer more exact.
+        if (json.status === 'completed' && FAILED_CONCLUSIONS.has(String(json.conclusion))) {
+          const notRun = await readNotStarted(target, opts).catch(() => null);
+          if (notRun) return { ref: target.ref, state: 'pending', detail: notRunDetail(notRun), notRun };
+        }
         return { ref: target.ref, state: runLanded(json), ...(detail ? { detail } : {}) };
       }
       // `mergeCommit` is an object (`{oid}`) in gh's JSON; carried as the sha
@@ -868,6 +1017,156 @@ function probeGh(
       return { ref: target.ref, state: 'unknown', detail: 'unparseable gh output' };
     }
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * A run GitHub never started (control-tower phase 111, #166)
+ * ------------------------------------------------------------------ */
+
+/** The conclusions a refused run ends with; anything else ran. */
+const FAILED_CONCLUSIONS: ReadonlySet<string> = new Set(['failure', 'startup_failure']);
+
+/**
+ * GitHub's own sentence on a job it refused for money: "The job was not
+ * started because recent account payments have failed or your spending limit
+ * needs to be increased." Matched on its two halves, so a rewording of either
+ * still reads.
+ */
+export const NOT_STARTED_BILLING = /job was not started because .*(payments? (have|has) failed|spending limit)/i;
+
+type GhRead = { ok: true; json: unknown } | { ok: false; why: string };
+
+/**
+ * One `gh api` read, bounded like the probe it serves; every failure is a reason.
+ * A GET that says so — the JSON `Accept` header and none of the flags that turn
+ * `api` into a write — which is the shape `issues-readonly.test.ts` admits here.
+ */
+async function ghApi(path: string, opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv }): Promise<GhRead> {
+  const run = await shell('gh', ['api', path, '-H', 'Accept: application/vnd.github+json'], {
+    channel: 'shell', intent: 'watch-ref', timeout: opts.timeoutMs ?? 10_000, env: opts.env ?? process.env,
+    capture: { keep: 512 * 1024, mode: 'head' }, expectFailure: true,
+  });
+  if (!run.ok) return { ok: false, why: String(run.error?.message || run.stderr || `gh exited ${run.code}`).trim().slice(0, 120) };
+  try { return { ok: true, json: JSON.parse(run.stdout) }; } catch { return { ok: false, why: 'unparseable gh output' }; }
+}
+
+type GhJob = { id?: unknown; conclusion?: unknown; runner_id?: unknown; runner_name?: unknown; steps?: unknown; run_attempt?: unknown };
+
+/**
+ * Was this completed, failed run never started? Its jobs first — every failed
+ * job with no runner and no step — then the first such job's annotations for
+ * GitHub's sentence, then the budgets the token can read. Null when it ran.
+ */
+async function readNotStarted(
+  target: Extract<WatchRefTarget, { kind: 'gh-run' }>,
+  opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv },
+): Promise<CiNotRun | null> {
+  const jobsRead = await ghApi(`repos/${target.repo}/actions/runs/${target.id}/jobs?per_page=100`, opts);
+  if (!jobsRead.ok) return null;
+  const jobs = (jobsRead.json as { jobs?: GhJob[] } | null)?.jobs;
+  if (!Array.isArray(jobs)) return null;
+  const failed = jobs.filter((job) => FAILED_CONCLUSIONS.has(String(job?.conclusion)));
+  const unstarted = (job: GhJob) => !job.runner_id && !job.runner_name && !(Array.isArray(job.steps) && job.steps.length);
+  if (!failed.length || !failed.every(unstarted)) return null;
+  const first = failed[0];
+  const notes = await ghApi(`repos/${target.repo}/check-runs/${String(first.id)}/annotations`, opts);
+  if (!notes.ok || !Array.isArray(notes.json)) return null;
+  const sentence = (notes.json as { message?: unknown }[])
+    .map((note) => String(note?.message ?? ''))
+    .find((message) => NOT_STARTED_BILLING.test(message));
+  if (!sentence) return null;
+  const attempt = Number(first.run_attempt);
+  const budget = await readBudgets(target.repo, opts);
+  return {
+    cause: 'billing', repo: target.repo, run: target.id,
+    ...(Number.isInteger(attempt) && attempt > 0 ? { attempt } : {}),
+    jobs: failed.length,
+    annotation: sentence.replace(/\s+/g, ' ').trim().slice(0, 240),
+    ...budget,
+  };
+}
+
+type GhBudget = {
+  id?: unknown; budget_scope?: unknown; budget_entity_name?: unknown; budget_amount?: unknown;
+  consumed_amount?: unknown; prevent_further_usage?: unknown;
+  budget_product_sku?: unknown; budget_product_skus?: unknown; budget_type?: unknown;
+};
+
+/**
+ * The Actions budgets that bind this repository — its own, then its
+ * organization's — with what each has consumed, as far as the token can read
+ * them. The list endpoint may omit `consumed_amount`; a budget that does is
+ * read again by id. Bounded at two budgets, three calls.
+ */
+async function readBudgets(
+  repo: string, opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv },
+): Promise<Pick<CiNotRun, 'budgets' | 'unreadable' | 'headroom'>> {
+  const owner = repo.split('/')[0];
+  const path = `organizations/${owner}/settings/billing/budgets`;
+  const listed = await ghApi(path, opts);
+  if (!listed.ok) return { unreadable: `${path}: ${listed.why}` };
+  const all = (listed.json as { budgets?: GhBudget[] } | null)?.budgets;
+  if (!Array.isArray(all)) return { unreadable: `${path}: no budgets in the answer` };
+  const actions = (b: GhBudget) => /actions/i.test(JSON.stringify([b.budget_product_sku, b.budget_product_skus, b.budget_type]));
+  const mine = all.filter((b) => actions(b) && (
+    (b.budget_scope === 'repository' && (b.budget_entity_name === repo || b.budget_entity_name === repo.split('/')[1]))
+    || b.budget_scope === 'organization'));
+  mine.sort((a, b) => (a.budget_scope === 'repository' ? 0 : 1) - (b.budget_scope === 'repository' ? 0 : 1));
+  const budgets: CiBudget[] = [];
+  for (const b of mine.slice(0, 2)) {
+    let consumed = Number(b.consumed_amount);
+    if (!Number.isFinite(consumed) && typeof b.id === 'string' && /^[\w-]+$/.test(b.id)) {
+      const one = await ghApi(`${path}/${b.id}`, opts);
+      consumed = one.ok ? Number((one.json as GhBudget | null)?.consumed_amount) : Number.NaN;
+    }
+    const amount = Number(b.budget_amount);
+    if (!Number.isFinite(consumed) || !Number.isFinite(amount)) continue;
+    budgets.push({
+      scope: b.budget_scope === 'repository' ? 'repository' : 'organization',
+      name: b.budget_scope === 'repository' ? repo : owner,
+      amount, consumed, stops: b.prevent_further_usage === true,
+    });
+  }
+  if (!budgets.length) return { unreadable: `${path}: no Actions budget with a consumed amount names ${repo}` };
+  const stopping = budgets.filter((b) => b.stops);
+  return { budgets, ...(stopping.length ? { headroom: stopping.every((b) => b.consumed < b.amount) } : {}) };
+}
+
+/** The sentence a refused run's row carries — the brief, the card and the journal all read it. */
+export function notRunDetail(notRun: CiNotRun, landed = false): string {
+  const jobs = `${notRun.jobs} job${notRun.jobs === 1 ? '' : 's'}`;
+  if (landed) return `not-run (billing) — the Actions budget has room again (${budgetClause(notRun)}): re-run the failed jobs`;
+  if (notRun.headroom === true) {
+    return `not-run (billing): GitHub did not start ${jobs}, though ${budgetClause(notRun)} — `
+      + 'the account\'s payment method or spending limit is the likelier cause';
+  }
+  return `not-run (billing): GitHub did not start ${jobs} — ${budgetClause(notRun)}`;
+}
+
+/** `gh run rerun <id> --repo <repo> --failed` — the act that follows the room. */
+export function rerunCommand(notRun: Pick<CiNotRun, 'run' | 'repo'>): string {
+  return `gh run rerun ${notRun.run} --repo ${notRun.repo} --failed`;
+}
+
+/**
+ * The ONE errand a refused run files on its phase: what GitHub refused, the
+ * budget as read, where to raise it, and what happens after — the watch sees
+ * the room and resumes the phase to re-run the failed jobs.
+ */
+export function ciRefusedErrand(notRun: CiNotRun, ref: string): { need: string; how: string } {
+  const owner = notRun.repo.split('/')[0];
+  const why = notRun.headroom === true
+    ? `${budgetClause(notRun)}, so the budget is not what stopped it — the account's payment method or spending limit is`
+    : budgetClause(notRun);
+  return {
+    need: `GitHub Actions refused to start the jobs of ${ref} (${notRun.repo}): "${notRun.annotation.slice(0, 160)}" — ${why}.`,
+    how: notRun.headroom === true
+      ? `Fix the account's payment method or spending limit (https://github.com/organizations/${owner}/settings/billing), `
+        + `then re-run the failed jobs: ${rerunCommand(notRun)} — the watch follows the new attempt.`
+      : `Raise the Actions budget (https://github.com/organizations/${owner}/settings/billing/budgets; read it with `
+        + `gh api organizations/${owner}/settings/billing/budgets). The watch sees the room and resumes the phase to re-run `
+        + `the failed jobs (${rerunCommand(notRun)}); it follows the new attempt on the same ref.`,
+  };
 }
 
 /* ------------------------------------------------------------------ *

@@ -13,7 +13,7 @@ All eight capability switches are off unless named. Flags are read once, at star
 | `--allow-accounts` | Register Claude accounts and choose one per run. The usage meters need no flag. |
 | `--allow-mcp` | Register MCP servers, hold their credentials, and attach them to plans and phases. *Reading* the registry, the statuses and the catalog needs no flag. |
 | `--allow-webhooks` | POST every announcement this console makes to URLs you register — Slack, Discord, Telegram, your own relay. Off means no outbound request is made at all, whatever is registered. *Reading* the destination list needs no flag. The payload schema and the Slack/Discord/Telegram recipes are in [docs/webhooks.md](https://github.com/phased-execution-public/phase-console/blob/main/docs/webhooks.md) — a link rather than a path, because a packaged copy ships no `docs/` directory. |
-| `--allow-publish` | Push `pe/*` branches (never a trunk, never with force) and file issues, where a plan's `permission.destructive` row and `Issues:` line allow it. Off means no push and no issue, ever; a `Land: pr` landing parks with the reason. |
+| `--allow-publish` | Push `pe/*` branches (never a trunk, never with force), where a plan's `permission.destructive` row allows it. Off means no push, ever; a `Land: pr` landing parks with the reason. |
 | `--port <n>` / `-p` | Pin a port instead of deriving one from the repository path. Never probed past. |
 | `--host <addr>` | The bind address. Defaults to `127.0.0.1` and there is no good reason to change it — see **Mobile setup**. |
 | `--no-open` | Do not open a browser on start. `PHASE_CONSOLE_NO_OPEN=1` does the same. |

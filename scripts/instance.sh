@@ -119,6 +119,25 @@ pe_docs_root() {
   git rev-parse --show-toplevel 2>/dev/null || pwd
 }
 
+# pe_outer_checkout [dir] → the OUTERMOST checkout holding <dir> (default: the
+# cwd) on stdout: its git toplevel, walked outward one superproject at a time —
+# the run root a session's relative paths mean (`phase-outcome.sh … verified
+# --in`, control-tower phase 106, #196). Unlike `pe_docs_root` it never steps
+# from a linked worktree to its main tree and never reads $DOCS_ROOT: a run's
+# mirror is a linked worktree of the hub, and it is the mirror the console
+# judges a line in. Exit 1 outside a git working tree.
+pe_outer_checkout() {
+  local r up
+  r="$(git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$r" ] || return 1
+  while :; do
+    up="$(git -C "$r" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+    [ -n "$up" ] && [ "$up" != "$r" ] || break
+    r="$up"
+  done
+  printf '%s' "$r"
+}
+
 # pe_instance_root → the repository root this session is working in
 pe_instance_root() {
   pe_path_resolve "$(pe_docs_root)"

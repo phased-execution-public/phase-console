@@ -693,7 +693,7 @@ test('RS-6: resume on a settled pause relaunches the run with its own settings, 
   }
 });
 
-test('RS-6: a pause still being reached is taken back on the live loop; anything that is not a pause is refused, naming Continue', async () => {
+test('RS-6: a pause still being reached is taken back on the live loop; a STOPPED run is continued with its own settings (#176); a finished one is refused', async () => {
   const root = scratch();
   const svc = service(root);
   try {
@@ -714,20 +714,39 @@ test('RS-6: a pause still being reached is taken back on the live loop; anything
     assert.equal(starts.length, 0, 'the loop never stopped — nothing to relaunch');
 
     // No loop behind a `pausing` record (its console went away mid-pause):
-    // the read path calls that `interrupted`, and an interrupted run is
-    // Continue's — refused by name, never flipped to a `running` nobody drives.
+    // the read path calls that `interrupted`, and since control-tower phase
+    // 110 (#176) Resume continues it through the one door — never a status
+    // flipped to a `running` nobody drives.
     runners.delete('alpha');
-    parkedRun(root, (state) => { state.status = 'pausing'; });
+    const interrupted = parkedRun(root, (state) => { state.status = 'pausing'; });
     const orphaned = await call(svc, '/api/run/alpha/resume', {});
-    assert.equal(orphaned.status, 409, JSON.stringify(orphaned.body));
-    assert.match(String(orphaned.body.error), /interrupted; Continue brings it back/);
+    assert.equal(orphaned.status, 200, JSON.stringify(orphaned.body));
+    assert.deepEqual(orphaned.body.resumed, { runId: interrupted.id, from: 'interrupted', act: 'relaunched' });
 
-    // A parked run is not Resume's either.
-    parkedRun(root);
+    // A parked run is continued the same way, naming nothing but the run: the
+    // supervisor's remedy for a parked run with ready work pressed this verb,
+    // and every press was refused while the run sat for 6.6 hours.
+    const parked = parkedRun(root);
+    const continued = await call(svc, '/api/run/alpha/resume', {});
+    assert.equal(continued.status, 200, JSON.stringify(continued.body));
+    assert.deepEqual(continued.body.resumed, { runId: parked.id, from: 'parked', act: 'relaunched' });
+    assert.deepEqual(starts.map((start) => start.resumeRunId), [interrupted.id, parked.id]);
+    for (const field of ['autonomy', 'permissionProfile', 'onlyPhases', 'accountId', 'onLimit']) {
+      assert.equal(starts[1]![field], undefined, `resume said ${field} for the run`);
+    }
+
+    // A finished run is not Resume's: refused by name, nothing started. (The
+    // runs above are finished first — the latest run is the newest unfinished.)
+    for (const id of [live.id, interrupted.id, parked.id]) {
+      const stored = loadRun(root, 'alpha', id, null)!;
+      stored.status = 'finished';
+      saveRun(stored);
+    }
+    parkedRun(root, (state) => { state.status = 'finished'; });
     const refused = await call(svc, '/api/run/alpha/resume', {});
     assert.equal(refused.status, 409);
-    assert.match(String(refused.body.error), /No pause of alpha .* parked; Continue brings it back/);
-    assert.equal(starts.length, 0, 'nothing was started for a refusal');
+    assert.match(String(refused.body.error), /No pause of alpha .* its run is finished\./);
+    assert.equal(starts.length, 2, 'nothing was started for a refusal');
   } finally {
     svc.close();
   }

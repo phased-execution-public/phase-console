@@ -26,6 +26,11 @@
  * — a Claude session stopped at its own terminal prompt has no action at all,
  * because the console genuinely cannot answer for it.
  *
+ * **And, after it, what is coming.** An act declared before it is due
+ * (control-tower phase 121, #182) is listed below the cards under *Coming
+ * up*, as the card's row: what it waits on and the command to copy. It is no
+ * card of its own because nothing on it can be done yet.
+ *
  * **No triage keyboard, no filters, no grouping.** All three are Now's, and
  * all three assume a keyboard and a scroll wheel.
  *
@@ -49,6 +54,7 @@ import type { InboxAction, InboxItem } from '@/lib/api';
 import { MicField } from './mic-field';
 import { HaltCategoryMark } from '@/components/halt-mark';
 import { HumanStepCard } from '@/components/human-step-card';
+import { isUpcomingItem } from '@/components/human-step-words';
 import { useRoute } from '@/app/router';
 
 /**
@@ -81,7 +87,14 @@ export default function ApprovePage() {
     const at = list.findIndex((item) => item.humanStep?.stepId === focus);
     return at > 0 ? [list[at]!, ...list.slice(0, at), ...list.slice(at + 1)] : list;
   }, [data, focus]);
-  const focusGone = Boolean(focus && data && !items.some((item) => item.humanStep?.stepId === focus));
+  // The acts not due yet (control-tower phase 121): after everything that is.
+  const upcoming = useMemo(() => (data?.items ?? []).filter(isUpcomingItem), [data]);
+  const focusGone = Boolean(
+    focus &&
+    data &&
+    !items.some((item) => item.humanStep?.stepId === focus) &&
+    !upcoming.some((item) => item.humanStep?.stepId === focus),
+  );
   const waiting = (data?.items ?? []).filter((item) => item.severity !== 'fyi' && !item.ack).length;
 
   if (isLoading) {
@@ -164,6 +177,26 @@ export default function ApprovePage() {
           {waiting - items.length} more need a person but cannot be answered from this console — open it to
           see them.
         </p>
+      )}
+
+      {upcoming.length > 0 && (
+        <section aria-label="Coming up" data-testid="approve-coming-up" className="flex flex-col gap-2 pt-2">
+          <h2 className="text-sm font-medium text-ink">Coming up</h2>
+          <p className="text-2xs text-ink-muted">
+            Not yours yet. Each one becomes due, with one notification, when what it waits on lands.
+          </p>
+          <ul className="flex list-none flex-col gap-2 p-0">
+            {upcoming.map((item) => (
+              <li
+                key={item.id}
+                data-testid="approve-upcoming"
+                className="rounded-lg border border-dashed border-rule-strong bg-surface p-3"
+              >
+                <HumanStepCard item={item} variant="row" perform={perform} {...(busy ? { busy } : {})} />
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
     </div>
   );

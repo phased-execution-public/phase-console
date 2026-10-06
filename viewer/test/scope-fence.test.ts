@@ -170,12 +170,15 @@ type Loose = Record<string, unknown>;
 /**
  * Every announcement the console makes goes through `announce` — record them.
  * Except the docs watcher's "Plans changed", which fires on its own debounce
- * after the root opens and says nothing about any phase.
+ * after the root opens and says nothing about any phase, and the meters'
+ * `usage-climbing`: a real Service polls the machine login's own usage, so a
+ * meter past its threshold announces whenever a poll lands inside a test
+ * (control-tower phase 123 — SF-5 met the operator's weekly meter at 100 %).
  */
 function announcements(svc: Svc): Array<{ category: string; title: string; phase: number | null }> {
   const out: Array<{ category: string; title: string; phase: number | null }> = [];
   (svc as never as Loose).announce = (category: string, message: { title: string }, context: { phase?: number | null } = {}) => {
-    if (category === 'changed') return;
+    if (category === 'changed' || category === 'usage-climbing') return;
     out.push({ category, title: message.title, phase: context.phase ?? null });
   };
   return out;

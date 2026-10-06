@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
+import { EXTERNAL_PARK_GRACE_MS } from '../server/runner/runner-core.ts';
 import { owesVerification } from '../server/runner/state.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
 
@@ -147,6 +148,10 @@ test('CK-4: a watchdog park whose condition cannot succeed as a watch — the se
     await held.inSession;
     held.say(call('var', 'until grep -q "ios done" "$L" 2>/dev/null; do sleep 2; done'));
     c.wind(46 * MINUTE);
+    await instance.tickLiveness();
+    // An external wait is nudged first and parked once the grace after the
+    // nudge has passed with the call still open (control-tower phase 111, #179).
+    c.wind(EXTERNAL_PARK_GRACE_MS);
     await instance.tickLiveness();
     const record = instance.current()!.phases['1'];
     assert.deepEqual(record.watch ?? [], [], 'no ref armed that could never land');

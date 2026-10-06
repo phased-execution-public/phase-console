@@ -61,18 +61,8 @@ test('the round-trip is lossless for all forty', () => {
 
 test('the groups are the ones the plan named, and nothing is stranded', () => {
   const object = toAutomation(FLAT);
-  assert.deepEqual(Object.keys(object).sort(), [
-    'accounts',
-    'caps',
-    'defaults',
-    'git',
-    'mcp',
-    'policy',
-    'recover',
-    'schedule',
-    'stall',
-    'watch',
-  ]);
+  const groups = ['accounts', 'caps', 'defaults', 'git', 'mcp', 'policy', 'recover', 'schedule', 'stall', 'watch'];
+  assert.deepEqual(Object.keys(object).sort(), groups);
   // The schedule is the one group that IS its value rather than a bag of
   // scalars — it is coerced by `sanitiseSchedule` beside the rules it has to
   // agree with, and splitting it would put its shape in two places.

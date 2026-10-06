@@ -9,7 +9,8 @@
  * one action on each is the strip's, chosen by that bay.
  *
  * - **Needs you** also carries the inbox rows no strip draws — an ask about a
- *   plan, a gate, a sign-in — with the inbox's own verbs (`InboxRow`).
+ *   plan, a gate, a sign-in — with the inbox's own verbs (`InboxRow`) — and,
+ *   last and uncounted, *Coming up*: the acts not due yet (phase 121).
  * - **Waiting** and **Queued** say what each run waits on, on the strip
  *   itself (`waits.ts`): a hold, a scope fence and its refs, a folded errand,
  *   the queue's holder — a sibling run's branch included.
@@ -131,12 +132,21 @@ export function TowerBays({
       return <SettledBody runs={model.bays.settled} allowRun={allowRun} focused={focus === bay} />;
     const runs = model.bays[bay];
     const loose = bay === 'needs-you' ? model.loose : [];
-    if (!runs.length && !loose.length && !(bay === 'queued' && queuedHead)) return null;
+    const upcoming = bay === 'needs-you' ? model.upcoming : [];
+    if (!runs.length && !loose.length && !upcoming.length && !(bay === 'queued' && queuedHead)) return null;
     return (
       <>
         {bay === 'queued' && queuedHead}
         {runs.length > 0 && <Strips runs={runs} allowRun={allowRun} />}
         {loose.length > 0 && <LooseRows items={loose} />}
+        {/* The acts not due yet (control-tower phase 121, #182): last, uncounted, each the
+            card's row with what it waits on and the command to copy. */}
+        {upcoming.length > 0 && (
+          <section data-testid="coming-up">
+            <h3 className="mb-1.5 text-xs text-ink-muted">Coming up</h3>
+            <LooseRows items={upcoming} />
+          </section>
+        )}
       </>
     );
   }

@@ -1826,9 +1826,11 @@ test('a gate raises a row only when a PERSON must clear it', () => {
   // needs to perform.
   assert.deepEqual(rows(gatedPlan({}, { gateKind: 'ai', gate: { clear: false, kind: 'ai' } })), []);
 
-  // A DELEGATED human gate is the same case by the operator's own standing
-  // decision (Settings ▸ Automation), which is off by default and explicit.
-  assert.deepEqual(rows(gatedPlan({ gatesDelegated: true })), []);
+  // A MANUAL gate is never subtracted as "delegated" (control-tower phase 107,
+  // #174): it is a person's whatever the plan's `gates` row or the console's
+  // switch answers, and an unattended session that cleared one changed
+  // production data. A plan carrying the old flag still asks.
+  assert.equal(rows(gatedPlan({ gatesDelegated: true })).length, 1, "a manual gate is a person's, delegated or not");
 
   // Already approved: `gate-approve.sh` wrote the row and the engine reads it.
   assert.deepEqual(rows(gatedPlan({}, { gate: { clear: false, kind: 'human', approved: true } })), []);
@@ -2299,12 +2301,15 @@ test('a pending-approval draft is a needs-you row with Approve, Discard and two 
   assert.equal(row.actions[3].says?.field, 'body');
 });
 
-test('with --allow-publish off the Approve action carries the flag and the row says so', () => {
+test('with the filing flag off the Approve action carries the flag and the row says so', () => {
   const { items } = buildInbox({ issueDrafts: [DRAFT], flags: {}, acks: {} }, NOW);
   const [row] = items;
-  assert.equal(row.actions[0].flag, 'publish');
+  // The flag Approve needs: `--allow-publish` in a free tree, and since
+  // control-tower phase 115 the narrower `--allow-issues` (which publish implies).
+  let flag = 'publish';
+  assert.equal(row.actions[0].flag, flag);
   assert.equal(row.actions[1].flag, undefined, 'Discard needs no capability');
-  assert.match(row.how, /--allow-publish/);
+  assert.match(row.how, new RegExp(`--allow-${flag}`));
 });
 
 test('a comment and a close draft name their number; a close held for the landing is fyi with Discard alone', () => {

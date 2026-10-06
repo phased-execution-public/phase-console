@@ -469,3 +469,35 @@ test('a done record\'s QA-round marker is cleared on read when no child holds wo
     assert.equal(state.phases['12'].qaSession?.round, 1, 'a review whose process is alive is still a review');
   } finally { live.restore(); dir.cleanup(); }
 });
+
+/* ------------------------------------------------------------------ *
+ * A run parked `unlanded` is not over because its board is (phase 112, #184)
+ * ------------------------------------------------------------------ */
+
+test('SL-1 (read path): a run parked `unlanded` stays parked over a board reading every phase done', async () => {
+  // The park's whole point is that the BOARD is not what is outstanding: every
+  // phase is done, and the run's branch is still not on `origin/main`. The
+  // read-path settle that turns a stopped run with a finished board into
+  // `finished` would undo it on the next page view — `finished` with nothing
+  // outstanding, the exact claim #184 measured as false.
+  const { autoResolveRun, resolveRunsAgainst, settleFinishedRun } = await import('../server/runner/state.ts');
+  const dir = scratchRoot();
+  try {
+    const state = newRun({ slug: 'demo', root: dir.root });
+    state.status = 'parked';
+    state.stoppedBy = 'system';
+    for (const phase of [1, 2]) phaseRecord(state, phase).status = 'done';
+    state.halt = { at: new Date().toISOString(), kind: 'unlanded', reason: 'pe/demo conflicts with main in docs/closeout.md' };
+    const board = { 1: 'done', 2: 'done' };
+    assert.equal(settleFinishedRun(state, board), false);
+    assert.equal(autoResolveRun(state, board), false);
+    assert.deepEqual(resolveRunsAgainst([state], new Map([['demo', board]])), []);
+    assert.equal(state.status, 'parked');
+    assert.equal(state.halt?.kind, 'unlanded');
+    assert.equal(state.resolved ?? null, null);
+    // …while the same park of any other kind still settles exactly as before.
+    state.halt = { at: new Date().toISOString(), kind: 'nothing-ready', reason: 'nothing is ready' };
+    assert.equal(settleFinishedRun(state, board), true);
+    assert.equal(state.status, 'finished');
+  } finally { dir.cleanup(); }
+});

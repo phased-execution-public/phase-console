@@ -153,7 +153,11 @@ test('UP-3: against the console’s distRev — the same commit is ok, another c
   assert.equal(row.status, 'fail');
   assert.equal(report.ok, true);
   const ids = report.rows.map((r) => r.id);
-  assert.equal(ids.indexOf('skill'), ids.indexOf('hooks') + 1, 'beside the other half of the Claude Code wiring');
+  // Beside the other half of the Claude Code wiring: the hooks, then the hooks'
+  // reach on every account (`presence`, control-tower phase 108, #194), then
+  // the skill copy.
+  const hooks = ids.indexOf('hooks');
+  assert.deepEqual(ids.slice(hooks, hooks + 3), ['hooks', 'presence', 'skill'], 'beside the other half of the Claude Code wiring');
   assert.equal((await doctorReport(doctorDeps())).rows.find((r) => r.id === 'skill')?.status, 'skip',
     'a deps builder that cannot read the copies says so');
 });

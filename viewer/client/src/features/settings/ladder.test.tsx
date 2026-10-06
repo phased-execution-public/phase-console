@@ -102,7 +102,9 @@ describe('<LadderCard>', () => {
     // the exact thing the console exists to remove. Since 5.0.0 it ships ON
     // (`gates: delegated`), so the row reads "On" and a click turns it off.
     await mount({});
-    const label = screen.getByText('Let a session clear a human gate');
+    // Since control-tower phase 107 (#174) it reaches only an overdue gate: a
+    // manual one is a person's whatever it says, and the label says so.
+    const label = screen.getByText('Let a session clear an overdue gate');
     const row = label.closest('div')!;
     const toggle = within(row).getByRole('button', { name: 'On' });
     expect(toggle.getAttribute('aria-pressed')).toBe('true');

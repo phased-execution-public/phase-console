@@ -163,8 +163,20 @@ function rawContentRead(argv: { file: string; args: string[] }): boolean {
     && argv.args.every((a) => !API_WRITE_FLAGS.includes(a));
 }
 
+/**
+ * The CI-refusal probe's reads (control-tower phase 111, #166): a run's jobs, a
+ * job's annotations and the Actions budgets, read when GitHub may never have
+ * started the run. GETs that say so with the JSON `Accept` header, in
+ * `watch-refs.ts` alone, carrying none of the flags that turn `api` into a write.
+ */
+const JSON_ACCEPT = 'Accept: application/vnd.github+json';
+function jsonRead(argv: { file: string; args: string[] }): boolean {
+  return argv.file === RAW_READ_FILE && argv.args[0] === 'api' && argv.args.includes(JSON_ACCEPT)
+    && argv.args.every((a) => !API_WRITE_FLAGS.includes(a));
+}
+
 function allowed(argv: { file: string; args: string[] }): boolean {
-  if (rawContentRead(argv)) return true;
+  if (rawContentRead(argv) || jsonRead(argv)) return true;
   const lists: string[][] = [...ALLOWED_GH];
   return lists.some(([head, verb]) => argv.args[0] === head && argv.args[1] === verb);
 }
@@ -203,7 +215,7 @@ test('the scanner is looking at the real server, not at nothing', () => {
   assert.ok(GH_ARGVS.length >= 4, `only ${GH_ARGVS.length} gh argv literals found — is the scan reaching them?`);
 });
 
-test('every gh argument list in viewer/server is one of the READ verbs — or the writer\'s own three, in the writer alone', () => {
+test('every gh argument list in viewer/server is one of the READ verbs — or the writer\'s own, in the writer alone', () => {
   const offences = GH_ARGVS
     .filter((argv) => !allowed(argv))
     .map((argv) => `${argv.file}:${argv.line} ${JSON.stringify(argv.args)}`);
@@ -226,17 +238,27 @@ test('every gh argument list in viewer/server is one of the READ verbs — or th
     'a server file outside the named set spawns gh — name it here, deliberately');
 });
 
-test('no writing gh subcommand appears in any file that spawns gh — the writer excepted, for its three verbs only', () => {
+test('no writing gh subcommand appears in any file that spawns gh — the writer excepted, for its own verbs only', () => {
   // Belt to the allow-list's braces. It catches a write reached by a shape the
   // head check cannot see — `['issue', verb]` with `verb` computed, say, whose
   // literal `'close'` would still be sitting in some array nearby.
   const banned = new Set(WRITE_VERBS);
   const offences = GH_ARGVS
     .filter((argv) => argv.args.some((a) => banned.has(a)))
-    .filter((argv) => !rawContentRead(argv))
+    .filter((argv) => !rawContentRead(argv) && !jsonRead(argv))
     .map((argv) => `${argv.file}:${argv.line} ${JSON.stringify(argv.args)}`);
 
   assert.deepEqual(offences, [], 'a writing gh subcommand reached an argument list');
+});
+
+test('the CI probe\'s JSON read is admitted in watch-refs.ts alone, and never with a write flag', () => {
+  const read = "shell('gh', ['api', path, '-H', 'Accept: application/vnd.github+json'], opts);";
+  assert.ok(allowed(argvLiterals(read, 'watch-refs.ts')[0]!), 'the probe\'s own GET passes');
+  assert.ok(!allowed(argvLiterals(read, 'issues/fetch.ts')[0]!), 'the allowance does not travel');
+  const post = "shell('gh', ['api', path, '-X', 'POST', '-H', 'Accept: application/vnd.github+json'], opts);";
+  assert.ok(!allowed(argvLiterals(post, 'watch-refs.ts')[0]!), 'a method flag makes it a write');
+  const field = "shell('gh', ['api', path, '-f', 'state=closed', '-H', 'Accept: application/vnd.github+json'], opts);";
+  assert.ok(!allowed(argvLiterals(field, 'watch-refs.ts')[0]!), 'so does a field');
 });
 
 
@@ -295,4 +317,17 @@ test('the scanner can FAIL — the same rules against sources that break them', 
 
   assert.deepEqual(argvLiterals("const handler = verbs['close'];"), [],
     'reading a property named close executes nothing');
+});
+
+test('the whole-list read stays a LIST: no field that answers a body rides it (control-tower phase 118)', async () => {
+  // Phase 118 reads a repository's whole list — up to two thousand issues in
+  // one `gh issue list` — so the fields are the read gate's second half: a
+  // field that answers every body (or every comment's) would turn a list into
+  // a library, and a body stays one `issue view` each, on demand.
+  const { ISSUE_LIST_FIELDS, ISSUE_LIST_CAP } = await import('../server/issues/fetch.ts');
+  const fields = ISSUE_LIST_FIELDS.split(',');
+  for (const heavy of ['body', 'comments', 'reactionGroups', 'projectItems', 'closedByPullRequestsReferences']) {
+    assert.ok(!fields.includes(heavy), `${heavy} must not ride the list call`);
+  }
+  assert.ok(ISSUE_LIST_CAP >= 2000);
 });

@@ -1059,6 +1059,10 @@ describe('a table says whether it scrolls', () => {
       'the checkout roles — shared/worktree-model.js CHECKOUT_ROLES, painted by OpsBadge (`checkout-role`)',
     'features/repo/checkouts.tsx:state':
       'the presence words `live` / `ended` by OpsBadge, and the literal words `prunable` / `managed`',
+    'features/repo/issues.tsx:category':
+      'the issue categories — shared/issues-model.js ISSUE_CATEGORIES, painted by OpsBadge (`issue-category`)',
+    'features/repo/issues.tsx:severity':
+      'the issue severities — shared/issues-model.js ISSUE_SEVERITY_WORDS, painted by OpsBadge (`issue-severity`)',
     'features/repo/issues.tsx:state': 'a fetch reason, or the literal words `no issues` / `open` / `closed`',
     'features/repo/settles.tsx:kind':
       'the settle kinds — shared/worktree-model.js SETTLE_KINDS, painted by OpsBadge (`settle`)',

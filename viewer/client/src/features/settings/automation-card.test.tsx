@@ -179,4 +179,5 @@ describe('phase 15 — the launch defaults and the eighth flag', () => {
     // There is no control: a start flag is changed at the start command.
     expect(screen.queryByRole('button', { name: /allow-publish/ })).toBeNull();
   });
+
 });

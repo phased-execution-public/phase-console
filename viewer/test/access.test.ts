@@ -355,7 +355,7 @@ test('a real console refuses to start on a wide bind with a capability flag', as
   assert.match(stderr, /--allow-run/);
 });
 
-async function waitFor(port: number, tries = 100): Promise<boolean> {
+async function waitFor(port: number, tries = 1200): Promise<boolean> { // ~60 s: a console boot outran a 10 s window at load 60 (control-tower phase 116)
   for (let i = 0; i < tries; i++) {
     try { if ((await http(port, '/api/state')).status === 200) return true; } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 50));

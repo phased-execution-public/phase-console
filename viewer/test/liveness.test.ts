@@ -19,6 +19,7 @@ import {
   applyEvent, attemptSignals, evaluateStall, livenessOf, newLaneSignals, noteWaitDenied, oldestOpenTool, stallThresholds,
   type LaneSignals,
   mintWatchRef, WATCH_ONESHOT_LEADS, waitScope,
+  clockLoop, knownEndOf, ownBackgroundWork,
 } from '../server/runner/liveness.ts';
 import { VERIFY_ENV_FALLBACK } from '../server/runner/verify-env.ts';
 import {
@@ -801,6 +802,41 @@ test('waitScope: a loopback URL, a local git probe and an announced pid are the 
   assert.equal(waitScope('until ! kill -0 4242; do sleep 5; done'), 'external');
   assert.equal(waitScope('until ! ps -p 4242 && ! ps -p 77; do sleep 5; done', { ownPids: [4242] }), 'external',
     'one pid it did not start is a wait on somebody else');
+});
+
+test('waitScope (control-tower phase 111, #179): a loop on nothing but the clock is the session timing itself', () => {
+  // Its condition reads the time and nothing else, and its body only paces.
+  assert.equal(clockLoop('until [ "$(date +%s)" -ge "$target" ]; do sleep 5; done'), true);
+  assert.equal(clockLoop('while (( SECONDS < 600 )); do sleep 10; done'), true);
+  assert.equal(clockLoop('until [[ $EPOCHSECONDS -ge $end ]]; do echo waiting; sleep 1; done'), true);
+  // Another substitution in the condition reads something besides the clock,
+  // and a body that does work is a poll, whatever bounds it.
+  assert.equal(clockLoop('until [ "$(date +%s)" -ge "$(cat /tmp/deadline)" ]; do sleep 5; done'), false);
+  assert.equal(clockLoop('until [ "$(date +%s)" -ge "$t" ]; do gh run view 1 --json status; sleep 30; done'), false);
+  assert.equal(clockLoop('until curl -sf https://ci.example.invalid/; do sleep 5; done'), false);
+  // What follows `done` is what it does once the time comes, not what it waits on.
+  assert.equal(waitScope('until [ "$(date +%s)" -ge "$t" ]; do sleep 5; done; gh run view 1'), 'local');
+});
+
+test('knownEndOf (#179): a clock loop is bounded by the instant its target names, and by nothing it would have to guess', () => {
+  const target = '2026-10-01T07:54:40Z';
+  const loop = `t=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' '${target}' +%s); until [ "$(date +%s)" -ge "$t" ]; do sleep 5; done`;
+  const before = Date.parse(target) - 30 * 60_000;
+  assert.equal(knownEndOf(loop, before), Date.parse(target));
+  assert.equal(knownEndOf(loop, Date.parse(target) + 1000), null, 'a target already passed bounds nothing');
+  assert.equal(knownEndOf('until [ "$(date +%s)" -ge "$t" ]; do sleep 5; done', before), null, 'no instant named, none guessed');
+  assert.equal(knownEndOf(`until gh run view 1 | grep -q ${target}; do sleep 5; done`, before), null,
+    'a timestamp inside a poll is not when the poll ends');
+});
+
+test('ownBackgroundWork (#206): the session\'s own background tasks, never a subagent\'s', () => {
+  const tasks = [
+    { id: 'b1', taskType: 'local_bash', description: 'release preflight', since: 1 },
+    { id: 'a1', taskType: 'local_agent', ownedBySubagent: true, since: 2 },
+    { id: 'm1', taskType: 'local_bash', tool: 'Monitor', since: 3 },
+  ];
+  assert.deepEqual(ownBackgroundWork({ backgroundTasks: tasks }).map((task) => task.id), ['b1', 'm1']);
+  assert.deepEqual(ownBackgroundWork({ backgroundTasks: [] }), []);
 });
 
 test('the pids a session announces with $! are remembered on its lane, and nothing else is', () => {

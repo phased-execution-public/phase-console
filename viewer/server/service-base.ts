@@ -76,6 +76,7 @@ import { pollableRefs, probeWatchRef } from './watch-refs.ts';
 import { hintedPhases, runEndedBadly, runResumable, type HintedPhase, type ResumeTrigger } from '../shared/run-lifecycle.js';
 import { WatchScheduler, phaseDoneOf, type WatchLandingOutcome } from './watch-scheduler.ts';
 import { VerifyWatch, type VerifyLookup } from './verify-watch.ts';
+import { UnitProber } from './watch-unit.ts';
 import { proofsFile, readProofs } from './runner/proofs.ts';
 import { answerDeclaredProbe, DECLARED_PROBE_BUDGET_MS, type DeclaredProbeAnswer } from './declared-probe.ts';
 import type { WatchState as WatchStateView } from './watch-refs.ts';
@@ -406,6 +407,7 @@ import {
 } from './runner/auth.ts';
 import { Accounts, DEFAULT_ACCOUNT_ID, type AccountView, type RunIdentity } from './accounts/index.ts';
 import { ConnectivityProbe } from './connectivity-probe.ts';
+import { CostDrift } from './runner/usage.ts';
 import { HEALTH_TTL_MS, Mcp, type McpServerView } from './mcp/index.ts';
 import { IDLE_POLL_MS as ISSUES_SWEEP_MS } from './issues/fetch.ts';
 import {
@@ -417,6 +419,7 @@ import {
   type RetentionReport,
 } from './retention.ts';
 import { IssuesStore, type IssueProvenance } from './issues/index.ts';
+import { planFixesLookup } from './issues/fixes.ts';
 import { pruneMcpConfigs } from './mcp/config.ts';
 import { pruneSettingsFiles, tokenFromSettingsFile, type Approval, type ApprovalEvent, type ManifestCheck } from './runner/approvals.ts';
 import { assertTranscriptLayout, cliVersion, portTranscript } from './accounts/transcripts.ts';
@@ -832,6 +835,11 @@ export abstract class ServiceBase {
     phase: number,
     landed: WatchStateView,
   ): Promise<WatchLandingOutcome>;
+  /**
+   * A watched run GitHub refused to start (control-tower phase 111, #166) —
+   * the healer files the phase's ONE errand naming the budget.
+   */
+  protected abstract onCiNotRun(slug: string, state: RunState, phase: number, verdict: WatchStateView): void;
   abstract maybeAutoRecover(slug: string, pass?: { trigger?: string; fingerprint?: string }): Promise<AutoRecoverResult>;
   protected abstract mcpRequireTimeoutMs(): number;
   protected abstract onChange(paths: string[]): void;
@@ -1072,7 +1080,9 @@ export abstract class ServiceBase {
       if (!plan?.phased) continue;
       plans.set(record.slug, plan);
       let stored: ReturnType<typeof listRuns> = [];
-      try { stored = listRuns(root, record.slug); } catch { continue; }
+      // The live set, always (control-tower phase 110, #175): read without it,
+      // every run this console drove was reconciled as abandoned — once an hour.
+      try { stored = listRuns(root, record.slug, this.liveRunIds()); } catch { continue; }
       for (const run of stored) {
         const touched = Date.parse(run.updatedAt ?? '');
         if (Number.isFinite(touched) && touched < since) continue;
@@ -1319,6 +1329,8 @@ export abstract class ServiceBase {
   readonly watchClock: WatchScheduler;
   /** The `verify:` scheme's oracle — a phase's red lines, re-run on a new head (control-tower phase 88). */
   readonly verifyWatch: VerifyWatch;
+  /** The `unit:` scheme's prober — one queue and one ssh master per host (control-tower phase 121). */
+  readonly unitProber = new UnitProber();
   /**
    * Settles when this `open()`'s boot work is done: queued runs re-adopted and
    * the convergence loop's boot pass over every plan complete. What a harness
@@ -1921,6 +1933,7 @@ export abstract class ServiceBase {
         saveRun(state);
       },
       onLanded: (slug, state, phase, landed) => this.onWatchLanded(slug, state, phase, landed),
+      onNotRun: (slug, state, phase, verdict) => this.onCiNotRun(slug, state, phase, verdict),
       fleetHold: () => this.fleetHold(),
       // A landed offer is HELD while its delivery is still being driven. The
       // healer holds the drive's own promise — which settles exactly when the
@@ -1960,6 +1973,8 @@ export abstract class ServiceBase {
       phaseDone: (slug, phase) => this.phaseDoneAnswer(slug, phase),
       // `verify:<slug>/<N>`: the declaring phase's red lines on a new head.
       verifyProbe: (target) => this.verifyWatch.probe(target),
+      // `unit:<host>/<unit>` (control-tower phase 121, #181): one ssh master per host.
+      unitProbe: (target) => this.unitProber.probe(target),
     });
     this.verifyWatch = new VerifyWatch({
       lookup: (slug, phase) => this.verifyLookup(slug, phase),
@@ -1982,6 +1997,16 @@ export abstract class ServiceBase {
       // Which plan filed a number (phase 12) — answered by the Pro half from
       // the plans' issue ledgers, `undefined` from this base and the free tree.
       provenance: (nameWithOwner, number) => this.issueProvenance(nameWithOwner, number),
+      // The desk's "planned in <slug> phase N" (control-tower phase 118): the
+      // phase whose `Fixes:` line names the issue, read off the plan store's
+      // own parse and re-indexed only when that plan's file moves.
+      fixes: planFixesLookup((slug) => {
+        const record = this.store?.get(slug);
+        return record?.plan ? { mtime: record.planMtime, phases: record.plan.phases } : undefined;
+      }),
+      // The repositories the operator added to the desk by `owner/name`
+      // (`prefs.issueRepos`) — read live, so an Add or a Remove is the next read.
+      added: () => this.prefs.issueRepos ?? [],
     });
     this.accounts = new Accounts({
       onChange: () => this.emitAccounts(),
@@ -2443,7 +2468,7 @@ export abstract class ServiceBase {
           slug: record.slug,
           liveRunIds: live,
           children: (runId) =>
-            childrenOf(loadRun(root, record.slug, runId) ?? ({ phases: {} } as RunState)).map(
+            childrenOf(loadRun(root, record.slug, runId, live) ?? ({ phases: {} } as RunState)).map(
               (child) => child.pid,
             ),
           probe: (pid) => pidHoldsWork(pid),
@@ -2452,13 +2477,13 @@ export abstract class ServiceBase {
           // whether it ended badly, which `keep-on-failure` asks. The boot
           // sweep passed neither before, so it read every run as clean and
           // every word as the shipped default.
-          retention: (runId) => loadRun(root, record.slug, runId)?.worktreeRetention ?? this.prefs.worktreeRetention,
-          failed: (runId) => runEndedBadly(loadRun(root, record.slug, runId)),
+          retention: (runId) => loadRun(root, record.slug, runId, live)?.worktreeRetention ?? this.prefs.worktreeRetention,
+          failed: (runId) => runEndedBadly(loadRun(root, record.slug, runId, live)),
           // 🔴 #94: this sweep runs BEFORE any runner re-registers, so `live` is
           // empty here by construction and "not live" read as "over" — a paused
           // run's clean mirror mounts went at every restart. The stored run is
           // the only witness that something will drive it again.
-          resumable: (runId) => runResumable(loadRun(root, record.slug, runId)),
+          resumable: (runId) => runResumable(loadRun(root, record.slug, runId, live)),
         });
         if (result.removed.length || result.kept.length || result.spared.length) {
           log.info('run.worktrees-swept', {
@@ -2787,7 +2812,7 @@ export abstract class ServiceBase {
     let repriced = 0;
     for (const plan of this.store?.list() ?? []) {
       let runs: ReturnType<typeof listRuns> = [];
-      try { runs = listRuns(root, plan.slug); } catch { continue; }
+      try { runs = listRuns(root, plan.slug, live); } catch { continue; }
       for (const state of runs) {
         if ((state.costModel ?? 1) >= COST_MODEL || live.has(state.id)) continue;
         try {
@@ -2832,7 +2857,7 @@ export abstract class ServiceBase {
     let remeasured = 0;
     for (const plan of this.store?.list() ?? []) {
       let runs: ReturnType<typeof listRuns> = [];
-      try { runs = listRuns(root, plan.slug); } catch { continue; }
+      try { runs = listRuns(root, plan.slug, live); } catch { continue; }
       for (const state of runs) {
         if ((state.clockModel ?? 1) >= CLOCK_MODEL || live.has(state.id)) continue;
         try {
@@ -2876,9 +2901,10 @@ export abstract class ServiceBase {
         runsDir: this.root?.ok ? consoleRunsDir(this.root.path) : null,
         live,
         // Kept run worktrees (#75): the `project` root's trees, and every
-        // tree's size as last measured off the loop.
+        // tree's size as last measured off the loop — never a new scan of a
+        // tree whose run is live (#171).
         projectWorktrees: this.root?.ok ? join(worktreesRoot(this.root.path), 'runs') : null,
-        treeBytes: (dir) => keptTreeBytes(dir, treeDisk),
+        treeBytes: (dir, facts) => keptTreeBytes(dir, (tree) => treeDisk(tree), { live: facts?.live ?? false }),
       }),
       loadPrefs().retention,
       Date.now(),
@@ -3440,6 +3466,9 @@ export abstract class ServiceBase {
   /** The reminder clock's pass (control-tower phase 43) — `ServiceRecovery.humanStepClockTick`. */
   protected abstract humanStepClockTick(now?: number): unknown;
 
+  /** The due pass over upcoming acts (control-tower phase 121) — `ServiceRecovery.humanStepDuePass`. */
+  protected abstract humanStepDuePass(now?: number): Promise<unknown>;
+
   /** An embedded terminal a human step opened has exited — its command's exit may prove the step. */
   protected abstract humanStepTerminalExited(id: string, code: number): Promise<unknown>;
 
@@ -3453,6 +3482,11 @@ export abstract class ServiceBase {
       try { this.humanStepClockTick(); } catch (error) {
         log.warn('human-steps.clock-failed', { error: (error as Error)?.message ?? String(error) });
       }
+      // Then the due pass (control-tower phase 121): it awaits probes, so it
+      // runs beside the tick, one at a time, and never throws into the clock.
+      this.humanStepDuePass().catch((error: unknown) => {
+        log.warn('human-steps.clock-failed', { error: (error as Error)?.message ?? String(error), pass: 'due' });
+      });
     }, HUMAN_STEP_CLOCK_MS);
     this.humanStepTimer.unref?.();
   }
@@ -3506,12 +3540,22 @@ export abstract class ServiceBase {
    * live session's lock under it. So an `ended` record with no identity whose
    * pid still runs reads `unknown` here — nobody vouches either way, and the
    * lease decides.
+   *
+   * Since control-tower phase 108 (#172) the registry calls a `/clear`ed id
+   * `ended` outright once its successor has started in the same process — the
+   * SESSION is over, and the queue must stop waiting on it. Its CLAIM is not:
+   * the person who cleared is still at that process, so while it runs the
+   * lease decides here exactly as it did before (PRS-1).
    */
   protected declarerPresence(sessionId: string): { presence: Presence; pid?: number } {
     const seen = this.sessions.presenceDetail(sessionId);
     if (seen.presence !== 'ended' || !seen.pid) return seen;
+    const record = this.sessions.get(sessionId);
+    if (record?.supersededBy) {
+      return this.sessions.processLive(record) ? { presence: 'unknown', pid: seen.pid } : seen;
+    }
     // Identity was asked and answered: the process that ran it is gone.
-    if (this.sessions.get(sessionId)?.procStartedAt) return seen;
+    if (record?.procStartedAt) return seen;
     return this.sessions.pidLive(seen.pid) ? { presence: 'unknown', pid: seen.pid } : seen;
   }
 
@@ -3911,7 +3955,7 @@ export abstract class ServiceBase {
       const onThisPhase = Boolean(plan && phase && plan.slug === phase.slug && plan.phase === phase.phase);
       // An operator said this terminal is not working here (#119).
       if (holdReleasedAt(record, now)) continue;
-      const read = this.sessionScope(record, root, now);
+      const read = this.sessionScope(record, root, now, locks);
       const claimUntil = onThisPhase ? null : read.leaseUntil ?? claimWindowEnds(record);
       if (claimUntil != null && now >= claimUntil) continue;
       // A session at work on THIS phase holds it whatever it touched; any other
@@ -3972,8 +4016,13 @@ export abstract class ServiceBase {
    * was scope `all` for its whole life, whatever it worked on. Now the cwd is
    * only the bounded unknown lease of a session that has touched nothing yet,
    * and a session whose every touch is in another docs root holds nothing here.
+   *
+   * `locks` is what the caller already read (control-tower phase 108, #172): a
+   * claim in the transcript holds only while its lock is still on disk and
+   * unexpired, so a released lock's scope never lingers on the session that
+   * claimed it — whoever released it.
    */
-  protected sessionScope(record: SessionRecord, root: string, now = Date.now()): InferredScope {
+  protected sessionScope(record: SessionRecord, root: string, now = Date.now(), locks?: readonly LockView[]): InferredScope {
     return inferSessionScope({
       root,
       record,
@@ -3983,6 +4032,7 @@ export abstract class ServiceBase {
         if (!plan) return undefined;
         return phase == null ? [] : this.scopeOf(slug, phase) ?? [];
       },
+      ...(locks ? { lockHeld: (slug: string, phase: number) => locks.some((lock) => lock.slug === slug && lock.phase === phase && !lock.expired) } : {}),
       now,
     });
   }
@@ -4042,6 +4092,8 @@ export abstract class ServiceBase {
 
   /** One connectivity probe for every run this console starts (control-tower phase 80, #108). */
   private outageProbe: ConnectivityProbe | null = null;
+  /** One memory of a drifting price for every run this console starts (control-tower phase 109, #202). */
+  private costDrift: CostDrift | null = null;
 
   private makeRunner(): Runner {
     const flags = this.flags;
@@ -4055,6 +4107,9 @@ export abstract class ServiceBase {
       // What a lane waiting out an outage asks "is the API back?" — phase 76's
       // probe, one per console, so a dozen waiting lanes cost one look a minute.
       connectivity: (this.outageProbe ??= new ConnectivityProbe()),
+      // One memory of a drifting price for every run (control-tower phase 109,
+      // #202): a drift is announced once a day, not once per run.
+      costDrift: (this.costDrift ??= new CostDrift()),
       // The panic button, for the one auto-start the runner owns that the
       // scheduler cannot see — the park poke. See `RunnerDeps.fleetHold`.
       fleetHold: () => this.fleetHold(),
@@ -4116,6 +4171,9 @@ export abstract class ServiceBase {
       // boarded on (control-tower phase 83, #103): a red already there is
       // inherited, never charged to it.
       verifyBaseline: () => true,
+      // …measured beside the session since control-tower phase 105, and held
+      // by the same machine-load guard that holds new admissions (phase 100).
+      machineLoad: () => this.scheduler.loadReading(),
       // Opt-in, and absent means no: a `human` gate is a person's until an
       // operator says otherwise for their own console.
       delegateHumanGates: () => this.prefs.delegateHumanGates === true,
@@ -6027,11 +6085,9 @@ export abstract class ServiceBase {
           budget, at: new Date(now).toISOString(),
         });
         journal.append('phase.wait-budget-spent', { ...spent.data, trigger }, record.phase);
-        journal.append('phase.errand', { ...spent.errand }, record.phase);
+        if (spent.errand) journal.append('phase.errand', { ...spent.errand }, record.phase);
         // A spent budget announces as one (control-tower phase 14, #40).
-        if (spent.errand.budget) {
-          this.announceBudget({ slug, runId: state.id, phase: record.phase, state: 'spent', fact: spent.errand.budget });
-        }
+        this.announceBudget({ slug, runId: state.id, phase: record.phase, state: 'spent', fact: spent.fact });
         spentParks.push(record.phase);
       }
       const resumable = parks.filter((record) => !spentParks.includes(record.phase));

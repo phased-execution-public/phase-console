@@ -425,9 +425,16 @@ describe('the honest states', () => {
     );
     expect(await screen.findByText('This console cannot start runs.')).toBeTruthy();
     const command = screen.getByText(/--allow-writes --allow-run/, { selector: 'code' });
-    expect(command.textContent).toBe(
-      '"$HOME/skill/start" "$HOME/work/repo" --port 4130 --allow-writes --allow-run --allow-terminal --allow-agent --allow-accounts --allow-mcp --allow-webhooks',
-    );
+    const flags = [
+      '--allow-writes',
+      '--allow-run',
+      '--allow-terminal',
+      '--allow-agent',
+      '--allow-accounts',
+      '--allow-mcp',
+      '--allow-webhooks',
+    ];
+    expect(command.textContent).toBe(`"$HOME/skill/start" "$HOME/work/repo" --port 4130 ${flags.join(' ')}`);
     expect(screen.getByRole('button', { name: 'Copy the command' })).toBeTruthy();
     const launch = screen.getByRole('button', { name: 'Start' });
     expect(launch).toBeDisabled();

@@ -29,8 +29,11 @@
 
 /**
  * Every scenario gets the same workflow — the catalogue of §Architecture 12,
- * in its own order. Sixteen, and closed: a scenario that fits none is a kind
- * nobody has designed the proof for yet, and the lint refuses the word.
+ * in its own order. Seventeen kinds, and closed: a scenario that fits none is a
+ * kind nobody has designed the proof for yet, and the lint refuses the word.
+ * The last, `operator-act` (control-tower phase 121, #182), is the general act
+ * only the operator does — a command to run or a click path to follow — and
+ * the one kind that is usually born BEFORE it is due (`upcoming`, below).
  * @typedef {(typeof HUMAN_STEP_KINDS)[number]} HumanStepKind
  */
 export const HUMAN_STEP_KINDS = Object.freeze(
@@ -51,14 +54,20 @@ export const HUMAN_STEP_KINDS = Object.freeze(
     'interactive-prompt',
     'captcha',
     'email-link',
+    'operator-act',
   ]),
 );
 
 /**
- * Where a step has got to. A PATH, not flags: `declared` → `notified` →
- * `opened` (as often as the person needs) → `checking` → `proven` is the
- * ordinary road. The last four settle a step; nothing moves out of them.
+ * Where a step has got to. Nine states, a PATH, not flags: `declared` →
+ * `notified` → `opened` (as often as the person needs) → `checking` →
+ * `proven` is the ordinary road. The last four settle a step; nothing moves
+ * out of them. A step declared with a due-when ref starts one stop earlier.
  *
+ *   upcoming   — born before it is due (control-tower phase 121): open, but
+ *                unannounced and unreminded, and its window has not started.
+ *                Its due-when ref landing makes it `declared` with the ONE
+ *                push; nothing else moves into it
  *   declared   — written to the ledger; nobody has been told yet
  *   notified   — the inbox row stands and the push went out (a reminder
  *                re-notifies)
@@ -72,6 +81,7 @@ export const HUMAN_STEP_KINDS = Object.freeze(
  */
 export const HUMAN_STEP_STATES = Object.freeze(
   /** @type {const} */ ([
+    'upcoming',
     'declared',
     'notified',
     'opened',
@@ -83,23 +93,26 @@ export const HUMAN_STEP_STATES = Object.freeze(
   ]),
 );
 
-/** The states a step is still OPEN in — an inbox row stands for each. */
+/** The states a step is still OPEN in — an inbox row stands for each (an `upcoming` one is *Coming up*). */
 export const HUMAN_STEP_OPEN_STATES = Object.freeze(
-  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(0, 4))),
+  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(0, 5))),
 );
 
 /** The states that settle a step. */
 export const HUMAN_STEP_SETTLED_STATES = Object.freeze(
-  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(4))),
+  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(5))),
 );
 
 /**
  * Which state may follow which. Re-entry is allowed where the workflow wants
  * it — open again, remind again, check again — and nothing leaves a settled
- * state: a proven step that "un-proves" is a new step.
+ * state: a proven step that "un-proves" is a new step. An `upcoming` step
+ * becomes due (`declared`), or settles — its proof landed early, a person
+ * cannot do it, or it was withdrawn — and is never opened or reminded first.
  * @type {Readonly<Record<HumanStepState, readonly HumanStepState[]>>}
  */
 export const HUMAN_STEP_TRANSITIONS = Object.freeze({
+  upcoming: Object.freeze(['declared', 'proven', 'expired', 'cannot', 'dismissed']),
   declared: Object.freeze(['notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']),
   notified: Object.freeze(['notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']),
   opened: Object.freeze(['notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']),
@@ -149,13 +162,38 @@ export const HUMAN_STEP_BIRTHS = Object.freeze(/** @type {const} */ (['plan', 's
  *
  *   - **Human step:** <kind> · <what> · open: <url or command> · proof: <ref>
  *     · where: host|any · window: 2d [· auto-open: host] [· credential: <id>]
+ *     [· due: <ref>]
  *
  * `credential:` belongs to `secret-entry` alone — the registry id the secret
- * is stored under.
+ * is stored under. `due:` (control-tower phase 121) is a watch ref: the step
+ * is `upcoming` until it lands, then due — the bullet is legal under the
+ * plan's `## Operator errands` too, where it is the plan's own (phase 0).
  */
 export const HUMAN_STEP_BULLET_KEYS = Object.freeze(
-  /** @type {const} */ (['open', 'proof', 'where', 'window', 'auto-open', 'credential']),
+  /** @type {const} */ (['open', 'proof', 'where', 'window', 'auto-open', 'credential', 'due']),
 );
+
+/**
+ * Is a `due:` value a watch ref the console can poll — each scheme's SHAPE,
+ * exactly as the F37 lint (`phase-graph.sh`) and the session door
+ * (`phase-outcome.sh` `_watch_problem`) read it (control-tower phase 121)? A
+ * value that fits none would leave its step `upcoming`, unannounced, for ever.
+ * @param {unknown} ref
+ * @returns {boolean}
+ */
+export function dueRefOk(ref) {
+  const text = String(ref ?? '');
+  const body = text.slice(text.indexOf(':') + 1);
+  if (text.startsWith('gh:'))
+    return /^gh:[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*#(run|pr)\/[0-9]+$/.test(text);
+  if (/^(date|until):/.test(text)) return /^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}/.test(body);
+  if (/^(lock|phase|verify):/.test(text)) return /^[A-Za-z0-9][A-Za-z0-9._-]*\/0*[1-9][0-9]*$/.test(body);
+  if (text.startsWith('cmd:'))
+    return /[^ \t]/.test(body.replace(/^"/, '').replace(/"$/, '').replace(/^'/, '').replace(/'$/, ''));
+  if (text.startsWith('unit:'))
+    return /^unit:[A-Za-z0-9][A-Za-z0-9._-]{0,62}\/[A-Za-z0-9][A-Za-z0-9@._:-]{0,254}$/.test(text);
+  return false;
+}
 
 /**
  * The reminder clock a waiting step is re-announced on: +15 m, +1 h, +6 h, then
@@ -183,13 +221,15 @@ export const HUMAN_STEP_VERBS = Object.freeze(
 
 /**
  * What a ledger move line's `verb` records: every verb above, and the
- * console's own moves — the first `notify`, each `remind`, the `prove` a
+ * console's own moves — the `due` an upcoming step's landed due-when ref makes
+ * (control-tower phase 121), the first `notify`, each `remind`, the `prove` a
  * landed proof makes, and the `expire` a closed window makes. A move written
  * before phase 43 carries none, and reads by its state.
  * @typedef {(typeof HUMAN_STEP_MOVES)[number]} HumanStepMove
  */
 export const HUMAN_STEP_MOVES = Object.freeze(
   /** @type {const} */ ([
+    'due',
     'notify',
     'remind',
     'open',
@@ -326,6 +366,12 @@ export const KIND_META = Object.freeze({
     label: 'Follow a link in an email',
     where: 'any',
     proof: 'a cmd: ref that probes the service',
+  }),
+  'operator-act': Object.freeze({
+    icon: 'clipboard-check',
+    label: 'Carry out a task',
+    where: 'host',
+    proof: 'a cmd: ref that reads what the task changed',
   }),
 });
 
@@ -788,6 +834,7 @@ export function settingsPaneFor(text) {
  *   code?: string,
  *   act?: string,
  *   path?: string,
+ *   dueWhen?: string,
  * }} HumanStepView
  */
 
@@ -809,6 +856,7 @@ export function settingsPaneFor(text) {
  *   path?: string,
  *   answer?: boolean,
  *   check?: boolean,
+ *   dueWhen?: string,
  * }} HumanStepViewInput
  */
 
@@ -872,6 +920,8 @@ export function humanStepView(input) {
     if (input.act) view.act = input.act;
     if (input.path) view.path = input.path;
   }
+  // What an `upcoming` step waits on before it is due (control-tower phase 121).
+  if (typeof input.dueWhen === 'string' && input.dueWhen.trim()) view.dueWhen = input.dueWhen.trim();
   return view;
 }
 

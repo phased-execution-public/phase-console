@@ -256,12 +256,23 @@ export type HumanStepPush = {
  */
 export function humanStepPush(step: {
   id: string; kind: string; label: string; title: string; where: 'host' | 'any'; slug: string; phase: number; code?: string;
+  openCommand?: string; openUrl?: string;
 }): { message: { title: string; body: string; detail: string }; step: HumanStepPush } {
   const place = step.where === 'host' ? ' — at the machine the console runs on' : '';
+  // Phase 0 is the plan itself — its `## Operator errands` (control-tower phase 121).
+  const scope = step.phase > 0 ? `${step.slug} phase ${step.phase}` : `the plan ${step.slug}`;
+  // An operator act says what to do NOW, on the lock screen (#182): the exact
+  // command when it has one, else the act itself — a click path is its lines.
+  const title = step.kind === 'operator-act'
+    ? `NOW: ${step.openCommand ?? step.title}`
+    : `Your turn: ${step.label.toLowerCase()} — ${scope}`;
+  const body = step.kind === 'operator-act'
+    ? `${step.title} — ${scope}${step.openUrl ? `: ${step.openUrl}` : ''}${place}.`
+    : `${step.title}${step.code ? ` — code ${step.code}` : ''}${place}.`;
   return {
     message: {
-      title: `Your turn: ${step.label.toLowerCase()} — ${step.slug} phase ${step.phase}`,
-      body: `${step.title}${step.code ? ` — code ${step.code}` : ''}${place}.`,
+      title,
+      body,
       detail: `${step.title}${place}.`,
     },
     step: {

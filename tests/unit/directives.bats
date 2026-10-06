@@ -99,6 +99,7 @@ load ../helpers/test_helper
   [ "$output" = "$(printf 'off\tdefault')" ]
 }
 
+
 @test "--isolation: silence is the third state — the run decides, and the run is not here" {
   setup_docs landing landing
   run pg landing --isolation 2

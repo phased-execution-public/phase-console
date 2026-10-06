@@ -1273,6 +1273,12 @@ export type AutoRecoverResult = {
   label?: string;
   rung?: string;
   vehicle?: DriveVehicle['kind'];
+  /**
+   * The pass was dropped because the run moved on while it read (control-tower
+   * phase 110, #178): live again, or a newer attempt boarded. It wrote
+   * nothing, and converge remembers no fingerprint for evidence that is gone.
+   */
+  stale?: true;
 };
 
 /**

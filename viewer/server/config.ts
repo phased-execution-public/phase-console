@@ -43,7 +43,7 @@ import {
   CONFLICT_POLICIES, DEFAULT_BASE_BRANCH, DEFAULT_CONFLICT, DEFAULT_LAND, LAND_POLICIES,
 } from '../shared/landing-model.js';
 import { DEFAULT_MESSAGING, MESSAGING_WORDS } from '../shared/message-model.js';
-import { DEFAULT_ISSUES, ISSUE_MODES } from '../shared/issues-model.js';
+import { DEFAULT_ISSUES, ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
 import { sanitiseCategories, type CategoryId } from './push/catalogue.ts';
 // A value import, and it is safe because `retention-policy.ts` imports nothing.
 // The sweeper itself (`retention.ts`) logs, so it reaches `log.ts`, which reads
@@ -734,7 +734,7 @@ export function isLoopbackHost(host: string): boolean {
 
 /**
  * The capability flags, worst blast radius first — the order a refusal names
- * them in. One list, so a ninth flag cannot be added without appearing here.
+ * them in. One list, so a new flag cannot be added without appearing here.
  *
  * `--allow-publish` sits right under the session-spawning flags: it is the one
  * flag that puts this repository's WORK somewhere other people build on (a
@@ -819,6 +819,7 @@ export function flagsWarning(flags: Flags): string | null {
     + '  --remote-user <login> behind a proxy that authenticates the caller.';
 }
 
+
 /**
  * Where the long-form docs are, for anything a user reads at runtime.
  *
@@ -872,7 +873,8 @@ function printHelp(): void {
                     means the console pushes nothing and files nothing, and a
                     landing that needs a push parks with the reason.
                     See ${DOCS_URL}/safety-rails.md
-  --remote <host>   also answer to this hostname, fronted by an authenticating
+`
+    + `  --remote <host>   also answer to this hostname, fronted by an authenticating
                     proxy (e.g. \`tailscale serve\`). Repeatable. Turns on strict
                     Host checking, so any other Host is refused.
   --remote-user <l> a login allowed to arrive via --remote. Repeatable; also
@@ -1004,6 +1006,13 @@ export function expandHome(input: string): string {
 
 export type Prefs = {
   recentRoots: string[];
+  /**
+   * The Issues desk's repositories outside this console (control-tower phase
+   * 118): `owner/name`s the operator added to read and refresh beside the
+   * estate. Stored only as `issueReposOf` passes them — GitHub's alphabet,
+   * once each, at most `ISSUE_REPOS_MAX` — and absent when there are none.
+   */
+  issueRepos?: string[];
   lastRoot?: string;
   theme?: 'dark' | 'light' | 'system';
   density?: 'comfortable' | 'compact';
@@ -1209,16 +1218,19 @@ export type Prefs = {
    *   when the console comes back.
    * - `autoAccountSwitch`: an auth or usage wall switches to a registered
    *   account with headroom instead of halting.
-   * - `delegateHumanGates`: a `human` gate is briefed to the phase's own
-   *   session to VERIFY and clear, instead of stopping the run for a person.
-   *   **On by default since 5.0.0** (phase 11 of zero-touch-console, operator
-   *   decision 11: `gates: delegated`) — it is this console's word for the
-   *   manifest's `gates` row, below a plan's own `## Decisions` row and
-   *   `policy.gates`, and a gate whose conditions are not written stays a
-   *   person's whatever the switch says. What makes delegation safe is not
-   *   trust: the brief requires cited evidence per condition and STOPS with
-   *   the condition named when it has none (`phase-outcome.sh … blocked`);
-   *   `gate-status.md` records such approvals as `by: ai-session-delegated`.
+   * - `delegateHumanGates`: a human-family gate the plan did NOT mark
+   *   `manual` — an overdue `deadline`/`by` gate — is briefed to the phase's
+   *   own session to VERIFY and clear, instead of stopping the run for a
+   *   person. A gate the plan marks `manual` is a person's whatever this says
+   *   (control-tower phase 107, #174): never delegated, and its approval counts
+   *   only from a person's door. **On by default since 5.0.0** (phase 11 of
+   *   zero-touch-console, operator decision 11: `gates: delegated`) — it is
+   *   this console's word for the manifest's `gates` row, below a plan's own
+   *   `## Decisions` row and `policy.gates`, and a gate whose conditions are
+   *   not written stays a person's whatever the switch says. What makes
+   *   delegation safe is not trust: the brief requires cited evidence per
+   *   condition and STOPS with the condition named when it has none
+   *   (`phase-outcome.sh … blocked`).
    * - `policy`: this console's answers to the decision manifest's rows
    *   (`shared/policy-model.js` `DECISION_ANSWERS`), keyed by decision key —
    *   `{ "qa.exhausted": "halt", "ambiguity": "ask" }`. Read below a plan's
@@ -1702,6 +1714,7 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
   };
 }
 
+
 /**
  * Preferences about the PERSON, not the project.
  *
@@ -1777,7 +1790,7 @@ export function loadPrefs(instance: Instance = INSTANCE): Prefs {
   // `notify` is rebuilt rather than spread: a stored map missing a key must
   // take that category's default, not inherit `undefined`. The automation
   // keys are rebuilt for the same reason, plus type coercion.
-  return withAutomation({
+  const prefs = withAutomation({
     ...DEFAULT_PREFS,
     ...scoped,
     ...pick(shared, USER_GLOBAL_KEYS),
@@ -1787,6 +1800,13 @@ export function loadPrefs(instance: Instance = INSTANCE): Prefs {
     notify: sanitiseCategories(scoped.notify),
     retention: sanitiseRetention(scoped.retention),
   });
+  // The Issues desk's added repositories (control-tower phase 118) pass the
+  // same gate on the way in from disk as on the way in from a patch: a hand-
+  // edited file is a caller too, and `gh --repo` sees only what passed.
+  const issueRepos = issueReposOf(scoped.issueRepos);
+  if (issueRepos.length) prefs.issueRepos = issueRepos;
+  else delete prefs.issueRepos;
+  return prefs;
 }
 
 function pick<K extends keyof Prefs>(source: Partial<Prefs>, keys: readonly K[]): Partial<Prefs> {

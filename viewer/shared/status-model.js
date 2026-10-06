@@ -378,6 +378,32 @@ export const WORD_ROWS = Object.freeze({
     human: row('Needs a person', 'user-round-check', 'needs-you', 'standing', PERSON),
     green: row('Green', 'list-checks', 'done', 'settled', OK),
   }),
+  // The Issues desk's three readings of an issue (control-tower phase 118;
+  // `shared/issues-model.js` owns the words and derives them from labels).
+  // A CATEGORY is a kind, not a condition, so it stays quiet — its icon tells
+  // the kinds apart. SEVERITY is the loud one, a ramp from red to grey. And
+  // the PLAN state is a journey: waiting for a plan, in one, set aside, fixed.
+  'issue-category': Object.freeze({
+    bug: row('Bug', 'bug', 'queued', 'standing'),
+    enhancement: row('Enhancement', 'lightbulb', 'queued', 'standing'),
+    documentation: row('Documentation', 'book-open', 'queued', 'standing'),
+    question: row('Question', 'message-circle-question', 'queued', 'standing'),
+    other: row('Other', 'circle-dashed', 'skipped', 'standing'),
+  }),
+  'issue-severity': Object.freeze({
+    critical: row('Critical', 'siren', 'failed', 'standing', FYI),
+    high: row('High', 'octagon-alert', 'waiting', 'standing'),
+    medium: row('Medium', 'circle-alert', 'queued', 'standing'),
+    low: row('Low', 'circle-dot', 'skipped', 'standing'),
+    none: row('No severity', 'minus', 'skipped', 'standing'),
+  }),
+  'issue-plan': Object.freeze({
+    'needs-plan': row('Needs a plan', 'list-todo', 'waiting', 'standing'),
+    planned: row('Planned', 'scroll-text', 'queued', 'standing'),
+    deferred: row('Deferred', 'pause', 'skipped', 'standing'),
+    fixed: row('Fixed', 'check-check', 'done', 'settled', OK),
+    none: row('No plan', 'circle-dashed', 'skipped', 'standing'),
+  }),
   note: NOTE_ROWS,
 });
 

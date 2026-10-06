@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { SKILL_DIR } from '../server/config.ts';
 import { Service } from '../server/service.ts';
 import { tagFor } from '../server/push/index.ts';
+import { EXTERNAL_PARK_GRACE_MS, EXTERNAL_WAIT_NUDGE, waitProcedure } from '../server/runner/runner-core.ts';
 
 type Pushed = { category: string; message: { title: string; tag: string }; opts: unknown };
 
@@ -291,4 +292,13 @@ test('Service.announce threads `replace` to the push leg', () => {
   } finally {
     sv.close();
   }
+});
+
+test('the external-clock nudge corrects before any park: it names the grace the runner keeps and the way to wait (control-tower phase 111, #179)', () => {
+  // The watchdog steers this to the session at minute five, then waits the
+  // grace out before it parks; the words must not promise another clock.
+  assert.equal(EXTERNAL_PARK_GRACE_MS, 5 * 60_000);
+  assert.match(EXTERNAL_WAIT_NUDGE, /parks the lane in five minutes if the call is still open/);
+  assert.ok(EXTERNAL_WAIT_NUDGE.includes(waitProcedure()), 'and it hands the session the procedure that ends the wait properly');
+  assert.match(EXTERNAL_WAIT_NUDGE, /waiting-external/);
 });

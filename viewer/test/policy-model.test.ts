@@ -22,7 +22,7 @@ import { PROBE_STATUSES } from '../shared/ops-vocab.js';
 import { SITUATIONS, SUB_KINDS, situationKey } from '../shared/situation-model.js';
 import {
   DECISION_ANSWERS, MANIFEST_BLOCKING, OWNER_KEYS, POLICY_CLASSES, POLICY_DEFAULTS, POLICY_SOURCES, POLICY_TABLE,
-  TRUNK_BRANCHES, answerOf, decisionKeyOfSituation, destructiveExceptions, destructivePushBranches, isAnswerWord, isAutomaticAnswer, policyRowOf, resolvePolicy,
+  TRUNK_BRANCHES, answerOf, decisionKeyOfSituation, destructiveCommandExceptions, destructiveExceptions, destructivePushBranches, isAnswerWord, isAutomaticAnswer, policyRowOf, resolvePolicy,
   sanitisePolicyPrefs,
 } from '../shared/policy-model.js';
 import { keyedAsks } from '../server/runner/ladder.ts';
@@ -207,4 +207,42 @@ test('#112 (control-tower phase 84): a row names push branches narrowly — neve
   assert.deepEqual(destructiveExceptions(row), ['Bash(gh pr create:*)'], 'the exception reader is unchanged by the shared splitter');
   assert.deepEqual(destructivePushBranches('deny — may publish: branch pushes to `pe/demo`'), ['pe/demo'],
     'a policy word far from the phrase does not negate it');
+});
+
+test('#205 (control-tower phase 107): a row\'s exceptions are read PER PHASE — a phase-qualified list, named options, and the clause that ends it', () => {
+  // ai-builder-v7's row, verbatim: the opener is "with these allow rows:", which the classic reader never saw.
+  const row = 'deny, with these allow rows: Phase 1 — `gh label create`, `gh issue create`; Phases 4/17/22 — `gh pr create`, `gh pr merge --squash --delete-branch`, `gh issue close`, `gh issue comment`, the direct pathspec pushes …; every phase — `git push` of `pe/ai-builder-v7` as a backup …';
+  const entries = destructiveCommandExceptions(row);
+  const of = (verb: string) => entries.find((e) => e.verb.join(' ') === verb);
+  assert.deepEqual(of('gh label create')?.phases, [1]);
+  assert.deepEqual(of('gh pr create')?.phases, [4, 17, 22]);
+  assert.deepEqual(of('gh pr merge')?.options, ['--squash', '--delete-branch'], 'the options a named command must carry');
+  assert.equal(of('gh pr create')?.rule, 'Bash(gh pr create:*)');
+  assert.equal(of('git push'), undefined, 'a push in a list is never a whole rule: its BRANCH is what the clause names');
+  assert.deepEqual(destructiveExceptions(row, { phase: 4 }).sort(),
+    ['Bash(gh issue close:*)', 'Bash(gh issue comment:*)', 'Bash(gh pr create:*)', 'Bash(gh pr merge --squash --delete-branch:*)']);
+  assert.deepEqual(destructiveExceptions(row, { phase: 1 }).sort(), ['Bash(gh issue create:*)', 'Bash(gh label create:*)']);
+  assert.deepEqual(destructiveExceptions(row, { phase: 9 }), [], 'phase 9 is named by no list');
+  assert.deepEqual(destructivePushBranches(row, { phase: 9 }), ['pe/ai-builder-v7'], 'every phase — the backup push');
+
+  // Phase lists as rows write them.
+  for (const [value, phases] of [
+    ['deny, with these allow rows: Phases 4, 17 and 22 — `gh pr create`', [4, 17, 22]],
+    ['deny, with these allow rows: Phases 4–6: `gh pr create`', [4, 5, 6]],
+    ['deny; allow `gh release create` in phases 1 and 35', [1, 35]],
+    ['deny; allow `Bash(npm publish:*)` — phase 74 ONLY', [74]],
+    ['deny; allow `gh pr create`', null],
+  ] as [string, number[] | null][]) {
+    assert.deepEqual(destructiveCommandExceptions(value)[0]?.phases, phases, value);
+  }
+  // A list runs on across `;` only into clauses that open with a phase and refuse nothing.
+  const refusing = 'deny, with these allow rows: Phases 4/17 — `gh pr create`; Phase 9 — never `gh pr merge`; `gh issue close` later';
+  assert.deepEqual(destructiveCommandExceptions(refusing).map((e) => e.verb.join(' ')), ['gh pr create']);
+  const ended = 'deny, with these allow rows: Phase 2 — `gh pr create`. Phase 3 — `gh pr merge`';
+  assert.deepEqual(destructiveCommandExceptions(ended).map((e) => e.verb.join(' ')), ['gh pr create'], 'a full stop ends the list');
+  // A branch or a path in the list is not a command.
+  assert.deepEqual(destructiveCommandExceptions('deny, with these allow rows: every phase — `pe/x`, `docs/`, `gh pr create`')
+    .map((e) => e.verb.join(' ')), ['gh pr create']);
+  // The classic opener keeps TRS-4's reading: `git push` there IS the whole rule.
+  assert.deepEqual(destructiveExceptions('deny; allow `git push`'), ['Bash(git push:*)']);
 });

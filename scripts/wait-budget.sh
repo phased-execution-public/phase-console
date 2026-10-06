@@ -6,6 +6,11 @@
 #   per phase   - **Waits on:** <ref>[, …] · <max>  in the ### Phase N block  (wait_budget_for_phase)
 #
 # Usage: wait-budget.sh <slug> [--phase N [--ref REF]…] <max>
+#        wait-budget.sh <slug> [--phase N] --count <n>
+#   --count   how many waits the phase may DECLARE (control-tower phase 121,
+#             #40): `- **Wait count:** <n>` in the ### Phase N block, or the
+#             plan's `**Wait count:** <n>` in §Session budget — a whole number
+#             1..99; read back through `phase-graph.sh --wait-count [N]`
 #   <max>     a duration: `90m`, `2h`, `3d`, or bare minutes (`150`)
 #   --phase   that phase's own `Waits on:` max; without it, the plan's line
 #   --ref     the refs to name when the phase has NO `Waits on:` bullet yet —
@@ -47,21 +52,29 @@
 #     while the rules above hold, which is the point: it is the alarm for the
 #     day one side changes without the other.
 set -euo pipefail
-usage="usage: wait-budget.sh <slug> [--phase N [--ref REF]...] <max>"
+usage="usage: wait-budget.sh <slug> [--phase N [--ref REF]...] <max> | wait-budget.sh <slug> [--phase N] --count <n>"
 slug="${1:?$usage}"
 shift
-phase=""; max=""; refs=()
+phase=""; max=""; refs=(); count=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --phase) phase="${2:?--phase needs a number}"; shift 2 ;;
     --ref) refs+=("${2:?--ref needs a ref}"); shift 2 ;;
+    --count) count="${2:?--count needs a number}"; shift 2 ;;
     -*) echo "unknown option: $1" >&2; echo "$usage" >&2; exit 2 ;;
     *)
       [ -z "$max" ] || { echo "one budget only, got: $max and $1" >&2; exit 2; }
       max="$1"; shift ;;
   esac
 done
-[ -n "$max" ] || { echo "$usage" >&2; exit 2; }
+if [ -n "$count" ]; then
+  [ -z "$max" ] || { echo "--count sets the number of waits, <max> the time they may take: one change per call, got both" >&2; exit 2; }
+  [ "${#refs[@]}" -eq 0 ] || { echo "--ref names a phase's waits for its Waits on: bullet; --count does not take one" >&2; exit 2; }
+  case "$count" in ''|*[!0-9]*) echo "--count needs a whole number from 1 to 99, got: $count" >&2; exit 2 ;; esac
+  count=$((10#$count))
+  [ "$count" -ge 1 ] && [ "$count" -le 99 ] || { echo "--count needs a whole number from 1 to 99, got: $count" >&2; exit 2; }
+fi
+[ -n "$max" ] || [ -n "$count" ] || { echo "$usage" >&2; exit 2; }
 if [ -n "$phase" ]; then
   case "$phase" in ''|*[!0-9]*) echo "phase must be a number, got: $phase" >&2; exit 2 ;; esac
   phase=$((10#$phase))   # `08` is a handoff filename, not a number — normalise once
@@ -71,6 +84,7 @@ fi
 # The duration, as the reader parses one (duration_minutes): a number and a
 # unit, or bare minutes. Anything else — `soon`, `0m`, `1.5h` — is refused
 # rather than guessed at.
+if [ -z "$count" ]; then
 minutes="$(printf '%s' "$max" | awk '{
   s = tolower($0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
   if (s ~ /^[0-9]+$/) { n = s + 0; if (n > 0) print n; exit }
@@ -84,6 +98,7 @@ minutes="$(printf '%s' "$max" | awk '{
 if [ $((minutes % 1440)) -eq 0 ]; then spelled="$((minutes / 1440))d"
 elif [ $((minutes % 60)) -eq 0 ]; then spelled="$((minutes / 60))h"
 else spelled="${minutes}m"; fi
+fi
 
 for r in ${refs[@]+"${refs[@]}"}; do
   case "$r" in
@@ -104,6 +119,80 @@ commit() {  # commit <tmp>
   if cmp -s "$1" "$f"; then rm -f "$1"; else mv "$1" "$f"; fi
 }
 tmp="$f.tmp.$$"
+
+# ---- the COUNT (control-tower phase 121, #40): one line, rewritten or added --
+if [ -n "$count" ]; then
+  if [ -z "$phase" ]; then
+    LC_ALL=C awk -v n="$count" '
+      tolower($0) ~ /^##[[:space:]]+session budget/ { insec=1; seen=1; print; next }
+      /^##[[:space:]]/ { if (insec && !done) { print "> **Wait count:** " n; print ""; done=1 } insec=0 }
+      insec && !done && tolower($0) ~ /^[[:space:]>]*([-*][[:space:]]+)?\*{0,2}wait[[:space:]]+count\*{0,2}[[:space:]]*:/ {
+        p = index($0, ":"); head = substr($0, 1, p); rest = substr($0, p + 1)
+        if (match(rest, /^\*+/)) { head = head substr(rest, 1, RLENGTH) }
+        print head " " n; done=1; next
+      }
+      { print }
+      END { if (!seen) { print ""; print "## Session budget"; print ""; print "> **Wait count:** " n } else if (insec && !done) print "> **Wait count:** " n }
+    ' "$f" > "$tmp"
+  else
+    has="$(awk -v want="$phase" '
+      /^###[[:space:]]+[Pp]hase[[:space:]]+[0-9]+/ {
+        h=$0; sub(/^###[[:space:]]+[Pp]hase[[:space:]]+/,"",h); sub(/[^0-9].*/,"",h); if (h==want) found=1
+      }
+      END { print (found ? "yes" : "no") }
+    ' "$f")"
+    [ "$has" = yes ] || {
+      echo "phase $phase: no \"### Phase $phase\" section in $f — the engine reads a phase's wait count from that block, so there is nowhere to write one" >&2
+      exit 2
+    }
+    LC_ALL=C awk -v want="$phase" -v n="$count" '
+      /^###[[:space:]]+[Pp]hase[[:space:]]+[0-9]+/ {
+        h=$0; sub(/^###[[:space:]]+[Pp]hase[[:space:]]+/,"",h); sub(/[^0-9].*/,"",h)
+        if (cur && !done) { pend=0 }
+        cur=(h==want)?1:0
+        if (cur) { print; pend=1; next }
+      }
+      /^##[[:space:]]/ && !/^###/ { cur=0 }
+      cur && !done && tolower($0) ~ /^[[:space:]]*[-*][[:space:]]*\*{0,2}wait[[:space:]]+count\*{0,2}[[:space:]]*:/ {
+        p = index($0, ":"); head = substr($0, 1, p); rest = substr($0, p + 1)
+        if (match(rest, /^\*+/)) { head = head substr(rest, 1, RLENGTH) }
+        print head " " n; done=1; next
+      }
+      { print }
+    ' "$f" > "$tmp"
+    if ! grep -qiE '^[[:space:]]*[-*][[:space:]]*\*{0,2}wait[[:space:]]+count\*{0,2}[[:space:]]*:[[:space:]]*\*{0,2}[[:space:]]*'"$count"'$' "$tmp" \
+       || [ "$(awk -v want="$phase" '
+            /^###[[:space:]]+[Pp]hase[[:space:]]+[0-9]+/ { h=$0; sub(/^###[[:space:]]+[Pp]hase[[:space:]]+/,"",h); sub(/[^0-9].*/,"",h); cur=(h==want)?1:0; next }
+            /^##[[:space:]]/ { cur=0 }
+            cur && tolower($0) ~ /wait[[:space:]]+count/ { c++ }
+            END { print c+0 }' "$tmp")" -eq 0 ]; then
+      # No bullet in the phase yet: one after the heading.
+      LC_ALL=C awk -v want="$phase" -v line="- **Wait count:** $count" '
+        /^###[[:space:]]+[Pp]hase[[:space:]]+[0-9]+/ && !done {
+          h=$0; sub(/^###[[:space:]]+[Pp]hase[[:space:]]+/,"",h); sub(/[^0-9].*/,"",h)
+          if (h==want) { print; print line; done=1; next }
+        }
+        { print }
+      ' "$f" > "$tmp"
+    fi
+  fi
+  commit "$tmp"
+  if [ -n "$phase" ]; then
+    answer="$("$SCRIPT_DIR/phase-graph.sh" "$slug" --wait-count "$phase")" \
+      || { echo "wait-budget.sh: the edit is written, but phase-graph.sh could not read $f back (see above)" >&2; exit 1; }
+    want="$(printf '%s\tphase' "$count")"
+  else
+    answer="$("$SCRIPT_DIR/phase-graph.sh" "$slug" --wait-count)" \
+      || { echo "wait-budget.sh: the edit is written, but phase-graph.sh could not read $f back (see above)" >&2; exit 1; }
+    want="$(printf '%s\tplan' "$count")"
+  fi
+  [ "$answer" = "$want" ] || {
+    echo "wait-budget.sh: wrote the wait count $count${phase:+ for phase $phase}, but phase-graph.sh --wait-count${phase:+ $phase} reads \"$answer\" — $f carries a count this script did not write; edit it by hand" >&2
+    exit 1
+  }
+  printf '%s\n' "$answer"
+  exit 0
+fi
 
 # The shared half of both rewrites: in `rest`, replace the FIRST duration the
 # reader would parse (and a `~` hugging it), keeping what follows; with none,

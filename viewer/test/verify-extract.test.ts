@@ -363,6 +363,25 @@ test('read-only gh passes; everything that writes, waits or posts goes to a pers
   }
 });
 
+test('a keychain lookup is a read; one that prints or writes the secret goes to a person (#201)', () => {
+  for (const command of [
+    'security find-generic-password -s phase-console-npm-token',
+    'security find-internet-password -s github.com -a me',
+  ]) {
+    assert.deepEqual(runs(command), [command], command);
+  }
+  for (const [command, why] of [
+    ['security find-generic-password -s token -w', /prints the secret/],
+    ['security find-generic-password -gs token', /prints the secret/],
+    ['security add-generic-password -s token -a me', /read-only keychain lookups/],
+    ['security dump-keychain -d', /read-only keychain lookups/],
+    ['security delete-generic-password -s token', /mutates/],
+  ] as const) {
+    assert.equal(runs(command).length, 0, command);
+    assert.match(held(command)[0]?.reason ?? '', why, command);
+  }
+});
+
 test('compose-level flags no longer hide the subcommand from the gate', () => {
   // The backtracking bug: `-f` after `compose` made the captured subcommand
   // "compose", which is not in DOCKER_READ_ONLY — refusing a pure read.

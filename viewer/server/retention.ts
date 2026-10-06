@@ -118,9 +118,11 @@ export type RetentionScan = {
    * A kept tree's size in bytes, or `undefined` when it is not known yet. A
    * LOOKUP, never a measurement: a kept superproject mirror is gigabytes and
    * tens of thousands of files, so the caller measures off the loop
-   * (`keptTreeBytes`) and this walk only asks what is known.
+   * (`keptTreeBytes`) and this walk only asks what is known. `live` says the
+   * tree's run is being driven — its size is the last known one, never a new
+   * scan (control-tower phase 112, #171).
    */
-  treeBytes?: (dir: string) => number | undefined;
+  treeBytes?: (dir: string, facts?: { live: boolean }) => number | undefined;
 };
 
 /**
@@ -133,21 +135,37 @@ export type RetentionScan = {
  * directory's mtime; a read that finds none yet answers `undefined` and the
  * next report has it. A finished run's kept tree does not change, so one
  * measurement is usually its last.
+ *
+ * 🔴 …which is why a tree that IS changing is not measured at all
+ * (control-tower phase 112, #171). The inventory also lists a live run's
+ * mirror, whose mtime moves for as long as a session writes into it, and the
+ * guard against a second scan was per DIRECTORY — so a mirror's repositories
+ * were scanned side by side, back to back, three `du` at once at load 279. A
+ * tree whose run is `live`, or whose mtime moved inside `TREE_QUIET_MS`, keeps
+ * the size it last had; and at most ONE measurement is in flight across every
+ * tree (the measurer, `treeDisk`, holds the same line console-wide).
  */
 const treeSizes = new Map<string, { bytes: number; mtime: number }>();
-const measuring = new Set<string>();
+let measuring: string | null = null;
 
-export function keptTreeBytes(dir: string, measure: (dir: string) => Promise<number | undefined>): number | undefined {
+/** How long a tree must sit unwritten before its size is worth a scan. */
+export const TREE_QUIET_MS = 10 * 60_000;
+
+export function keptTreeBytes(
+  dir: string, measure: (dir: string) => Promise<number | undefined>,
+  opts: { live?: boolean; now?: number } = {},
+): number | undefined {
   let mtime: number;
   try { mtime = statSync(dir).mtimeMs; } catch { treeSizes.delete(dir); return undefined; }
   const held = treeSizes.get(dir);
   if (held?.mtime === mtime) return held.bytes;
-  if (!measuring.has(dir)) {
-    measuring.add(dir);
+  if (opts.live || (opts.now ?? Date.now()) - mtime < TREE_QUIET_MS) return held?.bytes;
+  if (measuring === null) {
+    measuring = dir;
     void measure(dir)
       .then((bytes) => { if (bytes !== undefined) treeSizes.set(dir, { bytes, mtime }); })
       .catch(() => undefined)
-      .finally(() => measuring.delete(dir));
+      .finally(() => { measuring = null; });
   }
   return held?.bytes;
 }
@@ -366,7 +384,10 @@ export function collectRetention(scan: RetentionScan): RetentionInventory {
       return;
     }
     const clocks = runClocks.get(slug);
-    const bytes = from.treeBytes?.(dir);
+    // Live first, and handed to the lookup: a tree a run is writing into is
+    // never the subject of a new scan (#171).
+    const live = clocks?.liveIds.has(runId) ?? (from.live?.[slug] ?? []).includes(runId);
+    const bytes = from.treeBytes?.(dir, { live });
     into.push({
       sink: 'run-worktrees',
       path: dir,
@@ -374,7 +395,7 @@ export function collectRetention(scan: RetentionScan): RetentionInventory {
       at: clocks?.recordAt.get(runId) ?? at,
       slug,
       runId,
-      live: clocks?.liveIds.has(runId) ?? (from.live?.[slug] ?? []).includes(runId),
+      live,
       // A tree whose record is gone is an orphan of a swept run: as finished as anything gets.
       finished: clocks?.finished.get(runId) ?? true,
       ...(bytes === undefined ? { unmeasured: true } : {}),

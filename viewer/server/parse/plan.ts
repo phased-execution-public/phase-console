@@ -25,7 +25,7 @@ import {
 import { MESSAGING_WORDS, DEFAULT_MESSAGING } from '../../shared/message-model.js';
 import { ISSUE_MODES, DEFAULT_ISSUES } from '../../shared/issues-model.js';
 import {
-  CREDENTIAL_ID_RE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BULLET_KEYS, HUMAN_STEP_WHERE, KIND_META, humanStepKindOf,
+  CREDENTIAL_ID_RE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BULLET_KEYS, HUMAN_STEP_WHERE, KIND_META, dueRefOk, humanStepKindOf,
   type HumanStepKind, type HumanStepWhere,
 } from '../../shared/human-step-model.js';
 import { parseDecisionsTable } from '../../shared/decisions-model.js';
@@ -221,6 +221,12 @@ export type PhaseDetail = {
    */
   waitsOn?: { refs: string[]; maxMinutes?: number };
   /**
+   * `- **Wait count:** <n>` — how many waits this phase may DECLARE, 1..99
+   * (control-tower phase 121, #40; `wait_count_for_phase()`). Overrides the
+   * plan's `**Wait count:**`; absent is silence (the console's own four).
+   */
+  waitCount?: number;
+  /**
    * `- **Person-check:** allow|halt|<owner>` — what to do with a §Verification
    * fragment written as prose (`person_check_for_phase()`; chapter 10 ZTD-6,
    * the `verification.person-check` row). One lower-cased word; absent is
@@ -286,6 +292,12 @@ export type SessionBudget = {
    * the console's own default applies (`DEFAULT_WAIT_BUDGET_MS`).
    */
   waitBudgetMinutes?: number;
+  /**
+   * `**Wait count:**` — how many waits each phase may DECLARE, 1..99
+   * (control-tower phase 121, #40; `plan_wait_count()`). A phase's own bullet
+   * overrides it; absent is silence, and the console's own four apply.
+   */
+  waitCount?: number;
   /**
    * `**Verify timeout:**` — how long one §Verification command of any phase may
    * run, in minutes (control-tower phase 83, #95; `plan_verify_timeout()`). A
@@ -383,6 +395,12 @@ export type Plan = {
    */
   reviewers: { section: string; excerpt: string }[];
   phases: Record<number, PhaseDetail>;
+  /**
+   * The plan's OWN acts (control-tower phase 121): `- **Human step:**` bullets
+   * under `## Operator errands`, which no phase owns — `--human-steps 0`.
+   * Absent when the section declares none.
+   */
+  operatorErrands?: HumanStepDirective[];
   body: string;
 };
 
@@ -642,6 +660,8 @@ function parseSessionBudget(section?: Section): SessionBudget {
   // `plan_wait_budget()`: the label at the start of a line, then the FIRST
   // duration after the colon.
   const waitBudgetMinutes = durationMinutes(/^\*{0,2}Wait[ \t]+budget\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
+  // `plan_wait_count()`: the same label shape, then the first whole number.
+  const waitCount = countWord(/^\*{0,2}Wait[ \t]+count\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
   // `plan_verify_timeout()`: the same shape as the wait budget above.
   const verifyTimeoutMinutes = durationMinutes(/^\*{0,2}Verify[ \t]+timeout\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
   // `plan_qa_exhausted()`: the label at the start of a line (after the quote
@@ -702,6 +722,7 @@ function parseSessionBudget(section?: Section): SessionBudget {
     clashZones,
     ...(setupLine ? { setup: setupLine } : {}),
     ...(waitBudgetMinutes !== undefined ? { waitBudgetMinutes } : {}),
+    ...(waitCount !== undefined ? { waitCount } : {}),
     ...(verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}),
     ...(qaExhausted !== undefined ? { qaExhausted } : {}),
     ...(landing !== undefined ? { landing } : {}),
@@ -884,6 +905,8 @@ const WAITS_ON_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Waits[ \t]+on\*{0,2}[ \t]*:(
 const PERSON_CHECK_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Person-check\*{0,2}[ \t]*:(.*)$/i;
 /** `human_step_bodies()`: every `- **Human step:**` bullet, bold or not, the colon inside or outside it. */
 const HUMAN_STEP_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}human[ \t]+step\*{0,2}[ \t]*:/i;
+/** `wait_count_for_phase()` (control-tower phase 121) — the label, then everything after its first colon. */
+const WAIT_COUNT_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Wait[ \t]+count\*{0,2}[ \t]*:(.*)$/i;
 /** `wall_clock_floor_directive()` — the same shape; bold optional, like `Checkout`. */
 const WALL_CLOCK_FLOOR_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Wall-clock[ \t]+floor\*{0,2}[ \t]*:(.*)$/i;
 /** `verify_timeout_directive()` — the same shape again (control-tower phase 83, #95). */
@@ -955,6 +978,17 @@ function credentialPolicyBullet(block: string): CredentialPolicy | undefined {
   return credentialPolicyOf(firstMatch(block, CREDENTIAL_POLICY_BULLET_RE));
 }
 
+/**
+ * `_count_word()`: bold and backticks stripped, the FIRST token a whole number
+ * from 1 to 99 — anything else is silence, so the console's default stands.
+ */
+function countWord(remainder: string | undefined): number | undefined {
+  if (remainder === undefined) return undefined;
+  const match = /^\s*(\d+)(?![\dA-Za-z])/.exec(remainder.replace(/^\*+/, '').replace(/[*`]/g, ''));
+  const n = match ? Number(match[1]) : NaN;
+  return Number.isInteger(n) && n >= 1 && n <= 99 ? n : undefined;
+}
+
 /** The phase's `- **Person-check:** allow|halt|<owner>`, or undefined for silence. */
 function personCheckBullet(block: string): string | undefined {
   return policyWord(firstMatch(block, PERSON_CHECK_BULLET_RE));
@@ -994,6 +1028,10 @@ export function parseHumanStepBody(body: string): HumanStepDirective | undefined
   if (credential && (kind !== 'secret-entry' || !CREDENTIAL_ID_RE.test(credential))) return undefined;
   const open = values.open;
   if (open && /^[A-Za-z][A-Za-z0-9+.-]*:\S/.test(open) && !/^https?:\/\/[^\s/?#]+/i.test(open)) return undefined;
+  // `due:` (control-tower phase 121) — a watch ref, by its scheme; the step is
+  // `upcoming` until it lands.
+  const due = values.due;
+  if (due && !dueRefOk(due)) return undefined;
   return {
     kind, what, where,
     ...(open ? { open } : {}),
@@ -1001,6 +1039,7 @@ export function parseHumanStepBody(body: string): HumanStepDirective | undefined
     ...(windowMinutes !== undefined ? { windowMinutes } : {}),
     ...(autoOpen ? { autoOpen: 'host' as const } : {}),
     ...(credential ? { credential } : {}),
+    ...(due ? { due } : {}),
   };
 }
 
@@ -1120,19 +1159,44 @@ export type HumanStepDirective = {
   windowMinutes?: number;
   autoOpen?: 'host';
   credential?: string;
+  /** The watch ref the step is `upcoming` until (control-tower phase 121). */
+  due?: string;
 };
 
-/** The steps phase N declares for a person — `human_steps_for_phase()`. */
+/**
+ * The steps phase N declares for a person — `human_steps_for_phase()`. Phase 0
+ * is the plan's own: its `## Operator errands` bullets (control-tower phase 121).
+ */
 export function humanStepsFor(plan: Plan | undefined, phase: number): HumanStepDirective[] {
+  if (phase === 0) return plan?.operatorErrands ?? [];
   return plan?.phases[phase]?.humanSteps ?? [];
 }
 
-/** One step as the engine prints it: kind, what, open, proof, where, window, auto-open, credential — tab-separated. */
+/**
+ * One step as the engine prints it: kind, what, open, proof, where, window,
+ * auto-open, credential — tab-separated — and a ninth field, the `due:` ref,
+ * only when the step names one.
+ */
 export function humanStepLine(step: HumanStepDirective): string {
   return [
     step.kind, step.what, step.open ?? '', step.proof ?? '', step.where,
     step.windowMinutes === undefined ? '' : String(step.windowMinutes), step.autoOpen ?? '', step.credential ?? '',
+    ...(step.due ? [step.due] : []),
   ].join('\t');
+}
+
+/**
+ * How many waits a phase may declare, and which line said so (control-tower
+ * phase 121, #40) — `wait_count_for_phase()`: the phase's `Wait count:`
+ * bullet, else the plan's line, else undefined (the console's own four). With
+ * no phase, the plan line alone.
+ */
+export function waitCountFor(plan: Plan | undefined, phase?: number): { count: number; source: 'phase' | 'plan' } | undefined {
+  if (!plan) return undefined;
+  const own = phase === undefined ? undefined : plan.phases[phase]?.waitCount;
+  if (own !== undefined) return { count: own, source: 'phase' };
+  const planWide = plan.sessionBudget.waitCount;
+  return planWide !== undefined ? { count: planWide, source: 'plan' } : undefined;
 }
 
 /** The phase's `- **Person-check:**` word — `person_check_for_phase()`; phase-only, no plan-wide line. */
@@ -1389,6 +1453,7 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       // What the phase waits on and its own parked-time allowance
       // (`waits_on_refs()` / `wait_budget_for_phase()`).
       waitsOn: waitsOnBullet(block.raw),
+      waitCount: countWord(firstMatch(block.raw, WAIT_COUNT_BULLET_RE)),
       // Whether this phase states its own QA regime — see PhaseDetail.qa.
       qa: qaBullet(block.raw),
       handoffMustRecord: bullet(bullets, 'Handoff must record'),
@@ -1432,6 +1497,11 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
     callouts: calloutLines(body),
     reviewers: inPlanReviewers(body),
     phases,
+    // `human_step_bodies 0` (control-tower phase 121): the section's own bullets.
+    ...((() => {
+      const errands = humanStepBullets(findSection(secs, 'Operator errands')?.body ?? '');
+      return errands ? { operatorErrands: errands } : {};
+    })()),
     body,
   };
 }

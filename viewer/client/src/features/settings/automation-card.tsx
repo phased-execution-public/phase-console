@@ -70,7 +70,9 @@ export function AutomationCard() {
             (phase 8), stated beside the landing and issues defaults it
             governs, because `Landing: pr` and `Issues: file` above mean one
             thing with it and another without — and nothing on this page can
-            turn it on. A start flag is changed at the start command. */}
+            turn it on. A start flag is changed at the start command. Filing
+            issues rides its own flag since control-tower phase 115,
+            `--allow-issues`, which `--allow-publish` implies. */}
         <p className={cn(row, 'text-2xs text-ink-muted')} data-testid="publish-flag">
           <span className="min-w-0">
             <span className="text-sm text-ink">Outward writes</span>
@@ -78,8 +80,8 @@ export function AutomationCard() {
               <code>--allow-publish</code> is <strong>{state?.allowPublish ? 'on' : 'off'}</strong> on this
               console — a start flag, not a preference.{' '}
               {state?.allowPublish
-                ? 'A phase whose word is pr or trunk is pushed and its pull request opened; an issue a plan says to file is filed.'
-                : 'Nothing is pushed and no issue is filed: a pr or trunk landing is held and says so, and Issues: file holds every draft in the inbox for a person. Restart with the flag to change that.'}{' '}
+                ? 'A phase whose word is pr or trunk is pushed and its pull request opened.'
+                : 'Nothing is pushed: a pr or trunk landing is held and says so. Restart with the flag to change that.'}{' '}
               <a href={settingsHref('essentials')} className="text-action underline">
                 Essentials
               </a>{' '}

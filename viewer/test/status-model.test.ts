@@ -66,6 +66,7 @@ import { CHECKOUT_ROLES, CHECKOUT_STATES, RADAR_STATES, SETTLE_KINDS } from '../
 import { LANDING_STATES } from '../shared/landing-model.js';
 import { HANDOFF_WORDS, VERIFICATION_WORDS } from '../shared/evidence-model.js';
 import { INBOX_SEVERITIES } from '../shared/attention-model.js';
+import { ISSUE_CATEGORIES, ISSUE_PLAN_STATES, ISSUE_SEVERITY_WORDS } from '../shared/issues-model.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const sorted = (xs: readonly string[]) => [...xs].sort();
@@ -104,6 +105,9 @@ const OWNERS: Record<string, readonly string[]> = {
   'checkout-role': CHECKOUT_ROLES,
   landing: LANDING_STATES,
   verification: VERIFICATION_WORDS,
+  'issue-category': ISSUE_CATEGORIES,
+  'issue-severity': ISSUE_SEVERITY_WORDS,
+  'issue-plan': ISSUE_PLAN_STATES,
   note: NOTE_SEVERITIES,
 };
 

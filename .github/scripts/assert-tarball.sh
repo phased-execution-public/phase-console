@@ -29,6 +29,7 @@ for p in \
   "viewer/server/registry-file.ts" \
   "viewer/server/watch-refs.ts" \
   "viewer/server/watch-scheduler.ts" \
+  "viewer/server/watch-unit.ts" \
   "viewer/server/declared-probe.ts" \
   "viewer/server/verify-watch.ts" \
   "viewer/server/debug/index.ts" \
@@ -48,6 +49,7 @@ for p in \
   "viewer/server/issues/inventory.ts" \
   "viewer/server/issues/fetch.ts" \
   "viewer/server/issues/prompt.ts" \
+  "viewer/server/issues/fixes.ts" \
   "viewer/server/mcp/login.ts" \
   "viewer/server/accounts/index.js" \
   "viewer/server/accounts/usage.ts" \
@@ -71,6 +73,8 @@ for p in \
   "viewer/shared/scope.js" \
   "viewer/shared/landing-model.js" \
   "viewer/shared/issues-model.js" \
+  "viewer/shared/issue-modes.js" \
+  "viewer/shared/launch-presets.js" \
   "viewer/shared/human-step-model.js" \
   "viewer/shared/instances.mjs" \
   "viewer/shared/recovery-model.js" \
@@ -82,7 +86,9 @@ for p in \
   "viewer/shared/attention-model.js" \
   "viewer/shared/run-lifecycle.js" \
   "viewer/shared/verb-model.js" \
+  "viewer/shared/door-model.js" \
   "viewer/shared/supervisor-model.js" \
+  "viewer/shared/ci-refusal.js" \
   "viewer/shared/fact-map.js" \
   "viewer/shared/evidence-model.js" \
   "viewer/shared/routes.js" \
@@ -108,6 +114,8 @@ for p in \
   "viewer/server/analysis/phase-report.ts" \
   "viewer/server/runner/models.ts" \
   "viewer/server/runner/liveness.ts" \
+  "viewer/server/runner/shell-reading.ts" \
+  "viewer/server/runner/manifest-verdict.ts" \
   "viewer/server/runner/session-record.ts" \
   "viewer/server/runner/wait-budget.ts" \
   "viewer/server/runner/queue-episodes.ts" \
@@ -222,8 +230,10 @@ grep -vxF "package/viewer/client/src/assets/fonts/OFL.txt" "$list" > "$scan"
 # the shared/ modules NOTHING under server/ imports from creeping in.
 # `status-vocab` left this list in Phase 6: server/inbox.ts imports its
 # `isLiveStatus` rather than keeping a private copy, so it must ship.
-# `launch-presets` (control-tower phase 22) is the launch form's own table —
-# only the client and its tests read it.
+# `launch-presets` left it in control-tower phase 123: the plan author
+# (`server/pro/issues/author.ts`, phase 120) builds a plan's `## Decisions` from
+# the launch form's preset table, so it ships — in the free tarball too, which
+# this list also gates.
 # `status-model` and `status-notes` left it in control-tower phase 88: the
 # "is waiting" push says `waitSentence`, the sentence every run surface prints.
 # `assets/console.gif` is 34 MB of demo screencast: every npm install and every
@@ -257,7 +267,6 @@ for a in \
   "viewer/shared/phase-model" \
   "viewer/shared/route-meta" \
   "viewer/shared/interval-format" \
-  "viewer/shared/launch-presets" \
   "viewer/shared/sw-push"; do
   if grep -q "package/$a" "$scan"; then
     echo "MUST NOT ship, but is in tarball: $a" >&2

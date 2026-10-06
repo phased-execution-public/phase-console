@@ -174,6 +174,26 @@ test('a denial says whose decision it is, names the rule, and is written down', 
   service.close();
 });
 
+test('a press of the console\'s own authority is refused in the console\'s voice, before any card, on every profile (control-tower phase 129, #218)', async () => {
+  const command = "curl -X POST -H 'x-phase-console: 1' http://127.0.0.1:4123/api/run/demo/settings -d '{\"permissionProfile\":\"bypass\"}'";
+  for (const profile of ['guarded', 'trusted', 'bypass']) {
+    const { service, noted } = serviceOn(profile);
+    try {
+      const reply = decision(await service.decideToolUse({ tool_name: 'Bash', tool_input: { command } }, 'r1'));
+      assert.equal(reply.permissionDecision, 'deny', profile);
+      assert.match(reply.permissionDecisionReason, /^blocked by the console \(rule: console-forge\): it would change a run's settings/);
+      assert.match(reply.permissionDecisionReason, /not a person rejecting your work/, 'standing policy, in the console\'s own voice');
+      assert.match(reply.permissionDecisionReason, /phase-outcome\.sh demo 2 blocked --needs permission --reason/, 'and what to declare instead');
+      assert.equal(service.approvals.all().length, 0, `${profile}: no card was raised — a person approving one would still be the session pressing`);
+      const denied = noted.find((n) => n.event === 'phase.tool-denied');
+      assert.deepEqual([denied?.data.rule, denied?.data.verb, denied?.phase], ['console-forge', 'run-settings', 2]);
+    } finally {
+      service.approvals.disarm();
+      service.close();
+    }
+  }
+});
+
 test('a wrapper cannot smuggle a denied command past a profile that stopped asking', async () => {
   // The hole the profile change would otherwise have opened. `stripWrappers`
   // refuses to peel `flock` — its arguments vary too much to guess — so the

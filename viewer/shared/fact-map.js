@@ -39,7 +39,7 @@
  * `HALT_KIND_SITUATION` is total over `HALT_KINDS` because a halt kind with no
  * situation is a stop nothing can classify, and the classifier's fallback for
  * one is `unknown` — which reads to a person as "the console has no idea",
- * from a console that has a twenty-nine-word table saying exactly what happened.
+ * from a console that has a thirty-word table saying exactly what happened.
  *
  * `inboxKind: null` is a real answer and means **raise nothing**: `superseded`
  * and `work-in-progress` are the board and a live session doing their jobs.
@@ -292,6 +292,13 @@ export const HALT_KIND_SITUATION = Object.freeze({
    * Drop isolation does — so the honest word, like `worktree-merge`'s.
    */
   'isolation-refused': 'unknown',
+  /**
+   * Every phase is done and the run's branch is not on its trunk (control-tower
+   * phase 112, #184). Nothing a phase's ladder knows lands a branch — a merge
+   * errand tree and a person's landing do — so the honest word, like
+   * `isolation-refused`'s.
+   */
+  unlanded: 'unknown',
 });
 
 /**

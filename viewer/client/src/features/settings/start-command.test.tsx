@@ -37,13 +37,23 @@ const STATE: ConsoleState = {
   allowWebhooks: false,
 };
 
+/**
+ * The switches past the free seven: `--allow-issues` in Pro (control-tower phase 115), none in the free
+ * tree. A list the Pro region adds to, never a `let` it reassigns: with the region stripped, a `let`
+ * nothing reassigns fails the free tree's `prefer-const` (control-tower phase 117).
+ */
+const PRO_SWITCHES: string[] = [];
+const PRO_TAIL = PRO_SWITCHES.map((flag) => ` ${flag}`).join('');
+const SWITCHES = 7 + PRO_SWITCHES.length;
+
 describe('composeStartCommand', () => {
-  it('renders every home path as "$HOME/…" and carries all seven switches', () => {
+  it('renders every home path as "$HOME/…" and carries every switch it composes', () => {
     const command = composeStartCommand(STATE);
     expect(command).toBe(
       '"$HOME/.claude/skills/phased-execution/start" "$HOME/code/my-repo" --port 4123 ' +
         '--allow-writes --allow-run --allow-terminal --allow-agent --allow-accounts --allow-mcp ' +
-        '--allow-webhooks',
+        '--allow-webhooks' +
+        PRO_TAIL,
     );
     expect(command).not.toContain('/home/testperson');
   });
@@ -52,7 +62,8 @@ describe('composeStartCommand', () => {
     expect(composeStartCommand({ ...STATE, root: { path: '/srv/repo' } })).toContain(' /srv/repo ');
     expect(composeStartCommand({})).toBe(
       'phase-console start --allow-writes --allow-run --allow-terminal --allow-agent ' +
-        '--allow-accounts --allow-mcp --allow-webhooks',
+        '--allow-accounts --allow-mcp --allow-webhooks' +
+        PRO_TAIL,
     );
   });
 
@@ -74,7 +85,7 @@ describe('composeStartCommand', () => {
       .filter((key) => /^allow[A-Z]/.test(key))
       .map((key) => `--${key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`)
       .sort();
-    expect(exposed.length).toBe(7);
+    expect(exposed.length).toBe(SWITCHES);
     expect(composed).toEqual(exposed);
   });
 

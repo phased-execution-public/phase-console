@@ -526,6 +526,47 @@ test('a lock-cap park keeps its scope-cap reason through a save and a load', asy
   }
 });
 
+test('a lane in its Setup or its baseline is in flight: a read without the live set folds the run to running, never interrupted (#173)', async () => {
+  // Hub run `fabb9339985d` read `interrupted` for half an hour while its lane
+  // ran P3's `Setup:` and baseline: no session child, no write, and a reader
+  // that did not know the run was live. The command's process is on the run
+  // now (control-tower phase 105, BL-4), so the fold has a fact to read.
+  await import('./state-sandbox.ts');
+  const { newRun, phaseRecord, saveRun, loadRun, clearRunFileCache } = await import('../server/runner/state.ts');
+  const { forgetPid } = await import('../server/pid.ts');
+  const { spawn } = await import('node:child_process');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const root = mkdtempSync(join(tmpdir(), 'pc-setup-lane-'));
+  const kid = spawn('sleep', ['60'], { stdio: 'ignore' });
+  try {
+    const state = newRun({ slug: 'a-plan', root, model: 'opus' });
+    state.status = 'running';
+    phaseRecord(state, 3).status = 'pending';
+    const at = new Date().toISOString();
+    state.verifying = {
+      3: {
+        phase: 3, purpose: 'baseline', stage: 'setup', command: 'task setup', index: 1, total: 1,
+        startedAt: at, commandStartedAt: at, pid: 999_999, child: { pid: kid.pid!, procStartedAt: at },
+      },
+    };
+    saveRun(state);
+    clearRunFileCache();
+    const back = loadRun(root, 'a-plan', state.id)!;
+    assert.equal(back.status, 'running');
+    assert.equal(back.lifecycle?.state, runLifecycle({ status: 'running' }).state);
+    assert.equal(runUiState(back.status), 'running', 'painted as the live lane it is');
+  } finally {
+    const gone = new Promise((done) => kid.once('exit', done));
+    kid.kill('SIGKILL');
+    await gone;
+    forgetPid(kid.pid!);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('waitReasonOf knows every word WAIT_REASONS holds', () => {
   // It knew two of four after the list grew, so a recorded `scope` fell
   // through to the phase scan and was reported as a usage limit — the exact

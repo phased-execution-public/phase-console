@@ -42,7 +42,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { count } from './counters.ts';
 import { gitTraceDir, gitTraceEnv } from './git-trace.ts';
 import { log } from './log.ts';
-import { groupSignal } from './runner/signals.ts';
+import { groupSignal, killLadder } from './runner/signals.ts';
 import { envCarrier } from './trace.ts';
 
 /**
@@ -74,7 +74,19 @@ export type ShellOptions = {
    * For the speculative reads: does this ref exist, is this tree a repository.
    */
   expectFailure?: boolean;
+  /**
+   * How the ceiling ends the job. `kill` (the default) is one SIGKILL to the
+   * group. `ladder` walks the signals ladder (`runner/signals.ts` `killLadder`:
+   * SIGCONT, SIGTERM to the group, SIGKILL after `LADDER_TERM_GRACE_MS`) and
+   * answers only once it has — for a caller that must not start the next
+   * command while this one is still alive (control-tower phase 112, #171: the
+   * one `du` the console runs at a time).
+   */
+  ceiling?: 'kill' | 'ladder';
 };
+
+/** How long a laddered ceiling's SIGTERM gets before the SIGKILL. */
+export const LADDER_TERM_GRACE_MS = 2_000;
 
 export type ShellRun = {
   ok: boolean;
@@ -255,6 +267,25 @@ export async function shell(file: string, argv: readonly string[], options: Shel
           return;
         }
         timedOut = true;
+        if (pid && options.ceiling === 'ladder') {
+          // The polite end first, awaited: a `du` honours SIGTERM, and the
+          // caller's slot is held until the ladder has run its course. The
+          // command's own exit is what "gone" means here; a grandchild still
+          // holding its pipes then goes with the group, as on the default path.
+          void killLadder(pid, {
+            interrupt: false, killAfterMs: LADDER_TERM_GRACE_MS, alive: () => exited === null,
+          }).then((ending) => {
+            if (settled) return;
+            const signal: NodeJS.Signals = ending === 'killed' ? 'SIGKILL' : 'SIGTERM';
+            if (exited) {
+              groupSignal(pid, 'SIGKILL');
+              answer(exited.code, exited.signal ?? signal);
+              return;
+            }
+            grace = setTimeout(() => answer(null, signal), CLOSE_GRACE_MS);
+          });
+          return;
+        }
         if (pid) groupSignal(pid, 'SIGKILL');
         // `close` normally follows at once and carries the last output; a
         // process the kernel cannot kill yet (a `du` in uninterruptible disk

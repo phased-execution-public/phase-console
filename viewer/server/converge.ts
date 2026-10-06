@@ -33,7 +33,9 @@
  * Two promises the code is built around. **An operator's stop is respected**:
  * a run paused or stopped by a person (`stoppedBy: 'operator'`), or one a
  * person dismissed (`resolved`), is pinned — the loop reads it and leaves it,
- * and only the operator's own press overrides that. **Every act is journalled
+ * and only the operator's own press overrides that. A SCRIPT's dismissal is
+ * not a person's (control-tower phase 110, #176): it pins the run against
+ * everything but ready work that appears after it. **Every act is journalled
  * and bounded**: debris releases and boot resumes each carry a journal line on
  * the run they touch, a boot resume is capped per phase, and the ladder's own
  * caps (count and dollars) bound everything the healer launches.
@@ -46,7 +48,7 @@ import {
   CONSOLE_STOPPED_NOTE, IN_FLIGHT, childrenOf, resetForRetry, pidAlive as realPidAlive,
   processState as realProcessState, waitClockOf, waitReasonOf, type ProcessState,
   type Errand, type PhaseRecord, type RunState,
-  setRunState,
+  setRunState, dismissedByPerson, readySinceDismissal,
 } from './runner/state.ts';
 import { log } from './log.ts';
 import { holdBinds } from './fleet-hold.ts';
@@ -970,7 +972,28 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
     });
     return plan;
   }
-  if (!pressed && run.resolved) return skip(run.id, `the stop is resolved (${run.resolved.auto ? 'the board settled it' : 'a person dismissed it'}) — pinned`);
+  if (!pressed && run.resolved) {
+    /* Who dismissed it decides how firmly it is pinned (control-tower phase
+     * 110, #176). A person's judgement stands until their own press. A
+     * script's — a watchdog agent's, a cron's, recorded `by: script` — pins the
+     * run against everything EXCEPT ready work that appears after it: the hub's
+     * run `6043ba472ccf` sat parked with a ready phase for 6.6 hours behind a
+     * dismissal its record called the operator's. A halt only a person lifts
+     * stays a person's, whoever dismissed it. */
+    const fresh = facts.board && !run.resolved.auto ? readySinceDismissal(run, facts.board) : [];
+    const pressOnlyHalt = run.status === 'halted' && PRESS_ONLY_HALT_KINDS.includes(run.halt?.kind ?? '');
+    if (fresh.length && !dismissedByPerson(run.resolved) && !stoppedByOperator(run) && !pressOnlyHalt) {
+      actions.push({
+        kind: 'relaunch', runId: run.id, reboard: [], rearm: [],
+        why: [`new ready work since the dismissal at ${run.resolved.at} (phase ${fresh.join(', ')}) — `
+          + `a script dismissed it (by ${run.resolved.by ?? 'nobody named'}), and a script's dismissal is not a person's`],
+      });
+      return plan;
+    }
+    const who = run.resolved.auto ? 'the board settled it' : dismissedByPerson(run.resolved) ? 'a person dismissed it' : 'a script dismissed it';
+    return skip(run.id, `the stop is resolved (${who}) — pinned`
+      + (fresh.length ? `; ready since the dismissal: phase ${fresh.join(', ')}` : ''));
+  }
   if (!pressed && stoppedByOperator(run)) return skip(run.id, 'the operator stopped it — pinned until they continue it');
   // A halt only a person's press relaunches (RCV-3, RCV-1): the failure
   // streak is the run's one "this plan is broken" bound, and relaunching it
@@ -1325,6 +1348,8 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
 /** What the healer answers — the slice of `Service.maybeAutoRecover`'s result this loop reads. */
 export type HealResult = {
   launched: boolean;
+  /** The healer dropped its pass: the run moved on while it read (#178). */
+  stale?: boolean;
   reason?: string;
   phase?: number;
   situation?: string;
@@ -1655,17 +1680,22 @@ export async function executeConvergence(plan: ConvergePlan, deps: ConvergeDeps)
         } catch (error) {
           result = { launched: false, reason: (error as Error)?.message ?? String(error) };
         }
-        if (result.launched) { launched = true; noop = null; } else noop = action.fingerprint;
+        if (result.launched) { launched = true; noop = null; } else noop = result.stale ? null : action.fingerprint;
         // The latch rides the run, where its evidence already lives (SLF-7): a
         // heal that found nothing writes the fingerprint it found nothing in;
-        // one that launched clears it.
-        try {
-          deps.editRun(slug, action.runId, (state) => {
-            state.converge = result.launched ? null : { lastNoop: action.fingerprint, at: new Date(deps.now?.() ?? Date.now()).toISOString() };
-          });
-        } catch { /* the in-memory latch still holds for this process */ }
+        // one that launched clears it. A STALE pass writes nothing at all
+        // (control-tower phase 110, #178): its evidence is gone, and the run it
+        // read is somebody else's now.
+        if (!result.stale) {
+          try {
+            deps.editRun(slug, action.runId, (state) => {
+              state.converge = result.launched ? null : { lastNoop: action.fingerprint, at: new Date(deps.now?.() ?? Date.now()).toISOString() };
+            });
+          } catch { /* the in-memory latch still holds for this process */ }
+        }
         deps.journal(slug, action.runId, 'run.converge', {
           trigger, action: 'heal', why: action.why, launched: result.launched,
+          ...(result.stale ? { stale: true } : {}),
           ...(result.reason ? { reason: result.reason } : {}),
           ...(result.phase != null ? { phase: result.phase } : {}),
           ...(result.situation ? { situation: result.situation } : {}),

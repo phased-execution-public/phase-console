@@ -231,7 +231,8 @@ Some rows resolve from lines in this section — `**Credentials:**` + `**Credent
 `- **Human step:**`, `- **Person-check:**`). Answers that arrive later go to a twin the engine
 merges over the table, written only by `scripts/decisions.sh`. The human-step bullet has one grammar
 since control-tower phase 41 — `- **Human step:** <kind> · <what> · open: <url or command> · proof:
-<ref> · where: host|any · window: <duration> [· auto-open: host]`, one of sixteen kinds — and the
+<ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]`, one of seventeen
+kinds — legal under the plan's `## Operator errands` heading too, as the plan's own act — and the
 5.1.0 `<who, what, proof ref>` spelling it replaced fails the lint by name (F37).
 
 **The wait budget is a total, and spending it is never a failure.** `**Wait budget:** 48h` is the
@@ -252,8 +253,10 @@ already spent parked, read from each park's own stamps — at park and again at 
   failure streak is not charged; a landing still resumes the session, and raising the budget and
   pressing Retry gives it a clock again.
 
-One phase may declare at most four waits (`WAIT_MAX_PER_PHASE`); the console's own watchdog parks
-spend a separate allowance and never touch this one.
+One phase may declare at most four waits (`WAIT_MAX_PER_PHASE`) unless the plan raises the count —
+`**Wait count:** <n>` in this section, or `- **Wait count:** <n>` on the phase, 1 to 99 (control-tower
+phase 121, #40); a spent count whose watch ref still polls is a wait on that ref, never an errand. The
+console's own watchdog parks spend a separate allowance and never touch this one.
 
 ```bash
 scripts/phase-graph.sh <slug> --decisions        # the rows as they hold: key, state, owner, blocking, source, value

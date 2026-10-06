@@ -224,34 +224,104 @@ export function resumePolicy(
   return { choice: 'resume', reason: 'cache-warm', ...measured };
 }
 
-/* ---- what a session's own calls are worth (control-tower phase 46, #62, CC-5) ---- */
+/* ---- what a session's own calls are worth (control-tower phase 46, #62, CC-5; phase 109, #202) ---- */
 
 /*
- * USD per token, by model family, for the four counters a call reports. Only
- * what was MEASURED: the audit week priced every non-resumed Opus session
- * (`opus` n = 77, `opus[1m]` n = 49) at a median of exactly 1.000 × what the CLI
- * reported, with these rates — a cache write at twice input (the one-hour
- * cache), a read at a tenth. A family with no measured row is not priced, and
- * an unpriced session is simply not corroborated: a guessed price would journal
- * a mismatch for every session it got wrong.
+ * USD per token, by MODEL VERSION, for the four counters a call reports — each
+ * version at its own list rates. Only what was MEASURED:
+ *  - `claude-opus-5`: the audit week priced every non-resumed Opus 5 session
+ *    (n = 126) at a median of exactly 1.000 × what the CLI reported — a cache
+ *    write at twice input (the one-hour cache), a read at a tenth;
+ *  - `claude-opus-5-5` (control-tower phase 109, #202): 389 fresh Opus 5.5
+ *    sessions, 2026-09-25 → 10-03, at a median of 1.000 and 291 of them within
+ *    ±2 % — a write at twice input, a read at a TWENTIETH. Until this row
+ *    existed the one row was `opus`, found by substring, so every 5.5 session
+ *    was priced as Opus 5 and read `under` at ≈ 0.54: 347 false findings, and a
+ *    doubled booking on the default model read as agreement.
+ * A version with no measured row is not priced — an alias (`opus`) names no
+ * version at all — and an unpriced session is simply not corroborated: a
+ * guessed price would journal a mismatch for every session it got wrong.
  */
 export const TOKEN_PRICES_USD: Readonly<Record<string, Readonly<{ input: number; cacheWrite: number; cacheRead: number; output: number }>>> = Object.freeze({
-  opus: Object.freeze({ input: 5e-6, cacheWrite: 10e-6, cacheRead: 0.5e-6, output: 25e-6 }),
+  'claude-opus-5': Object.freeze({ input: 5e-6, cacheWrite: 10e-6, cacheRead: 0.5e-6, output: 25e-6 }),
+  'claude-opus-5-5': Object.freeze({ input: 4e-6, cacheWrite: 8e-6, cacheRead: 0.2e-6, output: 20e-6 }),
 });
 
-/** The family a model id or alias belongs to, when one of `TOKEN_PRICES_USD` names it. */
-function priceFamily(model: string | null | undefined): string | null {
-  const id = (model ?? '').toLowerCase();
-  return Object.keys(TOKEN_PRICES_USD).find((family) => id.includes(family)) ?? null;
+/**
+ * The row of `TOKEN_PRICES_USD` a model id names, or null — matched by the
+ * WHOLE id (#202), never by a family substring, which priced
+ * `claude-opus-5-5[1m]` as `claude-opus-5`. Two spellings are the same model:
+ * the window suffix (it selects a context window, and the measured sessions
+ * show no long-context rate) and a trailing date stamp (`-20251001`, how the
+ * CLI ships a dated id).
+ */
+export function priceRowOf(model: string | null | undefined): string | null {
+  const id = (model ?? '').trim().toLowerCase();
+  const base = (id.endsWith(MODELS_ENV_FALLBACK.oneM) ? id.slice(0, -MODELS_ENV_FALLBACK.oneM.length) : id).replace(/-\d{8}$/, '');
+  return Object.prototype.hasOwnProperty.call(TOKEN_PRICES_USD, base) ? base : null;
 }
 
-/** A session's own calls, priced — null when its model's family has no measured row. */
+/** A session's own calls, priced — null when its model has no measured row. */
 export function priceUsage(model: string | null | undefined, counters: Pick<TokenCounters, 'input' | 'cacheWrite' | 'cacheRead' | 'output'>): number | null {
-  const family = priceFamily(model);
-  if (!family) return null;
-  const rate = TOKEN_PRICES_USD[family];
+  const row = priceRowOf(model);
+  if (!row) return null;
+  const rate = TOKEN_PRICES_USD[row];
   return counters.input * rate.input + counters.cacheWrite * rate.cacheWrite
     + counters.cacheRead * rate.cacheRead + counters.output * rate.output;
+}
+
+/*
+ * A drifting rate, noticed once (control-tower phase 109, #202). When fresh
+ * sessions of one model book the same fraction of their price, session after
+ * session, the PRICE is what is wrong — a lineup change, a new cache rate — not
+ * the bookings: three such sessions within a day, their ratios within ±5 % of
+ * their median and on one side, are announced once (`phase.cost-drift`), and
+ * for the rest of that day a session at that ratio is explained by it. A
+ * session OFF the ratio is still a finding, so a re-reported total (#62) is
+ * caught on a drifting model too.
+ */
+export const COST_DRIFT_SESSIONS = 3;
+export const COST_DRIFT_BAND = 0.05;
+export const COST_DRIFT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export type CostDriftVerdict =
+  | { kind: 'mismatch' }
+  | { kind: 'drift'; ratio: number; sessions: number; since: string }
+  | { kind: 'explained'; ratio: number; since: string };
+
+/**
+ * One console's memory of its models' mismatches (#202): the service hands
+ * every runner the same one, so a drift announced in one run is not announced
+ * again by the next run of the same day.
+ */
+export class CostDrift {
+  private readonly samples = new Map<string, { ratio: number; at: number; direction: 'over' | 'under' }[]>();
+  private readonly announced = new Map<string, { ratio: number; at: number; direction: 'over' | 'under' }>();
+
+  /** What one mismatching session is: a finding, the drift's announcement, or the drift already announced. */
+  note(input: { model: string; ratio: number; direction: 'over' | 'under'; fresh: boolean; at: number }): CostDriftVerdict {
+    const { model, ratio, direction, at } = input;
+    const told = this.announced.get(model);
+    if (told && at - told.at < COST_DRIFT_WINDOW_MS) {
+      const onIt = told.direction === direction && Math.abs(ratio - told.ratio) <= COST_DRIFT_BAND * told.ratio;
+      return onIt ? { kind: 'explained', ratio: told.ratio, since: new Date(told.at).toISOString() } : { kind: 'mismatch' };
+    }
+    if (told) this.announced.delete(model);
+    // A resumed session books a delta against a mark; only a fresh one's ratio
+    // is the price's evidence. A session that booked NOTHING is no price at all
+    // (a lost total, a crashed CLI): ratio 0 is a finding, never a drift.
+    if (!input.fresh || ratio <= 0) return { kind: 'mismatch' };
+    const kept = (this.samples.get(model) ?? []).filter((sample) => at - sample.at < COST_DRIFT_WINDOW_MS);
+    kept.push({ ratio, at, direction });
+    this.samples.set(model, kept.slice(-COST_DRIFT_SESSIONS));
+    const recent = kept.slice(-COST_DRIFT_SESSIONS);
+    if (recent.length < COST_DRIFT_SESSIONS || recent.some((sample) => sample.direction !== direction)) return { kind: 'mismatch' };
+    const median = recent.map((sample) => sample.ratio).sort((a, b) => a - b)[Math.floor(recent.length / 2)];
+    if (recent.some((sample) => Math.abs(sample.ratio - median) > COST_DRIFT_BAND * median)) return { kind: 'mismatch' };
+    this.announced.set(model, { ratio: median, at, direction });
+    this.samples.delete(model);
+    return { kind: 'drift', ratio: median, sessions: recent.length, since: new Date(recent[0].at).toISOString() };
+  }
 }
 
 /*

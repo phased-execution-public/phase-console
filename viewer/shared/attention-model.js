@@ -1111,7 +1111,7 @@ export const SESSION_ASK_WAIT_KINDS = Object.freeze(/** @type {const} */ (['perm
  * @property {string} [situation]  The classifier's key — `id` or `id:sub`.
  * @property {boolean} [errand]    An errand is stored against this phase.
  * @property {string} [board]      The engine's bucket for the phase.
- * @property {{kind?: string, clear?: boolean, delegated?: boolean, approved?: boolean}} [gate]
+ * @property {{kind?: string, clear?: boolean, approved?: boolean}} [gate]
  * @property {{signal?: string}} [record]  The phase record's own stall signal.
  * @property {{waiting?: {kind?: string}|null, presence?: string, kind?: string}} [session]
  * @property {{live?: boolean}} [run]
@@ -1136,11 +1136,15 @@ export const SESSION_ASK_WAIT_KINDS = Object.freeze(/** @type {const} */ (['perm
  *
  * Four rules, each one a measured defect:
  *
- *   1. **A gate row only for a gate a PERSON must clear.** `ai`, delegated and
- *      already-approved gates all raise nothing — a session clears the first
- *      two itself and the third is done. And only while the board would call
- *      the phase ready: a gate on a phase still waiting on its dependencies is
- *      asking for an act that changes nothing today.
+ *   1. **A gate row only for a gate a PERSON must clear.** `ai` and
+ *      already-approved gates raise nothing — a session clears the first itself
+ *      and the second is done. A `human` gate (a `manual` Gate-check) ALWAYS
+ *      raises one, whatever the `gates` row says: delegation stopped reaching a
+ *      manual gate in control-tower phase 107 (#174), after a session cleared
+ *      one itself and changed production data, so subtracting a "delegated"
+ *      row here would hide the one gate a person must clear. And only while the
+ *      board would call the phase ready: a gate on a phase still waiting on its
+ *      dependencies is asking for an act that changes nothing today.
  *   2. **A declared park raises its errand and NEVER a health row.** The
  *      classifier's most common wrong answer was `plan-broken:stale-handoff`
  *      over a session that had honestly declared a wait — 92 times. Only
@@ -1161,14 +1165,7 @@ export function deriveAttention(facts = {}) {
   const mapped = key ? factsFor(...splitSituation(key)) : null;
 
   const gate = facts.gate;
-  if (
-    gate &&
-    facts.board === 'ready' &&
-    gate.kind === 'human' &&
-    gate.clear === false &&
-    !gate.delegated &&
-    !gate.approved
-  ) {
+  if (gate && facts.board === 'ready' && gate.kind === 'human' && gate.clear === false && !gate.approved) {
     out.push({ kind: 'gate', severity: 'needs-you', subject: 'gated-manual', situation: 'gated-manual' });
   }
 

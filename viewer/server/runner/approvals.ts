@@ -29,9 +29,12 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync,
+  unlinkSync, writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { log } from '../log.ts';
 import { processState } from '../pid.ts';
@@ -47,7 +50,12 @@ import {
   KIND_META, REDACTED, SIGN_IN_SHAPES, SIGN_IN_STEPS, SIGN_IN_UNATTENDED, redactSecrets,
   type HumanStepKind, type HumanStepWhere,
 } from '../../shared/human-step-model.js';
+import {
+  AUTHORITY_ROUTES, CONSOLE_FILES_VERB, authorityCliOf, authorityRouteOf, cliFormOf, type AuthorityRoute,
+} from '../../shared/door-model.js';
+import { DEFAULT_PORT, PORT_RANGE_SIZE, PORT_RANGE_START, readRegistry } from '../../shared/instances.mjs';
 import { splitStatements, type Statement } from './liveness.ts';
+import { executedTexts, readShell, type ShellReading } from './shell-reading.ts';
 
 /* ------------------------------------------------------------------ *
  * The two lists
@@ -119,6 +127,61 @@ export const SHARED_STATE_ASK = [
  */
 export const RUN_TREE_CLONE_RULE = 'run-tree-clone';
 
+/**
+ * The rule name a session's detach of its OWN mirror is denied under
+ * (control-tower phase 112, #183). Path-aware like `run-tree-clone`: the verb
+ * is harmless in an errand tree, a hand lane or the shared root, and only the
+ * run's own checkout makes it the wall.
+ */
+export const RUN_TREE_DETACH_RULE = 'run-tree-detach';
+
+/** `git checkout` options that take a separate value — skipped when counting what it was asked to check out. */
+const CHECKOUT_VALUED = new Set(['-b', '-B', '--orphan', '--conflict', '--pathspec-from-file']);
+
+/**
+ * Does this `git switch` / `git checkout` leave HEAD detached? `--detach` /
+ * `-d` say so outright; a `checkout` of exactly ONE commit-ish that is not a
+ * branch does it silently — a hex sha, a remote-tracking or tag ref, a
+ * revision expression (`HEAD~1`, `v6.0.0^0`, `@{-1}`). A `--` or a second
+ * positional is a path restore, and `-b`/`-B`/`--orphan` make a branch: none
+ * of those detaches anything.
+ */
+function detaches(verb: string, args: readonly string[]): boolean {
+  if (args.includes('--')) return false;
+  if (verb === 'switch') return args.includes('--detach') || args.includes('-d');
+  if (args.includes('--detach')) return true;
+  if (args.some((arg) => arg === '-b' || arg === '-B' || arg === '--orphan')) return false;
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg.startsWith('-')) { if (CHECKOUT_VALUED.has(arg)) i++; continue; }
+    positional.push(arg);
+  }
+  if (positional.length !== 1) return false;
+  const rev = positional[0]!;
+  return /^[0-9a-f]{7,40}$/i.test(rev)
+    || /[~^]|@\{/.test(rev)
+    || /^(?:refs\/(?:remotes|tags)\/|origin\/)/.test(rev)
+    || /^(?:FETCH|ORIG|MERGE)_HEAD$/.test(rev);
+}
+
+/**
+ * Does the line's shell RUN a detaching `git switch` / `git checkout`? The
+ * path walk below finds the candidate and its directory; this asks the shell
+ * reader (`bashSubjects`, control-tower phase 107) whether it is a command at
+ * all — a here-doc body or a quoted argument naming one is data, and denying
+ * data is a wall in the wrong place.
+ */
+function executesDetach(command: string): boolean {
+  return bashSubjects(command).some((text) => {
+    const words = text.trim().split(/\s+/).filter(Boolean);
+    if (words[0] !== 'git') return false;
+    const at = words.findIndex((word, i) => i > 0 && !word.startsWith('-') && words[i - 1] !== '-C' && words[i - 1] !== '-c');
+    const verb = at > 0 ? words[at] : undefined;
+    return (verb === 'switch' || verb === 'checkout') && detaches(verb, words.slice(at + 1));
+  });
+}
+
 /** Where a shell segment runs: `git -C <dir>` beats the cwd the segment inherited. */
 function gitDirOf(words: string[], cwd: string): string {
   const at = words.indexOf('-C');
@@ -153,7 +216,15 @@ const CLONE_VALUED = new Set([
  */
 export function treeGuard(
   toolName: string, input: unknown,
-  ctx: { cwd?: string | null; runRoot?: string | null; runTrees: readonly string[] },
+  ctx: {
+    cwd?: string | null; runRoot?: string | null; runTrees: readonly string[];
+    /** The run's OWN checkout — its mirror or its single tree — for the detach rule. Absent: that rule is off. */
+    ownTree?: string | null;
+    /** The branch that checkout stands on, named in the reason. */
+    runBranch?: string | null;
+    /** The run's checkout is detached by design: it owns no branch a detach could break. */
+    detached?: boolean;
+  },
 ): { verdict: 'deny' | 'ask' | 'allow'; rule: string; reason: string } | null {
   if (toolName !== 'Bash' || !ctx.cwd || !ctx.runTrees.length) return null;
   const command = (input as { command?: unknown } | null)?.command;
@@ -162,6 +233,8 @@ export function treeGuard(
   const runTrees = ctx.runTrees.map((tree) => resolve(tree));
   const inRunTree = (path: string): string | undefined => runTrees.find((tree) => inside(path, tree));
   const root = ctx.runRoot ? resolve(ctx.runRoot) : null;
+  const ownTree = ctx.ownTree && !ctx.detached ? resolve(ctx.ownTree) : null;
+  const branch = ctx.runBranch ? `\`${ctx.runBranch}\`` : 'the run branch';
   let cwd = resolve(ctx.cwd);
   let submodule: 'ask' | 'allow' | null = null;
   let where = '';
@@ -197,6 +270,22 @@ export function treeGuard(
       }
       if (verb === 'submodule') {
         if (inRunTree(dir)) { submodule = 'ask'; where = dir; } else if (root && inside(dir, root) && submodule !== 'ask') { submodule = 'allow'; where = dir; }
+      }
+      // A detach of the run's OWN checkout (control-tower phase 112, #183):
+      // measured, a release phase's session put its mirror on `origin/main` to
+      // make `task drift:*` green, and the next boarding was refused
+      // `isolation-refused` — a run never boards over a detached mount.
+      if ((verb === 'switch' || verb === 'checkout') && ownTree && inside(dir, ownTree)
+        && detaches(verb, words.slice(verbAt + 1)) && executesDetach(command)) {
+        return {
+          verdict: 'deny', rule: RUN_TREE_DETACH_RULE,
+          reason: `\`git ${verb}\` there would leave ${dir}, in the run's own checkout (${ownTree}), on a detached HEAD `
+            + `instead of ${branch} — and the console refuses the next boarding over a detached mount `
+            + '(`isolation-refused`). A release that squash-merged the branch needs no detach: once its content is on '
+            + `the trunk (a merge-tree proof) the console re-seats ${branch} on \`origin/main\` itself, before its own `
+            + 'verification and at the next boundary. Run a check that needs another commit in an errand tree, or '
+            + 'record the line red with this reason in your handoff.',
+        };
       }
     }
     if (words[0] === 'gh' && words[1] === 'repo' && words[2] === 'clone') {
@@ -739,7 +828,8 @@ export function stripWrappers(command: string): string | null {
 const NEVER_AUTO = /^(watch|setsid|flock)\b|(^|\s)find\s+.*\s-exec\b/;
 
 export function neverAutoApproves(command: string): boolean {
-  return commandSegments(command).some((segment) => NEVER_AUTO.test(segment));
+  // The commands the line RUNS (#189) — a here-doc that mentions `watch` hides nothing.
+  return bashSubjects(command).some((segment) => NEVER_AUTO.test(segment));
 }
 
 /** How many words deep to look inside a wrapper. Long enough for any real one. */
@@ -954,15 +1044,722 @@ export function planRule(toolName: string, input: unknown): string | null {
  */
 export type ToolVerdict = Decision | 'ask';
 
-/** Everything a rule may match about one call: the input, and each command a shell line would run. */
+/**
+ * Everything a rule may match about one call: the input — or, for a shell
+ * line, each command it would RUN (`bashSubjects`).
+ */
 function callSubjects(toolName: string, input: unknown): unknown[] {
-  const subjects: unknown[] = [input];
   const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
-  if (typeof command === 'string') {
-    for (const segment of commandSegments(command)) subjects.push({ command: segment });
-  }
-  return subjects;
+  if (typeof command !== 'string') return [input];
+  return bashSubjects(command).map((text) => ({ command: text }));
 }
+
+/**
+ * The texts a rule is matched against for one shell line (control-tower phase
+ * 107, #189): each command the shell would RUN, as `shell-reading.ts` reads
+ * it, each also peeled of the CLI's documented wrappers — and never the data
+ * around them. A quoted here-doc's body, a `python3 -c`/`node -e` payload and a
+ * quoted argument match no `Bash(<cmd>:*)` rule: the raw-segment reading this
+ * replaced split a handoff-writing `python3 - <<'EOF'` at the `&&` inside its
+ * text, found a `git push`, and parked a release phase on a person's card.
+ *
+ * Never weaker than that reading: a `$( … )`, a group, a compound, a shell's
+ * `-c` payload and an unquoted here-doc's substitutions are all commands here,
+ * which the raw split never saw — and where the reader names something it
+ * could not resolve (an `eval` of a variable, a command word that is an
+ * expansion, a program read from a pipe, text that never closes), the raw line
+ * and its old segments are matched as well.
+ */
+export function bashSubjects(command: string): string[] {
+  const reading = readShell(command);
+  const out = new Set<string>();
+  for (const text of executedTexts(reading)) {
+    out.add(text);
+    const inner = stripWrappers(text);
+    if (inner) out.add(inner);
+  }
+  if (reading.opaque.length) {
+    out.add(command);
+    for (const segment of commandSegments(command)) out.add(segment);
+    // A publishing verb the reader could not place still names itself — the
+    // raw text from each one on — where the line's own shell may RUN that
+    // text: a value an `eval` or a `$CMD` runs, a program piped into a shell,
+    // a script the line wrote. So "a push may be hidden in an `eval`" is
+    // asked about rather than allowed unread, while a push named in a quoted
+    // argument (a ruling's `--what`) stays data.
+    if (reading.opaque.some((o) => HIDDEN_KINDS.has(o.kind))) {
+      for (const hit of command.matchAll(HIDDEN_PUBLISHING)) out.add(command.slice(hit.index));
+    }
+  }
+  return [...out];
+}
+
+/** The rule name a forged gate approval is denied under (control-tower phase 107, #174). */
+export const GATE_FORGE_RULE = 'gate-forge';
+
+/** The gate file of a plan's work-state — `docs/handoffs/<slug>/gate-status.md` — which `gate-approve.sh` alone writes. */
+const GATE_FILE = /(?:^|\/)docs\/handoffs\/[^/]+\/gate-status\.md$/;
+
+/**
+ * Why a call would forge a gate approval, or null (control-tower phase 107,
+ * #174). A manual gate's approval counts only from a person's DOOR, which
+ * `gate-approve.sh` names from its own environment and writes in
+ * `gate-status.md`. Two direct ways a session could forge one: set the
+ * console's own door (`PE_GATE_DOOR`, by assignment, `export` or `env` — a
+ * grep for the name is data, read as the shell reads it), or write the gate
+ * file with the file tools. Inside one OS user nothing is unforgeable (a
+ * shell redirect still writes a file); this walls the paths a session takes.
+ */
+export function gateForgeCall(toolName: string, input: unknown): string | null {
+  const fields = (input ?? {}) as Record<string, unknown>;
+  if (toolName === 'Bash') {
+    const command = fields.command;
+    if (typeof command !== 'string' || !command.includes('PE_GATE_DOOR')) return null;
+    const reading = readShell(command);
+    const door = (w: string) => /^PE_GATE_DOOR(?:=|$)/.test(w);
+    const sets = reading.assigned.some(door) || reading.commands.some((c) => (
+      c.words.slice(0, Math.max(0, c.words.length - c.lead.length)).some(door)
+      || (['export', 'declare', 'typeset', 'readonly', 'local', 'env'].includes(c.lead[0] ?? '') && c.lead.some(door))
+    ));
+    return sets || reading.opaque.length ? 'it sets the console\'s own gate door (`PE_GATE_DOOR`), which only the console sets for a person\'s press' : null;
+  }
+  if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit' || toolName === 'NotebookEdit') {
+    const path = fields.file_path ?? fields.notebook_path;
+    if (typeof path === 'string' && GATE_FILE.test(path)) {
+      return 'it writes gate-status.md, which only gate-approve.sh writes — a manual gate is approved on the Gate card or in a person\'s own terminal';
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * The console-forge guard (control-tower phase 129, #218)
+ * ------------------------------------------------------------------ */
+
+/** The rule name a supervised session's press of its own console is denied under (control-tower phase 129, #218). */
+export const CONSOLE_FORGE_RULE = 'console-forge';
+
+/** A press the guard found: what it is, why, and what to declare instead. */
+export type ConsoleForge = {
+  /** An `AUTHORITY_VERBS` member, or `CONSOLE_FILES_VERB` for the console's own files. */
+  verb: string;
+  /** One clause: "it would answer a permission card through `phase-console run approve`". */
+  why: string;
+  declare: AuthorityRoute['declare'];
+  /** The CLI forms a `permission.destructive` row may name this press by. */
+  names: string[];
+  /** The console file it would write. */
+  path?: string;
+};
+
+/** What the guard knows about the console it guards. */
+export type ConsoleForgeContext = {
+  /** `stateHome()` — runs, approvals, accounts, the fleet's token, the plugin's clone. */
+  stateDir: string;
+  /** `configDir()` — the policy, the machine profile, the registry. */
+  configDir: string;
+  /** The ports a console of this machine answers on (`consolePorts`). */
+  ports: ReadonlySet<number>;
+  /** The hook's cwd, for a relative path. */
+  cwd?: string | null;
+  /** What `~` and `$HOME` mean; this process's home by default. */
+  home?: string;
+};
+
+/** Programs the shell runs as an HTTP request. */
+const HTTP_CLIENTS: ReadonlySet<string> = new Set(['curl', 'wget', 'http', 'https', 'xh', 'xhs']);
+/** httpie and xh, which read a body from their input. */
+const STDIN_CLIENTS: ReadonlySet<string> = new Set(['http', 'https', 'xh', 'xhs']);
+/** Programs that write a request by hand onto a socket — their whole line is the request. */
+const RAW_SOCKETS = /^(?:nc|ncat|netcat|socat|telnet|openssl)$/;
+/** Programs that run a payload the shell cannot read — what a wrapper is. */
+const INTERPRETERS = /^(?:python[\d.]*|pypy[\d.]*|node|nodejs|deno|bun|ruby|perl|php|osascript|pwsh|powershell|lua|tclsh|[gmn]?awk|g?sed)$/;
+/** Shells, and the builtins that run a file in the current one. */
+const SHELLS = /^(?:bash|sh|zsh|dash|ksh|fish|source|\.)$/;
+/** An interpreter's options that hand it its program inline (`python3 -c`, `node -e`, `php -r`, `deno eval`). */
+const INLINE_CODE = /^(?:-[ceEpr]|--eval|--print|--command|eval)$/;
+/** What the CLI's program word is, run directly or by path. */
+const CLI_PROGRAMS: ReadonlySet<string> = new Set(['phase-console', 'phase-console.mjs']);
+/** Leads that run a script file named by their first word: the CLI's bin is one. */
+const SCRIPT_RUNNERS = /^(?:node|nodejs|bun|deno|bash|sh|zsh|dash|ksh)$/;
+/** Package runners that run the program named after their own options. */
+const PACKAGE_RUNNERS = /^(?:npx|bunx|pnpx)$/;
+/** A runner's options that take the next word as their value. */
+const RUNNER_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-r', '--require', '--import', '--loader', '--experimental-loader', '-C', '--conditions', '--env-file',
+  '-p', '--package',
+]);
+/** Programs that write, move, link or remove the files they name. */
+const FILE_WRITERS = /^(?:cp|mv|install|rsync|ln|rm|unlink|truncate|touch|chmod|chown|chgrp|shred|dd|g?sed|perl)$/;
+/** curl's short options that take a value — the rest of a cluster after one is that value. */
+const CURL_VALUE_SHORT = 'AbcCDeEHKmoPQrtuUwyYz';
+const HTTP_METHOD = /^(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|TRACE|CONNECT)$/i;
+/** The console's own mutation header (`api/routes.ts` `guardMutation`). */
+const CONSOLE_HEADER = /x-phase-console/i;
+/** A loopback address and a port, as text writes them — a URL, `('127.0.0.1', 4130)`, `nc 127.0.0.1 4130`. */
+const ADDRESS_IN_TEXT = /(?:localhost|127(?:\.\d{1,3}){3}|::1|0\.0\.0\.0)\]?['"]?(?:\s*[:,]\s*|\s+|\/)(\d{2,5})\b/g;
+/** A proxy setting in text: `http_proxy=…`, `ALL_PROXY=…`. */
+const PROXY_IN_TEXT = /\b(?:https?|all)_proxy\s*=\s*['"]?(\S+)/gi;
+/** A console path as text writes it, the fleet's mount included. */
+const API_PATH_IN_TEXT = /(?:\/c\/[^\s/'"`]+)?\/api\/[^\s'"`<>)\]},;]*/g;
+/**
+ * Leads that treat their arguments as data: a client's name after one is text
+ * (`echo curl …`), never a program it runs.
+ */
+const DATA_LEADS: ReadonlySet<string> = new Set(['echo', 'printf', 'grep', 'egrep', 'fgrep', 'cat', 'which', 'type', 'whereis']);
+/** A CLI press as text writes it: the program, then `run`'s flags or none, then the verb. */
+const CLI_IN_TEXT = /phase-console(?:\.mjs)?\b[^\n]*?\b(run|supervisor)\b(?:\s+--(?:json|console\s+\S+))*\s+([a-z][\w-]*)/g;
+/** A command line inside one argument word: optionally after `key=` or `--opt=`, and a git alias's `!`. */
+const EMBEDDED = /^\s*(?:-{0,2}[\w.-]+=)?!?((\S+)\s[\s\S]*)$/;
+/** Options whose value is prose — a commit message, a reason, a body — and never a command. */
+const PROSE_FLAGS = /^(?:-m|--message|--body|--title|--reason|--text|--what|--why|--note|--subject|--cost-if-wrong|--description|--comment)(?:=|$)/;
+
+let portsCache: { at: number; ports: ReadonlySet<number> } | null = null;
+
+/**
+ * The ports a console of this machine answers on: the default, the derived
+ * range, the fleet supervisor's and every registered instance's (a pinned port
+ * may lie outside the range). Read again at most once a minute.
+ */
+export function consolePorts(own?: number): ReadonlySet<number> {
+  const now = Date.now();
+  if (!portsCache || now - portsCache.at > 60_000) {
+    const ports = new Set<number>([DEFAULT_PORT]);
+    for (let port = PORT_RANGE_START; port < PORT_RANGE_START + PORT_RANGE_SIZE; port += 1) ports.add(port);
+    try {
+      for (const entry of Object.values(readRegistry().instances) as { port?: unknown }[]) {
+        if (Number.isInteger(entry.port)) ports.add(entry.port as number);
+      }
+    } catch { /* an unreadable registry leaves the range */ }
+    portsCache = { at: now, ports };
+  }
+  if (!own || portsCache.ports.has(own)) return portsCache.ports;
+  return new Set([...portsCache.ports, own]);
+}
+
+/** curl's globs — `{a,b}` sets and `[a-z]` / `[1-9]` ranges — expanded, bounded. */
+function expandGlobs(word: string): string[] {
+  let out = [word];
+  for (let round = 0; round < 6; round += 1) {
+    const next: string[] = [];
+    for (const w of out) {
+      const set = /\{([^{}]*)\}/.exec(w);
+      const range = /\[([a-zA-Z]-[a-zA-Z]|\d+-\d+)(?::\d+)?\]/.exec(w);
+      const m = set ?? range;
+      if (!m) { next.push(w); continue; }
+      let alts: string[] = [];
+      if (m === set) alts = (m[1] ?? '').split(',');
+      else {
+        const [from = '', to = ''] = (m[1] ?? '').split('-');
+        if (/^\d+$/.test(from)) {
+          for (let n = Number(from); n <= Number(to) && alts.length < 64; n += 1) alts.push(String(n).padStart(from.length, '0'));
+        } else {
+          for (let c = from.charCodeAt(0); c <= to.charCodeAt(0) && alts.length < 64; c += 1) alts.push(String.fromCharCode(c));
+        }
+      }
+      for (const alt of alts) next.push(w.slice(0, m.index) + alt + w.slice(m.index + m[0].length));
+    }
+    if (next.length === out.length && next.every((w, i) => w === out[i])) break;
+    out = next.slice(0, 256);
+  }
+  return out;
+}
+
+/** The URLs a word names, as each client reads a word: a scheme, httpie's `:port` shorthand, or `[user@]host:port/…`. */
+function urlsOf(word: string, glob: boolean): URL[] {
+  const out: URL[] = [];
+  for (const w of glob ? expandGlobs(word) : [word]) {
+    let text: string | null = null;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(w)) text = w;
+    else if (/^:\d{1,5}(?:[/?#]|$)/.test(w)) text = `http://localhost${w}`;
+    else if (/^(?:[^\s/@]+@)?(?:[\w.-]+|\[[0-9a-f:.]+\]):\d{1,5}(?:[/?#]|$)/i.test(w)
+      || /^(?:[^\s/@]+@)?(?:localhost|127\.[\d.]+)(?:[/?#]|$)/i.test(w)) text = `http://${w}`;
+    if (!text) continue;
+    try { out.push(new URL(text)); } catch { /* not a URL after all */ }
+  }
+  return out;
+}
+
+/** A method word as a client was handed it, or null when only the shell knows it (`"$METHOD"`). */
+function methodWord(word: string | undefined): string | null {
+  return typeof word === 'string' && /^[A-Za-z]+$/.test(word) ? word.toUpperCase() : null;
+}
+
+/** One request a client makes: the URLs, the method (null when no reader can tell), its words, and whether it goes through a console as a proxy. */
+type HttpRequest = { urls: URL[]; method: string | null; words: string[]; proxied: boolean };
+
+/** Does a proxy value point at a console? */
+function consoleProxy(value: string | undefined, ports: ReadonlySet<number>): boolean {
+  if (!value) return false;
+  return urlsOf(value, false).some((url) => ports.has(url.port ? Number(url.port) : 80));
+}
+
+/** curl's request for one `--next`-separated segment of its arguments. */
+function curlRequest(args: readonly string[], ports: ReadonlySet<number>): HttpRequest {
+  const words: string[] = [];
+  let explicit: string | null | undefined;
+  let data = false;
+  let head = false;
+  let get = false;
+  let target: string | undefined;
+  let proxied = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] ?? '';
+    const long = /^--([a-z][\w-]*)(?:=([\s\S]*))?$/.exec(a);
+    if (long) {
+      const [, name = '', inline] = long;
+      if (name === 'request') explicit = methodWord(inline ?? args[i + 1]);
+      else if (/^(?:data(?:-[a-z]+)?|json|form(?:-string)?|upload-file)$/.test(name)) data = true;
+      else if (name === 'head') head = true;
+      else if (name === 'get') get = true;
+      else if (name === 'url' && inline) words.push(inline);
+      else if (name === 'request-target') target = inline ?? args[i + 1];
+      else if (name === 'proxy' || name === 'preproxy') proxied ||= consoleProxy(inline ?? args[i + 1], ports);
+      continue;
+    }
+    if (/^-[A-Za-z]/.test(a)) {
+      for (let j = 1; j < a.length; j += 1) {
+        const c = a[j] ?? '';
+        if (c === 'X') { explicit = methodWord(a.slice(j + 1) || args[i + 1]); break; }
+        if (c === 'x') { proxied ||= consoleProxy(a.slice(j + 1) || args[i + 1], ports); break; }
+        if (c === 'd' || c === 'F' || c === 'T') { data = true; break; }
+        if (c === 'I') head = true;
+        if (c === 'G') get = true;
+        if (CURL_VALUE_SHORT.includes(c)) break;
+      }
+      continue;
+    }
+    words.push(a);
+  }
+  const method = explicit !== undefined ? explicit : get ? 'GET' : data ? 'POST' : head ? 'HEAD' : 'GET';
+  const urls = words.flatMap((w) => urlsOf(w, true));
+  // `--request-target` sends ITS path to the URL's host, whatever the URL's path says.
+  const sent = target ? urls.flatMap((url) => { try { return [new URL(target!, url)]; } catch { return []; } }) : [];
+  return { urls: [...urls, ...sent], method, words, proxied };
+}
+
+/**
+ * The requests one HTTP client makes. curl's `--next` (`-:`) starts a fresh
+ * request with fresh options, so each segment is read on its own; httpie and
+ * xh send a body read from their input as a POST, so a client whose input the
+ * line feeds (`|`, `<`) has a method no reader can tell.
+ */
+function httpRequests(client: string, args: readonly string[], ports: ReadonlySet<number>, fed: boolean): HttpRequest[] {
+  if (client === 'curl') {
+    const segments: string[][] = [[]];
+    for (const a of args) {
+      if (a === '--next' || a === '-:') segments.push([]);
+      else segments[segments.length - 1]!.push(a);
+    }
+    return segments.map((segment) => curlRequest(segment, ports));
+  }
+  const words: string[] = [];
+  let explicit: string | null | undefined;
+  let data = false;
+  if (client === 'wget') {
+    let proxied = false;
+    for (let i = 0; i < args.length; i += 1) {
+      const a = args[i] ?? '';
+      const long = /^--([a-z][\w-]*)(?:=([\s\S]*))?$/.exec(a);
+      if (long) {
+        if (long[1] === 'method') explicit = methodWord(long[2] ?? args[i + 1]);
+        else if (/^(?:post|body)-(?:data|file)$/.test(long[1] ?? '')) data = true;
+        else if (long[1] === 'execute' && /proxy\s*=/.test(long[2] ?? args[i + 1] ?? '')) proxied = true;
+        continue;
+      }
+      if (!a.startsWith('-')) words.push(a);
+    }
+    return [{ urls: words.flatMap((w) => urlsOf(w, false)), method: explicit !== undefined ? explicit : data ? 'POST' : 'GET', words, proxied }];
+  }
+  // httpie (`http`, `https`) and xh: `[METHOD] URL [items]` — an item that
+  // carries data (`k=v`, `k:=json`, `@file`, `k@file`) makes it a POST.
+  if (args.includes('--offline')) return [];
+  let stdin = STDIN_CLIENTS.has(client) && fed && !args.includes('--ignore-stdin') && !args.includes('-I');
+  for (const a of args) {
+    if (a.startsWith('-')) {
+      if (a === '--form' || a === '-f' || a === '--multipart' || /^--raw(?:=|$)/.test(a)) data = true;
+      continue;
+    }
+    if (HTTP_METHOD.test(a)) { explicit = a.toUpperCase(); continue; }
+    if (urlsOf(a, false).length) { words.push(a); continue; }
+    if (/:=|@/.test(a) || /(?:^|[^=])=(?:$|[^=])/.test(a)) data = true;
+  }
+  if (explicit !== undefined) stdin = false;
+  return [{
+    urls: words.flatMap((w) => urlsOf(w, false)),
+    method: explicit !== undefined ? explicit : data ? 'POST' : stdin ? null : 'GET',
+    words,
+    proxied: false,
+  }];
+}
+
+/**
+ * The fenced row a request presses, or null: a console's address and a row's
+ * path. An address is a console's when it names a console's PORT — on any
+ * host, since a name for this machine need not look like one (`localhost.`, a
+ * hosts-file alias) — when it is the fleet supervisor's `/c/<id>/` mount, when
+ * the request goes through a console as its proxy, or when the call carries
+ * the console's own header, which is what makes any address a console's.
+ */
+function pressOf(url: URL, request: HttpRequest, header: boolean, ports: ReadonlySet<number>): Readonly<AuthorityRoute> | null {
+  const port = url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80;
+  if (!header && !request.proxied && !ports.has(port) && !/^\/c\/[^/]+\/api\//.test(url.pathname)) return null;
+  return authorityRouteOf(request.method, url.pathname);
+}
+
+/** A program this guard reads: a client, the CLI, a runner of either, a shell, an interpreter, a raw socket. */
+function knownProgram(program: string): boolean {
+  return HTTP_CLIENTS.has(program) || CLI_PROGRAMS.has(program) || SCRIPT_RUNNERS.test(program) || SHELLS.test(program)
+    || PACKAGE_RUNNERS.test(program) || INTERPRETERS.test(program) || RAW_SOCKETS.test(program);
+}
+
+type Lead = { lead: string[]; expands: boolean };
+
+/**
+ * The commands a reading runs, each as its program and its arguments — and,
+ * behind a lead the reader does not peel (`caffeinate`, `arch -arm64`,
+ * `gtimeout 5`, `proxychains`), the program it runs as well: the first word
+ * after it that names one this guard reads.
+ */
+function effectiveLeads(reading: ShellReading): Lead[] {
+  const out: Lead[] = [];
+  for (const c of reading.commands) {
+    const lead = c.lead.length ? c.lead : c.words;
+    out.push({ lead, expands: c.expands });
+    const first = basename(lead[0] ?? '');
+    if (knownProgram(first) || DATA_LEADS.has(first)) continue;
+    // `.` and `source` are builtins no wrapper can run, and `.` is a search
+    // path far more often than a program (`rg -n … .`).
+    const at = lead.findIndex((word, i) => i > 0 && word !== '.' && word !== 'source' && knownProgram(basename(word)));
+    if (at > 0) out.push({ lead: lead.slice(at), expands: c.expands });
+  }
+  return out;
+}
+
+/** The command line one argument word carries (`alias.p=!env curl …`), or null. */
+function embeddedLine(word: string): string | null {
+  return EMBEDDED.exec(word)?.[1] ?? null;
+}
+
+/** Does a line, read as the shell reads it, run a program this guard reads — behind any wrapper or assignment? */
+function runsKnownProgram(line: string): boolean {
+  return effectiveLeads(readShell(line)).some(({ lead }) => knownProgram(basename(lead[0] ?? '')));
+}
+
+/** The argument words of a lead that may carry a command line of their own — never a prose option's value. */
+function commandWords(lead: readonly string[]): string[] {
+  if (DATA_LEADS.has(basename(lead[0] ?? ''))) return [];
+  return lead.slice(1).filter((word, i) => !PROSE_FLAGS.test(word) && !PROSE_FLAGS.test(lead[i] ?? ''));
+}
+
+/** The words after the CLI's program, when a command runs the CLI — directly, by path, through a runner. */
+function cliArgsOf(lead: readonly string[]): string[] | null {
+  const program = basename(lead[0] ?? '');
+  if (CLI_PROGRAMS.has(program)) return lead.slice(1);
+  if (!SCRIPT_RUNNERS.test(program) && !PACKAGE_RUNNERS.test(program)) return null;
+  for (let i = 1; i < lead.length; i += 1) {
+    const word = lead[i] ?? '';
+    if (word.startsWith('-')) {
+      if (RUNNER_VALUE_FLAGS.has(word)) i += 1;
+      continue;
+    }
+    if (program === 'deno' && word === 'run') continue;
+    return CLI_PROGRAMS.has(basename(word)) ? lead.slice(i + 1) : null;
+  }
+  return null;
+}
+
+/** A row's forge, told by the door the call took. */
+function routeForge(row: Readonly<AuthorityRoute>, door: 'route' | 'wrapper' | { cli: string }): ConsoleForge {
+  const through = typeof door === 'object'
+    ? `\`phase-console ${door.cli}\``
+    : `the console's own route (${row.method} ${row.path})${door === 'wrapper' ? ', from inside a wrapper' : ''}`;
+  return {
+    verb: row.verb,
+    why: `it would ${row.summary} through ${through}`,
+    declare: row.declare,
+    names: typeof door === 'object' ? [door.cli] : [...row.cli],
+  };
+}
+
+/** A path a write names, made absolute the way the shell would — or null when only the shell knows it. */
+function writtenPath(word: string, ctx: ConsoleForgeContext): string | null {
+  const home = ctx.home ?? homedir();
+  let path = word.trim();
+  if (path === '~' || path.startsWith('~/')) path = home + path.slice(1);
+  path = path.replace(/^\$(?:HOME\b|\{HOME\})/, home);
+  if (!path || /[`$]/.test(path)) return null;
+  if (!isAbsolute(path)) {
+    if (!ctx.cwd) return null;
+    path = resolve(ctx.cwd, path);
+  }
+  return resolve(path);
+}
+
+/** A path with its symbolic links followed — a link's target, even one not there yet, is what a write reaches. */
+function realPath(path: string, depth = 0): string {
+  try { return realpathSync.native(path); } catch { /* not there, or a link to nothing yet */ }
+  try {
+    if (depth < 8 && lstatSync(path).isSymbolicLink()) return realPath(resolve(dirname(path), readlinkSync(path)), depth + 1);
+  } catch { /* not a link either */ }
+  try { return join(realpathSync.native(dirname(path)), basename(path)); } catch { return path; }
+}
+
+/** A Claude Code config dir's files the console's sessions never write: the settings that carry the hooks, and the login. */
+const ACCOUNT_CONFIG_FENCED = /^(?:settings(?:\.local)?\.json|\.credentials\.json)$/;
+
+/**
+ * Does a path lie under the console's state or config directories — where only
+ * the console writes? Two homes under the state directory are a session's own,
+ * because the console puts them there: a run's checkout under
+ * `runs/<instance>/<slug>/worktrees/` (`worktreeRoot: state`), and the Claude
+ * Code config dir it keeps for an account (`…/accounts/<id>/config/`), where a
+ * session writes its memory, its plans and its transcripts — all but the
+ * settings that carry its hooks and its login.
+ */
+function underConsole(path: string, stateDir: string, configDir: string): boolean {
+  // The directory itself counts: `cp x <config>` writes `<config>/x`.
+  const under = (dir: string) => {
+    const rel = relative(dir, path);
+    if (rel === '') return [];
+    return !rel.startsWith('..') && !isAbsolute(rel) ? rel.split(sep) : null;
+  };
+  if (under(configDir)) return true;
+  const parts = under(stateDir);
+  if (!parts) return false;
+  if (parts[0] === 'runs' && parts[3] === 'worktrees' && parts.length > 4) return false;
+  const account = parts.findIndex((part, i) => part === 'accounts' && parts[i + 2] === 'config');
+  if (account >= 0 && parts.length > account + 3) {
+    const inside = parts.slice(account + 3);
+    return inside.length === 1 && ACCOUNT_CONFIG_FENCED.test(inside[0] ?? '');
+  }
+  return true;
+}
+
+/** Is a write to this path a write to the console's files — as written, or where its links lead? */
+function consoleFile(path: string, ctx: ConsoleForgeContext): boolean {
+  const real = realPath(path);
+  const dirs: [string, string][] = [[ctx.stateDir, ctx.configDir], [realPath(ctx.stateDir), realPath(ctx.configDir)]];
+  return [path, real].some((p) => dirs.some(([state, config]) => underConsole(p, state, config)));
+}
+
+function filesForge(path: string): ConsoleForge {
+  return {
+    verb: CONSOLE_FILES_VERB,
+    why: `it writes ${path} — the console's own state, which only the console writes`,
+    declare: { status: 'blocked', needs: 'permission' },
+    names: [],
+    path,
+  };
+}
+
+/** The files a file-writing program changes: every operand, but a copy's source is only read. */
+function fileOperands(lead: readonly string[]): string[] {
+  const program = basename(lead[0] ?? '');
+  const args = lead.slice(1);
+  if (program === 'dd') return args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3));
+  if (/^(?:g?sed|perl)$/.test(program) && !args.some((a) => /^(?:-[A-Za-z]*i|--in-place)/.test(a))) return [];
+  const operands = args.filter((a) => !a.startsWith('-'));
+  if (/^(?:cp|install|rsync)$/.test(program)) {
+    const target = args.find((a, i) => /^--target-directory=/.test(a) || args[i - 1] === '-t');
+    return target ? [target.replace(/^--target-directory=/, '')] : operands.slice(-1);
+  }
+  return operands;
+}
+
+/** Does a shell or interpreter run text that is not a file it was named — inline, or read from its input? */
+function runsInlineText(lead: readonly string[]): boolean {
+  const program = basename(lead[0] ?? '');
+  const args = lead.slice(1);
+  if (INTERPRETERS.test(program) && args.some((a) => INLINE_CODE.test(a))) return true;
+  // awk and sed take their program as their first argument unless `-f` names a file.
+  if (/^(?:[gmn]?awk|g?sed)$/.test(program)) return !args.includes('-f');
+  if (!SHELLS.test(program) && !INTERPRETERS.test(program)) return false;
+  const file = args.find((a) => !a.startsWith('-') || a === '-');
+  return file === undefined || file === '-' || file === '/dev/stdin' || file.startsWith('$(');
+}
+
+/**
+ * Does the line run text a reader of its words cannot see into? A line the
+ * reader could not resolve; a request written onto a socket by hand (`nc`,
+ * `/dev/tcp`); a here-string or a process substitution; an alias the line
+ * defines; a shell or interpreter running inline code or its input; an HTTP
+ * client whose URL it does not hold itself (`"$URL"`, a URL piped into
+ * `xargs curl`); a program named inside an argument. Then the WHOLE line is
+ * what is judged.
+ */
+function runsHiddenText(command: string, reading: ShellReading, leads: readonly Lead[], ports: ReadonlySet<number>): boolean {
+  if (reading.opaque.length || /\/dev\/(?:tcp|udp)\/|<<<|[<>]\(|\balias\s+[\w.-]+=/.test(command)) return true;
+  return leads.some(({ lead, expands }) => {
+    const program = basename(lead[0] ?? '');
+    if (RAW_SOCKETS.test(program) || runsInlineText(lead)) return true;
+    if (HTTP_CLIENTS.has(program)) {
+      return expands || httpRequests(program, lead.slice(1), ports, true).every((request) => !request.urls.length);
+    }
+    return commandWords(lead).some((word) => {
+      const line = embeddedLine(word);
+      return Boolean(line && runsKnownProgram(line));
+    });
+  });
+}
+
+/**
+ * Every fenced press written into text: a console's address and a row's path
+ * — whatever the method, since text that hides its program hides its method
+ * too — or the CLI's program and a fenced verb.
+ */
+function pressesInText(text: string, ports: ReadonlySet<number>): ConsoleForge[] {
+  const out: ConsoleForge[] = [];
+  let address = CONSOLE_HEADER.test(text);
+  if (!address) {
+    for (const m of text.matchAll(ADDRESS_IN_TEXT)) {
+      if (ports.has(Number(m[1]))) { address = true; break; }
+    }
+  }
+  if (address) {
+    for (const m of text.matchAll(API_PATH_IN_TEXT)) {
+      const row = authorityRouteOf(null, m[0]);
+      if (row) out.push(routeForge(row, 'wrapper'));
+    }
+  }
+  for (const m of text.matchAll(CLI_IN_TEXT)) {
+    const form = cliFormOf([m[1] ?? '', m[2] ?? '']);
+    const row = form ? AUTHORITY_ROUTES.find((r) => r.cli.includes(form)) : undefined;
+    if (row && form) out.push(routeForge(row, { cli: form }));
+  }
+  return out;
+}
+
+/** Every press one call would make, in the order the line makes them. */
+function forgesOf(toolName: string, input: unknown, ctx: ConsoleForgeContext, depth: number): ConsoleForge[] {
+  const fields = (input ?? {}) as Record<string, unknown>;
+  if (toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit' || toolName === 'NotebookEdit') {
+    const named = fields.file_path ?? fields.notebook_path;
+    const path = typeof named === 'string' ? writtenPath(named, ctx) : null;
+    return path && consoleFile(path, ctx) ? [filesForge(path)] : [];
+  }
+  if (toolName !== 'Bash' || typeof fields.command !== 'string') return [];
+  const command = fields.command;
+  const reading = readShell(command);
+  const leads = effectiveLeads(reading);
+  const out: ConsoleForge[] = [];
+
+  // The console's own files: a redirection, `tee`, and a program that writes,
+  // moves, links or removes the files it names.
+  const targets = [...reading.writes];
+  // `>|` (a redirection past `noclobber`) is split at its bar by the statement
+  // reader, so its target is read from the text here.
+  for (const m of command.matchAll(/>\|\s*(?:"([^"]*)"|'([^']*)'|([^\s;&|<>]+))/g)) targets.push(m[1] ?? m[2] ?? m[3] ?? '');
+  for (const { lead } of leads) {
+    const program = basename(lead[0] ?? '');
+    if (program === 'tee') targets.push(...lead.slice(1).filter((w) => !w.startsWith('-')));
+    else if (FILE_WRITERS.test(program)) targets.push(...fileOperands(lead));
+  }
+  for (const target of targets) {
+    const path = writtenPath(target, ctx);
+    if (path && consoleFile(path, ctx)) out.push(filesForge(path));
+  }
+
+  // A console proxy named on the line (`http_proxy=…`) carries every request.
+  const proxyEnv = [...command.matchAll(PROXY_IN_TEXT)].some((m) => consoleProxy(m[1], ctx.ports));
+  const header = CONSOLE_HEADER.test(command);
+  const fed = /[|<]/.test(command);
+  // The words of a request that only reads — taken out of the text the
+  // whole-line judgement below reads: they were read exactly, and press nothing.
+  const read: string[] = [];
+  for (const { lead } of leads) {
+    const program = basename(lead[0] ?? '');
+    if (HTTP_CLIENTS.has(program)) {
+      for (const request of httpRequests(program, lead.slice(1), ctx.ports, fed)) {
+        const seen = { ...request, proxied: request.proxied || proxyEnv };
+        for (const url of seen.urls) {
+          const row = pressOf(url, seen, header, ctx.ports);
+          if (row) out.push(routeForge(row, 'route'));
+        }
+        if (seen.method !== null && /^(?:GET|HEAD|OPTIONS)$/.test(seen.method)) read.push(...seen.words);
+      }
+      continue;
+    }
+    const args = cliArgsOf(lead);
+    const row = args ? authorityCliOf(args) : null;
+    if (row && args) out.push(routeForge(row, { cli: cliFormOf(args) ?? '' }));
+  }
+
+  // A command line handed to a program as ONE word — `script -qec "curl …"`,
+  // `rg --pre 'curl …'`, a git alias `alias.p=!curl …`, a pager
+  // `core.pager=curl …` — is read again as a line of its own.
+  if (depth < 2) {
+    for (const { lead } of leads) {
+      for (const word of commandWords(lead)) {
+        const line = embeddedLine(word);
+        if (line && runsKnownProgram(line)) out.push(...forgesOf('Bash', { command: line }, ctx, depth + 1));
+      }
+    }
+  }
+
+  if (runsHiddenText(command, reading, leads, ctx.ports)) {
+    let text = command;
+    for (const word of read) if (word.length > 4) text = text.split(word).join(' ');
+    out.push(...pressesInText(text, ctx.ports));
+  }
+  return out;
+}
+
+/**
+ * The first press of its own console a call would make that `excused` does
+ * not let through, or null (control-tower phase 129, #218). A supervised
+ * session runs as the operator's OS user, so the console's loopback API and
+ * CLI answer it as they answer the operator — one `curl` could answer its own
+ * card, strike a deny rule, raise its run to `bypass`, approve a manual gate
+ * or prove a person's step. Read as the shell reads the line (`readShell`): an
+ * HTTP client the shell runs against a console's address with a mutating
+ * method and a path in `AUTHORITY_ROUTES`; the CLI twin of such a route; or —
+ * where the line runs text no reader of its words can see into (an
+ * interpreter, an `eval`, a script piped into a shell, a here-string, a URL in
+ * a variable, a command line inside one argument) — text that carries a
+ * console address and a fenced path, or the CLI and a fenced verb. A write
+ * into the console's state or config directories — by the file tools, a
+ * redirection, `tee` or a program that writes, moves, links or removes files,
+ * judged where its links lead — is the same act by another door. EVERY press
+ * on the line is judged, so one a plan excuses carries no other. Like
+ * `gateForgeCall`, this walls the paths a session takes; a payload assembled
+ * at run time, or a script written by one call and run by the next, is past
+ * what a reader of one line can see.
+ */
+export function consoleForgeCall(
+  toolName: string, input: unknown, ctx: ConsoleForgeContext, excused?: (forge: ConsoleForge) => boolean,
+): ConsoleForge | null {
+  return forgesOf(toolName, input, ctx, 0).find((forge) => !excused?.(forge)) ?? null;
+}
+
+/**
+ * The rule of a plan's `permission.destructive` row that names a forged press,
+ * or null (control-tower phase 129). `rules` are the row's exceptions for the
+ * running phase (`destructiveExceptions(value, {phase})`, as phase 107's
+ * auto-grant reads them). A press is named by its CLI form, whichever door it
+ * took (`phase-console run approve` names the card's route too) — never by a
+ * rule that happens to match the line it rides on. The console's own files are
+ * no row's to hand out.
+ */
+export function consoleForgeException(rules: readonly string[], forge: ConsoleForge): string | null {
+  if (forge.verb === CONSOLE_FILES_VERB) return null;
+  const named = new Set(forge.names.map((form) => `Bash(phase-console ${form}:*)`));
+  return rules.find((rule) => named.has(rule)) ?? null;
+}
+
+/** What a session is told when the guard denies it — the declaration to make instead, in the console's own voice. */
+export function consoleForgeRefusal(forge: ConsoleForge, outcome: string): string {
+  return `blocked by the console (rule: ${CONSOLE_FORGE_RULE}): ${forge.why}. `
+    + 'A session never presses its own console — a permission card, the policy, a run\'s permissions, a gate and a '
+    + 'person\'s step are a person\'s to press, and the console\'s files are its own. Hand off and declare what you need: '
+    + `\`${outcome} ${forge.declare.status} --needs ${forge.declare.needs} --reason "<what a person must press, and why>"\`. `
+    + 'This is standing policy, not a person rejecting your work — do not retry it another way.';
+}
+
+/** What the reader could not resolve that the line's own shell may still run as text. */
+const HIDDEN_KINDS: ReadonlySet<string> = new Set(['eval', 'dynamic', 'stdin', 'script']);
+/** The publishing verbs (`OPEN_PR_ASK` ∪ `PUBLISH_ASK`) as they read in raw text. */
+const HIDDEN_PUBLISHING = /\b(?:git\s+push|gh\s+pr\s+(?:create|merge))\b/g;
 
 /** The first of `rules` that matches this call, or null. */
 function firstMatch(rules: readonly string[], toolName: string, input: unknown): string | null {
@@ -1071,11 +1868,9 @@ export function hitsHidden(command: string, toolName: string, rules: string[]): 
 export function matchedDenyRule(
   toolName: string, input: unknown, policy: AutopilotPolicy,
 ): string | null {
-  const subjects: unknown[] = [input];
+  // The classifier's own subjects (#189), so the rule named is the one that decided.
+  const subjects = callSubjects(toolName, input);
   const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
-  if (typeof command === 'string') {
-    for (const segment of commandSegments(command)) subjects.push({ command: segment });
-  }
   const direct = policy.deny.find(
     (rule) => subjects.some((subject) => ruleMatches(rule, toolName, subject)),
   );
@@ -2105,12 +2900,33 @@ export type ManifestCheck = {
   value: string;
   /** `plan` (the plan's rows) · `run` (the run's stored manifest) · the row's own source. */
   source: string;
-  /** `allow` when the row covers this exact call; null when it does not. */
-  answer: 'allow' | null;
+  /**
+   * `allow` when the row covers this exact call; `deny` when it would cover
+   * the push in its bare form and this call is not that form (control-tower
+   * phase 107, #186) — answered at once, naming `bareForm`; null when it does
+   * not cover the act in any form, which is a person's card.
+   */
+  answer: 'allow' | 'deny' | null;
   why: string;
   /** The branch the row named that the push goes to, on an `allow` for a push. */
   branch?: string;
+  /** On a `deny`: the command the row would answer, to run in a call of its own. */
+  bareForm?: string;
 };
+
+/**
+ * What a session is told when the manifest answers its push `deny` (control-
+ * tower phase 107, #186): the row allows the push, only not in this shape — so
+ * the one useful instruction is the bare form, run alone, and the read that
+ * came with it run separately. Shared by the hook's at-once answer and a card
+ * an automatic actor settles under the same answer.
+ */
+export function reshapeReason(check: Pick<ManifestCheck, 'why' | 'bareForm' | 'rule'>): string {
+  const act = check.rule === PUSH_DENY ? 'this push' : 'this command';
+  return `this plan's permission.destructive row allows ${act} in its bare form, not in this shape (${check.why}). `
+    + `Re-run \`${check.bareForm ?? 'it'}\` alone, then read its result in a separate call. `
+    + 'This is the plan\'s written answer, not a person rejecting your work.';
+}
 
 /**
  * The actors that settle a card with nobody's judgement behind it: the
@@ -2515,6 +3331,13 @@ export class Approvals {
         decision = 'allow';
         reason = `answered from the plan's permission.destructive row — ${check.why}; ${by} does not overrule the plan`;
         by = 'manifest';
+      } else if (check?.answer === 'deny') {
+        // The row allows the push bare, not in this shape (#186): still a no,
+        // but the plan's, naming the form to re-run — never a timeout that
+        // parks the run on an act the plan permits in writing.
+        approval.manifest = check;
+        reason = reshapeReason(check);
+        by = 'manifest';
       }
       clearClocks(entry);
       this.waiting.delete(approval.id);
@@ -2539,8 +3362,9 @@ export class Approvals {
       // held open past it — its timeout was fixed at spawn — so the session is
       // told no NOW (silence would fail open), and the card itself stands on a
       // standing card's clock, answerable. Unless the plan's manifest answers
-      // the call: the timeout's own settle turns that into `allow`, as ever.
-      if (approval.standsUntil && !approval.standing && this.manifestCheck(approval)?.answer !== 'allow') {
+      // the call: the timeout's own settle turns that into the manifest's
+      // `allow`, or its `deny` naming the bare form (#186), as ever.
+      if (approval.standsUntil && !approval.standing && !this.manifestCheck(approval)?.answer) {
         approval.standing = true;
         approval.converted = { at: new Date().toISOString() };
         approval.expiresAt = approval.standsUntil;

@@ -10,6 +10,18 @@
  */
 
 import type { HumanStepKind, HumanStepView } from '@shared/human-step-model.js';
+import type { InboxItem } from '@/lib/api';
+
+/**
+ * Is this inbox row an act that is not due yet — *Coming up* (control-tower
+ * phase 121, #182)? A ledger step born `upcoming` is shown, never a summons:
+ * the Tower and the approve head list it after what is due, and no run is
+ * summoned by it until its due-when ref lands.
+ */
+export function isUpcomingItem(item: Pick<InboxItem, 'humanStep' | 'ack'>): boolean {
+  // Only a ledger step is ever `upcoming` — a folded card has no such state.
+  return item.humanStep?.state === 'upcoming' && !item.ack;
+}
 
 /**
  * The five acts a card can lead with. `open` follows the step's link here;
@@ -37,6 +49,7 @@ export const PRIMARY_ACT: Readonly<Record<HumanStepKind, PrimaryAct>> = Object.f
   'interactive-prompt': 'terminal',
   captcha: 'open',
   'email-link': 'open',
+  'operator-act': 'terminal',
 });
 
 /** The kinds whose link is a sign-in — every other link is just a link. */

@@ -29,13 +29,14 @@
  */
 
 import { useMemo, useState } from 'react';
-import { FileText, Filter, X } from 'lucide-react';
+import { CircleDot, FileText, Filter, X } from 'lucide-react';
 import { useAttentionInbox, useConsoleState, usePlans, useRuns } from '@/lib/queries';
 import { usePrefs } from '@/lib/prefs';
 import { plural } from '@/lib/format';
 import {
   Banner,
   Button,
+  buttonVariants,
   Card,
   Disclosure,
   Empty,
@@ -45,6 +46,7 @@ import {
   type StatusNote,
 } from '@/components/ui';
 import { NewPlanButton } from '@/components/write-menu';
+import { repoHref } from '@/features/repo/routes';
 // The AI wizard, NOT gated on allowWrites: the claude session writes the plan,
 // not the console — `allowAgent` is its capability. It never imports the pane,
 // so mounting it here costs the plans chunk no xterm.
@@ -173,7 +175,13 @@ export default function PlansView() {
   const showEverything = () => setPrefs({ showDocuments: true, showClosed: true });
 
   const newPlan = (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2">
+      {/* The other way a plan starts: from the issues it fixes (control-tower
+          phase 118). A link, not a button — it goes to the Issues desk, where
+          a set of issues becomes a plan. */}
+      <a href={repoHref('issues')} className={buttonVariants({ size: 'sm', variant: 'ghost' })}>
+        <CircleDot size={14} aria-hidden /> Plan from issues
+      </a>
       <NewPlanWizardButton allowAgent={state?.allowAgent === true} />
       <NewPlanButton allowWrites={Boolean(state?.allowWrites)} />
     </div>

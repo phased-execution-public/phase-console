@@ -12,7 +12,7 @@ import { parkOnStep, stepJournalFields } from '../human-steps.ts';
 import { KIND_META } from '../../shared/human-step-model.js';
 import { comparedClause, stampTrees, type TreeStamp } from './tree-state.ts';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 import { log } from '../log.ts';
@@ -24,7 +24,7 @@ import {
   MAX_AUTO_WAIT_MS, MODEL_FALLBACK, type Disposition, type RetirementEvidence, lostResume,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
-import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type StreamEvent } from './spawn.ts';
+import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type StreamEvent } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -32,11 +32,12 @@ import {
 } from './freeze.ts';
 import {
   CASCADE_SKIP_REASON, STOPPED_SKIP_REASON, chainMembers, extractCommands, foldCommand, limitWords, resolveLead,
-  verificationVerdict, verifyPhase,
+  verificationVerdict, verifyEnvDigest, verifyPhase,
 } from './verify.ts';
 import {
-  appendLedger, cleanTrees, committers, fastGateLines, FAST_GATE_BUDGET_MS, lastCleanHead, lastRunOn, ownerByCommits, ownerFromLedger, readLedger,
-  resolveVerifyLimit, splitReds, verificationsFile, wipAttribution, wipOwners, WHOLE_COMMAND,
+  appendLedger, BASELINE_NICE, baselineLineWords, cleanTrees, committers, fastGateLines, FAST_GATE_BUDGET_MS, lastCleanHead,
+  outputTail, ownerByCommits, ownerFromLedger, readConsoleLedgers, readLedger, resolveVerifyLimit, reusableRun, splitReds,
+  verificationsFile, wipAttribution, wipOwners, WHOLE_COMMAND,
   type LedgerRow, type RedRow, type RedShare, type SessionWindow, type WipOwner,
 } from './verify-ledger.ts';
 import { qaVerdictInstruction } from '../qa-session.ts';
@@ -55,7 +56,7 @@ import {
   evaluateWait, openWaitEntry, parkedMsOf, spendsWaitBudget, WAIT_FLOOR_MS, waitApproaching, waitBudgetFact,
   type WaitAuthor, type WaitBudget,
 } from './wait-budget.ts';
-import { pollableRefs, unpollableRefs } from '../watch-refs.ts';
+import { backstopOf, pollableRefs, unpollableRefs } from '../watch-refs.ts';
 import { RESUME_REFUSED_RECHECK_MS, declaredClock, ordinalSuffix, type DeclaredClock } from './wait-budget.ts';
 import { closeoutSkipNote, outageResumePrompt, reboardResumeBrief, resumePolicyInstruction, resumePolicyWhy, type VettedResume, LOCK_MIRROR_ENV } from './runner-core.ts';
 import type { ResumePolicy } from './usage.ts';
@@ -70,8 +71,8 @@ import {
 import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
 import { isPaperwork, judgeProofs, proofsFile, type ProofJudgement } from './proofs.ts';
 import {
-  commitOf, commitsBetween, exportCheckout, filesCommittedBetween, filesCommittedSince, inHistory, settleIdleMirrorBranches,
-  treeChanges, uncommittedPaths, workingTreeOf, type ExportCheckout,
+  BORROWED_DEPS, commitOf, commitsBetween, exportCheckout, filesCommittedBetween, filesCommittedSince, inHistory,
+  settleIdleMirrorBranches, treeChanges, uncommittedPaths, workingTreeOf, type ExportCheckout,
 } from './worktree.ts';
 import {
   classifySituation, collectEvidence, declaredSubKind, situation as situationOf, workEvidence,
@@ -93,7 +94,7 @@ import {
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type QaRoundRecord, type RunStatus, type VerifySummary, clearWatchBookkeeping, isSessionGone,
   syncWaitClock, chargeDeclaration, DECLARATION_REFUSED_EVENT, type DeclarationCharge, prepareReboard,
-  setRunState, failureRootOf,
+  setRunState, failureRootOf, THIS_CONSOLE,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome, needsOf } from './outcome.ts';
 import { PLAN_APPROVAL_NEED } from './plan-approval.ts';
@@ -125,6 +126,31 @@ import { withSpan } from '../trace.ts';
  */
 const MAX_REBRIEFS = 3;
 
+/**
+ * The flag that asks a person (control-tower phase 111, #177): the first two
+ * are answered by a fresh session, or the next model where the policy lets the
+ * phase step down; the third is a person's.
+ */
+export const SAFEGUARD_FLAGS_BEFORE_PERSON = 3;
+
+/** The resume brief's words for a phase boarded fresh after a safeguard flag. */
+function safeguardInstruction(flag: { classifier?: string; requestId?: string }, flags: number): string {
+  return `The API's safeguards flagged the last session's message${flag.classifier ? ` (classifier ${flag.classifier})` : ''}`
+    + `${flag.requestId ? `, request ${flag.requestId}` : ''} — a false positive is likely, and resuming that conversation `
+    + 'would re-send it, so this is a FRESH session. Read the handoff, the working tree and the journal, then carry the '
+    + `phase on from where it stopped${flags > 1 ? '. It has happened twice: if one step keeps tripping it, take that step another way' : ''}.`;
+}
+
+/** "two fresh sessions were tried" · "a fresh session and sonnet were tried" — what a person is told. */
+export function triedSentence(tried: readonly string[]): string {
+  if (!tried.length) return 'nothing was tried';
+  if (tried.every((t) => t === 'a fresh session')) {
+    return tried.length === 1 ? 'a fresh session was tried' : `${tried.length === 2 ? 'two' : tried.length} fresh sessions were tried`;
+  }
+  return `${tried.length === 1 ? tried[0] : `${tried.slice(0, -1).join(', ')} and ${tried[tried.length - 1]}`} `
+    + `${tried.length === 1 ? 'was' : 'were'} tried`;
+}
+
 /** What an attempt is handed beside its prompt (see `attempt`). */
 export type AttemptOptions = {
   maxTurns?: Cap;
@@ -142,7 +168,7 @@ export type AttemptOptions = {
 /** An attempt's ending; `rebrief` asks `attempt` to swap the brief and go on in the same lane. */
 type AttemptResult = {
   carryOn: boolean; completed: boolean;
-  rebrief?: { policy: ResumePolicy; sessionId: string; unspawned: boolean };
+  rebrief?: { policy?: ResumePolicy; instruction?: string; why?: string; sessionId: string; unspawned: boolean };
 };
 
 /**
@@ -151,6 +177,93 @@ type AttemptResult = {
  * symlinked one (`/var/…` for `/private/var/…` on macOS), and the relative
  * path between the two spellings climbs out of any checkout it is joined to.
  */
+/**
+ * How often a baseline command asks the machine-load guard again while it
+ * holds new work back, and the most it will wait for one command
+ * (control-tower phase 105).
+ */
+const BASELINE_LOAD_POLL_MS = 30_000;
+const BASELINE_LOAD_WAIT_MAX_MS = 30 * 60_000;
+
+/** One baseline as it is planned and measured (control-tower phase 105) — see `takeBaseline`. */
+type BaselineJob = {
+  phase: number;
+  text: string;
+  commands: string[];
+  setupText?: string;
+  approvals?: VerifyApprovals;
+  /** Where its commands run: a clean checkout of the boarding head, or the tree in place. */
+  cwd: string;
+  exported: boolean;
+  /** The working-tree directory an export stands in for (`VerifyOptions.inPlace`, control-tower phase 106). */
+  inPlace?: string;
+  base: { top: string; tree: string; head: string | null } | null;
+  /** The reuse key's other two halves: the environment digest and the directory within the repository. */
+  env: string;
+  dir: string;
+  /** Every ledger row of this console, read once. */
+  rows: LedgerRow[];
+  at: string;
+  lines: VerifyBaseline['commands'];
+};
+
+/**
+ * The baseline's result as the session's next turn (control-tower phase 105,
+ * BL-3) — information from the console, explicitly not an instruction: it
+ * changes nothing the phase must do, and says so, as a peer's message does.
+ */
+export function frameBaselineNote(baseline: VerifyBaseline, mark: string): string {
+  // A line the machine stopped (a dependency not installed, a sibling the
+  // export lacks) is not a red the session inherits (control-tower phase 106).
+  const red = baseline.commands.filter((line) => !line.ok && !line.environment);
+  const stopped = baseline.commands.filter((line) => !line.ok && line.environment);
+  const lines = baseline.commands.map((line) => {
+    const failing = !line.ok && line.failures?.length ? ` — ${line.failures.slice(0, 5).join('; ')}` : '';
+    const name = line.chain ? `\`${line.command}\` (member of \`${line.chain}\`)` : `\`${line.command}\``;
+    // What a red line SAID (#195): the end of its output, as the verdict's red carries it.
+    const tail = !line.ok && line.tail
+      ? `\n  ${line.tail.split('\n').slice(-BASELINE_NOTE_TAIL_LINES).join('\n  ')}`
+      : '';
+    return `- ${name}: ${baselineLineWords(line)}${failing}${tail}`;
+  });
+  return `${mark} A note from the console, not an instruction: your phase's §Verification BASELINE is in — `
+    + `what its lines read on the tree you boarded on, before your work, measured beside you in a clean checkout. `
+    + (red.length
+      ? `${red.length} of ${baseline.commands.length} line(s) were already red there. A red that was there first is inherited: `
+        + 'it is not charged to you, and your verification is compared against this when you finish. '
+      : stopped.length ? ''
+        : `All ${baseline.commands.length} line(s) were green there, so a red at your finish is yours. `)
+    + (stopped.length
+      ? `${stopped.length} line(s) could not run there at all — the machine, not the work; each says why below `
+        + '(for a dependency that is not installed: install the dependencies — that is a `- **Setup:**` line\'s job). '
+      : '')
+    + `No reply is needed; carry on with your phase.\n\n${lines.join('\n')}`;
+}
+
+/** How many of a red line's last output lines the session's baseline note quotes. */
+const BASELINE_NOTE_TAIL_LINES = 6;
+
+/**
+ * Is this uncommitted path WORK that is not the verifying phase's own — a
+ * reason to verify on a clean export rather than in place (control-tower phase
+ * 89) — or the machine's own litter (control-tower phase 106, #191)? Never
+ * foreign: the phase's own writes, anything inside a dependency directory
+ * (`node_modules`, `.venv`, `venv`), an untracked path no phase's session wrote
+ * (a test run's compile cache, an installer's output), and an untracked path
+ * whose first component the phase's own `Setup:` names (its `data` symlink).
+ * ai-builder-v7's app-backend was exported — and its cross-repo gate made red
+ * — by exactly those last two. A tracked change, or an untracked file another
+ * phase's session wrote that no Setup names, still is.
+ */
+export function isForeignWip(path: string, owner: WipOwner, untracked: boolean, setupText?: string): boolean {
+  if (owner === 'self') return false;
+  if (path.split('/').some((part) => BORROWED_DEPS.has(part))) return false;
+  if (!untracked) return true;
+  if (owner === null) return false;
+  const head = path.split('/')[0]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return !(setupText && new RegExp(`(?:^|[^\\w.-])${head}(?:$|[^\\w.-])`).test(setupText));
+}
+
 function withinRepo(top: string, dir: string): string {
   const real = (path: string): string => { try { return realpathSync(path); } catch { return resolve(path); } };
   const rel = relative(real(top), real(dir));
@@ -207,9 +320,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
           this.rebriefing.delete(phase);
         }
         if (!settled.rebrief) return settled;
-        const { policy, sessionId, unspawned } = settled.rebrief;
-        current = await opts.rebrief!(reboardResumeBrief(resumePolicyInstruction(policy, sessionId)), {
-          sessionId, why: resumePolicyWhy(policy), unspawned,
+        const { policy, instruction, why, sessionId, unspawned } = settled.rebrief;
+        current = await opts.rebrief!(reboardResumeBrief(instruction ?? resumePolicyInstruction(policy!, sessionId)), {
+          sessionId, why: why ?? resumePolicyWhy(policy!), unspawned,
         });
         vetted = undefined;
       }
@@ -264,6 +377,31 @@ export abstract class RunnerAttempt extends RunnerLoop {
     record.boardingHint = hint;
     record.note = `session ${sessionId} is not worth resuming — ${resumePolicyWhy(policy)} — `
       + 'the next attempt boards fresh with the resume brief';
+    this.record('phase.reboard-requested', {
+      situation: hint.situation, rung: hint.rung, brief: hint.brief, by: 'console',
+    }, phase);
+    this.persist();
+    this.emit('phase', { phase, status: record.status, note: record.note });
+    return { carryOn: true, completed: false };
+  }
+
+  /**
+   * End this attempt and have the phase boarded FRESH with the resume brief
+   * carrying `instruction` — never `--resume` of the session that just ended
+   * (control-tower phase 111, #177: a flagged conversation re-sends the
+   * flagged message). In place when the lane can swap its brief, else through
+   * the boarding hint, exactly as `reboardNotWorth` does.
+   */
+  private reboardFresh(phase: number, record: PhaseRecord, instruction: string, why: string): AttemptResult {
+    const sessionId = record.sessionId ?? 'unknown';
+    record.resumeSessionId = undefined;
+    if (this.rebriefing.has(phase)) {
+      return { carryOn: true, completed: false, rebrief: { instruction, why, sessionId, unspawned: false } };
+    }
+    prepareReboard(record);
+    const hint: BoardingHint = reboardResumeBrief(instruction);
+    record.boardingHint = hint;
+    record.note = `session ${sessionId} ${why} — the next attempt boards fresh with the resume brief`;
     this.record('phase.reboard-requested', {
       situation: hint.situation, rung: hint.rung, brief: hint.brief, by: 'console',
     }, phase);
@@ -486,7 +624,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
         partialMessages: this.deps.stream?.partialMessages ?? true,
         subagentText: this.deps.stream?.subagentText ?? true,
         hookEvents: this.deps.stream?.hookEvents ?? true,
-        onHandle: (handle) => { lane.handle = handle; this.syncMirror(); },
+        onHandle: (handle) => {
+          lane.handle = handle;
+          // A new process, a new pipe (control-tower phase 109, #170).
+          delete lane.inputClosed;
+          this.syncMirror();
+          // A baseline that landed before this session could hear it is told now.
+          this.flushBaselineNote(lane.phase);
+        },
         // The child must know it IS the lock holder. Without this the runner
         // claims the phase as `autopilot/<runId>`, the session it spawns reads
         // a lock owned by a stranger, and — correctly, per the skill's own
@@ -526,8 +671,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // kept, and a session must be able to record the second without
           // touching the first.
           PE_RULINGS_FILE: rulingsFile(this.state!.root, this.state!.slug),
-          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
-          PE_PROOFS_FILE: proofsFile(this.state!.root, this.state!.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62),
+          // and where its lines are judged — the proof is keyed there (phase 106, `proofEnv`).
+          ...(await this.proofEnv(phase)),
           // Where the session publishes its TASK LIST. A clone of the outcome
           // channel next door, for the same reason: the CLI stopped
           // provisioning TodoWrite/TaskCreate to `-p` sessions in August 2026,
@@ -544,6 +690,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // the process it describes.
           lane.procStartedAt = new Date().toISOString();
           lane.signals.procStartedAt = Date.parse(lane.procStartedAt);
+          // …and the console that launched it, this one (control-tower phase
+          // 110, #175): the one fact a later reader judges an orphan by.
+          lane.launcher = { ...THIS_CONSOLE };
           record.liveness = livenessOf(phase, lane.signals, stallThresholds(this.deps.stallThresholds?.()));
           // A live, un-frozen child has just appeared, so if the run still
           // reads `frozen` that word is now false. This is the ONLY moment it
@@ -585,6 +734,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
 
       lane.pid = null;
       lane.handle = null;
+      // The session's input went with it (#170): a lane between sessions is not
+      // a live session whose input closed.
+      delete lane.inputClosed;
       this.syncMirror();
       // The dollars — the run's, the phase's and the rung's — were booked by the
       // spawn door (`bookSpend`), as this spawn's rise over its session's mark.
@@ -709,6 +861,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
         return { carryOn: false, completed: false };
       }
 
+      // A background agent the session left running, stopped with its process
+      // (control-tower phase 109, #188): named for the next boarding.
+      await this.noteAgentsKilled(phase, lane, outcome).catch(() => {});
       const disposition = classify(outcome.signal, this.now());
       this.record('phase.disposition', { attempt, kind: disposition.kind, reason: reasonOf(disposition) }, phase);
       this.emit('phase', { phase, disposition: disposition.kind, reason: reasonOf(disposition) });
@@ -886,6 +1041,47 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // the whole point of a boot prompt.
           resume = undefined;
           continue;
+        }
+
+        case 'safeguard-flag': {
+          // The API's safeguards flagged a message (control-tower phase 111,
+          // #177). A false positive is likely, and the banner names its own
+          // remedy: a NEW session — `--resume` would re-send the flagged
+          // message — or another model. First a fresh session with the resume
+          // brief; then a fresh session again, or the next model where the
+          // model policy lets the phase step down (`pinned` never does); only
+          // the third flag asks a person, saying what was tried.
+          const guard = (record.safeguard ??= { flags: 0, tried: [] });
+          guard.flags += 1;
+          const next = guard.flags === 2 && this.modelPolicyOf(phase) !== 'pinned' ? nextModel(currentModel) : null;
+          const remedy = guard.flags >= SAFEGUARD_FLAGS_BEFORE_PERSON ? 'needs-human' : next ? 'switch-model' : 'fresh-session';
+          this.record('phase.safeguard-flag', {
+            attempt, flags: guard.flags, remedy, model: currentModel,
+            classifier: disposition.classifier ?? null,
+            requestId: disposition.requestId ?? null,
+            messageId: disposition.messageId ?? null,
+          }, phase);
+          if (remedy === 'switch-model' && next) {
+            guard.tried.push(next);
+            this.record('phase.model-switch', { from: currentModel, to: next, reason: disposition.reason }, phase);
+            currentModel = next;
+            record.model = next;
+            resume = undefined;
+            this.persist();
+            continue;
+          }
+          if (remedy === 'fresh-session') {
+            guard.tried.push('a fresh session');
+            return this.reboardFresh(phase, record, safeguardInstruction(disposition, guard.flags),
+              'was flagged by the API\'s safeguards');
+          }
+          const reason = `the API's safeguards flagged the session (a false positive is likely); ${triedSentence(guard.tried)}`
+            + `${disposition.requestId ? ` — report request ${disposition.requestId}` : ''}`;
+          record.status = 'parked';
+          record.note = reason;
+          this.record('phase.needs-human', { reason }, phase);
+          this.halt(reason, phase, 'needs-human');
+          return { carryOn: false, completed: false };
         }
 
         case 'resume': {
@@ -1169,10 +1365,20 @@ export abstract class RunnerAttempt extends RunnerLoop {
           continue;
         }
 
-        case 'phase-failed':
+        case 'phase-failed': {
           record.note = disposition.reason;
-          if (attempt < MAX_ATTEMPTS) { await this.sleep(15_000); continue; }
+          if (attempt < MAX_ATTEMPTS) {
+            // The retry's prompt was composed before the agents it lost were
+            // known (control-tower phase 109, #188): told once, here.
+            const killed = this.agentsKilledLines(record);
+            if (killed.length) {
+              promptOnce = `${prompt}\n\nWHAT THE CONSOLE KNOWS ABOUT THIS TREE (read as this attempt restarted — control-tower phase 109):\n${killed.join('\n')}\n`;
+            }
+            await this.sleep(15_000);
+            continue;
+          }
           break;
+        }
       }
       break;
     }
@@ -1393,6 +1599,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
   private ledgerRows(
     phase: number, kind: LedgerRow['kind'], ran: readonly VerifyRun[],
     tree: { tree: string; head: string | null } | null, own: readonly RedShare[] = [], chain?: string,
+    /** The environment digest and directory it ran under — what a later baseline reuses it by (control-tower phase 105). */
+    where?: { env: string; dir: string },
   ): LedgerRow[] {
     const state = this.state!;
     const at = this.now().toISOString();
@@ -1403,7 +1611,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
         command: foldCommand(row.command), ...(chain ? { chain: foldCommand(chain) } : {}), code: row.code, ms: row.ms, ok: row.ok,
         ...(row.timedOut ? { timedOut: true } : {}),
         tree: tree?.tree ?? null, head: tree?.head ?? null,
+        ...(where ? { env: where.env, dir: where.dir } : {}),
         ...(row.failures?.length ? { failures: row.failures } : {}),
+        // What a red SAID, for a baseline as for a verdict (control-tower phase 106, #195).
+        ...(!row.ok && row.output?.trim() ? { tail: outputTail(row.output) } : {}),
+        ...(row.environment ? { environment: row.environment } : {}),
         ...(kind === 'verify' ? { own: mine ? (mine.failures.length ? [...mine.failures] : [WHOLE_COMMAND]) : [] } : {}),
       };
     });
@@ -1607,7 +1819,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   private async runMembers(
     chain: string, purpose: 'baseline' | 'attribution',
-    opts: { cwd: string; approvals?: VerifyApprovals; timeoutFor?: (command: string) => number },
+    opts: { cwd: string; inPlace?: string; approvals?: VerifyApprovals; timeoutFor?: (command: string) => number },
   ): Promise<VerifyRun[]> {
     const members = chainMembers(chain);
     if (!members || this.abort?.signal.aborted || this.stopRequested) return [];
@@ -1615,6 +1827,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const limit = opts.timeoutFor?.(chain) ?? VERIFY_TIMEOUT_MS;
     const ran = await verify(members.map((member) => `- \`${member}\``).join('\n'), {
       cwd: opts.cwd, purpose, cascade: false,
+      ...(opts.inPlace ? { inPlace: opts.inPlace } : {}),
       ...(opts.approvals ? { approvals: opts.approvals } : {}),
       preflightSkip: this.verifyEnv().preflightSkip,
       timeoutMs: limit, timeoutFor: () => limit,
@@ -1623,115 +1836,301 @@ export abstract class RunnerAttempt extends RunnerLoop {
     return RunnerAttempt.finalRows(ran).filter((row) => !row.proven);
   }
 
+  /** Baselines measuring BESIDE their phase's session (control-tower phase 105, BL-3), by phase. */
+  private readonly baselines = new Map<number, Promise<void>>();
+  /** Phases whose verdict waits on its baseline — the load guard holds it no longer. */
+  private readonly baselineAwaited = new Set<number>();
+
   /**
    * The phase's §Verification BASELINE (control-tower phase 83, #103): what
    * its lines read on the tree it boards on, before its session touches it.
-   * Each line's last run on that very tree stands in when the plan's ledger has
-   * one; the rest are run now, every line on its own (no cascade), and
-   * ledgered like any run. A line that is a red `&&` chain is broken into its
-   * members too, each run alone (the fifth amendment), so a member the chain's
-   * first red hid has a baseline of its own. Taken once per phase per run — a
-   * phase boarded again keeps its first, so its own half-done work can never
-   * become its baseline.
+   * Taken once per phase per run — a phase boarded again keeps its first, so
+   * its own half-done work can never become its baseline.
+   *
+   * Since control-tower phase 105 (#190) it no longer holds the boarding:
+   *  - a line is measured ONCE — a red baseline line is never retried, the
+   *    retry being the verdict's alone (BL-1);
+   *  - a line already measured on the same tree, command, environment digest
+   *    and directory by ANY plan, phase or run of this console within
+   *    `BASELINE_REUSE_MAX_AGE_MS` stands in, named with its source and age
+   *    (BL-2);
+   *  - the rest runs BESIDE the session, in a clean checkout of the boarding
+   *    head the session never touches, niced and under the machine-load guard;
+   *    the session hears the result as a next-turn note, and the verdict
+   *    awaits a baseline still running (`awaitBaseline`) — never drops it
+   *    (BL-3). A repository git will not export (a superproject) is measured
+   *    here, before boarding, under phase 89's tree rule, as it always was.
+   * A red `&&` chain is broken into its members, each measured alone (the
+   * fifth amendment), so a member the chain's first red hid has a baseline.
    */
   protected async takeBaseline(phase: number): Promise<void> {
     const state = this.state!;
     const record = phaseRecord(state, phase);
-    if (record.baseline || this.abort?.signal.aborted) return;
+    if (record.baseline || this.baselines.has(phase) || this.abort?.signal.aborted) return;
     const text = await this.deps.verificationText(state.slug, phase);
     if (!text?.trim()) return;
     const approvals = this.verifyApprovalsFor(phase);
     const commands = extractCommands(text, 'verify', approvals).commands;
     if (!commands.length) return;
-    // The same tree rule as the verdict's (control-tower phase 89): a tree
-    // holding changes that are not this phase's is measured on a clean
-    // checkout of its HEAD, so the baseline and the verdict read alike.
-    const exported = await this.exportForVerify(phase, await this.verifyCwd(phase));
-    const cwd = exported?.cwd ?? await this.verifyCwd(phase);
-    const at = this.now().toISOString();
+    const setupText = await this.deps.setupText?.(state.slug, phase);
+    const inPlace = await this.verifyCwd(phase);
+    const beside = await this.exportBoardingHead(phase, inPlace);
+    // The same tree rule as the verdict's (control-tower phase 89) where git
+    // would not export: a tree holding changes that are not this phase's is
+    // measured on a clean checkout of its HEAD, so the baseline and the verdict
+    // read alike.
+    const exported = beside ? null : await this.exportForVerify(phase, inPlace);
+    const cwd = beside?.cwd ?? exported?.cwd ?? inPlace;
     const base = await workingTreeOf(cwd).catch(() => null);
-    const file = verificationsFile(state.root, state.slug);
-    const rows = readLedger(file, state.slug);
-    const lines: VerifyBaseline['commands'] = [];
-    const reuse = (command: string, chain?: string): boolean => {
-      const prior = base ? lastRunOn(rows, command, base.tree) : undefined;
-      if (!prior) return false;
-      lines.push({
-        command: prior.command, ...(chain ? { chain: foldCommand(chain) } : {}), ok: prior.ok, code: prior.code,
-        ...(prior.failures?.length ? { failures: prior.failures } : {}),
-        from: 'reused', by: { phase: prior.phase, run: prior.run, at: prior.at },
-      });
-      return true;
+    const job: BaselineJob = {
+      phase, text, commands, cwd, base, at: this.now().toISOString(), lines: [],
+      ...(setupText ? { setupText } : {}), ...(approvals ? { approvals } : {}),
+      exported: Boolean(beside || exported),
+      ...(beside || exported ? { inPlace } : {}),
+      env: verifyEnvDigest({ ...(setupText ? { setupText } : {}) }),
+      dir: base ? withinRepo(base.top, cwd) : '',
+      rows: readConsoleLedgers(state.root),
     };
+    const missing = commands.filter((command) => !this.reuseBaselineLine(job, command));
+    if (beside && missing.length) {
+      // BESIDE the session: the boarding goes on at once.
+      const measuring = this.measureBaseline(job, missing, beside.made)
+        .catch((error: unknown) => {
+          this.record('phase.verify-baseline', { failed: String(error).slice(0, 300), concurrent: true }, phase);
+        })
+        .finally(() => {
+          this.baselines.delete(phase);
+          this.baselineAwaited.delete(phase);
+          void beside.made.remove().catch(() => {});
+          this.noteVerifying(phase, null, undefined, { only: 'baseline' });
+        });
+      this.baselines.set(phase, measuring);
+      return;
+    }
+    try {
+      await this.measureBaseline(job, missing, null);
+    } finally {
+      if (beside) await beside.made.remove().catch(() => {});
+    }
+  }
+
+  /**
+   * A clean checkout of the phase's boarding HEAD for its baseline to run in
+   * beside the session (control-tower phase 105, BL-3) — always, not only
+   * when a sibling's WIP is in the tree, because the session is about to edit
+   * this one. Null where git will not make one (no repository, a superproject).
+   */
+  private async exportBoardingHead(phase: number, cwd: string): Promise<{ cwd: string; made: ExportCheckout } | null> {
+    const tree = await workingTreeOf(cwd).catch(() => null);
+    if (!tree?.head) return null;
+    const made = await exportCheckout(tree.top, tree.head).catch((error: unknown) => ({ refused: String(error) }));
+    if ('refused' in made) {
+      this.record('phase.verify-in-place', { reason: 'the baseline is measured before boarding', refused: made.refused, head: tree.head }, phase);
+      return null;
+    }
+    return { cwd: join(made.dir, withinRepo(tree.top, cwd)), made };
+  }
+
+  /** A baseline line reused from the console's ledgers, when one stands in (BL-2). */
+  private reuseBaselineLine(job: BaselineJob, command: string, chain?: string): boolean {
+    if (!job.base) return false;
+    const now = Date.now();
+    const prior = reusableRun(job.rows, { command, tree: job.base.tree, env: job.env, dir: job.dir, now });
+    if (!prior) return false;
+    job.lines.push({
+      command: prior.command, ...(chain ? { chain: foldCommand(chain) } : {}), ok: prior.ok, code: prior.code,
+      ...(prior.failures?.length ? { failures: prior.failures } : {}),
+      ...(prior.tail ? { tail: prior.tail } : {}),
+      ...(prior.environment ? { environment: prior.environment } : {}),
+      from: 'reused',
+      by: { phase: prior.phase, run: prior.run, at: prior.at, slug: prior.slug, ageMs: Math.max(0, now - Date.parse(prior.at)) },
+    });
+    return true;
+  }
+
+  /**
+   * Measure what could not be reused, record the baseline, journal it — and,
+   * when it ran beside the session (`made`), tell the session. The lines are
+   * run once each, niced, every command waiting while the machine-load guard
+   * holds new work back.
+   */
+  private async measureBaseline(job: BaselineJob, missing: readonly string[], made: ExportCheckout | null): Promise<void> {
+    const state = this.state!;
+    const { phase } = job;
+    const record = phaseRecord(state, phase);
+    const concurrent = made !== null;
+    const file = verificationsFile(state.root, state.slug);
+    let loadWaitMs = 0;
+    let limits: { timeoutFor: (command: string) => number; limit: NonNullable<PhaseRecord['verifyLimit']> } | null = null;
+    const limitsFor = async () => (limits ??= await this.verifyLimitsFor(phase, job.text, job.approvals));
+    // Before boarding the commands own the lane: the stall detector stands
+    // down and the restart drain waits on their limit, as for a verification.
+    // Beside a session they own nothing — the session's silence still counts.
+    const owning = async (): Promise<void> => {
+      if (concurrent || record.baselineSince) return;
+      record.baselineSince = job.at;
+      record.verifyLimit = (await limitsFor()).limit;
+      this.persist();
+    };
+    const where = { env: job.env, dir: job.dir };
     const measure = (ran: readonly VerifyRun[], chain?: string): void => {
       for (const row of RunnerAttempt.finalRows(ran).filter((entry) => !entry.proven)) {
-        lines.push({
+        job.lines.push({
           command: foldCommand(row.command), ...(chain ? { chain: foldCommand(chain) } : {}), ok: row.ok, code: row.code,
           ...(row.failures?.length ? { failures: row.failures } : {}), from: 'measured',
+          // What it said and why the machine stopped it — a baseline's red is
+          // read as closely as a verdict's (control-tower phase 106, #195/#185).
+          ...(!row.ok && row.output?.trim() ? { tail: outputTail(row.output) } : {}),
+          ...(row.environment ? { environment: row.environment } : {}),
+          ...(!row.ok && !row.timedOut && !row.environment ? { once: true as const } : {}),
         });
       }
     };
-    const missing = commands.filter((command) => !reuse(command));
-    let limits: { timeoutFor: (command: string) => number; limit: NonNullable<PhaseRecord['verifyLimit']> } | null = null;
-    const limitsFor = async () => (limits ??= await this.verifyLimitsFor(phase, text, approvals));
-    // The commands own the lane while they run: the stall detector stands
-    // down and the restart drain waits on their limit, as for a verification.
-    const owning = async (): Promise<void> => {
-      if (record.baselineSince) return;
-      record.baselineSince = at;
-      record.verifyLimit = (await limitsFor()).limit;
-      this.persist();
+    const seat = {
+      purpose: 'baseline' as const, cascade: false, nice: BASELINE_NICE,
+      gate: async () => { loadWaitMs += await this.baselineLoadGate(phase); },
+      onChild: (pid: number) => this.noteVerifyingChild(phase, pid),
+      ...(job.inPlace ? { inPlace: job.inPlace } : {}),
+      ...(job.approvals ? { approvals: job.approvals } : {}),
+      preflightSkip: this.verifyEnv().preflightSkip,
+      signal: this.abort?.signal ?? undefined,
     };
     try {
       if (missing.length) {
         const { timeoutFor } = await limitsFor();
-        const setupText = await this.deps.setupText?.(state.slug, phase);
         const verify = this.deps.verify ?? verifyPhase;
         await owning();
-        const measured = await verify(text, {
-          cwd, purpose: 'baseline', cascade: false, only: new Set(missing.map(foldCommand)),
-          onStart: (command, index, total) => this.noteVerifying(phase, 'baseline', { command, index, total }, { startedAt: at, exported: Boolean(exported) }),
-          ...(setupText ? { setupText } : {}),
-          ...(approvals ? { approvals } : {}),
-          preflightSkip: this.verifyEnv().preflightSkip,
+        const measured = await verify(job.text, {
+          ...seat, cwd: job.cwd, only: new Set(missing.map(foldCommand)),
+          onStart: (command, index, total) => this.noteVerifying(phase, 'baseline', { command, index, total }, { startedAt: job.at, exported: job.exported }),
+          onSetupStart: (command, index, total) => this.noteVerifying(phase, 'baseline', { command, index, total }, { startedAt: job.at, exported: job.exported, stage: 'setup' }),
+          ...(job.setupText ? { setupText: job.setupText } : {}),
           timeoutMs: VERIFY_TIMEOUT_MS, timeoutFor,
-          signal: this.abort?.signal ?? undefined,
         });
         // A stop cut it: nothing was learned, and the next boarding asks again.
         if (this.abort?.signal.aborted || this.stopRequested) return;
         measure(measured.ran);
-        appendLedger(file, this.ledgerRows(phase, 'baseline', measured.ran, base));
+        appendLedger(file, this.ledgerRows(phase, 'baseline', measured.ran, job.base, [], undefined, where));
       }
-      // Each red chain's members, alone — reused from the ledger where every
-      // one already ran on this tree, measured otherwise.
-      for (const line of lines.filter((entry) => !entry.ok && !entry.chain)) {
+      // Each red chain's members, alone — reused where every one already ran
+      // on this tree, measured otherwise.
+      for (const line of job.lines.filter((entry) => !entry.ok && !entry.chain)) {
         const members = chainMembers(line.command);
         if (!members) continue;
-        const chain = commands.find((command) => foldCommand(command) === line.command) ?? line.command;
-        if (members.every((member) => base && lastRunOn(rows, member, base.tree))) {
-          for (const member of members) reuse(member, chain);
+        const chain = job.commands.find((command) => foldCommand(command) === line.command) ?? line.command;
+        const reusable = (member: string) => Boolean(job.base && reusableRun(job.rows, {
+          command: member, tree: job.base.tree, env: job.env, dir: job.dir,
+        }));
+        if (members.every(reusable)) {
+          for (const member of members) this.reuseBaselineLine(job, member, chain);
           continue;
         }
         await owning();
         const ran = await this.runMembers(chain, 'baseline', {
-          cwd, ...(approvals ? { approvals } : {}), timeoutFor: (await limitsFor()).timeoutFor,
+          cwd: job.cwd, ...(job.inPlace ? { inPlace: job.inPlace } : {}),
+          ...(job.approvals ? { approvals: job.approvals } : {}), timeoutFor: (await limitsFor()).timeoutFor,
         });
         if (this.abort?.signal.aborted || this.stopRequested) return;
         measure(ran, chain);
-        appendLedger(file, this.ledgerRows(phase, 'baseline', ran, base, [], chain));
+        appendLedger(file, this.ledgerRows(phase, 'baseline', ran, job.base, [], chain, where));
       }
     } finally {
       delete record.baselineSince;
-      await this.endVerifyPass(phase);
+      if (!concurrent) await this.endVerifyPass(phase);
     }
-    record.baseline = { at, tree: base?.tree ?? null, head: base?.head ?? null, commands: lines };
+    const lines = job.lines;
+    record.baseline = {
+      at: job.at, tree: job.base?.tree ?? null, head: job.base?.head ?? null, commands: lines, concurrent,
+      ...(loadWaitMs ? { loadWaitMs } : {}),
+    };
+    const reused = lines.filter((line) => line.from === 'reused');
+    const redOnce = lines.filter((line) => line.once).map((line) => line.command);
+    const told = concurrent ? this.tellBaseline(phase, record.baseline) : false;
     this.record('phase.verify-baseline', {
       tree: record.baseline.tree, head: record.baseline.head,
-      reused: lines.filter((line) => line.from === 'reused').length,
+      reused: reused.length,
       measured: lines.filter((line) => line.from === 'measured').length,
       red: lines.filter((line) => !line.ok).map((line) => line.command),
+      concurrent,
+      ...(reused.length ? {
+        reusedFrom: reused.map((line) => ({
+          command: line.command, slug: line.by?.slug, run: line.by?.run, phase: line.by?.phase, ageMs: line.by?.ageMs,
+        })),
+      } : {}),
+      ...(redOnce.length ? { redOnce } : {}),
+      ...(loadWaitMs ? { loadWaitMs } : {}),
+      ...(concurrent ? { told } : {}),
     }, phase);
     this.persist();
+  }
+
+  /**
+   * One baseline command's seat under the machine-load guard (control-tower
+   * phase 105; phase 100's guard): while the machine is loaded, new work
+   * waits — and a baseline beside a working session is new work. Never once
+   * the phase's verdict is waiting on it (that wait would only lengthen the
+   * lane), never past `BASELINE_LOAD_WAIT_MAX_MS`, never through a stop.
+   * Returns how long it waited.
+   */
+  private async baselineLoadGate(phase: number): Promise<number> {
+    const started = Date.now();
+    const poll = this.deps.baselineLoadPollMs ?? BASELINE_LOAD_POLL_MS;
+    while (this.deps.machineLoad?.()?.holding === true) {
+      if (this.baselineAwaited.has(phase) || this.abort?.signal.aborted || this.stopRequested) break;
+      if (Date.now() - started >= BASELINE_LOAD_WAIT_MAX_MS) break;
+      await new Promise((done) => setTimeout(done, poll));
+    }
+    return Date.now() - started;
+  }
+
+  /**
+   * The baseline is in: the session hears it as its next turn, framed as
+   * information and never an instruction (control-tower phase 105, BL-3).
+   * False when no session is there to tell — its record and the verdict still
+   * have it.
+   */
+  private tellBaseline(phase: number, baseline: VerifyBaseline): boolean | 'queued' {
+    const mark = `[[baseline:${randomUUID().replace(/-/g, '').slice(0, 8)}]]`;
+    const note = frameBaselineNote(baseline, mark);
+    const handle = this.lanes.get(phase)?.handle;
+    if (handle?.open()) {
+      try { if (handle.send(note)) return true; } catch { /* the session stopped taking input */ }
+      return false;
+    }
+    // Landed before the session could hear it (a quick baseline, a slow
+    // spawn): held for the session's first handle, never lost.
+    if (!this.lanes.has(phase)) return false;
+    this.baselineNotes.set(phase, note);
+    return 'queued';
+  }
+
+  /** Notes held for a session that had no handle yet when its baseline landed. */
+  private readonly baselineNotes = new Map<number, string>();
+
+  private flushBaselineNote(phase: number): void {
+    const note = this.baselineNotes.get(phase);
+    const handle = this.lanes.get(phase)?.handle;
+    if (!note || !handle?.open()) return;
+    this.baselineNotes.delete(phase);
+    try { handle.send(note); } catch { /* the session stopped taking input */ }
+  }
+
+  /**
+   * Wait for a baseline still measuring beside the phase's session before
+   * anything is judged against it (control-tower phase 105, BL-3): the verdict
+   * compares against it exactly as it always did, so it is awaited — never
+   * dropped. The load guard stops holding it the moment this is asked.
+   */
+  protected async awaitBaseline(phase: number): Promise<void> {
+    const pending = this.baselines.get(phase);
+    if (!pending) return;
+    this.baselineAwaited.add(phase);
+    await pending;
+  }
+
+  protected async settleBaselines(): Promise<void> {
+    for (const phase of this.baselines.keys()) this.baselineAwaited.add(phase);
+    await Promise.allSettled([...this.baselines.values()]);
   }
 
   /**
@@ -1797,7 +2196,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const paths = (dirty?.paths ?? []).filter((entry) => !isPaperwork(entry.path));
     if (!dirty || !paths.length) return null;
     const owners = wipOwners(paths, this.sessionWindows(), phase);
-    const foreign = [...owners].filter(([, owner]) => owner !== 'self');
+    const untracked = new Set(paths.filter((entry) => entry.untracked).map((entry) => entry.path));
+    const setupText = await this.deps.setupText?.(this.state!.slug, phase);
+    const foreign = [...owners].filter(([path, owner]) => isForeignWip(path, owner, untracked.has(path), setupText));
     if (!foreign.length) return null;
     const head = await commitOf(dirty.top, 'HEAD');
     if (!head) return null;
@@ -1821,7 +2222,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const made = this.verifyExports.get(phase);
     this.verifyExports.delete(phase);
     if (made) await made.remove().catch(() => {});
-    this.noteVerifying(phase, null);
+    // A baseline still measuring beside the session keeps its own lane entry
+    // and its own checkout (control-tower phase 105): it ends them itself.
+    this.noteVerifying(phase, null, undefined, this.baselines.has(phase) ? { only: 'verify' } : {});
   }
 
   /**
@@ -1883,7 +2286,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // Cut by the console (a shutdown, a stop): settled `interrupted`, not done.
     if (closed === 'interrupted') return false;
 
-    /* 1. the plan's own verification commands */
+    /* 1. the plan's own verification commands — compared against the
+     * baseline, so one still measuring beside the session is awaited first
+     * (control-tower phase 105, BL-3): never dropped, never raced. */
+    await this.awaitBaseline(phase);
     const text = await this.deps.verificationText(state.slug, phase);
     // Read beside the verification text and handed straight through: the
     // preamble is the phase's, not the run's, and `verifyPhase` owns the rule
@@ -1891,6 +2297,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const setupText = await this.deps.setupText?.(state.slug, phase);
     const verify = this.deps.verify ?? verifyPhase;
     const cwd = await this.verifyCwd(phase);
+    // A phase that squash-merged the run branch (a release) is checked against
+    // what LANDED, not the pre-squash tip its checkout still stands on
+    // (control-tower phase 112, #183) — only with no other lane live, so no
+    // tree moves under a working session.
+    if (text?.trim() && [...this.lanes.keys()].every((other) => other === phase)) await this.reseatLanded(state);
     // The LAST phase's checks run over a mirror without the run's own idle
     // branches (control-tower phase 62, #47) — before the stamps, so they
     // name what the commands really read.
@@ -1945,6 +2356,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
       reason: 'every check in this phase\'s §Verification was waived at the run\'s start — passed on the handoff',
     } : await verify(text, {
       cwd: runCwd,
+      // An export stands in for the working tree: what it cannot provide is
+      // the machine's, never a red (control-tower phase 106, #191).
+      ...(exported ? { inPlace: cwd } : {}),
       ...(setupText ? { setupText } : {}),
       ...(approvals ? { approvals } : {}),
       ...(proofs?.proven.size ? { proven: proofs.proven } : {}),
@@ -2000,7 +2414,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
     for (const row of verdict.broke) {
       const ran = measuring && chainMembers(row.command)
         ? await this.runMembers(row.command, 'attribution', {
-          cwd: runCwd, ...(approvals ? { approvals } : {}), ...(limits ? { timeoutFor: limits.timeoutFor } : {}),
+          cwd: runCwd, ...(exported ? { inPlace: cwd } : {}),
+          ...(approvals ? { approvals } : {}), ...(limits ? { timeoutFor: limits.timeoutFor } : {}),
         })
         : [];
       if (ran.length) members.push({ chain: row.command, ran });
@@ -2146,9 +2561,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
         }, phase);
         this.recordOwed(phase, attributed.inherited);
       }
-      appendLedger(ledger, this.ledgerRows(phase, 'verify', verification.ran, verifiedTree, attributed.own));
+      // Under the key a later baseline reuses it by (control-tower phase 105):
+      // the environment digest and the directory within the repository.
+      const where = verifiedTree
+        ? { env: verifyEnvDigest({ ...(setupText ? { setupText } : {}) }), dir: withinRepo(verifiedTree.top, runCwd) }
+        : undefined;
+      appendLedger(ledger, this.ledgerRows(phase, 'verify', verification.ran, verifiedTree, attributed.own, undefined, where));
       for (const { chain, ran } of members) {
-        appendLedger(ledger, this.ledgerRows(phase, 'verify', ran, verifiedTree, attributed.own, chain));
+        appendLedger(ledger, this.ledgerRows(phase, 'verify', ran, verifiedTree, attributed.own, chain, where));
       }
       // What this phase OWED is paid by its own line running green here — or,
       // for a chain's member, by that member green alone while the chain is
@@ -2502,7 +2922,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     let prompt = brief;
     const boardFresh = async (): Promise<boolean> => {
       let boot = '';
-      try { boot = (await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV })).stdout; } catch { boot = ''; }
+      try { boot = (await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV, ...this.issuePolicyEnv() })).stdout; } catch { boot = ''; }
       if (!boot.trim()) {
         this.record('phase.qa-session-skipped', {
           reason: `the engine produced no boot prompt for phase ${phase}, so no fresh session could be boarded`,
@@ -2618,8 +3038,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // sibling helper, so a site cannot state the mailbox and forget the ledger.
           ...this.issuesEnv(),
           PE_RULINGS_FILE: rulingsFile(state.root, state.slug),
-          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
-          PE_PROOFS_FILE: proofsFile(state.root, state.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62),
+          // and where its lines are judged — the proof is keyed there (phase 106, `proofEnv`).
+          ...(await this.proofEnv(phase)),
           PE_TASKS_FILE: this.armTasksFile(phase),
         }),
         signal: this.abort?.signal,
@@ -3346,32 +3767,15 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * somewhere other than where the plan said must never be silent.
    */
   private async verifyCwd(phase: number): Promise<string> {
-    const state = this.state!;
     // The LANE's root, so a worktree phase verifies the tree it just wrote. A
     // verification that ran in the shared checkout would grade the run branch
     // as it stood before this lane's commits — green for work it never saw.
-    const root = resolve(this.laneRoot(phase));
-    const declared = (await this.deps.verifyIn?.(state.slug, phase))?.trim();
-    if (!declared) return root;
-
-    const target = resolve(root, declared);
-    const inside = target === root || target.startsWith(`${root}/`);
-    if (!inside) {
-      this.record('phase.verify-in-missing', {
-        declared, reason: 'it resolves outside the repository root', usedRoot: true,
-      }, phase);
-      return root;
-    }
-
-    try {
-      if (!statSync(target).isDirectory()) throw new Error('not a directory');
-    } catch {
-      this.record('phase.verify-in-missing', {
-        declared, reason: 'no such directory under the repository root', usedRoot: true,
-      }, phase);
-      return root;
-    }
-    return target;
+    // One resolution (`verifyDirOf`), shared with the session's `PE_VERIFY_DIR`
+    // (control-tower phase 106), so where a proof is keyed and where it is
+    // judged cannot drift apart.
+    const { dir, declared, refused } = await this.verifyDirOf(phase);
+    if (refused) this.record('phase.verify-in-missing', { declared, reason: refused, usedRoot: true }, phase);
+    return dir;
   }
 
   /**
@@ -3806,7 +4210,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const budget = declared.status === 'waiting-external' || walled ? await this.waitBudgetOf(phase) : undefined;
     const scopes = new Map<number, string[]>();
     if (walled) for (const p of Object.keys(state.phases).map(Number)) scopes.set(p, await this.scopeFor(p));
-    const budgetStamp = budget ? { budget: { ms: budget.budgetMs, source: budget.source } } : {};
+    const budgetStamp = budget
+      ? {
+        budget: {
+          ms: budget.budgetMs, source: budget.source,
+          ...(budget.waitsMax !== undefined ? { waits: budget.waitsMax, waitsSource: budget.waitsSource ?? 'default' } : {}),
+        },
+      }
+      : {};
     // Before anything routes: the ladder's own bookkeeping, from the session's
     // own words. A no-op unless the ladder is what boarded this attempt.
     this.settleRungFromOutcome(phase, declared, record.said);
@@ -4016,6 +4427,12 @@ export abstract class RunnerAttempt extends RunnerLoop {
           slot.errand.how = `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}`
             + `${step.openUrl ? `, open ${step.openUrl}` : step.openCommand ? `, run \`${step.openCommand}\`` : ''}`
             + `${step.proof ? `; ${step.proof} proves it` : ''}. When it is done, Retry the phase — the same session resumes.`;
+          // Not due yet (control-tower phase 121): nobody is summoned until its
+          // due-when ref lands — then the step's own push says NOW.
+          if (step.state === 'upcoming') {
+            slot.errand.need = `Coming up — ${meta.label.toLowerCase()}: ${step.title}`;
+            slot.errand.upcoming = true;
+          }
         }
         const planHeld = declared.needs === PLAN_APPROVAL_NEED;
         const held = planHeld ? record.planApproval : undefined;
@@ -4097,6 +4514,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const state = this.state!;
     const record = phaseRecord(state, phase);
     if (this.abort?.signal.aborted || this.stopRequested) return;
+    // One console pass per phase at a time: a baseline still measuring beside
+    // the session that just wrapped up finishes first (control-tower phase 105).
+    await this.awaitBaseline(phase);
     const text = await this.deps.verificationText(state.slug, phase);
     const approvals = this.verifyApprovalsFor(phase);
     const commands = extractCommands(text, 'verify', approvals).commands;
@@ -4122,6 +4542,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     try {
       const summary = await verify(gate.lines.map((line) => `- \`${line}\``).join('\n'), {
         cwd: runCwd, purpose: 'wip-gate', cascade: false,
+        ...(checkout ? { inPlace: cwd } : {}),
         ...(approvals ? { approvals } : {}),
         preflightSkip: this.verifyEnv().preflightSkip,
         timeoutMs: FAST_GATE_BUDGET_MS, timeoutFor: (command) => gate.limitMs[foldCommand(command)] ?? FAST_GATE_BUDGET_MS,
@@ -4230,8 +4651,68 @@ export abstract class RunnerAttempt extends RunnerLoop {
       delete record.reverify;
       this.persist();
     }
+    // A background subagent the previous session left running past its handoff,
+    // stopped by the CLI's ceiling mid-work (control-tower phase 109, #188,
+    // BG-3) — consumed here, the brief being its reader.
+    lines.push(...this.agentsKilledLines(record));
     if (!lines.length) return '';
     return `\n\nWHAT THE CONSOLE KNOWS ABOUT THIS TREE (read as this phase boarded — control-tower phase 89):\n${lines.join('\n')}\n`;
+  }
+
+  /** The brief's lines for `record.agentsKilled`, which they consume (control-tower phase 109, #188). */
+  protected agentsKilledLines(record: PhaseRecord): string[] {
+    const killed = record.agentsKilled;
+    if (!killed) return [];
+    const lines = killed.agents.map((agent) => `- Your previous session's background subagent `
+      + `${agent.description ? `"${agent.description}"` : `(task ${agent.id})`} was still running when that session ended`
+      + `${killed.handedOffAt ? ` — after it handed off at ${killed.handedOffAt}` : ''} — and the CLI's ten-minute ceiling stopped it `
+      + `mid-work.${agent.lastText ? ` Its last words: "${agent.lastText.replace(/\s+/g, ' ').trim()}".` : ''}`);
+    if (killed.paths.length) {
+      const shown = killed.paths.slice(0, 12).join(', ') + (killed.paths.length > 12 ? ` and ${killed.paths.length - 12} more` : '');
+      lines.push(`- Paths written ${killed.handedOffAt ? 'after that handoff' : 'as that session ended'} and never committed — that agent's `
+        + `half-finished work, not the WIP the handoff describes: ${shown}. Read each before you keep, finish or discard it.`);
+    }
+    delete record.agentsKilled;
+    this.persist();
+    return lines;
+  }
+
+  /**
+   * The agents a session's process ended with still running (control-tower
+   * phase 109, #188, BG-3): the CLI stops them at its ceiling, ten minutes
+   * after the turn ends, mid-edit. Kept on the record for the next boarding's
+   * brief — each one's description and newest words, and the uncommitted
+   * paths written after the session handed off (its declaration's time), so
+   * the next attempt never mistakes them for its predecessor's own WIP.
+   */
+  protected async noteAgentsKilled(phase: number, lane: Lane, outcome: SpawnOutcome): Promise<void> {
+    const open = new Set((outcome.signal.backgroundTasks ?? []).map((task) => task.id));
+    const agents = (lane.signals.endedWithProcess ?? []).filter((task) => open.has(task.id));
+    lane.signals.endedWithProcess = [];
+    if (!agents.length) return;
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    const declared = readOutcome(outcomeFileFor(state.root, state.slug, state.id, phase), {
+      slug: state.slug, phase, notBefore: record.attemptStartedAt ?? record.startedAt,
+    });
+    const handedOffAt = declared?.written_at ?? null;
+    const after = handedOffAt ? Date.parse(handedOffAt) : Math.min(...agents.map((task) => task.lastAt ?? task.since));
+    const dirty = await uncommittedPaths(await this.verifyCwd(phase)).catch(() => null);
+    const paths = (dirty?.paths ?? [])
+      .filter((entry) => !isPaperwork(entry.path) && entry.mtimeMs !== null && entry.mtimeMs > after)
+      .map((entry) => entry.path).sort().slice(0, 40);
+    record.agentsKilled = {
+      at: this.now().toISOString(), handedOffAt, paths,
+      agents: agents.map((task) => ({
+        id: task.id, ...(task.description ? { description: task.description } : {}),
+        ...(task.lastText ? { lastText: task.lastText } : {}), ...(task.tool ? { tool: task.tool } : {}),
+      })),
+    };
+    this.record('phase.agents-killed', {
+      agents: record.agentsKilled.agents.map((agent) => ({ id: agent.id, description: agent.description ?? null })),
+      handedOffAt, paths,
+    }, phase);
+    this.persist();
   }
 
   /**
@@ -4244,13 +4725,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   protected noteVerifying(
     phase: number, purpose: VerifyingLane['purpose'] | null,
-    at?: { command: string; index: number; total: number }, opts: { startedAt?: string; exported?: boolean } = {},
+    at?: { command: string; index: number; total: number },
+    opts: { startedAt?: string; exported?: boolean; stage?: 'setup'; only?: VerifyingLane['purpose'] } = {},
   ): void {
     const state = this.state;
     if (!state) return;
     const key = String(phase);
     if (!purpose || !at) {
       if (!state.verifying?.[key]) return;
+      // A pass ends only its OWN entry: a baseline measured beside the session
+      // (control-tower phase 105) is not ended by another pass's cleanup.
+      if (opts.only && state.verifying[key]!.purpose !== opts.only) return;
       delete state.verifying[key];
       if (!Object.keys(state.verifying).length) delete state.verifying;
     } else {
@@ -4259,10 +4744,26 @@ export abstract class RunnerAttempt extends RunnerLoop {
         phase, purpose, command: at.command.replace(/\s+/g, ' ').trim().slice(0, 200), index: at.index + 1, total: at.total,
         startedAt: opts.startedAt ?? state.verifying[key]?.startedAt ?? now, commandStartedAt: now,
         ...(opts.exported ? { exported: true } : {}), pid: process.pid,
+        ...(opts.stage ? { stage: opts.stage } : {}),
       };
     }
     this.persist();
     this.emit('run', { state });
+  }
+
+  /**
+   * The command a pass is running has its process (control-tower phase 105,
+   * #173): recorded on the lane's entry as `(pid, procStartedAt)`, so a reader
+   * that does not know this run is live reads a lane in its Setup or its
+   * baseline as the work in flight it is (`laneInFlight`).
+   */
+  protected noteVerifyingChild(phase: number, pid: number): void {
+    const check = this.state?.verifying?.[String(phase)];
+    if (!check) return;
+    // The WALL clock, never the runner's (a test's) — it is compared with the
+    // kernel's start time for the pid, exactly as a session's is.
+    check.child = { pid, procStartedAt: new Date().toISOString() };
+    this.persist();
   }
 
   /**
@@ -4271,6 +4772,20 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * (`record.contextWrapup`, `Runner.noteContext`) — so a stamp for the
    * session that just declared, written after this attempt began, is the proof.
    */
+  /**
+   * How many uncommitted, non-paperwork paths of a SHARED tree are this
+   * phase's own — written inside its sessions' windows (`wipOwners` 'self')
+   * — or 0, and always 0 for a lane with its own worktree: nothing a sibling
+   * boards into holds them (control-tower phase 109, #192).
+   */
+  private async ownUncommittedShared(phase: number): Promise<number> {
+    if (this.lanes.get(phase)?.worktree) return 0;
+    const dirty = await uncommittedPaths(await this.verifyCwd(phase));
+    const paths = (dirty?.paths ?? []).filter((entry) => !isPaperwork(entry.path));
+    if (!paths.length) return 0;
+    return [...wipOwners(paths, this.sessionWindows(), phase).values()].filter((owner) => owner === 'self').length;
+  }
+
   private wrapupAsked(record: PhaseRecord, reason: string | null | undefined): boolean {
     if (reason !== 'context' && reason !== 'budget') return false;
     const told = record.contextWrapup;
@@ -4306,6 +4821,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
     this.record('phase.resume-automatic', {
       trigger: 'outcome', path: 'wrapup', count: record.wrapupResumes, sessionId, reason, by: 'console',
     }, phase);
+    // Its lane is kept while its own WIP sits uncommitted in a shared tree
+    // (control-tower phase 109, #192): it re-boards before any sibling whose
+    // scope meets it, in the very pass that released it.
+    const paths = await this.ownUncommittedShared(phase).catch(() => 0);
+    if (paths) {
+      record.keepsLane = { at: hint.at, reason, sessionId, paths };
+      this.record('phase.lane-kept', { reason, paths, sessionId }, phase);
+    }
     this.record('phase.outcome-partial', { reason, climbed: false, wrapup: true }, phase);
     this.persist();
     this.emit('phase', { phase, status: record.status, note: record.note });
@@ -4700,6 +5223,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // healer's table names, driven here and accounted on no ladder.
       ...(opts.blocked ? { declared: 'blocked', rung: 'poll-park', vehicle: 'runner' } : {}),
       ...(unbudgeted ? { unbudgeted: true } : {}),
+      // A date beside a live ref is a BACKSTOP (control-tower phase 121, #181).
+      ...(backstopOf(declared.watch) ? { backstop: backstopOf(declared.watch)!.backstop } : {}),
     }, phase);
     this.emit('phase', { phase, status: 'waiting', note: record.parkReason, parkedUntil: until });
     this.armParkPoke(phase, until);
@@ -4800,8 +5325,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // kept, and a session must be able to record the second without
           // touching the first.
           PE_RULINGS_FILE: rulingsFile(this.state!.root, this.state!.slug),
-          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
-          PE_PROOFS_FILE: proofsFile(this.state!.root, this.state!.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62),
+          // and where its lines are judged — the proof is keyed there (phase 106, `proofEnv`).
+          ...(await this.proofEnv(phase)),
           // Where the session publishes its TASK LIST. A clone of the outcome
           // channel next door, for the same reason: the CLI stopped
           // provisioning TodoWrite/TaskCreate to `-p` sessions in August 2026,

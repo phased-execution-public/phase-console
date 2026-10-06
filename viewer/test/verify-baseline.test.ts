@@ -39,7 +39,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
-import { chainMembers, failureIds, foldCommand, type VerifyOptions } from '../server/runner/verify.ts';
+import { chainMembers, failureIds, foldCommand, verifyEnvDigest, type VerifyOptions } from '../server/runner/verify.ts';
 import {
   newRun, phaseRecord, saveRun, streakPhases, type PhaseRecord, type RunState, type VerifyRun, type VerifySummary,
 } from '../server/runner/state.ts';
@@ -266,7 +266,11 @@ test('VB-3: a line already run on the base tree is reused as the baseline — no
   const h = harness([1]);
   const base = await workingTreeOf(h.root);
   assert.ok(base, 'the harness is a repository');
-  appendLedger(verificationsFile(h.root, 'demo'), [ledgerRow({ tree: base!.tree, head: base!.head })]);
+  // As the console writes a row since control-tower phase 105 (BL-2): the
+  // environment digest and the directory are half of what makes it reusable.
+  appendLedger(verificationsFile(h.root, 'demo'), [ledgerRow({
+    tree: base!.tree, head: base!.head, env: verifyEnvDigest({}), dir: '', at: new Date().toISOString(),
+  })]);
   const { runner, calls } = runnerFor(h, { final: greenRun() });
   const state = await runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' });
   await runner.wait();
@@ -282,13 +286,18 @@ test('VB-3: a line already run on the base tree is reused as the baseline — no
   assert.equal(state.phases['1'].status, 'done');
 });
 
-test('VB-3: with nothing to reuse the baseline is MEASURED at boarding, before the session edits the tree, and ledgered', async () => {
+test('VB-3: with nothing to reuse the baseline is MEASURED on the tree the phase boarded on — never the session\'s edits — and ledgered', async () => {
   const h = harness([1]);
+  const boarded = await workingTreeOf(h.root);
   const { runner, calls } = runnerFor(h, { baseline: greenRun(), final: greenRun() });
   const state = await runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' });
   await runner.wait();
 
-  assert.deepEqual(calls, ['baseline', 'session', 'verify']);
+  // Since control-tower phase 105 (BL-3) it runs BESIDE the session, in a clean
+  // checkout of the boarding head, and the verdict waits for it.
+  assert.deepEqual([...calls].sort(), ['baseline', 'session', 'verify']);
+  assert.ok(calls.indexOf('baseline') < calls.indexOf('verify'), 'the baseline was in before the verdict');
+  assert.equal(state.phases['1'].baseline?.tree, boarded!.tree, 'the boarding tree, though the session changed src.txt');
   assert.deepEqual(state.phases['1'].baseline?.commands.map((entry) => entry.from), ['measured']);
   const kinds = readLedger(verificationsFile(h.root, 'demo'), 'demo').map((entry) => [entry.phase, entry.kind]);
   assert.deepEqual(kinds, [[1, 'baseline'], [1, 'verify']], 'the measured baseline is a run of the line like any other');

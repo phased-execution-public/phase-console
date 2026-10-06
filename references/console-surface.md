@@ -39,6 +39,11 @@ phase report draws it as that task's bar and times its rate for the ETA, so say 
 exits 2 and records nothing.
 
 `PE_SCOPE` and `PE_WORKTREE` may also be set; `scripts/phase-lock.sh` reads all of them by itself.
+So are `PE_PROOFS_FILE`, `PE_VERIFY_DIR` and `PE_RUN_ROOT` (control-tower phase 106, #196): the
+proof ledger, the directory the console runs this phase's §Verification in, and the run root.
+`phase-outcome.sh … verified` keys a proof by `PE_VERIFY_DIR` whatever directory your shell stands
+in, resolves a relative `--in` against `PE_RUN_ROOT` — never `$PWD` — and refuses, when you record
+it, a proof the verdict could only refuse (a tree the judging repository does not hold).
 The presence of `PE_OUTCOME_FILE` is the reliable test for "am I supervised" — the scripts fall back
 to the console's inbox without it, which is how a hand-driven session's declaration still reaches a
 running console.
@@ -175,9 +180,11 @@ both.
 
 **What a declaration may ask for is bounded, and spending the bound is never a failure.** A
 `waiting-external` spends this phase's wait budget: at most 4 waits (`WAIT_MAX_PER_PHASE`) and 8 h
-parked in total (`DEFAULT_WAIT_BUDGET_MS`) unless the plan's `**Wait budget:**` line or the phase's
-`- **Waits on:** <ref> · <max>` bullet says otherwise — a `date:` ref there countersigns a wait up to
-that instant. Your boot prompt's contract states the ceiling and where it came from. Past what is left,
+parked in total (`DEFAULT_WAIT_BUDGET_MS`) unless the plan says otherwise — the count by its
+`**Wait count:**` line or the phase's `- **Wait count:** <n>` bullet (control-tower phase 121, #40), the
+time by its `**Wait budget:**` line or the phase's `- **Waits on:** <ref> · <max>` bullet — a `date:`
+ref there countersigns a wait up to that instant, and beside a live ref is only its backstop: the live
+ref wakes the phase the moment it lands (#181). Your boot prompt's contract states the ceiling and where it came from. Past what is left,
 a wait that names a `--watch` ref the console can poll is given what is left and then waits on that ref
 alone; one that names none parks on a SPENT budget — `waiting`, no clock of its own, and a `budgets`
 errand carrying the arithmetic for a person to raise it — never a failure, never a streak charge. So
@@ -206,6 +213,17 @@ The runner installs an HTTP `Stop` hook (`viewer/server/runner/approvals.ts` →
 every supervised session. When you try to end your turn it asks the console one question: **does this
 phase read done on the board, or has a valid outcome been declared?** If neither, the hook refuses the
 stop and hands back the instruction — finish the closeout, or declare the wait.
+
+**A session ends when its agents do** (control-tower phase 109, #188). If the answer is yes — the board
+reads done, or `partial` / `complete` is declared — but a background subagent or monitor YOU launched is
+still running, the hook refuses that exit too (`hook.stop-background`): a handoff written while your
+agent still edits the tree hands off work that is still being written, and the CLI stops the agent ten
+minutes after your turn ends, mid-edit. The refusal names each agent and the two ways out — wait for it
+in one bounded foreground call (`TaskOutput`, `block: true`, at most ten minutes), or `TaskStop` it and
+name under **Outstanding** what it was doing and the files it touched. A turn that ends to WAIT on such
+an agent, with nothing declared, is still let go (`hook.stop-awaiting`), and so is a declared wait. The
+0.6× wrap-up notice names the live agents with the same choices, and one killed after a handoff anyway
+is named in the next attempt's brief, with its last words and the paths it wrote.
 
 Three properties, all deliberate:
 
@@ -260,6 +278,26 @@ rule and the command as fields —
 `phase-outcome.sh <slug> <N> blocked --needs permission --rule "<the rule>" --command "<the command>"`
 — and stop. The card is driven only from the console's own recorded denial: a wall described in prose,
 a denial that names no rule, and the guards' `in-turn-wait` and `poll-loop` offer nothing to widen.
+
+**A session never presses its own console** (`console-forge`, control-tower phase 129, #218). You run
+as the operator's own OS user, so the console's loopback API and its CLI would answer you as they
+answer the operator. The hook therefore denies, on every profile and before it runs, any call that
+would press a route or CLI verb in `viewer/shared/door-model.js`'s `AUTHORITY_ROUTES`: answering a
+permission card (`POST /api/approvals/:id`, `phase-console run approve|deny`), editing the policy,
+changing a run's settings (its profile, carve-out and auto-grant among them), approving a gate (the
+gate route and `/api/write`), and checking or dismissing a person's step.
+It reads an HTTP client the shell
+would run (`curl`, `wget`, `http`, `xh`) against a console's address, the CLI however it is reached,
+and — where a payload the shell cannot read runs (`python3 -c`, `node -e`, an `eval`, a script piped
+into a shell, a URL in a variable) — text that carries a console address and a fenced path. A write
+into the console's state or config directories, by the file tools or a shell redirection, is denied
+the same way; your run's own checkout and your memory can live there, and stay writable. Reads, the
+`/hooks/*` routes, your own message token, the skill's scripts and the operational verbs (`update`,
+`update-plugin`, `doctor`, `hooks-status`, a run's `hold` and `release`) pass. The denial names the declaration to make instead — `blocked --needs permission`,
+`needs-human --needs gates` or `needs-human --needs human-acts` — and is journalled
+`phase.tool-denied {rule: 'console-forge', verb}`; nothing about it is a person's to widen from a card.
+The one door through is the plan's own `permission.destructive` row naming the press for your phase
+(`` `phase-console run approve` `` names the card's route too), read as the auto-grant reads it.
 
 ## Never wait on somebody else's clock inside a turn — and never poll
 

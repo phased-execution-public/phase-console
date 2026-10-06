@@ -19,7 +19,7 @@ import { RELAY_CLI_FLOOR } from '../shared/run-settings.js';
 import { PROBE_STATUSES } from '../shared/ops-vocab.js';
 import {
   atLeast, cliVerdict, consoleVerdict, doctorExitCode, doctorReport, environmentVerdict, formatDoctor, gitVerdict, hooksVerdict,
-  nodeArgsVerdict, ptyHelperVerdict, skipped,
+  nodeArgsVerdict, presenceDirs, presenceVerdict, ptyHelperVerdict, skipped,
   type DoctorDeps, type DoctorRow,
 } from '../server/doctor.ts';
 import type { HooksStatus } from '../server/hooks-install.ts';
@@ -48,6 +48,7 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
     credentials: async () => okv('1 of 1 credential held'),
     delivery: async () => okv('1 subscribed device'),
     hooks: async () => hooks(),
+    presence: async () => [{ dir: '/home/someone/.claude', accounts: ['default'], status: hooks() }],
     unit: async () => ({ installed: true, disabled: false, runAtLoad: true, stoppedMarker: false, label: 'com.phase-console.abcd1234-demo' }),
     cliVersion: async () => '2.1.270',
     gh: async () => okv('gh auth status: signed in'),
@@ -65,7 +66,7 @@ const HEAP = '--max-old-space-size=6144';
 
 test('every row answers ok|fail|skip with a reason, in the documented order; a clean machine is ok', async () => {
   const report = await doctorReport(deps());
-  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'skill', 'node', 'pty', 'cli', 'gh', 'publish', 'git', 'environment', 'console'];
+  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'presence', 'skill', 'node', 'pty', 'cli', 'gh', 'publish', 'git', 'environment', 'console'];
   assert.deepEqual(report.rows.map((r) => r.id), order);
   for (const row of report.rows) {
     assert.ok((PROBE_STATUSES as readonly string[]).includes(row.status), `${row.id}: ${row.status}`);
@@ -85,6 +86,7 @@ test('every row answers ok|fail|skip with a reason, in the documented order; a c
   assert.match(formatDoctor(report), /^phase-console doctor — demo \(abcd1234-demo, :4130\) — answered by the running console/);
   assert.match(formatDoctor(report), /\ndoctor: ok$/);
 });
+
 
 test('a failing blocking row fails the report and is named first; a failing non-blocking row only reports', async () => {
   const blocked = await doctorReport(deps({
@@ -255,6 +257,115 @@ test('SKILL-2 — the offline doctor reads the same copies, through the same rea
     assert.ok(row.reason.includes(behind) && row.reason.includes(OLDER_REV.slice(0, 12)), row.reason);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The `presence` row (control-tower phase 108, #194)
+ * ------------------------------------------------------------------ */
+
+/**
+ * A run that moved to a profile account at a boundary spawned 13 phase
+ * sessions the registry never saw — and the `hooks` row stayed green, because
+ * it reads ONE settings file, the login's. The presence row reads every config
+ * dir the pool's sessions run from.
+ */
+test('PR-1 — the pool grouped by config dir: the login for the machine login and a token, each profile its own', () => {
+  const read = (path: string) => (path.includes('/work/') ? hooks({ path, installed: false, events: { SessionStart: false, SessionEnd: false, Stop: false, Notification: false } }) : hooks({ path }));
+  const dirs = presenceDirs([
+    { id: 'default', dir: '/home/someone/.claude' },
+    { id: 'pasted', dir: '/home/someone/.claude' },
+    { id: 'work', dir: '/state/accounts/work/config' },
+  ], read);
+  assert.deepEqual(dirs.map((one) => [one.dir, one.accounts]), [
+    ['/home/someone/.claude', ['default', 'pasted']],
+    ['/state/accounts/work/config', ['work']],
+  ]);
+  assert.equal(dirs[1]!.status?.path, '/state/accounts/work/config/settings.json', 'each dir\'s own settings file is what is read');
+  const thrown = presenceDirs([{ id: 'x', dir: '/nope' }], () => { throw new Error('EACCES'); });
+  assert.equal(thrown[0]!.status, null, 'a read that throws is unknown, never a crash');
+
+  const green = presenceVerdict([dirs[0]!]);
+  assert.equal(green.status, 'ok');
+  assert.match(green.reason, /every pooled account's config dir/);
+  const red = presenceVerdict(dirs);
+  assert.equal(red.status, 'fail');
+  assert.match(red.reason, /1 of 2 config dirs without the presence hook/);
+  assert.match(red.reason, /work: not installed in \/state\/accounts\/work\/config\/settings\.json/);
+  assert.deepEqual(red.warnings?.length, 1);
+  assert.match(red.warnings![0]!, /phase-console install-hooks --settings \/state\/accounts\/work\/config\/settings\.json/);
+  assert.match(presenceVerdict([{ ...dirs[1]!, status: hooks({ parseError: 'Unexpected token' }) }]).reason, /does not parse — Unexpected token/);
+  assert.match(presenceVerdict([{ ...dirs[1]!, status: hooks({ stale: true }) }]).reason, /another checkout/);
+  assert.equal(presenceVerdict(null).status, 'skip');
+  assert.equal(presenceVerdict([]).status, 'skip');
+});
+
+test('PR-2 — a profile without the hook fails the presence row and never the report; an older deps builder is a skip', async () => {
+  const report = await doctorReport(deps({
+    presence: async () => [
+      { dir: '/home/someone/.claude', accounts: ['default'], status: hooks() },
+      { dir: '/state/accounts/account-4e86/config', accounts: ['account-4e86'], status: null },
+    ],
+  }));
+  const row = report.rows.find((r) => r.id === 'presence')!;
+  assert.equal(row.status, 'fail');
+  assert.equal(row.blocking, false, 'the console provisions a profile at its next session — a report, not a stop');
+  assert.match(row.reason, /account-4e86: \/state\/accounts\/account-4e86\/config\/settings\.json could not be read/);
+  assert.equal(report.ok, true);
+  assert.match(formatDoctor(report), /✗ Presence on every account .*account-4e86/);
+
+  const older = await doctorReport(deps({ presence: undefined }));
+  assert.equal(older.rows.find((r) => r.id === 'presence')?.status, 'skip');
+});
+
+test('PR-3 — the offline doctor reads the instance\'s pooled accounts off disk, and names the profile dir that lacks the hook', async () => {
+  const { instanceStateDir, registerInstance } = await import('../shared/instances.mjs');
+  const { installHooks } = await import('../server/hooks-install.ts');
+  const root = mkdtempSync(join(tmpdir(), 'pc-doctor-presence-'));
+  let stateDir: string | undefined;
+  try {
+    mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+    // A registered console on a port nothing listens on, named by id: the
+    // doctor must read it off disk, never ask whichever console holds the
+    // default's port (a cwd under /var resolves as /private/var, which is not
+    // the registered spelling, and the walk would find a default candidate).
+    // Pro registers a NON-default one; the free tree's registry holds one slot,
+    // always the default, so there the root is that.
+    const patch: { name: string; port: number; default?: boolean } = { name: 'pr3', port: 1 };
+    const entry = registerInstance(root, patch);
+    assert.ok(entry, 'the root is registered');
+    stateDir = instanceStateDir(entry.id, entry.default === true);
+    const env = {
+      ...process.env, PHASE_CONSOLE_HOME: REPO, HOME: root,
+      PATH: [dirname(process.execPath), '/usr/bin', '/bin'].join(':'),
+    };
+    const doctorJson = () => {
+      const run = spawnSync(process.execPath, [join(REPO, 'bin', 'phase-console.mjs'), 'doctor', '--json', '--instance', entry.id], {
+        encoding: 'utf8', cwd: root, timeout: 60_000, env,
+      });
+      return JSON.parse(run.stdout) as { mode: string; instance: { id: string; default: boolean } | null; rows: DoctorRow[] };
+    };
+    const accountsDir = join(stateDir, 'accounts');
+    mkdirSync(join(accountsDir, 'work', 'config'), { recursive: true });
+    writeFileSync(join(accountsDir, 'accounts.json'), JSON.stringify({
+      version: 1, accounts: [{ id: 'work', kind: 'profile', name: 'work', createdAt: NOW }],
+    }));
+    installHooks({ skillDir: REPO, settingsPath: join(root, '.claude', 'settings.json') });
+
+    const report = doctorJson();
+    assert.equal(report.mode, 'offline');
+    const row = report.rows.find((r) => r.id === 'presence')!;
+    assert.equal(row.status, 'fail', row.reason);
+    assert.ok(row.reason.includes(join(accountsDir, 'work', 'config', 'settings.json')), row.reason);
+    assert.ok(!row.reason.includes(join(root, '.claude')), `the login has it: ${row.reason}`);
+
+    installHooks({ skillDir: REPO, settingsPath: join(accountsDir, 'work', 'config', 'settings.json') });
+    const fixed = doctorJson().rows.find((r) => r.id === 'presence')!;
+    assert.equal(fixed.status, 'ok', fixed.reason);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    // The default's state is the state home itself: take the pool back out.
+    if (stateDir) rmSync(join(stateDir, 'accounts'), { recursive: true, force: true });
   }
 });
 

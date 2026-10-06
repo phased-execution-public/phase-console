@@ -44,6 +44,13 @@ process.env.XDG_CONFIG_HOME = join(dir, 'config');
 // empty sandbox, so a console a test builds never reads the machine's plugins
 // into its prompts, its inbox or its doctor.
 process.env.PE_CLAUDE_CONFIG_DIRS = join(dir, 'claude');
+// …and never a supervising console's idea of where a phase is judged
+// (control-tower phase 106, #196): `phase-outcome.sh verified` keys a proof by
+// `PE_VERIFY_DIR` and resolves `--in` against `PE_RUN_ROOT`, and a suite run
+// by a session would otherwise refuse its fixtures' proofs against the
+// session's own tree. A test that means them sets them.
+delete process.env.PE_VERIFY_DIR;
+delete process.env.PE_RUN_ROOT;
 
 /**
  * A pty broker started by a test retires in seconds, not in five minutes.
@@ -81,6 +88,19 @@ process.env.PHASE_CONSOLE_SELF_UPDATE = '0';
  * it on against a console of its own.
  */
 process.env.PHASE_OUTCOME_PROBE = '0';
+
+/**
+ * No test reaches the operator's login keychain (control-tower phase 116,
+ * #200). A real `Service` builds its `Accounts` on the real `security`, and a
+ * test that registered a token account through one wrote that token into the
+ * keychain — and went red whenever the keychain was locked. `realExec` refuses
+ * every keychain write, replace and delete in any test process; this arms the
+ * same refusal for a test file run with plain `node`, which carries no test
+ * marker, and for every console a test spawns. A test that needs a secret
+ * stored gives the store a stub exec and `platform: 'linux'`, whose backend is
+ * a 0600 file under this sandbox.
+ */
+process.env.PHASE_CONSOLE_KEYCHAIN = '0';
 
 process.on('exit', () => {
   // Before the directory goes, so the pid files are still there to read.

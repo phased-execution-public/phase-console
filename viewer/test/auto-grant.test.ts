@@ -290,17 +290,20 @@ test('the lane is found by session id, so a parallel run applies the RIGHT phase
   service.close();
 });
 
-test('a wrapper hiding a denied payload is never a silent yes — the card stays human', async () => {
+test('a wrapper hiding a denied payload is never a silent yes — the wall reads the payload', async () => {
   rmSync(POLICY_PATH, { force: true });
   const { service } = serviceOn({});
-  // `git push` is deny by default; `flock` hides it one word in. classifyTool
-  // says ask (guarded wrapper fallback); auto-grant must refuse to answer it.
-  const pending = Symbol('still asking');
-  const outcome = await Promise.race([
-    service.decideToolUse({ tool_name: 'Bash', tool_input: { command: 'flock /tmp/l git push origin main' } }, 'r1'),
-    new Promise((resolve) => { setTimeout(() => resolve(pending), 100).unref(); }),
-  ]);
-  assert.equal(outcome, pending, 'the wall gets a person, not a standing yes');
+  // `git push` is deny by default; `flock` hides it one word in. Until
+  // control-tower phase 107 the classifier could not see it and asked a person
+  // (the guarded wrapper fallback). The shell reader (`shell-reading.ts`) reads
+  // a lead that runs what it is handed, so the wall itself answers — on every
+  // profile, as a deny always does. Never a yes, silent or otherwise.
+  const answer = reply(await service.decideToolUse(
+    { tool_name: 'Bash', tool_input: { command: 'flock /tmp/l git push origin main' } }, 'r1',
+  ));
+  assert.equal(answer.permissionDecision, 'deny', 'the wall answers, not a standing yes');
+  assert.match(answer.permissionDecisionReason, /rule: Bash\(git push:\*\)/, 'naming the rule that stopped it');
+  assert.equal(service.approvals.pending().length, 0, 'nothing waits on a person for what the wall refuses');
   service.approvals.disarm();
   service.close();
 });

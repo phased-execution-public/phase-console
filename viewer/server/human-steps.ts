@@ -46,7 +46,7 @@ import { log } from './log.ts';
 import {
   CREDENTIAL_ID_RE, DEVICE_CODE_RE, HUMAN_STEP_DEFAULT_WINDOW_MS, HUMAN_STEP_MOVES, HUMAN_STEP_OPEN_STATES,
   HUMAN_STEP_STATES, HUMAN_STEP_WHERE, KIND_META, REMINDER_SERIES_MS,
-  canTransition, humanStepKindOf, isOpenableUrl, redactSecrets,
+  canTransition, dueRefOk, humanStepKindOf, isOpenableUrl, redactSecrets,
   type HumanStepBirth, type HumanStepKind, type HumanStepMove, type HumanStepState, type HumanStepWhere,
 } from '../shared/human-step-model.js';
 import { keychainStore, realExec, SECRET_MUST_BE_ONE_LINE, type Exec } from './accounts/credentials.ts';
@@ -73,6 +73,8 @@ export type DeclaredStep = {
   lines?: string[];
   code?: string;
   credential?: string;
+  /** The watch ref the step is `upcoming` until (control-tower phase 121). */
+  due_when?: string;
 };
 
 /** One step, folded — every string already redacted. */
@@ -98,6 +100,15 @@ export type HumanStep = {
   autoOpen?: 'host';
   /** When the step's window closes, if it has one. */
   until?: string;
+  /**
+   * The watch ref an `upcoming` step waits on before it is due (control-tower
+   * phase 121, #182) — `phase-outcome.sh --due-when`, a plan bullet's `due:`.
+   */
+  dueWhen?: string;
+  /** When its due-when ref landed and it became `declared`. */
+  dueAt?: string;
+  /** An upcoming step's window, in minutes — it starts at `dueAt`, not at the birth. */
+  windowMinutes?: number;
   state: HumanStepState;
   declaredAt: string;
   /** When the state it is in was reached. */
@@ -140,6 +151,8 @@ type MoveLine = {
   where?: 'here' | 'host' | 'terminal';
   /** `snooze`: no reminder before this. */
   snoozeUntil?: string;
+  /** `due`: the window it now has, starting at the due moment. */
+  until?: string;
 };
 
 /** One line of a step's history, as `history` answers it — the datums a card shows. */
@@ -188,6 +201,7 @@ function foldMove(known: HumanStep, state: HumanStepState, move: MoveLine): Huma
       if (move.by) next.provenBy = move.by;
       break;
     case 'snooze': if (move.snoozeUntil) next.snoozeUntil = move.snoozeUntil; break;
+    case 'due': next.dueAt = move.at; if (move.until) next.until = move.until; break;
     default: break;
   }
   return next;
@@ -270,6 +284,13 @@ export function sanitiseStep(raw: unknown, birth: HumanStepBirth): CleanStep | n
   }
   const minutes = Number(input.windowMinutes ?? input.window_minutes);
   if (Number.isFinite(minutes) && minutes > 0) step.windowMinutes = Math.round(minutes);
+  // The moment it becomes due (control-tower phase 121): a watch ref, by its
+  // scheme — anything else would leave the step upcoming for ever.
+  const due = text(input.due_when ?? input.dueWhen, PROOF_MAX);
+  if (due !== undefined) {
+    if (dueRefOk(due)) step.dueWhen = due;
+    else dropped.push('due_when');
+  }
   return { step, dropped };
 }
 
@@ -339,7 +360,9 @@ export function readLedger(file: string, opts: { history?: boolean } = {}): Ledg
       }
       const known = steps.get(id);
       if (!known) {
-        if (state !== 'declared' || !humanStepKindOf(parsed.kind)) { skipped++; continue; }
+        // A step is born `declared`, or `upcoming` when it waits on a due-when
+        // ref (control-tower phase 121).
+        if ((state !== 'declared' && state !== 'upcoming') || !humanStepKindOf(parsed.kind)) { skipped++; continue; }
         const { v: _v, ...rest } = parsed;
         const step = rest as unknown as HumanStep;
         steps.set(id, { ...step, opened: typeof step.opened === 'number' ? step.opened : 0 });
@@ -371,10 +394,10 @@ export type MoveRefusal = { refused: 'unknown-step' | 'transition'; from?: Human
 /** What a move may say beside its state — each field redacted or shaped before it is written. */
 export type MoveExtra = {
   by?: string; pushed?: boolean; stored?: 'keychain' | 'file'; note?: string;
-  verb?: HumanStepMove; where?: MoveLine['where']; snoozeUntil?: string;
+  verb?: HumanStepMove; where?: MoveLine['where']; snoozeUntil?: string; until?: string;
 };
 
-/** Is this step still open — one of the four states short of settled? */
+/** Is this step still open — one of the states short of settled (an `upcoming` one included)? */
 export function isOpenStep(step: Pick<HumanStep, 'state'>): boolean {
   return (HUMAN_STEP_OPEN_STATES as readonly string[]).includes(step.state);
 }
@@ -424,6 +447,11 @@ export class HumanStepLedger {
     return readLedger(this.file).steps.get(id);
   }
 
+  /** The ledger's own clock — what every line it writes is stamped with. */
+  clock(): Date {
+    return this.now();
+  }
+
   /** Every move a step made after its declaration, oldest first — each open, each check and what it read. */
   history(id: string): StepMove[] {
     return readLedger(this.file, { history: true }).moves?.get(id) ?? [];
@@ -435,20 +463,26 @@ export class HumanStepLedger {
     return [...read.steps.values()].map((step) => ({ step, moves: read.moves?.get(step.id) ?? [] }));
   }
 
-  /** Write a new step, state `declared`. */
+  /**
+   * Write a new step, state `declared` — or `upcoming` when it names a
+   * due-when ref (control-tower phase 121): its window then starts when it is
+   * due, so the minutes are kept rather than turned into a clock now.
+   */
   declare(input: {
     slug: string; phase: number; birth: HumanStepBirth; runId?: string; sessionId?: string; clean: CleanStep['step'];
   }): HumanStep {
     const declaredAt = this.now().toISOString();
     const { windowMinutes, ...fields } = input.clean;
     const id = stepIdFor({ slug: input.slug, phase: input.phase, declaredAt, kind: fields.kind, title: fields.title });
-    const until = windowMinutes ? new Date(Date.parse(declaredAt) + windowMinutes * 60_000).toISOString() : undefined;
+    const upcoming = Boolean(fields.dueWhen);
+    const until = windowMinutes && !upcoming ? new Date(Date.parse(declaredAt) + windowMinutes * 60_000).toISOString() : undefined;
     const step: HumanStep = {
       id, ...fields, birth: input.birth, slug: input.slug, phase: input.phase,
       ...(input.runId ? { runId: input.runId } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(until ? { until } : {}),
-      state: 'declared', declaredAt, at: declaredAt, opened: 0,
+      ...(upcoming && windowMinutes ? { windowMinutes } : {}),
+      state: upcoming ? 'upcoming' : 'declared', declaredAt, at: declaredAt, opened: 0,
     };
     this.append({ v: HUMAN_STEP_LINE_VERSION, ...step });
     this.changed(step);
@@ -473,6 +507,7 @@ export class HumanStepLedger {
       ...(extra.note ? { note: redactSecrets(extra.note.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, 300) } : {}),
       ...(extra.where ? { where: extra.where } : {}),
       ...(extra.snoozeUntil ? { snoozeUntil: extra.snoozeUntil } : {}),
+      ...(extra.until ? { until: extra.until } : {}),
     };
     this.append(line);
     const moved = this.get(id)!;
@@ -515,6 +550,15 @@ export function declareHumanStep(
   if (clean.dropped.length) {
     log.warn('human-steps.fields-dropped', { id: declared.id, kind: declared.kind, birth: input.birth, dropped: clean.dropped });
   }
+  // Born before it is due (control-tower phase 121): shown as *Coming up*,
+  // told to nobody. Its ONE push waits for its due-when ref (`dueHumanStep`).
+  if (declared.state === 'upcoming') {
+    log.info('human-steps.declared', {
+      id: declared.id, kind: declared.kind, where: declared.where, birth: input.birth,
+      slug: input.slug, phase: input.phase, pushed: false, upcoming: true,
+    });
+    return declared;
+  }
   let pushed = false;
   try {
     pushed = deps.announce(declared);
@@ -527,6 +571,39 @@ export function declareHumanStep(
     slug: input.slug, phase: input.phase, pushed,
   });
   return 'refused' in moved ? declared : moved;
+}
+
+/**
+ * An `upcoming` step's due-when ref has LANDED (control-tower phase 121, #182):
+ * the step is `declared` — its window starts now — then announced ONCE, then
+ * `notified`, exactly the road a step born due takes. A step that is not
+ * upcoming is refused (`transition`): an act is due once, and a second landing
+ * of the same ref is no news.
+ */
+export function dueHumanStep(
+  deps: { ledger: HumanStepLedger; announce: (step: HumanStep) => boolean },
+  id: string,
+  opts: { ref: string; detail?: string },
+): HumanStep | MoveRefusal {
+  const step = deps.ledger.get(id);
+  if (!step) return { refused: 'unknown-step', to: 'declared' };
+  if (step.state !== 'upcoming') return { refused: 'transition', from: step.state, to: 'declared' };
+  const at = deps.ledger.clock().getTime();
+  const due = deps.ledger.move(id, 'declared', {
+    by: 'console', verb: 'due',
+    note: `due — ${opts.ref} landed${opts.detail ? `: ${opts.detail}` : ''}`,
+    ...(step.windowMinutes ? { until: new Date(at + step.windowMinutes * 60_000).toISOString() } : {}),
+  });
+  if ('refused' in due) return due;
+  let pushed = false;
+  try {
+    pushed = deps.announce(due);
+  } catch (error) {
+    log.warn('human-steps.announce-failed', { id, error: (error as Error)?.message ?? String(error) });
+  }
+  const moved = deps.ledger.move(id, 'notified', { by: 'console', pushed, verb: 'notify' });
+  log.info('human-steps.due', { id, kind: step.kind, slug: step.slug, phase: step.phase, ref: opts.ref, pushed });
+  return 'refused' in moved ? due : moved;
 }
 
 /**
@@ -616,11 +693,15 @@ export function stepWindowEndOf(record: Pick<PhaseRecord, 'declared'>): number |
   return Number.isFinite(until) ? until : null;
 }
 
-/** When a step's window closes: its own `until`, else seven days after it was declared. */
-export function windowEndOf(step: Partial<Pick<HumanStep, 'until' | 'declaredAt'>>): number {
+/**
+ * When a step's window closes: its own `until`, else seven days after it
+ * became due — `dueAt` for a step that was `upcoming` first, its declaration
+ * for one born due.
+ */
+export function windowEndOf(step: Partial<Pick<HumanStep, 'until' | 'declaredAt' | 'dueAt'>>): number {
   const own = Date.parse(step.until ?? '');
   if (Number.isFinite(own)) return own;
-  const declared = Date.parse(step.declaredAt ?? '');
+  const declared = Date.parse(step.dueAt ?? step.declaredAt ?? '');
   return (Number.isFinite(declared) ? declared : Date.now()) + HUMAN_STEP_DEFAULT_WINDOW_MS;
 }
 
@@ -691,7 +772,8 @@ export function outsideQuiet(at: number, quiet: ReminderQuiet | null | undefined
 export function nextReminderAt(
   step: HumanStep, opts: { quiet?: ReminderQuiet | null; minuteOf?: (ms: number) => number } = {},
 ): number | null {
-  if (!isOpenStep(step)) return null;
+  // An upcoming step is unreminded: nobody has been told of it yet.
+  if (!isOpenStep(step) || step.state === 'upcoming') return null;
   const anchor = Math.max(
     ...[step.notifiedAt ?? step.declaredAt, step.remindedAt, step.actedAt]
       .map((stamp) => Date.parse(stamp ?? ''))
@@ -740,6 +822,9 @@ export function tickHumanSteps(deps: StepClockDeps): StepClockPass {
       if (!('refused' in moved)) pass.dismissed.push(step.id);
       continue;
     }
+    // Upcoming (control-tower phase 121): its window has not started and
+    // nobody has been told — the due pass (`dueHumanStep`) is what moves it.
+    if (step.state === 'upcoming') continue;
     const end = windowEndOf(step);
     if (deps.now >= end) {
       const moved = deps.ledger.move(step.id, 'expired', {

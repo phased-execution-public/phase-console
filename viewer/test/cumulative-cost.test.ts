@@ -256,15 +256,25 @@ const tokensOf = (partial: Partial<TokenCounters>): TokenCounters => ({
   calls: 7, lastContext: 450_000, peakContext: 450_000, input: 0, cacheWrite: 0, cacheRead: 0, output: 0, rebuilds: 0, ...partial,
 });
 
-test('CC-5: per-message usage is priced by the model\'s family — the week\'s measured Opus rates — and nothing is guessed', () => {
-  near(priceUsage('claude-opus-5-5[1m]', tokensOf({ input: 1_000_000 }))!, 5, 'input');
-  near(priceUsage('opus', tokensOf({ cacheWrite: 1_000_000 }))!, 10, 'a cache write');
-  near(priceUsage('opus[1m]', tokensOf({ cacheRead: 1_000_000 }))!, 0.5, 'a cache read');
-  near(priceUsage('claude-opus-5', tokensOf({ output: 1_000_000 }))!, 25, 'output');
-  assert.equal(priceUsage('some-future-model', tokensOf({ output: 1_000 })), null, 'an unpriced family is not priced');
+test('CC-5: per-message usage is priced by the model\'s own row — each version\'s measured rates — and nothing is guessed', () => {
+  // Opus 5 (the audit week's rows) and Opus 5.5 (control-tower phase 109, #202),
+  // matched by the whole id: this test pinned `claude-opus-5-5[1m]` at Opus 5's
+  // $5 until #202 found the substring match behind 347 false findings.
+  near(priceUsage('claude-opus-5[1m]', tokensOf({ input: 1_000_000 }))!, 5, 'Opus 5 input');
+  near(priceUsage('claude-opus-5', tokensOf({ cacheWrite: 1_000_000 }))!, 10, 'Opus 5 a cache write');
+  near(priceUsage('claude-opus-5[1m]', tokensOf({ cacheRead: 1_000_000 }))!, 0.5, 'Opus 5 a cache read');
+  near(priceUsage('claude-opus-5', tokensOf({ output: 1_000_000 }))!, 25, 'Opus 5 output');
+  near(priceUsage('claude-opus-5-5[1m]', tokensOf({ input: 1_000_000 }))!, 4, 'Opus 5.5 input');
+  near(priceUsage('claude-opus-5-5', tokensOf({ cacheWrite: 1_000_000 }))!, 8, 'Opus 5.5 a cache write');
+  near(priceUsage('claude-opus-5-5[1m]', tokensOf({ cacheRead: 1_000_000 }))!, 0.2, 'Opus 5.5 a cache read');
+  near(priceUsage('claude-opus-5-5', tokensOf({ output: 1_000_000 }))!, 20, 'Opus 5.5 output');
+  // P85's fresh 5.5 session (#202): the CLI's own figure, not the $27.2010 the one row said.
+  near(priceUsage('claude-opus-5-5[1m]', tokensOf({ input: 268, cacheWrite: 389_327, cacheRead: 37_695_498, output: 178_346 }))!, 14.2217, 'P85', 1e-4);
+  assert.equal(priceUsage('some-future-model', tokensOf({ output: 1_000 })), null, 'an unmeasured model is not priced');
+  assert.equal(priceUsage('opus', tokensOf({ output: 1_000 })), null, 'an alias names no version, so no row');
   assert.equal(priceUsage(null, tokensOf({ output: 1_000 })), null);
   // P14's 7-call resume: 3,025,226 cached tokens read, 4,666 written out.
-  near(priceUsage('opus', tokensOf({ cacheRead: 3_025_226, output: 4_666, cacheWrite: 2_000, input: 20 }))!, 1.649363, 'P14');
+  near(priceUsage('claude-opus-5', tokensOf({ cacheRead: 3_025_226, output: 4_666, cacheWrite: 2_000, input: 20 }))!, 1.649363, 'P14');
 });
 
 test('CC-5: a mismatch is a booked figure past tolerance of the priced one — subagents explain an excess, never a shortfall', () => {
@@ -287,7 +297,7 @@ test('CC-5: a booked figure the tokens cannot explain journals phase.cost-mismat
         sessionId: 'sess-fresh', costUsd: 26.01,
         tokens: tokensOf({ cacheRead: 3_025_226, output: 4_666, cacheWrite: 2_000, input: 20 }),
       });
-    });
+    }, { phaseDefaults: () => ({ model: 'claude-opus-5' }) });
     await instance.start({ slug: 'demo', root: h.root, onlyPhases: [1] });
     await instance.wait();
     assert.equal(instance.current()!.phases['1'].status, 'done', 'never blocks');

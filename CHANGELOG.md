@@ -20,6 +20,397 @@ into a web form at the moment of release.
 
 ## [Unreleased]
 
+## [6.1.0] - 2026-10-06
+
+**The world outside a run.** 6.1 lets an unattended run wait on what happens outside its own checkout,
+and tells the truth about where its work stands. A wait can watch a job on another machine
+(`unit:<host>/<unit>`), a date can stand beside a live ref as its backstop, a plan can raise its own
+wait count, and the operator's own acts — a command to run, a click path to follow — form one queue
+whose entries come due when their trigger lands. A run is settled only once its branch has landed on
+the trunk, a manual gate is a person's alone, a session can no longer press its own console, and the
+Issues desk reads a repository's whole issue list, each issue with its category, severity and plan
+status. The free tree stays MIT. Nothing a 6.0 plan says stops working — what moved under people's
+feet is below.
+
+### Migration
+- **A manual gate is a person's.** A gate the plan marks `manual` is never delegated to a session,
+  whatever the `gates` row says. `gate-status.md` gains a `Door` column, and `--gate-status` honours a
+  manual approval only when a person's door — the console's Gate card or a person's own terminal —
+  wrote it, so a row written before 6.1, which names no door, no longer clears its gate: approve it
+  again.
+- **A run is settled only once it has landed.** A run that owns a branch reads `finished` only when
+  every repository's `pe/<slug>`, the root's included, is held by `origin/<trunk>`; until then it parks
+  `unlanded` with one merge errand, where 6.0 called it finished. Under `landing: hold` nothing moves
+  the branch onto the trunk by itself.
+- **A session cannot press its own console.** A supervised session's HTTP client (`curl`, `wget`,
+  `http`, `xh`) against a console's approval, policy, run-settings, gate or person's-step routes, and
+  its writes into the console's state or config directories, are denied before they run
+  (`console-forge`). A phase that must press one names that press's CLI form in the plan's
+  `permission.destructive` row.
+- **A §Verification line runs without `CI=1`.** The console no longer sets it, so a suite that changed
+  its behaviour on `CI` runs as it does in the session; non-interactivity comes from `NO_COLOR`,
+  `TERM=dumb` and a closed stdin, and a `CI` the console itself was started with passes through.
+- **A session's turn ends after its own agents.** While a background subagent or monitor the session
+  launched still runs, the Stop hook refuses a `partial` or `complete` exit (twice at most) and names
+  the two ways out: wait for it in one bounded foreground call, or stop it and record what it was doing.
+- **A new advisory lint, F39 `setup-deps-missing`,** names a §Verification line that runs a package
+  script or a `.venv/bin/*` binary in a repository the phase's `- **Setup:**` installs nothing for.
+  Add the install to Setup; the lint never changes the exit code.
+- **Update the console's scripts and the plugin together**, as at 6.0: a 6.0.0 `phase-outcome.sh` has
+  no `--act` or `--due-when` and knows no `unit:` ref, and a 6.0.0 `phase-graph.sh` has no
+  `--wait-count` or `--verify-in` arm.
+- **For readers of the vocabularies:** a person's turn has a seventeenth kind, `operator-act`, and a
+  ninth state, `upcoming`, first in the path; a run has a new halt kind, `unlanded`.
+
+### Added
+- **A wait on another machine's job** (control-tower phase 121, #181). A new watch scheme,
+  `unit:<host>/<unit>`, asks a systemd unit on another machine whether it is still running — over ONE
+  shared ssh connection per host (`ControlMaster`, its socket under the console's state directory),
+  every 5 minutes — and lands the moment the unit leaves `activating`/`active`, recording its `Result=`
+  and exit time in the wait history. The host's address, user, key and port come from `hosts.<name>` in
+  the machine profile `~/.config/phase-console/fleet.json`; a host not named there is refused, and none
+  of those details is written into a run record — ssh's own failure is told in fixed words of its class,
+  never its text. The master socket lives with the instance's state, or, where that path would overrun a
+  Unix socket's 104 bytes, in a private directory of the user's own under the system's temporary one.
+  `phase-outcome.sh` refuses a malformed `unit:` ref.
+- **A date beside a live ref is a backstop** (#181). `waiting-external --watch <ref> --watch date:<iso>`
+  wakes the phase the moment the ref lands; the date only bounds the wait, and if it passes first the
+  phase is resumed told that the ref has NOT landed and what it last read (`phase.waiting` carries
+  `backstop`). The script says which ref is the backstop when it records the declaration.
+- **A plan raises its own wait count** (#40). `**Wait count:** <n>` in §Session budget, or
+  `- **Wait count:** <n>` on a phase (1–99), lifts the four declared waits a phase may spend;
+  `phase-graph.sh --wait-count [N]` reads it, `wait-budget.sh [--phase N] --count <n>` writes it. A park
+  on a spent count or a spent time budget whose watch ref still polls now reads as a WAIT on that ref —
+  the run `waiting` on it, looked at again every six hours — never an errand to re-check it by hand. A
+  `date:` is a clock, not such a ref, and a ref the watch clock has refused for good no longer counts:
+  either way the park is a person's again, with its `budgets` errand. The session contract states the
+  raised count and where it came from.
+- **The operator's acts, as one queue** (#182). A seventeenth human-step kind, `operator-act` — an act
+  only the operator does, a command to run or a click path to follow — and a ninth state, `upcoming`,
+  first in the path: a step declared with a due-when ref is shown under *Coming up*, unannounced and
+  unreminded, its window not started, until that ref lands; then it is due with ONE notification,
+  `NOW: <command>`, and its proof landing clears it and resumes the phase that needed it. A session
+  declares one with `phase-outcome.sh … needs-human --act --due-when <ref>`; a plan with a `due: <ref>`
+  field on its `- **Human step:**` bullet, in a phase or under `## Operator errands` (the plan's own,
+  phase 0). A `due:` that fits no scheme's shape fails the F37 lint by name. While an act is coming up
+  its park summons nobody — no needs-you push, no errand row — and a due-when ref the console refuses
+  makes it due at once, the refusal named; a frozen console asks no due-when ref at all. The approve page
+  and the Tower list *Coming up* after what is due, each row with its command to copy. New journal line
+  `phase.human-step-due`, log `human-steps.due`.
+- **The Issues desk** (control-tower phase 118). Repo ▸ Issues reads a repository's WHOLE issue list:
+  one `gh issue list --state all` with a cap of 2,000 (`ISSUE_LIST_CAP`, asked one over so `truncated` is
+  measured, never assumed), with `author`, `createdAt` and `closedAt` now among the fields and still no
+  field that returns a body. Each issue carries what the desk reads off it, derived once in
+  `viewer/shared/issues-model.js` (`categoryOf`, `severityOf`, `planStateOf`, `triageOf`) and drawn
+  through the status family: its category (`bug` · `enhancement` · `documentation` · `question` ·
+  `other`), its severity (a `severity:` label, or none) and where it stands in a plan — needs a plan
+  (`awaiting-plan`), planned in `<slug>` phase N (`plan:<slug>`, with the phase a local plan's `Fixes:`
+  line names), deferred (`plan:<slug>-deferred`), fixed (closed, with a plan label). Every column sorts
+  and the sort is in the URL beside the new Category, Severity and Plan status filters. The repository
+  picker takes any GitHub `owner/name` an operator adds (`prefs.issueRepos`, at most 12), read and
+  refreshed like the estate and marked "outside this console". The palette's entry is "The Issues
+  desk", and the Plans page links "Plan from issues" to it.
+- **The issue rubric's words** (control-tower phase 114). `viewer/shared/issues-model.js` owns the
+  three issue types (`bug` · `enhancement` · `documentation`), the four severities worst-first with their
+  one-line meanings (critical — data loss, a security or permission bypass, an unapproved production
+  change, or every lane blocked; high — a run halts or parks, or reaches a wrong verdict, with no in-run
+  workaround; medium — time or money wasted, a workaround exists; low — cosmetic, wording, noise), the
+  lifecycle labels `awaiting-plan` and `from-session` with the `severity:` prefix, and the suggestion
+  words; `scripts/issues.env` is their bash twin, held word for word by `gates-vocab.test.ts`.
+- **The docs say what 6.1 adds, in English and Persian** (control-tower phase 122). The help sheet's
+  Halts section gains *A job on another machine* (the `unit:` watch and its `hosts.<name>` profile
+  entry) and its watch card the date backstop and the raised wait count; Your turn gains *Acts that come
+  due later* (`operator-act`, *Coming up*, `due:`, `--act --due-when`); Getting around's Repo card says
+  what the Issues desk reads off each issue; When stuck ▸ Parked explains a run that is done but not on
+  its trunk (`unlanded`). README and USAGE carry a 6.1 paragraph each and their Persian twins the same,
+  `viewer/README.md` and its twin state the 6.1 wait rules, and `docs/loop.md`'s scheme table gains
+  `unit:`.
+
+### Fixed
+- **A temp-file save under `docs/` no longer makes the console forget every plan** (#244). An editor's or
+  an agent's atomic write reached the plan store as a change that named no plan, so the console forgot
+  every plan and read them all again, and hung while every board was derived anew. The watcher now drops
+  temp-file and atomic-save artifacts before they become a change, and a change forgets only the plans it
+  moved or named.
+- **A plan card's repository tag keeps its width on a phone** (control-tower phase 118, #203). At 360 px
+  a range estimate and the time filled the card's meta row, and the tag — the one part allowed to shrink —
+  gave way to zero pixels. The row now wraps the time onto a line of its own first, and the tag never
+  draws narrower than three characters. The e2e register gains a probe class, `squeezed`, for text a
+  layout gave a line's height and no width; without the fix it names the tag (`span "app" ×2` on the
+  Plans stop at phone-360), and `e2e/baseline.json` stays `[]`.
+- **No test reaches the login keychain, and the suite's slow and flaky fixtures are mended**
+  (control-tower phase 116, #200, #169). `auto-recovery.test.ts` RCV-10/ACC-3.2 registered a spare token
+  account on a real `Service`, so every suite run wrote a token into the operator's macOS login keychain
+  and deleted it again — and went red whenever that keychain was locked. `realExec`
+  (`server/accounts/credentials.ts`) now refuses every keychain write, replace and delete in any test
+  process (`NODE_TEST_CONTEXT`, `VITEST`, a `--test` argv, or `PHASE_CONSOLE_KEYCHAIN=0`, which
+  `test/state-sandbox.ts` sets for a file run with plain `node`, and `test/spawn-console.ts` for every
+  console a test or the browser tour spawns — the tour's since phase 123) before
+  a child starts, with the fix in the sentence, and `keychainStore` lets that sentence through rather than
+  "unlock the login keychain". A lookup still runs: a real `Service` judges the machine login by its item.
+  Production carries none of these markers; `testProcess` in `shared/instances.mjs` is the one reading of
+  "a test process" for both belts. `git-browse.test.ts`'s fixture `git` is hermetic — no global or system
+  config, `gc.auto=0` and `maintenance.auto=false` as command-line config, the inherited `GIT_*`
+  environment dropped — and a fixture command that fails reports `.git/HEAD`, the refs and the reflog
+  tail. G-DIFF builds its overflowing stat from 5 500 deep paths in one `git fast-import` (5 s under load,
+  where it took 102 s). The runner suite's `sleep` stub was never a Runner option, so RF-3 and two
+  connectivity tests waited out real 60 s backoffs; the harness now installs it, and the two boarding-pause
+  tests press inside the slow gate's window rather than 300 ms after the start. UP-3 pins the doctor's
+  Claude Code rows in the order phase 108 gave them (hooks, presence, skill), `plan-fields.ts`
+  accounts for `--verify-in`, and the eight files that boot a console wait about 60 s for it, not 5–10 s.
+  Phase 117 mended the two the release gate still met: BL-3 expects the suite's own priority plus the
+  baseline's nice, clamped at the kernel's floor, rather than an absolute niceness, so a suite started
+  niced passes; and PR-3 registers the free tree's one default slot rather than a second console its
+  one-slot registry refuses.
+- **One `ps` per process in flight, so a busy console cannot run out of descriptors** (control-tower
+  phase 123). The process probe's single-flight started a new `ps` before it looked for the one already
+  out, so it deduplicated the bookkeeping and not the subprocess: every ask on a stale sample spawned
+  another `ps`. A presence backlog applied on a busy loop asked about 3,500 times about a few live pids,
+  each `ps` held three pipe descriptors until the loop could reap it, and once the process had about
+  10,240 open — macOS's `OPEN_MAX` — every later spawn in it failed `EBADF`, `git` and `bash` included.
+  That was `sessions-presence.test.ts`'s cascade under whole-suite load (phase 116 met it twice in three
+  runs). A probe already out is now the refresh, and the awaited ask joins it.
+- **A session cannot press its own console** (control-tower phase 129, #218). A supervised session runs as
+  the operator's own OS user, and the console's write guard is a capability flag, its header and a
+  same-origin test — so one `curl` could answer the session's own permission card, strike a deny rule,
+  raise its run to `bypass`, approve a manual gate or prove a person's step. A new hook guard,
+  `console-forge`, denies such a call before it runs, on every profile and beside `gate-forge`: an HTTP
+  client the shell would run (`curl`, `wget`, `http`, `xh`) against a console's address with a mutating
+  method and a path in `viewer/shared/door-model.js`'s `AUTHORITY_ROUTES` (the approval cards, the
+  policy, a run's settings, the gate route, `/api/write`, a person's step's check and dismiss), the CLI
+  twins (`phase-console run approve|deny`), a wrapper whose text carries a console address and a fenced
+  path, and a write into the console's state or config directories by the file tools or a shell
+  redirection. A run's own checkout and a session's memory, which can live under the state directory,
+  stay writable; reads, `/hooks/*`, a session's message token, the skill's scripts and the operational
+  verbs pass; a press the plan's `permission.destructive` row names for the running phase passes. The
+  refusal names the declaration to make instead, and is journalled `phase.tool-denied {rule:
+  'console-forge', verb}`. And `POST /api/write {action: 'gate-approve'}` no longer takes a gate's door
+  from its body: an approval there goes through the gate route's own person test, so a manual gate is
+  refused to a script whatever door it claims.
+- **Settled means landed** (control-tower phase 112, #184). A run that owns a branch now reports `finished`
+  with nothing outstanding only when every repository's run branch — each mirror mount, the root's
+  included — is held by `origin/<trunk>`. The proof is tree containment asked in each repository:
+  `git merge-tree --write-tree <trunk> <tip>` writing `<trunk>^{tree}`, never `git cherry`; the local trunk
+  only for a repository with no remote copy (`run.landing-proof`). Anything else parks the run `unlanded`
+  — a new run-level halt kind — with one errand ("pe/x conflicts with main in a.md, b.md"), whose card
+  opens a merge errand tree; the read path never settles it to `finished`, and Recover & continue proves it
+  again. Before, a hub run settled `keep` and read `finished {outstanding: []}` with its last two phases'
+  docs on an unpushed root branch that conflicted with `main` in six files. Under `landing: hold` every
+  brief now says nothing moves the branch onto the trunk by itself. And untracked files never pin a mirror
+  mount at the prune: they move to the run's `stale-mounts/` and the mount goes; a mount kept for tracked
+  edits is named in a `run.errand` with its paths.
+- **A squash-landed branch is re-seated** (control-tower phase 112, #183). Once a release squash-merges
+  `pe/<slug>` and the trunk holds all its content (the same merge-tree proof), the console moves the branch
+  onto `origin/<trunk>` in the run's own checkout (`run.branch-reseated`, with the old tip and the proof).
+  It does this before its own verification of the phase and at every boundary, only on a clean mount, and
+  never under another lane. A mount a session detached on the trunk is re-seated rather than switched back
+  to the pre-squash tip. A dirty one's `isolation-refused` names that remedy instead of only "switch it
+  back or remove it". And a session's `git switch --detach` / `git checkout <commit>` inside its run's own
+  checkout is refused before it runs (`run-tree-detach`). Before, a release's `task drift:*` lines could go
+  green only by detaching the mirror, and the next boarding was refused.
+- **Retention leaves live trees alone** (control-tower phase 112, #171). A tree whose run is live, or
+  whose mtime moved in the last ten minutes, keeps its last known size and is never scanned. At most one
+  `du` runs console-wide. A `du` past its 30 s ceiling is ended through the signals ladder (SIGCONT,
+  SIGTERM to its group, SIGKILL after 2 s) and its tree is not asked again for six hours. Nothing is
+  measured while the one-minute load exceeds twice the cores. The runner's git probe no longer measures the
+  run it is driving. Before, three `du -sk` of one live mirror ran at once at load 279 on 14 cores, and
+  1,419 of 1,419 scans of a 14-repository mirror hit the ceiling without an answer.
+- **Spend is corroborated at each model's own rates** (control-tower phase 109, #202). The price table
+  had one row, `opus`, found by a family substring, so every Opus 5.5 session was priced at Opus 5's
+  rates and journalled a false `phase.cost-mismatch` reading `under` (347 on one machine) — and a
+  doubled booking on the default model read as agreement. Opus 5.5 now has its own row ($4 input, $8
+  one-hour cache write, $0.20 cache read, $20 output per MTok) beside Opus 5's, matched by the whole
+  model id; a version with no measured row, or an alias that names none, is not priced and not
+  corroborated. P85's tokens price to $14.2217, the CLI's own figure. A model whose fresh sessions sit
+  at one ratio all day is announced once, as `phase.cost-drift`, and a session off that ratio is still
+  a finding.
+- **A wrap-up keeps its lane** (control-tower phase 109, #192). A phase that hands off `partial` at the
+  console's wrap-up with its own work uncommitted in a shared tree now re-boards before any sibling
+  whose scope meets its own — ranked right after a person's re-board, and with its scope held for it
+  in the very pass that released its lane (`phase.lane-kept`). Before, the lane's teardown woke the
+  loop while the attempt was still settling, and a graph-ready sibling was admitted one second later
+  over the red WIP (ai-builder-v7 P13 past P7, on a console with #128's fix).
+- **A session ends when its agents do** (control-tower phase 109, #188). While a background subagent or
+  monitor the session launched still runs, the Stop hook refuses a `partial` or `complete` exit (twice
+  at most), with the two ways out: wait for it in one bounded foreground call, or `TaskStop` it and
+  record what it was doing under Outstanding. The 0.6× wrap-up notice names the live agents. One still
+  killed by the CLI's ten-minute ceiling after the handoff is named in the next attempt's brief — its
+  description, its last words and the paths it wrote after the handoff (`phase.agents-killed`).
+- **A live lane keeps its handle** (control-tower phase 109, #170). The input of a session that ended
+  its turn to wait on its own background subagent stays open, so a steer, an ask, a peer's message and
+  the wrap-up notice reach it; the turn after the agent reports closes it, bounded by the idle closer
+  and the CLI's background ceiling. A refused message now names the session's real state — "phase 6's
+  session (pid 7529) is running, but its input closed at 07:12:04Z (…)", or that it was adopted from
+  the run record with no pipe — never "no session is running". Every close is journalled with its
+  cause (`phase.input-closed`) and the lane view carries `input: {open: false, closedAt, cause}`.
+- **A `/clear` ends the session it replaced, and a released lock holds nothing** (control-tower phase
+  108, #172). A `SessionStart` for a new session id in a process that other records name now ends
+  those records at once: the registry reads them `ended`, superseded by the new id
+  (`endedBy: successor` when no end was reported), their waits closed, their messaging sockets
+  dropped and a `superseded` line on their event logs. A terminal a person `/clear`ed therefore no
+  longer stands in the queue as the holder of the scope it used to work in. Only records last seen
+  within two seconds of the new start are ended, never another process's, and a `/resume` of the old
+  id in the same process revives it. While that process runs, a lock it took is still never treated
+  as debris. A `release` in a session's own transcript now cancels its earlier lock calls for that
+  phase, and a claim whose lock has gone holds nothing after 60 s, so a released lock's scope no
+  longer lingers on the record.
+- **Hold evidence counts only the tree** (control-tower phase 108, #180). Writes under
+  `~/.claude/**`, another Claude config directory, `~/.claude.json` or the session's own config
+  directory are no longer evidence of touching the tree. A bare `git -C <root> …` no longer claims
+  the whole root, though a git verb in a repository under the root still holds it. The queue card
+  shows, under the terminal it waits on, what the hold rests on (`held because it edited …`), newest
+  first.
+- **Every account reports presence** (control-tower phase 108, #194). A session spawned under a
+  profile account runs with that profile's `CLAUDE_CONFIG_DIR`, whose `settings.json` carried no
+  presence hook, so the registry never saw it and its lock could not be tied to a session. Each
+  profile workspace's `settings.json` now carries this console's four presence entries and never the
+  login's other hooks: a person's own hooks are kept, a stale entry is refreshed, and a file that
+  does not parse is left alone and logged (`accounts.workspace.presence-installed`,
+  `…presence-failed`). A phase session on a profile now appears in the registry with its plan, phase
+  and run. `phase-console doctor` gains a non-blocking `presence` row over every pooled account's
+  config directory, whether the console is up or not.
+- **The pre-session baseline is quick, visible and never a verdict** (control-tower phase 105, #190,
+  #193, #173). A session no longer waits for its phase's baseline: what must be measured runs BESIDE
+  it in a clean checkout of the boarding head, niced and held by the machine-load guard, and the
+  session hears the result as a next-turn note; the verdict waits for a baseline still running and
+  compares against it as before. A red baseline line is run once and recorded `red once (not
+  retried)` — the one recorded retry is the verdict's alone. A line any plan of the console measured
+  on the same tree, command, environment digest and directory in the last day is reused, named with
+  its source run and age. A phase in its baseline or its `Setup:` is a lane on every surface
+  (`baseline 9/10 · <line>` with its clock), the header names it (`running — P8 baseline 9/10`, never
+  `phase ?`), and a read that does not know the run is live no longer paints it `interrupted`: the
+  command's process is recorded on the run, and a lane whose lock its console keeps refreshing keeps
+  the run `running`.
+- **A §Verification line runs in the session's environment, and ends** (control-tower phase 106,
+  #195, #191, #185, #168, #196). The console no longer sets `CI=1` on the lines it runs — suites
+  read it as "this is the CI infrastructure", and a line green in the session was red every time the
+  console ran it; non-interactivity comes from `NO_COLOR`, `TERM=dumb` and a closed stdin, and a
+  `CI` the console itself was started with passes through untouched. A red line keeps its failing
+  tests and the end of its output for a baseline as for a verdict — on the record, in the ledger,
+  in the session's baseline note and in the phase drawer. A clean export of a repository that is a
+  superproject's submodule now stands at its own path with the sibling repositories and the root's
+  files linked around it, so a line reading a sibling (`../frontend`) reads it; untracked files no phase
+  wrote, the phase's own `Setup:` outputs and dependency directories no longer send a verdict to an
+  export at all; and a sibling an export cannot provide is `environment`, never red. A line that
+  fails within seconds because its `node_modules` or `.venv` is not installed is `environment` too,
+  with its tail, and the session is told to install the dependencies — and a new advisory lint,
+  **F39** `setup-deps-missing`, names a §Verification line that runs a package script or a
+  `.venv/bin/*` binary in a repository the phase's `Setup:` installs nothing for, before any run
+  meets it. `phase-graph.sh <slug> --verify-in N` reads a phase's `Verify in:`. When a line's leader exits
+  while a process it left behind still holds its output, the line settles on the leader's exit code
+  after a two-second grace, the stragglers named and stopped; at its timeout the signal ladder now
+  reaches the whole process group even when the leader is gone, and a process that left the group
+  can no longer hold a line open. `phase-outcome.sh … verified` keys a proof where the console judges
+  the line (`PE_VERIFY_DIR`, which the runner now gives every phase session, with `PE_RUN_ROOT`):
+  `--in` is resolved against the run root, never the shell's cwd, and a proof the verdict could only
+  refuse is refused when it is recorded, naming both trees.
+- **A manual gate is a person's, and a cross-plan gate clears** (control-tower phase 107, #174,
+  #167). A gate the plan marks `manual` is never delegated to a session, whatever the `gates` row
+  says: the runner holds it, the boot prompt tells the session to stop and declare
+  `needs-human --needs gates`, and the inbox always raises it. `gate-approve.sh` now names its DOOR
+  from its own environment, never from `--by` — `console` (a person's press in the console),
+  `terminal` (a person's own shell), `session` or `script` — refuses a manual gate from a session, a
+  script or an `ai-*` approver, and records the door in a new `Door` column of `gate-status.md`;
+  `--gate-status` ignores a manual approval a person's door did not write, the door-less row a
+  session once wrote for itself included, and says why. The console approves a manual gate only for
+  a person's press — the Gate card from a browser, a phone's signed Approve, a supervisor-chat act a
+  person confirmed — and logs anything else as `gate.approve-refused`. A session's own tools cannot
+  borrow a person's door either: setting `PE_GATE_DOOR`, or writing a plan's `gate-status.md` with the
+  file tools, is denied before it runs (`gate-forge`), and a `--note` or `--by` carrying escapes can no
+  longer write a row of its own (the cells reach awk verbatim). A `plan <slug>:<phases>` gate
+  reads the other plan's verified set whatever its separators, so `plan other:10,11` clears once the
+  other plan has verified 10 and 11 — it could clear only when exactly one phase was verified.
+- **The approval judge reads a shell line as a shell does** (control-tower phase 107, #189, #186,
+  #205). Permission rules match only the words a line would run: a quoted here-doc's body, an
+  interpreter's `-c`/`-e` payload and a quoted argument are data and match no rule, while a `$( … )`,
+  a backtick, a `<( … )`, a group, a compound, a shell's `-c` payload, an `eval`'s words and an
+  unquoted here-doc's substitutions are commands — and what the judge cannot read it matches raw as
+  well, so the deny wall is never weaker than before. A handoff written by a `python3 - <<'EOF'` whose
+  text mentions `git push` no longer raises a person's card. A push the plan's
+  `permission.destructive` row names is answered from the row beside read-only company — a read-only
+  `$( … )`, a `$?`, `rc=$?` — and the same push in a shape the row cannot answer as it stands (a
+  `git add`/`git commit` beside it, a `$( … )` that writes, a branch the shell computes, a bare
+  `git push`, a push inside a here-doc or an `eval`) is refused at once, naming the bare form to re-run
+  alone, rather than left an hour on a card (`phase.approval-reshaped`); a card an automatic actor
+  settles under that answer no longer parks the run. A row's exceptions are read for the RUNNING
+  phase: "with these allow rows: Phases 4/17/22 — `gh pr create`, `gh pr merge --squash
+  --delete-branch` …" grants those commands in phases 4, 17 and 22, announced as any manifest grant,
+  and another phase's card says which phases the row allows. The row answers the publishing act
+  alone: a command beside it that the run would ask about on its own is never carried past the ask
+  list (the call is answered at once with the bare form), a form the row names with options is that
+  form (`--admin` beside `--squash --delete-branch` is a card), and a push goes to a remote the
+  checkout names, never a URL or a path. What runs is what the row answered: a publishing command with
+  an environment in front (`GIT_SSH_COMMAND=…`, `GH_HOST=…`, `env`) or git's own options before its
+  verb (`-c …`) is a person's card, a push goes to `origin`, and a line that also assigns, changes its
+  shell (`export`, `alias`, `source` …) or defines a function is answered with the bare form. The
+  reader also follows bash on here-doc delimiters (`<<E"OF"`, `<<END!`), an unclosed here-doc, `$[ … ]`
+  arithmetic, ANSI-C quoting (`$'git' push`) and `coproc`. A here-doc OWNER that is a shell in a quoted
+  or escaped spelling — `"sh" <<EOF`, `b\ash <<EOF`, `s""h <<EOF` — now reads its body as CODE as bash
+  does, so a `git push` the shell runs there meets the wall; deciding by a raw-text regex alone had
+  called that body data and let the push through.
+- **An orphan is a session the live console did not launch** (control-tower phase 110, #175). Each
+  session's record now names the console that launched it — its pid and the instant it booted — and a
+  run is parked `orphaned-session` only when that console is gone (the pid exited, or a later boot
+  holds it), never because the record went quiet or a reader did not know the run was live. The hourly
+  sizing census read every run file as if nothing were live, and parked the runs its own console was
+  driving — on disk, once an hour, with no journal line. Every run-file read now says which runs are
+  live, a real orphan park is journalled (`run.orphaned`), and a start beside a session this console
+  launched is refused, naming its pid and phase, instead of parking it.
+- **A heal acts on the run as it is now** (control-tower phase 110, #178). A healer pass re-reads the
+  run after classifying — the slow part — and again before it climbs or launches anything, and drops
+  itself (`run.heal-dropped`) when the run is live again, a phase holds a newer attempt than it read,
+  or the stop was resolved meanwhile. What a pass records is merged onto the record as it stands, never
+  its whole copy saved back; a dropped pass writes nothing, and converge keeps no fingerprint for it
+  (`run.converge` carries `stale: true`). An operator's Retry had boarded attempt 3 while a heal read
+  attempt 2 for five minutes and then saved that copy over the live run.
+- **A parked run whose plan gains ready work comes back** (control-tower phase 110, #176). Resume
+  continues a parked, halted or interrupted run through the one start door with its own settings — it
+  refused every one ("No pause … Continue brings it back") — and an automatic press never lifts a halt
+  only a person may, a person's stop or a person's dismissal. A dismissal records who made it and what
+  the board read ready then: a script's is worded as a script's ("dismissed by a script, not a
+  person"), and converge relaunches the run once work turns ready after it, while a person's still
+  pins the run and now names the ready work it holds back. A hub run sat parked for 6.6 hours with a
+  ready phase behind a watchdog's dismissal recorded as the operator's.
+- **An API safeguard false positive is not the model declining the task** (control-tower phase 111,
+  #177). The banner "safeguards flagged this message … This sometimes happens with safe, normal
+  conversations" classifies as `safeguard-flag`, read off the API-error channel or a stop that was a
+  refusal or an API error — never off a successful session quoting it. The phase is boarded FRESH with
+  the resume brief (resuming would re-send the flagged message), then fresh again — or on the next
+  model under a `ladder` model policy — and only the third flag asks a person: "the API's safeguards
+  flagged the session (a false positive is likely); two fresh sessions were tried — report request
+  req_…". `phase.safeguard-flag` carries the classifier, the request id and the message id. A twenty-hour
+  run had parked on "the model declined the task".
+- **The in-turn clock guard judges a wait by its subject** (control-tower phase 111, #179, #206). A loop
+  on nothing but the clock is the session's own job, whatever its line runs after `done`, and a URL the
+  summary's cap cut before its host was whole names no remote host — P34's fixture window had been
+  checkpointed at minute five as somebody else's clock. An external-clock wait is now nudged first and
+  parked only if the call is still open five minutes after a nudge the session received; a park on a
+  clock loop is bounded by the loop's own target instant; the phase lifecycle names the watchdog as the
+  actor (`stop.kind: watchdog`), never `declared`; and a person's Continue on a run waiting on parks
+  cuts a watchdog window short, and a declared one whose ref has landed — asked at the press — or says
+  why not when the relaunch could only park it again (`phase.wait-cut`). It had answered `running` and
+  the run parked again 72 s later. Time a call spends held on a person's approval card is credited back
+  to its wait, a window closes when its call returns once the session is in another wait, and while the
+  session's own background tasks run an external wait takes the own-job rungs, so a checkpoint no longer
+  ends them (two release preflights had died with one) — and a park that does end them names them.
+- **A CI run GitHub never started is not a red CI** (control-tower phase 111, #166). When a watched run
+  ends `completed: failure` with every failed job unstarted — no runner, no step — under the "job was not
+  started … spending limit" annotation, the probe reads `not-run (billing)`: the wait stays open, ONE
+  errand names the repository's Actions budget and its consumed amount when the token can read them,
+  and the Tower draws one "CI refused (billing)" line per repository, however many phases wait behind
+  it. When the budget is read again with room, the ref lands and the phase resumes with "re-run the
+  failed jobs (`gh run rerun <id> --repo <repo> --failed`)", watching the same ref, which follows the
+  run's newest attempt. Four sessions of one plan had been sent to fix a CI that never ran.
+- **A keychain proof is a watch verb** (control-tower phase 111, #201). `security find-generic-password`
+  and `find-internet-password` are commands the judge accepts — attributes only: `-w` and `-g`, which
+  print the secret, and every other `security` subcommand stay refused, each with its reason. The plan's
+  own E5.1 proof and the human-steps fixture's declare as written, with no wrapper script.
+- **Recheck on a declared external wall asks the wall** (control-tower phase 111, #204). The card's
+  recommended verb ran the three done-checks, which a phase waiting on the outside world can only fail,
+  and re-judged the wall `failed`/`no-handoff`. It now probes the declaration's watch refs through the
+  watch clock: a landed one resumes the phase's own session exactly as the scheduler's landing does, and
+  otherwise one `run.recheck` line names each ref and what it read, the wall left as it was.
+
 ## [6.0.0] - 2026-10-01
 
 **Control Tower.** 6.0 makes an unattended run something a person can read at a glance and trust to

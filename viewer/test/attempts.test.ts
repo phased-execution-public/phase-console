@@ -474,17 +474,21 @@ process.stdin.on('data', () => {
   say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_2', role: 'assistant',
     stop_reason: 'end_turn', content: [{ type: 'text', text: 'waiting for the reviewer' }] } });
   say({ type: 'result', subtype: 'success', is_error: false, num_turns: first, total_cost_usd: 4.5, result: 'waiting', session_id: sid });
+  // The agent reports whether or not stdin closed (E3) — and since control-tower
+  // phase 109 (#170) the runner holds stdin open until the turn it starts ends.
+  setTimeout(notify, 50);
 });
-process.stdin.on('end', () => {
-  setTimeout(() => {
-    say({ type: 'system', subtype: 'task_notification', task_id: 't1', tool_use_id: 'toolu_agent', status: 'completed',
-      summary: 'review done', session_id: sid });
-    say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_3', role: 'assistant',
-      stop_reason: 'end_turn', content: [{ type: 'text', text: 'NOTIFIED' }] } });
-    say({ type: 'result', subtype: 'success', is_error: false, num_turns: second, total_cost_usd: 5.25, result: 'NOTIFIED', session_id: sid });
-    setTimeout(() => process.exit(0), 20);
-  }, 50);
-});
+let notified = false;
+function notify() {
+  if (notified) return;
+  notified = true;
+  say({ type: 'system', subtype: 'task_notification', task_id: 't1', tool_use_id: 'toolu_agent', status: 'completed',
+    summary: 'review done', session_id: sid });
+  say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_3', role: 'assistant',
+    stop_reason: 'end_turn', content: [{ type: 'text', text: 'NOTIFIED' }] } });
+  say({ type: 'result', subtype: 'success', is_error: false, num_turns: second, total_cost_usd: 5.25, result: 'NOTIFIED', session_id: sid });
+}
+process.stdin.on('end', () => { notify(); setTimeout(() => process.exit(0), 20); });
 `;
 
 function stubbed(env: Record<string, string>): SpawnRequest {

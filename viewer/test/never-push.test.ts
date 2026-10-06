@@ -58,7 +58,7 @@ import { dirname, join, relative } from 'node:path';
 
 import { argvLiterals } from './argv-scan.ts';
 import { PUSH_ARGV } from '../shared/landing-model.js';
-import { manifestPushVerdict } from '../shared/policy-model.js';
+import { manifestPushVerdict } from '../server/runner/manifest-verdict.ts';
 import { PUSH_REF, pushRef } from '../server/runner/worktree.ts';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -638,8 +638,15 @@ test('the seam refuses BEFORE spawning — a caller not allowed learns nothing, 
 });
 
 test('#112 (control-tower phase 84): the manifest\'s push answer is a PARSER, never an argv — and never answers a force, a delete or a trunk, whatever the row names', () => {
-  const source = readFileSync(join(SERVER_DIR, '..', 'shared', 'policy-model.js'), 'utf8');
-  assert.doesNotMatch(source, /child_process|spawn\(|execFile/, 'reading a session\'s command spawns nothing');
+  // The row's grammar, the shell reader and the verdict over both (control-
+  // tower phase 107 moved the verdict into `runner/manifest-verdict.ts`).
+  for (const file of [
+    join(SERVER_DIR, '..', 'shared', 'policy-model.js'),
+    join(SERVER_DIR, 'runner', 'manifest-verdict.ts'),
+    join(SERVER_DIR, 'runner', 'shell-reading.ts'),
+  ]) {
+    assert.doesNotMatch(readFileSync(file, 'utf8'), /child_process|spawn\(|execFile/, `reading a session's command spawns nothing: ${file}`);
+  }
   const row = 'deny; may publish: branch pushes to `pe/x` + `main` + `master`';
   for (const command of [
     'git push origin main', 'git push origin pe/x:master', 'git push -f origin pe/x', 'git push origin +pe/x',

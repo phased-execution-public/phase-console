@@ -106,11 +106,15 @@ into `PHASE_HALT_KINDS` (`verify-failed` · `no-handoff` · `phase-blocked` · `
 `verify-timeout`) and `RUN_HALT_KINDS` (`budget` ·
 `failure-streak` · `models-exhausted` · `run-preflight` · `plan-unreadable` · `plan-lint` ·
 `runner-crashed` · `plan-deadlocked` · `nothing-ready` · `interrupted-by-restart` · `operator-stop` ·
-`credential-refused` · `identity-changed` · `isolation-refused`).
+`credential-refused` · `identity-changed` · `isolation-refused` · `unlanded`).
 The four before `credential-refused` are the parks and stops that used to carry no kind at all (LFC-1);
 `identity-changed` is the run's account answering somebody else's login (control-tower phase 91, #131 —
-parked for a person's choice, press-only), and `isolation-refused` the checkout the run asked for that
-could not be had (control-tower phase 90). `credential-refused` is the
+parked for a person's choice, press-only), `isolation-refused` the checkout the run asked for that
+could not be had (control-tower phase 90), and `unlanded` a run whose every phase is done while a
+repository's run branch — the root's included — is not on its trunk (control-tower phase 112, #184): the
+landing proof is tree containment in `origin/<trunk>` (`git merge-tree --write-tree <trunk> <tip>` writing
+`<trunk>^{tree}`, never `git cherry`), and the park carries one errand whose card opens a merge errand tree.
+The read path never settles it to `finished` over a board reading every phase done. `credential-refused` is the
 API refusing the run's OWN credential — an organisation policy, an expired login, a billing hold, a
 certificate — which stops the run and retires the account for its organisation (RCV-1: it used to ride
 `needs-human`, a PHASE-level kind, so one blocked credential settled the phase and the loop boarded the next
@@ -416,6 +420,7 @@ first — the session's own testimony — else `record.watch`), plus a `lock:` r
 | `date:` / `until:` | `date:<ISO8601>` | `now ≥ t` | **once**, at its instant | arithmetic; nothing executes |
 | `lock:` | `lock:<slug>/<phase>` — somebody ELSE's: one naming the declaring phase is refused at the script and at ingest (`phase.watch-refused {why: own-lock}`), and retired if it was armed before that | nothing holds that phase's scope — no lock, a lapsed lease, or a holder whose session **ended** | 1 min | the console's own lock store (a GRANT is not seen — see the phase-2 handoff) |
 | `cmd:` | `cmd:<command>` or `cmd:"<command>"` | the command exits 0 | 5 min, 15 min, 1 h, then **6 h until the phase's wait budget ends** | the policy §Verification gets (NOT read-only — `npm ci` passes it), 60 s, `watchCmdRefs` |
+| `unit:` | `unit:<host>/<unit>` — a systemd unit on another machine; the host is a name in the machine profile's `hosts.<name>` (`address`, `user`, `key`, `port`), and a host the profile lacks is refused | the unit is no longer `activating`, `active`, `reloading`, `deactivating` or `refreshing` — its `Result=` and exit time go into the wait history; a unit the host reports `LoadState=not-found` is refused | 5 min | `ssh -o BatchMode=yes` with fixed argv, one shared `ControlMaster` connection per host (`server/watch-unit.ts`); ssh's failure told in fixed words of its class, never its text |
 
 The scheduler's own timer fires at `min(nextDueAt)` with a **60 s floor**, so a ref due in thirty
 seconds does not buy a wake in thirty seconds. One probe per ref per pass, however many plans
@@ -559,8 +564,10 @@ change.
 §Session budget). Parked time is derived from each park's own stamps (`record.waitHistory`,
 `parkedMsOf`), so a park that never resumed still counts. The rules, in order:
 
-1. a ledger with no parks left refuses — `WAIT_MAX_PER_PHASE` (4) declared waits, or the watchdog's own
-   `WATCHDOG_PARKS_MAX_PER_PHASE` (4);
+1. a ledger with no parks left refuses — `WAIT_MAX_PER_PHASE` (4) declared waits, or as many as the
+   plan's `Wait count:` raises it to (control-tower phase 121, #40), or the watchdog's own
+   `WATCHDOG_PARKS_MAX_PER_PHASE` (4) — and a refused wait whose watch ref still polls waits on that ref
+   alone, the run `waiting` on it, never an errand;
 2. a declared `date:` ref later than the requested window extends the ask to its instant;
 3. the watchdog's park (`by: 'watchdog'`) is bounded by its count alone — it never spends the declared
    budget and is never refused by it;
@@ -1290,7 +1297,7 @@ is missing — with `--rule` and `--command` beside it for a permission block.
 | `staleClaimTakeover` | on | take over an expired foreign claim over unfinished work |
 | `resumeAtBoot` | **ask** | what to do about the runs this console's own restart stopped when the RUN itself did not say — `ask` (put the question on screen, start nothing), `auto` (the pre-3.5 behaviour), `off` (write the errand). Since 5.0.0 the run's own `resumeOnRestart` (asked at the launch form's Decisions stage) answers first; this is the fallback for a run carrying no answer |
 | `autoAccountSwitch` | on | switch accounts at an auth or a far usage wall |
-| `delegateHumanGates` | **on** (since 5.0.0) | a `manual` gate is briefed to the phase's own session to VERIFY against citable evidence and clear (recorded `by: ai-session-delegated`), or STOP naming the condition it could not verify — instead of stopping the run for a person |
+| `delegateHumanGates` | **on** (since 5.0.0) | an overdue gate (a `deadline`/`by` gate past its date) is briefed to the phase's own session to VERIFY against citable evidence and clear, or STOP naming the condition it could not verify — instead of stopping the run for a person. Never a `manual` gate, which is a person's whatever this says (control-tower phase 107, #174) |
 | `policy` | `{}` | this console's answers to the decision manifest's rows, keyed by decision key (`shared/policy-model.js` `DECISION_ANSWERS`) — read below a plan's own `## Decisions` row and above the shipped defaults (`gates: delegated` · `qa.exhausted: waive` · `resume.on-restart: continue` · `ambiguity: ruling`); edited row by row on Settings ▸ Automation ▸ Policy answers (one control per policy-table row, a line of text for the free-text keys), written whole through `POST /api/prefs` and journalled per changed key as `policy.changed {key, from, to, by}`; a ruling remembered on this console lands here |
 | `relayRules` | `[]` | this console's relay rules, merged over the shipped (empty) `RELAY_RULE_DEFAULTS`; a relayed answer remembered as a rule lands here |
 | `allowUnverifiedPhases` | **off** | a phase whose plan states NO §Verification boards and passes on its handoff alone (`phase.verify-waived`), instead of parking at boarding with "add a command, then Retry"; a declared bullet the runner cannot read still parks |

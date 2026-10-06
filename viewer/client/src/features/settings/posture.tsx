@@ -54,8 +54,8 @@ export function PostureCard() {
       handsOff: ladder.delegateHumanGates === true,
       reading:
         ladder.delegateHumanGates === true
-          ? 'A session may clear a human gate itself, against evidence it can cite.'
-          : 'A human gate stops the phase until you approve it.',
+          ? 'A session may clear an overdue gate against evidence it can cite. A manual gate waits for you.'
+          : 'A gate that needs a person stops the phase until you approve it.',
     },
     {
       setting: 'A phase that stops',

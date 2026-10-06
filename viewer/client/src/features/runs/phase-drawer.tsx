@@ -175,6 +175,7 @@ export function PhaseDrawer({
   const failed = (data?.verification?.ran ?? []).filter((x) => !x.ok);
   const record = run?.phases?.[String(phase)];
   const qaRounds = record?.qa ?? [];
+  const baselineReds = (record?.baseline?.commands ?? []).filter((line) => !line.ok);
   const tree = verdictTree(data?.verification);
   const pre =
     'mt-1 max-h-56 overflow-auto rounded border border-rule bg-ground px-2 py-1.5 font-mono text-2xs whitespace-pre-wrap';
@@ -330,6 +331,37 @@ export function PhaseDrawer({
                     </div>
                     {(x.tree ?? tree) && <TreeLine tree={(x.tree ?? tree)!} className="text-2xs" />}
                     <pre className={pre}>{x.output || '(no output)'}</pre>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* What the BASELINE said (control-tower phase 106, #195): a line red
+                on the tree this phase boarded on keeps its failing tests and
+                the end of its output, as the verdict's red does above — and a
+                line the machine stopped says why, since it is no red the phase
+                inherited. Read off the run, where the baseline lives. */}
+            {baselineReds.length > 0 && (
+              <div>
+                <div className="text-2xs">
+                  <b>Red before this phase began:</b>
+                </div>
+                {baselineReds.map((line, i) => (
+                  <div key={i} className="mt-1">
+                    <div className="flex flex-wrap items-center gap-2 text-2xs">
+                      <code className="min-w-0 font-mono">{line.command}</code>
+                      <span className="text-ink-faint">
+                        {line.environment
+                          ? `could not run here — ${line.environment}`
+                          : `exited ${line.code}`}
+                      </span>
+                    </div>
+                    {line.failures?.length ? (
+                      <div className="text-2xs text-ink-faint">
+                        Failing: {line.failures.slice(0, 5).join('; ')}
+                      </div>
+                    ) : null}
+                    {line.tail && <pre className={pre}>{line.tail}</pre>}
                   </div>
                 ))}
               </div>

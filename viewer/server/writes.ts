@@ -55,6 +55,17 @@ export type WriteRequest = {
   worktree?: string;
   /** Un-approve a gate: the row flips to `revoked` and the gate is back in force. */
   revoke?: boolean;
+  /**
+   * The door a gate approval goes through (control-tower phase 107, #174):
+   * `console` only for a PERSON's press — the Gate card from a browser, a
+   * phone's signed Approve, a chat act a person confirmed. gate-approve.sh
+   * records it in the row, and a MANUAL gate counts no other door's row.
+   * Absent means no door is claimed. Only `Service.approveGate` sets it, from
+   * the request's own person test: `/api/write` deletes it from a body and
+   * sends a gate approval through that same door (control-tower phase 129,
+   * #218).
+   */
+  door?: 'console';
   path?: string;
   /**
    * The QA directive to write (`qa-mode`): `on`/`off` for the plan (no
@@ -160,6 +171,20 @@ function requirePhase(phase?: number): number {
   return phase as number;
 }
 
+/**
+ * The environment of a person's gate approval through the console
+ * (control-tower phase 107, #174): the console's door named, and every marker
+ * gate-approve.sh reads as a SESSION emptied — the console speaks for the
+ * person who pressed, not for whatever shell it was started from.
+ */
+export const GATE_DOOR_CONSOLE_ENV: Readonly<Record<string, string>> = Object.freeze({
+  PE_GATE_DOOR: 'console',
+  PE_OWNER: '',
+  PE_OUTCOME_FILE: '',
+  PE_SESSION_KIND: '',
+  CLAUDECODE: '',
+});
+
 export type WritePlan = {
   script: string;
   args: string[];
@@ -248,6 +273,12 @@ export function planWrite(request: WriteRequest, opts: { root: string; docsDir?:
         description: request.revoke
           ? `Revoke the phase ${phase} gate approval on ${slug}`
           : `Approve the phase ${phase} gate on ${slug}${by ? ` as ${by}` : ''}`,
+        // The door is stated, never inherited: the console's own environment
+        // may carry a session's markers (a console started from inside a
+        // Claude Code session) or a stray `PE_GATE_DOOR`, and neither is a
+        // fact about THIS press. A person's press clears them and names the
+        // console; anything else names no door at all.
+        env: request.door === 'console' ? GATE_DOOR_CONSOLE_ENV : { PE_GATE_DOOR: '' },
       };
     }
 

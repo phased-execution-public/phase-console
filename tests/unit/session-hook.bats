@@ -14,6 +14,9 @@ setup() {
   mkdir -p "$STUB"
   # Nothing inherited from the session this suite may itself be running in.
   unset PE_SESSION_ID PE_OWNER PE_SCOPE PE_SESSION_KIND PHASE_CONSOLE_URL PHASE_CONSOLE_HOOK_OFF PHASE_CONSOLE_PROBE CLAUDE_CODE_SESSION_ID
+  # The process and the login the running session reports are ITS facts; a
+  # case about either sets its own.
+  unset CLAUDE_PID CLAUDE_CONFIG_DIR
   # …and the rest of what a console exports into every session it spawns —
   # including the one running THIS suite under an autopilot. The hook honours
   # `$DOCS_ROOT` by design (a lane worktree's cwd is the wrong root), so with
@@ -132,6 +135,36 @@ inbox_files() { find "$1" -type f -name '*.json' 2>/dev/null | sort; }
   [ "$status" -eq 0 ]
   [ -z "$output" ]
   assert_contains "$(cat "$STUB/curl.body")" '"event":"Stop"'
+}
+
+@test "hook (#172): a /clear — SessionEnd reason clear, then SessionStart source clear — names ONE process for both" {
+  # The registry ends the replaced record because the new id's start names the
+  # pid the old one did; the pid is CLAUDE_PID, never the hook's own parent,
+  # which is a different shell for every event.
+  CLAUDE_PID=87367 run bash -c "printf '%s' '$(payload SessionEnd ',"reason":"clear"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  ended="$(cat "$STUB/curl.body")"
+  assert_contains "$ended" '"session_id":"s1"'
+  assert_contains "$ended" '"reason":"clear"'
+  assert_contains "$ended" '"pid":87367,'
+  start="$(payload SessionStart ',"source":"clear"' | sed 's/"session_id":"s1"/"session_id":"s2"/')"
+  CLAUDE_PID=87367 run bash -c "printf '%s' '$start' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  started="$(cat "$STUB/curl.body")"
+  assert_contains "$started" '"session_id":"s2"'
+  assert_contains "$started" '"source":"clear"'
+  assert_contains "$started" '"pid":87367,'
+  assert_contains "$output" '--session s2'
+}
+
+@test "hook (#194): a session on a profile names the profile's config dir; unset, the CLI's own default" {
+  prof="$BATS_TEST_TMPDIR/accounts/account-1/config"
+  CLAUDE_CONFIG_DIR="$prof" run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$STUB/curl.body")" "\"config_dir\":\"$prof\""
+  run env HOME="$BATS_TEST_TMPDIR/home" bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$STUB/curl.body")" "\"config_dir\":\"$BATS_TEST_TMPDIR/home/.claude\""
 }
 
 @test "hook: the FIRST occurrence of a field wins — a quoted payload inside last_assistant_message cannot spoof cwd or session_id" {

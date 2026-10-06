@@ -17,6 +17,7 @@ import {
   renameSync, rmSync, statSync, writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 import { DEFAULT_PRIORITY, type RunPriority } from '../../shared/orchestration-model.js';
 import type { AttemptWindow } from '../../shared/phase-clocks.js';
@@ -43,8 +44,9 @@ import {
 import { consoleRunsDir, isRunSidecar, journalFile, runDir, runFile } from './run-paths.ts';
 import type { BudgetFact, BudgetKind } from '../../shared/budget-model.js';
 import { adoptionHeld } from '../crash-ledger.ts';
-import type { WorktreeRefusal } from './worktree.ts';
+import type { LandingProof, WorktreeRefusal } from './worktree.ts';
 import type { HolderEta } from './scheduler.ts';
+import type { CiNotRun } from '../watch-refs.ts';
 import { pidAlive, pidHoldsWork, processState, type ProcessState } from '../pid.ts';
 import type { PermissionProfile } from './approvals.ts';
 import type { PermissionMode } from './spawn.ts';
@@ -481,9 +483,18 @@ export type VerifyRun = {
    * session served on — the sentence says which (`verify.ts`
    * `environmentOf`). Such a row is never red: the verdict reads it
    * `unproven`, nothing is charged, nothing re-opens, and it is not retried,
-   * since an unchanged precondition fails the same way twice.
+   * since an unchanged precondition fails the same way twice. Since
+   * control-tower phase 106 also a dependency that is not installed (#185) and
+   * a sibling repository a clean export could not provide (#191).
    */
   environment?: string;
+  /**
+   * Processes the command left in its process GROUP after its leader exited
+   * (control-tower phase 106, #168) — named, then stopped through the signal
+   * ladder. The row's code is still the leader's: a sweep that passed and left
+   * Metro holding its stdout passed.
+   */
+  stragglers?: { pid: number; comm?: string }[];
 };
 
 /**
@@ -747,10 +758,37 @@ export type VerifyBaseline = {
     ok: boolean;
     code: number;
     failures?: string[];
+    /**
+     * A red line's output tail (`outputTail`, control-tower phase 106, #195) —
+     * what it said, kept for a baseline as for a verdict and shown on the phase.
+     */
+    tail?: string;
+    /**
+     * Why the MACHINE stopped it (`environmentOf`: a dependency not installed,
+     * a sibling the export cannot provide, an exit 127, …) — not a red the
+     * session inherits (control-tower phase 106, #185).
+     */
+    environment?: string;
     from: 'reused' | 'measured';
-    /** The run that stood in, for a reused line. */
-    by?: { phase: number; run: string; at: string };
+    /**
+     * A measured red, run ONCE and never retried (control-tower phase 105,
+     * #190): the one recorded retry is the verdict's alone.
+     */
+    once?: true;
+    /**
+     * The run that stood in, for a reused line — since control-tower phase 105
+     * any plan's of this console (`slug`), with its age when it was reused.
+     */
+    by?: { phase: number; run: string; at: string; slug?: string; ageMs?: number };
   }[];
+  /**
+   * Measured BESIDE the session, in a clean checkout of the boarding head
+   * (control-tower phase 105, #190 ask 2); false when git would not export the
+   * repository and it was measured before boarding, in place.
+   */
+  concurrent?: boolean;
+  /** How long its commands waited under the machine-load guard (phase 100's). */
+  loadWaitMs?: number;
 };
 
 /**
@@ -1290,6 +1328,13 @@ export type PhaseRecord = {
    */
   watchdogParks?: number;
   /**
+   * The API's safeguards flagged this phase's sessions (control-tower phase
+   * 111, #177): how many times, and what was tried in answer — in the words
+   * the person's park says them ("a fresh session", a model's name). The
+   * third flag asks a person; an operator's Retry starts the count again.
+   */
+  safeguard?: { flags: number; tried: string[] };
+  /**
    * Every status this phase's sessions have DECLARED, counted (WAI-8, SLF-4).
    * `waits` counts only the two `waiting-external` parks; this ledger counts
    * all six words, so a `partial` or a `needs-human` re-filed for free has a
@@ -1384,7 +1429,11 @@ export type PhaseRecord = {
      * (control-tower phase 6, #19). Absent on a declaration written before
      * the stamp; `waitBudgetEndOf` reads the console default for it.
      */
-    budget?: { ms: number; source: 'phase' | 'plan' | 'default' };
+    budget?: {
+      ms: number; source: 'phase' | 'plan' | 'default';
+      /** The declared-wait count in force, when a plan raised it (control-tower phase 121, #40). */
+      waits?: number; waitsSource?: 'phase' | 'plan' | 'default';
+    };
     /**
      * The human step this declaration raised (control-tower phase 41): its
      * ledger id and kind — the step itself lives in `human-steps.ndjson`. A
@@ -1445,7 +1494,7 @@ export type PhaseRecord = {
     at: string;
     refs: {
       ref: string;
-      scheme: 'gh-run' | 'gh-pr' | 'date' | 'lock' | 'phase' | 'verify' | 'cmd';
+      scheme: 'gh-run' | 'gh-pr' | 'date' | 'lock' | 'phase' | 'verify' | 'cmd' | 'unit';
       state: WatchStateWord;
       detail?: string;
       checkedAt: string;
@@ -1479,6 +1528,13 @@ export type PhaseRecord = {
        * `cmd:` is ever executed is `watch-scheduler.ts`'s policy.
        */
       minted?: true;
+      /**
+       * A `gh-run` GitHub never started (control-tower phase 111, #166) — what
+       * the probe read. Kept on the row: the next reading's room is a landing
+       * only against this one's spent budget, and the Tower draws one state
+       * per repository from it (`shared/ci-refusal.js`).
+       */
+      notRun?: CiNotRun;
     }[];
   };
   /**
@@ -1833,6 +1889,13 @@ export type PhaseRecord = {
      */
     localNudges?: number;
     localNudgedAt?: string;
+    /**
+     * The EXTERNAL-clock ladder's nudge (control-tower phase 111, #179): the
+     * session is told before the console parks it, and the park comes only
+     * once `EXTERNAL_PARK_GRACE_MS` has passed since a nudge it received.
+     */
+    externalNudges?: number;
+    externalNudgedAt?: string;
   };
   /**
    * How many attempts of THIS phase in a row ended with nothing committed and
@@ -1905,6 +1968,26 @@ export type PhaseRecord = {
    * this commit, so every sibling it stops is ONE cause, charged once.
    */
   wipRed?: WipRed;
+  /**
+   * A wrap-up KEEPS its lane (control-tower phase 109, #192): the session
+   * handed off `partial` at the console's notice with its own WIP uncommitted
+   * in a tree its siblings share (`paths` files). Until it boards again it
+   * ranks right after a person's re-board (`boardingOrder`), and its scope is
+   * held against every sibling whose scope meets it — in the very pass its lane
+   * was released in, too. Written by `resumeAfterWrapup`, spent at boarding.
+   */
+  keepsLane?: { at: string; reason: string; sessionId: string | null; paths: number };
+  /**
+   * The background agents this phase's last session ended with still running,
+   * stopped by the CLI's ceiling mid-work (control-tower phase 109, #188):
+   * each one's description and newest words, when its session handed off, and
+   * the uncommitted paths written after that. Written as the session settles,
+   * consumed by the next boarding's brief (`boardingWipBlock`).
+   */
+  agentsKilled?: {
+    at: string; handedOffAt: string | null; paths: string[];
+    agents: { id: string; description?: string; lastText?: string; tool?: string }[];
+  };
   /**
    * The loopback ports this phase's sessions served on (control-tower phase
    * 89, `LaneSignals.ownPorts`), kept past the lane: a refused connection to
@@ -2260,6 +2343,13 @@ export type Errand = {
    */
   watching?: boolean;
   /**
+   * The act this park waits on is not due yet — a human step born `upcoming`
+   * (control-tower phase 121, #182). The errand stands for the healer, but it
+   * announces nothing and draws no needs-you row: the ledger's *Coming up* row
+   * is its face, and its due-when ref landing is its ONE push.
+   */
+  upcoming?: boolean;
+  /**
    * Other phases of this run whose declared external wall is THIS one — the
    * same scope, `--needs external`, and reason fingerprint — folded in rather
    * than written, parked and announced again (control-tower phase 6, #19
@@ -2465,7 +2555,50 @@ export type RunResolution = {
   by?: string;
   /** What they said about it, if anything. */
   note?: string;
+  /**
+   * The phases the board read ready when it was dismissed (control-tower phase
+   * 110, #176) — so work that turns ready AFTER it reads as new. Absent on a
+   * dismissal written before this was kept, or when the board could not be read.
+   */
+  ready?: number[];
 };
+
+/**
+ * The `by` a request is derived as when it named nobody and came from neither
+ * a browser nor the console's own CLI — a watchdog agent, a cron, a `curl`
+ * (`actorOfRequest`, SHD-3).
+ */
+export const SCRIPT_BY = 'script';
+
+/**
+ * Was this dismissal a PERSON's judgement (control-tower phase 110, #176)? A
+ * script's is not, whatever its sentence said — the hub's watchdog dismissed a
+ * run that was then recorded "dismissed by the operator" — and only a person's
+ * pins a run against ready work that appears after it. A manual dismissal with
+ * no `by` at all predates the field and keeps the benefit of the doubt.
+ */
+export function dismissedByPerson(resolved: RunResolution | null | undefined): boolean {
+  return Boolean(resolved && !resolved.auto && resolved.by !== SCRIPT_BY && resolved.by !== 'unattributed');
+}
+
+/**
+ * The phases that turned ready AFTER this run was dismissed (#176): ready on
+ * the board, never boarded by the run, inside its scope, and not in the ready
+ * set the dismissal recorded. A dismissal that recorded none (written before
+ * it was kept) saw nothing ready — the shape of the `nothing-ready` park it was
+ * written over.
+ */
+export function readySinceDismissal(
+  run: Pick<RunState, 'resolved' | 'phases' | 'onlyPhases'>, board: Record<number, string>,
+): number[] {
+  const seen = new Set(run.resolved?.ready ?? []);
+  const asked = run.onlyPhases?.length ? new Set(run.onlyPhases) : null;
+  return Object.entries(board)
+    .map(([phase, word]) => ({ phase: Number(phase), word }))
+    .filter(({ phase, word }) => word === 'ready' && !run.phases[String(phase)] && !seen.has(phase) && (!asked || asked.has(phase)))
+    .map(({ phase }) => phase)
+    .sort((a, b) => a - b);
+}
 
 /**
  * Stopped, with nothing driving it and nothing that will.
@@ -2506,6 +2639,14 @@ export type VerifyingLane = {
   exported?: boolean;
   /** The console's own pid — the process whose children the commands are. */
   pid: number;
+  /** The pass is in its `Setup:` preamble — `command` is the bring-up command (control-tower phase 105). */
+  stage?: 'setup';
+  /**
+   * The running command's own process, as `(pid, procStartedAt)` — the fact a
+   * reader that does not know the run is live can still check (#173): a lane
+   * in its Setup or its baseline is work in flight while this holds work.
+   */
+  child?: { pid: number; procStartedAt: string };
 };
 
 export type ChildRef = {
@@ -2529,6 +2670,15 @@ export type ChildRef = {
    * as "it started at the epoch".
    */
   procStartedAt?: string;
+  /**
+   * The console that LAUNCHED this process — its pid and the instant it booted
+   * (control-tower phase 110, #175). The one fact an orphan is judged by: a
+   * child is orphaned only when this console is no longer the live one (its
+   * pid gone, or the pid held by a later boot), never because a record went
+   * quiet or a reader did not know the run was live. Absent on a record an
+   * older console wrote, which reads as "cannot tell" — never as "mine".
+   */
+  launcher?: ConsoleRef;
   /**
    * Set while this lane's process sits under SIGSTOP. Recorded on the lane and
    * not only in the run-level `freeze` slot because several lanes can be frozen
@@ -2597,10 +2747,47 @@ export function procIdentity(child: ChildRef): { startedAt?: string } {
   return child.procStartedAt ? { startedAt: child.procStartedAt } : {};
 }
 
-export function childrenOf(state: RunState): ChildRef[] {
+export function childrenOf(state: Pick<RunState, 'children' | 'child'>): ChildRef[] {
   const lanes = state.children ? Object.values(state.children) : [];
   if (lanes.length) return lanes;
   return state.child ? [state.child] : [];
+}
+
+/** A console process, as a child record names the one that launched it. */
+export type ConsoleRef = { pid: number; bootedAt: string };
+
+/**
+ * The console this module runs in — the LIVE console, to every child it
+ * launches (control-tower phase 110, #175). `bootedAt` is the process's own
+ * start, the instance's boot id: a later boot that is handed the same pid is a
+ * different console, and its predecessor's children are orphans.
+ */
+export const THIS_CONSOLE: Readonly<ConsoleRef> = Object.freeze({
+  pid: process.pid,
+  bootedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+});
+
+/** How far two readings of one boot may differ: one clock, read moments apart. */
+const BOOT_SLACK_MS = 2_000;
+
+/**
+ * Is the console that launched this child still the live one?
+ *
+ * `true` for this console's own children, `false` when the console that
+ * launched it is gone — its pid exited, or now belongs to a later boot — and
+ * `null` when the record names no launcher: one an older console wrote, which
+ * is never read as this console's own. This console is asked by pid and boot
+ * alone; any other console by the probe on that `(pid, boot)` tuple, so a
+ * reader that is not the console (the CLI, a test) answers for the console
+ * that wrote the record — never for itself.
+ */
+export function launcherAlive(child: Pick<ChildRef, 'launcher'>): boolean | null {
+  const launcher = child.launcher;
+  if (!launcher || !Number.isInteger(launcher.pid) || launcher.pid <= 0) return null;
+  const booted = Date.parse(launcher.bootedAt);
+  if (!Number.isFinite(booted)) return null;
+  if (launcher.pid === THIS_CONSOLE.pid) return Math.abs(booted - Date.parse(THIS_CONSOLE.bootedAt)) <= BOOT_SLACK_MS;
+  return pidHoldsWork(launcher.pid, { startedAt: launcher.bootedAt });
 }
 
 export type Autonomy = AutonomyMode;
@@ -3072,6 +3259,15 @@ export type RunState = {
    * readers treat as over.
    */
   verifying?: Record<string, VerifyingLane>;
+  /**
+   * The lane's beat (control-tower phase 105, #173): stamped when a lane's
+   * lock is claimed and at every refresh of it, with the identity of the
+   * console process doing the refreshing. A lock the lane refreshes keeps the
+   * run `running` on a read that does not know it is live (`laneInFlight`) —
+   * the quiet steps with no child to point at (the gap between two commands, a
+   * post-verify lint) included.
+   */
+  laneBeat?: { at: string; pid: number; procStartedAt: string };
   waitUntil: string | null;
   /** Which wait `waitUntil` is — see `WAIT_REASONS`. Absent on older runs. */
   waitReason?: WaitReason | null;
@@ -3302,6 +3498,13 @@ export type RunState = {
    * settled mount's detached HEAD; a red final verdict puts them back at once.
    */
   mirrorSettled?: { phase: number; at: string; mounts: string[] };
+  /**
+   * The repositories whose run branch was NOT on its trunk when every phase
+   * was done (control-tower phase 112, #184) — set with the `unlanded` park,
+   * from `landingProofs`. `phase` is the last phase this run finished: the
+   * errand card's merge errand tree is made for it.
+   */
+  unlanded?: { at: string; phase: number | null; repos: LandingProof[] };
   /**
    * Which impossibility this run hit, when `checkout` is `refused`.
    *
@@ -4393,6 +4596,7 @@ export function resetForRetry(
     delete record.stallRemedy;
     delete record.declarations;
     delete record.watchRetired;
+    delete record.safeguard;
     // The wall and the denial the phase last stopped on are the console's
     // evidence about the PREVIOUS attempt; a person asking for the phase from
     // the top has, by pressing, claimed the world has changed (phase 9).
@@ -4701,10 +4905,66 @@ export function consoleStoppedNote(phase: number, was?: string, suffix?: string)
  */
 export type LiveRuns = string | null | undefined | ReadonlySet<string>;
 
+/**
+ * What a READER of run files must say about liveness (control-tower phase 110,
+ * #175): the live set, one id, or `null` for "nothing here is live". There is
+ * no default. The hourly sizing census read every run with none, `undefined`
+ * meant "nothing is live" by omission, and every run its console was driving
+ * was reconciled as abandoned — parked on disk, once an hour, with no journal
+ * line, until the runner's next save wrote over it.
+ */
+export type LiveRunsKnown = string | null | ReadonlySet<string>;
+
 /** Is this run one of the ones something is actually driving? */
 export function isLive(id: string, live: LiveRuns): boolean {
   if (!live) return false;
   return typeof live === 'string' ? live === id : live.has(id);
+}
+
+/**
+ * How fresh a lane beat must be to count: two of the lease keepalive's
+ * ten-minute cadences and a minute's grace (`LEASE_REFRESH_MS` in
+ * `runner-core.ts`) — one missed tick is a busy event loop, not a dead lane.
+ */
+export const LANE_BEAT_FRESH_MS = 21 * 60_000;
+
+/**
+ * Is a lane of this run demonstrably at work — by a fact about PROCESSES,
+ * which any reader can check, rather than a status, which is only a claim
+ * (control-tower phase 105, #173)?
+ *
+ *  - a `Setup:`, baseline or §Verification command the console is running
+ *    for a phase, recorded on `verifying[N].child` as `(pid, procStartedAt)`,
+ *    still holds work; or
+ *  - the lane's lock was refreshed within `LANE_BEAT_FRESH_MS` by a console
+ *    process that still holds work (`laneBeat`).
+ *
+ * The run this answers for was being reclaimed as `interrupted` by any read
+ * that lacked the live set: no session child, and an `updatedAt` frozen at the
+ * last write while a half-hour `task verify:local` ran. Neither fact outlives
+ * its process: a dead console's beat holds nothing, and the run is reclaimed
+ * the moment its last command ends.
+ *
+ * And a session the LIVE console launched (control-tower phase 110, #175):
+ * `launcher` names its console, and while that console is the live one and the
+ * session holds work, the lane is at work — however long its record has been
+ * quiet, and whatever a reader was told about which runs are live.
+ */
+export function laneInFlight(state: Pick<RunState, 'verifying' | 'laneBeat' | 'children' | 'child'>, now = Date.now()): boolean {
+  for (const check of Object.values(state.verifying ?? {})) {
+    const child = check?.child;
+    if (child && Number.isInteger(child.pid) && pidHoldsWork(child.pid, { startedAt: child.procStartedAt })) return true;
+  }
+  for (const child of childrenOf(state)) {
+    if (launcherAlive(child) === true && pidHoldsWork(child.pid, procIdentity(child))) return true;
+  }
+  const beat = state.laneBeat;
+  if (beat && Number.isInteger(beat.pid)) {
+    const at = Date.parse(beat.at);
+    if (Number.isFinite(at) && now - at <= LANE_BEAT_FRESH_MS
+      && pidHoldsWork(beat.pid, { startedAt: beat.procStartedAt })) return true;
+  }
+  return false;
 }
 
 /**
@@ -5072,11 +5332,18 @@ export function orphanAdvice(
  * `liveRunId` is the id the current `Runner` is driving, and it is the only
  * thing that licenses an in-flight status. Everything else gets reclaimed.
  * Returns whether anything changed, so callers only write when there is
- * something to write.
+ * something to write. `journal`, when given, is where a REAL orphan's park is
+ * said (#175) — the read path used to write it to the record alone.
  */
-export function reconcileRun(state: RunState, liveRunId?: LiveRuns): boolean {
+export function reconcileRun(
+  state: RunState, liveRunId?: LiveRuns, opts: { journal?: DeclarationSink } = {},
+): boolean {
   if (isLive(state.id, liveRunId)) return false;
   if (!IN_FLIGHT.includes(state.status)) return false;
+  // A lane in its `Setup:` or its baseline, one whose lock its console is
+  // still refreshing, or a session the live console launched, IS driven —
+  // whatever this reader was told (#173, #175).
+  if (laneInFlight(state)) return false;
 
   const at = new Date().toISOString();
   // Whether the OPERATOR had asked this run to stop before the console died —
@@ -5128,6 +5395,15 @@ export function reconcileRun(state: RunState, liveRunId?: LiveRuns): boolean {
     // composer, so the two cannot describe it differently either.
     state.halt ??= { at, kind: 'orphaned-session', reason: advice.reason, phase: advice.phase };
     state.stoppedBy = 'system';
+    // Said where a person reads, once (#175): this park was written to the
+    // record alone, so the false ones left nothing to date them by — and a real
+    // one is the moment an operator most needs the line. `launcher` says what
+    // was known of the console that launched them: gone, or never recorded.
+    opts.journal?.('run.orphaned', {
+      pids: alive.map((child) => child.pid), phases: alive.map((child) => child.phase),
+      launcher: alive.some((child) => launcherAlive(child) === null) ? 'unknown' : 'gone',
+      ...(advice.frozen.length ? { frozen: advice.frozen.map((child) => child.pid) } : {}),
+    }, advice.phase);
     return true;
   }
 
@@ -5674,6 +5950,10 @@ export function autoResolveRun(
 ): boolean {
   if (state.resolved || state.reopenedAt) return false;
   if (!RESOLVABLE.includes(state.status)) return false;
+  // A run parked because its work is not on its trunk is not superseded by the
+  // board: every phase reading done is the very premise of that park
+  // (control-tower phase 112, #184).
+  if (state.halt?.kind === 'unlanded') return false;
   // A stop about the plan is not superseded by any phase reading done — its
   // anchor always does (control-tower phase 81, #97). Only a clean lint answers
   // it, and "superseded" here pinned the run against the relaunch that would.
@@ -5762,6 +6042,12 @@ export const RECORD_RECONCILABLE: readonly RunStatus[] = [...SETTLEABLE, 'paused
 export function settleFinishedRun(state: RunState, board: Record<number, string>): boolean {
   if (!SETTLEABLE.includes(state.status)) return false;
   if (state.stoppedBy === 'operator') return false;
+  // 🔴 Never over an `unlanded` park (control-tower phase 112, #184): it is
+  // exactly "every phase done, and the work NOT landed", so settling it here
+  // would write `finished` over unlanded work on the next page view — the
+  // claim #184 measured as false. Its way out is a landing and a person's
+  // Recover & continue, which proves it again.
+  if (state.halt?.kind === 'unlanded') return false;
   // A phase still owed the verification a restart cut is not finished work,
   // however the board reads it (control-tower phase 48, #69).
   if (Object.values(state.phases).some((record) => owesVerification(record) || record.reopened)) return false;
@@ -5905,13 +6191,17 @@ export function healLegacyHalt(state: RunState): boolean {
 }
 
 function settle(state: RunState, liveRunId?: LiveRuns): RunState {
-  const live = isLive(state.id, liveRunId);
+  // Live by the caller's word, or by a fact any reader can check: a lane in its
+  // Setup or its baseline, or one whose lock is being refreshed (#173).
+  // Only for a run that claims to be in flight: a stopped run's last beat says
+  // nothing about now, and its wait clock and records must still settle.
+  const live = isLive(state.id, liveRunId) || (IN_FLIGHT.includes(state.status) && laneInFlight(state));
   // A run that lost its clock gets the record's BEFORE `reconcileRun` reads the
   // run — see `rearmWaitClock`. Never for a live run: the loop owns its clock.
   const rearmed = live ? null : rearmWaitClock(state);
   // A stamp written as one string before it was a set (RCV-8) reads as a set.
   const folded = foldLegacyWatchStamps(state);
-  const reclaimed = reconcileRun(state, liveRunId);
+  const reclaimed = reconcileRun(state, liveRunId, { journal: journalOf(state) });
   // A kindless legacy halt gets its word before anything reads it (LFC-1).
   const healed = healLegacyHalt(state);
   // A scoped run an older console called finished with its scope still open
@@ -5954,7 +6244,7 @@ function foldLegacyWatchStamps(state: RunState): boolean {
   return folded;
 }
 
-export function loadRun(root: string, slug: string, id: string, liveRunId?: LiveRuns): RunState | null {
+export function loadRun(root: string, slug: string, id: string, liveRunId: LiveRunsKnown): RunState | null {
   const target = runFile(root, slug, id);
   // A save OWED for this run means this process is holding a copy newer than
   // the file. Reading the file would hand back a state the console has already
@@ -6067,8 +6357,76 @@ function readRunFile(target: string): RunState | null {
   return raw;
 }
 
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * Carry what ONE writer changed in its copy of a run onto the record as it
+ * stands now (control-tower phase 110, #178) — a three-way merge of plain
+ * JSON. Every path where `mine` differs from `base` (the copy the writer read)
+ * is set on `target`; every other path keeps `target`'s value, which a runner,
+ * a person or a later pass may have moved meanwhile. Objects merge key by key;
+ * a list merges entry by entry, and what the writer APPENDED is appended after
+ * whatever was appended meanwhile (a rung history keeps both); anything else is
+ * one value. Answers whether `target` changed.
+ *
+ * The heal pass read a run, spent minutes classifying it under load, and then
+ * saved that whole copy: the live attempt the operator's Retry had boarded in
+ * the meantime was written over with the park it had already answered.
+ */
+export function mergeRunChanges(base: unknown, mine: unknown, target: Record<string, unknown>): boolean {
+  if (!isPlainObject(base) || !isPlainObject(mine)) return false;
+  let changed = false;
+  for (const key of new Set([...Object.keys(base), ...Object.keys(mine)])) {
+    const had = Object.hasOwn(base, key) && base[key] !== undefined;
+    const has = Object.hasOwn(mine, key) && mine[key] !== undefined;
+    if (!has) {
+      if (had && Object.hasOwn(target, key)) { delete target[key]; changed = true; }
+      continue;
+    }
+    const before = base[key];
+    const after = mine[key];
+    if (had && isDeepStrictEqual(before, after)) continue;
+    const current = target[key];
+    if (had && isPlainObject(before) && isPlainObject(after) && isPlainObject(current)) {
+      if (mergeRunChanges(before, after, current)) changed = true;
+      continue;
+    }
+    if (had && Array.isArray(before) && Array.isArray(after) && Array.isArray(current) && after.length >= before.length) {
+      if (mergeListChanges(before, after, current)) changed = true;
+      continue;
+    }
+    if (isDeepStrictEqual(current, after)) continue;
+    target[key] = structuredClone(after);
+    changed = true;
+  }
+  return changed;
+}
+
+/** `mergeRunChanges` for a list the writer edited in place or appended to. */
+function mergeListChanges(before: unknown[], after: unknown[], current: unknown[]): boolean {
+  let changed = false;
+  for (let i = 0; i < before.length && i < current.length; i += 1) {
+    if (isDeepStrictEqual(before[i], after[i])) continue;
+    const was = before[i];
+    const now = after[i];
+    const at = current[i];
+    if (isPlainObject(was) && isPlainObject(now) && isPlainObject(at)) {
+      if (mergeRunChanges(was, now, at)) changed = true;
+    } else if (!isDeepStrictEqual(at, now)) {
+      current[i] = structuredClone(now);
+      changed = true;
+    }
+  }
+  for (const added of after.slice(before.length)) {
+    current.push(structuredClone(added));
+    changed = true;
+  }
+  return changed;
+}
+
 /** Every run recorded for a plan, newest first. */
-export function listRuns(root: string, slug: string, liveRunId?: LiveRuns): RunState[] {
+export function listRuns(root: string, slug: string, liveRunId: LiveRunsKnown): RunState[] {
   const dir = runDir(root, slug);
   if (!existsSync(dir)) return [];
   const runs: RunState[] = [];
@@ -6086,7 +6444,7 @@ export function listRuns(root: string, slug: string, liveRunId?: LiveRuns): RunS
  * most recent. A finished run is still worth showing — it is the record of what
  * happened — but it must never be silently resumed.
  */
-export function latestRun(root: string, slug: string, liveRunId?: LiveRuns): RunState | null {
+export function latestRun(root: string, slug: string, liveRunId: LiveRunsKnown): RunState | null {
   const runs = listRuns(root, slug, liveRunId);
   return runs.find((r) => r.status !== 'finished') ?? runs[0] ?? null;
 }

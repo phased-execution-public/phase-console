@@ -297,6 +297,50 @@ test('a person\'s lock whose session the hook reports ENDED is released by the c
   } finally { cleanup(); }
 });
 
+test('a /clear (control-tower phase 108, #172): the replaced session reads ended, and its lock is not debris while the process runs', async () => {
+  const { root, cleanup } = scratch();
+  const { warmPids } = await import('../server/pid.ts');
+  const terminal = spawnProcess('sleep', ['120'], { stdio: 'ignore' });
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    const svc = service(root, {}, (s) => { s.prefs.convergeEveryMs = 3_600_000; });
+    try {
+      await settle(svc);
+      await warmPids([terminal.pid!]);
+      const held = claim(root, 2, 'sam@laptop', 3600, 's-before');
+      svc.store?.refresh([join(root, 'docs', 'handoffs', 'alpha', '.locks')]);
+      const event = (body: Record<string, unknown>) =>
+        svc.ingestSessionEvent({ cwd: root, user: 'sam', host: 'laptop', pid: terminal.pid, at: new Date().toISOString(), ...body });
+      event({ session_id: 's-before', event: 'SessionStart', source: 'startup' });
+      const { newRun, saveRun, phaseRecord } = await import('../server/runner/state.ts');
+      const state = newRun({ slug: 'alpha', root, autoRecover: false });
+      state.status = 'halted';
+      state.halt = { at: new Date().toISOString(), reason: 'x' };
+      Object.assign(phaseRecord(state, 2), { status: 'failed', attempts: 1 });
+      saveRun(state);
+
+      // The /clear: the old id ends, the new one starts in the same process.
+      event({ session_id: 's-before', event: 'SessionEnd', reason: 'clear' });
+      event({ session_id: 's-after', event: 'SessionStart', source: 'clear' });
+      assert.equal(svc.sessions.presence('s-before'), 'ended', 'the session is over: its process belongs to s-after');
+      const views = ((await call(svc, 'GET', '/api/sessions/registry')).payload as { sessions: { sessionId: string; presence: string }[] }).sessions;
+      assert.deepEqual(
+        views.filter((one) => ['s-before', 's-after'].includes(one.sessionId)).map((one) => [one.sessionId, one.presence]).sort(),
+        [['s-after', 'live'], ['s-before', 'ended']],
+      );
+
+      // …but the person who cleared is still at that process, holding phase 2.
+      await svc.converger.idle();
+      assert.ok(existsSync(held), 'a /clear never frees the lock the old id claimed while its process lives (PRS-1)');
+      // (With the process gone the claim is debris — `presence-clear.test.ts` PC-2..3.)
+    } finally { svc.close(); }
+  } finally {
+    terminal.kill('SIGKILL');
+    cleanup();
+  }
+});
+
 /* ------------------------------------------------------------------ *
  * Unsupervised outcomes
  * ------------------------------------------------------------------ */
@@ -1232,9 +1276,11 @@ test('ACC-7.1 (REG-2): an inbox drop two hours old applies on load() with its la
     const twoHours = Date.now() - 2 * 60 * 60_000;
     const minute = Date.now() - 60_000;
     for (const [n, id, at] of [[1, 's-late-ask', twoHours], [3, 's-fresh-ask', minute]] as const) {
-      drop(n, { session_id: id, event: 'SessionStart', cwd: root, pid: process.pid, at: new Date(at - 1_000).toISOString() });
+      // Two sessions, two live processes — one pid for both would be a `/clear` (#172).
+      const pid = id === 's-late-ask' ? process.ppid : process.pid;
+      drop(n, { session_id: id, event: 'SessionStart', cwd: root, pid, at: new Date(at - 1_000).toISOString() });
       drop(n + 1, {
-        session_id: id, event: 'Notification', cwd: root, pid: process.pid, notification_type: 'permission_prompt',
+        session_id: id, event: 'Notification', cwd: root, pid, notification_type: 'permission_prompt',
         message: `${id} needs permission to use Bash`, at: new Date(at).toISOString(),
       });
     }

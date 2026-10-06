@@ -36,7 +36,8 @@ import {
   type LandPolicy,
 } from '@shared/landing-model.js';
 import { DEFAULT_MESSAGING, MESSAGING_WORDS, type MessagingWord } from '@shared/message-model.js';
-import { DEFAULT_ISSUES, ISSUE_MODES, type IssueMode } from '@shared/issues-model.js';
+import { DEFAULT_ISSUES, ISSUE_MODES } from '@shared/issue-modes.js';
+import type { IssueMode } from '@shared/issues-model.js';
 import type { McpPolicy } from './runs';
 import type { GitMode, HolderKind, ReviewerPolicy } from '@shared/run-lifecycle.js';
 import type { BootHoldKind } from '@shared/ops-vocab.js';
@@ -791,6 +792,11 @@ export interface ConsoleState {
     conflictPolicy?: ConflictPolicy;
     messaging?: MessagingWord;
     issuesMode?: IssueMode;
+    /**
+     * The Issues desk's repositories outside this console (control-tower phase
+     * 118): `owner/name`s added to read beside the estate. Absent when none.
+     */
+    issueRepos?: string[];
     autoRecoverByDefault?: boolean;
     autoContinueRecovery?: boolean;
     watchCmdRefs?: boolean;
@@ -816,7 +822,7 @@ export interface ConsoleState {
      */
     resumeAtBoot?: ResumeAtBootMode | boolean;
     autoAccountSwitch?: boolean;
-    /** A `human` gate is briefed to the phase's own session to verify and clear. ON by default since 5.0.0 (`gates: delegated`) — see `server/config.ts`. */
+    /** An overdue gate is briefed to the phase's own session to verify and clear — never a `manual` one (#174). ON by default since 5.0.0 (`gates: delegated`) — see `server/config.ts`. */
     delegateHumanGates?: boolean;
     /**
      * This console's answers to the decision manifest's rows, keyed by decision

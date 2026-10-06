@@ -25,6 +25,7 @@
 
 import { Duration } from '@/components/ui';
 import { PhaseStatusBadge } from '@/components/ui/status';
+import { CHECK_PURPOSE_WORDS } from '@/features/runs/check-words';
 import type { NowLane } from '@/features/runs/lanes-model';
 import type { RunState, VerifyingLane } from '@/lib/api';
 import { clockTime } from '@/lib/format';
@@ -32,12 +33,8 @@ import { clockTime } from '@/lib/format';
 /** The one phase word a check is drawn as — `shared/status-model.js` owns its label, icon and paint. */
 const CHECK_RECORD = { status: 'verifying' } as const;
 
-/** What each pass is called on its row. */
-export const CHECK_PURPOSE_WORDS: Readonly<Record<VerifyingLane['purpose'], string>> = {
-  verify: '§Verification',
-  baseline: 'baseline',
-  'wip-gate': 'wrap-up gate',
-};
+/** What each pass is called on its row — the lane model's one table (control-tower phase 105). */
+export { CHECK_PURPOSE_WORDS };
 
 /** The run's own checks, in phase order — `[]` when nothing is verifying, or the server predates the field. */
 export function verifyingLanes(run: Pick<RunState, 'verifying'>): VerifyingLane[] {

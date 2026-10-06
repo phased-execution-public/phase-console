@@ -1956,3 +1956,193 @@ test('GD-2: `git submodule` inside a run worktree asks; in the run root it is al
     { ...policy, ask: policy.ask.filter((rule: string) => rule !== 'Bash(git submodule:*)') }, 'trusted'), 'allow');
 });
 
+test('RB-3 (control-tower phase 112, #183): a session\'s detach of its OWN mirror is refused before it runs, with the reason', async () => {
+  const { RUN_TREE_DETACH_RULE } = await import('../server/runner/approvals.ts');
+  assert.equal(RUN_TREE_DETACH_RULE, 'run-tree-detach');
+  const own = (command: string, cwd = `${MIRROR}/trade`, ctx: { runBranch?: string; detached?: boolean } = {}) =>
+    treeGuard('Bash', { command }, { cwd, runRoot: HUB, runTrees: RUN_TREES, ownTree: MIRROR, runBranch: 'pe/demo', ...ctx });
+  // The measured shape (#183): a release phase's session put its mirror's
+  // checkout on `origin/main` to make a drift line green.
+  for (const command of [
+    'git switch --detach origin/main',
+    'git switch -d origin/main',
+    'git switch --detach',
+    'git checkout --detach origin/main',
+    'git checkout bb0abd7d',
+    'git checkout 48be6d91f3e9f26f0c1d2e3a4b5c6d7e8f9a0b1c',
+    'git checkout origin/main',
+    'git checkout refs/remotes/origin/main',
+    'git checkout HEAD~1',
+    'git checkout v6.0.0^0',
+    `git -C ${MIRROR}/trade switch --detach origin/main`,
+    'cd backend && git checkout origin/main',
+    'git fetch origin && git switch --detach origin/main && task drift:backend',
+  ]) {
+    const verdict = own(command);
+    assert.equal(verdict?.verdict, 'deny', command);
+    assert.equal(verdict?.rule, RUN_TREE_DETACH_RULE, command);
+    assert.match(String(verdict?.reason), /detached HEAD/, command);
+    assert.match(String(verdict?.reason), /next boarding/, command);
+    assert.match(String(verdict?.reason), /re-seats `pe\/demo` on `origin\/main`/, command);
+  }
+  // Not a detach: restoring paths, switching or creating a branch, reading.
+  for (const command of [
+    'git checkout -- docs/notes.md',
+    'git checkout origin/main -- docs/notes.md',
+    'git checkout bb0abd7d docs/notes.md',
+    'git checkout -b scratch',
+    'git switch pe/demo',
+    'git switch -c scratch origin/main',
+    'git status',
+    'git log --oneline origin/main',
+    // Data, not a command: a here-doc body and a quoted argument (phase 107's reader).
+    "cat <<'EOF' > notes.md\ngit checkout bb0abd7d\nEOF",
+    'git commit -m "never git switch --detach origin/main here"',
+  ]) {
+    assert.equal(own(command)?.rule === RUN_TREE_DETACH_RULE, false, command);
+  }
+  // Anywhere but the run's OWN mirror it is none of this rule's business: an
+  // errand tree, another run's mirror, the shared root.
+  assert.equal(own('git switch --detach origin/main', `${HUB}/.worktrees/hand/demo/p12-errand`), null);
+  assert.equal(own('git switch --detach origin/main', `${HUB}/.worktrees/runs/other/aaaaaaaaaaaa/integration/trade`), null);
+  assert.equal(own('git checkout origin/main', HUB), null);
+  // A run whose mirror is DETACHED by design owns no branch to break.
+  assert.equal(own('git switch --detach origin/main', `${MIRROR}/trade`, { detached: true }), null);
+  // No own tree known: the guard does not guess.
+  assert.equal(guardOf('git switch --detach origin/main', `${MIRROR}/trade`), null);
+});
+
+
+test('#189 (control-tower phase 107): rules match only what a line RUNS — the wall is never weaker than the raw reading, and data never matches', async () => {
+  const { bashSubjects, carvedPolicy, classifyTool, matchedDenyRule } = await import('../server/runner/approvals.ts');
+  const policy = { deny: [...DEFAULT_DENY], ask: [...DEFAULT_ASK], allow: [] };
+  // Every shape the shell RUNS a force push in is walled, carve-out or not —
+  // a shell's `-c` payload, a substitution, an `eval`'s words, an assignment
+  // or a wrapper in front, git's own options before its verb, a group, a
+  // compound, a here-doc a shell reads, an unquoted here-doc's substitution.
+  for (const command of [
+    'git push --force origin main',
+    "bash -c 'git push --force origin main'",
+    'echo "$(git push --force origin main)"',
+    'echo `git push --force origin main`',
+    'eval "git push --force origin main"',
+    'FOO=1 git push --force origin main',
+    'git -C sub push --force origin main',
+    '(cd sub && git push --force origin main)',
+    'if true; then git push --force origin main; fi',
+    'bash <<EOF\ngit push --force origin main\nEOF',
+    'cat <<EOF\n$(git push --force origin main)\nEOF',
+    'diff <(git push --force origin main) /dev/null',
+    // A here-doc delimiter read as bash reads it: the whole word, quote
+    // removal — a terminator read short never meets its line and would
+    // swallow the push after it as data.
+    'cat <<E"OF"\nhello\nEOF\ngit push --force origin main',
+    'cat <<"E"OF\nhello\nEOF\ngit push --force origin main',
+    'cat <<END!\nx\nEND!\ngit push --force origin main',
+    // A body that never meets its delimiter is malformed: the raw text is read too.
+    'cat <<EOF\nnever closed\ngit push --force origin main',
+    // ANSI-C quoting and a coprocess run what they spell.
+    "$'git' push --force origin main",
+    "git $'push' --force origin main",
+    'coproc git push --force origin main',
+    'coproc NAME { git push --force origin main; }',
+    // `$[ … ]` is arithmetic: its `<<` is a shift, never a here-doc whose
+    // "body" (closed by a line `2`) would hide the push bash runs.
+    'echo $[ 1 << 2 ]\ngit push --force origin main\n2',
+  ]) {
+    for (const carved of [policy, carvedPolicy(policy as never, 'trusted', true)]) {
+      assert.equal(classifyTool('Bash', { command }, carved, 'trusted'), 'deny', `walled: ${command}`);
+      assert.ok(matchedDenyRule('Bash', { command }, carved), `and the rule that walled it is named: ${command}`);
+    }
+  }
+  // What the reader cannot resolve, it matches raw as well: an `eval` of a
+  // value, a `$CMD` command word, a program piped into a shell, a script the
+  // line itself wrote from a here-doc and then runs — never weaker than the
+  // old reading.
+  for (const command of [
+    'eval "$CMD"; git push --force origin main',
+    'X="git push --force origin main"; $X',
+    'echo "git push --force origin main" | sh',
+    "cat > deploy.sh <<'EOF'\ngit push --force origin main\nEOF\nbash deploy.sh",
+    "cat > deploy.sh <<'EOF'\ngit push --force origin main\nEOF\n. ./deploy.sh",
+  ]) {
+    assert.equal(classifyTool('Bash', { command }, policy, 'trusted'), 'deny', `opaque, still walled: ${command}`);
+  }
+  // …while a script a line merely RUNS keeps its arguments as data: a
+  // session's own ruling about a push is not a push (the raw split once read
+  // the `;` inside its quotes as a statement boundary).
+  for (const command of [
+    'bash "$PE_SCRIPTS"/phase-outcome.sh control-tower 107 ruling --what "re-ran git push origin pe/x alone; git push --force was refused"',
+    "bash scripts/x.sh --note 'git push --force origin main'",
+  ]) {
+    assert.notEqual(classifyTool('Bash', { command }, policy, 'trusted'), 'deny', `arguments are data: ${command}`);
+  }
+  // Data matches nothing: a quoted here-doc's body, an interpreter's payload,
+  // a quoted argument — not even the deny list.
+  for (const command of [
+    "python3 - <<'EOF'\nprint('git push --force origin main && rm -rf /')\nEOF",
+    "node -e 'process.stdout.write(\"git push --force origin main\")'",
+    'git log --grep "git push --force"',
+    'echo "git push --force origin main; gh pr merge 1"',
+  ]) {
+    assert.notEqual(classifyTool('Bash', { command }, policy, 'trusted'), 'deny', `data: ${command}`);
+    assert.ok(!bashSubjects(command).some((text) => text.startsWith('git push')), `no pushed words: ${JSON.stringify(bashSubjects(command))}`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The console-forge guard's reader (control-tower phase 129, #218)
+ * ------------------------------------------------------------------ */
+
+test('CF-4: the console\'s files are named by `~` and `$HOME` too, and an account\'s settings and login stay the console\'s', async () => {
+  const { consoleForgeCall } = await import('../server/runner/approvals.ts');
+  const ctx = {
+    stateDir: '/home/u/.local/state/phase-console', configDir: '/home/u/.config/phase-console',
+    ports: new Set([4130]), home: '/home/u', cwd: '/repo',
+  };
+  const bash = (command: string) => consoleForgeCall('Bash', { command }, ctx)?.path ?? null;
+  assert.equal(bash('echo {} > ~/.config/phase-console/autopilot.json'), '/home/u/.config/phase-console/autopilot.json');
+  assert.equal(bash('echo {} >> "$HOME/.config/phase-console/fleet.json"'), '/home/u/.config/phase-console/fleet.json');
+  assert.equal(bash('echo x >| ${HOME}/.local/state/phase-console/fleet/fleet.token'), '/home/u/.local/state/phase-console/fleet/fleet.token', 'a clobbering redirection too');
+  assert.equal(bash('echo x 2>~/.local/state/phase-console/approvals/pending.json'), '/home/u/.local/state/phase-console/approvals/pending.json');
+  assert.equal(bash('echo x &>> ~/.local/state/phase-console/approvals/pending.json'), '/home/u/.local/state/phase-console/approvals/pending.json');
+  assert.equal(bash('cd ~/.config && echo x > /tmp/y'), null, 'a cd is not a write');
+  assert.equal(bash('echo x > "$PE_OUTCOME_FILE"'), null, 'a path only the shell knows is past a reader');
+  assert.equal(bash('echo x > ../.config/phase-console/autopilot.json'), null, 'relative to /repo, not the console\'s');
+  assert.equal(bash('echo x 2>&1 > /dev/null'), null);
+  assert.equal(bash('dd if=/tmp/x of=~/.config/phase-console/autopilot.json'), '/home/u/.config/phase-console/autopilot.json', 'dd writes its of=');
+  assert.equal(bash('cp ~/.config/phase-console/autopilot.json /tmp/backup.json'), null, 'a copy only reads its source');
+  const account = '/home/u/.local/state/phase-console/instances/i/accounts/a/config';
+  const file = (file_path: string) => consoleForgeCall('Write', { file_path, content: '' }, ctx)?.verb ?? null;
+  assert.equal(file(`${account}/settings.json`), 'console-files', 'the hooks a session runs under');
+  assert.equal(file(`${account}/.credentials.json`), 'console-files', 'its login');
+  assert.equal(file(`${account}/projects/-repo/memory/MEMORY.md`), null, 'its memory');
+  assert.equal(file(`${account}/plans/the-plan.md`), null, 'its plan-mode plan');
+  assert.equal(file('/home/u/.local/state/phase-console/runs/i/demo/worktrees/r1/app/x.ts'), null, 'its run tree');
+  assert.equal(file('/home/u/.local/state/phase-console/runs/i/demo/worktrees/../run-r1.json'), 'console-files', 'a dot segment is resolved first');
+  assert.equal(file('/home/u/.local/state/phase-console/accounts/learned.json'), 'console-files');
+});
+
+test('CF-6: a forged press is excused only by the plan row\'s name for it — never by a rule the line matches, never the console\'s files', async () => {
+  const { consoleForgeCall, consoleForgeException } = await import('../server/runner/approvals.ts');
+  const { destructiveExceptions } = await import('../shared/policy-model.js');
+  const ctx = { stateDir: '/s', configDir: '/c', ports: new Set([4130]), home: '/h' };
+  const row = 'deny; allow `phase-console run approve` — phase 7 only; Phase 8 — `Bash(curl:*)`, `git push`';
+  const excused = (phase: number, command: string) => {
+    const forge = consoleForgeCall('Bash', { command }, ctx);
+    assert.ok(forge, command);
+    return consoleForgeException(destructiveExceptions(row, { phase }), forge!);
+  };
+  const curl = "curl -X POST -H 'x-phase-console: 1' http://127.0.0.1:4130/api/approvals/a1";
+  assert.equal(excused(7, 'phase-console run approve a1'), 'Bash(phase-console run approve:*)');
+  assert.equal(excused(7, curl), 'Bash(phase-console run approve:*)', 'the press is named by its CLI form, whatever door it took');
+  assert.equal(excused(7, 'phase-console run deny a1'), null, 'deny is a verb the row does not name');
+  assert.equal(excused(6, 'phase-console run approve a1'), null);
+  assert.equal(excused(8, curl), null, 'a rule that matches the line is no name for the press');
+  // Every press on a line is asked: an excused one carries no other.
+  const both = consoleForgeCall('Bash', { command: `phase-console run approve a1; ${curl.replace('approvals/a1', 'policy')} -d '{}'` }, ctx,
+    (forge) => consoleForgeException(destructiveExceptions(row, { phase: 7 }), forge) !== null);
+  assert.equal(both?.verb, 'edit-policy');
+  const files = consoleForgeCall('Write', { file_path: '/c/autopilot.json', content: '' }, ctx)!;
+  assert.equal(consoleForgeException(['Bash(phase-console run approve:*)'], files), null);
+});

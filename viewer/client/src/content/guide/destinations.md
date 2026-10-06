@@ -43,7 +43,13 @@ more than one, then a section. On a phone, **Repo** is under **More**, in **The 
 - **Working trees** — where the parallel work is, and what is left over from work that ended.
 - **Changes** — what changed between any two points, one file at a time.
 - **Settles** — how each run's work reached the trunk, or why it did not.
-- **Issues** — every repository's open issues. Tick some to **Author a plan from N issues** (needs `--allow-agent`).
+- **Issues** — the Issues desk: a repository's whole issue list, each issue with its category, severity and plan status. Every column sorts, and the filters and the sort live in the URL. Add any GitHub `owner/name` to read it beside your own repositories. Tick some to **Author a plan from N issues** (needs `--allow-agent`).
+
+The desk reads each issue's words off its labels. Its category is a bug, an enhancement, documentation,
+a question or other. Its severity comes from a `severity:` label: critical, high, medium or low, or
+none. Its plan status says where it stands: it needs a plan (`awaiting-plan`), it is planned in a plan
+and phase (`plan:<slug>`), it is deferred (`plan:<slug>-deferred`) or it is fixed (closed with a plan
+label). A repository you add is read-only and marked *outside this console*.
 
 
 ## Insights — how long, how much, how fast?

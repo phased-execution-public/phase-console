@@ -28,7 +28,7 @@ import { rmSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { INSTANCE } from '../config.ts';
+import { INSTANCE, SKILL_DIR } from '../config.ts';
 import { log } from '../log.ts';
 import { parseAuth, type AuthStatus } from '../runner/auth.ts';
 import { classify, type RetirementEvidence } from '../runner/errors.ts';
@@ -508,6 +508,13 @@ export type AccountsOptions = {
   /** Test seams: the registry directory (per instance) and the learned file (machine-wide). */
   registryDir?: string;
   learnedFile?: string;
+  /**
+   * The skill checkout whose `session-hook.sh` a profile workspace's presence
+   * entries run (control-tower phase 108, #194) — this console's own by default
+   * (`SKILL_DIR`, which the machine profile's `hookScript` overrides as it does
+   * for the login); `null` provisions no presence hook.
+   */
+  hookSkillDir?: string | null;
   /**
    * Where profile logins and token files live — this instance's accounts
    * directory by default. A process reading another console's registrations
@@ -1525,15 +1532,20 @@ export class Accounts {
    * Env to merge into a child so it runs as this account. `null` = inherit.
    *
    * A profile's config dir is provisioned on the way out (the `skills` and
-   * `plugins` links, the login's plugin settings, and workspace trust for
-   * `trustRoots`) — see `workspace.ts` for the incident
+   * `plugins` links, the login's plugin settings, the session-presence hook and
+   * workspace trust for `trustRoots`) — see `workspace.ts` for the incidents
    * that made this load-bearing: a bare `CLAUDE_CONFIG_DIR` boots sessions
-   * that cannot find `/phased-execution` and exit success with zero turns.
+   * that cannot find `/phased-execution` and exit success with zero turns, and
+   * sessions the registry never sees (#194).
    */
   async envFor(accountId: string | undefined, trustRoots: string[] = []): Promise<NodeJS.ProcessEnv | null> {
     if (!accountId || accountId === DEFAULT_ACCOUNT_ID) return null;
     const env = await this.creds.envFor(this.store.get(accountId) ?? null);
-    if (env?.CLAUDE_CONFIG_DIR) ensureProfileWorkspace(env.CLAUDE_CONFIG_DIR, trustRoots);
+    if (env?.CLAUDE_CONFIG_DIR) {
+      ensureProfileWorkspace(env.CLAUDE_CONFIG_DIR, trustRoots, undefined, undefined, {
+        hookSkillDir: this.opts.hookSkillDir === undefined ? SKILL_DIR : this.opts.hookSkillDir,
+      });
+    }
     return env;
   }
 
@@ -2068,25 +2080,39 @@ export class Accounts {
     // answers the same login as the account being left is that account — the
     // machine login `default` read as headroom for the admin@ profile it was
     // the same meter as — and two profiles of one person rank once.
-    const leaving = exclude ? this.personOf(exclude) : null;
-    const candidates: { id: string; person: string | null; tier: number; score: number; entitled: number; order: number }[] = [];
+    // Ranked as POOLS (control-tower phase 110, #187): `poolOf` is the one key
+    // every headroom decision reads, so the picker, the forecast and the
+    // supervisor's hot-account remedy cannot disagree about what one meter is.
+    const leaving = exclude ? this.poolOf(exclude) : null;
+    const candidates: { id: string; pool: string; tier: number; score: number; entitled: number; order: number }[] = [];
     this.accountIds().forEach((id, order) => {
       if (id === exclude) return;
-      const person = this.personOf(id);
-      if (leaving && person === leaving) return;
+      const pool = this.poolOf(id);
+      if (pool === leaving) return;
       const verdict = this.candidacy(id, family, nowMs);
-      if (verdict.ok) candidates.push({ id, person, tier: verdict.tier, score: verdict.score, entitled: verdict.entitled, order });
+      if (verdict.ok) candidates.push({ id, pool, tier: verdict.tier, score: verdict.score, entitled: verdict.entitled, order });
     });
     candidates.sort((a, b) => a.tier - b.tier || a.score - b.score || a.entitled - b.entitled || a.order - b.order);
     const seen = new Set<string>();
     return candidates
       .filter((c) => {
-        if (!c.person) return true;
-        if (seen.has(c.person)) return false;
-        seen.add(c.person);
+        if (seen.has(c.pool)) return false;
+        seen.add(c.pool);
         return true;
       })
       .map((c) => c.id);
+  }
+
+  /**
+   * The usage POOL an account spends (control-tower phase 110, #187): its
+   * login — email and organisation, `personOf` — or the account alone when no
+   * login names it (a setup-token, a profile nobody signed in). Two
+   * registrations of one login read one meter to the second, so a move between
+   * them buys a fresh boot and no headroom: the supervisor suggested exactly
+   * that, `default` → `account-6ffc`, "has room (90 %)", at 90 % itself.
+   */
+  poolOf(id: string): string {
+    return this.personOf(id) ?? `account:${id}`;
   }
 
   /** `personOf`'s answers, kept as long as the identity cache keeps its reads. */

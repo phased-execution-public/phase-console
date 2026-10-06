@@ -21,6 +21,7 @@ import { money, plural } from '@/lib/format';
 import { useSpend } from '@/lib/queries';
 import { cn } from '@/lib/cn';
 import { insightsHref, runsBayHref } from '@/app/routes';
+import { runFocusWords } from '@/features/runs/check-words';
 import type { TowerModel } from './tower-model';
 
 export interface SituationPart {
@@ -64,9 +65,12 @@ export function situationParts(input: {
   const liveHref = runsBayHref('live');
   if (live.length === 1) {
     const only: RunState = live[0]!.run;
+    // The phase it works — or the console's own check on it, when that is all
+    // that runs (control-tower phase 105, #193) — and never `phase ?`.
+    const focus = runFocusWords(only);
     parts.push({
       key: 'live',
-      text: `${only.slug} is running — phase ${only.activePhase ?? '?'}`,
+      text: focus ? `${only.slug} is running — ${focus}` : `${only.slug} is running`,
       href: liveHref,
     });
   } else if (live.length > 1) parts.push({ key: 'live', text: `${live.length} live`, href: liveHref });

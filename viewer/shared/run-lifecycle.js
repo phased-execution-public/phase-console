@@ -599,9 +599,13 @@ export const PRESENCE = Object.freeze(/** @type {const} */ (['live', 'ended', 'u
  * itself, at the moment it gave; `probe` is the registry finding the process
  * gone, which is an INFERENCE: `endedAt` is then the last evidence of life
  * (`lastSeen`) and `endedDetectedAt` the moment the probe noticed, and every
- * page draws it differently from a reported end.
+ * page draws it differently from a reported end. `successor` is a session
+ * whose own end never arrived while ANOTHER session started in its process
+ * (control-tower phase 108, #172 — a `/clear` whose SessionEnd hook was lost):
+ * a fact rather than an inference, since one process is one session at a time,
+ * with `endedAt` its last evidence of life.
  */
-export const PRESENCE_END_SOURCES = Object.freeze(/** @type {const} */ (['hook', 'probe']));
+export const PRESENCE_END_SOURCES = Object.freeze(/** @type {const} */ (['hook', 'probe', 'successor']));
 
 /**
  * @typedef {(typeof PRESENCE_END_SOURCES)[number]} PresenceEndSource
@@ -937,6 +941,7 @@ export const WAIT_AUTHORS = Object.freeze(
  *     it. Like `trigger` it opens no `startRun` site of its own — it presses
  *     the verb's own `Service` method (`server/verb-press.ts`) — so whatever
  *     it starts is an automatic start the ceiling counts.
+ *
  */
 export const START_DOORS = Object.freeze(
   /** @type {const} */ ([
@@ -1446,6 +1451,12 @@ export const PHASE_STOP_KINDS = Object.freeze(
     'mcp',
     /** The session said so itself — `stop.declared` carries which word. */
     'declared',
+    /**
+     * The console's watchdog parked it by itself (control-tower phase 111,
+     * #179) — never the session's word, though `stop.declared` keeps the one
+     * it parked on.
+     */
+    'watchdog',
     /** §Verification ran and was red. */
     'verification',
     /** The ladder spent its rungs or its dollars. */
@@ -1724,7 +1735,7 @@ export function waitOnOf(run, kind) {
  * something — `mcpPark`, `declared` and the lock wait are what say who.
  *
  * @param {{ status?: string, lifecycle?: PhaseLifecycle, mcpPark?: unknown,
- *           declared?: { status?: string }|null, lockWaitSince?: unknown,
+ *           declared?: { status?: string, by?: string }|null, lockWaitSince?: unknown,
  *           verification?: { ok?: boolean }|null }|null|undefined} record
  * @returns {PhaseLifecycle}
  */
@@ -1741,11 +1752,15 @@ export function phaseLifecycle(record) {
   const lifecycle = { state };
 
   let kind = PHASE_STOP_FOLD[status];
+  // A park the console's watchdog wrote is the watchdog's act, whatever word
+  // it parked on (control-tower phase 111, #179): it read `declared` over a
+  // declaration nobody made.
+  const declaredBy = record?.declared?.by === 'watchdog' ? 'watchdog' : 'declared';
   if (!kind && state === 'parked') {
     kind = record?.mcpPark
       ? 'mcp'
       : record?.declared
-        ? 'declared'
+        ? declaredBy
         : record?.lockWaitSince
           ? 'scope-cap'
           : null;
@@ -1753,7 +1768,7 @@ export function phaseLifecycle(record) {
   if (!kind && state === 'failed') {
     kind = record?.verification?.ok === false ? 'verification' : 'ladder';
   }
-  if (!kind && state === 'waiting' && record?.declared) kind = 'declared';
+  if (!kind && state === 'waiting' && record?.declared) kind = declaredBy;
   if (kind) {
     lifecycle.stop = record?.declared?.status ? { kind, declared: record.declared.status } : { kind };
   }

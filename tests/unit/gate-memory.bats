@@ -214,13 +214,14 @@ EOF
   assert_contains "$output" "ready: 2, 3"
 }
 
-# --- delegated human gates (PE_GATE_DELEGATE) --------------------------------
-# A `human` gate says a person must decide, and the boot prompt says STOP. An
-# operator who wants a plan to run unattended can delegate that verification to
-# the session instead — which `gate-status.md`'s own header already names as a
-# legitimate approver ("an AI session that verified the conditions"), and which
-# this repository's own plans already record (`by: ai-session-delegated`).
-# Opt-in, per run, and never the default: the plan author wrote `human`.
+# --- a manual gate is a person's, delegated or not (#174) --------------------
+# Until control-tower phase 107 an operator could delegate a `human` gate's
+# verification to the session (`PE_GATE_DELEGATE=1`, on by default since 5.0.0):
+# the boot prompt briefed it to verify each condition and record the clearance
+# as `ai-session-delegated`. An unattended session did exactly that on a MANUAL
+# gate and then changed production data. So a manual gate is a person's
+# whatever the run's `gates` row says: the brief is gone, the variable is inert,
+# and gate-approve.sh refuses a session's approval of one (gate-approve.bats).
 
 @test "boot-prompt: a human gate says STOP by default" {
   setup_docs gatecheck gatecheck
@@ -229,32 +230,34 @@ EOF
   assert_contains "$output" "Do NOT implement past an unapproved human gate"
 }
 
-@test "boot-prompt: PE_GATE_DELEGATE briefs the session to verify and clear it" {
-  setup_docs gatecheck gatecheck
-  PE_GATE_DELEGATE=1 run pg gatecheck --boot-prompt 5
-  assert_contains "$output" "DELEGATED"
-  assert_contains "$output" "ai-session-delegated"
-  refute_contains "$output" "Do NOT implement past an unapproved human gate"
-}
-
-@test "boot-prompt: a delegated gate still refuses to invent evidence" {
-  setup_docs gatecheck gatecheck
-  PE_GATE_DELEGATE=1 run pg gatecheck --boot-prompt 5
-  # The whole safety of delegation is NOT that the session is trusted to judge —
-  # it is that a condition it cannot verify from evidence STOPS it, by name.
-  assert_contains "$output" "verify it against evidence you can actually read"
-  assert_contains "$output" "Never record an approval you cannot cite evidence for"
-  assert_contains "$output" "cannot verify from evidence"
-  # And the stop is a declared outcome the supervisor reads, not prose — by key.
-  assert_contains "$output" "blocked --needs gates --reason"
-}
-
-@test "boot-prompt: delegation does not touch an ai gate's own wording" {
+@test "boot-prompt: PE_GATE_DELEGATE no longer briefs a session to clear a manual gate (#174)" {
   setup_docs gatecheck gatecheck
   run pg gatecheck --boot-prompt 5
   before="$output"
+  PE_GATE_DELEGATE=1 run pg gatecheck --boot-prompt 5
+  [ "$output" = "$before" ]
+  refute_contains "$output" "DELEGATED"
+  refute_contains "$output" "ai-session-delegated"
+  assert_contains "$output" "Do NOT implement past an unapproved human gate"
+}
+
+@test "boot-prompt: a manual gate's stop is a declared outcome by key, and names the person's doors" {
+  setup_docs gatecheck gatecheck
+  run pg gatecheck --boot-prompt 5
+  # The stop is a declared outcome the supervisor reads, not prose — by key.
+  assert_contains "$output" "needs-human --needs gates --reason"
+  assert_contains "$output" "Gate card"
+  assert_contains "$output" "in their own terminal"
+  assert_contains "$output" "never approve it yourself"
+}
+
+@test "boot-prompt: PE_GATE_DELEGATE does not touch an auto gate's wording either" {
+  setup_docs gatecheck gatecheck
+  run pg gatecheck --boot-prompt 2
+  before="$output"
   PE_GATE_DELEGATE=1 run pg gatecheck --boot-prompt 2
-  # phase 2 is a date gate (auto), not human — delegation must not reword it.
+  # phase 2 is a date gate (auto), not human — the variable changes nothing.
+  [ "$output" = "$before" ]
   refute_contains "$output" "DELEGATED"
 }
 

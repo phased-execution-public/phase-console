@@ -464,9 +464,12 @@ export abstract class ServiceLive extends ServiceBase {
   protected announceErrand(data: unknown): void {
     const event = data as {
       slug?: string; runId?: string; phase?: number;
-      errand?: { at?: string; need?: string; how?: string; tried?: string[]; situation?: string; budget?: BudgetFact };
+      errand?: { at?: string; need?: string; how?: string; tried?: string[]; situation?: string; budget?: BudgetFact; upcoming?: boolean };
     } | undefined;
     const { slug, runId, phase, errand } = event ?? {};
+    // An act not due yet summons nobody (control-tower phase 121, #182): its
+    // ONE push is the step's own, when its due-when ref lands.
+    if (errand?.upcoming) return;
     // An errand a BUDGET wrote (a ladder cap, a spent wait) is announced as the
     // budget it is (control-tower phase 14, #40), under `budget` and through the
     // one dedupe, never as a second, mismatched needs-you card beside it.
@@ -1086,19 +1089,43 @@ export abstract class ServiceLive extends ServiceBase {
 
   protected onChange(paths: string[]): void {
     if (!this.store) return;
+    const store = this.store;
+    const slugOf = (p: string) => store.slugForPath(p);
+    // Paths the store does not model (a save's scratch name under the plans
+    // directory, a subdirectory's file) name no plan — `Store.ignores`.
+    const relevant = paths.filter((p) => !store.ignores(p));
     // A plan touched ONLY through its `.locks/` keeps its cached answers (#44).
     // The store re-reads its locks and carries its revision, since a lock is
     // not in the fingerprint and neither `phase-graph.sh` nor `validate.sh`
     // reads one — forgetting here threw away the board of the plan an autopilot
     // is working on every claim, lease refresh and release. The lock ledger and
     // the scheduler below still see every one of those writes.
-    const lockOnly = lockOnlySlugs(paths, (p) => this.store!.slugForPath(p));
-    const carried = new Map([...lockOnly].map((s) => [s, this.store!.get(s)?.revision]));
-    const slugs = this.store.refresh(paths);
+    const lockOnly = lockOnlySlugs(relevant, slugOf);
+    // …and so does a plan the batch neither named nor moved (2026-10-05,
+    // engine queue 588, temp-file rescans). A rescan returns EVERY slug and
+    // already carries each unchanged plan's revision (`carryRevision`), but
+    // forgetting all of them anyway dropped ~160 boards and re-indexed every
+    // plan in search, so the next page poll queued ~320 engine reads — and a
+    // session saving a plan each minute kept that queue from ever draining.
+    // A plan is forgotten when it MOVED (new or deleted counts) or a path
+    // NAMED it: the fingerprint does not cover every file the engine reads
+    // (`gate-status.md`, `landing.md`), so a terminal's `gate-approve.sh` must
+    // still drop that plan's cached gate status. A path no plan owns is a
+    // directory flush — something changed, not what — and still forgets every
+    // plan (PR-1c).
+    const named = new Set(relevant.map(slugOf).filter((s): s is string => Boolean(s)));
+    const flush = relevant.some((p) => !slugOf(p));
+    const before = new Map(store.list().map((r) => [r.slug, r.revision]));
+    const all = store.refresh(paths);
+    const moved = (slug: string) => store.get(slug)?.revision !== before.get(slug);
+    // The plans this batch changed — every one of them for a flush — are also
+    // the only ones told downstream: an unrelated plan is not news.
+    const slugs = flush ? all : all.filter((slug) => named.has(slug) || moved(slug));
     for (const slug of slugs) {
-      if (lockOnly.has(slug) && this.store.get(slug)?.revision === carried.get(slug)) continue;
+      if (lockOnly.has(slug) && !moved(slug)) continue;
       this.forget(slug);
     }
+    for (const slug of before.keys()) if (!store.get(slug)) this.forget(slug);
     this.portfolioCache = null;
     this.generation++;
     void this.refreshRepoInfo();
@@ -1680,12 +1707,14 @@ export abstract class ServiceLive extends ServiceBase {
     const record = this.store?.get(slug);
     if (!record) return DEFAULT_WAIT_BUDGET;
     try {
-      const [line, refs] = await Promise.all([
+      const [line, refs, count] = await Promise.all([
         run(this.engineOpts(), 'phase-graph.sh', [slug, '--wait-budget', String(phase)], { slug, revision: record.revision }),
         run(this.engineOpts(), 'phase-graph.sh', [slug, '--waits-on', String(phase)], { slug, revision: record.revision }),
+        // The plan's declared-wait count (control-tower phase 121, #40).
+        run(this.engineOpts(), 'phase-graph.sh', [slug, '--wait-count', String(phase)], { slug, revision: record.revision }),
       ]);
       const text = (result: typeof line): string => (result.code === 0 && !result.timedOut ? result.stdout : '');
-      return waitBudgetFrom(text(line), text(refs), dateOfRef);
+      return waitBudgetFrom(text(line), text(refs), dateOfRef, text(count));
     } catch {
       return DEFAULT_WAIT_BUDGET;
     }
@@ -1712,19 +1741,46 @@ export abstract class ServiceLive extends ServiceBase {
   async approveGate(
     slug: string,
     phase: number,
-    opts: { approve: boolean; by?: string; note?: string; continueRun?: boolean; actor?: Actor },
+    opts: {
+      approve: boolean; by?: string; note?: string; continueRun?: boolean; actor?: Actor;
+      /**
+       * A PERSON's press (control-tower phase 107, #174): the Gate card from a
+       * browser, a phone's signed Approve, a supervisor-chat act a person
+       * confirmed on its card. Only a person's press opens a MANUAL gate, and
+       * only one is written through the console's door — absent is no person.
+       */
+      person?: boolean;
+    },
   ): Promise<{ ok: boolean; gate: GateStatus | null; detail: string; resumed?: boolean }> {
     if (!this.flags.allowWrites) {
       return { ok: false, gate: null, detail: 'Writes are disabled. Restart with --allow-writes to enable them.' };
     }
     const record = this.store?.get(slug);
     if (!record || !this.root) return { ok: false, gate: null, detail: `No plan named ${slug}.` };
+    // A manual gate is a person's (#174). A script calling this route, or a
+    // chat act nobody confirmed, is refused here with the sentence that says
+    // where a person approves it — before the script is asked, which refuses
+    // the same act on its own (`gate-approve.sh`'s door).
+    const gateDetail = record.plan?.phases[phase];
+    if (opts.approve && opts.person !== true
+      && gateKindOf(gateDetail?.gateCheck, gateDetail?.gated ?? false, this.gateVocab) === 'human') {
+      log.warn('gate.approve-refused', { slug, phase, by: opts.by, via: opts.actor?.via ?? null });
+      return {
+        ok: false,
+        gate: null,
+        detail: `Phase ${phase}'s gate is manual — a person's to clear. Approve it on the phase's Gate card in the console `
+          + 'or from a notification on your phone; a script, a session or an unconfirmed chat act cannot.',
+      };
+    }
 
     let outcome;
     try {
       outcome = await runWrite(
         planWrite(
-          { action: 'gate-approve' as const, slug, phase, by: opts.by, reason: opts.note, revoke: !opts.approve },
+          {
+            action: 'gate-approve' as const, slug, phase, by: opts.by, reason: opts.note, revoke: !opts.approve,
+            ...(opts.person === true ? { door: 'console' as const } : {}),
+          },
           { root: this.root.path, docsDir: this.root.docsDir },
         ),
         { scriptsDir: this.flags.scriptsDir, root: this.root.path },

@@ -93,7 +93,7 @@ export const MECHANISM_LEGEND =
 /**
  * A halt kind, as a type — the array below is the one truth and this is the only
  * way to name it in a type position. Without it every consumer had to
- * retype the twenty-nine words, which is exactly what `server/runner/state.ts`
+ * retype the thirty words, which is exactly what `server/runner/state.ts`
  * and `client/src/lib/api/runs.ts` both did. (The count in that sentence is held
  * to the array by `test/docs-parity.test.ts`: it read "seventeen" for months
  * while the array held eighteen — LFC-10.)
@@ -193,6 +193,10 @@ export const HALT_KINDS = Object.freeze(
     // checkout, which is exactly what the run asked not to do — so it parks
     // with the refusal and its fix, and dropping isolation is a person's act.
     'isolation-refused',
+    // Every phase is done and the run's branch is NOT on its trunk
+    // (control-tower phase 112, #184): RUN-level, a park with one errand — a
+    // merge errand tree, then a landing — never `finished` over unlanded work.
+    'unlanded',
   ]),
 );
 
@@ -290,6 +294,8 @@ export const RUN_HALT_KINDS = Object.freeze(
     // The checkout the run asked for could not be had: no phase may board in
     // the shared one instead (control-tower phase 90).
     'isolation-refused',
+    // Its work is not on its trunk once every phase is done (phase 112).
+    'unlanded',
   ]),
 );
 
@@ -552,6 +558,11 @@ export const KIND_PROFILE = {
   // PARK, and a person's at once — Repair checkout, or Drop isolation to run
   // in the shared tree. No session or agent briefing applies; nothing boarded.
   'isolation-refused': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
+  // Every phase done, the work not on its trunk (control-tower phase 112,
+  // #184): a PARK and a person's — a merge errand tree, a landing, then
+  // Recover & continue proves it again. No session is briefed for it: a
+  // landing under `hold` is exactly what the plan said nothing may do alone.
+  unlanded: { sessionShaped: false, humanClass: null, autoClass: null, park: true },
 };
 
 /**

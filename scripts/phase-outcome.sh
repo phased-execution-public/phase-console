@@ -52,6 +52,14 @@
 #               --code CODE              device-code only: the short code to show
 #               --credential ID          secret-entry only (required): the
 #                                        registry id the secret is stored under
+#               --due-when REF           (control-tower phase 121) a watch ref:
+#                                        the step is `upcoming` — shown, never
+#                                        pushed or reminded — until it lands,
+#                                        then due, with ONE push
+#   --act     sugar for `--step operator-act` (control-tower phase 121, #182):
+#             an act only the operator does — a command (--open-command) or a
+#             click path (--open-url and --step-line) — usually with --due-when.
+#             The push says "NOW: <command>" the moment it is due.
 #             A value shaped like a secret — a token, a password, a one-time
 #             code, a URL query secret — is REFUSED (exit 2, nothing written):
 #             codes and secrets never enter a declaration. A step a session
@@ -108,9 +116,16 @@
 # content, committed or not — the git index copied, every change added, written
 # as a tree object — because a session tests and then commits, and a proof
 # pinned to HEAD would go stale the moment the commit it proved landed. The
-# session's own index is never touched. --in names where the command ran
-# (default: here); outside a git working tree there is nothing to prove against,
-# and the script says so (exit 2). ONE NDJSON line to $PE_PROOFS_FILE (the runner
+# session's own index is never touched. The tree is keyed where the console
+# JUDGES the phase's lines (control-tower phase 106, #196): by default the
+# directory the runner names in $PE_VERIFY_DIR (unsupervised: the run root moved
+# by the plan's `Verify in:`), whatever directory the session's shell stands
+# in; --in names another, and a relative --in is resolved against the RUN ROOT
+# ($PE_RUN_ROOT, else $PE_WORKTREE, else the outermost superproject of this
+# checkout) — never against $PWD. A proof whose tree is not an object of the
+# repository the console judges in is refused NOW (exit 2), naming both trees,
+# rather than refused at the verdict and the line re-run; outside a git working
+# tree there is nothing to prove against (exit 2). ONE NDJSON line to $PE_PROOFS_FILE (the runner
 # injects it) or, unsupervised, to <state>/phase-console/runs/<instance id>/<slug>/proofs.ndjson
 # — the same per-plan file the console reads. Record each command as you run it,
 # red ones too: a red proof is not a proof, and the console runs that one itself.
@@ -180,9 +195,12 @@ usage() {
   echo '   --wait-minutes/--until: waiting-external | blocked | needs-human' >&2
   echo '   --needs KEY: REQUIRED on blocked | needs-human — a decision key from scripts/decisions.env' >&2
   echo '   --step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any] [--proof REF]' >&2
-  echo '        [--step-line TEXT]... [--code CODE] [--credential ID]: needs-human only — a human step' >&2
+  echo '        [--step-line TEXT]... [--code CODE] [--credential ID] [--due-when REF]: needs-human only — a human step' >&2
+  echo '   --act: --step operator-act — the operator'"'"'s own act (a command or a click path), due when --due-when lands' >&2
   echo "               ($DECISION_KEYS) or a blocker class as its short form ($NEED_CLASSES)" >&2
-  echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>"' >&2
+  echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>" · unit:<host>/<unit>' >&2
+  echo '       unit:<host>/<unit> lands when that systemd unit on that host leaves activating/active (the host is named in the machine profile);' >&2
+  echo '       a date: beside a live ref is a BACKSTOP: the ref wakes the phase, the date only bounds the wait' >&2
   echo '       phase:<slug>/<N> lands when the console reads sibling phase N done — the way to wait on a sibling;' >&2
   echo '       verify:<slug>/<this phase> lands when your own red §Verification lines pass again on a new head;' >&2
   echo '       a cmd: ref is self-contained (absolute paths, no $, no cd, at most 1000 characters) and exits 0 only once the thing has happened' >&2
@@ -295,8 +313,17 @@ _watch_problem() {  # _watch_problem <ref>
     cmd:*)
       [ -n "$(_cmd_body "$1")" ] || printf '%s' 'a cmd: ref names no command'
       ;;
+    unit:*)
+      # A host the machine profile names and a systemd unit (control-tower
+      # phase 121, #181). The console runs `systemctl show` over ssh, and ssh
+      # hands its command to the REMOTE shell — so the shape is the whole
+      # safety: no leading dash (an ssh option), no shell character at all.
+      # `watch-refs.ts` `UNIT_REF_RE` is the twin.
+      printf '%s' "$1" | grep -Eq '^unit:[A-Za-z0-9][A-Za-z0-9._-]{0,62}/[A-Za-z0-9][A-Za-z0-9@._:-]{0,254}$' \
+        || printf '%s' 'a unit: ref is unit:<host>/<unit> — a host the machine profile names, a systemd unit name (letters, digits, @ . _ : -), nothing else'
+      ;;
     *)
-      printf '%s' 'no watch scheme — the console polls gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>"'
+      printf '%s' 'no watch scheme — the console polls gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>" · unit:<host>/<unit>'
       ;;
   esac
 }
@@ -419,6 +446,7 @@ exit_code=""; in_dir=""
 label=""; done_n=""; of_n=""; progress_flags=""
 step_kind=""; step_title=""; step_open_url=""; step_open_command=""; step_where=""; step_proof=""
 step_lines_json=""; step_line_count=0; step_code=""; step_credential=""; step_flags=""
+step_act=""; step_due_when=""; watch_refs=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --label|--done|--of)
@@ -443,6 +471,8 @@ while [ $# -gt 0 ]; do
     --wait-minutes) wait_minutes="${2:?--wait-minutes needs a number}"; shift 2 ;;
     --until)        until_iso="${2:?--until needs an ISO8601 time}"; shift 2 ;;
     --step)         step_kind="${2:?--step needs a kind}"; shift 2 ;;
+    --act)          step_act=1; step_flags=1; shift ;;
+    --due-when)     step_due_when="${2:?--due-when needs a watch ref}"; step_flags=1; shift 2 ;;
     --title)        step_title="${2:?--title needs text}"; step_flags=1; shift 2 ;;
     --open-url)     step_open_url="${2:?--open-url needs a link}"; step_flags=1; shift 2 ;;
     --open-command) step_open_command="${2:?--open-command needs a command}"; step_flags=1; shift 2 ;;
@@ -492,6 +522,14 @@ while [ $# -gt 0 ]; do
               exit 2
             fi
             _cmd_ref_hints "$ref" ;;
+          unit:*)
+            # Refused, not warned: a malformed unit: ref is a string the console
+            # would hand to a remote shell (control-tower phase 121).
+            problem="$(_watch_problem "$ref")"
+            if [ -n "$problem" ]; then
+              echo "--watch $ref refused: $problem. Nothing was written." >&2
+              exit 2
+            fi ;;
         esac
         # Recorded either way — the reason still helps a person — but a ref no
         # scheme can parse is a ref nothing will ever probe, and saying so now,
@@ -500,6 +538,8 @@ while [ $# -gt 0 ]; do
         problem="$(_watch_problem "$ref")"
         [ -n "$problem" ] && echo "warning: --watch \"$ref\" will never be checked: $problem" >&2
         watch_json="${watch_json:+$watch_json, }\"$(_json_str "$ref")\""
+        watch_refs="${watch_refs}${ref}
+"
         watch_count=$((watch_count + 1))
       else
         echo "ignoring --watch beyond the 8th: $ref" >&2
@@ -619,9 +659,17 @@ esac
 # title, a link that is not http(s), a code on the wrong kind, a secret in any
 # value — because a declaration the console must repair is one a person never
 # sees in time.
+if [ -n "$step_act" ]; then
+  # `--act` is `--step operator-act` (control-tower phase 121), never beside
+  # another kind: two kinds on one step is a session that has not decided.
+  if [ -n "$step_kind" ] && [ "$(printf '%s' "$step_kind" | tr 'A-Z' 'a-z')" != operator-act ]; then
+    echo "--act is --step operator-act; it cannot ride --step $step_kind — choose one kind" >&2; exit 2
+  fi
+  step_kind=operator-act
+fi
 if [ -n "$step_kind" ] || [ -n "$step_flags" ]; then
   [ "$mode" = outcome ] || { echo "--step and its fields belong to a needs-human declaration, not to $status" >&2; exit 2; }
-  [ -n "$step_kind" ] || { echo '--title/--open-url/--open-command/--where/--proof/--step-line/--code/--credential need --step <kind>' >&2; exit 2; }
+  [ -n "$step_kind" ] || { echo '--title/--open-url/--open-command/--where/--proof/--step-line/--code/--credential/--due-when need --step <kind> (or --act)' >&2; exit 2; }
   [ "$status" = needs-human ] || { echo "--step is valid only with needs-human (a person's turn), not $status" >&2; exit 2; }
   step_kind="$(printf '%s' "$step_kind" | tr 'A-Z' 'a-z')"
   case " $HUMAN_STEP_KINDS " in
@@ -664,6 +712,18 @@ if [ -n "$step_kind" ] || [ -n "$step_flags" ]; then
     [ "${#step_proof}" -le "$WATCH_REF_MAX" ] || { echo "--proof is longer than $WATCH_REF_MAX characters" >&2; exit 2; }
     proof_problem="$(_cmd_ref_problem "$step_proof")"
     [ -z "$proof_problem" ] || { echo "--proof refused: $proof_problem" >&2; exit 2; }
+  fi
+  # The moment the step becomes due (control-tower phase 121): a watch ref the
+  # console polls. One it could never probe would leave the step `upcoming`
+  # for ever — never pushed, never due — so it is refused here, while the
+  # session can still fix it.
+  if [ -n "$step_due_when" ]; then
+    [ "${#step_due_when}" -le "$WATCH_REF_MAX" ] || { echo "--due-when refused: longer than $WATCH_REF_MAX characters" >&2; exit 2; }
+    due_problem="$(_watch_problem "$step_due_when")"
+    [ -z "$due_problem" ] && case "$step_due_when" in cmd:*) due_problem="$(_cmd_ref_problem "$step_due_when")" ;; esac
+    [ -z "$due_problem" ] && _own_lock_ref "$step_due_when" && due_problem="it names this phase's own lock, which is released only when the phase ends"
+    [ -z "$due_problem" ] || { echo "--due-when refused: $due_problem. Nothing was written." >&2; exit 2; }
+    _screen_secret --due-when "$step_due_when"
   fi
   _screen_secret --title "$step_title"
   _screen_secret --open-url "$step_open_url"
@@ -731,6 +791,26 @@ if [ -n "$until_iso" ]; then
   fi
 fi
 
+# A date beside a live ref is a BACKSTOP (control-tower phase 121, #181): the
+# live ref wakes the phase the moment it lands, and the date — a `date:` ref or
+# `--until` — only bounds the wait. Said, so the session knows the two are not
+# alternatives it must choose between.
+case "$status" in
+  waiting-external|blocked|needs-human)
+    _live=""; _date=""
+    while IFS= read -r _ref; do
+      [ -z "$_ref" ] && continue
+      case "$_ref" in date:*|until:*) [ -z "$(_watch_problem "$_ref")" ] && _date="$_ref" ;; *) _live="${_live:+$_live, }$_ref" ;; esac
+    done <<EOF_REFS
+$watch_refs
+EOF_REFS
+    [ -z "$_date" ] && [ -n "$until_iso" ] && _date="--until $until_iso"
+    if [ -n "$_live" ] && [ -n "$_date" ]; then
+      echo "note: $_date is the backstop: it only bounds the wait — $_live wakes the phase the moment it lands" >&2
+    fi
+    ;;
+esac
+
 # Reason is capped so a pasted log cannot bloat the record the runner
 # journals verbatim.
 reason="$(printf '%s' "$reason" | cut -c1-500)"
@@ -769,31 +849,81 @@ fi
 # object. The session's own index, its staged work and HEAD are never touched;
 # the objects written are ordinary unreferenced ones git collects in its time.
 if [ "$mode" = proof ]; then
-  where="${in_dir:-.}"
+  # The working tree of the repository at <top>, written as a tree object.
+  _proof_tree() {  # _proof_tree <top>
+    local at="$1" real_index scratch out=""
+    # A linked worktree's index lives under the main repository's git dir, which
+    # `--git-path` knows; it answers relative to where it was asked.
+    real_index="$(cd "$at" && git rev-parse --git-path index 2>/dev/null || true)"
+    case "$real_index" in ''|/*) : ;; *) real_index="$at/$real_index" ;; esac
+    scratch="$(mktemp "${TMPDIR:-/tmp}/pe-proof-index.XXXXXX")"
+    # `-p` keeps the index file's mtime, and that is load-bearing: git trusts an
+    # entry's stat data only when the entry is OLDER than the index file, and
+    # re-reads the content of one that is not (its racy-clean check). A copy with a
+    # fresh mtime makes a file rewritten at the same size in the same second it was
+    # staged look unchanged, and the tree would name what was staged, not what ran.
+    if [ -n "$real_index" ] && [ -f "$real_index" ]; then cp -p "$real_index" "$scratch"; else rm -f "$scratch"; fi
+    if GIT_INDEX_FILE="$scratch" git -C "$at" add -A >/dev/null 2>&1; then
+      out="$(GIT_INDEX_FILE="$scratch" git -C "$at" write-tree 2>/dev/null || true)"
+    fi
+    rm -f "$scratch"
+    printf '%s' "$out"
+  }
+  # The run root (control-tower phase 106, #196): $PE_RUN_ROOT, which the runner
+  # injects, else the lock's $PE_WORKTREE, else the OUTERMOST superproject of the
+  # checkout this shell stands in. ai-builder-v7 P14's session recorded `--in .`
+  # from a shell standing INSIDE a submodule: its proofs were keyed by the
+  # submodule's tree, while the console judges those lines — `cd <sub> && …` —
+  # at the plan root, against the superproject's. A relative --in is therefore
+  # resolved against the run root and never against $PWD.
+  run_root="${PE_RUN_ROOT:-${PE_WORKTREE:-}}"
+  if [ -z "$run_root" ] || [ ! -d "$run_root" ]; then
+    # instance.sh's walk, never a private copy (tests/integration/gitroot.bats).
+    run_root="$(pe_outer_checkout . 2>/dev/null || true)"
+  fi
+  # Where the console JUDGES this phase's lines: $PE_VERIFY_DIR when a console
+  # supervises the session — its own answer — else the run root moved by the
+  # plan's `Verify in:` (`phase-graph.sh --verify-in`), when the plan reads.
+  judge_dir="${PE_VERIFY_DIR:-}"
+  [ -n "$judge_dir" ] && [ ! -d "$judge_dir" ] && judge_dir=""
+  if [ -n "$in_dir" ]; then
+    case "$in_dir" in
+      /*) where="$in_dir" ;;
+      *)  where="${run_root:-.}/$in_dir" ;;
+    esac
+  elif [ -n "$judge_dir" ]; then
+    where="$judge_dir"
+  elif [ -n "$run_root" ]; then
+    verify_in="$("$SCRIPT_DIR/phase-graph.sh" "$slug" --verify-in "$phase" 2>/dev/null | head -1 || true)"
+    where="$run_root"
+    if [ -n "$verify_in" ] && [ -d "$run_root/$verify_in" ]; then where="$run_root/$verify_in"; fi
+  else
+    where="."
+  fi
   top="$(git -C "$where" rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -z "$top" ]; then
     echo "not recorded: $where is not inside a git working tree, so there is no tree to prove against" >&2
     exit 2
   fi
-  # A linked worktree's index lives under the main repository's git dir, which
-  # `--git-path` knows; it answers relative to where it was asked.
-  real_index="$(cd "$top" && git rev-parse --git-path index 2>/dev/null || true)"
-  case "$real_index" in ''|/*) : ;; *) real_index="$top/$real_index" ;; esac
-  scratch="$(mktemp "${TMPDIR:-/tmp}/pe-proof-index.XXXXXX")"
-  # `-p` keeps the index file's mtime, and that is load-bearing: git trusts an
-  # entry's stat data only when the entry is OLDER than the index file, and
-  # re-reads the content of one that is not (its racy-clean check). A copy with a
-  # fresh mtime makes a file rewritten at the same size in the same second it was
-  # staged look unchanged, and the tree would name what was staged, not what ran.
-  if [ -n "$real_index" ] && [ -f "$real_index" ]; then cp -p "$real_index" "$scratch"; else rm -f "$scratch"; fi
-  tree=""
-  if GIT_INDEX_FILE="$scratch" git -C "$top" add -A >/dev/null 2>&1; then
-    tree="$(GIT_INDEX_FILE="$scratch" git -C "$top" write-tree 2>/dev/null || true)"
-  fi
-  rm -f "$scratch"
+  tree="$(_proof_tree "$top")"
   if [ -z "$tree" ]; then
     echo "not recorded: git could not write the working tree of $top as a tree object" >&2
     exit 2
+  fi
+  # A proof the verdict could only refuse is refused NOW, while the session can
+  # still record it where its lines are judged: a tree that is not an object of
+  # the repository the console judges in ("not an object of this repository")
+  # was refused at the verdict and the line re-run — ~15 minutes on ai-builder-v7
+  # P14, the lane held throughout. Only where that repository is KNOWN — a
+  # console told the session ($PE_VERIFY_DIR); unsupervised, the verdict judges.
+  if [ -n "$judge_dir" ]; then
+    judge_top="$(git -C "$judge_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$judge_top" ] && [ "$(cd "$judge_top" && pwd -P)" != "$(cd "$top" && pwd -P)" ] \
+       && ! git -C "$judge_top" cat-file -e "${tree}^{tree}" 2>/dev/null; then
+      judge_tree="$(_proof_tree "$judge_top")"
+      echo "not recorded: the tree ${tree:0:12} (the working tree of $top, where --in pointed) is not an object of $judge_top — where the console judges phase $phase's lines, whose tree is ${judge_tree:0:12} — so the verdict would refuse it and run the line again. Record it where the line is judged: drop --in, or give one relative to the run root ($run_root)." >&2
+      exit 2
+    fi
   fi
   head_sha="$(git -C "$top" rev-parse -q --verify HEAD 2>/dev/null || true)"
   # Folded exactly as the console folds a §Verification command before it
@@ -951,6 +1081,7 @@ if [ -n "$step_kind" ]; then
   [ "$step_line_count" -gt 0 ] && step_line="$step_line, \"lines\": [$step_lines_json]"
   [ -n "$step_code" ] && step_line="$step_line, \"code\": \"$step_code\""
   [ -n "$step_credential" ] && step_line="$step_line, \"credential\": \"$step_credential\""
+  [ -n "$step_due_when" ] && step_line="$step_line, \"due_when\": \"$(_json_str "$step_due_when")\""
   step_line="$step_line},"
 fi
 resume_line="$( [ -n "$resume_after" ] && printf '\n  "resume_after": "%s",' "$(_json_str "$resume_after")" || true )"

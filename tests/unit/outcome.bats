@@ -891,6 +891,58 @@ proofs_file() { # <slug>
   assert_contains "$(cat "$f")" '"session_id":"sess-42"'
 }
 
+# ── verified --in: the run root, never $PWD (control-tower phase 106, #196) ──
+# ai-builder-v7 P14 recorded `--in .` from a shell standing INSIDE its
+# app-frontend submodule, so its five proofs were keyed by the submodule's
+# tree; the console judges those lines (`cd app/app-frontend && …`) at the
+# plan root, against the SUPERPROJECT's tree, and refused all five at the verdict.
+# A relative --in is now resolved against the run root, the default is where the
+# console judges the phase ($PE_VERIFY_DIR), and a tree the judging repository
+# does not hold is refused at RECORD time, naming both trees.
+
+proof_superproject() {
+  local origin="$BATS_TEST_TMPDIR/origin"
+  SUPER="$BATS_TEST_TMPDIR/super"
+  mkdir -p "$origin" "$SUPER"
+  git -C "$origin" init -q -b main
+  printf 'app\n' > "$origin/app.txt"
+  git -C "$origin" add -A && git -C "$origin" -c user.email=t@example.invalid -c user.name=t commit -qm init
+  git -C "$SUPER" init -q -b main
+  printf '# root\n' > "$SUPER/README.md"
+  git -C "$SUPER" add -A && git -C "$SUPER" -c user.email=t@example.invalid -c user.name=t commit -qm init
+  git -C "$SUPER" -c protocol.file.allow=always submodule add -q "$origin" sub
+  git -C "$SUPER" -c user.email=t@example.invalid -c user.name=t commit -qm mount
+}
+
+@test "verified --in: '.' from inside a submodule means the RUN ROOT — the tree the console judges" {
+  proof_superproject
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson" PE_RUN_ROOT="$SUPER" PE_VERIFY_DIR="$SUPER"
+  run bash -c "cd '$SUPER/sub' && '$SYS_BASH' '$PE_SCRIPTS/phase-outcome.sh' demo 5 verified --command 'cd sub && npm test' --exit 0 --in ."
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_PROOFS_FILE")" "\"tree\":\"$(working_tree "$SUPER")\""
+}
+
+@test "verified: with no --in the proof is keyed where the console judges the phase (\$PE_VERIFY_DIR), whatever the cwd" {
+  proof_superproject
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson" PE_RUN_ROOT="$SUPER" PE_VERIFY_DIR="$SUPER/sub"
+  run bash -c "cd '$SUPER' && '$SYS_BASH' '$PE_SCRIPTS/phase-outcome.sh' demo 5 verified --command 'npm test' --exit 0"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_PROOFS_FILE")" "\"tree\":\"$(working_tree "$SUPER/sub")\""
+}
+
+@test "verified: a tree the judging repository does not hold is refused at RECORD time, naming both trees" {
+  proof_superproject
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson" PE_RUN_ROOT="$SUPER" PE_VERIFY_DIR="$SUPER"
+  sub_tree="$(working_tree "$SUPER/sub")"
+  root_tree="$(working_tree "$SUPER")"
+  run pe_outcome demo 5 verified --command 'cd sub && npm test' --exit 0 --in sub
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "not recorded"
+  assert_contains "$output" "${sub_tree:0:12}"
+  assert_contains "$output" "${root_tree:0:12}"
+  [ ! -f "$PE_PROOFS_FILE" ]
+}
+
 # ── the ref is checked where it is declared (control-tower phase 88) ─────────
 # #125: a 200-character cut silently split a two-check `cmd:` ref mid-word, the
 # console refused what was left three seconds later, and the errand went on
@@ -981,4 +1033,43 @@ proofs_file() { # <slug>
   run pe_outcome demo 50 blocked --needs external --reason "x" --watch "verify:demo/43"
   [ "$status" -eq 2 ]
   [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+# ---- a job on another machine, and a date that only bounds a live ref (control-tower phase 121, #181)
+
+@test "outcome: a unit:<host>/<unit> ref is a watch scheme — recorded with no warning" {
+  run pe_outcome demo 8 waiting-external --reason "the nightly build runs on the box" \
+    --watch "unit:build-box/nightly-build.service" --wait-minutes 30
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'will never be checked'* ]]
+  grep -q '"watch": \["unit:build-box/nightly-build.service"\]' "$PE_OUTCOME_FILE"
+}
+
+@test "outcome: a unit: ref the console could not run safely is refused, nothing written" {
+  for bad in 'unit:-oProxyCommand=sh/x.service' 'unit:build-box/x;reboot' 'unit:build-box/' 'unit:/x.service' 'unit:build box/x' 'unit:build-box/$(id)'; do
+    rm -f "$PE_OUTCOME_FILE"
+    run pe_outcome demo 8 waiting-external --reason "box" --watch "$bad"
+    [ "$status" -eq 2 ] || { echo "accepted $bad: $output"; return 1; }
+    assert_contains "$output" 'unit:<host>/<unit>'
+    [ ! -f "$PE_OUTCOME_FILE" ]
+  done
+}
+
+@test "outcome: a date: beside a live ref is named as the BACKSTOP — the ref wakes it, the date only bounds it" {
+  run pe_outcome demo 8 waiting-external --reason "the box job" \
+    --watch "unit:build-box/nightly-build.service" --watch "date:2026-10-06T09:00:00Z"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" 'date:2026-10-06T09:00:00Z is the backstop'
+  assert_contains "$output" 'unit:build-box/nightly-build.service wakes the phase the moment it lands'
+  grep -q '"watch": \["unit:build-box/nightly-build.service", "date:2026-10-06T09:00:00Z"\]' "$PE_OUTCOME_FILE"
+  # --until is the same backstop, spelled as a clock.
+  rm -f "$PE_OUTCOME_FILE"
+  run pe_outcome demo 8 waiting-external --reason "ci" --watch "gh:acme/app#run/42" --until "2026-10-06T09:00:00Z"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" '--until 2026-10-06T09:00:00Z is the backstop'
+  # A date alone is a clock, not a backstop: nothing to say.
+  rm -f "$PE_OUTCOME_FILE"
+  run pe_outcome demo 8 waiting-external --reason "soak" --watch "date:2026-10-06T09:00:00Z"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'backstop'* ]]
 }

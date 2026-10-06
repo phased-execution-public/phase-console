@@ -498,13 +498,17 @@ describe('the board renders the estate honestly', () => {
     expect(issuesRefresh).not.toHaveBeenCalled();
   });
 
-  it('says when a repository holds more issues than one page', async () => {
+  it('says when a repository holds more issues than the desk reads at once', async () => {
     // The per-repository facts live on the repo row and in the inspector; an
     // issue row's detail is about the ISSUE.
     issues.mockResolvedValue({ ...PAYLOAD, repos: [{ ...STALE, truncated: true }] } satisfies IssuesPayload);
     mount('#/repo/issues?state=all&issue=acme%2Ftwo%233');
     await screen.findByTestId('issue-body');
-    expect(screen.getByTestId('repo-truncated').textContent).toMatch(/more issues exist/i);
+    // Since control-tower phase 118 the desk reads a repository's whole list
+    // up to the server's cap (2,000); past it the newest are shown, and said.
+    expect(screen.getByTestId('repo-truncated').textContent).toMatch(
+      /more issues than the desk reads at once/i,
+    );
   });
 
   it('has no axe violations', async () => {
@@ -906,6 +910,10 @@ describe('filed by sessions', () => {
   it('with the filter on and nothing filed by a session, the empty state says so and names the plan word that allows it', async () => {
     mount('#/repo/issues?state=all&filed=sessions');
     expect(await screen.findByText(/no issue here was filed by a session/i)).toBeTruthy();
-    expect(screen.getByText(/Issues: draft/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        /the plan’s `Issues:` line first, then the run’s own word, then this console’s own setting/,
+      ),
+    ).toBeTruthy();
   });
 });

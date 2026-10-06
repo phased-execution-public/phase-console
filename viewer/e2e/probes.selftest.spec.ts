@@ -29,6 +29,10 @@ const BROKEN = `<!doctype html>
   .shell > .pane { height: 120px; overflow-y: auto; }
   .sliver { height: 20px; overflow: hidden; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .meta { display: flex; width: 200px; gap: 8px; }
+  .meta .tag { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta .fixed { flex: none; white-space: nowrap; width: 200px; }
+  .meta .floor { min-width: 3ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style></head>
 <body>
   <header><div id="banner" style="width: 2000px">Banner wider than any phone</div></header>
@@ -50,6 +54,8 @@ const BROKEN = `<!doctype html>
     <details><summary>Folded</summary><button>Folded away</button></details>
     <details open><summary>Unfolded</summary><button style="pointer-events: none">Unfolded deaf</button></details>
     <p><span class="sr">Only for screen readers, and long enough to be wide</span></p>
+    <p class="meta"><span class="tag">squeezed tag</span><span class="fixed">a range estimate</span></p>
+    <p class="meta"><span class="floor">floored tag</span><span class="fixed">a range estimate</span></p>
     <p style="color: #c8c8c8; background: #fff">Faint text nobody can read</p>
     <p><button class="ghost">Ghost</button></p>
   </main>
@@ -76,6 +82,13 @@ test.describe('the probes fail on a deliberately broken page', () => {
   test('overflow: a header wider than the viewport is named', async ({ page }) => {
     const found = await layoutFindings(page, { touch: false });
     expect(keys(found, 'overflow')).toContain('div "Banner wider than any phone"');
+  });
+
+  test('squeezed: a tag its row gave zero width is named; a floored tag and an sr-only span are not (#203)', async ({
+    page,
+  }) => {
+    const found = await layoutFindings(page, { touch: false });
+    expect(keys(found, 'squeezed')).toEqual(['span "squeezed tag"']);
   });
 
   test('touch: the clipped control fails WINS and SURVIVES — its ancestor answering is not a pass', async ({

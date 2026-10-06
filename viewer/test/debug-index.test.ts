@@ -1172,7 +1172,25 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // `-withdrawn`, `-requeued`) and a plan's order (`run.queue-reordered`). Free.
   // +5 from control-tower phase 100 (#135): an operator's word on a lane
   // (`phase.lane-pinned`, `-unpinned`, `-reserved`, `-unreserved`, `-yielded`). Free.
-  assert.equal(kinds.length, 444 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
+  // +1 the catalogue already held at `719083ab` while this pin read 444 (L-B
+  // was red there since phase 107's approval rows) — pinned here with 109's.
+  // +4 from control-tower phase 109 (#202, #192, #188, #170): a drifting price
+  // announced once (`phase.cost-drift`), a wrap-up's kept lane
+  // (`phase.lane-kept`), background agents the CLI's ceiling stopped
+  // (`phase.agents-killed`) and a live session's input closing
+  // (`phase.input-closed`). Free.
+  // +2 the catalogue already held at `35e7221e` while this pin read 449 (L-B
+  // was red there since control-tower phase 110's `run.heal-dropped` and
+  // `run.orphaned`) — pinned here with 111's.
+  // +2 from control-tower phase 111 (#177, #179): an API safeguard flag and the
+  // remedy it took (`phase.safeguard-flag`), and a person's Continue cutting a
+  // park short (`phase.wait-cut`). Free; both read as info.
+  // +2 from control-tower phase 112 (#184, #183): every repository's landing
+  // proved at the end of a run (`run.landing-proof`) and a squash-landed run
+  // branch moved onto what landed (`run.branch-reseated`). Free; both info.
+  // +1 from control-tower phase 121 (#182): an upcoming human step's due-when
+  // ref landing (`phase.human-step-due`). Free; info.
+  assert.equal(kinds.length, 456 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]

@@ -30,7 +30,7 @@ import {
 } from '../../shared/run-settings.js';
 import { RELAY_WINDOW_MS } from '../../shared/relay-model.js';
 import type { PollEpisode } from '../../shared/poll-loop.js';
-import { CONTEXT_CHECKPOINT_FRACTION, tokensLabel, type ResumePolicy } from './usage.ts';
+import { CONTEXT_CHECKPOINT_FRACTION, tokensLabel, type CostDrift, type ResumePolicy } from './usage.ts';
 import type { CapTable } from './session-record.ts';
 import { landingDirective } from '../watch-refs.ts';
 import { log } from '../log.ts';
@@ -44,7 +44,7 @@ import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
-import { EFFORTS, markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnRequest, type StreamEvent, type PermissionMode } from './spawn.ts';
+import { EFFORTS, markFor, spawnClaude, type InputCloseCause, type SpawnFn, type SpawnHandle, type SpawnRequest, type StreamEvent, type PermissionMode } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -67,7 +67,7 @@ import {
 import {
   accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
-import type { Actor, AccountChoice, AccountRequirement, ResolvedManifest, RungRecord, RunNote, RunVerifyApprovals } from './state.ts';
+import type { Actor, AccountChoice, AccountRequirement, ConsoleRef, ResolvedManifest, RungRecord, RunNote, RunVerifyApprovals } from './state.ts';
 import type { PolicyInputs } from '../../shared/policy-model.js';
 import {
   childrenOf, loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
@@ -218,6 +218,12 @@ export type RunnerDeps = {
   schedulingPolicy?: (slug: string) => string;
   /** The plan's critical path over a board, in order (control-tower phase 100) — what `critical-path` promotes. */
   criticalPath?: (slug: string, board: Board | null) => readonly number[];
+  /**
+   * The console's ONE memory of a drifting price (control-tower phase 109,
+   * #202), shared by every run so a drift is announced once a day, not once a
+   * run. Absent: the runner keeps its own.
+   */
+  costDrift?: CostDrift;
   /** Injectable so the loop can be tested without spending money on a model. */
   spawn?: SpawnFn;
   verify?: typeof verifyPhase;
@@ -773,6 +779,15 @@ export type RunnerDeps = {
    * test that did not mean it to be.
    */
   verifyBaseline?: () => boolean;
+  /**
+   * The machine-load guard's reading now (control-tower phase 100) — what a
+   * baseline measured BESIDE a working session waits on before each command
+   * (control-tower phase 105): new work holds while the machine is loaded. The
+   * service answers from its scheduler; absent, nothing holds.
+   */
+  machineLoad?: () => { holding: boolean; reason?: string } | null;
+  /** How often a held baseline command asks the guard again — tests only; default 30 s. */
+  baselineLoadPollMs?: number;
   /**
    * May a `human` gate be briefed to the phase's own session to verify and
    * clear, instead of stopping the run for a person? Absent = no, and that is
@@ -1729,8 +1744,12 @@ export function consoleSkillDirective(facts: ConsoleSkillFacts | null | undefine
 
 export function unattendedDirective(
   scriptsDir: string, slug: string, phase: number,
-  wait: { budgetMs: number; source: WaitBudgetSource } = { budgetMs: WAIT_BUDGET_DEFAULT, source: 'default' },
+  wait: { budgetMs: number; source: WaitBudgetSource; waitsMax?: number; waitsSource?: WaitBudgetSource } =
+    { budgetMs: WAIT_BUDGET_DEFAULT, source: 'default' },
 ): string {
+  // The count a plan raised is the one the session is told (control-tower phase 121, #40).
+  const waits = wait.waitsMax ?? WAITS_PER_PHASE;
+  const waitsFrom = wait.waitsSource && wait.waitsSource !== 'default' ? WAIT_COUNT_WORDS[wait.waitsSource] : 'WAIT_MAX_PER_PHASE';
   return [
     '',
     '',
@@ -1748,7 +1767,7 @@ export function unattendedDirective(
     `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} waiting-external \\`,
     '        --wait-minutes <realistic-window> --reason "<what you are waiting on>" --watch <ref>',
     '  The supervisor parks the phase and RESUMES THIS SESSION when the window elapses — inside',
-    `  this phase's wait budget: at most ${WAITS_PER_PHASE} waits (WAIT_MAX_PER_PHASE) and ${hoursText(wait.budgetMs)} parked in total`,
+    `  this phase's wait budget: at most ${waits} waits (${waitsFrom}) and ${hoursText(wait.budgetMs)} parked in total`,
     `  (${WAIT_BUDGET_WORDS[wait.source]}). Past what is left, a wait naming a --watch ref the console`,
     '  can poll is given what is left and then waits on that ref alone; one naming none parks on a',
     '  spent budget with a `budgets` errand — never a failure, and no clock resumes it until a',
@@ -1823,6 +1842,13 @@ const WAIT_BUDGET_WORDS: Record<WaitBudgetSource, string> = {
   phase: "this phase's `Waits on:` bullet",
   plan: "the plan's `Wait budget:` line",
   default: 'the console default',
+};
+
+/** Where a raised declared-wait count came from (control-tower phase 121, #40). */
+const WAIT_COUNT_WORDS: Record<WaitBudgetSource, string> = {
+  phase: "this phase's `Wait count:` bullet",
+  plan: "the plan's `Wait count:` line",
+  default: 'WAIT_MAX_PER_PHASE',
 };
 
 /**
@@ -2043,7 +2069,32 @@ export type AskResult = {
   mark?: string;
   /** This exact message had already been sent; nothing was written again. */
   repeated?: boolean;
+  /**
+   * Refused because the phase's session is LIVE but cannot take input
+   * (control-tower phase 109, #170) — `reason` says why, in the session's
+   * real state. Absent on every other refusal.
+   */
+  unreachable?: boolean;
 };
+
+/** `07:12:04Z` — the clock of an ISO instant, for a sentence. */
+export function clockOf(iso: string): string {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? `${new Date(ms).toISOString().slice(11, 19)}Z` : iso;
+}
+
+/** Why a session's input closed, as words (control-tower phase 109, #170). */
+export function inputCloseWords(cause: InputCloseCause): string {
+  switch (cause) {
+    case 'turn-end': return 'its turn ended with nothing outstanding and nothing of its own in the background';
+    case 'idle': return 'the idle closer: it stopped streaming with its input open';
+    case 'epipe': return 'the pipe broke (EPIPE)';
+    case 'abort': return 'the console stopped or checkpointed it';
+    case 'background-ceiling': return 'its background work ran past the CLI\'s ten-minute ceiling with no new turn';
+    case 'adopted': return 'adopted without a pipe';
+    default: return cause;
+  }
+}
 
 /**
  * Things worth knowing before spending a session finding them out.
@@ -2139,7 +2190,19 @@ export type Lane = {
    * later console can tell this child from whatever recycled its pid.
    */
   procStartedAt?: string;
+  /**
+   * The console that launched this lane's process — this one, stamped beside
+   * `procStartedAt` at spawn (control-tower phase 110, #175) and carried into
+   * `state.children`, where it is what an orphan is judged by.
+   */
+  launcher?: ConsoleRef;
   handle: SpawnHandle | null;
+  /**
+   * When this lane's live session's input closed, and why — the spawn's
+   * `input-closed` event (control-tower phase 109, #170). A steer, an ask and a
+   * peer's message to it are refused naming this; cleared at each spawn.
+   */
+  inputClosed?: { at: string; cause: InputCloseCause };
   /**
    * The last `phase.resources` reading journalled for this lane, and when.
    *
@@ -2422,6 +2485,20 @@ export function waitProcedure(outcome = 'phase-outcome.sh <slug> <N>'): string {
  * A steer, not an Ask, for `SILENT_NUDGE`'s reason: this session is not owed a
  * question, it is owed a way to keep working.
  */
+/**
+ * The external-clock nudge (control-tower phase 111, #179): a session waiting
+ * inside its turn on somebody else's clock is told before the console parks
+ * it, and has `EXTERNAL_PARK_GRACE_MS` to end the wait itself.
+ */
+export const EXTERNAL_WAIT_NUDGE =
+  'Supervisor check: this session has had a Bash call open for a while, waiting on somebody else\'s clock — '
+  + 'a CI run, a deploy, a remote service. A wait like that, inside the turn, holds this phase\'s lane and its '
+  + 'lock, and the console parks the lane in five minutes if the call is still open. How to wait from here:\n'
+  + waitProcedure();
+
+/** How long after its nudge an external-clock wait still open is parked. */
+export const EXTERNAL_PARK_GRACE_MS = 5 * 60_000;
+
 export const LOCAL_JOB_NUDGE =
   'Supervisor check: this session has had a Bash call open for a while, waiting on a job it started '
   + 'itself. One such wait is allowed, but a wait is not work, and the phase lock stays held while it '
@@ -2454,17 +2531,67 @@ export function pollLoopNotice(episode: PollEpisode, outcome = 'phase-outcome.sh
  */
 export function contextWrapupNotice(
   context: number, window: number, outcome = 'bash phase-outcome.sh <slug> <N>',
-  where: { shared?: boolean; fastGate?: readonly string[] } = {},
+  where: { shared?: boolean; fastGate?: readonly string[]; background?: readonly BackgroundRef[]; now?: number } = {},
 ): string {
+  // The session's own agents still at work (control-tower phase 109, #188):
+  // named, with the two ways out, before the steps that end in a handoff.
+  const background = where.background?.length
+    ? `You still have ${backgroundCount(where.background)} running: ${backgroundList(where.background, where.now ?? Date.now())}. `
+      + 'Before step 3, wait for each in ONE bounded foreground call (`TaskOutput` with `block: true`, at most ten '
+      + 'minutes), or stop it with `TaskStop` and name under **Outstanding** what it was doing and the files it touched. '
+      + 'A handoff while one runs is refused: the CLI stops it ten minutes after your turn ends, mid-edit.\n'
+    : '';
   return `Supervisor check: your context is ${tokensLabel(context)} tokens of a ${tokensLabel(window)} window `
     + `(${Math.round((context / window) * 100)} %). Every tool call re-reads all of it, and a session this large `
     + 'is both expensive and past its best. Wrap up now:\n'
+    + background
     + '  1. Finish the step you are on — do not start another.\n'
     + `  2. ${wrapupCommitStep(where)}\n`
     + '  3. Write the handoff with status `in-progress`, naming exactly what remains.\n'
     + `  4. Declare it: \`${outcome} partial --reason context\`\n`
     + '  5. Stop. The next attempt boards fresh from the handoff.\n'
     + `At ${Math.round(CONTEXT_CHECKPOINT_FRACTION * 100)} % of the window the console checkpoints this session itself.`;
+}
+
+/** A background task as the wrap-up, the Stop hook and the brief name it (control-tower phase 109, #188). */
+export type BackgroundRef = { id: string; description?: string; tool?: string; taskType?: string; since?: number };
+
+/** `1 background agent` · `2 background agents` · `1 background monitor` · … */
+function backgroundCount(tasks: readonly BackgroundRef[]): string {
+  const monitors = tasks.every((task) => task.tool === 'Monitor');
+  const noun = monitors ? 'monitor' : 'agent';
+  return `${tasks.length} background ${noun}${tasks.length === 1 ? '' : 's'}`;
+}
+
+/** `"Knobs guide, quotas" (Agent, task t1, since 13:31Z — 27 min)`, comma-joined, at most five. */
+function backgroundList(tasks: readonly BackgroundRef[], now: number): string {
+  const shown = tasks.slice(0, 5).map((task) => {
+    const what = task.description ? `"${task.description.replace(/\s+/g, ' ').slice(0, 80)}"` : `task ${task.id}`;
+    const tool = task.tool ?? task.taskType ?? 'task';
+    const since = typeof task.since === 'number' && Number.isFinite(task.since)
+      ? `, since ${new Date(task.since).toISOString().slice(11, 16)}Z — ${Math.max(0, Math.round((now - task.since) / 60_000))} min`
+      : '';
+    return `${what} (${tool}, task ${task.id}${since})`;
+  });
+  return shown.join(', ') + (tasks.length > 5 ? ` and ${tasks.length - 5} more` : '');
+}
+
+/**
+ * The Stop hook's refusal of an EXIT while the session's own background
+ * agents or monitors still run (control-tower phase 109, #188): a `partial`
+ * or `complete` handoff — or a board that already reads done — is held, at
+ * most twice (the hook's refuse-twice channel), with the two ways out.
+ */
+export function backgroundExitRefusal(phase: number, slug: string, tasks: readonly BackgroundRef[], now: number): string {
+  const one = tasks.length === 1;
+  return `Phase ${phase} of ${slug} cannot hand off yet: ${backgroundCount(tasks)} you launched ${one ? 'is' : 'are'} still `
+    + `running — ${backgroundList(tasks, now)}. A handoff now hands off work that is still being written: after your `
+    + `turn ends the CLI stops ${one ? 'it' : 'them'} at its ten-minute ceiling, mid-edit, and nothing records what `
+    + `${one ? 'it' : 'they'} changed. Do ONE of these, then end your turn:\n`
+    + `  1. Wait for ${one ? 'it' : 'them'} in the FOREGROUND, bounded — one \`TaskOutput\` call with \`block: true\` and a `
+    + 'timeout of at most 600000 ms per task — then commit what is verified and say in the handoff what it produced.\n'
+    + `  2. Stop ${one ? 'it' : 'them'} with \`TaskStop\` (${tasks.slice(0, 5).map((task) => task.id).join(', ')}), and name under `
+    + '**Outstanding** in the handoff what each was doing and the files it touched.';
 }
 
 /**
@@ -2954,9 +3081,24 @@ export function issuesModeRank(mode: string | undefined): number {
   return Math.max(0, (ISSUE_MODES as readonly string[]).indexOf(mode ?? DEFAULT_ISSUES));
 }
 
-/** Does this patch ask to LOOSEN the run's `issuesMode`? The door's 409, `applySettings`' no-op. */
-export function issuesModeLoosens(state: Pick<RunState, 'issuesMode'>, next: string | undefined): boolean {
-  return next !== undefined && issuesModeRank(next) > issuesModeRank(state.issuesMode);
+/**
+ * Does this patch ask to LOOSEN the run's `issuesMode`? The door's 409, `applySettings`' no-op.
+ *
+ * Judged on the word the run EFFECTIVELY files under (control-tower phase
+ * 115): `off` is stored as no word at all, and a run with no word files under
+ * this console's own — Settings ▸ Issues, `consoleWord`. So on a console that
+ * files, moving a `draft` run to `off` would WIDEN it and is refused, and
+ * holding a run that said nothing to `draft` tightens it and is taken. No
+ * console word — the free edition, or a caller that has none — reads as `off`,
+ * which is the rule as it always was.
+ */
+export function issuesModeLoosens(
+  state: Pick<RunState, 'issuesMode'>, next: string | undefined, consoleWord?: string,
+): boolean {
+  if (next === undefined) return false;
+  const effective = (word: string | undefined) =>
+    word === undefined || word === DEFAULT_ISSUES ? consoleWord ?? DEFAULT_ISSUES : word;
+  return issuesModeRank(effective(next)) > issuesModeRank(effective(state.issuesMode));
 }
 
 /** Has the run's branch been cut already? After this, `baseBranch` is a fact about the past. */
@@ -3040,7 +3182,12 @@ export function lockedSettingRefusals(state: RunState | null, patch: RunSettings
   return refused;
 }
 
-export function applySettings(state: RunState, patch: RunSettingsPatch): RunState {
+/**
+ * `consoleIssues` is this console's own issue word (Settings ▸ Issues, Pro) —
+ * what `issuesModeLoosens` reads a run with no word of its own as. Absent is
+ * `off`, the rule as it was.
+ */
+export function applySettings(state: RunState, patch: RunSettingsPatch, consoleIssues?: string): RunState {
   if (patch.model) state.model = patch.model;
   // The run's own lane cap (phase 13): a positive whole number sets it, and
   // `0`/`null` clears it back to the console's cap — `newRun`'s omission.
@@ -3260,7 +3407,7 @@ export function applySettings(state: RunState, patch: RunSettingsPatch): RunStat
     if (patch.messaging === DEFAULT_MESSAGING) delete state.messaging;
     else state.messaging = patch.messaging;
   }
-  if (patch.issuesMode !== undefined && !issuesModeLoosens(state, patch.issuesMode)) {
+  if (patch.issuesMode !== undefined && !issuesModeLoosens(state, patch.issuesMode, consoleIssues)) {
     if (patch.issuesMode === DEFAULT_ISSUES) delete state.issuesMode;
     else state.issuesMode = patch.issuesMode;
   }

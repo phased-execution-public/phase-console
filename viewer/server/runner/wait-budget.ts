@@ -175,6 +175,15 @@ export function declarationCooldownFor(status: string): number | undefined {
 
 /* ---- the shapes --------------------------------------------------------- */
 
+/**
+ * How long a run waiting on refs ALONE — a phase whose wait budget is spent
+ * but whose ref still polls (control-tower phase 121, #40) — holds before its
+ * loop looks again. The ref's landing is what resumes the phase; this clock
+ * only keeps the run a `waiting` run with a clock, so a reader that finds no
+ * live loop reads it paused with its clock intact rather than interrupted.
+ */
+export const REF_WAIT_LOOK_AGAIN_MS = 6 * 60 * 60_000;
+
 /** Who parked the phase — `shared/run-lifecycle.js` `WAIT_AUTHORS`, the owner. */
 export type WaitAuthor = WaitAuthorWord;
 
@@ -202,6 +211,12 @@ export type WaitEntry = {
    * UNBUDGETED: a person's time is not the external-wait budget's to charge.
    */
   kind?: 'person';
+  /**
+   * How the job a `unit:` ref watched ENDED (control-tower phase 121, #181):
+   * the ref, systemd's `Result=` and the exit time — written when the ref
+   * lands (`recordUnitExit`), never the host's address, user or key.
+   */
+  unit?: { ref: string; result: string; exitedAt?: string };
 };
 
 /**
@@ -241,6 +256,14 @@ export type WaitBudget = {
   countersignedUntil: number | null;
   /** The bullet's refs, verbatim — what the halt sentence and the prompt name. */
   refs: string[];
+  /**
+   * How many waits the phase may DECLARE (control-tower phase 121, #40): the
+   * phase's `- **Wait count:**`, else the plan's `**Wait count:**`, else the
+   * console's own `WAIT_MAX_PER_PHASE`. Absent reads as the console's four.
+   */
+  waitsMax?: number;
+  /** Which line said so — the refusal names it as the way to raise the count. */
+  waitsSource?: WaitBudgetSource;
 };
 
 export type WaitAsk = {
@@ -345,6 +368,19 @@ const SOURCE_WORDS: Record<WaitBudgetSource, string> = {
   default: 'the console default',
 };
 
+/** Where a phase's COUNT came from, in the refusal's words (control-tower phase 121). */
+const COUNT_SOURCE_WORDS: Record<WaitBudgetSource, string> = {
+  phase: "this phase's `Wait count:` bullet",
+  plan: "the plan's `Wait count:` line",
+  default: 'the console default',
+};
+
+/** How many waits a phase may declare — the plan's count, else the console's four. */
+export function waitsMaxOf(budget: Pick<WaitBudget, 'waitsMax'>): number {
+  return typeof budget.waitsMax === 'number' && Number.isInteger(budget.waitsMax) && budget.waitsMax > 0
+    ? budget.waitsMax : WAIT_MAX_PER_PHASE;
+}
+
 /**
  * May this phase park, and until when?
  *
@@ -417,12 +453,13 @@ export function evaluateWait(ask: WaitAsk): WaitVerdict {
     return { verdict: 'park', until: requested, granted: requested - ask.now, capped: false, ...base };
   }
 
-  if (ask.waits >= WAIT_MAX_PER_PHASE) {
+  const maxWaits = waitsMaxOf(ask.budget);
+  if (ask.waits >= maxWaits) {
     return {
       verdict: 'timeout', ledger: 'waits', ...base,
       reason: `the phase has already declared ${ask.waits} wait(s) — the most one phase may `
-        + `(${WAIT_MAX_PER_PHASE}); ${hoursText(parkedMs)} of its ${hoursText(budgetMs)} wait budget `
-        + `(${SOURCE_WORDS[ask.budget.source]}) is spent.`,
+        + `(${maxWaits}, ${COUNT_SOURCE_WORDS[ask.budget.waitsSource ?? 'default']}); ${hoursText(parkedMs)} of its `
+        + `${hoursText(budgetMs)} wait budget (${SOURCE_WORDS[ask.budget.source]}) is spent.`,
     };
   }
   const wanted = requested - ask.now;
@@ -598,8 +635,16 @@ export function openWaitEntry(
  * parser, passed in so this leaf imports nothing.
  */
 export function waitBudgetFrom(
-  budgetLine: string, refsText: string, dateOf: (ref: string) => number | null,
+  budgetLine: string, refsText: string, dateOf: (ref: string) => number | null, countLine = '',
 ): WaitBudget {
+  // `--wait-count N` (control-tower phase 121): `n<TAB>phase|plan`, or nothing.
+  const [countText, countSourceText] = countLine.trim().split('\t');
+  const count = Number(countText);
+  const counted = Number.isInteger(count) && count >= 1 && count <= 99
+    && (countSourceText === 'phase' || countSourceText === 'plan');
+  const waits = counted
+    ? { waitsMax: count, waitsSource: countSourceText as WaitBudgetSource }
+    : { waitsMax: WAIT_MAX_PER_PHASE, waitsSource: 'default' as WaitBudgetSource };
   const [minutesText, sourceText] = budgetLine.trim().split('\t');
   const minutes = Number(minutesText);
   const source: WaitBudgetSource = sourceText === 'phase' || sourceText === 'plan' ? sourceText : 'default';
@@ -610,8 +655,8 @@ export function waitBudgetFrom(
     if (at !== null && (countersignedUntil === null || at > countersignedUntil)) countersignedUntil = at;
   }
   return Number.isSafeInteger(minutes) && minutes > 0 && source !== 'default'
-    ? { budgetMs: minutes * 60_000, source, countersignedUntil, refs }
-    : { budgetMs: DEFAULT_WAIT_BUDGET_MS, source: 'default', countersignedUntil, refs };
+    ? { budgetMs: minutes * 60_000, source, countersignedUntil, refs, ...waits }
+    : { budgetMs: DEFAULT_WAIT_BUDGET_MS, source: 'default', countersignedUntil, refs, ...waits };
 }
 
 /**

@@ -11,7 +11,7 @@ allowed-tools:
   - Glob
   - Agent
 metadata:
-  version: 6.0.0
+  version: 6.1.0
 ---
 
 # Phased Execution
@@ -107,7 +107,11 @@ runs inside machinery it should not mistake for a malfunction. The short version
   your lock identity — never override `--owner`, or the supervisor cannot release your lock.
 - **The Stop hook can refuse your exit, twice.** Ending a turn with the phase not `done` on the board and
   no declared outcome is blocked, with the instruction handed back: finish the closeout, or declare the
-  wait. It fails open on any uncertainty and never blocks a third time. A turn that "will not end" is this
+  wait. So is an EXIT — a `partial` or `complete` declared, or the board already done — while a
+  background subagent or monitor you launched still runs: wait for it in one bounded foreground call
+  (`TaskOutput`, `block: true`, at most ten minutes), or stop it with `TaskStop` and name under
+  **Outstanding** what it was doing, because the CLI stops it ten minutes after your turn ends, mid-edit.
+  It fails open on any uncertainty and never blocks a third time. A turn that "will not end" is this
   contract, not a bug.
 - **A denied tool is a decision, not a failure.** The run's permission profile (`guarded` · `trusted` ·
   `bypass`) moves only what a person is *asked* about; the `deny` wall is identical in all three and holds
@@ -144,7 +148,9 @@ runs inside machinery it should not mistake for a malfunction. The short version
      minted from the refused command, else the plan's `- **Waits on:**` refs, else it is refused and the
      phase parks for a person (`phase.watch-missing`). A sibling phase's finish is
      `--watch phase:<slug>/<N>`, never a `cmd:` grep of its handoff; your own red lines going green
-     again is `--watch verify:<slug>/<N>` — the schemes are listed under `phase-outcome.sh` below.
+     again is `--watch verify:<slug>/<N>`; a job on another machine is `--watch unit:<host>/<unit>`,
+     and a `date:` beside a live ref is only its backstop — the schemes are listed under
+     `phase-outcome.sh` below.
 
   **A wait on your own job runs on the console's clock too.** One still open after 10 minutes draws
   one nudge, and one still open at 45 minutes parks the phase in the console's own name
@@ -697,6 +703,10 @@ refuses to start when the console's and the skill's do not meet, naming the half
   branch* — board it in a checkout DETACHED at the trunk's head, which owns no ref and so may stand
   beside any number of others. That is what a phase after the run's pull request has merged needs.
   Every other value is documentation the console reads and acts on for nobody),
+  **`--verify-in N`** (phase N's `**Verify in:**` directory on one line — bold and backticks stripped,
+  an empty line for the repository root — read by the console's own rule: a bold label, top-level or
+  nested under `**Verification:**`, the first one. It is where §Verification AND Setup run, so a
+  `cd` or a path in either is spelled from there),
   **`--floor [N]`** (phase N's `- **Wall-clock floor:** <duration>` bullet, in MINUTES rounded up — the
   phase's FIXED floor (a full gate run, a CD wait), separate from its `Size:` tag, which weights context
   rather than clock time; with no argument, every phase that declares one as `N<TAB>minutes`, ascending
@@ -715,9 +725,9 @@ refuses to start when the console's and the skill's do not meet, naming the half
   `decision-state-unknown`, `decision-source-unknown` are the same tier). **Since 6.0.0 a fifth:**
   `human-step-superseded`, `human-step-kind-unknown` and `human-step-field-invalid` (**F37** — a
   `- **Human step:**` bullet the reader skips: the 5.1.0 `<who, what, proof ref>` spelling, named in the
-  line with the grammar that replaced it; a kind that is not one of the sixteen; a field, `where`,
-  `window`, `auto-open`, `credential` or `open:` link the grammar cannot read).
-  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38** on stderr, which
+  line with the grammar that replaced it; a kind that is not one of the seventeen; a field, `where`,
+  `window`, `auto-open`, `credential`, `due` or `open:` link the grammar cannot read).
+  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F39** on stderr, which
   never changes the exit code: F15 an unregistered MCP server, credential or account ·
   F16 a verification that waits on an external clock · F17 a lead binary not installed here ·
   F18 a cwd-sensitive lead with no `**Verify in:**` · F19 a plan that cannot progress at all ·
@@ -735,7 +745,11 @@ refuses to start when the console's and the skill's do not meet, naming the half
   (only `main`, `master` or `default` means anything to it) · **F36** a `Waits on:` max shorter
   than the timeout of the workflow it watches (`wait-window-short`, told through `PE_WAIT_TIMEOUTS`
   — `<ref>=<minutes>` pairs; unset is off, set but empty an answer) · **F38** a `Human step:` that
-  names no `proof:` ref (`human-step-no-proof`) — only a person's word can ever close it.
+  names no `proof:` ref (`human-step-no-proof`) — only a person's word can ever close it ·
+  **F39** a §Verification line that runs a package-manager script or a `.venv/bin/*` binary in a
+  repository the phase's Setup never installs (`setup-deps-missing`) — a run's isolated checkout
+  mounts it with no `node_modules`/`.venv`, so it goes red before it tests anything; Setup runs in
+  the `Verify in:` directory, so spell the install's path from there (the lint names the line to add).
   `references/plan-format.md` has the full reasoning for each), **`--qa-mode [N]`** (the QA regime: `off` ·
   `on <reason>` · `waived <reason>` — with no argument the PLAN's, and with a phase number that phase's
   resolved answer naming which level decided it, since `- **QA:** on|off` in a §Phase section beats the
@@ -791,7 +805,10 @@ refuses to start when the console's and the skill's do not meet, naming the half
   (how long a phase may stay parked on its declared waits, as `minutes<TAB>phase|plan` — its own
   `- **Waits on:** <ref> · <max>` bullet, else the plan's `**Wait budget:**`; nothing means the console's
   default) / **`--waits-on N`** (that bullet's refs, one per line — a `date:` among them countersigns a
-  wait up to that instant), **`--verify-timeout [N]`** (how long ONE §Verification command may run
+  wait up to that instant) / **`--wait-count [N]`** (how many waits a phase may DECLARE, as
+  `n<TAB>phase|plan` — its own `- **Wait count:** <n>` bullet, else the plan's `**Wait count:**`, a whole
+  number from 1 to 99; nothing means the console's four, control-tower phase 121, #40),
+  **`--verify-timeout [N]`** (how long ONE §Verification command may run
   before the console cuts it, as `minutes<TAB>phase|plan` — the phase's `- **Verify timeout:**`
   bullet, else the plan's `**Verify timeout:**`; nothing means the console scales the limit from the
   line's measured history. A command cut by its clock is retried once at twice the limit, and a second
@@ -801,10 +818,12 @@ refuses to start when the console's and the skill's do not meet, naming the half
   to do with a §Verification fragment written as prose; silence prints nothing and the console's
   policy table answers), **`--human-steps [N]`** (the acts only a person can do that phase N declares,
   one `- **Human step:** <kind> · <what> · open: … · proof: … · where: … · window: … [· auto-open: host]
-  [· credential: <id>]` bullet per line as `kind<TAB>what<TAB>open<TAB>proof<TAB>where<TAB>window-minutes
-  <TAB>auto-open<TAB>credential` — `where` resolved to the kind's default when the bullet is silent; with
-  no argument, every phase's, each line led by `N<TAB>`; a bullet the lint refuses (F37) is not a step;
-  the sixteen kinds are `scripts/human-steps.env`'s),
+  [· credential: <id>] [· due: <ref>]` bullet per line as `kind<TAB>what<TAB>open<TAB>proof<TAB>where
+  <TAB>window-minutes<TAB>auto-open<TAB>credential`, and a ninth field, the `due:` ref, when the bullet
+  names one — `where` resolved to the kind's default when the bullet is silent; with no argument, every
+  phase's, each line led by `N<TAB>`, phase `0` being the plan's own acts under its `## Operator errands`
+  heading; a bullet the lint refuses (F37) is not a step; the seventeen kinds are
+  `scripts/human-steps.env`'s),
   **`--decisions [N]`**
   (the decision manifest as it HOLDS — the plan's `## Decisions` rows with
   `docs/handoffs/<slug>/decisions.md` merged over them and, with a phase, that phase's own rows over
@@ -842,7 +861,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   the next number); `none` forces the final-phase closeout (which prints the `qa-full` brief only for
   QA-`on` plans).
 - `scripts/validate.sh <slug>` — deterministic validator: structural lint of the plan
-  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38 on stderr) **plus**
+  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F39 on stderr) **plus**
   handoff body/consistency checks (valid status, required sections, `depends_on` agreeing with the graph).
   Run before trusting a board or finishing a phase.
 - `scripts/phase-lock.sh <slug> <claim|release|status|list|conflicts|mirror> <N> [--owner ID] [--lease S]
@@ -908,13 +927,15 @@ refuses to start when the console's and the skill's do not meet, naming the half
   somebody decided something. It is a third section rather than a fifth cell because both tables are
   COUNTED positionally by the bash and JS readers, and prose is the one value that cannot promise to be
   short. See `references/qa-method.md`.
-- `scripts/wait-budget.sh <slug> [--phase N [--ref REF]…] <max>` — the deterministic writer for the
-  two wait-budget directives `--wait-budget` reads: the phase's `- **Waits on:** <refs> · <max>` (the
+- `scripts/wait-budget.sh <slug> [--phase N [--ref REF]…] <max>` · `<slug> [--phase N] --count <n>` —
+  the deterministic writer for the two wait-budget directives `--wait-budget` reads: the phase's `- **Waits on:** <refs> · <max>` (the
   refs and any note kept; `--ref` names them when the phase has no bullet yet) or, without `--phase`,
   the plan's `**Wait budget:**` line. `<max>` is `90m`, `2h`, `3d` or bare minutes, written in its
   plainest unit. Idempotent, atomic, never touches git; its only output is the engine's read-back
   (`minutes<TAB>phase|plan`), and a disagreement is exit 1. What the console's one-press raise runs
-  (control-tower phase 14, #40).
+  (control-tower phase 14, #40). `--count <n>` writes the other number instead (control-tower phase
+  121): the phase's `- **Wait count:** <n>` or the plan's `**Wait count:**`, 1 to 99, read back through
+  `--wait-count` — how many waits the phase may declare, where `<max>` is how long they may take.
 - `scripts/qa-mode.sh <slug> [--phase N] on|off|inherit` — the deterministic writer for the two QA
   switches the engine reads. Without `--phase` it sets the plan's `**QA gate:** on|off` line in
   §Session budget (adding the line — or the whole section — when there is none); with one it sets that
@@ -938,7 +959,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
 - `scripts/phase-outcome.sh <slug> <N> <complete|waiting-external|blocked|needs-human|partial|no-defect>
   [--reason TEXT] [--watch REF]… [--wait-minutes N | --until ISO8601] [--needs KEY] [--rule TEXT]
   [--command TEXT] [--step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any]
-  [--proof REF] [--step-line TEXT]… [--code CODE] [--credential ID]]` — the
+  [--proof REF] [--step-line TEXT]… [--code CODE] [--credential ID] [--due-when REF]] [--act]` — the
   session→runner channel: ONE atomic JSON file at `$PE_OUTCOME_FILE`, read once and consumed.
   **A parking declaration that names `--watch` refs asks the console first** (`POST /hooks/declaration`,
   20 s at most): when a ref has ALREADY landed, nothing is written or parked and the script **exits 3**
@@ -959,7 +980,12 @@ refuses to start when the console's and the skill's do not meet, naming the half
   `--watch` is repeatable to 8 refs, and the console polls them on a timer of its own
   (`viewer/server/watch-scheduler.ts`), resuming YOUR session when one lands: `gh:<repo>#run/<id>`
   (the run reaches `completed`, any conclusion) · `gh:<repo>#pr/<n>` (the PR leaves OPEN) ·
-  `date:<ISO8601>` (that instant passes) · `lock:<slug>/<phase>` (nothing holds that scope any more —
+  `date:<ISO8601>` (that instant passes) · `unit:<host>/<unit>` (the systemd unit on that host leaves
+  `activating`/`active` — a job on another machine, `unit:build-box/nightly-build.service`: asked every
+  5 minutes over ONE shared ssh connection per host, whose address, user, key and port come from
+  `hosts.<host>` in the machine profile `~/.config/phase-console/fleet.json` — a host not named there is
+  refused, and none of it is written into the run record — and its `Result=` and exit time land in the
+  wait history) · `lock:<slug>/<phase>` (nothing holds that scope any more —
   somebody ELSE's lock: one naming the declaring phase is refused, exit 2, because the only release it
   could see is its own closeout's) · `phase:<slug>/<N>` (the console's RECORD of sibling phase N reads
   done, after its §Verification — the way to wait on a sibling, re-probed the moment that phase moves;
@@ -976,7 +1002,12 @@ refuses to start when the console's and the skill's do not meet, naming the half
   written (a script at an absolute path is one short ref). The resume instruction names what actually
   happened, so read it rather than assuming the thing you waited for succeeded — a cancelled run is not
   a result. A ref no scheme parses is still recorded, with a warning on stderr: nothing will ever check it.
-  **Declarations are bounded.** `waiting-external` spends the phase's 4 waits and its wait budget;
+  **A `date:` beside a live ref is the wait's BACKSTOP** (#181): the live ref wakes the phase the moment
+  it lands, and the date only bounds the wait — if it passes first, the phase is resumed told that the
+  ref has NOT landed and what it last read. The script says so when it records one.
+  **Declarations are bounded.** `waiting-external` spends the phase's 4 waits (more where the plan's
+  `Wait count:` says so) and its wait budget — and a wait past either whose ref still polls goes on
+  waiting on that ref alone, the run reading `waiting`, never an errand to re-check it by hand;
   each other status is acted on at most 4 times per phase — a fifth is recorded, not acted on, and parks
   the phase for a person until an operator's Retry; a `blocked`/`needs-human` clock is capped at 7 days;
   and unsupervised, two `partial`s within 5 minutes are one act. A declaration stands until a newer one,
@@ -985,7 +1016,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   **`--step KIND` makes a `needs-human` a HUMAN STEP** (control-tower phase 41) — refused on every
   other status: the ask becomes a typed record the console holds in its ledger, raises as ONE
   `human-step` inbox row and ONE `needs-you` push, and parks with wait kind `person`, charging no
-  external-wait budget. KIND is one of the sixteen (`scripts/human-steps.env`); `--title` (required)
+  external-wait budget. KIND is one of the seventeen (`scripts/human-steps.env`); `--title` (required)
   says what the person must do, `--open-url` (http or https only) or `--open-command` what to open,
   `--where host|any` where (default: the kind's), `--proof` the watch ref that proves it, `--step-line`
   a numbered step (repeatable), `--code` a device code (`device-code` only), `--credential` the
@@ -993,6 +1024,13 @@ refuses to start when the console's and the skill's do not meet, naming the half
   a password, a one-time code, a URL query secret — is refused (exit 2, nothing written, the value
   never echoed): the person types it where the step opens, never into a declaration. A session's
   step never opens by itself; only a plan's `auto-open: host` may.
+  **`--act` is `--step operator-act`** (control-tower phase 121, #182): an act only the operator does —
+  a command to run (`--open-command`) or a click path (`--open-url`, `--step-line`). **`--due-when
+  <ref>`** (any kind) says when it becomes due: until that watch ref lands the step is `upcoming` —
+  listed under *Coming up*, unannounced, unreminded, its window not started — and the moment it lands
+  (or the console finds it never can) the step is due, with ONE push, `NOW: <command>`; its proof
+  landing clears it and resumes the phase that needed it. A plan declares the same act with a `due: <ref>` field on its `- **Human step:**`
+  bullet — in a phase, or under `## Operator errands` for the plan itself.
   Its second
   shape, **`… <N> ruling --what … [--why …] [--kind ambiguity|deviation|deferral] [--cost-if-wrong …]
   [--for <M|next|all>]
@@ -1083,11 +1121,11 @@ refuses to start when the console's and the skill's do not meet, naming the half
   *reading* the usage meters needs no flag) · `--allow-webhooks` (POST every announcement to URLs
   you register — Slack, Discord, Telegram, your own relay; one of the two that send anything off the
   machine, and *reading* the destination list needs none) · `--allow-publish` (push a finished phase's
-  `pe/*` branch — never a trunk, never with force — and file issues on the repository's behalf, only where
-  the plan's `permission.destructive` row and `Issues:` line allow it; off means the console pushes nothing
-  and files nothing — the other of the two that reach outward) · `--allow-mcp` (register MCP servers, hold their
-  credentials, attach them to plans and phases — *reading* the registry needs no flag). Shut down is
-  deliberately not behind a flag. One flag switches something OFF rather than on: **`--no-converge`**
+  `pe/*` branch — never a trunk, never with force — only where the plan's `permission.destructive` row
+  allows it; off means the console pushes nothing — the other of the two that reach outward) ·
+  `--allow-mcp` (register MCP servers, hold their credentials, attach them to plans and phases —
+  *reading* the registry needs no flag).
+  Shut down is deliberately not behind a flag. One flag switches something OFF rather than on: **`--no-converge`**
   stops the convergence loop's automatic triggers (boot / docs change / timer / the minute after a halt);
   the operator's own *Recover & continue* press converges regardless. `phase-console doctor [instance]`
   runs the run-start prelude's probes and the machine checks — the Claude CLI against the relay floor,
@@ -1153,12 +1191,15 @@ The load-bearing rules a session must not get wrong; full rationale in `referenc
   verify each condition, do the work to make failing ones true, record it (`gate-approve.sh`), then
   implement; a `manual` (human) gate stops everything until a person does the numbered steps and approves
   (console Gate card or `gate-approve.sh`); auto checks (`date`/`phase`/…) answer by themselves. An
-  approval clears ANY kind; `--revoke` restores the gate. Never implement past an unapproved human gate
-  — **unless it is delegated** (the plan's `gates` row, else Settings ▸ Automation — on by default
-  since 5.0.0, `gates: delegated`; a gate that states no condition stays a person's), in which case the
-  boot prompt briefs you to verify each condition against evidence you can cite and record it as
-  `ai-session-delegated`, or STOP naming the condition you could not verify. Never approve a gate you
-  cannot cite evidence for. (plan-format §Gates; conventions §Gates)
+  approval clears ANY kind; `--revoke` restores the gate. Never implement past an unapproved human gate.
+  **A gate the plan marks `manual` is a person's, whatever the `gates` row says** (control-tower phase
+  107, #174): never delegated, `gate-approve.sh` refuses it from a session or an `ai-*` approver, and
+  `--gate-status` honours its approval only when a person's door wrote it (the console's Gate card or a
+  person's own terminal — the `Door` column, never the `By` text). Declare `needs-human --needs gates`
+  and stop. Delegation (`gates: delegated`) reaches only a human-family verdict on a gate the plan did
+  not mark manual — an overdue `deadline` — where the boot prompt briefs you to verify each condition
+  against evidence you can cite, or STOP naming the one you could not. Never approve a gate you cannot
+  cite evidence for. (plan-format §Gates; conventions §Gates)
 - **Validate before you trust the board** — `scripts/validate.sh <slug>` catches malformed rows, undefined
   deps, cycles, a table whose columns cannot be located by name, cells it could not believe, an open
   phase with nothing runnable to verify it, a gated heading with no `Gate-check` (or an unknown type),

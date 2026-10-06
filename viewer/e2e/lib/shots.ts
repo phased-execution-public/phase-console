@@ -45,6 +45,8 @@ export const STOPS: readonly Stop[] = [
   ...DESTINATIONS.map((d) => ({ name: d, hash: `#/${d}` })),
   ...PLAN_TABS.map((t) => ({ name: `plan-${t}`, hash: `#/plan/${TOUR_PLAN}/${t}` })),
   { name: 'approve', hash: '#/approve' },
+  // The Issues desk (control-tower phase 118): the fixture's added repository, every state and reading
+  { name: 'repo-issues', hash: '#/repo/issues?state=all' },
   // `?k=` `?help=` `?bell=` — `client/src/app/routes.ts` OVERLAY_KEYS.
   { name: 'overlay-palette', hash: '#/runs?k=', overlay: 'palette' },
   { name: 'overlay-help', hash: '#/runs?help=', overlay: 'help' },

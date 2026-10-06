@@ -202,7 +202,7 @@ function call(port: number, path: string, init: { method?: string; body?: string
   });
 }
 
-async function up(port: number, tries = 120): Promise<boolean> {
+async function up(port: number, tries = 1200): Promise<boolean> { // ~60 s: a console boot outran a 10 s window at load 60 (control-tower phase 116)
   for (let i = 0; i < tries; i++) {
     try { if ((await call(port, '/api/state')).status === 200) return true; } catch { /* not yet */ }
     await new Promise((r) => setTimeout(r, 50));
@@ -354,5 +354,88 @@ test('a console a test spawns reads the same quiet machine', () => {
     assert.match(box.env.NODE_OPTIONS ?? '', /--import=file:\S*\/e2e\/fixture\/steady-load\.mjs(?:\s|$)/);
   } finally {
     box.cleanup();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The login keychain (control-tower phase 116, #200)
+ * ------------------------------------------------------------------ */
+
+/**
+ * No test reaches the operator's login keychain. `auto-recovery.test.ts`
+ * RCV-10/ACC-3.2 registered a spare token account on a real `Service`, whose
+ * `Accounts` runs the real `security`: every suite run wrote a token into the
+ * keychain and deleted it again, went red whenever the keychain was locked, and
+ * would have overwritten — then deleted — the token of an account the operator
+ * had named "Spare". The belt is `realExec`'s: in a test process every
+ * `security` subcommand but a lookup is refused before any child starts, with
+ * the fix in the sentence. A lookup still runs — a real `Service` judges the
+ * machine login by its item, and the run-start door refuses a signed-out one.
+ */
+const KEYCHAIN_REFUSED = /a test reached for the macOS login keychain/;
+
+test('the keychain belt: a test that would write the real login keychain FAILS, naming the fix', async () => {
+  const credentials = await import('../server/accounts/credentials.ts');
+  // Asked first: without the belt this fails HERE, before anything below can
+  // reach the real `security`.
+  assert.equal(credentials.keychainRefused?.(), true, 'this test process may still reach the login keychain');
+  const { Accounts } = await import('../server/accounts/index.ts');
+
+  // The one writer, on the real exec — refused with ITS sentence, not hidden
+  // behind the fixed "the keychain refused to store the secret".
+  await assert.rejects(credentials.keychainStore(credentials.realExec, 'phase-console-account-belt', 'not-a-secret'), KEYCHAIN_REFUSED);
+  // A token account's secret, on a Mac's backend…
+  await assert.rejects(new credentials.Credentials(undefined, 'darwin').storeToken('belt', 'not-a-secret'), KEYCHAIN_REFUSED);
+  // …and through the facade exactly as a `Service` builds it: no exec of its
+  // own, which is how RCV-10's spare token reached the keychain.
+  const accounts = new Accounts({ platform: 'darwin' });
+  try {
+    await assert.rejects(accounts.addToken('Spare', 'token-belt-aaaaaaaaaaaaaaaaaaaa'), KEYCHAIN_REFUSED);
+  } finally {
+    accounts.stop();
+  }
+  // A delete is refused too, by any spelling of the binary, and so is every
+  // subcommand that is not a lookup — `dump-keychain` lists the whole keychain.
+  await assert.rejects(credentials.realExec('/usr/bin/security', ['delete-generic-password', '-s', 'phase-console-account-belt']), KEYCHAIN_REFUSED);
+  await assert.rejects(credentials.realExec('security', ['dump-keychain']), KEYCHAIN_REFUSED);
+  await assert.rejects(credentials.realExec('security', []), KEYCHAIN_REFUSED);
+  // What still runs is a lookup, and only a lookup.
+  assert.deepEqual([...credentials.KEYCHAIN_READS].sort(), ['find-generic-password', 'find-internet-password']);
+});
+
+test('the keychain belt is armed by a test process or the sandbox, and by nothing a console carries in production', async () => {
+  const { keychainRefused } = await import('../server/accounts/credentials.ts');
+  const console_ = ['/usr/local/bin/node', '/opt/phase-console/viewer/server/index.ts', '--port', '4130', '--allow-run'];
+  assert.equal(keychainRefused({}, console_), false, 'a console in production must reach its own keychain');
+  assert.equal(keychainRefused({ PHASE_CONSOLE_KEYCHAIN: '1' }, console_), false);
+  // A console a node test spawns inherits the runner's marker.
+  assert.equal(keychainRefused({ NODE_TEST_CONTEXT: 'child-v8' }, console_), true);
+  assert.equal(keychainRefused({ VITEST: 'true' }, console_), true);
+  assert.equal(keychainRefused({}, ['node', '--test', 'test/accounts.test.ts']), true);
+  assert.equal(keychainRefused({}, ['node', '--test-concurrency=1', 'test/accounts.test.ts']), true);
+  // A test file run with plain `node`, which carries no marker, is armed by the
+  // sandbox it imports — and so is every console a test spawns, which inherits
+  // this environment.
+  assert.equal(keychainRefused({ PHASE_CONSOLE_KEYCHAIN: '0' }, ['node', 'test/accounts.test.ts']), true);
+  assert.equal(process.env.PHASE_CONSOLE_KEYCHAIN, '0', 'state-sandbox.ts no longer arms the keychain belt');
+});
+
+test('a console the sandbox hands over is armed by the sandbox itself — the browser tour\'s included', async () => {
+  // Control-tower phase 123, phase 116's deferral. The e2e fixture
+  // (`e2e/fixture/console.ts`) runs under plain `node`, imports no state
+  // sandbox and carries no test marker, so a console it spawned inherited
+  // nothing that armed the belt. Asked here with every marker taken away, as
+  // the fixture's own process has none: the sandbox's, and the test runner's.
+  const { keychainRefused } = await import('../server/accounts/credentials.ts');
+  const saved = process.env.PHASE_CONSOLE_KEYCHAIN;
+  delete process.env.PHASE_CONSOLE_KEYCHAIN;
+  const box = sandbox('keychain-belt');
+  try {
+    const { NODE_TEST_CONTEXT: _runner, VITEST: _vitest, ...handed } = box.env;
+    const console_ = ['node', join(VIEWER_DIR, 'server', 'index.ts'), '--port', '4999'];
+    assert.equal(keychainRefused(handed, console_), true, 'a console the e2e fixture spawns may reach the login keychain');
+  } finally {
+    box.cleanup();
+    process.env.PHASE_CONSOLE_KEYCHAIN = saved;
   }
 });

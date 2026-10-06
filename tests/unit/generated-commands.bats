@@ -48,11 +48,13 @@ missing_docs_root() {
   [ -z "$bad" ] || { echo "generated without DOCS_ROOT:" >&2; echo "$bad" >&2; false; }
 }
 
-@test "boot-prompt: every generated skill-script command carries its DOCS_ROOT (delegated gate)" {
+@test "boot-prompt: every generated skill-script command carries its DOCS_ROOT (a manual gate's declared stop)" {
   setup_docs gatecheck gatecheck
+  # The delegated brief is gone (control-tower phase 107, #174); the manual
+  # gate's block now carries a phase-outcome.sh line of its own instead.
   PE_GATE_DELEGATE=1 run pg gatecheck --boot-prompt 5
   [ "$status" -eq 0 ] || false
-  assert_contains "$output" "DELEGATED"
+  assert_contains "$output" "needs-human --needs gates"
   bad="$(missing_docs_root "$output")"
   [ -z "$bad" ] || { echo "generated without DOCS_ROOT:" >&2; echo "$bad" >&2; false; }
 }

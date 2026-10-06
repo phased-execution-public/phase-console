@@ -34,10 +34,12 @@ import {
   holderViews,
   isAuthHalt,
   nothingReadySituation,
+  HUMAN_STEP_CATEGORY,
 } from '../shared/halt-categories.js';
 import { haltCtx, haltView } from '../shared/halt-view.js';
 import { HALT_HOLDER_KINDS, HALT_HOLDER_VERBS, HALT_KINDS, recoveryActionsFor } from '../shared/recovery-model.js';
 import { HALT_KIND_SITUATION } from '../shared/fact-map.js';
+import { HUMAN_STEP_KINDS } from '../shared/human-step-model.js';
 import { SITUATIONS, SUB_KINDS, situationKey } from '../shared/situation-model.js';
 import { situationOfHalt } from '../server/service-core.ts';
 
@@ -301,4 +303,12 @@ test('a sign-in stop is read from the kind first, then the words', () => {
   assert.equal(isAuthHalt({ kind: 'budget', reason: 'the run spent its budget' }), false);
   assert.equal(isAuthHalt({ reason: 'not signed in' }), true);
   assert.equal(isAuthHalt(null), false);
+});
+
+test('every kind of person\'s turn lights exactly one family — the operator act an act at the machine (control-tower phase 121)', () => {
+  assert.deepEqual(Object.keys(HUMAN_STEP_CATEGORY).sort(), [...HUMAN_STEP_KINDS].sort(), 'keyed by exactly the kinds');
+  for (const kind of HUMAN_STEP_KINDS) assert.ok(HALT_CATEGORIES.includes(HUMAN_STEP_CATEGORY[kind]!), `${kind}: a family`);
+  // A command or a click path the operator runs is an act at the machine, like
+  // an interactive prompt or a cable — never "Stopped by you", which is a stop.
+  assert.equal(HUMAN_STEP_CATEGORY['operator-act'], 'environment');
 });

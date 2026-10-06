@@ -28,7 +28,7 @@
  */
 
 import { useMemo, useState } from 'react';
-import { RefreshCw, Sparkles } from 'lucide-react';
+import { Plus, RefreshCw, Sparkles, X } from 'lucide-react';
 import type { ViewProps } from '@/app/router';
 import { navigate } from '@/app/router';
 import {
@@ -44,21 +44,36 @@ import {
   Spinner,
 } from '@/components/ui';
 import type { Issue, IssuesPayload, RepoIssues } from '@/lib/api';
-import { useConsoleState, useIssues, useIssuesRefresh } from '@/lib/queries';
+import { useConsoleState, useIssues, useIssuesRefresh, useSavePrefs } from '@/lib/queries';
 import { clockTime } from '@/lib/format';
+import { describeWord } from '@shared/status-model.js';
+import {
+  ISSUE_CATEGORIES,
+  ISSUE_PLAN_STATES,
+  ISSUE_REPOS_MAX,
+  ISSUE_SEVERITY_WORDS,
+  addedRepoKey,
+  issueRepoName,
+} from '@shared/issues-model.js';
 import {
   DEFAULT_FILTER,
   IssueBoard,
   RepoActions,
   SELECTION_MAX,
+  SORT_DEFAULT_DIR,
   ageLine,
   backedOff,
   boardRows,
+  deskHref,
   issueRef,
   labelUniverse,
   safeHttpUrl,
+  sortFrom,
+  wordOf,
   type IssueFilter,
   type IssueRow,
+  type IssueSort,
+  type IssueSortId,
 } from './issues';
 // The LAZY boundary, never `./issues-launch` — see that module's twin.
 import { IssuesLaunchDialog } from './lazy-issues-launch';
@@ -84,31 +99,36 @@ const ANY = 'all';
 const pick = (value: string) => `v:${value}`;
 const unpick = (value: string) => (value === ANY ? undefined : value.slice(2));
 
-/** `all` is a word in the URL; the other two are the vocabulary's own. */
+/**
+ * `all` is a word in the URL; the other two are the vocabulary's own. The
+ * desk's three readings (control-tower phase 118) take only a word of their
+ * own vocabulary — anything else is no filter, rather than a filter that hides
+ * every row for a word nothing could ever carry.
+ */
 function filterFrom(query: Record<string, string | undefined>): IssueFilter {
   const state = query.state === 'closed' || query.state === 'all' ? query.state : DEFAULT_FILTER.state;
+  const category = wordOf(ISSUE_CATEGORIES, query.category);
+  const severity = wordOf(ISSUE_SEVERITY_WORDS, query.severity);
+  const plan = wordOf(ISSUE_PLAN_STATES, query.plan);
   return {
     state,
     ...(query.repo ? { repo: query.repo } : {}),
     ...(query.label ? { label: query.label } : {}),
     ...(query.q ? { q: query.q } : {}),
     ...(query.filed === 'sessions' ? { filed: 'sessions' as const } : {}),
+    ...(category ? { category } : {}),
+    ...(severity ? { severity } : {}),
+    ...(plan ? { plan } : {}),
   };
 }
 
-/** A link to this section carrying one changed filter, and dropping the rest of the noise. */
-function href(current: IssueFilter, patch: Partial<IssueFilter> & { issue?: string }): string {
-  const next = { ...current, ...patch };
-  return repoHref('issues', {
-    repo: next.repo,
-    // `open` is the default, so it is not written — a URL that states every
-    // default is a URL nobody can read the interesting part of.
-    state: next.state === DEFAULT_FILTER.state ? undefined : next.state,
-    label: next.label,
-    q: next.q,
-    filed: next.filed,
-    issue: patch.issue,
-  });
+/** A vocabulary's words as a Select's options, each in the words the status family paints it with. */
+function wordOptions(vocab: 'issue-category' | 'issue-severity' | 'issue-plan', words: readonly string[]) {
+  return words.map((word) => (
+    <SelectItem key={word} value={pick(word)}>
+      {describeWord(vocab, word).label}
+    </SelectItem>
+  ));
 }
 
 /** The estate in one line: how many repositories, and how many cannot answer. */
@@ -127,12 +147,17 @@ function EstateLine({ payload }: { payload: IssuesPayload }) {
 
 export default function IssuesSection({ route }: { route: ViewProps['route'] }) {
   const filter = useMemo(() => filterFrom(route.query), [route.query]);
+  const sort = useMemo(() => sortFrom(route.query), [route.query]);
+  // One link builder for every control: the filters and the sort in force, one change over them.
+  const href = (patch: Parameters<typeof deskHref>[2]) => deskHref(filter, sort, patch);
   const openRef = route.query.issue;
   const { data, isPending, error, refetch } = useIssues();
   const { data: state } = useConsoleState();
   const refresh = useIssuesRefresh();
+  const savePrefs = useSavePrefs();
   const [selected, setSelected] = useState<string[]>([]);
   const [launching, setLaunching] = useState(false);
+  const [adding, setAdding] = useState<string | null>(null);
 
   const labels = useMemo(() => labelUniverse(data), [data]);
   const rows = useMemo(() => boardRows(data, filter), [data, filter]);
@@ -172,8 +197,52 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
    * prevent.
    */
   const held = new Set(livingRefs(data));
+  // A repository the operator ADDED is read here and planned nowhere: no plan
+  // of this console can scope it, and the ticket door resolves only the
+  // estate. Its picks stay picked — and are named rather than sent.
+  const outside = new Set(livingRefs(data, 'added'));
   const live = selected.filter((ref) => held.has(ref));
-  const dropped = selected.filter((ref) => !held.has(ref));
+  const outsidePicked = selected.filter((ref) => outside.has(ref));
+  const dropped = selected.filter((ref) => !held.has(ref) && !outside.has(ref));
+  const added = state?.prefs?.issueRepos ?? [];
+  const scopedAdded = scoped?.kind === 'added' ? scoped : undefined;
+
+  /** Write the added list, then fetch what was added — the next read lists it, the refresh fills it. */
+  const saveAdded = (next: string[], fetch?: string) =>
+    savePrefs.mutate(
+      { issueRepos: next },
+      {
+        onSuccess: () => {
+          if (fetch) {
+            refresh.mutate(addedRepoKey(fetch));
+            navigate(href({ repo: addedRepoKey(fetch) }));
+          } else {
+            void refetch();
+          }
+        },
+      },
+    );
+  const addRepo = (raw: string) => {
+    const name = issueRepoName(raw);
+    if (!name) {
+      setAdding('An added repository is GitHub’s owner/name — octo/widget, not a URL or a path.');
+      return;
+    }
+    // A name the desk already lists — the estate's own, or one added before —
+    // is a repository to go to, not one to add twice.
+    const listed = data.repos.find((repo) => repo.nameWithOwner?.toLowerCase() === name.toLowerCase());
+    if (listed || added.some((have) => have.toLowerCase() === name.toLowerCase())) {
+      setAdding(null);
+      navigate(href({ repo: listed?.key ?? addedRepoKey(name) }));
+      return;
+    }
+    if (added.length >= ISSUE_REPOS_MAX) {
+      setAdding(`The desk holds ${ISSUE_REPOS_MAX} added repositories — remove one to add another.`);
+      return;
+    }
+    setAdding(null);
+    saveAdded([...added, name], name);
+  };
 
   return (
     <div className="flex flex-col gap-3">
@@ -182,7 +251,7 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           <span>Repository</span>
           <Select
             value={filter.repo === undefined ? ANY : pick(filter.repo)}
-            onValueChange={(value) => navigate(href(filter, { repo: unpick(value) }))}
+            onValueChange={(value) => navigate(href({ repo: unpick(value) }))}
           >
             <SelectTrigger className="min-w-44" aria-label="Repository">
               <SelectValue />
@@ -192,6 +261,7 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
               {data.repos.map((repo) => (
                 <SelectItem key={repo.key} value={pick(repo.key)}>
                   {repo.label}
+                  {repo.kind === 'added' && <span className="text-ink-faint"> · outside this console</span>}
                   {repo.state !== 'fresh' && <span className="text-ink-faint"> · {repo.state}</span>}
                 </SelectItem>
               ))}
@@ -208,7 +278,7 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           <span>State</span>
           <Select
             value={filter.state}
-            onValueChange={(value) => navigate(href(filter, { state: value as IssueFilter['state'] }))}
+            onValueChange={(value) => navigate(href({ state: value as IssueFilter['state'] }))}
           >
             <SelectTrigger className="min-w-32" aria-label="State">
               <SelectValue />
@@ -225,7 +295,7 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           <span>Label</span>
           <Select
             value={filter.label === undefined ? ANY : pick(filter.label)}
-            onValueChange={(value) => navigate(href(filter, { label: unpick(value) }))}
+            onValueChange={(value) => navigate(href({ label: unpick(value) }))}
           >
             <SelectTrigger className="min-w-40" aria-label="Label">
               <SelectValue />
@@ -255,7 +325,7 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           <Select
             value={filter.filed ?? 'anyone'}
             onValueChange={(value) =>
-              navigate(href(filter, { filed: value === 'sessions' ? 'sessions' : undefined }))
+              navigate(href({ filed: value === 'sessions' ? 'sessions' : undefined }))
             }
           >
             <SelectTrigger className="min-w-32" aria-label="Filed by">
@@ -268,6 +338,58 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           </Select>
         </label>
 
+        {/* The desk's three readings (control-tower phase 118): what kind of
+            issue, how bad, and where it stands in a plan — each one word of
+            the vocabulary `shared/issues-model.js` derives, so a filter and a
+            badge can never disagree about a word. */}
+        <label className="flex flex-col gap-1 text-2xs text-ink-muted">
+          <span>Category</span>
+          <Select
+            value={filter.category === undefined ? ANY : pick(filter.category)}
+            onValueChange={(value) => navigate(href({ category: unpick(value) as IssueFilter['category'] }))}
+          >
+            <SelectTrigger className="min-w-36" aria-label="Category">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ANY}>Every category</SelectItem>
+              {wordOptions('issue-category', ISSUE_CATEGORIES)}
+            </SelectContent>
+          </Select>
+        </label>
+
+        <label className="flex flex-col gap-1 text-2xs text-ink-muted">
+          <span>Severity</span>
+          <Select
+            value={filter.severity === undefined ? ANY : pick(filter.severity)}
+            onValueChange={(value) => navigate(href({ severity: unpick(value) as IssueFilter['severity'] }))}
+          >
+            <SelectTrigger className="min-w-32" aria-label="Severity">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ANY}>Every severity</SelectItem>
+              {wordOptions('issue-severity', ISSUE_SEVERITY_WORDS)}
+            </SelectContent>
+          </Select>
+        </label>
+
+        <label className="flex flex-col gap-1 text-2xs text-ink-muted">
+          <span>Plan status</span>
+          <Select
+            value={filter.plan === undefined ? ANY : pick(filter.plan)}
+            onValueChange={(value) => navigate(href({ plan: unpick(value) as IssueFilter['plan'] }))}
+          >
+            <SelectTrigger className="min-w-36" aria-label="Plan status">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ANY}>Every plan status</SelectItem>
+              {wordOptions('issue-plan', ISSUE_PLAN_STATES)}
+            </SelectContent>
+          </Select>
+        </label>
+
         {/* A form, not a keystroke listener: typing into the address bar on
             every character fills the back stack with half-typed words. */}
         <form
@@ -275,7 +397,7 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           onSubmit={(event) => {
             event.preventDefault();
             const value = String(new FormData(event.currentTarget).get('q') ?? '').trim();
-            navigate(href(filter, { q: value || undefined }));
+            navigate(href({ q: value || undefined }));
           }}
         >
           <label className="flex flex-col gap-1 text-2xs text-ink-muted">
@@ -296,6 +418,10 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           filter.label ||
           filter.q ||
           filter.filed ||
+          filter.category ||
+          filter.severity ||
+          filter.plan ||
+          sort ||
           filter.state !== DEFAULT_FILTER.state) && (
           <Button size="sm" variant="ghost" onClick={() => navigate(repoHref('issues'))}>
             Clear
@@ -368,6 +494,66 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
         </p>
       )}
 
+      {/* The repositories beyond the estate (control-tower phase 118): any
+          GitHub `owner/name` the operator adds is read and refreshed here,
+          remembered in `prefs.issueRepos`, and marked outside this console —
+          it has no checkout here, so no plan of this console can take it. */}
+      <div className="flex flex-wrap items-start gap-x-3 gap-y-1.5">
+        <form
+          className="flex flex-wrap items-end gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const form = event.currentTarget;
+            addRepo(String(new FormData(form).get('add') ?? ''));
+            form.reset();
+          }}
+        >
+          <label className="flex flex-col gap-1 text-2xs text-ink-muted">
+            <span>Add a repository</span>
+            <Input
+              name="add"
+              aria-label="Add a repository"
+              aria-describedby={adding ? 'add-repo-error' : undefined}
+              placeholder="owner/name"
+              className="w-48"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <Button size="sm" type="submit" variant="ghost" disabled={savePrefs.isPending}>
+            <Plus size={14} aria-hidden /> Add
+          </Button>
+        </form>
+        {adding && (
+          <p id="add-repo-error" className="self-center text-2xs text-ink-muted" data-testid="add-repo-error">
+            {adding}
+          </p>
+        )}
+        {scopedAdded && (
+          <p
+            className="flex flex-wrap items-center gap-2 self-center text-2xs text-ink-muted"
+            data-testid="outside-repo"
+          >
+            <span>
+              <code className="font-mono">{scopedAdded.label}</code> is outside this console: read and
+              refreshed here, planned from its own.
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              aria-label={`Remove ${scopedAdded.label} from the desk`}
+              disabled={savePrefs.isPending}
+              onClick={() => {
+                saveAdded(added.filter((name) => name.toLowerCase() !== scopedAdded.label.toLowerCase()));
+                navigate(href({ repo: undefined }));
+              }}
+            >
+              <X size={14} aria-hidden /> Remove
+            </Button>
+          </p>
+        )}
+      </div>
+
       {/* The bar survives a filter that leaves nothing selectable: a selection
           that exists with no way to launch or clear it is a dead end, and the
           refs are still going to the ticket. (QA round 1, L-5.) */}
@@ -411,6 +597,13 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
             {live.length} selected
             {live.length > SELECTION_MAX && ` · ${SELECTION_MAX} is the ticket’s ceiling`}
           </span>
+          {outsidePicked.length > 0 && (
+            <span className="text-2xs text-ink-faint" data-testid="selection-outside">
+              {outsidePicked.length} from a repository outside this console — a plan here cannot take{' '}
+              {outsidePicked.length === 1 ? 'it' : 'them'}, so{' '}
+              {outsidePicked.length === 1 ? 'it is' : 'they are'} not sent.
+            </span>
+          )}
           {dropped.length > 0 && (
             <span className="text-2xs text-ink-faint" data-testid="selection-dropped">
               {dropped.length} no longer in this console’s issues and will not be sent:{' '}
@@ -446,16 +639,26 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
         filter={filter}
         selected={new Set(selected)}
         onToggle={toggle}
-        onOpen={(row) => navigate(href(filter, { issue: row.ref || `${row.repo.key}#${row.issue.number}` }))}
+        onOpen={(row) => navigate(href({ issue: row.ref || `${row.repo.key}#${row.issue.number}` }))}
         onRefresh={(key) => refresh.mutate(key)}
         refreshing={refresh.isPending || data.refreshing}
+        {...(sort ? { sort } : {})}
+        onSort={(id: IssueSortId) => {
+          // A press on the column in force reverses it; on any other, that
+          // column in its own first direction.
+          const next: IssueSort =
+            sort?.id === id
+              ? { id, dir: sort.dir === 'ascending' ? 'descending' : 'ascending' }
+              : { id, dir: SORT_DEFAULT_DIR[id] };
+          navigate(href({ sort: next }));
+        }}
       />
 
       {open && (
         <IssueInspector
           repo={open.repo}
           issue={open.issue}
-          onClose={() => navigate(href(filter, {}))}
+          onClose={() => navigate(href({}))}
           onRefresh={(key) => refresh.mutate(key)}
           refreshing={refresh.isPending || data.refreshing}
         />
@@ -473,10 +676,15 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
   );
 }
 
-/** Every ref the payload can still resolve — what a ticket may name. */
-function livingRefs(payload: IssuesPayload | undefined): string[] {
+/**
+ * Every ref the payload can still resolve — what a ticket may name: the
+ * estate's (`kind` absent), or the added repositories' (`'added'`), which no
+ * ticket may name.
+ */
+function livingRefs(payload: IssuesPayload | undefined, kind?: 'added'): string[] {
   const out: string[] = [];
   for (const repo of payload?.repos ?? []) {
+    if ((repo.kind === 'added') !== (kind === 'added')) continue;
     for (const issue of repo.issues) {
       const ref = issueRef(repo, issue);
       if (ref) out.push(ref);
@@ -549,7 +757,11 @@ export function IssueInspector({
           <dt className="uppercase tracking-wide text-ink-muted">Repository</dt>
           <dd className="min-w-0 break-words font-mono">{repo.nameWithOwner ?? repo.label}</dd>
           <dt className="uppercase tracking-wide text-ink-muted">Scope token</dt>
-          <dd className="min-w-0 break-words font-mono">{repo.scopeToken}</dd>
+          <dd className="min-w-0 break-words font-mono">
+            {repo.kind === 'added' ? 'none — outside this console' : repo.scopeToken}
+          </dd>
+          <dt className="uppercase tracking-wide text-ink-muted">Author</dt>
+          <dd className="min-w-0 break-words">{issue.author ?? 'not recorded'}</dd>
           <dt className="uppercase tracking-wide text-ink-muted">Assignees</dt>
           <dd className="min-w-0 break-words">{issue.assignees.join(', ') || 'unassigned'}</dd>
           <dt className="uppercase tracking-wide text-ink-muted">Updated</dt>

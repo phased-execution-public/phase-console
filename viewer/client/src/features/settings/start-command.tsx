@@ -20,7 +20,9 @@ import { useConsoleState } from '@/lib/queries';
 import { Card, CardBody, CardHeader, CardTitle, Badge, CopyButton } from '@/components/ui';
 
 /**
- * The SEVEN capability switches, in the order every doc lists them.
+ * The capability switches the start command composes, in the order every doc
+ * lists them — every switch but `--allow-publish`, the one that pushes the work,
+ * which stays a deliberate act at the start command a person types.
  *
  * `--allow-mcp` was missing here and nowhere else — `server/config.ts` parses
  * it, `/api/state` exposes it and the Desktop launcher's own flag set carries
@@ -101,10 +103,10 @@ export function StartCommandCard() {
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
         <p className="text-sm text-ink-muted">
-          The exact line for this console — its source directory, its port, all seven switches (writes, runs,
-          terminal, agent, accounts, mcp), and every setting it was started with (remote access, session
-          ceiling, default skills). Paths are <code>$HOME</code>-relative, so the line is portable and
-          screenshots carry no username.
+          The exact line for this console — its source directory, its port, every switch it composes (
+          {CAPABILITIES.map(([, , label]) => label).join(', ')}), and every setting it was started with
+          (remote access, session ceiling, default skills). Paths are <code>$HOME</code>-relative, so the line
+          is portable and screenshots carry no username.
         </p>
 
         <div>

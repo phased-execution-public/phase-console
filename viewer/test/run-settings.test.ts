@@ -36,7 +36,7 @@ import { DEFAULT_MESSAGING } from '../shared/message-model.js';
 import { DEFAULT_ISSUES } from '../shared/issues-model.js';
 import { DEFAULT_RETENTION } from '../shared/worktree-model.js';
 import { newRun } from '../server/runner/state.ts';
-import { applySettings } from '../server/runner/runner-core.ts';
+import { applySettings, issuesModeLoosens } from '../server/runner/runner-core.ts';
 
 /** The seven, in the order the form shows them. */
 const NEW_FIELDS = [
@@ -170,6 +170,29 @@ test('issuesMode may only tighten', () => {
   assert.equal('issuesMode' in state, false, 'off → draft loosens and is ignored');
 });
 
+test('issuesMode tightens by the word a run EFFECTIVELY files under — a run with no word files under the console\'s (phase 115)', () => {
+  // `off` is stored as no word at all, and a run with no word files under this
+  // console's Settings ▸ Issues. So on a console that FILES, `draft → off`
+  // would widen the run to `file` — refused — and a run that said nothing
+  // moving to `draft` is a tightening, taken.
+  assert.equal(issuesModeLoosens({ issuesMode: 'draft' }, DEFAULT_ISSUES, 'file'), true, 'draft → off widens on a filing console');
+  assert.equal(issuesModeLoosens({ issuesMode: 'draft' }, DEFAULT_ISSUES, 'off'), false, 'and tightens on one that does not');
+  assert.equal(issuesModeLoosens({}, 'draft', 'file'), false, 'no word → draft tightens on a filing console');
+  assert.equal(issuesModeLoosens({}, 'file', 'file'), false, 'no word → file changes nothing there');
+  assert.equal(issuesModeLoosens({}, 'file', 'off'), true, 'and widens where the console says off');
+  assert.equal(issuesModeLoosens({ issuesMode: 'file' }, DEFAULT_ISSUES, 'file'), false, 'file → off can never widen');
+  // No console word — the free edition, or a caller that has none — is the rule as it was.
+  assert.equal(issuesModeLoosens({ issuesMode: 'draft' }, DEFAULT_ISSUES), false);
+  assert.equal(issuesModeLoosens({}, 'draft'), true);
+
+  const state = newRun({ slug: 'demo', root: '/tmp/demo', issuesMode: 'draft' });
+  applySettings(state, { issuesMode: DEFAULT_ISSUES }, 'file');
+  assert.equal(state.issuesMode, 'draft', 'draft → off on a filing console is ignored, like any widening');
+  const silent = newRun({ slug: 'demo', root: '/tmp/demo' });
+  applySettings(silent, { issuesMode: 'draft' }, 'file');
+  assert.equal(silent.issuesMode, 'draft', 'a run that said nothing may be held to draft');
+});
+
 /* ------------------------------------------------------------------ *
  * The doors
  * ------------------------------------------------------------------ */
@@ -210,6 +233,9 @@ function fakeService(over: Record<string, unknown> = {}) {
     verificationPreflight: async () => [],
     claimPreflight: () => [],
     runFor: async () => null as Record<string, unknown> | null,
+    // This console's own issue word (Settings ▸ Issues, phase 115): none, as
+    // in the free edition, unless a test gives one.
+    consoleIssueWord: (): string | undefined => undefined,
     _started: started,
     _configured: configured,
     ...over,
@@ -291,6 +317,21 @@ test('a settings patch may tighten issuesMode and never loosen it', async () => 
 
   const same = fakeService({ runFor: async () => ({ id: 'r1', issuesMode: 'draft' }) });
   assert.equal((await call(same, 'POST', '/api/run/demo/settings', { issuesMode: 'draft' })).status, 200);
+});
+
+test('on a console that files, the door judges a run by the word it files under (phase 115)', async () => {
+  const files = { consoleIssueWord: () => 'file' };
+  // draft → off would hand the run this console's `file`: a widening, refused, and the refusal says why.
+  const widen = fakeService({ ...files, runFor: async () => ({ id: 'r1', issuesMode: 'draft' }) });
+  const out = await call(widen, 'POST', '/api/run/demo/settings', { issuesMode: DEFAULT_ISSUES });
+  assert.equal(out.status, 409);
+  assert.match(err(out), /off would hand it this console's file/);
+  assert.equal(widen._configured.length, 0);
+
+  // A run that said nothing files under `file` here, so holding it to draft tightens it.
+  const hold = fakeService({ ...files, runFor: async () => ({ id: 'r1' }) });
+  assert.equal((await call(hold, 'POST', '/api/run/demo/settings', { issuesMode: 'draft' })).status, 200);
+  assert.equal(hold._configured[0].issuesMode, 'draft');
 });
 
 /* ------------------------------------------------------------------ *

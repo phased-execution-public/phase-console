@@ -47,12 +47,12 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 import { SPAWN_FIRST_EVENT_MS, SPAWN_INIT_IDLE_MS } from '../../shared/attention-model.js';
-import { isProductiveEvent, suspectedStepOf, type SuspectedStep } from './liveness.ts';
+import { isProductiveEvent, suspectedStepOf, wakesTheSession, type SuspectedStep } from './liveness.ts';
 import { MAX_TASKS, MAX_TASK_TEXT } from '../../shared/task-model.js';
 import { ENDED_BY, type EndedBy } from '../../shared/run-lifecycle.js';
 import { CHAT_TOOL_SERVER } from '../../shared/supervisor-model.js';
 import { log } from '../log.ts';
-import { API_RETRY_ERRORS, childEnv, type PermissionDenial, type StopSignal } from './errors.ts';
+import { API_RETRY_ERRORS, BG_WAIT_CEILING_MS, childEnv, type PermissionDenial, type StopSignal } from './errors.ts';
 import { DEFAULT_KILL_AFTER_MS, INT_GRACE_MS, forgetInterrupt, groupSignal, interruptOnce, wakeAndTerm } from './signals.ts';
 import { resolveCaps, type SessionCaps } from './session-record.ts';
 import { printedCommits } from './scope-drift.ts';
@@ -268,6 +268,17 @@ export function peerMark(message: unknown): string | null {
  */
 export type TodoItem = { content: string; status: string; activeForm?: string };
 
+/**
+ * Why a session's input closed (control-tower phase 109, #170): its turn ended
+ * with nothing outstanding and nothing of its own in the background
+ * (`turn-end`), the idle closer (`idle`), a broken pipe (`epipe`), the console
+ * ending it (`abort`), or its background work outliving the CLI's ceiling with
+ * no new turn (`background-ceiling`). `adopted` is never a spawn's: it is a
+ * live child a later console adopted from the run record with no pipe at all.
+ */
+export const INPUT_CLOSE_CAUSES = ['turn-end', 'idle', 'epipe', 'abort', 'background-ceiling', 'adopted'] as const;
+export type InputCloseCause = typeof INPUT_CLOSE_CAUSES[number];
+
 export type StreamEvent =
   | {
     kind: 'init';
@@ -434,8 +445,16 @@ export type StreamEvent =
   | {
     kind: 'background'; op: 'started'; taskId: string;
     taskType?: string; tool?: string; description?: string; ownedBySubagent?: boolean;
+    /** The starting call's id — a background agent's words carry it as `parent` (control-tower phase 109, #188). */
+    toolUseId?: string;
   }
   | { kind: 'background'; op: 'ended'; taskId: string; status?: string }
+  /**
+   * The session's input closed, and why (control-tower phase 109, #170) — once
+   * per spawn. Past it nothing can be written to the session: a steer, an
+   * ask, a peer's message and the wrap-up notice are refused with this cause.
+   */
+  | { kind: 'input-closed'; cause: InputCloseCause; at: string }
   | { kind: 'hook'; name: string; event: string; outcome?: string }
   /**
    * A message the operator sent into a running session. Emitted twice for one
@@ -495,7 +514,16 @@ export type StreamEvent =
   | { kind: 'control-request'; requestId?: string; subtype?: string; tool?: string }
   /** The turn ended on a `defer` (phase 14, spike S3): the call kept as `deferred_tool_use`, resumable with `--resume`. */
   | { kind: 'deferred'; toolUseId?: string; tool?: string }
-  | { kind: 'result'; subtype?: string; costUsd?: number; turns?: number; isError?: boolean; terminalReason?: string }
+  /**
+   * `queuedTurns` is the result line's `queued_turn_count` (measured on CLI
+   * 2.1.270, `test/fixtures/spikes/sigint.md`): how many turns the CLI still
+   * holds queued behind this one — a message written mid-turn that it did not
+   * fold into the turn. Absent on a CLI that does not say.
+   */
+  | {
+    kind: 'result'; subtype?: string; costUsd?: number; turns?: number; isError?: boolean; terminalReason?: string;
+    queuedTurns?: number;
+  }
   | { kind: 'stderr'; text: string };
 
 /**
@@ -611,6 +639,12 @@ export type SpawnRequest = {
   hookEvents?: boolean;
   /** Silence after the phase's turn that means wedged rather than working. */
   idleCloseMs?: number;
+  /**
+   * How long the input is held open past a turn for the session's own
+   * background agents with no new turn (control-tower phase 109, #170) —
+   * `BG_WAIT_CEILING_MS`, the CLI's own ceiling, unless a test says otherwise.
+   */
+  bgWaitCeilingMs?: number;
   /**
    * How long this session may produce NOTHING AT ALL before it is ended.
    *
@@ -1028,7 +1062,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    * (`system/task_started`), with the CLI's `task_type` and the tool call that
    * started each — see the `background` event.
    */
-  const backgroundTasks = new Map<string, { description: string; taskType?: string; tool?: string }>();
+  const backgroundTasks = new Map<string, { description: string; taskType?: string; tool?: string; ownedBySubagent?: boolean }>();
   let ending: { endedBy: EndedBy; reason?: string } | null = null;
   const noteEnding = (endedBy: EndedBy, reason?: string): void => {
     if (ending) return;
@@ -1077,6 +1111,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   let lastResultTurns: number | null | undefined;
   /** A user, assistant, delta or task-notification line arrived after the previous result. */
   let movedSinceResult = false;
+  /** The same, of the session's OWN conversation — never a subagent's line (#170's background hold). */
+  let turnSinceResult = false;
   let injected = 0;
   let stdinOpen = true;
 
@@ -1177,11 +1213,29 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
 
   /* ---- writing to the child ---- */
 
+  /**
+   * The moment the input closes, and why — said once, as an `input-closed`
+   * event (control-tower phase 109, #170): a live session whose stdin closed
+   * cannot be steered, asked, told a peer's message or told to wrap up, and
+   * the console used to answer that it was not running at all.
+   */
+  let closedFor: InputCloseCause | null = null;
+  /** The background hold's clock, and whether it has run out — see `holdForBackground`. */
+  let backgroundHold: NodeJS.Timeout | null = null;
+  let holdExpired = false;
+  const noteInputClosed = (cause: InputCloseCause): void => {
+    if (closedFor) return;
+    closedFor = cause;
+    if (backgroundHold) { clearTimeout(backgroundHold); backgroundHold = null; }
+    emit({ kind: 'input-closed', cause, at: new Date().toISOString() });
+  };
+
   // EPIPE on a child that has already gone is normal, not a fault: it means the
   // session ended between our deciding to write and the write landing.
   child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
     stdinOpen = false;
     if (error.code !== 'EPIPE') log.warn('spawn.stdin', { error });
+    noteInputClosed('epipe');
   });
 
   const write = (text: string): boolean => {
@@ -1195,11 +1249,50 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     }
   };
 
-  const closeStdin = (): void => {
+  const closeStdin = (cause: InputCloseCause): void => {
     if (!stdinOpen) return;
     stdinOpen = false;
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     try { child.stdin?.end(); } catch { /* already gone */ }
+    noteInputClosed(cause);
+  };
+
+  /*
+   * The input stays open while the session's OWN agents or monitors work
+   * (control-tower phase 109, #170). It closed at the first turn's result
+   * whenever nothing of ours was in flight — but a session that ended its turn
+   * to wait on its background agent (wait rule 4) runs on: each notification
+   * starts a turn that does real work, and with its input closed the console
+   * could not steer it, ask it, or reach it with the 0.6× wrap-up. Held open,
+   * the next turn's result closes it once nothing is left to wake the session —
+   * bounded by the idle closer, and by the CLI's own background ceiling: a
+   * hold with no new turn for `bgWaitCeilingMs` closes it (`background-ceiling`),
+   * which is the moment the CLI would have stopped that work anyway.
+   */
+  const holdingBackground = (): boolean => [...backgroundTasks.values()].some(wakesTheSession);
+  const armBackgroundHold = (): void => {
+    backgroundHold = setTimeout(() => {
+      backgroundHold = null;
+      // A frozen lane's stretch is the operator's, not the session's: the
+      // clock starts again at the thaw (`setFrozen`), as the idle closer's does.
+      if (frozen) return;
+      holdExpired = true;
+      // A turn of its OWN in progress keeps the input until its result, where
+      // the close rule closes it; a background agent's chatter does not.
+      if (!stdinOpen || settled || turnSinceResult) return;
+      closeStdin('background-ceiling');
+    }, Math.max(1, request.bgWaitCeilingMs ?? BG_WAIT_CEILING_MS));
+    backgroundHold.unref?.();
+  };
+  const holdForBackground = (): boolean => {
+    if (holdExpired || !holdingBackground()) return false;
+    // One clock for the whole hold, from its first turn — never re-armed by a
+    // later one, so a monitor waking the session every few minutes cannot hold
+    // the input open for ever.
+    if (!backgroundHold) {
+      armBackgroundHold();
+    }
+    return true;
   };
 
   /* ---- the idle watchdog ---- */
@@ -1274,7 +1367,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         : 'the session stopped streaming with stdin still open';
       log.warn('spawn.idle-close', { afterMs: quiet, reason, pid: child.pid });
       emit({ kind: 'idle', afterMs: quiet, reason });
-      closeStdin();
+      closeStdin('idle');
     }, Math.max(1, delay));
     idleTimer.unref?.();
   };
@@ -1315,6 +1408,11 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       lastProductiveAt = lastEventAt;
       armIdle();
       armInitIdle();
+      // …and the background hold's clock starts again too (#170).
+      if (stdinOpen && !settled && !holdExpired && holdingBackground()) {
+        if (backgroundHold) clearTimeout(backgroundHold);
+        armBackgroundHold();
+      }
     },
     markEnding: (endedBy: EndedBy, reason?: string) => { noteEnding(endedBy, reason); },
   });
@@ -1342,7 +1440,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // abort the run's controller with their `ENDED_BY` word as the reason.
     const why = request.signal?.aborted ? request.signal.reason : undefined;
     if (typeof why === 'string' && (ENDED_BY as readonly string[]).includes(why)) noteEnding(why as EndedBy);
-    closeStdin();
+    closeStdin('abort');
     if (!child.pid) {
       try { child.kill('SIGTERM'); } catch { /* already gone */ }
       return;
@@ -1491,7 +1589,13 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // The conversation moved: what separates a new turn's `result` from a
     // repeat of the last one (see the `result` handler).
     if (type === 'user' || type === 'assistant' || type === 'stream_event'
-      || (type === 'system' && sub === 'task_notification')) movedSinceResult = true;
+      || (type === 'system' && sub === 'task_notification')) {
+      movedSinceResult = true;
+      // …and whether the session's OWN conversation did: a background agent's
+      // lines carry its parent call, and must not hold the input past the
+      // hold's clock (control-tower phase 109, #170).
+      if (!parent) turnSinceResult = true;
+    }
 
     // The running total, whichever message carried it, the last one winning
     // (SES-1). `result` is the documented carrier; reading it wherever it
@@ -1592,6 +1696,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         const tool = toolUseId ? toolInfo.get(toolUseId)?.name : undefined;
         backgroundTasks.set(taskId, {
           description, ...(taskType ? { taskType } : {}), ...(tool ? { tool } : {}),
+          ...(message.owned_by_subagent === true ? { ownedBySubagent: true } : {}),
         });
         if (backgroundTasks.size > MAX_PENDING_TOOLS) {
           const oldest = backgroundTasks.keys().next().value;
@@ -1603,6 +1708,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
           ...(tool ? { tool } : {}),
           ...(description ? { description } : {}),
           ...(message.owned_by_subagent === true ? { ownedBySubagent: true } : {}),
+          ...(toolUseId ? { toolUseId: toolUseId.slice(0, 80) } : {}),
         });
       } else if (taskId) {
         backgroundTasks.delete(taskId);
@@ -1929,6 +2035,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       const newTurn = lastResultTurns === undefined || reported !== lastResultTurns || movedSinceResult;
       lastResultTurns = reported;
       movedSinceResult = false;
+      turnSinceResult = false;
       if (newTurn && reported !== null) {
         turns += reported;
         reportedTurns = (reportedTurns ?? 0) + reported;
@@ -1988,6 +2095,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         turns,
         isError,
         ...(terminalReason ? { terminalReason } : {}),
+        ...(typeof message.queued_turn_count === 'number' && Number.isFinite(message.queued_turn_count)
+          ? { queuedTurns: Math.max(0, message.queued_turn_count) } : {}),
       });
 
       // One result per TURN. The first belongs to the boot prompt, so the phase
@@ -2012,8 +2121,11 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       sentSinceLastResult = false;
       // A conversation's stdin is the operator's, and only an abort closes it.
       if (request.conversation) return;
-      if (!wroteUntagged && !unecho.size) closeStdin();
-      else armIdle();
+      // …and not while the session's own agents or monitors still work: their
+      // notification starts its next turn (#170, `holdForBackground`).
+      if (!wroteUntagged && !unecho.size && !holdForBackground()) {
+        closeStdin(holdExpired && holdingBackground() ? 'background-ceiling' : 'turn-end');
+      } else armIdle();
     }
   };
 

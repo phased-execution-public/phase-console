@@ -30,6 +30,7 @@ import {
   type LaneSignals,
 } from '../server/runner/liveness.ts';
 import { Runner } from '../server/runner/runner.ts';
+import { EXTERNAL_PARK_GRACE_MS } from '../server/runner/runner-core.ts';
 import { VERIFY_ENV_FALLBACK } from '../server/runner/verify-env.ts';
 import { SKILL_DIR } from '../server/config.ts';
 import { Service } from '../server/service.ts';
@@ -217,6 +218,12 @@ test('WC-2/WC-3 — a watchdog park records no unpollable ref, and its rung sett
     assert.equal(mintWatchRef(wait), null, 'precondition: nothing to mint');
     held.say(call('toolu_wait', wait));
     clock.wind(6 * MINUTE);
+    await instance.tickLiveness();
+    // The session is told first (control-tower phase 111, #179) and parked
+    // only once the grace after that nudge has passed with the call still open.
+    assert.equal(instance.current()!.phases['1'].status, 'running', 'the first tick nudges, it does not park');
+    assert.equal(journalled(events, 'phase.auto-nudged').filter((n) => n.scope === 'external').length, 1);
+    clock.wind(EXTERNAL_PARK_GRACE_MS);
     await instance.tickLiveness();
 
     const record = instance.current()!.phases['1'];
@@ -459,6 +466,9 @@ test('MR-2 — a watchdog park never arms a minted cmd: ref the console will not
       await held.inSession;
       held.say(call('toolu_wait', 'until curl -sf https://status.example.test/health; do sleep 30; done'));
       clock.wind(6 * MINUTE);
+      await instance.tickLiveness();
+      // The nudge first, then the park once its grace has passed (#179).
+      clock.wind(EXTERNAL_PARK_GRACE_MS);
       await instance.tickLiveness();
       const record = instance.current()!.phases['1'];
       held.release();

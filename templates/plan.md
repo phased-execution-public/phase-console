@@ -78,7 +78,7 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
                                                   issue for something it finds OUTSIDE its phase (the
                                                   `issues` row). `draft` is the recommended answer:
                                                   the console holds the draft and a person approves.
-                                                  Budgets are 3 per phase, 10 per run. -->
+                                                  3 drafts a phase; a fourth is held for a person. -->
 <!-- Where the work HAPPENS and where it LANDS — all optional, all machine-read
      (phase-graph.sh --land / --base-branch / --gitlink / --conflict-policy / --isolation /
      --clash-zones / --messaging). Each answers `word<TAB>phase|plan|default`, so the console can tell

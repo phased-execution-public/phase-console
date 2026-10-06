@@ -153,3 +153,272 @@ load ../helpers/test_helper
   # …while the real bring-up, at a head, still fires.
   assert_contains "$output" "F22 phase 2"
 }
+
+# --------------------------------------------------------------------------
+# F39 `setup-deps-missing` (#185 ask 1) — a §Verification line that runs a
+# package-manager script or a `.venv/bin/*` binary in repository X, in a phase
+# whose resolved Setup installs nothing for X. A superproject mirror mounts
+# every scoped repository as a fresh worktree with no node_modules and no
+# .venv, so `cd hetzner && npm run verify:local` read red in 1.7 s at
+# baseline. Phases 1–3 are the shapes that must fire, 4–6 the ones that must
+# not (phase 4 is control-tower's own), 7–10 the edges.
+# --------------------------------------------------------------------------
+deps_docs() {
+  setup_docs setup-bullet deps
+  cat > "$DOCS_ROOT/docs/plans/deps.md" <<'EOF'
+---
+slug: deps
+status: active
+phases: 14
+---
+
+# Setup deps — fixture
+
+## Session budget
+
+**Target model:** `claude-opus-5` · **Budget:** ~200K weight/session · **Branch:** `main`
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|---|---|---|---|---|---|
+| 1 | Setup installs only another repo | — | — | app | it passes |
+| 2 | A venv binary, nothing installs Python | — | — | app | it passes |
+| 3 | A prefixed script under Verify in, no Setup | — | — | app | it passes |
+| 4 | The control-tower shape | — | — | app | it passes |
+| 5 | The venv is made in Setup | — | — | app | it passes |
+| 6 | Setup cds where the line cds | — | — | app | it passes |
+| 7 | The other ecosystem is not an install | — | — | app | it passes |
+| 8 | An install inside Verification is F22's | — | — | app | it passes |
+| 9 | Done, with the defect | — | — | app | it passes |
+| 10 | Two lines in one repository | — | — | app | it passes |
+| 11 | A fenced command continued with a backslash | — | — | app | it passes |
+| 12 | Directories the run does not mount | — | — | app | it passes |
+| 13 | A bash -c wrapper | — | — | app | it passes |
+| 14 | Setup cds into its own Verify in | — | — | app | it passes |
+
+### Phase 1 — Setup installs only another repo
+- **Setup:** `npm --prefix aws ci`
+- **Verification:**
+  - `cd hetzner && npm run verify:local`
+
+### Phase 2 — A venv binary, nothing installs Python
+- **Verification:**
+  - **Verify in:** .
+  - `.venv/bin/pytest -q`
+
+### Phase 3 — A prefixed script under Verify in, no Setup
+- **Verification:**
+  - **Verify in:** phased-execution
+  - `npm --prefix viewer run test`
+
+### Phase 4 — The control-tower shape
+- **Setup:** `npm --prefix viewer ci`
+- **Verification:**
+  - **Verify in:** phased-execution
+  - `npm --prefix viewer run test:client`
+  - `bash tests/run-tests.sh`
+  - `node --test viewer/test/skill-sync.test.ts`
+
+### Phase 5 — The venv is made in Setup
+- **Setup:** `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+- **Verification:**
+  - **Verify in:** .
+  - `.venv/bin/pytest -q`
+
+### Phase 6 — Setup cds where the line cds
+- **Setup:** `cd hetzner && npm ci`
+- **Verification:**
+  - `cd hetzner && npm run x`
+
+### Phase 7 — The other ecosystem is not an install
+- **Setup:** `cd hetzner && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+- **Verification:**
+  - `cd hetzner && npm run verify:local`
+  - `cd hetzner && .venv/bin/pytest -q`
+
+### Phase 8 — An install inside Verification is F22's
+- **Verification:**
+  - **Verify in:** .
+  - `npm ci`
+  - `node --version`
+
+### Phase 9 — Done, with the defect
+- **Verification:**
+  - `cd hetzner && npm run verify:local`
+
+### Phase 10 — Two lines in one repository
+- **Verification:**
+  - `cd hetzner && npm run lint`
+  - `cd hetzner && npm test`
+
+### Phase 11 — A fenced command continued with a backslash
+- **Verification:**
+  ```bash
+  cd aws \
+    && npm run verify:local
+  ```
+
+### Phase 12 — Directories the run does not mount
+- **Verification:**
+  - `cd ~/elsewhere && npm test`
+  - `npm --prefix /opt/tool run check`
+  - `cd "$(git rev-parse --show-toplevel)" && npm test`
+  - `cd ../outside && npm test`
+
+### Phase 13 — A bash -c wrapper
+- **Verification:**
+  - `bash -c 'cd admin-ui && yarn test'`
+
+### Phase 14 — Setup cds into its own Verify in
+- **Setup:** `cd app/app-frontend && pnpm install --frozen-lockfile`
+- **Verification:**
+  - **Verify in:** app/app-frontend
+  - `pnpm vitest run`
+EOF
+}
+
+@test "F39: a script in a repository the Setup does not install is named, exit stays 0" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "LINT OK"
+  # (a) the Setup installs `aws` only; the line runs in `hetzner`.
+  assert_contains "$output" 'F39 phase 1: setup-deps-missing — `cd hetzner && npm run verify:local` runs an npm script in `hetzner`'
+  assert_contains "$output" "the phase's Setup installs nothing for \`hetzner\`"
+  # The fix names the install, spelled from where Setup runs.
+  assert_contains "$output" '"- **Setup:** npm --prefix hetzner ci"'
+}
+
+@test "F39: a .venv binary with no Python install is named" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # (b)
+  assert_contains "$output" 'F39 phase 2: setup-deps-missing — `.venv/bin/pytest -q` runs a .venv binary in `.`'
+  assert_contains "$output" 'python3 -m venv .venv'
+}
+
+@test "F39: a package-manager directory flag joins onto Verify in" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # (c) the line means phased-execution/viewer, and Setup — which runs where
+  # §Verification runs — would install it as `npm --prefix viewer ci`.
+  assert_contains "$output" 'F39 phase 3: setup-deps-missing — `npm --prefix viewer run test` runs an npm script in `phased-execution/viewer`'
+  assert_contains "$output" '"- **Setup:** npm --prefix viewer ci"'
+}
+
+@test "F39: an install for the line's own repository silences it" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # (d) control-tower's own shape; (e) the venv made in Setup; (f) the same cd.
+  [[ "$output" != *"F39 phase 4"* ]]
+  [[ "$output" != *"F39 phase 5"* ]]
+  [[ "$output" != *"F39 phase 6"* ]]
+}
+
+@test "F39: an install of the OTHER ecosystem is no install for this line" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # #185's phase 21: its Setup made hetzner's venv, its line ran hetzner's npm.
+  assert_contains "$output" 'F39 phase 7: setup-deps-missing — `cd hetzner && npm run verify:local`'
+  # …while the venv binary in the same repository is satisfied by that Setup.
+  [[ "$output" != *'`cd hetzner && .venv/bin/pytest -q`'* ]]
+}
+
+@test "F39: an install, node or bash inside Verification is not a script run" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # `npm ci` in §Verification is bring-up, F22's to name; `node` is a lead.
+  assert_contains "$output" 'F22 phase 8: `npm ci`'
+  [[ "$output" != *"F39 phase 8"* ]]
+}
+
+@test "F39: a done phase is not nagged about history" {
+  deps_docs
+  # Open, phase 9 is named like any other…
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "F39 phase 9:"
+  # …and once its handoff says complete, it is history.
+  write_handoff deps 9 done complete
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"F39 phase 9"* ]]
+}
+
+@test "F39: one line per repository, not one per command" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c '^F39 phase 10:')" -eq 1 ]
+}
+
+@test "F39: a fenced command continued with a backslash is judged whole" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # The `cd aws` on the first line moves the second; judged apart, the
+  # script would have been placed at the root.
+  assert_contains "$output" 'F39 phase 11: setup-deps-missing — `cd aws && npm run verify:local` runs an npm script in `aws`'
+}
+
+@test "F39: a directory the run does not mount, or nobody can place, is not judged" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # Home, absolute, a command substitution, above the root: no isolated
+  # checkout mounts any of them, so "it has no node_modules there" would be
+  # a claim about nothing.
+  [[ "$output" != *"F39 phase 12"* ]]
+}
+
+@test "F39: a bash -c wrapper runs its own cd" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # The line is quoted as the plan writes it — wrapper and all — so a reader
+  # finds it by searching the plan; the repository is the one its own cd names.
+  assert_contains "$output" "F39 phase 13: setup-deps-missing — \`bash -c 'cd admin-ui && yarn test'\` runs a yarn script in \`admin-ui\`"
+  assert_contains "$output" '"- **Setup:** yarn --cwd admin-ui install"'
+}
+
+@test "F39: Setup runs where Verification does, so its cd into Verify in installs nothing" {
+  deps_docs
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  # The runner hands Setup and §Verification one cwd — the Verify-in
+  # directory — so this Setup's `cd app/app-frontend` means
+  # app/app-frontend/app/app-frontend and installs nothing. The line
+  # says where Setup runs, and the fix is spelled from there.
+  assert_contains "$output" 'F39 phase 14: setup-deps-missing — `pnpm vitest run` runs a pnpm script in `app/app-frontend`'
+  assert_contains "$output" '(Setup runs where §Verification does, in `app/app-frontend`)'
+  assert_contains "$output" '"- **Setup:** pnpm install"'
+}
+
+@test "F39: the plan-wide Setup line installs for every phase" {
+  deps_docs
+  # The resolved Setup is the plan-wide line UNIONED with the phase's own.
+  local f="$DOCS_ROOT/docs/plans/deps.md"
+  awk '{ print } /^\*\*Target model:\*\*/ { print "**Setup (every phase):** `cd hetzner && npm ci`" }' "$f" > "$f.new"
+  mv "$f.new" "$f"
+  grep -q 'Setup (every phase)' "$f"
+  run pg deps --lint
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"F39 phase 1:"* ]]
+  [[ "$output" != *"F39 phase 10:"* ]]
+  # …and a line in another repository still fires.
+  assert_contains "$output" "F39 phase 3:"
+}
+
+@test "F39: validate.sh inherits it without failing" {
+  deps_docs
+  run pe_validate deps
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "F39 phase 1"
+  assert_contains "$output" "VALIDATE OK"
+}

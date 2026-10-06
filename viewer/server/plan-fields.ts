@@ -70,8 +70,8 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: 'what happens when the QA rounds run out (default waive; skip when QA is off)' },
   { field: 'Person-check', flags: ['--person-check'], home: '- **Person-check:** allow|halt|<owner>',
     question: 'what a prose §Verification line does — waived, parked at boarding, or asked of whom' },
-  { field: 'Wait budget', flags: ['--wait-budget'], home: '**Wait budget:**',
-    question: "the longest a phase may stay parked on an external clock (default the console's)" },
+  { field: 'Wait budget', flags: ['--wait-budget', '--wait-count'], home: '**Wait budget:**, **Wait count:**',
+    question: "the longest a phase may stay parked on an external clock, and how many waits (default the console's)" },
   { field: 'Waits on', flags: ['--waits-on'], home: '- **Waits on:** <ref> · <max>',
     question: 'the external clocks a phase is known to wait on, each with its --watch ref' },
   { field: 'Verify timeout', flags: ['--verify-timeout'], home: '**Verify timeout:** and - **Verify timeout:**',
@@ -131,6 +131,10 @@ export const STATE_FLAGS: Readonly<Record<string, string>> = Object.freeze({
   // control-tower phase 41: asked once, by the manifest's `human-acts`
   // question (MANIFEST_QUESTIONS below) — not a field of the wizard's own.
   '--human-steps': "the `- **Human step:**` bullets as the step card reads them — asked by the manifest's human-acts question",
+  // control-tower phase 106 (#185): the line rides inside §Verification, which
+  // the wizard writes for every phase — so it is authored with that block,
+  // never asked as a field of its own.
+  '--verify-in': "the `**Verify in:**` directory a phase's §Verification runs from — written with that block, which every phase carries",
 });
 
 /** The question the wizard asks for each manifest key, in `DECISION_KEYS` order. */
@@ -141,7 +145,7 @@ export const MANIFEST_QUESTIONS: Readonly<Record<DecisionKey, string>> = Object.
   credentials: 'the logins it needs (**Credentials:**) and whether a missing one parks a phase (**Credential policy:**)',
   accounts: 'which accounts may spend, each with a headroom floor (**Accounts:** `id:min`)',
   mcp: 'the MCP servers, and what a phase does when one will not connect (**MCP policy:**)',
-  gates: 'a Gate-check on every *(GATED)* heading, and whether human gates are delegated',
+  gates: 'a Gate-check on every *(GATED)* heading, and whether an overdue gate is delegated (a manual gate never is)',
   'verification.person-check': 'allow, halt, or an owner when a §Verification line is prose (- **Person-check:**)',
   'qa.exhausted': 'waive, halt, or an owner when the QA rounds run out (**QA exhausted:**; skip when QA is off)',
   waits: 'each expected external wait, its --watch ref and its maximum (**Wait budget:**, - **Waits on:**)',

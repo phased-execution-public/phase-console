@@ -289,7 +289,7 @@ function ApprovalCard({
       {/* The plan already spoke about publishing (#112): the row this call was
           checked against, and why it did not cover it — so a person sees what
           the plan allows before answering what it does not. */}
-      {approval.manifest && approval.manifest.answer !== 'allow' && (
+      {approval.manifest && approval.manifest.answer === null && (
         <p className="mt-3 text-sm text-ink-muted" title={approval.manifest.value}>
           Checked against this plan&rsquo;s permission.destructive row, which does not cover it:{' '}
           {approval.manifest.why}.

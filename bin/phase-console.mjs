@@ -318,7 +318,7 @@ if (args[0] === 'run') {
 // runs this predicate against every agent flag and every capability flag.
 const FLEET_VERBS = new Set([
   'list', 'open', 'stop', 'restart', 'status', 'log', 'logs', 'update', 'remove',
-  'autostart', 'profile', 'fleet',
+  'autostart', 'profile', 'fleet', 'capability',
 ]);
 const isAgentFlag = (arg) => /^--(?:un)?install-agent$|^--agent-[a-z][a-z-]*$/.test(arg ?? '');
 if (args[0] === 'start') args.shift();

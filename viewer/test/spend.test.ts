@@ -478,3 +478,22 @@ test('#62: a run re-priced from its ledger reads its corrected figure here — a
   const summary = spendSummary({ runs: [{ ...run, updatedAt: '2026-09-23T00:20:00Z' } as SpendRunView], tz: TZ }, Date.parse('2026-09-23T01:00:00Z'));
   assert.equal(summary.runs[0]?.spentUsd, 34.7);
 });
+
+test('#202: Opus 5 and Opus 5.5 are two models here, each at what it BOOKED — the price check never moves a dollar', () => {
+  // P85's fresh 5.5 session booked the CLI's $14.2217; at the one `opus` row
+  // the console priced it $27.2010 and journalled a false `under`. That line
+  // was evidence only, and stays so: this view sums bookings, per model id.
+  const view = planCost({
+    slug: 'demo',
+    tz: TZ,
+    runs: [costRun('r1', 14.2217 + 27.201, {
+      85: { costUsd: 14.2217, endedAt: JUST_BEFORE, attempts: 1, model: 'claude-opus-5-5[1m]', actualModel: 'claude-opus-5-5' },
+      86: { costUsd: 27.201, endedAt: JUST_BEFORE, attempts: 1, model: 'claude-opus-5' },
+    })],
+  });
+  assert.deepEqual(view.byModel, [
+    { model: 'claude-opus-5', usd: 27.2, phases: 1 },
+    { model: 'claude-opus-5-5', usd: 14.22, phases: 1 },
+  ]);
+  assert.equal(view.residualUsd, 0, 'the phases sum to the run');
+});

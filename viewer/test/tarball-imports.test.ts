@@ -89,6 +89,19 @@ test('bin/run-verb.mjs ships in both tarballs and is dispatched by both bins', (
   assert.match(freeSafeGate, /"bin\/run-verb\.mjs"/, 'assert-tarball.sh must ship it in the free-safe list');
 });
 
+// `viewer/shared/door-model.js` (control-tower phase 129, #218): the table the
+// hook guard `console-forge` reads on every supervised tool call. A packed
+// console without it cannot boot its approvals module, so it ships in BOTH
+// tarballs — the free-safe list, and the free tree's own allowlist.
+test('the owner door\'s table ships wherever the guard that reads it does', () => {
+  const guard = readFileSync(join(repoRoot, 'viewer', 'server', 'runner', 'approvals.ts'), 'utf8');
+  assert.match(guard, /from '\.\.\/\.\.\/shared\/door-model\.js'/, 'the guard reads the one table');
+  const files: string[] = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).files;
+  assert.ok(files.includes('viewer/shared/door-model.js'));
+  const freeSafeGate = readFileSync(join(repoRoot, '.github', 'scripts', 'assert-tarball.sh'), 'utf8').split('!pro:start')[0]!;
+  assert.match(freeSafeGate, /"viewer\/shared\/door-model\.js"/, 'assert-tarball.sh ships it in the free-safe list');
+});
+
 
 
 

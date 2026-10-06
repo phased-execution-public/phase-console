@@ -394,7 +394,7 @@ test('FS-7: rule 7 grants min(asked, remaining) when the declaration names a pol
   assert.match(spent.reason, /budget is spent, so the phase waits on its refs/);
 });
 
-test('FS-7: a spent budget parks the phase WAITING with a `budgets` errand — no failed, no streak, no halt, no rung', async () => {
+test('FS-7: a spent budget parks the phase WAITING on its ref — no failed, no streak, no halt, no rung, no errand while the ref polls', async () => {
   // A one-minute budget and a floor of two: the declaration names a ref the
   // clock can poll and still cannot be granted anything.
   const h = harness([1], { budgetLine: '1\tphase' });
@@ -426,19 +426,22 @@ test('FS-7: a spent budget parks the phase WAITING with a `budgets` errand — n
     assert.equal(state.consecutiveFailures, 0, 'a budget is not a failure — even at a maximum of 1');
     assert.notEqual(state.halt?.kind, 'failure-streak');
     assert.notEqual(state.status, 'halted');
-    const errand = state.recoveries?.['1']?.errand;
-    assert.equal(errand?.decisionKey, 'budgets');
-    assert.match(errand?.need ?? '', /more wait budget for phase 1/);
-    assert.match(errand?.how ?? '', /resumes its own session the moment one lands/);
+    // Its ref still polls, so the park is a WAIT on that ref — never an errand
+    // asking a person to re-check by hand (control-tower phase 121, #40).
+    assert.equal(state.recoveries?.['1']?.errand, undefined);
+    assert.match(record.note ?? '', /^waiting on gh:acme\/app#run\/35581228664 — its wait budget is spent/);
     assert.equal(state.recoveries?.['1']?.rungs?.length ?? 0, 0, 'no rung');
     const lines = journal(h.root, state);
     const spent = lines.find((l) => l.event === 'phase.wait-budget-spent');
     assert.equal(spent?.data.parked, true);
+    assert.equal(spent?.data.polling, true);
+    assert.equal(lines.filter((l) => l.event === 'phase.errand').length, 0);
     assert.equal(lines.filter((l) => l.event === 'phase.halted').length, 0);
     assert.equal(lines.filter((l) => l.event === 'run.failure-charged' || l.event === 'run.failure-streak-held').length, 0,
       'the streak is not even asked');
-    // The run parks naming the errand, since nothing else is left to drive.
-    assert.match(state.finishedReason ?? '', /more wait budget/);
+    // The run WAITS on the ref, since nothing else is left to drive.
+    assert.equal(state.status, 'waiting');
+    assert.match(state.finishedReason ?? '', /resumes when gh:acme\/app#run\/35581228664 lands/);
   } finally { h.cleanup(); }
 });
 

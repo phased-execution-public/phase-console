@@ -18,8 +18,17 @@
  *
  * Read from the transcript's tail, incrementally (`TranscriptReader`), because
  * the peer feed asks on every admission scan and a transcript only grows.
+ *
+ * What is NOT evidence (control-tower phase 108): a path under a Claude config
+ * home — `~/.claude/**` (its memory, plans, todos), `~/.claude-*`, the
+ * session's own config dir — is neither the tree nor another repository, so it
+ * holds nothing, renews nothing and says nothing about "elsewhere" (#180); a
+ * bare `git -C <root> …` names no path at all, so it claims nothing (#180); and
+ * a lock the session released — in its own transcript, or by anybody, once its
+ * file is gone — lets go of every lock call before it (#172).
  */
 import { closeSync, existsSync, openSync, readSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 
 import { PHASE_IN_FLIGHT } from '../../shared/run-lifecycle.js';
@@ -37,6 +46,15 @@ import { PEER_CLAIM_WINDOW_MS } from './registry.ts';
  */
 export const UNKNOWN_LEASE_MS = PEER_CLAIM_WINDOW_MS;
 
+/**
+ * How long a `phase-lock.sh … claim` holds its scope with no lock on disk to
+ * show for it (control-tower phase 108, #172): long enough for the console's
+ * lock list to catch up with a claim it has not read yet, and no longer — a
+ * claim whose lock has gone (released by another session, by the console, or
+ * by its lease) holds nothing after it.
+ */
+export const CLAIM_GRACE_MS = 60_000;
+
 /** The transcript tail read on a first look: recent work, never the whole history. */
 const TAIL_BYTES = 4 * 1024 * 1024;
 const MAX_PATHS = 256;
@@ -48,11 +66,13 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const GIT_CHANGING = /\bgit\s+-C\s+("([^"]+)"|'([^']+)'|([^\s;&|]+))\s+(commit|add|rm|mv|checkout|switch|merge|rebase|reset|restore|stash|apply|am|cherry-pick|revert|pull)\b/g;
 const SCRIPT_CALL = /phase-(lock|graph)\.sh\s+([A-Za-z0-9][A-Za-z0-9._-]*)([^;&|\n]*)/g;
 const DOCS_ROOT_SET = /\bDOCS_ROOT=("([^"]+)"|'([^']+)'|([^\s;&|]+))/;
-const LOCK_PHASE = /^\s+(?:claim|conflicts|release|status|mirror)\s+(\d+)/;
+const LOCK_PHASE = /^\s+(claim|conflicts|release|status|mirror)\s+(\d+)/;
 const LOCK_SCOPE = /--scope(?:=|\s+)("([^"]*)"|'([^']*)'|([^\s;&|]+))/;
 
+/** A `phase-lock.sh` verb that names a phase. */
+export type LockVerb = 'claim' | 'conflicts' | 'release' | 'status' | 'mirror';
 export type Touch = { path: string; dir?: true; at?: number };
-export type PlanTouch = { slug: string; docsRoot?: string; phase?: number; scope?: string[]; at?: number };
+export type PlanTouch = { slug: string; docsRoot?: string; phase?: number; verb?: LockVerb; scope?: string[]; at?: number };
 export type SessionTouches = { paths: Touch[]; plans: PlanTouch[] };
 
 /** How a session's scope was read — the words the queue and the run card show. */
@@ -100,12 +120,12 @@ export function touchesOf(jsonl: string): SessionTouches {
       for (const m of command.matchAll(SCRIPT_CALL)) {
         const rest = m[3] ?? '';
         const lock = m[1] === 'lock';
-        const phase = lock ? LOCK_PHASE.exec(rest)?.[1] : undefined;
+        const call = lock ? LOCK_PHASE.exec(rest) : null;
         const scope = lock ? quoted(rest.match(LOCK_SCOPE), 1) : undefined;
         out.plans.push({
           slug: m[2]!,
           ...(docsRoot ? { docsRoot } : {}),
-          ...(phase ? { phase: Number(phase) } : {}),
+          ...(call ? { phase: Number(call[2]), verb: call[1] as LockVerb } : {}),
           ...(scope ? { scope: parseScope(scope) } : {}),
           ...stamp,
         });
@@ -438,6 +458,31 @@ const newestStart = (record: { startedAt?: string; resumedAt?: string }): number
 };
 
 /**
+ * Claude's own files, wherever they are (control-tower phase 108, #180): a
+ * config home directly under the user's home — `~/.claude` (memory, plans,
+ * todos, projects), `~/.claude-<name>`, `~/.claude.json` — and the session's
+ * own config dir (a profile's, under the console's state). A session writes
+ * there as it works, whatever repository it works in, so a path there is no
+ * evidence of the tree and none of another one either.
+ */
+function claudeOwn(path: string, home: string, configDir: string | undefined): boolean {
+  const target = resolve(path);
+  const base = resolve(home);
+  if (target.startsWith(base + sep)) {
+    const first = target.slice(base.length + 1).split(sep)[0] ?? '';
+    if (/^\.claude(?:\.json|-[^/]*)?$/.test(first)) return true;
+  }
+  if (configDir) {
+    const dir = resolve(configDir);
+    if (target === dir || target.startsWith(dir + sep)) return true;
+  }
+  return false;
+}
+
+/** `HH:MMZ` — when a touch was, for the card. */
+const clock = (at: number | undefined): string => (at != null && Number.isFinite(at) ? ` at ${new Date(at).toISOString().slice(11, 16)}Z` : '');
+
+/**
  * What a session holds in `root`, and why.
  *
  * In order: a declared `PE_SCOPE` is its own word; what it touched under the
@@ -447,15 +492,28 @@ const newestStart = (record: { startedAt?: string; resumedAt?: string }): number
  * nothing; and with no evidence at all, the unknown lease: what its cwd could
  * reach (a repository's token, else `all`) until `UNKNOWN_LEASE_MS` after its
  * newest start, and nothing after. The cwd is never evidence past the lease.
+ *
+ * Three things are not evidence of anything (control-tower phase 108): a path
+ * under a Claude config home (`claudeOwn` — #180's memory writes); a bare
+ * `changed .`, a git verb at the root that names no path (#180); and a lock
+ * call the session has let go of — a later `release` of the same phase, or a
+ * `claim` whose lock is gone past `CLAIM_GRACE_MS` (#172). A release holds
+ * nothing itself, and a session whose only lock calls were let go of holds
+ * nothing rather than the unknown lease: it claimed, and let go. The evidence
+ * names only what the hold rests on, newest first, with when.
  */
 export function inferSessionScope(input: {
   root: string;
-  record: { scope?: string; cwd: string; startedAt?: string; resumedAt?: string };
+  record: { scope?: string; cwd: string; startedAt?: string; resumedAt?: string; configDir?: string };
   touches: SessionTouches | null;
   /** This root's plans: a phase's scope, `[]` for a plan with no phase named, undefined for a plan it does not have. */
   planScope?: (slug: string, phase?: number) => string[] | undefined;
   /** Is this directory a checkout of its own? Defaults to "has a `.git`". */
   isRepository?: (dir: string) => boolean;
+  /** Is this plan phase's lock on disk right now? Absent: nobody asked, and a claim holds by its own word. */
+  lockHeld?: (slug: string, phase: number) => boolean;
+  /** The user's home, where the Claude config homes are. Defaults to `os.homedir()`. */
+  home?: string;
   now: number;
 }): InferredScope {
   const { record, now } = input;
@@ -464,9 +522,15 @@ export function inferSessionScope(input: {
 
   const roots = spellings(input.root);
   const own = normalizeToken(basename(roots[0]!)) || 'all';
+  const home = input.home ?? homedir();
   const inside: string[] = [];
-  const evidence: string[] = [];
-  const note = (line: string): void => { if (evidence.length < MAX_EVIDENCE && !evidence.includes(line)) evidence.push(line); };
+  /** What a hold rests on — touches under the root, with when. */
+  const held: { line: string; at?: number }[] = [];
+  /** Where else it works, for an `elsewhere` card. */
+  const away: string[] = [];
+  /** The lock calls it let go of, for a `nothing` card. */
+  const letGo: string[] = [];
+  const note = (list: string[], line: string): void => { if (list.length < MAX_EVIDENCE && !list.includes(line)) list.push(line); };
   let lastTouch = Number.NEGATIVE_INFINITY;
   let elsewhere = false;
   const hold = (token: string, at: number | undefined): void => {
@@ -476,29 +540,60 @@ export function inferSessionScope(input: {
 
   for (const touch of input.touches?.paths ?? []) {
     const rel = under(roots, touch.path);
-    if (rel === null) { elsewhere = true; note(`${touch.dir ? 'changed' : 'edited'} ${touch.path}`); continue; }
-    hold(tokenOf(rel, Boolean(touch.dir), own), touch.at);
-    note(`${touch.dir ? 'changed' : 'edited'} ${rel || '.'}`);
-  }
-  for (const plan of input.touches?.plans ?? []) {
-    if (plan.docsRoot && under(roots, plan.docsRoot) === null) {
+    if (rel === null) {
+      if (claudeOwn(touch.path, home, record.configDir)) continue;
       elsewhere = true;
-      note(`named plan ${plan.slug} in ${plan.docsRoot}`);
+      note(away, `${touch.dir ? 'changed' : 'edited'} ${touch.path}`);
       continue;
     }
-    const scope = plan.scope?.length ? plan.scope : input.planScope?.(plan.slug, plan.phase);
-    if (scope === undefined) { elsewhere = true; note(`named plan ${plan.slug}, not a plan of this root`); continue; }
-    for (const token of scope) hold(token, plan.at);
-    if (scope.length) note(`named ${plan.slug}${plan.phase != null ? ` P${plan.phase}` : ''}`);
+    // `git -C <root> …` names no path: it is no evidence of WHERE it worked.
+    if (touch.dir && rel === '') continue;
+    hold(tokenOf(rel, Boolean(touch.dir), own), touch.at);
+    held.push({ line: `${touch.dir ? 'changed' : 'edited'} ${rel}`, ...(touch.at != null ? { at: touch.at } : {}) });
   }
 
+  const plans = input.touches?.plans ?? [];
+  // The last release of each phase this transcript names: every lock call on
+  // that phase before it has been let go of.
+  const released = new Map<string, number>();
+  plans.forEach((plan, i) => { if (plan.verb === 'release' && plan.phase != null) released.set(`${plan.slug}#${plan.phase}`, i); });
+  plans.forEach((plan, i) => {
+    if (plan.docsRoot && under(roots, plan.docsRoot) === null) {
+      elsewhere = true;
+      note(away, `named plan ${plan.slug} in ${plan.docsRoot}`);
+      return;
+    }
+    const named = `${plan.slug}${plan.phase != null ? ` P${plan.phase}` : ''}`;
+    const ours = plan.scope?.length ? plan.scope : input.planScope?.(plan.slug, plan.phase);
+    if (plan.verb === 'release' || (plan.phase != null && (released.get(`${plan.slug}#${plan.phase}`) ?? -1) > i)) {
+      if (ours === undefined) { elsewhere = true; note(away, `named plan ${plan.slug}, not a plan of this root`); return; }
+      if (plan.verb === 'release') note(letGo, `released ${named}`);
+      return;
+    }
+    if (plan.verb === 'claim' && plan.phase != null && input.lockHeld && !input.lockHeld(plan.slug, plan.phase)
+      && !(plan.at != null && now - plan.at < CLAIM_GRACE_MS)) {
+      if (ours !== undefined) note(letGo, `claimed ${named}, and its lock has gone`);
+      return;
+    }
+    if (ours === undefined) { elsewhere = true; note(away, `named plan ${plan.slug}, not a plan of this root`); return; }
+    for (const token of ours) hold(token, plan.at);
+    if (ours.length) held.push({ line: `named ${named}`, ...(plan.at != null ? { at: plan.at } : {}) });
+  });
+
   if (inside.length) {
+    // Newest first, each line once, with when: what is keeping the hold alive leads.
+    const evidence: string[] = [];
+    for (const { line, at } of [...held].sort((a, b) => (b.at ?? Number.NEGATIVE_INFINITY) - (a.at ?? Number.NEGATIVE_INFINITY))) {
+      if (evidence.length >= MAX_EVIDENCE) break;
+      if (!evidence.some((said) => said.startsWith(`${line} at `) || said === line)) evidence.push(`${line}${clock(at)}`);
+    }
     const since = Number.isFinite(lastTouch) ? lastTouch : newestStart(record);
     const leaseUntil = (Number.isFinite(since) ? since : now) + PEER_CLAIM_WINDOW_MS;
     if (now >= leaseUntil) return { scope: [], basis: 'nothing', evidence };
     return { scope: inside, basis: 'touched', leaseUntil, evidence };
   }
-  if (elsewhere) return { scope: [], basis: 'elsewhere', evidence };
+  if (letGo.length) return { scope: [], basis: 'nothing', evidence: letGo };
+  if (elsewhere) return { scope: [], basis: 'elsewhere', evidence: away };
 
   const start = newestStart(record);
   const leaseUntil = start + UNKNOWN_LEASE_MS;

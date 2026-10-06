@@ -107,7 +107,9 @@ rail's grouping — a slim 80 px rail, a glyph over each name — and the situat
 header on every page. The phone tab bar is its own list, `TAB_BAR` in `app/shell/nav.ts` (Runs ·
 Plans · Sessions · Insights), and the rest are the More sheet.
 `Repo` and `Debug` are 4.0's additions, both built: Repo is six sections over the `GET /api/repo/…`
-and `GET /api/issues` surfaces (`features/repo/` — the sixth is the issues estate), Debug is every
+and `GET /api/issues` surfaces (`features/repo/` — the sixth is the Issues desk: since control-tower
+phase 118 a repository's WHOLE issue list, each issue's category, severity and plan status derived once
+in `shared/issues-model.js`, plus any GitHub `owner/name` an operator adds, read-only), Debug is every
 log this console writes on one time axis plus the redacted bundle (`features/debug/`). `views/` is gone;
 a page lives in `client/src/features/<destination>/`. Overlays (`?k=` palette, `?help=`, `?bell=`)
 are query params, never routes: open ⟺ the URL says so, so navigating anywhere closes them.
@@ -302,8 +304,16 @@ rather than refusing.
   timeout of the workflow it watches — told through `PE_WAIT_TIMEOUTS`, `<ref>=<minutes>` pairs the
   console resolves once per `gh:…#run/<id>` (`watch-refs.ts`); unset is off, set but empty an answer.
   **F38** (`human-step-no-proof`, control-tower phase 41) names a `- **Human step:**` with no `proof:`
-  ref. The advisory family is therefore F15–F19, F22–F23, F28, F30, F32–F36 and F38 — fifteen ids; F14
-  gates, and so do F26 (`note-target-unknown`), F27 (`land-word-unknown`), F29
+  ref. **F39** (`setup-deps-missing`, control-tower phase 106, #185) names a §Verification line that
+  runs a package-manager script or a `.venv/bin/*` binary in a repository the phase's resolved Setup
+  installs nothing for — a run's isolated checkout mounts every repository as a fresh worktree with no
+  `node_modules` or `.venv`, so the line is red at baseline before it tests anything. The line's
+  repository is its `**Verify in:**` (the same reader `--verify-in N` prints), moved by a `cd` and
+  the package manager's own directory flag; Setup is resolved from the SAME directory, because the
+  runner hands both one cwd, and an install counts only for its own ecosystem. Its word lists stay in
+  `phase-graph.sh`, not `verify.env`: no runtime reader asks them. The advisory family is therefore
+  F15–F19, F22–F23, F28, F30, F32–F36, F38 and F39 — sixteen ids; F14 gates, and so do F26
+  (`note-target-unknown`), F27 (`land-word-unknown`), F29
   (`landed-gate-unknown-phase`), F31 (`permission-mode-unknown`, control-tower phase 11): a
   `Permission mode:` line or bullet whose word is not one of `scripts/permission.env`'s, which the
   reader falls through exactly as F27's do — and F37 (`human-step-superseded`,
@@ -537,12 +547,13 @@ credentials, attach them to plans and phases — *reading* the registry, the sta
 needs no flag), `--allow-webhooks` (POST every announcement to the URLs you register — Slack, Discord,
 Telegram, your own relay; one of the two that send anything off the machine, and *reading* the
 destination list needs none), `--allow-publish` (push a finished phase's `pe/*` branch — never a trunk, never
-with force — and file issues on the repository's behalf, where a plan's `permission.destructive` row and
-`Issues:` line allow it; off means no push and no issue — the other outward-reaching flag, and the only
-one that writes to a repository somebody else reads). All eight default off — the set is `CAPABILITY_FLAGS` in
-`server/config.ts`, and `viewer/test/skill-sync.test.ts` holds this paragraph's count to it. Shut down
-is deliberately *not* behind a flag. One flag switches something OFF rather than on: `--no-converge`
-stops the convergence loop's automatic triggers; it is not a capability flag and is not one of the eight.
+with force — where a plan's `permission.destructive` row allows it; off means no push — the other
+outward-reaching flag, and the only one that writes to a repository somebody else reads). All eight default
+off — the set is `CAPABILITY_FLAGS` in `server/config.ts`, and `viewer/test/skill-sync.test.ts` holds this
+paragraph's count to it.
+Shut down is deliberately *not* behind a flag. One flag switches something OFF rather than on:
+`--no-converge` stops the convergence loop's automatic triggers; it is not a capability flag and is not one
+of the eight.
 
 ## Packaging, versions and releases
 

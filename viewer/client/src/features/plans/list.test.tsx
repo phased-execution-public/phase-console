@@ -658,6 +658,13 @@ beforeEach(() => {
 });
 
 describe('the plans page', () => {
+  it('links "Plan from issues" to the Issues desk — one move from the plans to the issues they fix', async () => {
+    const { default: PlansView } = await import('./index');
+    mount(<PlansView />);
+    const link = await screen.findByRole('link', { name: /plan from issues/i });
+    expect(link.getAttribute('href')).toBe('#/repo/issues');
+  });
+
   it('renders a title as text, not as markdown source', async () => {
     const { default: PlansView } = await import('./index');
     mount(<PlansView />);

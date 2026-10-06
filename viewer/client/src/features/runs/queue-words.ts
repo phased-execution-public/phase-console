@@ -55,6 +55,21 @@ export function sessionHolderText(holder: QueueHolder): string {
 }
 
 /**
+ * What a terminal's hold rests on, in one line (control-tower phase 108, #180):
+ * the console's reading of its transcript — paths under the root, newest
+ * first, with when. A hold that should not be there (a memory write, a git
+ * verb at the root) read as "waiting on a session" and nothing else; this is
+ * the line that lets a person tell a real edit from a wrong reading before
+ * pressing Release. Only a `touched` hold has one — a declared scope and the
+ * unknown lease are already said by `sessionHolderText`.
+ */
+export function holderEvidenceText(holder: QueueHolder): string | null {
+  if (holder.scopeBasis !== 'touched') return null;
+  const lines = (holder.evidence ?? []).filter(Boolean);
+  return lines.length ? `held because it ${lines.join('; ')}` : null;
+}
+
+/**
  * A sibling run's BRANCH on a shared checkout (control-tower phase 40, #41) —
  * the run, the branch and the repository. "Waiting on beta" alone reads as a
  * lock beta could release; this wait lifts when beta's tree leaves the branch

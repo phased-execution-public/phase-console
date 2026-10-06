@@ -261,10 +261,10 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    **`Issues:`** `off|draft|file` (`--issues [N]`, and the `issues` manifest row) is the outward-write
    directive and defaults to `off`, because opening an issue on somebody's repository is not something
    a plan that never considered the question should start doing. `draft` is the recommended answer:
-   the session writes, the console holds it in the inbox, a person approves. Budgets are three per
-   phase and ten per run — small on purpose, since a phase with four things to report has found a
-   CLASS of problem, and a class is one issue with four bullets. The two shapes, plan-wide in
-   §Session budget and per phase under its `### Phase N`:
+   the session writes, the console holds it in the inbox, a person approves. A session's budget is
+   three drafts a phase — small on purpose, since a phase with four things to report has found a
+   CLASS of problem, and a class is one issue with four bullets; a fourth is held for a person rather
+   than dropped. The two shapes, plan-wide in §Session budget and per phase under its `### Phase N`:
    > **Issues:** draft
    ```
    ### Phase 7 — Migrate the billing job
@@ -281,14 +281,21 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    window: <duration>` and `- **Person-check:** allow|halt|<owner>` refine
    the `waits`, `human-acts` and `verification.person-check` rows for that phase alone. `Waits on:`
    names what the phase waits on and, after the `·`, overrides the budget for that phase; a `date:` ref
-   there countersigns a wait up to that instant. Past what is left, a wait naming a ref the console can
+   there countersigns a wait up to that instant, and beside a live ref it is that wait's BACKSTOP
+   (#181): the live ref wakes the phase the moment it lands, the date only bounds the wait. Past what is left, a wait naming a ref the console can
    watch is given what is left, and one naming none parks on a spent budget with a `budgets` errand —
    never a failure — whose arithmetic names these two lines as the way to give it more
    (`phase-graph.sh <slug> --wait-budget N` / `--waits-on N` print what it reads). Since control-tower
    phase 14 (#40) those two lines have a writer: `scripts/wait-budget.sh <slug> [--phase N [--ref REF]…]
    <max>` rewrites the phase's `Waits on:` max (keeping its refs and any note) or the plan's
    `Wait budget:` line, idempotently, and proves it by the engine's read-back — it is what the console's
-   one-press raise runs, behind `--allow-writes`. The lint holds a `Waits on:` max to the timeout of the
+   one-press raise runs, behind `--allow-writes`. The NUMBER of waits a phase may declare is raised
+   the same way (control-tower phase 121, #40): `**Wait count:** <n>` in §Session budget, or
+   `- **Wait count:** <n>` on the phase, a whole number from 1 to 99 over the console's four — read back
+   with `phase-graph.sh <slug> --wait-count [N]` (`n<TAB>phase|plan`, the phase's bullet over the plan's
+   line) and written by `scripts/wait-budget.sh <slug> [--phase N] --count <n>`. A park on a spent count
+   or a spent budget whose watch ref still polls is a WAIT on that ref — the run reads `waiting`, on that
+   ref — never an errand to re-check it by hand. The lint holds a `Waits on:` max to the timeout of the
    workflow it watches (**F36** `wait-window-short`, advisory): a window shorter than the job it waits
    on can never outlast it. The timeouts are the console's, told through `PE_WAIT_TIMEOUTS` —
    whitespace-separated `<ref>=<minutes>` pairs, resolved once per `gh:…#run/<id>` (a job with no
@@ -296,20 +303,28 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    **A person's turn, declared by the plan (control-tower phase 41).** A phase names each act only a
    person can do on its own bullet, so the launch door can ask for it before anything spawns:
    `- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any ·
-   window: <duration> [· auto-open: host] [· credential: <id>]`. The kind and what to do are
+   window: <duration> [· auto-open: host] [· credential: <id>] [· due: <ref>]`. The kind and what to do are
    positional; every later field is `key: value`, in any order, a value in one pair of backticks read
-   without them. The kind is one of sixteen (`scripts/human-steps.env`, owner
+   without them. The kind is one of seventeen (`scripts/human-steps.env`, owner
    `viewer/shared/human-step-model.js`): `browser-login`, `device-code`, `one-time-code`,
    `secret-entry`, `claude-login`, `mcp-login`, `os-prompt`, `os-permission`, `third-party-approval`,
    `physical`, `person-check`, `decision`, `protected-path`, `interactive-prompt`, `captcha`,
-   `email-link`. `where` defaults to the kind's; `open:` is an http(s) link or a command for the
+   `email-link`, `operator-act` — the last the general act only the operator does, a command to run or
+   a click path to follow (control-tower phase 121, #182). `where` defaults to the kind's; `open:` is an http(s) link or a command for the
    terminal; `proof:` is a watch ref (`cmd:`, `gh:`, …); `window:` a duration; `auto-open: host` lets
    the step open by itself on the machine — a PLAN's step only, never a session's; `credential:` is
-   the registry id a `secret-entry` stores under. A phase may carry several. Read back with
-   `phase-graph.sh <slug> --human-steps [N]`. **The 5.1.0 spelling `- **Human step:** <who, what,
+   the registry id a `secret-entry` stores under; `due:` is a watch ref the step waits on before it is
+   due — until it lands the step is `upcoming`, listed under *Coming up*, unannounced and its window
+   not started, and when it lands the step is due with ONE push, `NOW: <command>` (a `due:` that fits no
+   scheme's shape — a date with no time, a `phase:` with no number — fails F37 by name). A phase may carry
+   several. The same bullet under a top-level `## Operator errands` heading is the PLAN's own act —
+   phase `0`, asked at every launch and listed with the rest, e.g.
+   `- **Human step:** operator-act · Publish the release · open: npm publish · proof: cmd:"npm view my-package version" · due: unit:build-box/nightly-build.service`.
+   Read back with `phase-graph.sh <slug> --human-steps [N]` (`0` for the plan's own; a ninth field, the
+   `due:` ref, when the bullet names one). **The 5.1.0 spelling `- **Human step:** <who, what,
    proof ref>` is superseded** — nothing ever parsed it — and fails the lint by name, with the new
    grammar in the sentence (**F37** `human-step-superseded`); so do a kind that is not one of the
-   sixteen (`human-step-kind-unknown`) and a field the grammar does not have
+   seventeen (`human-step-kind-unknown`) and a field the grammar does not have
    (`human-step-field-invalid`). A step with no `proof:` is advised about (**F38**
    `human-step-no-proof`): only a person's word can close it.
    **Spelling the model.** The `**Target model:**` value may be an alias (`opus`), a full id
@@ -443,11 +458,11 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      | Type | Category | Cleared by |
      |------|----------|-----------|
      | `ai <one-line check>` | **ai** | a booted session: it verifies each condition, does the work to make failing ones true, records the clearance (`gate-approve.sh`), then implements. A person may also approve. **The default — bias here.** |
-     | `manual <who/what>` | **human** | a person doing the numbered Gates steps, then approving (console Gate card, or `gate-approve.sh`) |
+     | `manual <who/what>` | **human** | a PERSON doing the numbered Gates steps, then approving — the console's Gate card, or `gate-approve.sh` in their own terminal. Never a session, whatever the plan's `gates` row says (see below). |
      | `date YYYY-MM-DD` | auto | the calendar (opens on that date) |
      | `deadline YYYY-MM-DD` / `by …` | auto | staying before the date — after it, `OVERDUE` |
      | `phase N` / `phases N,M,…` | auto | those phases of THIS plan reaching verified |
-     | `plan <slug>:<phases>` | auto | those phases of ANOTHER plan reaching done |
+     | `plan <slug>:<phases>` | auto | those phases of ANOTHER plan reaching verified (`--verified`'s set; `10,11`, `10, 11` and `10 11` read alike) |
      | `cmd <read-only command>` | auto | the command exiting 0 (executed only under `PHASE_EXEC_GATES=1` — the autopilot sets it; page views never do, and answer `unevaluated:` instead) |
      | `landed N` | auto | phase N's row in `docs/handoffs/<slug>/landing.md` reaching the state ITS landing policy ends at (`hold` → `held`, `integrate` → `integrated`, `pr` → `pr-merged`, `trunk` → `landed`) |
      | `pr-merged N` | auto | phase N's row reaching `pr-merged`, whatever its policy says |
@@ -477,6 +492,27 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      `docs/handoffs/<slug>/gate-status.md` that `--gate-status` honours before evaluating anything
      (`--revoke` restores the gate). Commit + push that file — a clearance only exists where it can be
      pulled.
+
+     **`manual` means a person** (control-tower phase 107, #174 — an unattended session once read a
+     plan's "all permissions" as leave to clear a manual gate, wrote its own approval row and changed
+     production data). Whatever the `gates` decision says, a `manual` gate — and a type the engine
+     does not know, which it reads as `manual` — is never delegated to a session, and its approval
+     counts only from a person's DOOR. `gate-approve.sh` names the door from its own environment, never
+     from `--by`, and writes it in `gate-status.md`'s sixth column, `Door`:
+
+     | Door | When |
+     |------|------|
+     | `console` | the console wrote it for a person's press — the Gate card from a browser, a phone's signed Approve, a supervisor-chat act a person confirmed |
+     | `terminal` | stdin is a terminal and no session marker is set — a person at their own shell |
+     | `session` | a Claude session's environment: `PE_OWNER=autopilot/*` or `console/*`, `PE_OUTCOME_FILE`, `PE_SESSION_KIND`, `CLAUDECODE=1` |
+     | `script` | anything else — a pipe, a cron job, a watchdog |
+
+     The script refuses a manual gate from `session` or `script`, and from an `ai-*`, `autopilot*` or
+     `console/*` approver at any door (exit 1, naming the Gate card and the `needs-human --needs gates`
+     declaration); a revoke is taken from any door. `--gate-status` ignores a manual row whose door is
+     not `console` or `terminal` — a five-column row written before the door existed, or a hand edit —
+     and says why. An older five-column table is widened in place on the next write, its rows kept.
+     `ai` gates are unchanged: a session clears one by design, through any door.
    - **Size (optional, drives batching):** tag each phase's rough working-set in its `### Phase N` block —
      `- **Size:** S|M|L` (default `M`; `S` ≤ ~15K, `M` ~15–50K, `L` ~50–120K tokens). Then
      `scripts/phase-graph.sh <slug> --session-plan <model>` forecasts the plan in sessions and, for a
@@ -599,20 +635,22 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      `cmd <observe-only command>`) that clears once the external process lands. A phase that keeps an
      external-clock verification will **park at runtime as `waiting`** instead of failing: the session
      writes an `in-progress` handoff, declares the wait via `scripts/phase-outcome.sh … waiting-external`,
-     and the runner resumes it when the window elapses — capped at 4 waits / 8 h per phase.
+     and the runner resumes it when the window elapses — capped at 4 waits / 8 h per phase, unless
+     the plan raises either (`Wait count:`, `Waits on:` — §Session budget above).
      Two ways to name that window, and **`--until <ISO8601>` is the right one whenever the wall-clock
      moment is what you actually know** ("not before the release lands at 09:00"); `--wait-minutes <M>`
      is for a duration. They are mutually exclusive, and both work with `blocked` and `needs-human` as
      well as `waiting-external` — the clock only decides when the console next brings the phase up, and
      never replaces the ask. Better still where it applies: a `--watch` ref, which the console polls on
-     a clock of its own and which resumes the phase the moment it lands — the same seven schemes a
+     a clock of its own and which resumes the phase the moment it lands — the same eight schemes a
      session's `phase-outcome.sh --watch` takes and a `- **Waits on:**` bullet names:
 
      | Ref | Lands when | Use it for |
      |-----|------------|------------|
      | `gh:<owner/repo>#run/<id>` | the run reaches `completed`, whatever its conclusion | a CI run, a deploy |
      | `gh:<owner/repo>#pr/<n>` | the PR leaves OPEN, merged or closed | a review, an auto-merge |
-     | `date:<ISO8601>` | that instant passes — resolved once, at that instant | "not before 09:00" |
+     | `date:<ISO8601>` | that instant passes — resolved once, at that instant | "not before 09:00"; beside a live ref, only its backstop |
+     | `unit:<host>/<unit>` | the systemd unit on that host leaves `activating`/`active`, its `Result=` and exit time going into the wait history — asked every 5 minutes over one shared ssh connection per host | a job on another machine, `unit:build-box/nightly-build.service`; the host's address, user, key and port come from `hosts.<host>` in `~/.config/phase-console/fleet.json`, and a host not named there is refused |
      | `lock:<slug>/<phase>` | nothing holds that phase's scope any more | somebody ELSE's lock, never your own |
      | `phase:<slug>/<N>` | the console's record of sibling phase N reads done, after its §Verification; un-lands if that phase is reopened | waiting on a sibling — never a `cmd:` grep of its handoff |
      | `verify:<slug>/<N>` | your own red §Verification lines all pass on one branch head, re-run whenever the head moves | your OWN phase, when its blocker is a sibling's red |
@@ -625,6 +663,28 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      Setup before §Verification and never marks the phase red for one, while the same line inside
      §Verification is a command the boarding preflight asks a person to vouch for AND a line that can
      turn a phase red for a reason unrelated to its work.
+     It warns (**F39** `setup-deps-missing`) when a §Verification line runs a **package-manager script
+     or a `.venv/bin/*` binary in a repository the phase's Setup never installs** — `cd hetzner && npm
+     run verify:local` in a phase whose `- **Setup:**` makes only another repository's venv. A run's
+     isolated checkout (a superproject mirror above all) mounts every repository as a fresh worktree
+     with no `node_modules` and no `.venv`, so such a line went red in 1.7 s at its baseline, in a
+     phase whose code was green (#185). The line's repository is its `**Verify in:**` directory, moved
+     by a `cd <dir>` before the command and by the package manager's own directory flag
+     (`npm --prefix`, `pnpm -C`/`--dir`, `yarn --cwd`); a `.venv/bin/<x>` lead means the directory
+     holding that `.venv`. A script run is `npm run|test|start|exec …`, `npx`, `pnpm`/`yarn` running a
+     script, or any `.venv/bin/*` binary — an install inside §Verification is F22's, and `node`,
+     `bash` and `git` are neither. Setup is read the same way **from the same place: the runner runs
+     Setup in the §Verification directory**, so under `Verify in: app/app-frontend` a Setup of
+     `cd app/app-frontend && pnpm install` fails its `cd` and installs nothing (the warning then
+     says where Setup runs). An install counts only for its own ecosystem — `npm ci|install`,
+     `pnpm install`, `yarn install` for a node line; `pip install`, `python3 -m pip install`,
+     `<venv>/bin/pip install`, `uv sync|venv`, `uv pip install`, `python3 -m venv`, `virtualenv`,
+     `poetry install` for a `.venv` one — so a venv made in hetzner is no install for hetzner's npm
+     script. A directory no run mounts (absolute, `~`, above the root) or nobody can place without
+     running the line (`cd "$(…)"`, `cd -`) is not judged, and the warning comes once per repository
+     and ecosystem. Add the install to the phase's `- **Setup:**`, spelled from the Verify-in
+     directory (`npm --prefix viewer ci` under `Verify in: phased-execution`), and the line can be red
+     only for its own reasons.
      It warns (**F23**) when an **expected failure is stated in prose** beside a command —
      "`task verify:local` — expected to fail until Phase 9". The runner executes the command and takes
      its exit code; the sentence is invisible to it, so the phase goes red. Encode the expectation in
@@ -668,8 +728,14 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      Re-checks. A command that *exits* 124 by itself is an ordinary red.
      **A red the phase inherited is not its own.** At its first boarding a phase takes a
      **baseline** — what its §Verification lines read on the tree it boards on, before its session
-     touches it: the last run of each line on that very tree from the plan's verification ledger, or a
-     run made then. At the verdict each red is compared with it, by the failing tests the output
+     touches it: a run of each line on that very tree, under the same environment and in the same
+     directory, that any plan of this console measured in the last day (named with its source run and
+     age), or a run made then. A baseline never holds the boarding: what must be measured runs BESIDE
+     the session, niced and under the machine-load guard, in a clean checkout of the boarding head,
+     and the session hears the result as a next-turn note (a repository git will not export — a
+     superproject — is measured before boarding instead). A baseline red is measured ONCE and never
+     retried — the one recorded retry is the verdict's. The verdict waits for a baseline still running
+     and then compares, exactly as before. At the verdict each red is compared with it, by the failing tests the output
      names (node's spec and TAP reporters, bats' TAP) or, when the output names none, by the whole
      command. A red already in the baseline is recorded **inherited**, with the phase that owns it —
      the phase once charged with it, else the one phase whose sessions committed between the last run
@@ -701,7 +767,12 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      that escapes the root or does not exist falls back to the root with a `phase.verify-in-missing`
      journal line. When a verification fails and the phase's Repos column names one repo that IS a
      directory near the root, the halt suggests this bullet — it never picks a directory on its own,
-     because a wrongly-guessed cwd verifies the wrong tree and reports green.
+     because a wrongly-guessed cwd verifies the wrong tree and reports green. Setup runs in the same
+     directory. Write the label bold (`**Verify in:**`, top-level or nested under `**Verification:**`)
+     and the value as a bare path: an unbolded `Verify in:` is not the field, and a value with prose
+     after it names no directory. Ask the engine: `scripts/phase-graph.sh <slug> --verify-in <N>` (the
+     directory on one line, bold and backticks stripped; an empty line means the root) — the same
+     reader lint F39 places a line with.
    - **Verify timeout:** *(optional)* how long ONE §Verification command of this phase may run before
      the console cuts it — `- **Verify timeout:** 90m` (the first duration after the label: `45m`,
      `2h`, `90 min`). A plan-wide `**Verify timeout:** 60m` in §Session budget covers every phase that
@@ -726,6 +797,10 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      `rm`, `git push`, `terraform apply`, `npm publish` and a script named for a verb of consequence
      stay refused. Each command is bounded at 10 minutes, at most 8 per phase. A plan-wide preamble every phase needs goes on one `**Setup (every phase):**` line
      in §Session budget and is UNIONED with each phase's own bullet, plan first — bring-up is ordered.
+     Setup runs where §Verification runs — the phase's `Verify in:` directory — so a path in it is
+     spelled from there, and it is where a run's fresh checkout gets its dependencies: a phase whose
+     §Verification runs `npm`/`pnpm`/`yarn` scripts or `.venv/bin/*` binaries in a repository needs an
+     install for that repository here (**F39** `setup-deps-missing` names the ones that have none).
      Ask the engine what a phase will actually run: `scripts/phase-graph.sh <slug> --setup <N>`.
    - **Checkout:** *(optional)* which branch this phase's session works ON, when it is not the run's
      own. **One value the console acts on: the default branch** — `main`, `master`, or the word

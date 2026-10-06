@@ -63,10 +63,14 @@ const ORDINARY = [
   'v6.0.0',
 ];
 
-test('sixteen kinds and eight states, frozen, each word once', () => {
-  assert.equal(HUMAN_STEP_KINDS.length, 16);
-  assert.equal(new Set(HUMAN_STEP_KINDS).size, 16);
-  assert.deepEqual([...HUMAN_STEP_STATES], ['declared', 'notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']);
+test('seventeen kinds and nine states, frozen, each word once', () => {
+  assert.equal(HUMAN_STEP_KINDS.length, 17);
+  assert.equal(new Set(HUMAN_STEP_KINDS).size, 17);
+  // The seventeenth (control-tower phase 121, #182): an act only the operator
+  // does — a command or a click path — with a moment it becomes due.
+  assert.equal(HUMAN_STEP_KINDS[16], 'operator-act');
+  // The ninth state comes FIRST: `upcoming` is a step born before it is due.
+  assert.deepEqual([...HUMAN_STEP_STATES], ['upcoming', 'declared', 'notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']);
   for (const list of [HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_WHERE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BIRTHS, HUMAN_STEP_BULLET_KEYS]) {
     assert.ok(Object.isFrozen(list), 'a vocabulary is frozen');
   }
@@ -75,12 +79,12 @@ test('sixteen kinds and eight states, frozen, each word once', () => {
   assert.deepEqual([...HUMAN_STEP_BIRTHS], ['plan', 'session', 'console']);
 });
 
-test('the open and settled states partition the eight', () => {
+test('the open and settled states partition the nine', () => {
   assert.deepEqual([...HUMAN_STEP_OPEN_STATES, ...HUMAN_STEP_SETTLED_STATES], [...HUMAN_STEP_STATES]);
-  assert.deepEqual([...HUMAN_STEP_OPEN_STATES], ['declared', 'notified', 'opened', 'checking']);
+  assert.deepEqual([...HUMAN_STEP_OPEN_STATES], ['upcoming', 'declared', 'notified', 'opened', 'checking']);
 });
 
-test('KIND_META is total over the sixteen kinds — icon, label, default where, proof hint', () => {
+test('KIND_META is total over the seventeen kinds — icon, label, default where, proof hint', () => {
   assert.deepEqual(Object.keys(KIND_META).sort(), [...HUMAN_STEP_KINDS].sort());
   const labels = new Set<string>();
   for (const kind of HUMAN_STEP_KINDS) {
@@ -94,7 +98,7 @@ test('KIND_META is total over the sixteen kinds — icon, label, default where, 
     assert.ok(meta.proof.length > 8, `${kind}: a proof hint a person can act on`);
   }
   // The catalogue's own column: the machine-bound kinds are `host`.
-  for (const kind of ['browser-login', 'one-time-code', 'claude-login', 'mcp-login', 'os-prompt', 'os-permission', 'protected-path', 'interactive-prompt'] as const) {
+  for (const kind of ['browser-login', 'one-time-code', 'claude-login', 'mcp-login', 'os-prompt', 'os-permission', 'protected-path', 'interactive-prompt', 'operator-act'] as const) {
     assert.equal(KIND_META[kind].where, 'host', kind);
   }
   for (const kind of ['device-code', 'secret-entry', 'third-party-approval', 'person-check', 'decision', 'captcha', 'email-link'] as const) {
@@ -106,7 +110,16 @@ test('the state machine: open states reach every settled one, and nothing leaves
   assert.deepEqual(Object.keys(HUMAN_STEP_TRANSITIONS), [...HUMAN_STEP_STATES]);
   for (const from of HUMAN_STEP_OPEN_STATES) {
     for (const to of HUMAN_STEP_SETTLED_STATES) assert.ok(canTransition(from, to), `${from} → ${to}`);
-    assert.ok(!canTransition(from, 'declared'), `${from} → declared: a step is declared once`);
+    // `upcoming → declared` is the one road into `declared` after a birth:
+    // the moment the act's due-when ref lands (control-tower phase 121).
+    if (from !== 'upcoming') assert.ok(!canTransition(from, 'declared'), `${from} → declared: a step is declared once`);
+  }
+  assert.ok(canTransition('upcoming', 'declared'), 'an upcoming act becomes due');
+  // Nothing moves INTO upcoming: it is a birth state, unannounced and unreminded.
+  for (const from of HUMAN_STEP_STATES) assert.ok(!canTransition(from, 'upcoming'), `${from} → upcoming must be refused`);
+  // An upcoming act is not opened, reminded or checked in place — it is due first.
+  for (const to of ['notified', 'opened', 'checking'] as const) {
+    assert.ok(!canTransition('upcoming', to), `upcoming → ${to}: it becomes due before anything else happens`);
   }
   for (const from of HUMAN_STEP_SETTLED_STATES) {
     for (const to of HUMAN_STEP_STATES) assert.ok(!canTransition(from, to), `${from} → ${to} must be refused`);

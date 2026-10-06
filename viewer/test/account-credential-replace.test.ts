@@ -25,6 +25,8 @@ import type { Exec } from '../server/accounts/credentials.ts';
 process.env.PHASE_CONSOLE_LOG = '';
 
 const { Accounts, meterStateOf } = await import('../server/accounts/index.ts');
+const { Credentials } = await import('../server/accounts/credentials.ts');
+const { ACCOUNTS_DIR } = await import('../server/accounts/store.ts');
 const { recent } = await import('../server/log.ts');
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
@@ -94,9 +96,23 @@ function service(over: Record<string, unknown> = {}) {
     scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null, ...over,
   } as never);
   svc.push.announce = (() => {}) as typeof svc.push.announce;
+  sandboxCredentials(svc, root);
   assert.equal(svc.open(root).ok, true);
   OPEN.push(svc);
   return { svc, root, cleanup: () => { for (const s of OPEN.splice(0)) s.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+/**
+ * Every `service()` keeps its secrets in the state sandbox (control-tower phase
+ * 116, #200). A real `Service` builds its `Accounts` on the real `security`, so
+ * CR-2..CR-4's tokens went into the operator's login keychain on every run —
+ * until the keychain belt refused them. The backend here is the one every
+ * machine but a Mac uses: a 0600 file under the sandboxed `ACCOUNTS_DIR`.
+ */
+function sandboxCredentials(svc: InstanceType<typeof Service>, root: string): void {
+  const accounts = svc.accounts as unknown as Record<string, unknown>;
+  assert.ok(accounts.creds instanceof Credentials, 'Accounts no longer keeps its backend in `creds` — sandbox it where it lives now');
+  accounts.creds = new Credentials(quietExec, 'linux', join(root, 'home'), ACCOUNTS_DIR);
 }
 
 type Captured = { status: number; body: Record<string, unknown> };

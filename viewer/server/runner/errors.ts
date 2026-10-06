@@ -38,6 +38,16 @@ export type Disposition =
   /** The work is unfinished but intact: resume that session with a bigger cap. */
   | { kind: 'resume'; raise: 'budget' | 'turns'; reason: string }
   /**
+   * The API's safeguards flagged a message (control-tower phase 111, #177) —
+   * not the model declining the task. The banner prescribes its own remedy, a
+   * new session or another model, and resuming would re-send the flagged
+   * message; so the runner boards the phase FRESH, then fresh again or on the
+   * next model (`modelPolicy` permitting), and only then asks a person. The
+   * classifier token and the two ids ride along so the false positive can be
+   * reported.
+   */
+  | { kind: 'safeguard-flag'; reason: string; classifier?: string; requestId?: string; messageId?: string }
+  /**
    * Nothing automatic will fix this. Park, notify, wait for a person.
    *
    * `cause: 'usage-window'` marks the one park that IS fixable without a
@@ -586,6 +596,16 @@ export function classify(signal: StopSignal, now = new Date()): Disposition {
     };
   }
 
+  // The API's safeguard banner (control-tower phase 111, #177), read off the
+  // API-error channel, or off the session's text when the stop itself was a
+  // refusal or an API error — never off a believed success, whose prose may
+  // quote it. Before the refusal arm below, which read it as the model
+  // declining the task and parked a twenty-hour run for a false positive.
+  if (!believedSuccess) {
+    const flagged = safeguardFlag(signal);
+    if (flagged) return flagged;
+  }
+
   // Everything below reads the session's PROSE, which is its output as well as
   // its stderr — and a session that did a phase's worth of work and reported
   // success is narrating, not confessing. Measured: a completed phase wrote an
@@ -776,6 +796,37 @@ export function classify(signal: StopSignal, now = new Date()): Disposition {
         : signal.subtype === 'success' && endedByConsole
           ? `the console ended the session (${signal.endedBy}) before its turn was done`
           : signal.subtype ? `session ended: ${signal.subtype}` : `session exited with code ${signal.code ?? '?'}`,
+  };
+}
+
+/**
+ * The API's safeguard banner (control-tower phase 111, #177): "<model>'s
+ * safeguards flagged this message (…/legal/aup). This sometimes happens with
+ * safe, normal conversations. … Try rephrasing the request in a new session or
+ * change your model. … Details: [<classifier>] · Request ID: req_… · Message
+ * ID: msg_…". Either of the first two sentences is the signature.
+ */
+export const SAFEGUARD_BANNER = /safeguards flagged this message|this sometimes happens with safe, normal conversations/i;
+const SAFEGUARD_CLASSIFIER = /Details:\s*`?\[([\w.-]{1,64})\]/;
+const SAFEGUARD_REQUEST = /Request ID:\s*`?(req_[A-Za-z0-9]{6,64})/;
+const SAFEGUARD_MESSAGE = /Message ID:\s*`?(msg_[A-Za-z0-9]{6,64})/;
+
+/** The banner's disposition, when this stop carries it where the API speaks. */
+function safeguardFlag(signal: StopSignal): Extract<Disposition, { kind: 'safeguard-flag' }> | null {
+  const api = signal.apiText ?? '';
+  const stoppedOnApi = signal.stopReason === 'refusal' || signal.terminalReason === 'api_error' || Boolean(signal.isError);
+  const text = SAFEGUARD_BANNER.test(api) ? api : stoppedOnApi && SAFEGUARD_BANNER.test(signal.text ?? '') ? signal.text ?? '' : '';
+  if (!text) return null;
+  const classifier = SAFEGUARD_CLASSIFIER.exec(text)?.[1];
+  const requestId = SAFEGUARD_REQUEST.exec(text)?.[1];
+  const messageId = SAFEGUARD_MESSAGE.exec(text)?.[1];
+  return {
+    kind: 'safeguard-flag',
+    reason: `the API's safeguards flagged the session${classifier ? ` (${classifier})` : ''} — a false positive is likely; `
+      + `a new session is the remedy${requestId ? ` (request ${requestId})` : ''}`,
+    ...(classifier ? { classifier } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(messageId ? { messageId } : {}),
   };
 }
 

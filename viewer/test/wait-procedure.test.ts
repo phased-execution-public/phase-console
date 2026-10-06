@@ -344,8 +344,10 @@ test('(c) a lane whose turn ended with an agent outstanding reads as waiting on 
 
 /**
  * E3, as the stream carries it: the boot turn dispatches an Agent in the
- * background and ends (two API turns); the runner closes stdin; the agent's completion
- * starts a second turn (ONE API turn — `num_turns` restarts); then it exits.
+ * background and ends (two API turns); the agent's completion starts a second
+ * turn (ONE API turn — `num_turns` restarts), stdin closed or not; the runner
+ * holds stdin open while the agent works (control-tower phase 109, #170) and
+ * closes it at that turn's result; then it exits.
  */
 const E3_STUB = `#!/usr/bin/env node
 'use strict';
@@ -366,17 +368,19 @@ process.stdin.on('data', () => {
   say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_2', role: 'assistant',
     stop_reason: 'end_turn', content: [{ type: 'text', text: 'waiting for the reviewer' }] } });
   say({ type: 'result', subtype: 'success', is_error: false, num_turns: 2, total_cost_usd: 0.025, result: 'waiting', session_id: sid });
+  setTimeout(notify, 50);
 });
-process.stdin.on('end', () => {
-  setTimeout(() => {
-    say({ type: 'system', subtype: 'task_notification', task_id: 'a1b2c3d4', tool_use_id: 'toolu_agent', status: 'completed',
-      summary: 'review done', session_id: sid });
-    say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_3', role: 'assistant',
-      stop_reason: 'end_turn', content: [{ type: 'text', text: 'NOTIFIED' }] } });
-    say({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, total_cost_usd: 0.0468, result: 'NOTIFIED', session_id: sid });
-    process.exit(0);
-  }, 50);
-});
+let notified = false;
+function notify() {
+  if (notified) return;
+  notified = true;
+  say({ type: 'system', subtype: 'task_notification', task_id: 'a1b2c3d4', tool_use_id: 'toolu_agent', status: 'completed',
+    summary: 'review done', session_id: sid });
+  say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_3', role: 'assistant',
+    stop_reason: 'end_turn', content: [{ type: 'text', text: 'NOTIFIED' }] } });
+  say({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, total_cost_usd: 0.0468, result: 'NOTIFIED', session_id: sid });
+}
+process.stdin.on('end', () => { notify(); setTimeout(() => process.exit(0), 20); });
 `;
 
 test('(d) a later result whose num_turns restarts is a new turn, and turns sum across them', async () => {
@@ -399,10 +403,14 @@ test('(d) a later result whose num_turns restarts is a new turn, and turns sum a
   // The background task, as the Stop hook and liveness need it: its type and the tool that started it.
   const background = events.filter((event) => event.kind === 'background');
   assert.deepEqual(background, [
-    { kind: 'background', op: 'started', taskId: 'a1b2c3d4', taskType: 'local_agent', tool: 'Agent', description: 'review' },
+    { kind: 'background', op: 'started', taskId: 'a1b2c3d4', taskType: 'local_agent', tool: 'Agent', description: 'review', toolUseId: 'toolu_agent' },
     { kind: 'background', op: 'ended', taskId: 'a1b2c3d4', status: 'completed' },
   ]);
   assert.equal(outcome.signal.backgroundTasks, undefined, 'a task that reported is not left open at exit');
+  // The input was held through the agent's work and closed by the turn it started (#170).
+  const closes = events.filter((event) => event.kind === 'input-closed');
+  assert.equal(closes.length, 1);
+  assert.ok(events.indexOf(closes[0]!) > events.findIndex((event) => event.kind === 'background' && event.op === 'ended'), 'closed after the agent reported');
 });
 
 /* ------------------------------------------------------------------ *

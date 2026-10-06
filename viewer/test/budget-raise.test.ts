@@ -124,8 +124,12 @@ function journal(root: string, runId: string): { event: string; phase?: number; 
     .map((line) => JSON.parse(line) as { event: string; phase?: number; data?: Record<string, unknown> });
 }
 
-/** Phase 2 parked on a spent wait budget: 60m budget, 60m parked, asked for 90m more. */
-function spentWaitRun(root: string): RunState {
+/**
+ * Phase 2 parked on a spent wait budget: 60m budget, 60m parked, asked for 90m
+ * more. With no ref to watch (`watch: []`) it is the `budgets` errand; since
+ * control-tower phase 121 a ref that still polls makes it a wait, with none.
+ */
+function spentWaitRun(root: string, watch: string[] = ['gh:acme/app#run/42']): RunState {
   const state = newRun({ slug: 'alpha', root });
   state.status = 'waiting';
   const record = phaseRecord(state, 2);
@@ -133,11 +137,11 @@ function spentWaitRun(root: string): RunState {
   record.sessionId = 'sess-2';
   record.waitHistory = [{ parkedFrom: new Date(T0 - HOUR).toISOString(), parkedUntil: new Date(T0).toISOString(), resumedAt: new Date(T0).toISOString(), by: 'session' }];
   record.waits = 1;
-  const budget = { budgetMs: HOUR, source: 'phase' as const, countersignedUntil: null, refs: ['gh:acme/app#run/42'] };
+  const budget = { budgetMs: HOUR, source: 'phase' as const, countersignedUntil: null, refs: watch };
   spentBudgetPark(state, 2, {
     ledger: 'budget', refusal: 'the phase needs another 1.5 h parked', budget,
     declared: {
-      status: 'waiting-external', watch: ['gh:acme/app#run/42'], by: 'session',
+      status: 'waiting-external', watch, by: 'session',
       requested: new Date(T0 + 90 * MIN).toISOString(), budget: { ms: HOUR, source: 'phase' }, at: new Date(T0).toISOString(),
     } as never,
     at: new Date(T0).toISOString(),
@@ -184,7 +188,7 @@ test('BR-3: a refused wait states the arithmetic first; the spent-budget errand 
   assert.match(verdict.reason, /its wait budget is 1\.0 h \(this phase's `Waits on:` bullet\)/, 'the old sentence survives behind it');
 
   const root = scratch();
-  const state = spentWaitRun(root);
+  const state = spentWaitRun(root, []);
   const errand = state.recoveries?.['2']?.errand as Record<string, unknown> & { need: string };
   assert.match(errand.need, /^Wait budget spent — 60m wait budget · 60m accrued · 0m left · asked for 90m/);
   assert.match(errand.need, /more wait budget for phase 2/);
@@ -212,9 +216,10 @@ test('BR-3: when the COUNT of declared waits ran out, the headline names the cou
   const { errand } = spentBudgetPark(state, 2, {
     ledger: 'waits', refusal: 'the phase has already declared 4 wait(s) — the most one phase may (4)',
     budget: { budgetMs: 2 * HOUR, source: 'phase', countersignedUntil: null, refs: [] },
-    declared: { status: 'waiting-external', watch: ['gh:acme/app#run/42'], by: 'session', at: new Date(T0).toISOString() } as never,
+    declared: { status: 'waiting-external', watch: [], by: 'session', at: new Date(T0).toISOString() } as never,
     at: new Date(T0).toISOString(),
   });
+  assert.ok(errand, 'nothing it named can be watched, so a person is asked');
   assert.match(errand.need, /^Wait budget spent — 4 declared waits allowed · 4 declared · 0 left/);
   assert.doesNotMatch(errand.need.split(' — it needs')[0], /\dm |\dh /, 'no minutes in the headline: the time budget is not what ran out');
   assert.equal((errand as { budget?: { unit: string } }).budget?.unit, 'waits');
@@ -229,7 +234,7 @@ test('BR-3: when the COUNT of declared waits ran out, the headline names the cou
 
 test('BR-1: the five facts carry {budget, phase, limit, spent, spentOn[]}', () => {
   const root = scratch();
-  const state = spentWaitRun(root);
+  const state = spentWaitRun(root, []);
   const wait = (state.recoveries?.['2']?.errand as { budget?: ReturnType<typeof budgetFact> }).budget!;
   assert.equal(wait.budget, 'wait');
   assert.equal(wait.phase, 2);
@@ -265,7 +270,7 @@ test('BR-1: a spent budget announces under `budget` exactly once, from the runne
   const root = scratch();
   const { svc, announced } = service(root);
   try {
-    const state = spentWaitRun(root);
+    const state = spentWaitRun(root, []);
     const fact = (state.recoveries?.['2']?.errand as { budget: ReturnType<typeof budgetFact> }).budget;
     const onRunnerEvent = (svc as unknown as { onRunnerEvent: (e: string, d: unknown) => void }).onRunnerEvent.bind(svc);
     onRunnerEvent('run:budget', { slug: 'alpha', runId: state.id, phase: 2, state: 'spent', fact });

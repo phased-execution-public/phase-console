@@ -47,6 +47,9 @@ import {
 import {
   ISSUE_MODES, DEFAULT_ISSUES, ISSUE_ACTIONS, ISSUE_STATES, ISSUE_BUDGETS,
   ISSUE_FIELDS, OPERATOR_ISSUE_SCOPE, issueFingerprint,
+  ISSUE_TYPES, ISSUE_SEVERITIES, ISSUE_SEVERITY_MEANINGS, DEFAULT_ISSUE_SEVERITY, ISSUE_SEVERITY_REQUIRED_FOR,
+  ISSUE_LABELS, ISSUE_SEVERITY_LABEL_PREFIX, issueSeverityLabel, SUGGESTION_TYPE, ISSUE_SUGGEST_WORDS,
+  DEFAULT_ISSUE_SUGGEST, ISSUE_REPO_AUTO, ROOT_REPO_KEY, CONSOLE_REPO_KEY,
 } from '../shared/issues-model.js';
 import {
   HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_OPEN_STATES, HUMAN_STEP_WHERE, HUMAN_STEP_AUTO_OPEN,
@@ -230,6 +233,12 @@ test('scripts/issues.env is issues-model.js, word for word', () => {
     ['ISSUE_ACTIONS', ISSUE_ACTIONS],
     ['ISSUE_STATES', ISSUE_STATES],
     ['ISSUE_FIELDS', ISSUE_FIELDS],
+    // What a draft IS and how bad it is (control-tower phase 114).
+    ['ISSUE_TYPES', ISSUE_TYPES],
+    ['ISSUE_SEVERITIES', ISSUE_SEVERITIES],
+    ['ISSUE_SEVERITY_REQUIRED_FOR', ISSUE_SEVERITY_REQUIRED_FOR],
+    ['ISSUE_LABELS', ISSUE_LABELS],
+    ['ISSUE_SUGGEST_WORDS', ISSUE_SUGGEST_WORDS],
   ];
   for (const [name, list] of pairs) {
     const bash = fromBash('issues.env', name);
@@ -238,11 +247,56 @@ test('scripts/issues.env is issues-model.js, word for word', () => {
   }
   assert.equal(fromBash('issues.env', 'DEFAULT_ISSUES'), DEFAULT_ISSUES);
   assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_PHASE'), String(ISSUE_BUDGETS.phase));
-  assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_RUN'), String(ISSUE_BUDGETS.run));
   // The operator door's meters and ledger scope (control-tower phase 12).
   assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_TICKET'), String(ISSUE_BUDGETS.ticket));
   assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_OPERATOR_DAY'), String(ISSUE_BUDGETS.operatorDay));
   assert.equal(fromBash('issues.env', 'OPERATOR_ISSUE_SCOPE'), OPERATOR_ISSUE_SCOPE);
+  // Phase 114: the severity a non-bug defaults to, the label shape, the
+  // suggestion's type, budget and switch, and the repository keys the script
+  // resolves `--repo auto` against.
+  assert.equal(fromBash('issues.env', 'DEFAULT_ISSUE_SEVERITY'), DEFAULT_ISSUE_SEVERITY);
+  assert.equal(fromBash('issues.env', 'ISSUE_SEVERITY_LABEL_PREFIX'), ISSUE_SEVERITY_LABEL_PREFIX);
+  assert.equal(fromBash('issues.env', 'SUGGESTION_TYPE'), SUGGESTION_TYPE);
+  assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_SUGGESTION'), String(ISSUE_BUDGETS.suggestion));
+  assert.equal(fromBash('issues.env', 'DEFAULT_ISSUE_SUGGEST'), DEFAULT_ISSUE_SUGGEST);
+  assert.equal(fromBash('issues.env', 'ISSUE_REPO_AUTO'), ISSUE_REPO_AUTO);
+  assert.equal(fromBash('issues.env', 'ROOT_REPO_KEY'), ROOT_REPO_KEY);
+  assert.equal(fromBash('issues.env', 'CONSOLE_REPO_KEY'), CONSOLE_REPO_KEY);
+  // The rubric itself, in the severities' order — what the script prints when
+  // a bug names no severity, so the session chooses by the owner's words.
+  assert.equal(
+    fromBash('issues.env', 'ISSUE_SEVERITY_RUBRIC'),
+    ISSUE_SEVERITIES.map((level) => `${level}=${ISSUE_SEVERITY_MEANINGS[level]}`).join('|'),
+    'ISSUE_SEVERITY_RUBRIC drifted from ISSUE_SEVERITY_MEANINGS',
+  );
+  // The per-run cap is gone from the script (phase 114) — the console's
+  // per-day filing rate replaces it — and its twin went with it, so no bash
+  // reader can count a run again.
+  assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_RUN'), '', 'issues.env still carries a per-run cap');
+});
+
+test('the issue rubric: three types, four severities worst-first with one meaning each, a bug must say (control-tower phase 114)', () => {
+  assert.deepEqual([...ISSUE_TYPES], ['bug', 'enhancement', 'documentation'], "GitHub's own three type labels");
+  assert.deepEqual([...ISSUE_SEVERITIES], ['critical', 'high', 'medium', 'low'], 'worst first');
+  assert.deepEqual(Object.keys(ISSUE_SEVERITY_MEANINGS), [...ISSUE_SEVERITIES], 'one meaning per level, in order');
+  for (const level of ISSUE_SEVERITIES) {
+    assert.ok(ISSUE_SEVERITY_MEANINGS[level].length > 8, `${level} has no meaning a session can choose by`);
+    assert.doesNotMatch(ISSUE_SEVERITY_MEANINGS[level], /[|=]/, `${level}'s meaning cannot ride the bash twin's separators`);
+  }
+  assert.match(ISSUE_SEVERITY_MEANINGS.critical, /data loss/);
+  assert.match(ISSUE_SEVERITY_MEANINGS.low, /cosmetic/);
+  assert.equal(DEFAULT_ISSUE_SEVERITY, 'low', 'a non-bug that names no severity is low');
+  assert.deepEqual([...ISSUE_SEVERITY_REQUIRED_FOR], ['bug'], 'a bug never files without the rubric\'s word');
+  assert.equal(SUGGESTION_TYPE, 'enhancement');
+  assert.ok((ISSUE_TYPES as readonly string[]).includes(SUGGESTION_TYPE));
+  assert.deepEqual([...ISSUE_LABELS], ['awaiting-plan', 'from-session'], 'the lifecycle labels, never phase-console or a slug');
+  assert.equal(issueSeverityLabel('high'), 'severity:high');
+  assert.equal(`${ISSUE_SEVERITY_LABEL_PREFIX}low`, issueSeverityLabel('low'));
+  assert.deepEqual([...ISSUE_SUGGEST_WORDS], ['off', 'on']);
+  assert.equal(DEFAULT_ISSUE_SUGGEST, 'off', 'operator decision 16: suggestions are off until a person turns them on');
+  assert.equal(ISSUE_REPO_AUTO, 'auto');
+  assert.equal(ROOT_REPO_KEY, 'root');
+  assert.notEqual(CONSOLE_REPO_KEY, ROOT_REPO_KEY);
 });
 
 test('scripts/human-steps.env is human-step-model.js, word for word (control-tower phase 41)', () => {
@@ -284,7 +338,12 @@ test('every key the readers look for is present in each new .env', () => {
       'MESSAGE_KINDS', 'MESSAGE_SCHEMES', 'MESSAGE_DELIVER', 'MESSAGE_PRIORITIES',
       'MESSAGE_STATES', 'MESSAGE_VIAS', 'MESSAGE_REFUSALS', 'MESSAGING_WORDS', 'DEFAULT_MESSAGING',
     ],
-    'issues.env': ['ISSUE_MODES', 'DEFAULT_ISSUES', 'ISSUE_ACTIONS', 'ISSUE_STATES', 'ISSUE_FIELDS'],
+    'issues.env': [
+      'ISSUE_MODES', 'DEFAULT_ISSUES', 'ISSUE_ACTIONS', 'ISSUE_STATES', 'ISSUE_FIELDS',
+      'ISSUE_TYPES', 'ISSUE_SEVERITIES', 'ISSUE_SEVERITY_RUBRIC', 'DEFAULT_ISSUE_SEVERITY', 'ISSUE_SEVERITY_REQUIRED_FOR',
+      'ISSUE_LABELS', 'ISSUE_SEVERITY_LABEL_PREFIX', 'SUGGESTION_TYPE', 'ISSUE_SUGGEST_WORDS', 'DEFAULT_ISSUE_SUGGEST',
+      'ISSUE_BUDGET_SUGGESTION', 'ISSUE_REPO_AUTO', 'ROOT_REPO_KEY', 'CONSOLE_REPO_KEY',
+    ],
     'human-steps.env': [
       'HUMAN_STEP_KINDS', 'HUMAN_STEP_STATES', 'HUMAN_STEP_OPEN_STATES', 'HUMAN_STEP_WHERE', 'HUMAN_STEP_AUTO_OPEN',
       'HUMAN_STEP_BIRTHS', 'HUMAN_STEP_BULLET_KEYS', 'HUMAN_STEP_DEFAULT_WHERE', 'HUMAN_STEP_SECRET_PATTERNS',
@@ -345,8 +404,12 @@ test('an issue fingerprint is stable, and different issues differ', () => {
   assert.equal(issueFingerprint(draft), issueFingerprint({ ...draft, body: 'a different body' }),
     'the BODY is not part of the identity — a session rewording the same finding must dedupe');
   assert.match(issueFingerprint(draft), /^[0-9a-f]{12}$/, 'a short hex digest, like a ruling id');
-  // The operator door's two meters joined in control-tower phase 12 (#30).
-  assert.deepEqual(ISSUE_BUDGETS, { phase: 3, run: 10, ticket: 1, operatorDay: 10 }, 'the option table names these numbers');
+  // The operator door's two meters joined in control-tower phase 12 (#30); the
+  // one suggestion a phase may make in phase 114. The per-run cap of ten is
+  // GONE (phase 115): what bounds the console is `dailyFilings`, the issues and
+  // comments it files by itself in any 24 hours — and a draft past it is held,
+  // never dropped. The script never counted that one, so it has no bash twin.
+  assert.deepEqual(ISSUE_BUDGETS, { phase: 3, suggestion: 1, ticket: 1, operatorDay: 10, dailyFilings: 20 }, 'the option table names these numbers');
 });
 
 test('worktree retention reads its words and its ttl', () => {

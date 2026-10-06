@@ -29,16 +29,17 @@
  */
 
 import {
-  askableRepos, repoByNameWithOwner, repoInventory,
+  repoByNameWithOwner, repoInventory,
   type InventoryRepo,
 } from './inventory.ts';
 import {
-  BODY_FETCH_BUDGET_MS, FAIL_BACKOFF_MS, FRESH_MS, IDLE_POLL_MS, RATE_LIMIT_BACKOFF_MS,
+  BODY_FETCH_BUDGET_MS, FAIL_BACKOFF_MS, FRESH_MS, GH_LIST_TIMEOUT_MS, IDLE_POLL_MS, RATE_LIMIT_BACKOFF_MS,
   fetchBodies, fetchIssues, ghRunner, mergeBodies, readCache, writeCache,
   type GhRunner, type Issue, type IssueCache, type IssueProvenance, type IssueReason,
 } from './fetch.ts';
+import { addedRepoKey, issueReposOf, triageOf } from '../../shared/issues-model.js';
 
-export type { Issue, IssueProvenance, IssueReason } from './fetch.ts';
+export type { Issue, IssueProvenance, IssueReason, IssueTriage } from './fetch.ts';
 export type { GitHubRemote, InventoryRepo } from './inventory.ts';
 export {
   INVENTORY_CAP, askableRepos, parseGitHubRemote, parseOriginUrl, readOriginUrl, repoInventory,
@@ -50,11 +51,20 @@ export const TICKET_ISSUES_MAX = 20;
 /** `owner/repo#123` — the only spelling a ticket may use. */
 export const ISSUE_REF_RE = /^([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100})#(\d{1,12})$/;
 
+/**
+ * A repository the desk lists: the estate's (`root`, `submodule`) or one the
+ * operator ADDED by its `owner/name` (control-tower phase 118) — read and
+ * refreshed like the rest, and outside this console: no checkout, no scope
+ * token, never a ticket's target.
+ */
+type ListedRepo = Omit<InventoryRepo, 'kind' | 'dir'> & { kind: InventoryRepo['kind'] | 'added'; dir?: string };
+
 export type RepoIssues = {
   key: string;
   label: string;
+  /** The plan Repos-column token — empty for an added repository, which no plan of this console can scope. */
   scopeToken: string;
-  kind: InventoryRepo['kind'];
+  kind: ListedRepo['kind'];
   remote?: string;
   nameWithOwner?: string;
   /** `fresh` · `stale` (age shown) · `unknown` (reason shown). */
@@ -117,6 +127,20 @@ export type IssuesStoreOptions = {
    * Joined on every `list()`, never written into the cache.
    */
   provenance?: (nameWithOwner: string, number: number) => IssueProvenance | undefined;
+  /**
+   * Which phases of a LOCAL plan name an issue on their `Fixes:` line
+   * (control-tower phase 118, `fixes.ts`) — what turns "planned in
+   * control-tower" into "planned in control-tower phase 118". Absent: a planned
+   * issue still names its plan, just not the phase.
+   */
+  fixes?: (slug: string, number: number) => readonly number[] | undefined;
+  /**
+   * The `owner/name`s the operator added to the desk (`prefs.issueRepos`) —
+   * re-read on every call, like the inventory, and validated here again
+   * whatever the caller stored. The ONLY way a repository outside the estate
+   * becomes one this console may ask `gh` about.
+   */
+  added?: () => readonly string[];
 };
 
 export class IssuesStore {
@@ -135,10 +159,35 @@ export class IssuesStore {
 
   private get run(): GhRunner { return this.opts.run ?? ghRunner(); }
 
+  /** The LIST call's runner: a whole list of two thousand issues needs `GH_LIST_TIMEOUT_MS`, not one view's budget. */
+  private get listRun(): GhRunner { return this.opts.run ?? ghRunner(process.env, GH_LIST_TIMEOUT_MS); }
+
   /** The estate as it stands. Cheap, and re-read every time — see the header. */
   inventory(): InventoryRepo[] {
     const root = this.opts.root();
     return root ? repoInventory(root) : [];
+  }
+
+  /**
+   * Every repository the desk lists: the estate, then each one the operator
+   * added that the estate does not already hold. Re-read every time.
+   */
+  repos(): ListedRepo[] {
+    const estate: ListedRepo[] = this.inventory();
+    const held = new Set(estate.map((repo) => repo.github?.nameWithOwner.toLowerCase()).filter(Boolean));
+    for (const name of issueReposOf(this.opts.added?.() ?? [])) {
+      if (held.has(name.toLowerCase())) continue;
+      held.add(name.toLowerCase());
+      const [owner, repo] = name.split('/') as [string, string];
+      estate.push({
+        key: addedRepoKey(name),
+        label: name,
+        scopeToken: '',
+        kind: 'added',
+        github: { owner, repo, nameWithOwner: name },
+      });
+    }
+    return estate;
   }
 
   /**
@@ -151,11 +200,11 @@ export class IssuesStore {
    */
   list(): IssuesPayload {
     const at = this.now;
-    const repos = this.inventory().map((repo) => this.rowFor(repo, at));
+    const repos = this.repos().map((repo) => this.rowFor(repo, at));
     return { at, refreshing: this.inFlight.size > 0, repos };
   }
 
-  private rowFor(repo: InventoryRepo, at: number): RepoIssues {
+  private rowFor(repo: ListedRepo, at: number): RepoIssues {
     const base = {
       key: repo.key,
       label: repo.label,
@@ -201,17 +250,26 @@ export class IssuesStore {
         : {}),
       ...(fetchedAt != null ? { fetchedAt, ageMs } : {}),
       ...(cache?.truncated ? { truncated: true } : {}),
-      issues: this.withProvenance(name, cache?.issues ?? []),
+      issues: this.joined(name, cache?.issues ?? []),
     };
   }
 
-  /** The rows with their provenance joined on — a copy, so the cache is never written with one. */
-  private withProvenance(nameWithOwner: string, issues: readonly Issue[]): Issue[] {
+  /**
+   * The rows with what the desk reads joined on — their triage (category,
+   * severity, plan state; control-tower phase 118) and their provenance — as
+   * COPIES, so the cache is never written with either: it holds GitHub's
+   * answer, and a derivation of it is recomputed from the plans as they stand.
+   */
+  private joined(nameWithOwner: string, issues: readonly Issue[]): Issue[] {
     const lookup = this.opts.provenance;
-    if (!lookup) return [...issues];
+    const fixes = this.opts.fixes;
     return issues.map((issue) => {
-      const provenance = lookup(nameWithOwner, issue.number);
-      return provenance ? { ...issue, provenance } : issue;
+      const provenance = lookup?.(nameWithOwner, issue.number);
+      return {
+        ...issue,
+        triage: triageOf(issue, fixes),
+        ...(provenance ? { provenance } : {}),
+      };
     });
   }
 
@@ -223,8 +281,8 @@ export class IssuesStore {
    * Returns the payload as it stands afterwards.
    */
   async refresh(key?: string | null): Promise<IssuesPayload | 'unknown-repo'> {
-    const inventory = this.inventory();
-    let targets: InventoryRepo[];
+    const inventory = this.repos();
+    let targets: ListedRepo[];
     if (key) {
       const repo = inventory.find((entry) => entry.key === key);
       if (!repo) return 'unknown-repo';
@@ -233,7 +291,7 @@ export class IssuesStore {
       // row) is more use than a 404 that says the repository is unknown.
       targets = repo.github ? [repo] : [];
     } else {
-      targets = askableRepos(inventory);
+      targets = inventory.filter((repo) => repo.github);
     }
     await Promise.all(targets.map((repo) => this.fetchOne(repo, true)));
     return this.list();
@@ -251,7 +309,7 @@ export class IssuesStore {
    * "Gentle" has to mean the console spends nothing until asked once.
    */
   async sweep(): Promise<void> {
-    const due = askableRepos(this.inventory()).filter((repo) => this.isDue(repo, false));
+    const due = this.repos().filter((repo) => repo.github && this.isDue(repo, false));
     await Promise.all(due.map((repo) => this.fetchOne(repo, false)));
   }
 
@@ -261,7 +319,7 @@ export class IssuesStore {
    * `discover` is what separates a refresh from a sweep: a repository with no
    * cached data at all is due for the first, never for the second.
    */
-  private isDue(repo: InventoryRepo, discover: boolean): boolean {
+  private isDue(repo: ListedRepo, discover: boolean): boolean {
     const name = repo.github!.nameWithOwner;
     const at = this.now;
     const failure = this.failures.get(name);
@@ -281,7 +339,7 @@ export class IssuesStore {
    * console earns a longer ban rather than a shorter one. The row keeps saying
    * `rate-limited`, so the refusal is visible rather than silent.
    */
-  private fetchOne(repo: InventoryRepo, force: boolean): Promise<void> {
+  private fetchOne(repo: ListedRepo, force: boolean): Promise<void> {
     const name = repo.github!.nameWithOwner;
     const running = this.inFlight.get(name);
     if (running) return running;
@@ -293,10 +351,10 @@ export class IssuesStore {
     return work;
   }
 
-  private async fetchNow(repo: InventoryRepo): Promise<void> {
+  private async fetchNow(repo: ListedRepo): Promise<void> {
     const remote = repo.github!;
     const name = remote.nameWithOwner;
-    const outcome = await fetchIssues(remote, this.run);
+    const outcome = await fetchIssues(remote, this.listRun);
     if (!outcome.ok) {
       // 🔴 The cache is NOT touched. See the fetch.ts header: an unanswerable
       // probe that empties a list turns "we could not ask" into "there is

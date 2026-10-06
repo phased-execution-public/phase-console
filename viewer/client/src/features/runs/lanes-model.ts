@@ -56,6 +56,7 @@ import type {
   PlanDetail,
   PlanSummaryFull,
   RunState,
+  VerifyingLane,
 } from '@/lib/api';
 
 /* ================================================================== *
@@ -163,6 +164,14 @@ export interface NowLane {
   /** The live child, when there is one — a queued lane has none. */
   child?: ChildRef;
   /**
+   * The console's own check on this phase while one runs — its §Verification,
+   * its baseline or a wrap-up's fast gate (`run.verifying`, control-tower
+   * phase 105, #193). A phase whose only live work is a check IS a lane: its
+   * record may still read `pending` (a baseline before boarding), and the run
+   * holds its scope all the same.
+   */
+  check?: VerifyingLane;
+  /**
    * The base the run's branch — and so this lane's — was cut from, as the
    * runner resolved it (`RunState.base`, phase 15). A fact about the RUN,
    * carried on the lane so the branch chip's title can say it without a
@@ -267,14 +276,22 @@ export function nowLanes(
     const detail = details.get(run.slug);
     const phases = new Map((detail?.phases ?? []).map((p: PhaseView) => [p.phase, p]));
     const etas = new Map((detail?.eta?.perPhase ?? []).map((e) => [e.phase, e]));
+    const checks = runChecks(run);
+    const drawn = new Set<number>();
 
     for (const [key, record] of Object.entries(run.phases ?? {})) {
       if (!record || !/^\d+$/.test(key)) continue;
+      const check = checks.get(record.phase);
       // A `done` phase with a QA round in flight IS a lane — the reviewer is a
       // session the run is paying for, and `done` is the only status a review
       // ever runs under. `LANE_STATUSES` itself is left alone: the round is a
-      // marker on the record, not a ninth phase status.
-      if (!LANE_STATUS_SET.has(record.status) && !record.qaSession) continue;
+      // marker on the record, not a ninth phase status. So is a phase the
+      // console is running a check for (control-tower phase 105, #193): a
+      // baseline leaves its record `pending` for as long as it measures, and
+      // that lane was on no surface at all.
+      const laneStatus = LANE_STATUS_SET.has(record.status) || record.qaSession;
+      if (!laneStatus && !check) continue;
+      drawn.add(record.phase);
       const child = run.children?.[key] ?? (run.child?.phase === record.phase ? run.child : undefined);
       const view = phases.get(record.phase);
       out.push({
@@ -284,15 +301,17 @@ export function nowLanes(
         runId: run.id,
         phase: record.phase,
         ...(view?.title ? { title: view.title } : {}),
-        status: record.status,
+        // The check's word for a lane whose record says nothing live yet.
+        status: laneStatus ? record.status : 'verifying',
+        ...(check ? { check } : {}),
         ...(record.lifecycle?.stop ? { stop: record.lifecycle.stop } : {}),
         runStatus: run.status,
         ...((record.model ?? run.model) ? { model: record.model ?? run.model } : {}),
         ...((record.effort ?? run.effort) ? { effort: record.effort ?? run.effort } : {}),
         ...(child ? { child } : {}),
         ...(run.base ? { base: run.base } : {}),
-        ...((child?.startedAt ?? record.startedAt)
-          ? { startedAt: child?.startedAt ?? record.startedAt }
+        ...((child?.startedAt ?? record.startedAt ?? check?.startedAt)
+          ? { startedAt: child?.startedAt ?? record.startedAt ?? check?.startedAt }
           : {}),
         costUsd: record.costUsd ?? 0,
         ...(record.turns != null ? { turns: record.turns } : {}),
@@ -310,9 +329,40 @@ export function nowLanes(
         enriched: view != null,
       });
     }
+    // A check whose phase has no record at all is a lane all the same: the
+    // console is running it, so the run is working.
+    for (const check of checks.values()) {
+      if (drawn.has(check.phase)) continue;
+      const view = phases.get(check.phase);
+      out.push({
+        key: `${run.id}#${check.phase}`,
+        slug: run.slug,
+        planTitle: detail?.summary?.title || run.slug,
+        runId: run.id,
+        phase: check.phase,
+        ...(view?.title ? { title: view.title } : {}),
+        status: 'verifying',
+        check,
+        runStatus: run.status,
+        startedAt: check.startedAt,
+        costUsd: 0,
+        attempts: 0,
+        frozen: false,
+        enriched: view != null,
+      });
+    }
   }
 
   return out.sort((a, b) => laneOrder(a, b, now));
+}
+
+/** A run's live console checks by phase — `run.verifying`, entries that name a phase. */
+export function runChecks(run: Pick<RunState, 'verifying'>): Map<number, VerifyingLane> {
+  const out = new Map<number, VerifyingLane>();
+  for (const check of Object.values(run.verifying ?? {})) {
+    if (check != null && Number.isFinite(check.phase)) out.set(check.phase, check);
+  }
+  return out;
 }
 
 /**

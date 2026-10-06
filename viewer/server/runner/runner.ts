@@ -52,7 +52,7 @@ import {
 } from './freeze.ts';
 import { extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './verify.ts';
 import { loadVerifyEnv, type VerifyEnv } from './verify-env.ts';
-import { localNudgeAfterMs, mintWatchRef, probeSignature, unmintedReason } from './liveness.ts';
+import { knownEndOf, localNudgeAfterMs, mintWatchRef, ownBackgroundWork, probeSignature, unmintedReason } from './liveness.ts';
 import {
   failureContext, resumeBrief, resumeInstruction, unblockBrief, type BriefFacts,
 } from './failure-context.ts';
@@ -80,15 +80,15 @@ import {
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type RunStatus, type VerifySummary, isSessionGone, mergeQaHistory,
-  syncWaitClock, accountPool, type AccountChoice, retirePhaseHalt, owesVerification,
+  syncWaitClock, accountPool, type AccountChoice, retirePhaseHalt, owesVerification, THIS_CONSOLE,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
-import { pollableRefs } from '../watch-refs.ts';
+import { liveRefs, pollableRefs, stillLiveRefs } from '../watch-refs.ts';
 import {
   boundedPlan, planDigest, planHoldOutcome, planTextFile, PLAN_HOLD_GRACE_MS,
   type PlanPresented, type PresentedPlan,
 } from './plan-approval.ts';
-import { runBudgetFact, screenDeclaration, screenedFields, streakFact, type ScreenedDeclaration } from './wait-budget.ts';
+import { REF_WAIT_LOOK_AGAIN_MS, runBudgetFact, screenDeclaration, screenedFields, streakFact, type ScreenedDeclaration } from './wait-budget.ts';
 import { OWN_LOCK_WATCH_REFUSAL, UNDRIVEN_STATUSES } from '../../shared/run-lifecycle.js';
 import { consumeTasks, foldTasks, readTaskEvents, tasksFileFor } from './tasks.ts';
 import {
@@ -109,7 +109,7 @@ import {
 } from './approvals.ts';
 
 import {
-  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, GIT_FIRST_PROBE_MS, GIT_PROBE_MS, LADDER_SEEN_TTL_MS, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_NONE_MAX, LIMIT_NONE_WINDOW_MS, WALL_REPROBE_BACKOFF_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_RESOURCES_EVERY_MS, LIVENESS_TICK_MS, RUN_PROGRESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, RUNNER_LEASE_S, lockStatusHolder, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, LOCAL_JOB_NUDGE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, SILENT_NUDGE, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, GIT_FIRST_PROBE_MS, GIT_PROBE_MS, LADDER_SEEN_TTL_MS, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_NONE_MAX, LIMIT_NONE_WINDOW_MS, WALL_REPROBE_BACKOFF_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_RESOURCES_EVERY_MS, LIVENESS_TICK_MS, RUN_PROGRESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, RUNNER_LEASE_S, lockStatusHolder, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, EXTERNAL_PARK_GRACE_MS, EXTERNAL_WAIT_NUDGE, LOCAL_JOB_NUDGE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, SILENT_NUDGE, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
 } from './runner-core.ts';
 import { contextCheckpointInstruction, contextWrapupNotice, resumePolicyInstruction, resumePolicyWhy, type VettedResume } from './runner-core.ts';
 import { loadModelsEnv, sameModel } from './models.ts';
@@ -170,6 +170,14 @@ function hoursAndMinutes(ms: number): string {
  * #100): the runner, on a session's own usage event — an automatic act, never
  * a person's, so it is not remembered as a choice and never clears one.
  */
+/**
+ * When this console process started, by its own clock — the half of its
+ * `(pid, start time)` identity a lane beat records (control-tower phase 105),
+ * compared with the kernel's start time for the pid by any reader. The same
+ * boot every child this console launches names (`THIS_CONSOLE`, phase 110).
+ */
+const CONSOLE_STARTED_AT = THIS_CONSOLE.bootedAt;
+
 const USAGE_DECISION_ACTOR = Object.freeze({ by: 'runner', via: 'event', origin: 'run.usage-decision', remoteUser: null } as const);
 
 /**
@@ -873,10 +881,25 @@ export class Runner extends RunnerAttempt {
   /** Start the lane's lease keepalive. See `Lane.leaseTimer`. */
   protected armLeaseTimer(lane: Lane, owner: string): void {
     this.clearLeaseTimer(lane);
+    this.beatLane();
     const cadence = this.deps.leaseRefreshMs ?? LEASE_REFRESH_MS;
     const timer = setInterval(() => { void this.refreshLease(lane, owner); }, cadence);
     timer.unref?.();
     lane.leaseTimer = timer;
+  }
+
+  /**
+   * The lane's beat (control-tower phase 105, #173): a lock this console holds
+   * for a lane and keeps refreshing is a lane at work, and the run says so in
+   * a fact any reader can check — this console's own `(pid, start time)` and
+   * when — so a read that does not know the run is live never reclaims it as
+   * `interrupted` mid-Setup, mid-baseline or mid-lint (`laneInFlight`).
+   */
+  private beatLane(): void {
+    const state = this.state;
+    if (!state) return;
+    state.laneBeat = { at: new Date().toISOString(), pid: process.pid, procStartedAt: CONSOLE_STARTED_AT };
+    this.persist();
   }
 
   protected clearLeaseTimer(lane: Lane): void {
@@ -944,6 +967,7 @@ export class Runner extends RunnerAttempt {
       const action = leaseAction(result, owner);
       if (action.act === 'keep') {
         this.record('phase.lock-refreshed', { detail: action.detail.slice(0, 120) }, lane.phase);
+        this.beatLane();
       } else if (action.act === 'retry') {
         // No verdict is not a refusal. The lease has eight missable cadences
         // of headroom, so the next tick is the retry; a lock somebody really
@@ -2582,13 +2606,16 @@ export class Runner extends RunnerAttempt {
       const branch = this.laneNamesFor(0).runBranch;
       // A mirror is N repositories; measuring the superproject would answer
       // for a tree the run never touches and a branch that is not in it.
+      // `live`: this probe runs while the run drives, and a tree a session is
+      // writing into is never handed to `du` (#171) — the card's size waits
+      // for the retention inventory, which measures a kept tree once it rests.
       view = state.mountedRepos?.length
         ? await probeMirrorGit({
           root: state.root, branch, workRoot,
-          mounts: state.mountedRepos, stateRoot,
+          mounts: state.mountedRepos, stateRoot, live: true,
         })
         : await probeRunGit({
-          root: state.root, branch, workRoot, stateRoot,
+          root: state.root, branch, workRoot, stateRoot, live: true,
         });
     } catch (error) {
       log.warn('runner.git-probe', { slug: state.slug, error: (error as Error)?.message ?? String(error) });
@@ -3353,7 +3380,13 @@ export class Runner extends RunnerAttempt {
   private externalWaitRemedy(
     lane: Lane, stall: StallState, thresholds: StallThresholds, now: number,
   ): void {
-    if (stall.scope !== 'local') { this.externalWaitPark(lane, stall, thresholds); return; }
+    // The session's OWN background work is running (control-tower phase 111,
+    // #206): a checkpoint signals its whole process group, and two release
+    // preflights died with one. A wait it holds over that work is judged on the
+    // own-job rungs — a nudge at ten minutes, the park at the local budget —
+    // and the park, when it comes, names the work it ends.
+    if (stall.scope !== 'local' && ownBackgroundWork(lane.signals).length) stall = { ...stall, scope: 'local' };
+    if (stall.scope !== 'local') { this.externalClockRemedy(lane, stall, thresholds, now); return; }
 
     const state = this.state;
     if (!state) return;
@@ -3436,6 +3469,53 @@ export class Runner extends RunnerAttempt {
       since: stall.since,
       scope: 'local',
       parkAfterMs: thresholds.stallLocalJobMs,
+    }, phase);
+    this.persist();
+  }
+
+  /**
+   * An external-clock wait (control-tower phase 111, #179): the session is
+   * told first, and parked only if the call is still open once
+   * `EXTERNAL_PARK_GRACE_MS` has passed since a nudge it RECEIVED in this
+   * episode — the own-job nudge counts too, it said the same thing. A session
+   * that cannot be told is parked at once, as before: nothing else reaches it.
+   * The park used to come at minute five with no word to the session at all.
+   */
+  private externalClockRemedy(
+    lane: Lane, stall: StallState, thresholds: StallThresholds, now: number,
+  ): void {
+    const state = this.state;
+    if (!state) return;
+    if (lane.checkpointed || lane.stopped || lane.frozen) return;
+    if (this.stopRequested || this.abort?.signal.aborted || state.halt) return;
+    if (state.status === 'pausing' || state.status === 'halting' || state.status === 'stopping') return;
+    if (state.status === 'frozen' || state.freeze) return;
+    const phase = lane.phase;
+    const record = phaseRecord(state, phase);
+    const opened = Date.parse(stall.since);
+    const told = [record.stallRemedy?.externalNudgedAt, record.stallRemedy?.localNudgedAt]
+      .map((at) => (at ? Date.parse(at) : Number.NaN))
+      .filter((at) => Number.isFinite(at) && (!Number.isFinite(opened) || at >= opened))
+      .sort((a, b) => b - a)[0];
+    if (told !== undefined) {
+      if (now - told >= EXTERNAL_PARK_GRACE_MS) this.externalWaitPark(lane, stall, thresholds);
+      return;
+    }
+    const sent = this.steer(EXTERNAL_WAIT_NUDGE, 'watchdog', undefined, phase);
+    if (!sent.ok) {
+      this.record('phase.auto-nudge-refused', {
+        detail: stall.detail, since: stall.since, scope: 'external', reason: sent.reason ?? null,
+      }, phase);
+      this.externalWaitPark(lane, stall, thresholds);
+      return;
+    }
+    record.stallRemedy = {
+      ...(record.stallRemedy ?? { nudges: 0, recycles: 0 }),
+      externalNudges: (record.stallRemedy?.externalNudges ?? 0) + 1,
+      externalNudgedAt: new Date(now).toISOString(),
+    };
+    this.record('phase.auto-nudged', {
+      detail: stall.detail, since: stall.since, scope: 'external', parkAfterMs: EXTERNAL_PARK_GRACE_MS,
     }, phase);
     this.persist();
   }
@@ -3607,6 +3687,8 @@ export class Runner extends RunnerAttempt {
       // own, or the run's shared branch with the fast gate the boarding read.
       contextWrapupNotice(context, window, `bash ${SCRIPTS_REF}/phase-outcome.sh ${state.slug} ${phase}`, {
         shared: !lane.worktree, ...(lane.fastGate ? { fastGate: lane.fastGate } : {}),
+        // …and its own agents still at work, named (control-tower phase 109, #188).
+        background: awaitingBackground(lane.signals), now: Date.now(),
       }),
       'watchdog', undefined, phase,
     );
@@ -3694,6 +3776,11 @@ export class Runner extends RunnerAttempt {
     // (`tail -f`), whose summary then stays on the card as the sentence a
     // person reads.
     const minted = watching?.summary ? mintWatchRef(watching.summary, this.now().getTime()) : null;
+    // A clock loop says when it ends (control-tower phase 111, #179): the park
+    // is bounded by that, not by a fixed window over a target seconds away.
+    const knownEnd = watching?.summary ? knownEndOf(watching.summary, this.now().getTime()) : null;
+    // …and the session's own background work this checkpoint ends (#206).
+    const ownWork = ownBackgroundWork(lane.signals);
     // A minted `cmd:` ref RUNS only on the operator's yes (`watchMintedCmdRefs`,
     // SLF-8). Armed anyway, it read `unknown — not run` for the whole park and
     // its only exit was the window (#121 item 3), so a park never arms a ref
@@ -3714,7 +3801,7 @@ export class Runner extends RunnerAttempt {
     // window alone (control-tower phase 47, #52). It used to record the
     // command itself as the watch — a ref the scheduler already knew it could
     // never poll, journalled as unpollable on the same second.
-    const reason = cmdRef
+    const parked = cmdRef
       ? said
       : ownJob
         ? `${said} — the checkpoint ends that job with the session (the whole process group), so no watch is armed on its output; the next session re-runs it`
@@ -3723,6 +3810,9 @@ export class Runner extends RunnerAttempt {
           : unminted
             ? `${said} — its condition cannot succeed as a watch (${unminted}), so it parks with no ref and resumes at the window`
             : `${said} — no ref the console can poll, so it resumes at the window`;
+    const reason = !cmdRef && knownEnd !== null
+      ? `${parked}; its loop ends at ${new Date(knownEnd).toISOString()}, so that is the window`
+      : parked;
     this.record('phase.external-wait', {
       detail: stall.detail,
       since: stall.since,
@@ -3730,6 +3820,8 @@ export class Runner extends RunnerAttempt {
       source: stall.source ?? 'open',
       command: watching?.summary ?? null,
       watch: cmdRef,
+      ...(knownEnd !== null && !cmdRef ? { until: new Date(knownEnd).toISOString() } : {}),
+      ...(ownWork.length ? { background: ownWork.map((task) => ({ id: task.id, description: task.description ?? null })) } : {}),
       thresholdMs: stall.scope === 'local'
         ? thresholds.stallLocalJobMs
         : thresholds.stallExternalWaitMs,
@@ -3740,7 +3832,10 @@ export class Runner extends RunnerAttempt {
       // Owed by the SESSION, not the console (`owesVerification` tells the two
       // apart): the next boarding's brief names the job and asks for it again.
       const record = phaseRecord(state, phase);
-      const jobs = [stall.chain?.key ?? (watching?.summary ? probeSignature(watching.summary) : null)].filter((job): job is string => Boolean(job));
+      const jobs = [
+        stall.chain?.key ?? (watching?.summary ? probeSignature(watching.summary) : null),
+        ...ownWork.map((task) => task.description ?? task.id),
+      ].filter((job): job is string => Boolean(job));
       record.reverify = { at: this.now().toISOString(), cause: 'checkpoint', ...(jobs.length ? { jobs } : {}) };
     }
     // No `resume_after`: the session never named a window, so `parkWaiting`'s
@@ -3759,6 +3854,7 @@ export class Runner extends RunnerAttempt {
       status: 'waiting-external',
       reason,
       watch: cmdRef ? [cmdRef] : [],
+      ...(knownEnd !== null && !cmdRef ? { resume_after: new Date(knownEnd).toISOString() } : {}),
       written_at: new Date(this.now().getTime()).toISOString(),
       ...(phaseRecord(state, phase).sessionId ? { session_id: phaseRecord(state, phase).sessionId } : {}),
     }, { by: 'watchdog', budget: this.knownWaitBudget(phase), ...(cmdRef ? { minted: [cmdRef] } : {}) });
@@ -3794,25 +3890,57 @@ export class Runner extends RunnerAttempt {
     // Only waits whose clock is still AHEAD: an expired one is either a
     // candidate the loop is about to board, or — when its board state cannot
     // board — not a reason to hold the run on a clock that has passed.
+    // A spent park whose every live ref the watch clock has since REFUSED waits
+    // on nothing: it is a person's again, with its `budgets` errand (control-
+    // tower phase 121) — filed once, here, where the run decides it waits.
+    for (const r of Object.values(state.phases)) {
+      const spent = r.declared?.budgetSpent;
+      if (r.status !== 'waiting' || r.parkedUntil || !spent || (asked && !asked.has(r.phase))) continue;
+      const named = liveRefs(r.watch ?? []);
+      if (!named.length || stillLiveRefs(r).length || state.recoveries?.[String(r.phase)]?.errand) continue;
+      const stamped = r.declared?.budget;
+      this.parkOnSpentBudget(r.phase, {
+        ledger: spent.ledger,
+        refusal: `every ref it waited on was refused (${named.map((t) => t.ref).join(', ')}), so nothing it named can be watched any more`,
+        budget: {
+          budgetMs: stamped?.ms ?? DEFAULT_WAIT_BUDGET_MS, source: stamped?.source ?? 'default', countersignedUntil: null, refs: [],
+          ...(stamped?.waits !== undefined ? { waitsMax: stamped.waits, waitsSource: stamped.waitsSource ?? 'default' } : {}),
+        },
+      });
+    }
     const waiting = Object.values(state.phases)
       .filter((r) => r.status === 'waiting' && r.parkedUntil && r.parkedUntil > nowIso)
       .filter((r) => !asked || asked.has(r.phase));
-    if (!waiting.length) return false;
-    const soonest = [...waiting].map((r) => r.parkedUntil!).sort()[0];
-    const names = waiting.map((r) => r.phase).sort((a, b) => a - b).join(', ');
+    // A phase waiting on its REFS alone — its wait budget spent, a ref still
+    // polling (control-tower phase 121, #40): the run waits on that ref, never
+    // `parked` with nothing ready. Its landing resumes the phase; the run's
+    // clock is only a look-again (`REF_WAIT_LOOK_AGAIN_MS`).
+    const onRefs = Object.values(state.phases)
+      .filter((r) => r.status === 'waiting' && !r.parkedUntil && Boolean(r.declared?.budgetSpent)
+        && stillLiveRefs(r).length > 0)
+      .filter((r) => !asked || asked.has(r.phase));
+    if (!waiting.length && !onRefs.length) return false;
+    const refs = [...new Set(onRefs.flatMap((r) => stillLiveRefs(r).map((target) => target.ref)))];
+    const soonest = waiting.length
+      ? [...waiting].map((r) => r.parkedUntil!).sort()[0]!
+      : new Date(Date.parse(nowIso) + REF_WAIT_LOOK_AGAIN_MS).toISOString();
+    const all = [...waiting, ...onRefs];
+    const names = all.map((r) => r.phase).sort((a, b) => a - b).join(', ');
     state.stoppedBy = 'system';
     // The same clock `syncWaitClock` keeps on every park — restated here because
     // this is the transition that makes it the RUN's wait.
     state.waitUntil = soonest;
-    setRunState(state, 'waiting', { kind: 'external', until: soonest });
-    state.finishedReason = `waiting on external work — phase${waiting.length === 1 ? '' : 's'} `
-      + `${names} parked (${waiting.map((r) => r.parkReason).filter(Boolean).join('; ') || 'declared waits'}); `
-      + `resumes at ${soonest}.`
+    setRunState(state, 'waiting', { kind: 'external', until: soonest, ...(refs.length ? { on: refs[0]! } : {}) });
+    state.finishedReason = `waiting on external work — phase${all.length === 1 ? '' : 's'} `
+      + `${names} parked (${all.map((r) => r.parkReason).filter(Boolean).join('; ') || 'declared waits'}); `
+      + (waiting.length
+        ? `resumes at ${soonest}${refs.length ? `, or when ${refs.join(' or ')} lands` : ''}.`
+        : `resumes when ${refs.join(' or ')} lands — its wait budget is spent, so the ref is its clock.`)
       // The stop a sibling phase ended on stands beside the wait (#53): its
       // errand is its own phase's, and the run says so rather than hiding it.
       + (beside ? ` Meanwhile phase ${beside.phase} stopped and stands as it is: ${beside.reason}` : '');
     this.record('run.waiting-external', {
-      phases: waiting.map((r) => r.phase), waitUntil: soonest,
+      phases: all.map((r) => r.phase), waitUntil: soonest, ...(refs.length ? { on: refs } : {}),
       ...(beside ? { beside } : {}),
     });
     return true;
@@ -3918,6 +4046,16 @@ export class Runner extends RunnerAttempt {
       applyEvent(lane.signals, event, this.now().getTime(), this.verifyEnv());
       // #28: the attempt window's first tool call — `timeToFirstToolMs`.
       if (event.kind === 'tool' && this.state) noteFirstTool(phaseRecord(this.state, phase), this.now().toISOString());
+      // The moment the session became unreachable, and why (control-tower
+      // phase 109, #170): what a refused steer names, and the journal's record
+      // of a live session going deaf — there was none, so nobody could say why.
+      if (event.kind === 'input-closed') {
+        lane.inputClosed = { at: event.at, cause: event.cause };
+        this.record('phase.input-closed', {
+          cause: event.cause, pid: lane.pid ?? lane.handle?.pid ?? null,
+          sessionId: this.state?.phases[String(phase)]?.sessionId ?? null,
+        }, phase);
+      }
       // The commits this lane's own git printed — what the scope-drift credit
       // may name as the phase's (control-tower phase 63, #88).
       if (event.kind === 'tool-result' && event.commits?.length) {

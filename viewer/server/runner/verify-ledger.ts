@@ -24,10 +24,10 @@
  * asked nothing here (the commit reads are `worktree.ts`'s).
  */
 
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { runDir } from './run-paths.ts';
+import { consoleRunsDir, runDir } from './run-paths.ts';
 import type { VerifyBaseline, VerifyLimitSource, VerifyRun } from './state.ts';
 import { foldCommand, VERIFY_TIMEOUT_CEILING_MS, VERIFY_TIMEOUT_MS } from './verify.ts';
 
@@ -67,8 +67,25 @@ export type LedgerRow = {
   /** The working tree the command ran against — a git tree object — and its HEAD. */
   tree?: string | null;
   head?: string | null;
+  /**
+   * The environment it ran under (`verifyEnvDigest`) and the directory of its
+   * repository it ran in (`''` at the top) — with the tree and the command,
+   * the key a baseline reuses a measurement by (control-tower phase 105). A
+   * row written before then names neither, and is never reused.
+   */
+  env?: string;
+  dir?: string;
   /** The failing tests its output named (`verify.ts` `failureIds`). */
   failures?: string[];
+  /**
+   * A red row's output tail (`outputTail`, control-tower phase 106, #195): what
+   * the line SAID, for a baseline as for a verdict. The ledger used to hold a
+   * red's code alone, and finding why a baseline was red meant re-running the
+   * suite by hand.
+   */
+  tail?: string;
+  /** Why it could not be judged on this machine (`verify.ts` `environmentOf`) — not a red. */
+  environment?: string;
   /**
    * A verdict row only: the failures its phase was CHARGED with — its own reds,
    * `*` for a whole command whose output named none. What names the owner of a
@@ -106,11 +123,32 @@ export function readLedger(file: string, slug: string): LedgerRow[] {
       ...(row.timedOut === true ? { timedOut: true } : {}),
       ...(typeof row.tree === 'string' ? { tree: row.tree } : {}),
       ...(typeof row.head === 'string' ? { head: row.head } : {}),
+      ...(typeof row.env === 'string' && row.env ? { env: row.env } : {}),
+      ...(typeof row.dir === 'string' ? { dir: row.dir } : {}),
       ...(failures ? { failures } : {}),
+      ...(typeof row.tail === 'string' && row.tail ? { tail: row.tail } : {}),
+      ...(typeof row.environment === 'string' && row.environment ? { environment: row.environment } : {}),
       ...(own ? { own } : {}),
     });
   }
   return out;
+}
+
+/**
+ * How much of a red line's output the record, the ledger and the session's
+ * note keep (control-tower phase 106, #195): the end of it, where a suite
+ * prints its failures and its summary. A tail, never the log — the row rides a
+ * run record and an append-only ledger.
+ */
+export const OUTPUT_TAIL_CHARS = 2_000;
+
+/** The last `OUTPUT_TAIL_CHARS` of an output, cut at a line boundary when one is near. */
+export function outputTail(output: string | undefined): string {
+  const text = (output ?? '').trim();
+  if (text.length <= OUTPUT_TAIL_CHARS) return text;
+  const cut = text.slice(-OUTPUT_TAIL_CHARS);
+  const newline = cut.indexOf('\n');
+  return newline >= 0 && newline < 200 ? cut.slice(newline + 1) : cut;
 }
 
 /** Append rows — one line each, so two writers can only ever interleave whole lines. */
@@ -188,6 +226,90 @@ export function fastGateLines(
 /* ------------------------------------------------------------------ *
  * The baseline (#103)
  * ------------------------------------------------------------------ */
+
+/**
+ * How old a measurement may be and still stand in for a baseline line
+ * (control-tower phase 105, #190 ask 3). The tree, the command, the
+ * environment and the directory are the same, but what the tree does not hold
+ * drifts — an installed dependency, a container image, a service a suite
+ * reaches — so a day is the bound.
+ */
+export const BASELINE_REUSE_MAX_AGE_MS = 24 * 60 * 60_000;
+
+/** The priority a baseline's commands run at beside a working session (`nice -n`). */
+export const BASELINE_NICE = 10;
+
+/**
+ * Every verification ledger of this CONSOLE — each plan's, read with its own
+ * slug, oldest first by `at`. What a baseline reuses from (control-tower phase
+ * 105): a line measured on the same tree by any plan's phase is the same
+ * measurement, and on the hub console every tb phase of ai-builder-v7 measured
+ * tb `main`'s `task verify:local` again because each plan read only its own.
+ */
+export function readConsoleLedgers(root: string): LedgerRow[] {
+  const dir = consoleRunsDir(root);
+  if (!existsSync(dir)) return [];
+  const rows: LedgerRow[] = [];
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  for (const slug of names) {
+    const file = join(dir, slug, 'verifications.ndjson');
+    if (existsSync(file)) rows.push(...readLedger(file, slug));
+  }
+  return rows.sort((a, b) => a.at.localeCompare(b.at));
+}
+
+/**
+ * The measurement a baseline line may reuse: the newest run of the same
+ * command, on the same tree, under the same environment digest, in the same
+ * directory of its repository, younger than `BASELINE_REUSE_MAX_AGE_MS` — by
+ * any phase or run (control-tower phase 105, BL-2). A run its clock cut says
+ * only "longer than the limit" and is never one; a row that names no
+ * environment cannot vouch for this one.
+ */
+export function reusableRun(rows: readonly LedgerRow[], key: {
+  command: string; tree: string; env: string; dir: string; now?: number; maxAgeMs?: number;
+}): LedgerRow | undefined {
+  const folded = foldCommand(key.command);
+  const now = key.now ?? Date.now();
+  const maxAge = key.maxAgeMs ?? BASELINE_REUSE_MAX_AGE_MS;
+  let best: LedgerRow | undefined;
+  for (const row of rows) {
+    if (row.command !== folded || row.tree !== key.tree || row.timedOut) continue;
+    if (!row.env || row.env !== key.env || (row.dir ?? null) !== key.dir) continue;
+    const at = Date.parse(row.at);
+    if (!Number.isFinite(at) || now - at > maxAge || at - now > 60_000) continue;
+    if (!best || row.at >= best.at) best = row;
+  }
+  return best;
+}
+
+/** An age as a person reads it: `40 s`, `12 min`, `2h`, `3h 5m`. */
+function ageWords(ms: number): string {
+  if (ms < 60_000) return `${Math.max(0, Math.round(ms / 1000))} s`;
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return `${minutes} min`;
+  const rest = minutes % 60;
+  return `${Math.floor(minutes / 60)}h${rest ? ` ${rest}m` : ''}`;
+}
+
+/**
+ * One baseline line, in the words the session's note, the journal and a
+ * person read (control-tower phase 105): a measured red is `red once (not
+ * retried)` — a baseline is never a verdict, and its red is not run twice —
+ * and a reused line names where it came from and how old it is.
+ */
+export function baselineLineWords(line: VerifyBaseline['commands'][number]): string {
+  // A line the MACHINE stopped (control-tower phase 106, #185) is not a red the
+  // session inherits: it says why it could not run, and what to do about it.
+  const outcome = line.ok ? 'green'
+    : line.environment ? `could not run here — ${line.environment}`
+      : line.once ? 'red once (not retried)' : 'red';
+  if (line.from !== 'reused' || !line.by) return outcome;
+  const where = `${line.by.slug ? `${line.by.slug} ` : ''}run ${line.by.run || '?'}`;
+  const age = line.by.ageMs != null ? `, ${ageWords(line.by.ageMs)} ago` : '';
+  return `reused from ${where} (phase ${line.by.phase}${age}) — ${outcome}`;
+}
 
 /** The last run of a line on this very tree — what stands in for measuring it at boarding. */
 export function lastRunOn(rows: readonly LedgerRow[], command: string, tree: string): LedgerRow | undefined {

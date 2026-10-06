@@ -230,6 +230,23 @@ export async function doctorVerb(argv, ctx) {
         };
       },
       hooks: async () => hooksStatus({ skillDir: ctx.root }),
+      // Every pooled account's config dir (control-tower phase 108, #194), read
+      // from the instance's registry on disk: the login's for the machine login
+      // and a token, `<accounts>/<id>/config` for a profile — the store's
+      // `profileConfigDir`, spelled here because a bin may load only the
+      // package's named entries, and the accounts store is not one.
+      presence: async () => {
+        if (!stateDir) return null;
+        const accountsDir = join(stateDir, 'accounts');
+        const login = join(process.env.HOME ?? '', '.claude');
+        const registry = readJson(join(accountsDir, 'accounts.json'));
+        const pool = [{ id: 'default', dir: login }];
+        for (const meta of Array.isArray(registry?.accounts) ? registry.accounts : []) {
+          if (!meta || typeof meta.id !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(meta.id)) continue;
+          pool.push({ id: meta.id, dir: meta.kind === 'profile' ? join(accountsDir, meta.id, 'config') : login });
+        }
+        return doctor.presenceDirs(pool, (settingsPath) => hooksStatus({ skillDir: ctx.root, settingsPath }));
+      },
       // The skill copy each config dir loads, against the commit THIS copy's
       // client was built from — the console's own `distRev`, read off disk (#151).
       skillCopy: () => skillCopies.skillCopyReport({

@@ -40,7 +40,7 @@ import { parseQaRounds, parseTestStatus } from '../server/parse/folder.ts';
 import { nextQaRound } from '../server/qa-round.ts';
 import {
   parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor, verifyTimeoutFor,
-  humanStepsFor, humanStepLine,
+  humanStepsFor, humanStepLine, waitCountFor,
   landFor, gitlinkFor, issuesFor, isolationFor, baseBranchOf, conflictPolicyOf, messagingOf, clashZonesOf,
   permissionModeFor, modelPolicyFor, type Plan,
 } from '../server/parse/plan.ts';
@@ -664,6 +664,10 @@ test('the two engines agree about a phase\'s wait budget, its source, and the re
       const jsLine = js ? `${js.minutes}\t${js.source}` : '';
       if (budget !== jsLine) problems.push(`${slug} p${phase}: wait budget JS "${jsLine}" vs engine "${budget}"`);
       assert.deepEqual(readWaitBudget({ code: 0, stdout: budget, stderr: '', ms: 0, timedOut: false }), js);
+      const count = await engine(corpus, [slug, '--wait-count', String(phase)], `${slug} p${phase} --wait-count`);
+      const jsCount = waitCountFor(plan, phase);
+      const jsCountLine = jsCount ? `${jsCount.count}\t${jsCount.source}` : '';
+      if (count !== jsCountLine) problems.push(`${slug} p${phase}: wait count JS "${jsCountLine}" vs engine "${count}"`);
       const jsRefs = waitsOnFor(plan, phase);
       if (refs !== jsRefs.join('\n')) problems.push(`${slug} p${phase}: waits-on JS ${JSON.stringify(jsRefs)} vs engine ${JSON.stringify(refs)}`);
       assert.deepEqual(readWaitsOn({ code: 0, stdout: refs, stderr: '', ms: 0, timedOut: false }), jsRefs);
@@ -674,6 +678,10 @@ test('the two engines agree about a phase\'s wait budget, its source, and the re
       const js = waitBudgetFor(record.plan!);
       const jsLine = js ? `${js.minutes}\t${js.source}` : '';
       if (planWide !== jsLine) problems.push(`${record.slug}: plan wait budget JS "${jsLine}" vs engine "${planWide}"`);
+      const planCount = await engine(corpus, [record.slug, '--wait-count'], `${record.slug} --wait-count`);
+      const jsCount = waitCountFor(record.plan!);
+      const jsCountLine = jsCount ? `${jsCount.count}\t${jsCount.source}` : '';
+      if (planCount !== jsCountLine) problems.push(`${record.slug}: plan wait count JS "${jsCountLine}" vs engine "${planCount}"`);
     }
     assert.deepEqual(problems, [], `${corpus.name} wait-budget mismatches:\n  ${problems.join('\n  ')}`);
     if (!corpus.live) assert.ok(carrying >= 4, 'the fixture corpus must carry the waits fixture, or this proves nothing');
@@ -694,10 +702,14 @@ test('the two engines agree about a phase\'s human steps, per phase and in the b
     for (const record of samplePlans(corpus)) {
       const plan = record.plan!;
       const all = await engine(corpus, [record.slug, '--human-steps'], `${record.slug} --human-steps`);
-      const js = plan.graph
-        .flatMap((row) => humanStepsFor(plan, row.phase).map((step) => `${row.phase}\t${humanStepLine(step)}`))
+      // Phase 0 — the plan's own `## Operator errands` — leads (control-tower phase 121).
+      const js = [0, ...plan.graph.map((row) => row.phase)]
+        .flatMap((phase) => humanStepsFor(plan, phase).map((step) => `${phase}\t${humanStepLine(step)}`))
         .join('\n');
       if (norm(all) !== norm(js)) problems.push(`${record.slug}: bare --human-steps JS ${JSON.stringify(js)} vs engine ${JSON.stringify(all)}`);
+      const own = await engine(corpus, [record.slug, '--human-steps', '0'], `${record.slug} --human-steps 0`);
+      const jsOwn = humanStepsFor(plan, 0).map(humanStepLine).join('\n');
+      if (norm(own) !== norm(jsOwn)) problems.push(`${record.slug}: --human-steps 0 JS ${JSON.stringify(jsOwn)} vs engine ${JSON.stringify(own)}`);
     }
     assert.deepEqual(problems, [], `${corpus.name} human-step mismatches:\n  ${problems.join('\n  ')}`);
     // The fixture spells every field, the defaults, case and bold, so the
@@ -724,6 +736,18 @@ test('the two engines agree about a phase\'s human steps, per phase and in the b
       assert.equal(humanStepsFor(plan, 4)[1].proof, undefined, 'a step with no proof is still a step (F38 advises)');
       assert.deepEqual(humanStepsFor(plan, 5).map((s) => [s.kind, s.where, s.windowMinutes, s.autoOpen]),
         [['os-permission', 'host', 90, undefined], ['person-check', 'any', undefined, 'host']]);
+      // The operator act (control-tower phase 121): the plan's own, as phase 0,
+      // and a phase's, each with its due ref — engine and parser alike.
+      const acts = store.get('operator-acts')!.plan!;
+      for (const phase of [0, 2, 3]) {
+        const line = await engine(corpus, ['operator-acts', '--human-steps', String(phase)], `operator-acts --human-steps ${phase}`);
+        assert.equal(norm(line), norm(humanStepsFor(acts, phase).map(humanStepLine).join('\n')), `operator-acts phase ${phase}`);
+      }
+      assert.deepEqual(humanStepsFor(acts, 0).map((s) => [s.kind, s.where, s.due]), [['operator-act', 'host', 'phase:operator-acts/2']]);
+      assert.deepEqual(humanStepsFor(acts, 2).map((s) => [s.kind, s.where, s.due]), [['operator-act', 'any', 'date:2026-10-06T09:00:00Z']]);
+      assert.equal(humanStepsFor(acts, 3)[0]!.due, undefined, 'a step with no due: is due at once');
+      assert.deepEqual([waitCountFor(acts), waitCountFor(acts, 1), waitCountFor(acts, 2)],
+        [{ count: 6, source: 'plan' }, { count: 8, source: 'phase' }, { count: 6, source: 'plan' }]);
     }
   });
 });

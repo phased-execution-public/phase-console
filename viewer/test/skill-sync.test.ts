@@ -60,6 +60,10 @@ import { RUNG_VEHICLES } from '../shared/ladder-model.js';
 import { MECHANISMS, HALT_KINDS, RECOVERY_CLASSES, ACTION_VOCAB } from '../shared/recovery-model.js';
 import { BOARD_BUCKETS, WAIT_REASONS } from '../shared/status-vocab.js';
 import { HANDOFF_STATUSES, QA_RESULTS, QA_MODES, GATE_KINDS } from '../shared/plan-vocab.js';
+import {
+  CONSOLE_REPO_KEY, DEFAULT_ISSUE_SEVERITY, ISSUE_BUDGETS, ISSUE_LABELS, ISSUE_REPO_AUTO, ISSUE_SEVERITIES,
+  ISSUE_SEVERITY_LABEL_PREFIX, ISSUE_SEVERITY_MEANINGS, ISSUE_SEVERITY_REQUIRED_FOR, ISSUE_TYPES,
+} from '../shared/issues-model.js';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const read = (rel: string) => readFileSync(`${root}${rel}`, 'utf8');
@@ -86,16 +90,60 @@ const SESSION_DOCS = (): string[] => ['SKILL.md', ...referenceDocs()];
  * ------------------------------------------------------------------ */
 
 /**
+ * Every `!pro:` region of a body, as character spans — what the free build
+ * strips. Control-tower phase 115 made the flag count differ by EDITION (the
+ * ninth, `--allow-issues`, is Pro), and only Pro regions exist — there is no
+ * free-only marker. So a count stated INSIDE a Pro region is the whole tree's,
+ * and one stated outside every region is what every tree carries: the free
+ * number. In the free tree there are no regions and the two are one.
+ */
+const proSpans = (body: string): Array<[number, number]> => {
+  const spans: Array<[number, number]> = [];
+  let open = -1;
+  for (const m of body.matchAll(/!pro:(start|end)/g)) {
+    if (m[1] === 'start' && open < 0) open = m.index ?? 0;
+    else if (m[1] === 'end' && open >= 0) {
+      spans.push([open, m.index ?? 0]);
+      open = -1;
+    }
+  }
+  return spans;
+};
+const insidePro = (spans: Array<[number, number]>, at: number): boolean => spans.some(([a, b]) => at > a && at < b);
+
+/**
  * Lifted from config.ts's own CAPABILITY_FLAGS table — the same source
  * `docs-parity.test.ts` reads, on purpose. That file asks whether the GUIDE is
  * right; this one asks whether the SKILL is, and they must not disagree about
- * where the truth lives.
+ * where the truth lives. Each row knows whether it sits in a Pro region.
  */
-const capabilityFlags = (): string[] => {
+const capabilityRows = (): Array<{ flag: string; pro: boolean }> => {
   const src = read('viewer/server/config.ts');
-  const block = src.slice(src.indexOf('const CAPABILITY_FLAGS'));
-  return [...new Set(block.slice(0, block.indexOf('];')).match(/--allow-[a-z-]+/g) ?? [])].sort();
+  const from = src.indexOf('const CAPABILITY_FLAGS');
+  const block = src.slice(from, src.indexOf('];', from));
+  const spans = proSpans(block);
+  const rows = new Map<string, boolean>();
+  for (const m of block.matchAll(/--allow-[a-z-]+/g)) {
+    if (!rows.has(m[0])) rows.set(m[0], insidePro(spans, m.index ?? 0));
+  }
+  return [...rows].map(([flag, pro]) => ({ flag, pro }));
 };
+const capabilityFlags = (): string[] => capabilityRows().map((row) => row.flag).sort();
+/** The flags every edition carries — the count a sentence outside a Pro region states. */
+const freeCapabilityFlags = (): string[] => capabilityRows().filter((row) => !row.pro).map((row) => row.flag).sort();
+
+/** Each written-out count in `body` with the number it must be: the whole tree's inside a Pro region, else the free one. */
+function* statedCounts(body: string, patterns: RegExp[]): Generator<{ word: string; want: number; where: string }> {
+  const spans = proSpans(body);
+  const all = capabilityFlags().length;
+  const free = freeCapabilityFlags().length;
+  for (const pattern of patterns) {
+    for (const m of body.matchAll(pattern)) {
+      const pro = insidePro(spans, m.index ?? 0);
+      yield { word: m[1], want: pro ? all : free, where: pro ? 'inside a Pro region' : 'outside every Pro region' };
+    }
+  }
+}
 
 test('SKILL.md names every capability flag and states the right count', () => {
   const flags = capabilityFlags();
@@ -113,16 +161,24 @@ test('SKILL.md names every capability flag and states the right count', () => {
     /\ball\s+(two|three|four|five|six|seven|eight|nine|ten)\s+default\s+off\b/gi,
   ];
   let stated = 0;
-  for (const pattern of patterns) {
-    for (const [, word] of skill.matchAll(pattern)) {
-      stated++;
-      assert.equal(
-        WORDS[word.toLowerCase()], flags.length,
-        `SKILL.md says '${word} flags'; config.ts has ${flags.length}`,
-      );
-    }
+  for (const { word, want, where } of statedCounts(skill, patterns)) {
+    stated++;
+    assert.equal(WORDS[word.toLowerCase()], want, `SKILL.md says '${word} flags' ${where}; that edition has ${want}`);
   }
   assert.ok(stated >= 2, `SKILL.md should state the flag count; found ${stated} statements`);
+});
+
+test('a Pro flag is named only inside a Pro region, so the free tree never states it (phase 115)', () => {
+  const pro = capabilityRows().filter((row) => row.pro).map((row) => row.flag);
+  for (const doc of ['SKILL.md', 'CLAUDE.md']) {
+    const body = read(doc);
+    const spans = proSpans(body);
+    for (const flag of pro) {
+      for (const m of body.matchAll(new RegExp(flag, 'g'))) {
+        assert.ok(insidePro(spans, m.index ?? 0), `${doc} names ${flag} outside a Pro region — the free tree would ship it`);
+      }
+    }
+  }
 });
 
 test('the flag that switches something OFF is never counted among the ones that switch things on', () => {
@@ -149,16 +205,11 @@ test('the flag that switches something OFF is never counted among the ones that 
 });
 
 test('CLAUDE.md and SKILL.md agree with config.ts about how many flags there are', () => {
-  const flags = capabilityFlags();
   for (const doc of ['CLAUDE.md', 'SKILL.md']) {
     const body = stripFences(read(doc));
-    for (const [, word] of body.matchAll(
-      /\b(two|three|four|five|six|seven|eight|nine|ten)\s+(?:capability\s+)?(?:flags|switches)\b/gi,
-    )) {
-      assert.equal(
-        WORDS[word.toLowerCase()], flags.length,
-        `${doc} says '${word}' where config.ts has ${flags.length} capability flags`,
-      );
+    const counts = [/\b(two|three|four|five|six|seven|eight|nine|ten)\s+(?:capability\s+)?(?:flags|switches)\b/gi];
+    for (const { word, want, where } of statedCounts(body, counts)) {
+      assert.equal(WORDS[word.toLowerCase()], want, `${doc} says '${word}' ${where}, where that edition has ${want} capability flags`);
     }
   }
 });
@@ -593,6 +644,12 @@ test('the unattended contract states the wait ceiling beside the flag it bounds 
   // The phase's own allowance is what the session reads when the plan set one.
   const planned = unattendedDirective('/skill/scripts', 'soak', 16, { budgetMs: 72 * 3_600_000, source: 'phase' });
   assert.match(planned, /72 h parked in total\s+\(this phase's `Waits on:` bullet\)/);
+  // …and the COUNT a plan raised, with where it came from (control-tower phase 121, #40).
+  const raised = unattendedDirective('/skill/scripts', 'soak', 16, {
+    budgetMs: 72 * 3_600_000, source: 'phase', waitsMax: 9, waitsSource: 'plan',
+  });
+  assert.match(raised, /at most 9 waits \(the plan's `Wait count:` line\)/);
+  assert.doesNotMatch(raised, /at most 4 waits/);
 });
 
 /* ------------------------------------------------------------------ *
@@ -824,9 +881,14 @@ const documentedSchemes = (text: string): Set<string> => {
   const fill: Record<string, string> = {
     repo: 'acme/web', 'owner/repo': 'acme/web', id: '17843290511', n: '4', ISO8601: '2026-09-27T06:00:00Z',
     ISO: '2026-09-27T06:00:00Z', slug: 'demo', phase: '3', N: '3', command: '/usr/bin/true',
+    host: 'build-box', unit: 'nightly-build.service',
   };
   const kinds = new Set<string>();
-  for (const [, sample] of text.matchAll(/`((?:gh|date|lock|phase|verify|cmd):[^`]+)`/g)) {
+  // Every scheme's prefix (`gh-run` and `gh-pr` are both `gh:`), so a new
+  // scheme is looked for the day it ships.
+  const prefixes = [...new Set(WATCH_SCHEMES.map((scheme) => scheme.replace(/-.*/, '')))];
+  const sampled = new RegExp(`\`((?:${prefixes.join('|')}):[^\`]+)\``, 'g');
+  for (const [, sample] of text.matchAll(sampled)) {
     const target = parseWatchRef(sample!.replace(/<([^<>]+)>/g, (whole, name: string) => fill[name] ?? whole));
     if (target) kinds.add(target.kind);
   }

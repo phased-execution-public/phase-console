@@ -39,7 +39,10 @@ const { WatchScheduler } = await import('../server/watch-scheduler.ts');
 const { PhaseClaimedError } = await import('../server/service-core.ts');
 const { WATCH_REDELIVER_SERIES_MS, liveErrandHow, redeliverAfter } = await import('../server/watch-refs.ts');
 const { recent: recentLog } = await import('../server/log.ts');
+const { Credentials } = await import('../server/accounts/credentials.ts');
+const { ACCOUNTS_DIR } = await import('../server/accounts/store.ts');
 type RunState = import('../server/runner/state.ts').RunState;
+type Exec = import('../server/accounts/credentials.ts').Exec;
 
 const SCRIPTS = join(SKILL_DIR, 'scripts');
 
@@ -94,9 +97,26 @@ function service(root: string, flags: Record<string, unknown> = {}) {
     scriptsDir: SCRIPTS, logFile: null, ...flags,
   } as never);
   svc.push.announce = (() => {}) as typeof svc.push.announce;
+  sandboxCredentials(svc);
   assert.equal(svc.open(root).ok, true);
   OPEN.set(root, [...(OPEN.get(root) ?? []), svc]);
   return svc;
+}
+
+/**
+ * Every `service()` keeps its secrets in this file's state sandbox
+ * (control-tower phase 116, #200). A real `Service` builds its `Accounts` on
+ * the real `security`, so RCV-10/ACC-3.2's spare token went into the
+ * operator's login keychain on every run — and the file went red whenever that
+ * keychain was locked. The backend here is the one every machine but a Mac
+ * uses: a 0600 file under `ACCOUNTS_DIR`, which this file redirected. It
+ * starts no process at all.
+ */
+function sandboxCredentials(svc: InstanceType<typeof Service>): void {
+  const accounts = svc.accounts as unknown as Record<string, unknown>;
+  assert.ok(accounts.creds instanceof Credentials, 'Accounts no longer keeps its backend in `creds` — sandbox it where it lives now');
+  const noProcess: Exec = async (file) => { throw new Error(`auto-recovery.test.ts starts no ${file}`); };
+  accounts.creds = new Credentials(noProcess, 'linux', join(STATE_HOME, 'home'), ACCOUNTS_DIR);
 }
 
 /** Stub the pty layer: everything up to the mint is real, the mint records. */
@@ -3096,6 +3116,8 @@ test('RCV-10/ACC-3.2: resource-wall:auth driven end to end — a retired credent
     record.cause = { kind: 'credential-refused', class: 'org-policy', reason: 'organization policy blocks this credential', at } as never;
     saveRun(run);
     spare = await svc.accounts.addToken('spare', 'token-spare-cccccccccccccccc');
+    // The spare's secret is a file in this file's sandbox — no keychain was asked (#200).
+    assert.equal(readFileSync(join(ACCOUNTS_DIR, spare.id, 'token'), 'utf8').trim(), 'token-spare-cccccccccccccccc');
     svc.accounts.retire('default', undefined, 'organization policy blocks this credential', 'classifier', 'org-policy');
 
     const result = await svc.maybeAutoRecover('alpha');

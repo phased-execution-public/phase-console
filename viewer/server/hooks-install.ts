@@ -72,6 +72,11 @@ export type HooksOptions = {
   /** The settings file; defaults to `$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`. */
   settingsPath?: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * The mode a file this CREATES gets — a profile workspace's files are 0600
+   * like everything under the accounts dir. An existing file keeps its own.
+   */
+  mode?: number;
 };
 
 /** Claude Code's user-scope settings file, honouring `CLAUDE_CONFIG_DIR` the way the CLI does. */
@@ -372,7 +377,7 @@ export function installHooks(options: HooksOptions): HooksWrite {
     if (!placed) { groups.push({ hooks: [wanted] }); changed = true; }
     hooks[event] = groups;
   }
-  if (changed || !file.exists) writeAtomic(path, spliceHooks(file, hooks), file.mode);
+  if (changed || !file.exists) writeAtomic(path, spliceHooks(file, hooks), file.mode ?? options.mode);
   return { ok: true, path, changed: changed || !file.exists, status: statusOf(readSettingsFile(path), path, options.skillDir, options.env) };
 }
 

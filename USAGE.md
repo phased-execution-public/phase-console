@@ -144,6 +144,31 @@ sink (`~/.local/state/phase-console/fleet/sessions/inbox/`). And while a console
 presence inbox is drained without it by `phase-console sessions ingest` — the hook runs it when its
 POST finds nobody — which does nothing while that console answers.
 
+**A repository's issues, on one desk.** Repo ▸ Issues reads a repository's whole issue list, open and
+closed, up to 2,000, and shows what each issue says about itself: its category (bug, enhancement,
+documentation, question or other), its severity from a `severity:` label (critical, high, medium or
+low), and where it stands in a plan — it needs one (`awaiting-plan`), it is planned in a plan's phase
+(`plan:<slug>`), it is deferred, or it is fixed. Every column sorts, and the sort and the category,
+severity and plan-status filters live in the URL. Any GitHub `owner/name` can be added and read beside
+your own repositories, read-only. Tick some issues to **Author a plan from N issues**, an interactive
+session that writes the plan (`--allow-agent`).
+
+**A wait names what it waits on.** A session that has to wait declares what it waits for, and the
+console checks it by itself: a GitHub run or pull request, a date, another phase, a command — and,
+since 6.1, a systemd unit on another machine, `unit:<host>/<unit>`, asked every five minutes over one
+ssh connection per host, whose address, user, key and port come from `hosts.<name>` in the machine
+profile. A date beside such a ref is only its backstop. A phase may declare four waits and stay parked
+eight hours in all; a plan raises the hours with `Wait budget:` or `Waits on:` and the count with
+`Wait count:`, and a spent budget whose ref is still being checked goes on waiting on it rather than
+asking you.
+
+**The acts only you do, queued.** An `operator-act` is a step only you carry out — a command to run, a
+click path to follow — declared by a session (`phase-outcome.sh … needs-human --act --due-when <ref>`)
+or written into the plan (`due: <ref>` on a `Human step:` bullet, in a phase or under
+`## Operator errands`). Until its ref lands it waits, silent, under *Coming up* on the Tower and the approve page;
+then it is due, with one notification — `NOW:` and its command, or its title for a click path — and
+its proof clears it and resumes the phase that needed it.
+
 
 **Reading a run from a shell.** `phase-console run status <slug>` prints the latest run in a small
 shape (the status word every page shows — `waiting` for a run asleep on a clock nobody paused — halt,

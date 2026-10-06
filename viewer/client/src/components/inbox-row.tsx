@@ -31,7 +31,7 @@
 import { useCallback, useState } from 'react';
 import { ChevronRight, ExternalLink } from 'lucide-react';
 import { INBOX_KIND_LABELS, SEVERITY_UI } from '@shared/attention-model.js';
-import { OPERATOR_ISSUE_SCOPE } from '@shared/issues-model.js';
+import { OPERATOR_ISSUE_SCOPE } from '@shared/issue-modes.js';
 import { api, type InboxAction, type InboxItem } from '@/lib/api';
 import { keys, useApiMutation } from '@/lib/queries';
 import { cn } from '@/lib/cn';

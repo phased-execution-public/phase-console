@@ -136,9 +136,10 @@ export function renderCommandFile(source: string, opts: { home: string; consoleH
   }
   const patched = source.replace(/^CONSOLE_HOME=.*$/m,
     `CONSOLE_HOME="${opts.consoleHome ? homeRelative(opts.consoleHome, opts.home) : ''}"`);
-  for (const line of ['WRITES="--allow-writes"', 'RUNS="--allow-run"', 'TERM_FLAG="--allow-terminal"',
+  const knobs = ['WRITES="--allow-writes"', 'RUNS="--allow-run"', 'TERM_FLAG="--allow-terminal"',
     'AGENT="--allow-agent"', 'ACCOUNTS="--allow-accounts"', 'MCP="--allow-mcp"',
-    'WEBHOOKS="--allow-webhooks"']) {
+    'WEBHOOKS="--allow-webhooks"'];
+  for (const line of knobs) {
     if (!patched.includes(line)) {
       throw new Error(`the launcher template is missing its ${line.split('=')[0]} knob — update the template first`);
     }

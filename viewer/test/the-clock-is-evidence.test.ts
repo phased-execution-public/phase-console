@@ -1086,7 +1086,11 @@ test('WAI-11: a declared `date:` ref extends the park to its instant — or is n
   assert.ok(honoured.verdict === 'park' && honoured.until === far && honoured.capped === false);
 
   // …and the engine's `Waits on:` max is the phase's own budget, in minutes.
-  assert.deepEqual(waitBudgetFrom('45\tphase\n', '', dateOfRef), { budgetMs: 45 * 60_000, source: 'phase', countersignedUntil: null, refs: [] });
+  assert.deepEqual(waitBudgetFrom('45\tphase\n', '', dateOfRef), {
+    budgetMs: 45 * 60_000, source: 'phase', countersignedUntil: null, refs: [],
+    // The count beside the time (control-tower phase 121, #40): silence is the console's four.
+    waitsMax: 4, waitsSource: 'default',
+  });
   assert.equal(waitBudgetFrom('', '', dateOfRef).budgetMs, DEFAULT_WAIT_BUDGET_MS, 'silence is the console default');
 });
 

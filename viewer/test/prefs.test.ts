@@ -368,6 +368,31 @@ test('mcpPolicy round-trips through savePreferences, and a bad one is dropped', 
   }
 });
 
+test('the Issues desk\'s added repositories round-trip through ONE gate, on disk and in a patch (control-tower phase 118)', () => {
+  // A hand-edited file is a caller too: what reaches `gh --repo` is only ever
+  // a name GitHub's alphabet allows, once, and the list is bounded.
+  writeConfig({ issueRepos: ['octo/a', 'not a repo', 'octo/a', '--repo=x/y'] });
+  assert.deepEqual(loadPrefs().issueRepos, ['octo/a']);
+  writeConfig({});
+  assert.equal(loadPrefs().issueRepos, undefined, 'absent when there are none — never an empty list on disk');
+  const service = makeService();
+  try {
+    assert.deepEqual(
+      service.savePreferences({ issueRepos: ['octo/b', '../etc/passwd', 'octo/c'] }).issueRepos,
+      ['octo/b', 'octo/c'],
+    );
+    assert.deepEqual(
+      service.savePreferences({ issueRepos: 'octo/d' } as never).issueRepos,
+      ['octo/b', 'octo/c'],
+      'a patch that is not a list is dropped, and the stored list survives',
+    );
+    assert.deepEqual(service.savePreferences({ issueRepos: [] }).issueRepos ?? [], []);
+    assert.equal(loadPrefs().issueRepos, undefined);
+  } finally {
+    service.close();
+  }
+});
+
 test('a bad gitMode in a patch keeps the stored one — dropped means dropped', () => {
   writeConfig({ gitMode: 'new-branch' });
   const service = makeService();

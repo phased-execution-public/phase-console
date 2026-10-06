@@ -704,6 +704,11 @@ test('RET-WT — a kept tree is measured off the loop, once per mtime, and read 
   const dir = fixture();
   const tree = join(dir, 'tree');
   mkdirSync(tree, { recursive: true });
+  // A kept tree nobody has written to for half an hour (control-tower phase
+  // 112, #171): one that moved inside ten minutes is still being written, and
+  // is not measured until it settles.
+  const quiet = (Date.now() - 30 * 60_000) / 1000;
+  utimesSync(tree, quiet, quiet);
   let measured = 0;
   const measure = async () => { measured++; return 4096; };
   assert.equal(keptTreeBytes(tree, measure), undefined, 'the first read measures in the background and answers nothing yet');
@@ -711,6 +716,13 @@ test('RET-WT — a kept tree is measured off the loop, once per mtime, and read 
   assert.equal(keptTreeBytes(tree, measure), 4096);
   assert.equal(keptTreeBytes(tree, measure), 4096);
   assert.equal(measured, 1, 'an unchanged tree is measured once');
+  // A tree whose run went live keeps its last size, and is not measured again
+  // however its mtime moves (#171).
+  const now = Date.now() / 1000;
+  utimesSync(tree, now, now);
+  assert.equal(keptTreeBytes(tree, measure, { live: true }), 4096);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(measured, 1, 'a live tree is never measured');
   rmSync(tree, { recursive: true, force: true });
   assert.equal(keptTreeBytes(tree, measure), undefined, 'a tree that has gone has no size');
 });

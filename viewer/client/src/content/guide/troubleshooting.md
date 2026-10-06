@@ -44,6 +44,12 @@ A gate that has not cleared · a lock held by another session · a phase that ne
 Clear the gate or release the lock, then start the run again. Nothing was lost — "Why this is
 stopped" names each blocker with its remedy.
 
+**Every phase is done, but the run's branch is not on its trunk yet.** A run that works on its own
+branch finishes only once that branch, in every repository it mounted, is held by the trunk on
+`origin`. Until then it parks as *unlanded*, with one errand naming what is in the way, such as a
+conflict and its files. The errand's card opens a merge errand tree; once the branch has landed,
+**Recover & continue** checks again and the run finishes.
+
 ## Waiting
 
 *A usage window is exhausted. Nothing is wrong.*

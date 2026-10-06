@@ -523,14 +523,14 @@ export function LadderCard() {
         </div>
         <div className={row}>
           <span className="min-w-0">
-            <span className="text-sm text-ink">Let a session clear a human gate</span>
+            <span className="text-sm text-ink">Let a session clear an overdue gate</span>
             <span className="mt-0.5 block text-2xs text-ink-muted">
               <strong>On since 5.0.0</strong> — this console&apos;s word for the manifest&apos;s{' '}
               <code>gates</code> row (<code>gates: delegated</code>); a plan&apos;s own{' '}
-              <code>## Decisions</code> row outranks it. What makes delegation safe is not trust: the brief
-              demands cited evidence for every condition and STOPS with the condition named when it has none,
-              and a gate whose conditions are not written stays a person&apos;s whatever this says.{' '}
-              <code>gate-status.md</code> records those approvals as <code>by: ai-session-delegated</code>.
+              <code>## Decisions</code> row outranks it. A gate whose deadline has passed goes to the
+              phase&apos;s session, which must cite evidence for every condition and stops, naming the
+              condition, when it has none. A gate the plan marks manual is yours whatever this says: only the
+              Gate card or your own terminal can approve it.
             </span>
           </span>
           {onOff(prefs.delegateHumanGates, 'delegateHumanGates')}

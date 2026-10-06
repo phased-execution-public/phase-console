@@ -263,3 +263,47 @@ bullet_of() {  # bullet_of <slug> <phase> — the phase's `Waits on:` line, verb
   run wb_set nope 30m;                  [ "$status" -eq 2 ]
   cmp -s "$(plan_of waits)" "$BATS_TEST_TMPDIR/before.md"
 }
+
+# ---- the declared-wait COUNT (control-tower phase 121, #40) -------------------
+
+@test "--wait-count: the plan's line, a phase's own bullet over it, and silence printing nothing" {
+  setup_docs operator-acts operator-acts
+  run pg operator-acts --wait-count
+  [ "$status" -eq 0 ]; [ "$output" = "$(printf '6\tplan')" ]
+  run pg operator-acts --wait-count 1
+  [ "$status" -eq 0 ]; [ "$output" = "$(printf '8\tphase')" ]
+  run pg operator-acts --wait-count 2
+  [ "$status" -eq 0 ]; [ "$output" = "$(printf '6\tplan')" ]
+  setup_docs linear linear
+  run pg linear --wait-count 1
+  [ "$status" -eq 0 ]; [ -z "$output" ]
+  run pg linear --wait-count 99
+  [ "$status" -eq 2 ]
+}
+
+@test "wait-budget.sh --count: a phase gains its own bullet, the plan's line is rewritten, the engine reads both back" {
+  setup_docs operator-acts operator-acts
+  run wb_set operator-acts --phase 3 --count 5
+  [ "$status" -eq 0 ]; [ "$output" = "$(printf '5\tphase')" ]
+  grep -q '^- \*\*Wait count:\*\* 5$' "$DOCS_ROOT/docs/plans/operator-acts.md"
+  run wb_set operator-acts --phase 1 --count 12
+  [ "$status" -eq 0 ]; [ "$output" = "$(printf '12\tphase')" ]
+  [ "$(grep -c 'Wait count:' "$DOCS_ROOT/docs/plans/operator-acts.md")" -eq 3 ]
+  run wb_set operator-acts --count 9
+  [ "$status" -eq 0 ]; [ "$output" = "$(printf '9\tplan')" ]
+  grep -q '^> \*\*Wait count:\*\* 9$' "$DOCS_ROOT/docs/plans/operator-acts.md"
+  before="$(cat "$DOCS_ROOT/docs/plans/operator-acts.md")"
+  run wb_set operator-acts --count 9
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DOCS_ROOT/docs/plans/operator-acts.md")" = "$before" ]
+}
+
+@test "wait-budget.sh --count refuses what is not a count, and a count with a budget beside it" {
+  setup_docs operator-acts operator-acts
+  for bad in 0 -3 x 2h 100; do
+    run wb_set operator-acts --phase 1 --count "$bad"
+    [ "$status" -eq 2 ] || { echo "accepted --count $bad"; return 1; }
+  done
+  run wb_set operator-acts --phase 1 --count 5 90m
+  [ "$status" -eq 2 ]
+}

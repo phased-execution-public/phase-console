@@ -47,7 +47,14 @@
 - **Working trees** — جایی که کارِ موازی هست، و آنچه از کارِ تمام‌شده باقی مانده.
 - **Changes** — آنچه میانِ هر دو نقطه عوض شده، یک فایل در هر بار.
 - **Settles** — کارِ هر اجرا چطور به شاخه‌ی اصلی رسید، یا چرا نرسید.
-- **Issues** — issueهای بازِ هر مخزن. چندتا را علامت بزنید و **Author a plan from N issues** را بزنید (به <span dir="ltr">`--allow-agent`</span> نیاز دارد).
+- **Issues** — میزِ issueها: فهرستِ کاملِ issueهای یک مخزن، هر کدام با دسته، شدت و وضعیتِ طرحش. هر ستون مرتب می‌شود، و فیلترها و ترتیب در URL می‌مانند. هر <span dir="ltr">`owner/name`</span> گیت‌هاب را بیفزایید تا کنار مخزن‌های خودتان خوانده شود. چندتا را علامت بزنید و **Author a plan from N issues** را بزنید (به <span dir="ltr">`--allow-agent`</span> نیاز دارد).
+
+میز واژه‌های هر issue را از برچسب‌هایش می‌خواند. دسته‌اش bug، enhancement، documentation، question یا other
+است. شدتش از برچسبِ <span dir="ltr">`severity:`</span> می‌آید: critical، high، medium یا low، یا هیچ.
+وضعیتِ طرحش می‌گوید کجا ایستاده: طرح لازم دارد (<span dir="ltr">`awaiting-plan`</span>)، در یک طرح و فاز
+برنامه‌ریزی شده (<span dir="ltr">`plan:<slug>`</span>)، به تعویق افتاده
+(<span dir="ltr">`plan:<slug>-deferred`</span>) یا درست شده (بسته، با برچسبِ یک طرح). مخزنی که شما
+می‌افزایید فقط‌خواندنی است و با *outside this console* (بیرون از این کنسول) علامت می‌خورد.
 
 
 ## Insights — چقدر زمان، چقدر هزینه، با چه سرعتی؟

@@ -42,11 +42,10 @@ import {
   failureContext, resumeBrief, resumeInstruction, unblockBrief, type BriefFacts,
 } from './failure-context.ts';
 import {
-  applyEvent, evaluateStall, isProductiveEvent, livenessOf, newLaneSignals, stallThresholds,
+  applyEvent, creditHeldTime, evaluateStall, isProductiveEvent, livenessOf, newLaneSignals, stallThresholds,
   type LaneLiveness, type LaneSignals, type StallState, type StallThresholds,
 } from './liveness.ts';
 import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
-import { proofsFile } from './proofs.ts';
 import {
   classifySituation, collectEvidence, situation as situationOf, workEvidence,
   type EvidenceDeps, type PhaseEvidence, type Situation,
@@ -60,10 +59,10 @@ import { closeQueueEpisode, foldRunBlocked, noteQueueHead, openQueueEpisode, sen
 import { branchHoldNow, readHolds, TREE_POLL_MS, type BranchHoldView, type TreeHold } from './tree-state.ts';
 import { resumePolicy, type ResumePolicy } from './usage.ts';
 import {
-  ENGINE_BUSY_BACKOFF_MS, reboardResumeBrief, resumePolicyInstruction, resumePolicyWhy, sessionLostInstruction,
+  clockOf, ENGINE_BUSY_BACKOFF_MS, inputCloseWords, reboardResumeBrief, resumePolicyInstruction, resumePolicyWhy, sessionLostInstruction,
 } from './runner-core.ts';
 import type { RungRecord } from './state.ts';
-import { accountPool, applyErrandAnswer, identityChangeWords, identityEcho, keepAccountInPool, manifestEcho, rankInPool, type ErrandAnswer } from './state.ts';
+import { accountPool, applyErrandAnswer, identityChangeWords, identityEcho, keepAccountInPool, launcherAlive, manifestEcho, rankInPool, type ErrandAnswer } from './state.ts';
 import {
   childrenOf, endLockWait, loadRun, newRun, orphanAdvice, phaseRecord, procIdentity, retirePhaseHalt, retireSettledErrands, runDir, saveRun, pidAlive, pidHoldsWork, IN_FLIGHT, SETTLED,
   setPhaseState, setRunState,
@@ -501,7 +500,7 @@ export abstract class RunnerControl extends RunnerBase {
         ...(options.messaging !== undefined ? { messaging: options.messaging } : {}),
         ...(options.issuesMode !== undefined ? { issuesMode: options.issuesMode } : {}),
       };
-      applySettings(this.state, named);
+      applySettings(this.state, named, this.consoleIssueWord());
       // A run resumed from disk may carry lanes recorded by the console that
       // died. `adopt` has already ruled on the dangerous case, so the entries
       // it left behind are gone — but "adopt ruled on it" is a claim about
@@ -2039,13 +2038,23 @@ export abstract class RunnerControl extends RunnerBase {
       PE_TASKS_FILE: undefined,
       PE_RULINGS_FILE: undefined,
       // The proof ledger (control-tower phase 62): per plan like the rulings,
-      // and a reviewer's run of a suite is not the phase's proof of it.
+      // and a reviewer's run of a suite is not the phase's proof of it — nor
+      // is the judging directory that keys one (phase 106, `proofEnv`).
       PE_PROOFS_FILE: undefined,
+      PE_VERIFY_DIR: undefined,
+      PE_RUN_ROOT: undefined,
       // The issue ledger too (phase 12): per PLAN rather than per attempt, but
       // a console started by a session of plan A must not hand plan A's
       // ledger to a reviewer of plan B — every site that wants it states it
       // through `issuesEnv()`.
       PE_ISSUES_FILE: undefined,
+      // …and the policy beside it (control-tower phase 114): the run's word,
+      // the suggestions switch and the estate's keys are THIS run's, stated by
+      // `issuePolicyEnv()`, never a value inherited from whoever started us.
+      PE_ISSUES_MODE: undefined,
+      PE_ISSUES_SOURCE: undefined,
+      PE_ISSUES_SUGGEST: undefined,
+      PE_ISSUE_REPOS: undefined,
       // The trace, stated on exactly the same terms and for the same reason:
       // an inherited `PE_TRACE_ID` belongs to whichever session started this
       // console, and a session that joined THAT trace would file its evidence
@@ -3249,8 +3258,9 @@ export abstract class RunnerControl extends RunnerBase {
           // every other spawn site keeps.
           PE_OUTCOME_FILE: this.armOutcomeFile(phase),
           PE_RULINGS_FILE: rulingsFile(state.root, state.slug),
-          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
-          PE_PROOFS_FILE: proofsFile(state.root, state.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62),
+          // and where its lines are judged — the proof is keyed there (phase 106, `proofEnv`).
+          ...(await this.proofEnv(phase)),
           PE_TASKS_FILE: this.armTasksFile(phase),
         }),
         signal: this.abort?.signal,
@@ -3649,8 +3659,9 @@ export abstract class RunnerControl extends RunnerBase {
           // kept, and a session must be able to record the second without
           // touching the first.
           PE_RULINGS_FILE: rulingsFile(this.state!.root, this.state!.slug),
-          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
-          PE_PROOFS_FILE: proofsFile(this.state!.root, this.state!.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62),
+          // and where its lines are judged — the proof is keyed there (phase 106, `proofEnv`).
+          ...(await this.proofEnv(phase)),
           // Where the session publishes its TASK LIST. A clone of the outcome
           // channel next door, for the same reason: the CLI stopped
           // provisioning TodoWrite/TaskCreate to `-p` sessions in August 2026,
@@ -3901,6 +3912,21 @@ export abstract class RunnerControl extends RunnerBase {
     // is still editing the repo"; a `zombie` is neither, so parking a run over
     // one printed a pid to look at that had already exited.
     const alive = children.filter((child) => pidHoldsWork(child.pid, procIdentity(child)));
+    // A session the LIVE console launched is not an orphan (control-tower phase
+    // 110, #175): whichever of this console's loops started it has let go, but
+    // its console has not, and a halt calling it "a session from an earlier
+    // console" would be false. The start is refused instead — never a second
+    // session beside it, and nothing written about the run.
+    const own = alive.filter((child) => launcherAlive(child) === true);
+    if (own.length) {
+      if (this.state === state && !this.driving) this.state = null;
+      throw new Error(
+        `${own.length === 1 ? 'A session' : `${own.length} sessions`} this console started `
+        + `${own.length === 1 ? 'is' : 'are'} still running (`
+        + `${own.map((child) => `pid ${child.pid}, phase ${child.phase}`).join('; ')}) — `
+        + 'let it end, or stop it, before this run starts again.',
+      );
+    }
     if (alive.length) {
       // ONE composer with `reconcileRun` (`orphanAdvice`). This path used to
       // have no frozen/running split at all: a SIGSTOPped orphan is not `gone`,
@@ -5136,6 +5162,37 @@ export abstract class RunnerControl extends RunnerBase {
     return this.laneFor(phase)?.handle?.open() === true;
   }
 
+  /**
+   * Why a phase's LIVE session cannot take a message, in one sentence — or
+   * null when no session of that phase lives (control-tower phase 109, #170).
+   * Three shapes: this console's lane whose input closed (the cause the
+   * spawn reported — `phase.input-closed`), its lane still starting, and a
+   * child another console started, adopted from the run record with no pipe
+   * at all. The Pro mailbox reaches the last two over the CLI's own inbox
+   * socket when the hook captured one; steer and ask have only the pipe.
+   */
+  liveButUnreachable(lane: Lane | null | undefined, phase: number | null): string | null {
+    if (phase == null) return null;
+    const who = `phase ${phase}'s session`;
+    if (lane) {
+      // Only while a session process lives: between sessions — verifying, a
+      // closeout to come, a retry's back-off — the lane stands with no pid, and
+      // the old words are the true ones.
+      const pid = lane.pid ?? lane.handle?.pid ?? null;
+      if (!pid) return null;
+      if (lane.inputClosed) {
+        return `${who} (pid ${pid}) is running, but its input closed at ${clockOf(lane.inputClosed.at)} `
+          + `(${inputCloseWords(lane.inputClosed.cause)}) — it cannot take messages now, and ends at the end of its turn`;
+      }
+      if (!lane.handle) return `${who} (pid ${pid}) is starting — its input is not open yet; send it again in a moment`;
+      return null;
+    }
+    const child = this.state?.children?.[String(phase)];
+    if (!child?.pid || !pidHoldsWork(child.pid, procIdentity(child))) return null;
+    return `${who} (pid ${child.pid}) is running, but this console did not start it — it was adopted from the run record `
+      + `with no input pipe (${inputCloseWords('adopted')}), so it cannot take messages; it ends at the end of its turn`;
+  }
+
   tellRelayAnswer(phase: number, answers: readonly { question: string; label: string; by: string; ruleId?: string }[]): AskResult {
     if (!answers.length) return { ok: false, reason: 'nothing to tell' };
     const told = answers.map((answer) => ({
@@ -5175,11 +5232,17 @@ export abstract class RunnerControl extends RunnerBase {
       // misunderstood which button was pressed — which is the one moment an
       // operator most needs to believe the refusal is about the session and
       // not about the request.
+      const act = kind === 'ask' ? 'ask' : kind === 'msg' ? 'tell' : 'steer';
+      // …and for the session as it REALLY is (control-tower phase 109, #170):
+      // "no session is running" over a live child whose input had closed sent
+      // a watchdog looking for a session that was there all along.
+      const live = this.liveButUnreachable(lane, targetPhase ?? lane?.phase ?? this.state?.activePhase ?? null);
+      if (live) return { ok: false, reason: live, unreachable: true };
       return {
         ok: false,
         reason: this.driving
           ? 'no session is running just now — the run is between phases, or verifying'
-          : `nothing is running to ${kind === 'ask' ? 'ask' : kind === 'msg' ? 'tell' : 'steer'}`,
+          : `nothing is running to ${act}`,
       };
     }
 
@@ -5396,7 +5459,7 @@ export abstract class RunnerControl extends RunnerBase {
     const before = this.profile();
     const carveBefore = this.openPrCarveOut();
     const was = { ...settingsBefore(this.state, patch), ...extra.before };
-    applySettings(this.state, patch);
+    applySettings(this.state, patch, this.consoleIssueWord());
     const after = this.profile();
 
     if (after !== before) {
@@ -5524,7 +5587,11 @@ export abstract class RunnerControl extends RunnerBase {
   }
 
   /** The person cards this run is waiting on — `cardId → {phase, until}` (WAI-10). */
-  private readonly personCards = new Map<string, { phase: number; until: string }>();
+  private readonly personCards = new Map<string, {
+    phase: number; until: string;
+    /** A TOOL card: when it went up and the call it holds — credited back to that call's wait (#206). */
+    held?: { since: number; toolUseId?: string };
+  }>();
 
   /**
    * A card is a WAIT (WAI-10). While a verification card or a tool approval
@@ -5536,10 +5603,13 @@ export abstract class RunnerControl extends RunnerBase {
    * like every wait: `reconcileRun` turns it `paused` with the clock intact,
    * the boot re-arm fires at the card's expiry and the resume re-raises it.
    */
-  enterPersonWait(phase: number, card: { id: string; until: string; on: string }): void {
+  enterPersonWait(phase: number, card: { id: string; until: string; on: string; tool?: boolean; toolUseId?: string }): void {
     const state = this.state;
     if (!state) return;
-    this.personCards.set(card.id, { phase, until: card.until });
+    this.personCards.set(card.id, {
+      phase, until: card.until,
+      ...(card.tool ? { held: { since: this.now().getTime(), ...(card.toolUseId ? { toolUseId: card.toolUseId } : {}) } } : {}),
+    });
     const soonest = [...this.personCards.values()].map((c) => c.until).sort()[0];
     state.waitUntil = soonest;
     setRunState(state, 'waiting', { kind: 'person', until: soonest, on: card.on });
@@ -5551,7 +5621,15 @@ export abstract class RunnerControl extends RunnerBase {
   /** The card is down — answered, expired or the run ended. The wait ends with the LAST card. */
   leavePersonWait(cardId: string): void {
     const state = this.state;
+    const card = this.personCards.get(cardId);
     if (!this.personCards.delete(cardId) || !state) return;
+    // The call a tool card held did not wait while it was held (control-tower
+    // phase 111, #206): 2 min 45 s on a card counted toward a "5 minute" wait
+    // and the checkpoint followed. Credited back to that call's clock.
+    const lane = card?.held ? this.lanes.get(card.phase) : undefined;
+    if (lane && card?.held) {
+      creditHeldTime(lane.signals, { ...card.held, until: this.now().getTime() });
+    }
     if (this.personCards.size) {
       state.waitUntil = [...this.personCards.values()].map((c) => c.until).sort()[0];
       this.persist();

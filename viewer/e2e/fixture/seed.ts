@@ -18,7 +18,7 @@
  * Later phases extend the shapes; the handoff of control-tower phase 15 lists
  * them.
  */
-import { existsSync, mkdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { instanceId } from '../../shared/instances.mjs';
@@ -444,6 +444,7 @@ export function seed(box: ConsoleSandbox, anchor: number): SeedInfo {
     };
     writeFileSync(join(dir, `run-${r.id}.json`), `${JSON.stringify(state, null, 2)}\n`);
   }
+  seedIssues(box, anchor);
   return {
     anchor,
     tourPlan: 'tower',
@@ -455,4 +456,99 @@ export function seed(box: ConsoleSandbox, anchor: number): SeedInfo {
       halt: r.halt?.kind ?? r.records.find((x) => x.halt)?.halt?.kind ?? null,
     })),
   };
+}
+
+/** The repository the Issues desk's stop reads (control-tower phase 118). */
+export const DESK_REPO = 'example/tower-issues';
+
+/**
+ * The Issues desk's data: one repository ADDED to the desk by its owner/name
+ * (`prefs.issueRepos`), and its issue list already in the cache, as a refresh
+ * leaves it — so the stop draws a real desk without ever reaching GitHub (the
+ * GET never fetches). Every category, severity and plan state is here once,
+ * a closed one fixed and a closed one merely closed, and one title long
+ * enough to wrap on a phone.
+ */
+function seedIssues(box: ConsoleSandbox, anchor: number): void {
+  const at = (min: number): string => new Date(anchor - min * 60_000).toISOString();
+  const config = join(box.configHome, 'phase-console', 'config.json');
+  mkdirSync(join(box.configHome, 'phase-console'), { recursive: true });
+  const prior = existsSync(config)
+    ? (JSON.parse(readFileSync(config, 'utf8')) as Record<string, unknown>)
+    : {};
+  writeFileSync(config, `${JSON.stringify({ ...prior, issueRepos: [DESK_REPO] }, null, 2)}\n`);
+
+  type Row = [number, string, string[], string, number, number?];
+  const rows: Row[] = [
+    [
+      52,
+      'Ground crews need the after-dark radio channel printed on every vehicle, the tug and the fuel truck included',
+      ['enhancement', 'awaiting-plan'],
+      'ops-lead',
+      25,
+    ],
+    [
+      48,
+      'Night landings need a second lighting check',
+      ['bug', 'awaiting-plan', 'severity:high'],
+      'airfield-ops',
+      40,
+    ],
+    [
+      47,
+      'The runway survey misses the eastern apron',
+      ['bug', 'plan:tower', 'severity:medium'],
+      'surveyor',
+      180,
+    ],
+    [
+      45,
+      'Hangar door sensors read open when closed',
+      ['bug', 'awaiting-plan', 'severity:critical'],
+      'maintenance',
+      1_440,
+    ],
+    [
+      44,
+      'Explain the fuel-truck rota in the handbook',
+      ['documentation', 'plan:tower-deferred'],
+      'ops-lead',
+      2_880,
+    ],
+    [
+      41,
+      'Show the wind sock on the tower board',
+      ['enhancement', 'plan:tower', 'severity:low'],
+      'controller',
+      4_320,
+    ],
+    [39, 'Which channel do ground crews use after dark?', ['question'], 'new-starter', 7_200],
+    [
+      36,
+      'Taxiway lights flicker on cold mornings',
+      ['bug', 'plan:tower', 'severity:medium'],
+      'surveyor',
+      8_640,
+      8_640,
+    ],
+    [30, 'An old checklist link is dead', ['documentation'], 'ops-lead', 12_960, 12_960],
+  ];
+  const issues = rows.map(([number, title, labels, author, updated, closed]) => ({
+    number,
+    title,
+    state: closed === undefined ? 'OPEN' : 'CLOSED',
+    labels,
+    assignees: number === 47 ? ['surveyor'] : [],
+    author,
+    createdAt: at(updated + 600),
+    updatedAt: at(updated),
+    ...(closed === undefined ? {} : { closedAt: at(closed) }),
+    url: `https://github.com/${DESK_REPO}/issues/${number}`,
+  }));
+  const dir = join(box.stateHome, 'phase-console', 'issues');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${DESK_REPO.replace(/[^A-Za-z0-9._-]+/g, '_')}.json`),
+    JSON.stringify({ nameWithOwner: DESK_REPO, fetchedAt: anchor - 4 * 60_000, issues }),
+  );
 }

@@ -13,15 +13,22 @@
  *       manifest — with auto-grant OFF too — journalled with the row, announced.
  * AP-2  The same inside a compound command: redirects, `echo $?`, and
  *       read-only `grep` / `git status` / `git stash list` tails beside it.
- * AP-3  A force push, another branch, a refspec to `main`, a segment the row
- *       does not cover, a substitution: a person's card, which names the row it
- *       was checked against and why it did not match.
+ * AP-3  A force push, another branch, a refspec to `main`: a person's card,
+ *       which names the row it was checked against and why it did not match.
+ *       A push the row names, in a shape it cannot answer as it stands — a
+ *       neighbour that writes, a branch the shell computes, a bare push — is
+ *       refused AT ONCE naming the bare form (control-tower phase 107, #186).
  * AP-4  No automatic actor — `by: timeout` included — decides `deny` on a card
  *       the manifest answers: the card resolves to the manifest's answer and
  *       the run is not parked. A person's deny still stands.
  * AP-5  The grammar: which branches a row names, and which command shapes a
  *       named branch covers — narrowly, because reading a refusal as a
  *       permission is the one mistake that matters.
+ * AJ-6  (control-tower phase 107, #205) A command the row names for the
+ *       RUNNING phase — `gh pr create` in a `Phases 4/17/22 —` list — is
+ *       auto-granted from the manifest and announced, naming the row and the
+ *       phase; a phase the row does not name gets the card, which says which
+ *       phases the row allows.
  */
 
 import '../e2e/fixture/steady-load.mjs';
@@ -40,7 +47,8 @@ process.env.PHASE_CONSOLE_LOG = '';
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const { POLICY_PATH, planPolicyPath } = await import('../server/runner/approvals.ts');
-const { destructivePushBranches, manifestPushVerdict } = await import('../shared/policy-model.js');
+const { destructivePushBranches } = await import('../shared/policy-model.js');
+const { manifestPushVerdict, manifestVerdict } = await import('../server/runner/manifest-verdict.ts');
 
 const flags = {
   port: 0, host: '127.0.0.1', open: false, allowWrites: false,
@@ -153,8 +161,8 @@ test('AP-2 (#112): the same push inside a compound command — redirects, echo $
   }
 });
 
-test('AP-3 (#112): a force push, another branch, a refspec to main, an uncovered segment or a substitution stays a person\'s card — which names the row and why it did not match', async () => {
-  const { service } = serviceOn({ ...CARVED, manifest: manifestOf(VCA_ROW) });
+test('AP-3 (#112, #186): a force push, another branch or a refspec to main stays a person\'s card naming the row and why; the row\'s own branch in a shape it cannot answer is refused at once, naming the bare form', async () => {
+  const { service, noted } = serviceOn({ ...CARVED, manifest: manifestOf(VCA_ROW) });
   try {
     const cases: [string, RegExp][] = [
       ['git push origin +pe/vca-refactor', /force/i],
@@ -162,9 +170,6 @@ test('AP-3 (#112): a force push, another branch, a refspec to main, an uncovered
       ['git push origin pe/vca-refactor:main', /main/],
       ['git push origin main', /main/],
       ['git push origin :pe/vca-refactor', /delete/i],
-      ['git push origin pe/vca-refactor && touch build/stamp', /touch/],
-      ['git push origin $(git branch --show-current)', /substitution/i],
-      ['git push', /names no branch/i],
     ];
     for (const [command, why] of cases) {
       assert.ok(await stillAsking(service, command), `${command} is a person's tap`);
@@ -180,6 +185,24 @@ test('AP-3 (#112): a force push, another branch, a refspec to main, an uncovered
       const answer = reply(await service.decideToolUse(bash(command), 'r1'));
       assert.equal(answer.permissionDecision, 'deny', `${command} is walled, whatever the row names`);
     }
+    // #186: the row names the branch; only the SHAPE is wrong. Answered now,
+    // with the form to re-run — no card for a person, no hour for the timeout.
+    const before = service.approvals.pending().length;
+    const reshaped: [string, RegExp, string][] = [
+      ['git push origin pe/vca-refactor && touch build/stamp', /touch/, 'git push origin pe/vca-refactor'],
+      ['git push origin $(git branch --show-current)', /computes/, 'git push origin <one of: pe/vca-refactor, fix/vca-backend-gaps>'],
+      ['git push', /names no branch/i, 'git push origin <one of: pe/vca-refactor, fix/vca-backend-gaps>'],
+    ];
+    for (const [command, why, bare] of reshaped) {
+      const answer = reply(await service.decideToolUse(bash(command), 'r1'));
+      assert.equal(answer.permissionDecision, 'deny', `${command} is answered at once`);
+      assert.ok(answer.permissionDecisionReason.includes(`Re-run \`${bare}\` alone`), `the bare form, for ${command}: ${answer.permissionDecisionReason}`);
+      assert.match(answer.permissionDecisionReason, why);
+      const line = noted.findLast((n) => n.event === 'phase.approval-reshaped');
+      assert.equal(line?.data.bareForm, bare, `journalled with its bare form: ${command}`);
+      assert.equal(line?.data.answeredBy, 'permission.destructive');
+    }
+    assert.equal(service.approvals.pending().length, before, 'no card was raised for a reshape');
   } finally {
     service.approvals.disarm();
     service.close();
@@ -264,15 +287,163 @@ test('AP-5 (#112): the grammar — the branches a row names, and the command sha
   assert.equal(verdict('git push origin pe/vca-refactor fix/vca-backend-gaps').answer, 'allow', 'two named branches in one push');
   assert.equal(verdict('git push origin pe/vca-refactor main').answer, null, 'a trunk riding along is still a trunk');
   assert.match(verdict('git push origin :pe/vca-refactor').why, /delete/i, 'an empty source deletes the branch the row names');
-  assert.equal(verdict('git push origin pe/vca-refactor:').answer, null, 'an empty destination names no branch');
+  assert.equal(verdict('git push origin pe/vca-refactor:').answer, 'deny', 'an empty destination names no branch — re-run it named');
   assert.equal(verdict('git push --force-with-lease origin pe/vca-refactor').answer, null);
   assert.equal(verdict('git push --no-verify origin pe/vca-refactor').answer, null, 'skipping the gate hook is not covered');
   assert.equal(verdict('git push --tags origin pe/vca-refactor').answer, null);
-  assert.equal(verdict('git push origin pe/vca-refactor; git reset --hard HEAD~3').answer, null, 'a destructive neighbour');
-  assert.equal(verdict('git push origin pe/vca-refactor | sh').answer, null);
-  assert.equal(verdict('echo `git push origin pe/vca-refactor`').answer, null);
+  // The row's branch in a shape it cannot answer: never `allow`, and never a
+  // card either (#186) — `deny`, naming the push to re-run alone.
+  for (const command of [
+    'git push origin pe/vca-refactor; git reset --hard HEAD~3',
+    'git push origin pe/vca-refactor | sh',
+    'echo `git push origin pe/vca-refactor`',
+  ]) {
+    const answer = verdict(command);
+    assert.equal(answer.answer, 'deny', `a destructive neighbour, a shell reading the push, a push in a substitution: ${command}`);
+    assert.equal(answer.bareForm, 'git push origin pe/vca-refactor', command);
+  }
   assert.equal(verdict('echo "$(git push origin main)"').answer, null, 'a substitution inside quotes is still a substitution');
   assert.equal(verdict('echo done').answer, null, 'no push at all is not a push the row answered');
   assert.equal(manifestPushVerdict('git push origin pe/control-tower', 'deny', { runBranch: 'pe/control-tower' }).answer, null,
     'a row that names nothing answers nothing');
+});
+
+/** ai-builder-v7's row, verbatim from #205: named commands in a phase-qualified list. */
+const AB7_ROW = 'deny, with these allow rows: Phase 1 — `gh label create`, `gh issue create`; Phases 4/17/22 — `gh pr create`, `gh pr merge --squash --delete-branch`, `gh issue close`, `gh issue comment`, the direct pathspec pushes …; every phase — `git push` of `pe/ai-builder-v7` as a backup …';
+
+test('AJ-6 (#205): a command the row names for the RUNNING phase is auto-granted from the manifest and announced, naming the row and the phase; another phase gets the card, which names the phases the row allows', async () => {
+  const restore = autoGrantOff();
+  const command = 'gh pr create -R acme/app-backend --base main --head pe/ai-builder-v7 --title "Release 0" --body "b"';
+  const four = serviceOn({ ...CARVED, slug: 'ai-builder-v7', activePhase: 4, manifest: manifestOf(AB7_ROW) });
+  try {
+    const answer = reply(await four.service.decideToolUse(bash(command), 'r1'));
+    assert.equal(answer.permissionDecision, 'allow', 'the row names gh pr create for phase 4');
+    assert.match(answer.permissionDecisionReason, /permission\.destructive/);
+    assert.equal(four.service.approvals.pending().length, 0, 'no card for what the plan answered');
+    const granted = four.noted.find((n) => n.event === 'phase.approval-auto-granted');
+    assert.ok(granted, 'journalled');
+    assert.equal(granted.phase, 4, 'on the phase that ran it');
+    assert.equal(granted.data.answeredBy, 'permission.destructive');
+    const exception = granted.data.exception as { rule: string; value: string; why: string };
+    assert.equal(exception.rule, 'Bash(gh pr create:*)');
+    assert.match(exception.value, /Phases 4\/17\/22/, 'the row it was answered from');
+    assert.match(exception.why, /`gh pr create` for phase 4/, 'naming the command and the phase');
+    const announced = four.events.filter((e) => e.name === 'notification' && (e.data as { category?: string }).category === 'approval');
+    assert.equal(announced.length, 1, 'and announced');
+    // The sibling shape #205 also carded: a read-only wait before the create.
+    const waited = reply(await four.service.decideToolUse(bash(
+      'until [ "$(git ls-remote origin refs/heads/pe/ai-builder-v7)" = "abc" ]; do sleep 10; done; ' + command), 'r1'));
+    assert.equal(waited.permissionDecision, 'allow', 'a wait loop before the create does not hide it');
+  } finally {
+    four.service.approvals.disarm();
+    four.service.close();
+  }
+
+  const five = serviceOn({ ...CARVED, slug: 'ai-builder-v7', activePhase: 5, manifest: manifestOf(AB7_ROW) });
+  try {
+    assert.ok(await stillAsking(five.service, command), 'phase 5 is not named: a person\'s card');
+    const card = five.service.approvals.pending()[0];
+    assert.equal(card?.manifest?.answer, null);
+    assert.match(card?.manifest?.why ?? '', /phases 4, 17, 22 — not phase 5/, `the card names the phases: ${card?.manifest?.why}`);
+    assert.equal(five.noted.filter((n) => n.event === 'phase.approval-auto-granted').length, 0);
+  } finally {
+    five.service.approvals.disarm();
+    five.service.close();
+    restore();
+  }
+});
+
+test('AJ-6 (#205): the grammar reads a phase-qualified list per phase — named options, a phase written in the clause, and a refusal never read as a permission', () => {
+  const v = (command: string, phase: number) => manifestVerdict(command, AB7_ROW, { phase });
+  assert.equal(v('gh pr merge 12 --squash --delete-branch', 17).answer, 'allow', 'the named form, in a named phase');
+  assert.match(v('gh pr merge 12 --merge', 17).why, /--squash --delete-branch/, 'a merge without the named options is a card that says which');
+  assert.equal(v('gh pr merge 12 --merge', 17).answer, null);
+  assert.equal(v('gh pr create --title x', 22).answer, 'allow');
+  assert.equal(v('gh pr create --title x', 1).answer, null, 'phase 1 names other commands');
+  assert.equal(v('git push origin pe/ai-builder-v7', 9).answer, 'allow', 'every phase — the backup push');
+  assert.equal(v('git push origin main', 4).answer, null, 'a trunk is never read from a list');
+  // A list does not run on into a clause that refuses.
+  const refusing = 'deny, with these allow rows: Phases 4/17 — `gh pr create`; Phase 9 — never `gh pr merge`';
+  assert.equal(manifestVerdict('gh pr merge 3 --squash', refusing, { phase: 9 }).answer, null);
+  // The run's own row (classic `allow`, no phases) answers every phase, as it always did.
+  const ours = 'deny by default; allow `Bash(git push:*)`, `Bash(gh pr create:*)`, `Bash(gh release create:*)`';
+  assert.equal(manifestVerdict('gh pr create --fill', ours, { phase: 107 }).answer, 'allow');
+  assert.equal(manifestVerdict('git add -A && git commit -m x && git push', ours, { phase: 107 }).answer, 'allow',
+    'a whole `Bash(git push:*)` rule answers any push, as TRS-4 always did');
+});
+
+test('AJ-6 (#205): the row answers the publishing act ALONE — a command beside it is judged as if it ran alone; a named form is that form; a remote is a name', async () => {
+  const restore = autoGrantOff();
+  // A guarded run: `npm install` is on the ask list, so it never rides a named
+  // `gh pr create` past it — answered at once, naming the bare form.
+  const guarded = serviceOn({ ...CARVED, slug: 'ai-builder-v7', activePhase: 4, manifest: manifestOf(AB7_ROW) });
+  try {
+    const answer = reply(await guarded.service.decideToolUse(bash('gh pr create --fill && npm install left-pad'), 'r1'));
+    assert.equal(answer.permissionDecision, 'deny', answer.permissionDecisionReason);
+    assert.match(answer.permissionDecisionReason, /asks about on its own: npm install left-pad/);
+    assert.ok(answer.permissionDecisionReason.includes('Re-run `gh pr create --fill` alone'), answer.permissionDecisionReason);
+    assert.equal(guarded.service.approvals.pending().length, 0, 'answered at once, no card');
+    // The read-only roster rides along as it always did.
+    const read = reply(await guarded.service.decideToolUse(bash('cd backend && gh pr create --fill 2>&1 | tail -3'), 'r1'));
+    assert.equal(read.permissionDecision, 'allow', read.permissionDecisionReason);
+  } finally {
+    guarded.service.approvals.disarm();
+    guarded.service.close();
+  }
+  // A trusted run with a whole `Bash(git push:*)` rule (this plan's own row):
+  // `git add` and `git commit` are allowed on their own there, so the
+  // compound push is answered as before.
+  const ours = 'deny by default; allow `Bash(git push:*)`, `Bash(gh pr create:*)`';
+  const trusted = serviceOn({ ...CARVED, slug: 'ai-builder-v7', activePhase: 9, permissionProfile: 'trusted', manifest: manifestOf(ours) });
+  try {
+    const answer = reply(await trusted.service.decideToolUse(bash('git add -A && git commit -m "wip" && git push origin pe/ai-builder-v7'), 'r1'));
+    assert.equal(answer.permissionDecision, 'allow', answer.permissionDecisionReason);
+  } finally {
+    trusted.service.approvals.disarm();
+    trusted.service.close();
+    restore();
+  }
+
+  const v = (command: string, phase: number) => manifestVerdict(command, AB7_ROW, { phase });
+  // A named form is that form: an option it does not name is a person's card.
+  assert.equal(v('gh pr merge 12 --squash --delete-branch --admin', 17).answer, null);
+  assert.match(v('gh pr merge 12 --squash --delete-branch --admin', 17).why, /also carries --admin/);
+  assert.equal(v('gh pr merge 12 --squash --delete-branch -R acme/app --subject "Release 0"', 17).answer, 'allow',
+    'options that only parameterise it are its own');
+  // The row answers a push to the checkout's origin — never a URL, a path
+  // (`.` and `..` are paths) or another remote.
+  for (const command of ['git push https://example.invalid/r.git pe/ai-builder-v7', 'git push ../elsewhere pe/ai-builder-v7',
+    'git push git@example.invalid:r.git pe/ai-builder-v7', 'git push .. pe/ai-builder-v7', 'git push . pe/ai-builder-v7']) {
+    assert.equal(v(command, 3).answer, null, command);
+    assert.match(v(command, 3).why, /a URL or a path/, command);
+  }
+  assert.equal(v('git push upstream pe/ai-builder-v7', 3).answer, null, 'another remote is a person\'s call');
+  assert.match(v('git push upstream pe/ai-builder-v7', 3).why, /the remote upstream/);
+  // What runs is what the row answered: an environment or git's own options in
+  // front of the verb change it (an ssh command, a remote URL, a host) — a
+  // person's call, whatever the row names.
+  for (const [command, why] of [
+    ['GIT_SSH_COMMAND="ssh -i k" git push origin pe/ai-builder-v7', /GIT_SSH_COMMAND/],
+    ['env GIT_SSH_COMMAND=x git push origin pe/ai-builder-v7', /GIT_SSH_COMMAND|env/],
+    ['git -c remote.origin.url=https://example.invalid/r.git push origin pe/ai-builder-v7', /git's own `-c`/],
+    ['GH_HOST=example.invalid gh pr create --fill', /GH_HOST/],
+  ] as [string, RegExp][]) {
+    assert.equal(v(command, 4).answer, null, command);
+    assert.match(v(command, 4).why, why, command);
+  }
+  assert.equal(v('git -C sub --no-pager push origin pe/ai-builder-v7', 3).answer, 'allow', 'where it runs is not what it does');
+  // A line that changes what its publishing command runs is answered with the bare form.
+  for (const [command, bare] of [
+    ['PATH=/tmp/x:$PATH; git push origin pe/ai-builder-v7', 'git push origin pe/ai-builder-v7'],
+    ['export GH_HOST=example.invalid; gh pr create --fill', 'gh pr create --fill'],
+    ['git() { echo; }; git push origin pe/ai-builder-v7', 'git push origin pe/ai-builder-v7'],
+    ['gh pr create --fill; PUSH="git push origin main"; eval "$PUSH"', 'gh pr create --fill'],
+  ] as [string, string][]) {
+    const answer = v(command, 4);
+    assert.equal(answer.answer, 'deny', `${command}: ${answer.why}`);
+    assert.equal(answer.bareForm, bare, command);
+  }
+  // What the verdict hands the caller to judge.
+  assert.deepEqual(manifestVerdict('gh pr create --fill && npm install left-pad', AB7_ROW, { phase: 4 }).companions, ['npm install left-pad']);
+  assert.equal(manifestVerdict('gh pr create --title "x y"', AB7_ROW, { phase: 4 }).companions, undefined, 'nothing beside it');
 });

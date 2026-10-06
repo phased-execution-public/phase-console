@@ -59,6 +59,7 @@ const { readRulings } = await import('../server/runner/rulings.ts');
 const { parseLock, parseQaRounds, parseTestStatus } = await import('../server/parse/folder.ts');
 const { readTaskEvents, foldTasks } = await import('../server/runner/tasks.ts');
 const { readMemoryBlock, readGateStatus, scriptEnv } = await import('../server/engine.ts');
+const { GATE_DOOR_CONSOLE_ENV } = await import('../server/writes.ts');
 
 const SCRIPTS = join(SKILL_DIR, 'scripts');
 const SLUG = 'wirefmt';
@@ -460,7 +461,10 @@ test('gate-approve.sh writes what --gate-status reads back through readGateStatu
   assert.equal(before.clear, false, `expected a blocked gate, got: ${JSON.stringify(before)}`);
   assert.equal(before.kind, 'manual');
 
-  sh('gate-approve.sh', [SLUG, '1', '--by', 'operator', '--note', 'keys minted'], { DOCS_ROOT: root });
+  // Through the console's own door, as a person's press on the Gate card
+  // writes it: since control-tower phase 107 (#174) a MANUAL gate refuses a
+  // session's or a script's approval, and this suite runs as a script.
+  sh('gate-approve.sh', [SLUG, '1', '--by', 'operator', '--note', 'keys minted'], { DOCS_ROOT: root, ...GATE_DOOR_CONSOLE_ENV });
 
   const file = join(root, 'docs', 'handoffs', SLUG, 'gate-status.md');
   const raw = readFileSync(file, 'utf8');

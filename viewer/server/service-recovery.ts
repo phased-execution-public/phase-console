@@ -87,7 +87,8 @@ import {
 } from './runner/ladder.ts';
 import { policyForSituation, policyPrefsOf } from './runner/policy.ts';
 import {
-  landingDirective, parseWatchRef, pollableRefs, redeliverAfter, watchClause, watchSummary, type WatchState,
+  ciRefusedErrand, landingDirective, MAX_CMD_RUNS_PER_PHASE, nextDueFor, parseWatchRef, pollableRefs, redeliverAfter, watchClause,
+  watchSummary, WATCH_POLL_MS, type WatchState,
 } from './watch-refs.ts';
 
 /**
@@ -109,7 +110,7 @@ import { environmentReport, type EnvIssue } from './env-doctor.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { Journal } from './runner/journal.ts';
 import {
-  HUMAN_STEPS_LISTED, STEP_TERMINAL_SCRIPT, STEP_WITHDRAW_GRACE_MS, isOpenStep, provenDetail, provenInstruction,
+  HUMAN_STEP_CLOCK_MS, HUMAN_STEPS_LISTED, STEP_TERMINAL_SCRIPT, STEP_WITHDRAW_GRACE_MS, dueHumanStep, isOpenStep, provenDetail, provenInstruction,
   refusedMove, stepJournalFields, stepViewOf, storeStepSecret, tickHumanSteps, windowEndOf,
   type HumanStep, type ReminderQuiet, type StepClockPass, type StepVerbResult, type StepView,
 } from './human-steps.ts';
@@ -126,7 +127,7 @@ import {
   autoResolveRun, childrenOf, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, retirePhaseHalt,
   reconcileRecordsAgainstBoard, resetForRetry, resetStreak, resolveRunsAgainst, saveRun, setRunState, syncWaitClock,
   slugsNeedingBoard, runDir, waitReasonOf, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText,
-  type BoardingBrief, type Errand, type McpPolicy, type PreflightWarning, type RungRecord, type RunState, type VerifySummary, mergeQaHistory,
+  mergeRunChanges, type BoardingBrief, type Errand, type McpPolicy, type PreflightWarning, type RungRecord, type RunState, type VerifySummary, mergeQaHistory,
 } from './runner/state.ts';
 import { openWaitEntry } from './runner/wait-budget.ts';
 import {
@@ -450,8 +451,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
      * the situation fingerprint (RCV-9), and an `interrupted` rung must stay
      * re-climbable once over evidence a restart did not move.
      */
-    opts: { verb?: boolean } = {},
+    opts: {
+      verb?: boolean;
+      /**
+       * How the gate writes what it reconciled — the healer's merge onto the
+       * record as it stands (control-tower phase 110, #178); a whole-copy save
+       * for every other caller, which read the run just now.
+       */
+      persist?: () => void;
+    } = {},
   ): Promise<'proceed' | 'superseded' | 'resolved' | 'unchanged' | 'capped'> {
+    const write = opts.persist ?? (() => saveRun(state));
     // `if (board)` used to be dead code: `boardStates` caught internally and
     // always returned an object, so this branch ran against an EMPTY board and
     // reconciled records against a read that had never happened. `board.error`
@@ -466,7 +476,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         ? holder.reconcileAgainstBoard(board)
         : reconcileRecordsAgainstBoard(state, board);
       if (!holder && result.changed) {
-        try { saveRun(state); } catch { /* a failed write must not block the verdict */ }
+        try { write(); } catch { /* a failed write must not block the verdict */ }
         this.emit('run:state', { state });
       }
       // "The board moved past the halt" is tested by `board[phase] === 'done'`,
@@ -497,7 +507,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         slot.lastAt = now;
         slot.lastOutcome = 'superseded';
         if (!state.resolved) autoResolveRun(state, board);
-        try { saveRun(state); } catch { /* as above */ }
+        try { write(); } catch { /* as above */ }
         this.emit('run:state', { state });
         // The urgent card this halt raised is now about nothing — stand it
         // down, with the quiet corrective push (same tag replaces the alarm).
@@ -948,6 +958,52 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (!state) return no('no run of that plan');
     if (!state.autoRecover) return no('the run opted out of auto-recovery');
 
+    /* What this pass READ, and the fence around it (control-tower phase 110,
+     * #178). A pass can spend minutes classifying under load, and the halt it
+     * was woken for may be answered meanwhile — the operator's Retry boarded
+     * attempt 3 of this plan's P33 while a heal due "a minute after the halt"
+     * read attempt 2 for five, then saved that copy over the live run. So the
+     * pass never writes its copy back: what it changes is MERGED onto the record
+     * as it stands (`mergeRunChanges`, through the stored-run writer, which
+     * hands a live run's edit to its own runner); and before it writes or acts
+     * it re-reads, and drops the pass when the run is live again or a phase
+     * holds a newer attempt than it read. `copy` is the record as this pass
+     * last read or wrote it, so its own merged changes never read as somebody
+     * else's. */
+    let copy = structuredClone(state);
+    const movedOn = (): string | null => {
+      if (this.liveRunner(slug)) return 'the run is live again';
+      const now = this.root?.ok ? loadRun(this.root.path, slug, state.id, this.liveRunIds()) : null;
+      if (!now) return 'the run can no longer be read';
+      if (IN_FLIGHT.includes(now.status) && !IN_FLIGHT.includes(state.status)) return `the run reads ${now.status} again`;
+      for (const [key, record] of Object.entries(now.phases)) {
+        const was = copy.phases[key]?.attempts ?? 0;
+        if ((record.attempts ?? 0) > was) return `phase ${key} has a newer attempt than this pass read (${record.attempts} > ${was})`;
+      }
+      if (now.resolved && !state.resolved) return 'the stop was resolved';
+      return null;
+    };
+    /** The pass's changes since its last write, onto the record as it stands. */
+    const merge = (): void => {
+      try {
+        this.editStoredRunById(slug, state.id, (current) => {
+          mergeRunChanges(copy, state, current as unknown as Record<string, unknown>);
+        });
+        copy = structuredClone(state);
+      } catch { /* the verdict matters more than the write */ }
+    };
+    /** `merge`, unless the run moved on — then nothing is written, and the reason is the answer. */
+    const persist = (): string | null => {
+      const moved = movedOn();
+      if (moved) return moved;
+      merge();
+      return null;
+    };
+    const dropped = (why: string, extra: Partial<AutoRecoverResult> = {}): AutoRecoverResult => {
+      log.info('run.heal-dropped', { slug, runId: state.id, trigger, why });
+      return no(`the run moved on while this pass read it — ${why}; nothing was done on the old reading`, { ...extra, stale: true });
+    };
+
     // Settle every rung left open by an earlier climb — by the RUNG'S OWN
     // GOAL, never by the record. `record.status === 'done'` was the old
     // judge, and for a QA rung it is always true (the phase finished before
@@ -1064,7 +1120,10 @@ export abstract class ServiceRecovery extends ServiceRuns {
           'phase.errand-cleared', { situation: sitId, verdict }, phaseNo,
         );
       }
-      if (touched) { try { saveRun(state); } catch { /* the verdict matters more than the write */ } }
+      if (touched) {
+        const moved = persist();
+        if (moved) return dropped(moved);
+      }
     }
 
     /* Resolve-first, for the halt's own phase when there is one: the board is
@@ -1073,7 +1132,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
      * answer somebody already gave. (The same gate runs again on the anchor
      * below — idempotent, and the anchor may be a different phase.) */
     if (state.halt?.phase != null) {
-      const gate = await this.preRecoveryGate(slug, state, state.halt.phase);
+      const gate = await this.preRecoveryGate(slug, state, state.halt.phase, { persist: () => { persist(); } });
       if (gate === 'superseded') {
         return no('the board had already moved past the halt — records reconciled, nothing to launch');
       }
@@ -1206,6 +1265,12 @@ export abstract class ServiceRecovery extends ServiceRuns {
       standing.push(record.phase);
     }
     const candidates = await this.classifyOpenPhases(slug, state, board, cache, new Set(standing));
+    // The re-read point (#178): classifying is the slow part of a pass, and
+    // nothing below it is said or written about a run that has moved on.
+    {
+      const moved = movedOn();
+      if (moved) return dropped(moved);
+    }
     if (!candidates.length && standing.length) {
       standing.sort((a, b) => a - b);
       // Still a sentence about the park, so it says what the watch clock will
@@ -1470,8 +1535,8 @@ export abstract class ServiceRecovery extends ServiceRuns {
           this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
           // Written down before the early return — the loop's own save below is
           // never reached from here, and an errand only the push saw is an ask
-          // no page can show.
-          try { saveRun(state); } catch { /* the verdict matters more than the write */ }
+          // no page can show. Merged onto the record as it stands (#178).
+          merge();
         }
         return no(`the run's ladder budget is spent (${run.open} of ${caps.perRunRungs} rungs on its open phases`
           + `${run.onDonePhases ? `; ${run.onDonePhases} more on phases already done no longer count` : ''}) — raise ladderPerRunRungs`,
@@ -1669,7 +1734,11 @@ export abstract class ServiceRecovery extends ServiceRuns {
       chosen = { ...c, rung: next.rung, vehicle };
       break;
     }
-    try { saveRun(state); } catch { /* the verdict matters more than the write */ }
+    {
+      // Merged, never the copy (#178) — and not at all over a run that moved on.
+      const moved = persist();
+      if (moved) return dropped(moved);
+    }
     this.emit('run:state', { state });
     log.info('run.heal-pass', {
       slug, runId: state.id, trigger, candidates: candidates.length, journalled: reJournalled, unchanged,
@@ -1700,11 +1769,16 @@ export abstract class ServiceRecovery extends ServiceRuns {
           + 'the stop was the engine, not the plan; the run is relaunched once the plan reads', said);
       }
     }
-    const gate = await this.preRecoveryGate(slug, state, phase);
+    const gate = await this.preRecoveryGate(slug, state, phase, { persist: () => { persist(); } });
     if (gate === 'superseded') {
       return no('the board had already moved past the halt — records reconciled, nothing to launch', { phase, situation: situation.key, label: situation.label });
     }
     if (gate === 'resolved') return no('the stop is already resolved', { phase, situation: situation.key, label: situation.label });
+    // The last read before anything is climbed or launched (#178).
+    {
+      const moved = movedOn();
+      if (moved) return dropped(moved, { phase, situation: situation.key, label: situation.label });
+    }
     // 🔴 Said once the rung is CHOSEN and the gate has let it through — not
     // inside `climb()`, and not before `preRecoveryGate`. A plan-shaped
     // repair that had to skip its FREE rung must say so however the climb then
@@ -1733,7 +1807,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       // remembers it tried — and the old `attempts`/`lastAt` move with it.
       accountRung(slot, { situation: situation.key, rung: rung.vehicle, params: rung.params, at: now, note: rung.label });
       if (state.halt?.reason) slot.lastReason = state.halt.reason;
-      saveRun(state);
+      merge();
       this.emit('run:state', { state });
       journal.append('phase.rung', {
         situation: situation.key, rung: rung.vehicle, params: rung.params ?? null, vehicle: vehicle.kind, attempt: slot.attempts, by, trigger,
@@ -1762,7 +1836,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
           this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
-          try { saveRun(state); } catch { /* best effort */ }
+          merge();
         });
       return answer();
     }
@@ -1784,7 +1858,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       if (record) {
         record.note = `${situation.label} — a person is asked to widen \`${vehicle.denied.rule}\` (approval card ${approval.id}); nothing spends until they answer`;
       }
-      saveRun(state);
+      merge();
       this.emit('run:state', { state });
       journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: rung.params ?? null, vehicle: 'card', cardId: approval.id, attempt: slot.attempts, by, trigger }, phase);
       log.info('run.auto-recovery', { slug, runId: state.id, phase, situation: situation.key, rung: rung.vehicle, vehicle: 'card', attempt: slot.attempts });
@@ -1863,7 +1937,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         doorActor('converge-heal', { by, via: viaOfTrigger(trigger), origin: `converge:${trigger}`, trigger: situation.key, guard: `ladder:${rung.vehicle}` }));
       if (!moved.ok) {
         this.settleRungOn(state, phase, 'failed', moved.reason ?? 'the account switch was refused');
-        try { saveRun(state); } catch { /* best effort */ }
+        merge();
         return no(`phase ${phase} reads ${situation.label} — the switch to ${vehicle.accountId} was refused: ${moved.reason ?? 'unknown'}`,
           { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
       }
@@ -1877,7 +1951,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       }).catch((error) => {
         log.warn('run.auto-recovery-failed', { slug, phase, error });
         this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
-        try { saveRun(state); } catch { /* best effort */ }
+        merge();
       });
       return answer();
     }
@@ -1895,7 +1969,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       });
       if (!raised) {
         this.settleRungOn(state, phase, 'failed', 'the stored run could not be edited');
-        try { saveRun(state); } catch { /* best effort */ }
+        merge();
         return no('the run could not be edited for the raise', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
       }
       journal.append('run.budget-raised', { from: vehicle.from, to: vehicle.to, pct: vehicle.pct, cap: vehicle.cap, spentUsd: state.spentUsd, by, rung: rung.vehicle });
@@ -1907,7 +1981,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       }).catch((error) => {
         log.warn('run.auto-recovery-failed', { slug, phase, error });
         this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
-        try { saveRun(state); } catch { /* best effort */ }
+        merge();
       });
       return answer();
     }
@@ -1946,7 +2020,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       });
       if (!parked) {
         this.settleRungOn(state, phase, 'failed', 'the stored run could not be edited');
-        try { saveRun(state); } catch { /* best effort */ }
+        merge();
         return no('the run could not be edited for the park', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
       }
       journal.append('phase.waiting', {
@@ -1978,7 +2052,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       }).catch((error) => {
         log.warn('run.auto-recovery-failed', { slug, phase, error });
         this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
-        try { saveRun(state); } catch { /* best effort */ }
+        merge();
       });
       return answer();
     }
@@ -2114,7 +2188,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
           this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
-          try { saveRun(state); } catch { /* best effort */ }
+          merge();
         });
       return answer();
     }
@@ -2129,7 +2203,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       if (!slot2.errand) {
         const errand: Errand = { phase, situation: situation.key, tried: (slot2.rungs ?? []).map((r) => r.rung), need, how, at: new Date().toISOString() };
         slot2.errand = errand;
-        try { saveRun(state); } catch { /* the ask is worth more than the write */ }
+        merge();
         journal.append('phase.errand', { ...errand }, phase);
         this.announceErrand({ slug, runId: state.id, phase, errand });
       }
@@ -2155,7 +2229,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
           this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
-          try { saveRun(state); } catch { /* best effort */ }
+          merge();
         });
       return answer();
     }
@@ -2195,7 +2269,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
           this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
-          try { saveRun(state); } catch { /* best effort */ }
+          merge();
         });
       return answer();
     }
@@ -2277,7 +2351,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
     const minted = await this.terminals.mint(undefined, undefined, built.launch);
     if (!minted.ok) {
       this.settleRungOn(state, phase, 'failed', minted.error);
-      try { saveRun(state); } catch { /* best effort */ }
+      merge();
       return no(minted.error, { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
     }
     this.runners.get(slug)?.note('run.auto-recovery', { phase, class: vehicle.cls, situation: situation.key, rung: rung.vehicle, attempt: slot.attempts }, phase);
@@ -2555,6 +2629,27 @@ export abstract class ServiceRecovery extends ServiceRuns {
     this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
     try { saveRun(state); } catch { /* the errand matters more than the write */ }
     return true;
+  }
+
+  /**
+   * A watched run GitHub refused to start (control-tower phase 111, #166):
+   * ONE errand on the waiting phase — what GitHub said, the budget as read,
+   * where to raise it, and what happens when it has room (the watch lands the
+   * ref and the session re-runs the failed jobs). The scheduler says it only
+   * when a row's reading changes, and an unchanged need is not re-written;
+   * the phase keeps waiting, and the pass that called this saves the run.
+   */
+  protected onCiNotRun(slug: string, state: RunState, phase: number, verdict: WatchState): void {
+    const record = state.phases[String(phase)];
+    if (!record || !verdict.notRun || !this.root?.ok) return;
+    const { need, how } = ciRefusedErrand(verdict.notRun, verdict.ref);
+    const at = new Date().toISOString();
+    const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: at });
+    if (slot.errand?.need === need) return;
+    const errand: Errand = { phase, situation: record.situation?.key ?? 'waiting-external', at, tried: [], need, how };
+    slot.errand = errand;
+    Journal.for(this.root.path, slug, state.id).append('phase.errand', { ...errand, ref: verdict.ref, cause: verdict.notRun.cause }, phase);
+    this.announceErrand({ slug, runId: state.id, phase, errand });
   }
 
   /* ------------------------------------------------------------------ *
@@ -2920,6 +3015,91 @@ export abstract class ServiceRecovery extends ServiceRuns {
       `${opts.by} withdrew the step — ${KIND_META[moved.kind].label.toLowerCase()}: ${moved.title} (${moved.note}).`,
       'Retry the phase to board it again, or resume its session with an instruction.');
     return { ok: true, step: this.stepView(id) };
+  }
+
+  /** One due pass at a time: it awaits probes, and the clock that starts it is a minute. */
+  private humanStepDueRunning = false;
+  /** Per step, the earliest the due pass asks its refs again — each ref's own cadence, `cmd:` backing off. */
+  private readonly humanStepDueNext = new Map<string, number>();
+  /** Per step and `cmd:` ref, how often the due pass has RUN it — bounded as the watch clock bounds a phase's. */
+  private readonly humanStepDueRuns = new Map<string, number>();
+
+  /**
+   * The operator-acts pass (control-tower phase 121, #182): every `upcoming`
+   * step's due-when ref, and every open PLAN act's proof, asked through the
+   * watch clock's one-ref probe — so a `cmd:` ref runs only where it would run
+   * on the timer, and a `unit:` ref goes over the same ssh — each at its
+   * scheme's own cadence, a `cmd:` one backing off as the timer's does and
+   * run at most `MAX_CMD_RUNS_PER_PHASE` times. A frozen console asks nothing,
+   * as the timer asks nothing. A landed due-when makes the step due: ONE push,
+   * "NOW: <command>" (`dueHumanStep`); so does a REFUSED one, its refusal
+   * named, because a ref that can never land would hold the act back, unseen,
+   * for ever. A landed proof proves a plan act, which parks no phase and so
+   * has no record for the scheduler to poll. A SESSION's act is not probed for
+   * its proof here: its phase is parked on it, the scheduler polls the proof
+   * from the record (`stepProofOf`), and that landing resumes the phase.
+   */
+  async humanStepDuePass(now = Date.now()): Promise<{ due: string[]; proven: string[] }> {
+    const out = { due: [] as string[], proven: [] as string[] };
+    if (this.humanStepDueRunning) return out;
+    let hold: ReturnType<ServiceRecovery['fleetHold']> | null;
+    try { hold = this.fleetHold(); } catch { hold = null; }
+    if (hold && !hold.plans) return out;
+    this.humanStepDueRunning = true;
+    try {
+      const ledger = this.humanStepsNow();
+      for (const step of ledger.open()) {
+        if (hold?.plans?.includes(step.slug)) continue;
+        const asks: { ref: string; why: 'due' | 'proof' }[] = [];
+        if (step.state === 'upcoming' && step.dueWhen) asks.push({ ref: step.dueWhen, why: 'due' });
+        if (step.birth === 'plan' && step.proof) asks.push({ ref: step.proof, why: 'proof' });
+        if (!asks.length || now < (this.humanStepDueNext.get(step.id) ?? 0)) continue;
+        let next = Infinity;
+        for (const ask of asks) {
+          const target = pollableRefs([ask.ref])[0];
+          const runsKey = `${step.id}\n${ask.ref}`;
+          const runs = this.humanStepDueRuns.get(runsKey) ?? 0;
+          let answer: WatchState;
+          if (target?.kind === 'cmd' && runs >= MAX_CMD_RUNS_PER_PHASE) {
+            answer = { ref: ask.ref, state: 'refused', detail: `run ${MAX_CMD_RUNS_PER_PHASE} times without landing` };
+          } else {
+            answer = await this.watchClock.probeNow(ask.ref);
+            if (target?.kind === 'cmd') this.humanStepDueRuns.set(runsKey, runs + 1);
+          }
+          if (target) {
+            const at = nextDueFor(target, answer.state, now, runs + (target.kind === 'cmd' ? 1 : 0));
+            if (at !== null) next = Math.min(next, at);
+          }
+          const refusedDue = ask.why === 'due' && answer.state === 'refused';
+          if (answer.state !== 'landed' && !refusedDue) continue;
+          if (ask.why === 'proof') {
+            const read = redactSecrets(`landed${answer.detail ? ` — ${answer.detail}` : ''}`).slice(0, 280);
+            const proven = ledger.move(step.id, 'proven', { by: 'watch', verb: 'prove', note: read });
+            if (!('refused' in proven)) {
+              out.proven.push(step.id);
+              this.stepJournal(proven, 'phase.human-step-proven', { proof: ask.ref, read, by: 'watch' });
+            }
+            break;
+          }
+          const detail = refusedDue
+            ? `its due-when ref was refused${answer.detail ? ` — ${answer.detail}` : ''}, so it is due now`
+            : answer.detail;
+          const due = dueHumanStep({ ledger, announce: (st) => this.announceHumanStep(st) }, step.id, {
+            ref: ask.ref, ...(detail ? { detail: redactSecrets(detail).slice(0, 280) } : {}),
+          });
+          if (!('refused' in due)) {
+            out.due.push(step.id);
+            this.stepJournal(due, 'phase.human-step-due', {
+              ref: ask.ref, detail: detail ?? null, pushed: due.pushed ?? false, ...(refusedDue ? { refused: true } : {}),
+            });
+          }
+        }
+        this.humanStepDueNext.set(step.id, Math.max(now + HUMAN_STEP_CLOCK_MS, Number.isFinite(next) ? next : now + 6 * 3_600_000));
+      }
+    } finally {
+      this.humanStepDueRunning = false;
+    }
+    return out;
   }
 
   /** The reminder clock's pass: remind what is due, expire what is past its window, withdraw the orphans. */

@@ -22,6 +22,7 @@
  */
 
 import { request, post } from './client';
+import type { IssueCategory, IssuePlanState, IssueSeverityWord } from '@shared/issues-model.js';
 
 /** Why a repository's issues could not be refreshed. */
 export type IssueReason = 'no-gh' | 'no-auth' | 'rate-limited' | 'no-remote' | 'never-fetched' | 'failed';
@@ -29,8 +30,22 @@ export type IssueReason = 'no-gh' | 'no-auth' | 'rate-limited' | 'no-remote' | '
 /** How old — and how trustworthy — a repository's rows are. */
 export type IssueFreshness = 'fresh' | 'stale' | 'unknown';
 
-/** What kind of repository this is inside the estate. */
-export type IssueRepoKind = 'root' | 'submodule';
+/**
+ * What kind of repository this is: the estate's own (`root`, `submodule`), or
+ * one the operator ADDED to the desk by its `owner/name` (control-tower phase
+ * 118) — read and refreshed like the rest, and outside this console.
+ */
+export type IssueRepoKind = 'root' | 'submodule' | 'added';
+
+/**
+ * What the desk reads off an issue — `shared/issues-model.js` `triageOf`,
+ * joined on by the server (with the phase a local plan's `Fixes:` line names).
+ */
+export interface IssueTriage {
+  category: IssueCategory;
+  severity: IssueSeverityWord;
+  plan: { state: IssuePlanState; slug?: string; phases?: number[] };
+}
 
 export interface Issue {
   number: number;
@@ -39,9 +54,17 @@ export interface Issue {
   title: string;
   labels: string[];
   assignees: string[];
+  /** Who opened it — a login. Absent when GitHub named nobody, or from a server before 6.1. */
+  author?: string;
+  /** ISO 8601, as GitHub sent it. */
+  createdAt?: string;
   /** ISO 8601, as GitHub sent it. */
   updatedAt: string;
+  /** ISO 8601 — a closed issue's only. */
+  closedAt?: string;
   url: string;
+  /** Category, severity and plan state. Absent from a server before 6.1: read it through `triageOfIssue`. */
+  triage?: IssueTriage;
   /** Present only once a body was asked for. Plain text — never rendered as markup. */
   body?: string;
   /** True when `body` was cut at the server's byte ceiling. */
@@ -94,7 +117,7 @@ export interface RepoIssues {
    * refresh honours, which is why a board must not offer a button that lies.
    */
   retryAt?: number;
-  /** More issues exist than one page holds. */
+  /** More issues exist than the server's list cap holds (2,000 since control-tower phase 118). */
   truncated?: boolean;
   issues: Issue[];
 }

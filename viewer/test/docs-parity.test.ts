@@ -48,6 +48,8 @@ import { BAR_KINDS, MARK_KINDS } from '../server/analysis/timeline.ts';
 import { MANIFEST, PATCH_DIR } from '../server/landing.ts';
 import { sanitiseSchedule } from '../shared/schedule-policy.js';
 import { HALT_CATEGORIES } from '../shared/halt-categories.js';
+import { HUMAN_STEP_KINDS, HUMAN_STEP_STATES } from '../shared/human-step-model.js';
+import { WATCH_SCHEMES } from '../server/watch-refs.ts';
 import { ENTITLEMENT_STATES } from '../shared/ops-vocab.js';
 import {
   WEBHOOK_PAYLOAD_FIELDS, WEBHOOK_BACKOFF_BASE_MS, WEBHOOK_BACKOFF_MAX_MS, WEBHOOK_TIMEOUT_MS,
@@ -189,6 +191,7 @@ const CATEGORY_COUNT_WORDS: Record<string, number> = {
   'twenty-seven': 27,
   'twenty-eight': 28,
   'twenty-nine': 29,
+  thirty: 30,
 };
 
 test('docs/phone.md documents every push category, and the right number of them', () => {
@@ -332,16 +335,46 @@ test('docs/metrics.md documents every board state a phase count is labelled with
  * 3. Guide claims vs the machine
  * ------------------------------------------------------------------ */
 
-/** The capability flags, lifted out of config.ts's own CAPABILITY_FLAGS table. */
-const capabilityFlags = (): string[] => {
-  const src = read('viewer/server/config.ts');
-  const block = src.slice(src.indexOf('const CAPABILITY_FLAGS'));
-  return [...new Set(block.slice(0, block.indexOf('];')).match(/--allow-[a-z-]+/g) ?? [])].sort();
+/**
+ * Every `!pro:` region of a body, as character spans — what the free build
+ * strips. The flag count differs by edition since control-tower phase 115 (the
+ * ninth, `--allow-issues`, is Pro) and only Pro regions exist, so a count
+ * stated inside one is the whole tree's and a count outside every one is the
+ * free tree's. `skill-sync.test.ts` reads the documents the same way.
+ */
+const proSpans = (body: string): Array<[number, number]> => {
+  const spans: Array<[number, number]> = [];
+  let open = -1;
+  for (const m of body.matchAll(/!pro:(start|end)/g)) {
+    if (m[1] === 'start' && open < 0) open = m.index ?? 0;
+    else if (m[1] === 'end' && open >= 0) {
+      spans.push([open, m.index ?? 0]);
+      open = -1;
+    }
+  }
+  return spans;
 };
+const insidePro = (spans: Array<[number, number]>, at: number): boolean => spans.some(([a, b]) => at > a && at < b);
+
+/** The capability flags, lifted out of config.ts's own CAPABILITY_FLAGS table — each knowing whether it is Pro. */
+const capabilityRows = (): Array<{ flag: string; pro: boolean }> => {
+  const src = read('viewer/server/config.ts');
+  const from = src.indexOf('const CAPABILITY_FLAGS');
+  const block = src.slice(from, src.indexOf('];', from));
+  const spans = proSpans(block);
+  const rows = new Map<string, boolean>();
+  for (const m of block.matchAll(/--allow-[a-z-]+/g)) {
+    if (!rows.has(m[0])) rows.set(m[0], insidePro(spans, m.index ?? 0));
+  }
+  return [...rows].map(([flag, pro]) => ({ flag, pro }));
+};
+const capabilityFlags = (): string[] => capabilityRows().map((row) => row.flag).sort();
 
 test('the guide documents every capability flag, and states the right count', () => {
   const flags = capabilityFlags();
   assert.ok(flags.length >= 5, 'CAPABILITY_FLAGS did not parse out of config.ts');
+  const proFlags = capabilityRows().filter((row) => row.pro).map((row) => row.flag);
+  const freeCount = flags.length - proFlags.length;
 
   const reference = read('viewer/client/src/content/guide/reference.md');
   const running = read('viewer/client/src/content/guide/running.md');
@@ -352,7 +385,9 @@ test('the guide documents every capability flag, and states the right count', ()
 
   // The written-out count, wherever the guide states one. This is the assertion
   // that was false for months: six flags, "All five ... are off unless named".
-  const WORDS: Record<string, number> = { four: 4, five: 5, six: 6, seven: 7, eight: 8 };
+  // Inside a Pro region it is the whole tree's count, outside every one the
+  // free tree's (phase 115).
+  const WORDS: Record<string, number> = { four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
   const surfaces = [
     ['guide/reference.md', reference],
     ['guide/running.md', running],
@@ -364,19 +399,28 @@ test('the guide documents every capability flag, and states the right count', ()
   // and "**All six are off unless you name them.**". A pattern that caught only
   // the first left the second free to say five for as long as nobody read it.
   const COUNT_PATTERNS = [
-    /\b(four|five|six|seven|eight)\s+(?:capability\s+)?switches\b/gi,
-    /\bAll\s+(four|five|six|seven|eight)\s+(?:are|of them are)\s+off\b/gi,
+    /\b(four|five|six|seven|eight|nine)\s+(?:capability\s+)?switches\b/gi,
+    /\bAll\s+(four|five|six|seven|eight|nine)\s+(?:are|of them are)\s+off\b/gi,
   ];
   let stated = 0;
   for (const [name, body] of surfaces) {
+    const spans = proSpans(body);
     for (const pattern of COUNT_PATTERNS) {
-      for (const [, word] of body.matchAll(pattern)) {
+      for (const m of body.matchAll(pattern)) {
         stated++;
+        const pro = insidePro(spans, m.index ?? 0);
+        const want = pro ? flags.length : freeCount;
         assert.equal(
-          WORDS[word.toLowerCase()],
-          flags.length,
-          `${name} says '${word}'; there are ${flags.length} capability flags`,
+          WORDS[m[1].toLowerCase()],
+          want,
+          `${name} says '${m[1]}' ${pro ? 'inside a Pro region' : 'outside every Pro region'}; that edition has ${want} capability flags`,
         );
+      }
+    }
+    // A Pro flag named outside a Pro region is a flag the free tree's guide documents and its console refuses.
+    for (const flag of proFlags) {
+      for (const m of body.matchAll(new RegExp(flag, 'g'))) {
+        assert.ok(insidePro(spans, m.index ?? 0), `${name} names ${flag} outside a Pro region`);
       }
     }
   }
@@ -385,11 +429,14 @@ test('the guide documents every capability flag, and states the right count', ()
 
 test('the guide sends readers only to settings sections that exist', () => {
   const nav = read('viewer/client/src/features/settings/nav.tsx');
-  const titles = [...nav.matchAll(/title: '([^']+)'/g)].map((m) => m[1]);
-  // Eight in every tree, and License (control-tower phase 72) inside a Pro fence
-  // the free tree strips — so nine here and eight there.
-  const sections = titles.includes('License') ? 9 : 8;
-  assert.equal(titles.length, sections, `expected ${sections} settings sections, nav.tsx has ${titles.length}`);
+  const navSpans = proSpans(nav);
+  const declared = [...nav.matchAll(/title: '([^']+)'/g)];
+  const titles = declared.map((m) => m[1]);
+  const proTitles = declared.filter((m) => insidePro(navSpans, m.index ?? 0)).map((m) => m[1]).sort();
+  // Eight in every tree; Pro adds Issues (control-tower phase 115) and License
+  // (phase 72) inside fences the free tree strips — so ten here and eight there.
+  assert.equal(titles.length - proTitles.length, 8, `expected 8 settings sections in every tree, nav.tsx has ${titles.length - proTitles.length}`);
+  assert.deepEqual(proTitles, proTitles.length ? ['Issues', 'License'] : [], 'the Pro sections are Issues and License');
 
   const guideDir = `${root}viewer/client/src/content/guide/`;
   const docs = [
@@ -1271,8 +1318,16 @@ function evidenceShapes(prefix: 'V'): number {
   return (read('viewer/shared/evidence-model.js').match(new RegExp(`^ \\*\\s{2,}${prefix}\\d\\s`, 'gm')) ?? []).length;
 }
 
+/** Pro's automatic-start doors (control-tower phase 120): counted in a fenced sentence of their own, never in the free census prose. */
+const PRO_START_DOORS: string[] = [];
+
 const SPELLED_COUNTS: SpelledCount[] = [
   { file: 'viewer/shared/halt-categories.js', find: /in one of (\w+) words/, expect: [HALT_CATEGORIES.length], what: 'HALT_CATEGORIES' },
+  /* A person's turn (control-tower phase 121): the seventeenth kind and the ninth state. */
+  { file: 'viewer/shared/human-step-model.js', find: /(\w+) kinds, and closed/, expect: [HUMAN_STEP_KINDS.length], what: 'HUMAN_STEP_KINDS' },
+  { file: 'viewer/shared/human-step-model.js', find: /(\w+) states, a PATH/, expect: [HUMAN_STEP_STATES.length], what: 'HUMAN_STEP_STATES' },
+  { file: 'references/plan-format.md', find: /the same (\w+) schemes a/, expect: [WATCH_SCHEMES.length], what: 'WATCH_SCHEMES' },
+  { file: 'references/plan-format.md', find: /The kind is one of (\w+) \(/, expect: [HUMAN_STEP_KINDS.length], what: 'HUMAN_STEP_KINDS' },
   { file: 'viewer/shared/issues-model.js', find: /(\w+) states because each one is a different thing/, expect: [ISSUE_STATES.length], what: 'ISSUE_STATES' },
   { file: 'viewer/shared/message-model.js', find: /(\w+) kinds and not (\w+), because a note/, expect: [MESSAGE_KINDS.length, MESSAGE_KINDS.length - 1], what: 'MESSAGE_KINDS' },
   { file: 'viewer/shared/message-model.js', find: /the same ([\w-]+)-word vocabulary a run's admission class/, expect: [MESSAGE_PRIORITIES.length], what: 'MESSAGE_PRIORITIES (= RUN_PRIORITIES)' },
@@ -1303,9 +1358,11 @@ const SPELLED_COUNTS: SpelledCount[] = [
   { file: 'viewer/shared/run-lifecycle.js', find: /the (\w+) transition words, as the/, expect: [RUN_PENDING_ACTS.length], what: 'RUN_PENDING_ACTS' },
   { file: 'viewer/shared/run-lifecycle.js', find: /for the (\w+) statuses that are one/, expect: [RUN_PENDING_ACTS.length], what: 'RUN_PENDING_ACTS (the three pending statuses)' },
   { file: 'viewer/shared/run-lifecycle.js', find: /the (\w+) words that are not `off`/, expect: [ULTRA_REVIEW_MODES.length - 1], what: 'ULTRA_REVIEW_MODES minus off' },
-  { file: 'viewer/shared/run-lifecycle.js', find: /(\w+) doors: \w+ are\b/, expect: [START_DOORS.length], what: 'START_DOORS' },
+  // The free census: Pro's Solve door (control-tower phase 120) is named in a
+  // fenced sentence of its own, so the counted prose is the free tree's.
+  { file: 'viewer/shared/run-lifecycle.js', find: /(\w+) doors: \w+ are\b/, expect: [START_DOORS.length - PRO_START_DOORS.length], what: 'START_DOORS' },
   // The census's split: nine `startRun` callers lead the list, the rest spawn some other way.
-  { file: 'viewer/shared/run-lifecycle.js', find: /the (\w+) `startRun` doors first, then the (\w+) that are not/, expect: [9, START_DOORS.length - 9], what: 'START_DOORS split' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /the (\w+) `startRun` doors first, then the (\w+) that are not/, expect: [9, START_DOORS.length - PRO_START_DOORS.length - 9], what: 'START_DOORS split' },
   { file: 'viewer/shared/status-vocab.js', find: /one of (\w+) UI states/i, expect: [UI_STATES.length], what: 'UI_STATES' },
   { file: 'viewer/shared/status-vocab.js', find: /`RunStatus`, (\w+) words/, expect: [RUN_STATUSES.length], what: 'RUN_STATUSES' },
   { file: 'viewer/shared/status-vocab.js', find: /`PhaseStatus`, (\w+) words/, expect: [PHASE_STATUSES.length], what: 'PHASE_STATUSES' },
@@ -1345,6 +1402,9 @@ const COUNT_ANECDOTES: { file: string; find: RegExp }[] = [
   { file: 'viewer/shared/run-settings.js', find: /Two doors accept run settings/ },
   { file: 'viewer/shared/run-settings.js', find: /two-rung cap/ },
   { file: 'viewer/shared/task-model.js', find: /one of its two doors/ },
+  // The settings history, not a list this file can count: "thirty" joined the
+  // word table with the thirtieth halt kind (control-tower phase 112).
+  { file: 'viewer/shared/automation-model.js', find: /[Tt]hirty-nine (?:flat )?keys/ },
   { file: 'docs/loop.md', find: /[Tt]hree modes/ },
   { file: 'docs/loop.md', find: /The two QA rungs/ },
   { file: 'docs/loop.md', find: /evaluates three signals against it/ },

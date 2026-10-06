@@ -15,7 +15,7 @@ process.env.PHASE_CONSOLE_HEARTBEAT_MS = '250';
 import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -24,7 +24,7 @@ import { join } from 'node:path';
 process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), 'pc-sbx-'));
 process.env.XDG_CONFIG_HOME = join(process.env.XDG_STATE_HOME, 'config');
 
-const { DocsWatcher } = await import('../server/watch.ts');
+const { DocsWatcher, isWatchNoise } = await import('../server/watch.ts');
 const { configureLog, log, recent, consoleDetached } = await import('../server/log.ts');
 const { degradedState, clearDegraded, markDegraded, onShutdown, runShutdownHandlers } = await import('../server/lifecycle.ts');
 
@@ -179,6 +179,66 @@ test('stopping is idempotent and leaves nothing armed', () => {
   assert.equal(watcher.healthy(), false);
   assert.equal(watcher.status().watching, 0);
   dir.cleanup();
+});
+
+/*
+ * TF-1/TF-2 (2026-10-05, engine queue 588) — a save's scratch name is noise.
+ *
+ * Every writer of the docs tree saves through a scratch name and a rename, and
+ * the rule dropped only a name ENDING in `.tmp`. A plans-directory scratch name
+ * maps to no slug, so each save rescanned every plan and forgot all their
+ * cached answers: 588 engine reads queued on the live console.
+ */
+test('TF-1: an atomic-write scratch name is watch noise; the real name it becomes is not', () => {
+  // Relative to the watched directory, exactly as `fs.watch` reports them.
+  for (const name of [
+    'ai-builder-v8.md.tmp.2831.842a2de19a90', // Claude Code: <file>.tmp.<pid>.<hex>
+    'demo.md.tmp.123.abc',
+    'demo/x.md.draft.9', // new-handoff.sh: <file>.draft.$$
+    'demo/test-status.md.tmp.4242', // qa-record.sh: <file>.tmp.$$
+    'demo/.locks/phase-26.lock.tmp.4242', // phase-lock.sh, inside .locks/
+    'demo.md.tmp', '.DS_Store', 'demo/.x.md.swp', 'demo.md~', // the rules that were already there
+  ]) {
+    assert.equal(isWatchNoise(name), true, `${name} is a scratch name — it must never reach the store`);
+  }
+  for (const name of [
+    'ai-builder-v8.md', 'demo/phase-07-ship.md', 'demo/test-status.md',
+    'demo/.locks/phase-26.lock', 'demo/.locks', 'demo',
+    'release.draft.md', // a plan may be called `release.draft`: a name ending `.md` is a document's own
+  ]) {
+    assert.equal(isWatchNoise(name), false, `${name} is a real change — dropping it would freeze the board`);
+  }
+});
+
+test('TF-2: a save through a scratch name reaches the handler as the real name, never the scratch one', async () => {
+  const dir = scratch();
+  const seen: string[] = [];
+  const watcher = new DocsWatcher((paths) => seen.push(...paths));
+  watcher.start([dir.plans, dir.handoffs]);
+  try {
+    mkdirSync(join(dir.handoffs, 'demo'), { recursive: true });
+    const plan = join(dir.plans, 'demo.md');
+    const handoff = join(dir.handoffs, 'demo', 'phase-01-x.md');
+    // The stimulus repeats, as in the re-arm test: `fs.watch` on macOS can lose
+    // an event in the window after it returns, and no wait recovers one.
+    let delivered = false;
+    const deadline = Date.now() + 20_000;
+    for (let n = 1; !delivered && Date.now() < deadline; n++) {
+      writeFileSync(`${plan}.tmp.${n}.842a2de19a90`, `# demo ${n}\n`);
+      renameSync(`${plan}.tmp.${n}.842a2de19a90`, plan);
+      writeFileSync(`${handoff}.draft.${n}`, `---\nstatus: complete\n---\n${n}\n`);
+      renameSync(`${handoff}.draft.${n}`, handoff);
+      delivered = await until(() => seen.includes(plan) && seen.includes(handoff), 500);
+    }
+    assert.ok(delivered, `the renames must still reach the handler; got ${JSON.stringify(seen)}`);
+    // Past the debounce, so anything else those writes produced has arrived too.
+    await wait(400);
+    assert.deepEqual(seen.filter((p) => /\.(?:tmp|draft)\.[^/]+$/.test(p)), [],
+      'a scratch name reached the handler — each one is a full rescan that forgets every plan');
+  } finally {
+    watcher.stop();
+    dir.cleanup();
+  }
 });
 
 test('the log records structured entries and unwraps errors', () => {

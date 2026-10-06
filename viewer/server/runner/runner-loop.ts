@@ -30,9 +30,9 @@ import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContin
 import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type StreamEvent } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import { capsFor, remainingTurns, type Cap } from './session-record.ts';
-import { closeWaitEntry, evaluateWait, hoursText, parkedMsOf, waitBudgetFact, type WaitBudget } from './wait-budget.ts';
+import { closeWaitEntry, evaluateWait, hoursText, parkedMsOf, waitBudgetFact, waitsMaxOf, type WaitBudget } from './wait-budget.ts';
 import { budgetFact, budgetHeadline } from '../../shared/budget-model.js';
-import { pollableRefs } from '../watch-refs.ts';
+import { pollableRefs, stillLiveRefs } from '../watch-refs.ts';
 import {
   lastFinishedPhase, ultraReviewJob, ULTRAREVIEW_EVENTS,
 } from './ultrareview.ts';
@@ -60,6 +60,7 @@ import {
   ISOLATION_PARKS, REFUSAL_FIX, REFUSAL_REASON, UNUSABLE_TREE, heldElsewhere, detachHandTree, worktreesRoot,
   type LandResult, type LaneNames, type MirrorMount, type Quarantined, type StructuralConflict, type WorktreeRefusal,
   ensureStaging, uncoveredCommits, STAGING_BRANCH, returnTree,
+  landingProofs, reseatLandedBranch, reseatLandedMounts, type LandingProof, type Reseat,
 } from './worktree.ts';
 import {
   foreignTrees, foreignTreeWarning, readHolds, readTrees, removeHold, writeHold, type TreeHold,
@@ -300,7 +301,7 @@ export function spentBudgetPark(state: RunState, phase: number, opts: {
   budget: WaitBudget;
   declared?: NonNullable<PhaseRecord['declared']>;
   at?: string;
-}): { errand: Errand; data: Record<string, unknown> } {
+}): { errand: Errand | null; fact: ReturnType<typeof budgetFact>; data: Record<string, unknown> } {
   const record = phaseRecord(state, phase);
   const at = opts.at ?? new Date().toISOString();
   // A park still holding ended here, on its own stamps — the time the phase
@@ -317,11 +318,20 @@ export function spentBudgetPark(state: RunState, phase: number, opts: {
     record.parkReason = declared.reason ?? record.parkReason;
     record.watch = declared.watch?.length ? declared.watch : undefined;
   }
-  record.note = `waiting on a spent wait budget — ${opts.refusal}`;
   if (!isSessionGone(record, record.sessionId)) record.resumeSessionId ??= record.sessionId;
-  const refs = pollableRefs(record.watch ?? []).map((target) => target.ref);
-  const raise = 'raise the budget with `- **Waits on:** <ref> · <max>` on this phase (or `**Wait budget:**` in '
-    + '§Session budget), then Retry';
+  const refs = stillLiveRefs(record).map((target) => target.ref);
+  // A wait on a ref that still polls is a WAIT (control-tower phase 121, #40's
+  // 2026-10-01 asks): its note leads with what it waits on, and nothing below
+  // asks a person to re-check by hand what the console is still watching. A
+  // `date:` alone is no such ref — it is a clock, and the budget bounded it —
+  // and neither is one the watch clock has refused, for good.
+  record.note = refs.length
+    ? `waiting on ${refs.join(', ')} — its wait budget is spent, so it has no clock of its own and resumes when one lands; ${opts.refusal}`
+    : `waiting on a spent wait budget — ${opts.refusal}`;
+  const raise = opts.ledger === 'waits'
+    ? 'raise the count with `- **Wait count:** <n>` on this phase (or `**Wait count:** <n>` in §Session budget), then Retry'
+    : 'raise the budget with `- **Waits on:** <ref> · <max>` on this phase (or `**Wait budget:**` in '
+      + '§Session budget), then Retry';
   const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: at });
   // The budget as a fact (control-tower phase 14, #40) — the limit, what the
   // parks accrued, what was asked — and its headline as the errand's FIRST
@@ -332,7 +342,7 @@ export function spentBudgetPark(state: RunState, phase: number, opts: {
   // and a phase stopped by it still has minutes left.
   const fact = opts.ledger === 'waits'
     ? budgetFact({
-      budget: 'wait', phase, limit: WAIT_MAX_PER_PHASE, spent: record.waits ?? WAIT_MAX_PER_PHASE, unit: 'waits',
+      budget: 'wait', phase, limit: waitsMaxOf(opts.budget), spent: record.waits ?? waitsMaxOf(opts.budget), unit: 'waits',
       spentOn: (record.waitHistory ?? []).filter((entry) => entry.by !== 'watchdog' && entry.by !== 'ladder')
         .map((entry) => ({ what: `declared ${entry.parkedFrom.slice(11, 16)} UTC` })),
       at,
@@ -341,25 +351,28 @@ export function spentBudgetPark(state: RunState, phase: number, opts: {
       now: Date.parse(at), at,
       askedMs: Number.isFinite(requested) ? Math.max(0, requested - Date.parse(declared?.at ?? at)) : null,
     });
+  const data = {
+    ledger: opts.ledger, refusal: opts.refusal, waits: record.waits ?? 0, parkedMs: record.parkedMs,
+    budgetMs: opts.budget.budgetMs, budgetSource: opts.budget.source,
+    ...(opts.ledger === 'waits' ? { waitsMax: waitsMaxOf(opts.budget), waitsSource: opts.budget.waitsSource ?? 'default' } : {}),
+    watch: refs, parked: true, by: declared?.by ?? 'session', polling: refs.length > 0,
+  };
+  // Still polling: a wait, with no errand — a budget errand standing from an
+  // earlier spend of this phase goes too, or the inbox would still say "needs you".
+  if (refs.length) {
+    if (slot.errand?.decisionKey === 'budgets') delete slot.errand;
+    return { errand: null, fact, data };
+  }
   slot.errand = {
     ...errandFor('waiting-external', slot.rungs ?? [], phase, at, null),
     decisionKey: 'budgets',
     need: `${budgetHeadline(fact, 'spent')} — it needs more wait budget for phase ${phase} to wait on a clock again: `
       + opts.refusal,
     budget: fact,
-    how: refs.length
-      ? `Nothing needs doing for it to go on: it waits on ${refs.join(', ')} and resumes its own session the `
-        + `moment one lands. To give it a clock again, ${raise}.`
-      : `Nothing it named can be watched, so only a person moves it: ${raise} — or resume its session with a ref to declare.`,
+    how: `Nothing it named can be watched, so only a person moves it: ${raise} — or resume its session with a ref to declare.`
+      + (opts.ledger === 'waits' ? '' : ' (A plan raises how MANY waits a phase may declare with `- **Wait count:** <n>`.)'),
   };
-  return {
-    errand: slot.errand,
-    data: {
-      ledger: opts.ledger, refusal: opts.refusal, waits: record.waits ?? 0, parkedMs: record.parkedMs,
-      budgetMs: opts.budget.budgetMs, budgetSource: opts.budget.source,
-      watch: refs, parked: true, by: declared?.by ?? 'session',
-    },
-  };
+  return { errand: slot.errand, fact, data };
 }
 
 /** `setTimeout`'s ceiling: a longer delay fires at once (Node clamps it to 1 ms). */
@@ -453,6 +466,9 @@ export abstract class RunnerLoop extends RunnerControl {
 
   private async sweepStaleWorktrees(): Promise<void> {
     const state = this.state!;
+    // 🔴 EVERY live run of this console, not just this one (SWP-2) — and the
+    // same set every run read below states (control-tower phase 110, #175).
+    const live: ReadonlySet<string> = new Set([state.id, ...(this.deps.liveRunIds?.() ?? [])]);
     try {
       const result = await sweepStale(state.root, {
         homes: this.worktreeHomes().all,
@@ -464,24 +480,24 @@ export abstract class RunnerLoop extends RunnerControl {
         // or a second console on the same root, had its checkout
         // `worktree remove --force`'d out from under a live lane. The Service
         // answers; absent (a harness) it is this run's id alone, as before.
-        liveRunIds: new Set([state.id, ...(this.deps.liveRunIds?.() ?? [])]),
+        liveRunIds: live,
         children: (runId) => childrenOf(
-          loadRun(state.root, state.slug, runId) ?? ({ phases: {} } as RunState),
+          loadRun(state.root, state.slug, runId, live) ?? ({ phases: {} } as RunState),
         ).map((child) => child.pid),
         probe: (pid) => pidHoldsWork(pid),
         // Each dead run's OWN word first (phase 15 — the launch form's), then
         // the console's. A run whose file is gone is answered by the console.
-        retention: (runId) => loadRun(state.root, state.slug, runId)?.worktreeRetention
+        retention: (runId) => loadRun(state.root, state.slug, runId, live)?.worktreeRetention
           ?? this.deps.worktreePrefs?.().retention,
         // A run whose record says it ended badly keeps its tree under
         // `keep-on-failure`: a red run's checkout holds the only copy of what
         // went wrong, and it is the first thing an operator opens.
-        failed: (runId) => runEndedBadly(loadRun(state.root, state.slug, runId)),
+        failed: (runId) => runEndedBadly(loadRun(state.root, state.slug, runId, live)),
         // …and a run that is only STOPPED — paused, halted, waiting, interrupted
         // with `resumeOnRestart` — keeps every tree it has (#94): another run
         // of this plan, or a second console, sweeping here must not take the
         // mounts it will resume into.
-        resumable: (runId) => runResumable(loadRun(state.root, state.slug, runId)),
+        resumable: (runId) => runResumable(loadRun(state.root, state.slug, runId, live)),
       });
       if (result.removed.length || result.kept.length) {
         this.record('run.worktrees-swept', {
@@ -748,6 +764,9 @@ export abstract class RunnerLoop extends RunnerControl {
           reattached: moved.moved,
           ...(moved.ok ? {} : { detail: moved.detail }),
         });
+        // A mount a session detached ON the trunk over a squash-landed branch
+        // went to what landed, not back to the old tip (#183).
+        this.noteReseated(moved.reseated);
       }
     }
     let holding = standing
@@ -1068,7 +1087,12 @@ export abstract class RunnerLoop extends RunnerControl {
     }
     if (state.isolation !== ISOLATED) return true;
     if (this.lanes.size) return true;
-    if (state.checkout === 'worktree' && state.workRoot && await this.runTreeStands(state)) return true;
+    if (state.checkout === 'worktree' && state.workRoot && await this.runTreeStands(state)) {
+      // A boundary, no lane live: the moment a branch a release squash-merged
+      // can be put on what landed without moving a tree under a session (#183).
+      await this.reseatLanded(state);
+      return true;
+    }
     const was = state.checkout;
     await this.ensureRunCheckout();
     if (state.checkout === 'worktree') {
@@ -1479,6 +1503,9 @@ export abstract class RunnerLoop extends RunnerControl {
       ...(state.detachAt ? { detach: true } : {}),
       ...this.confirmedRepair(state),
     });
+    // A mount a session detached on the trunk over a squash-landed branch was
+    // adopted on what landed, not refused (control-tower phase 112, #183).
+    this.noteReseated(made.reseated ?? []);
     this.noteQuarantined(made.quarantined);
     if (!made.ok) {
       return refuse(
@@ -2101,7 +2128,8 @@ export abstract class RunnerLoop extends RunnerControl {
         // What nothing drives, named (control-tower phase 79, #114): a phase the
         // board reads in progress that no lane, queue entry, hint, park or
         // errand of this run holds. Stamped every tick, so it is never stale.
-        this.noteUndriven(board, new Set(boardable));
+        // A lane still settling is driven (#192): its attempt has not returned.
+        this.noteUndriven(board, new Set([...boardable, ...inFlight.keys()]));
 
         // Nothing to start, but something is running: it may be about to make
         // more phases ready. Concluding "finished" here is the fastest way to
@@ -2145,6 +2173,11 @@ export abstract class RunnerLoop extends RunnerControl {
           // silently get none. Settled-well is the condition either way:
           // `unsettled` is empty, so nothing on this tree is still owed.
           await this.ultraReviewAtSettle();
+          // …and a scoped run that completed the WHOLE board is the plan's
+          // last word too: it is finished only once its work has landed
+          // (control-tower phase 112, #184). One with phases left is mid-plan
+          // — its branch is still being built, and no landing is owed yet.
+          if (!outstanding.length && await this.parkUnlanded(board)) break;
           setRunState(state, 'finished');
           // The single most-reported "it doesn't go to the next phase". The run
           // was scoped — usually from a per-row "Run only this" control — did
@@ -2195,6 +2228,12 @@ export abstract class RunnerLoop extends RunnerControl {
           // A scoped run whose asked phases are not settled well is never
           // finished, even with the board read out (#43).
           const scopeOpen = asked ? unsettled : [];
+          // Settled means LANDED (control-tower phase 112, #184): after the
+          // settle has done what its strategy does, every repository's run
+          // branch is proved against its trunk's remote copy, and a run whose
+          // work is not there parks `unlanded` with one errand — it never
+          // reports `finished` with nothing outstanding over it.
+          if (!outstanding.length && !endedBadly && !scopeOpen.length && await this.parkUnlanded(board, settled)) break;
           setRunState(state, outstanding.length || endedBadly || scopeOpen.length ? 'parked' : 'finished');
           if (outstanding.length || endedBadly || scopeOpen.length) state.stoppedBy = 'system'; else delete state.stoppedBy;
           // Name the phases AND attribute the sentence. Quoting one unlabelled
@@ -2411,6 +2450,16 @@ export abstract class RunnerLoop extends RunnerControl {
           break;
         }
         const ahead = this.ownLanes();
+        // A wrap-up KEEPS its lane (control-tower phase 109, #192): its lane is
+        // torn down — grant released, `noteLaneFreed` waking this pass — a
+        // moment before its attempt settles, and in that moment it is in
+        // flight, so no candidate, and its scope looked free: P13 was admitted
+        // one second after P7's `partial`, over P7's uncommitted red WIP. Its
+        // claim stands for it until it boards again.
+        for (const phase of inFlight.keys()) {
+          if (this.lanes.get(phase)?.grant || !phaseRecord(state, phase).keepsLane) continue;
+          ahead.push(await this.laneClaim(phase));
+        }
         const serialNow = new Set<number>();
         for (const phase of boardable) {
           const behind = await this.serialBehindOf(phase, ahead);
@@ -2419,8 +2468,18 @@ export abstract class RunnerLoop extends RunnerControl {
             this.markSerial(phase, behind);
             continue;
           }
-          if (inFlight.size >= this.maxLanes()) continue;
-          if (await this.landingHeld(phase, [...boardable, ...inFlight.keys()])) continue;
+          // A keeper this pass cannot board still holds its scope against the
+          // siblings after it (#192) — it is first in `boardingOrder`, so only
+          // they can be behind it, never a phase ahead of it.
+          const keeps = Boolean(phaseRecord(state, phase).keepsLane);
+          if (inFlight.size >= this.maxLanes()) {
+            if (keeps) ahead.push(await this.laneClaim(phase));
+            continue;
+          }
+          if (await this.landingHeld(phase, [...boardable, ...inFlight.keys()])) {
+            if (keeps) ahead.push(await this.laneClaim(phase));
+            continue;
+          }
           // The same re-check as the one above the board read, and for the
           // same reason: `rearmLockCapParks` and `climbLadder` both await
           // between there and here, so a pause or a halt can land in the gap —
@@ -2452,6 +2511,13 @@ export abstract class RunnerLoop extends RunnerControl {
       // under a landing session nobody supervises. A stop's abort already
       // reached that session; this only waits for it to end.
       await this.awaitLandings();
+      // …and so is a baseline still measuring beside a session that ended
+      // without a verdict (a halt, a stop): it is kept, never dropped
+      // (control-tower phase 105); a stop's abort ends its command.
+      await this.settleBaselines();
+      // No lane of this loop beats any more: a reader must not take the last
+      // beat for one that does (control-tower phase 105).
+      delete state.laneBeat;
       // A drain the loop never finished — a `break` that bypassed the loop top,
       // or the `catch` above halting with lanes still recorded — must still
       // land on the final word: nothing is running past this line. A park that
@@ -2709,6 +2775,9 @@ export abstract class RunnerLoop extends RunnerControl {
    *
    *   1. a PERSON's re-board (`boardingHint.by` is the person slot): an
    *      operator's resume-phase or Retry outranks every console candidate;
+   *   ⅒. a wrap-up that KEEPS its lane (`keepsLane`, control-tower phase 109,
+   *      #192) — it handed off `partial` with its own WIP uncommitted in a
+   *      shared tree, so no sibling boards into that tree before it;
    *   ¼. an operator's PIN, then a lane KEPT for it (control-tower phase
    *      100, #135 B.8, D.16) — the plan's next lane, by a person's word;
    *   1½. a phase whose committed WIP is RED (`wipRed`, control-tower phase
@@ -2748,13 +2817,19 @@ export abstract class RunnerLoop extends RunnerControl {
       // to wait in the queue, so its run's lanes go to its siblings first.
       const bump = !person ? record.queueControl?.bump : undefined;
       const aside = standsAside(record.queueControl, Date.parse(now));
+      // A wrap-up that keeps its lane (control-tower phase 109, #192): its WIP
+      // is uncommitted in the tree its siblings would board into, so it boards
+      // next after a person's own re-board — the fill pass also holds its
+      // scope for it while its attempt settles.
+      const keeps = !person && !aside ? record.keepsLane : undefined;
       // A pin and a kept lane (control-tower phase 100): a person's word on the
       // plan's NEXT lane, so right after a person's own re-board.
-      const pin = !person && !aside ? record.queueControl?.pin : undefined;
-      const kept = !person && !aside && !pin ? record.queueControl?.reserve : undefined;
-      const promoted = !person && !aside && !pin && !kept && !bump && !wipRed ? this.promotionOf(phase) : null;
-      const rank = aside ? 6 : person ? 0 : pin ? 0.25 : kept ? 0.3 : bump ? 0.5 : wipRed ? 1 : promoted ? 1.75 : this.landingReserve.has(phase) ? 2 : owesVerification(record) ? 3 : senior ? 4 : 5;
-      const at = pin ? Date.parse(pin.at)
+      const pin = !person && !aside && !keeps ? record.queueControl?.pin : undefined;
+      const kept = !person && !aside && !keeps && !pin ? record.queueControl?.reserve : undefined;
+      const promoted = !person && !aside && !keeps && !pin && !kept && !bump && !wipRed ? this.promotionOf(phase) : null;
+      const rank = aside ? 6 : person ? 0 : keeps ? 0.1 : pin ? 0.25 : kept ? 0.3 : bump ? 0.5 : wipRed ? 1 : promoted ? 1.75 : this.landingReserve.has(phase) ? 2 : owesVerification(record) ? 3 : senior ? 4 : 5;
+      const at = keeps ? Date.parse(keeps.at)
+        : pin ? Date.parse(pin.at)
         : kept ? Date.parse(kept.at)
           : bump && !aside ? -bump.stamp
             : promoted ? -promoted.rank
@@ -2763,6 +2838,8 @@ export abstract class RunnerLoop extends RunnerControl {
         phase, index, rank, clock: Number.isFinite(at) ? at : Number.POSITIVE_INFINITY,
         why: person
           ? { clock: 'operator', since: record.boardingHint!.at }
+          : keeps
+            ? { clock: 'lane-kept', since: keeps.at }
           : pin
             ? { clock: 'pin', since: pin.at }
           : kept
@@ -2987,7 +3064,21 @@ export abstract class RunnerLoop extends RunnerControl {
     // row, else this console's `policy.gates` (the legacy `delegateHumanGates`
     // switch folds in), else the shipped `delegated` — operator decision 11.
     const gatesPolicy = this.gatesPolicy();
-    const delegated = humanFamily && gatesPolicy.answer === 'delegated';
+    // A gate the plan marks MANUAL is a person's, whatever that row says
+    // (control-tower phase 107, #174): a session boarded on a delegated manual
+    // gate recorded its own approval as `ai-session-delegated` and went on to
+    // change production data. The KIND is the engine's (`--gate-kind`: `human`
+    // for `manual` and for a type it does not know, which it reads as manual),
+    // asked only for a closed gate in the human family. A read that fails, or
+    // answers a word that is not a kind a session may take, is a person's gate
+    // — the safe side. Delegation still reaches a human-family VERDICT on a
+    // gate the plan did not mark manual (an overdue deadline).
+    const personsGate = !gate.clear && humanFamily
+      && (await this.engine(['--gate-kind', String(phase)]).then(
+        (result) => result.code !== 0 || !['ai', 'auto', 'none'].includes(readText(result).trim()),
+        () => true,
+      ));
+    const delegated = humanFamily && gatesPolicy.answer === 'delegated' && !personsGate;
     // A delegated gate the session cannot EVIDENCE stops here, before the
     // spend: a `manual` gate whose conditions are not written cannot be
     // verified against anything a session could cite, and boarding it buys a
@@ -3016,7 +3107,9 @@ export abstract class RunnerLoop extends RunnerControl {
         // `parked`: the reader's next move is different, and so is the label.
         const why = unevidenceable
           ? 'delegated, but the gate states no condition a session could evidence — a person approves it'
-          : null;
+          : personsGate && gatesPolicy.answer === 'delegated'
+            ? 'a gate the plan marks manual is a person\'s — never delegated to a session, whatever the gates row says'
+            : null;
         record.status = 'gated';
         record.note = `gate not clear: ${gate.kind}${gate.detail ? ` — ${gate.detail}` : ''}${why ? ` (${why})` : ''}`;
         this.record('phase.gated', { gate, ...(why ? { why, decisionKey: 'gates', source: gatesPolicy.source } : {}) }, phase);
@@ -3344,7 +3437,7 @@ export abstract class RunnerLoop extends RunnerControl {
     if (!this.worktreePhases.size && !homes.all.some((home) => existsSync(join(home, state.id)))) return;
     const phases = [...this.worktreePhases];
     try {
-      const { removed, kept, lockedForeign } = await pruneRun(state.root, {
+      const { removed, kept, lockedForeign, preserved, held } = await pruneRun(state.root, {
         home: homes.active, runId: state.id, slug: state.slug, phases,
         // The run's own word (phase 15), else the console's, read fresh.
         retention: state.worktreeRetention ?? this.deps.worktreePrefs?.().retention,
@@ -3390,7 +3483,28 @@ export abstract class RunnerLoop extends RunnerControl {
         // deleted — the one thing the field must never say.
         if (this.state === state) this.persistNow();
       }
-      this.record('run.worktrees-pruned', { removed: removed.length, kept });
+      this.record('run.worktrees-pruned', {
+        removed: removed.length, kept,
+        // Untracked files moved aside so their mounts could go (#184).
+        ...(preserved.length ? { preserved } : {}),
+      });
+      // A mount kept because it holds WORK is a person's act, named with the
+      // paths — never a silent `kept` nobody reads (control-tower phase 112,
+      // #184: a kept mount pinned two run branches until a hand check).
+      if (held.length) {
+        const mounts = held.map((one) => one.mount);
+        this.record('run.errand', {
+          need: `the run's mirror kept ${held.length === 1 ? 'a mount' : `${held.length} mounts`} that hold uncommitted work: `
+            + mounts.map((mount) => (mount ? `\`${mount}\`` : 'the root')).join(', '),
+          how: held.map((one) => `${one.mount || 'the root'} (${one.dir}) holds ${one.paths.join(', ') || 'what git could not read'}`)
+            .join('; ')
+            + ' — commit it on the run branch or discard it, then remove the tree with `git worktree remove`; '
+            + 'until then the mount keeps its branch checked out.',
+          mounts,
+          reason: 'the prune kept a mount that holds uncommitted work',
+          by: 'runner',
+        });
+      }
     } catch (error) {
       this.record('run.worktrees-pruned', {
         removed: 0, kept: phases.map(String),
@@ -3745,14 +3859,15 @@ export abstract class RunnerLoop extends RunnerControl {
     const state = this.state!;
     const record = phaseRecord(state, phase);
     this.clearParkPoke(phase);
-    const { errand, data } = spentBudgetPark(state, phase, opts);
+    const { errand, fact, data } = spentBudgetPark(state, phase, opts);
     this.record('phase.wait-budget-spent', data, phase);
-    this.record('phase.errand', { ...errand }, phase);
+    // A wait whose ref still polls files no errand (control-tower phase 121).
+    if (errand) this.record('phase.errand', { ...errand }, phase);
     // No errand on the event: a budget park is not a summons. It announces as
     // what it is instead — a spent budget, under `budget` (control-tower phase
     // 14, #40) — and the run keeps driving its other phases.
     this.emit('phase', { phase, status: 'waiting', note: record.note });
-    if (errand.budget) this.emit('budget', { phase, state: 'spent', fact: errand.budget });
+    this.emit('budget', { phase, state: 'spent', fact });
     this.persist();
     this.emit('run', { state });
   }
@@ -4238,19 +4353,15 @@ export abstract class RunnerLoop extends RunnerControl {
     const mail = messagesBlock(this.deps.messaging?.deliverBoot?.(
       state.slug, phase, boundSession ? { sessionId: boundSession } : {},
     ));
-    // `PE_GATE_DELEGATE` swaps the human-gate block for the delegated brief:
-    // verify each condition against evidence you can cite, record the clearance,
-    // or STOP naming the condition you could not verify. Passed only when the
-    // operator asked for it — the default prompt still says a person must clear
-    // the gate, because by default one must.
+    // No `PE_GATE_DELEGATE` any more (control-tower phase 107, #174): it swapped
+    // the human-gate block for a brief telling the session to clear a MANUAL
+    // gate itself, which is the act #174 forbids — a manual gate is a person's,
+    // and the engine's block says so whatever this run's `gates` row answers.
     // `LOCK_MIRROR_ENV` makes the prompt's claim and conflicts lines FILE-ONLY
     // (control-tower phase 63, #85): this console mirrors the lock to git
     // itself, outside the session's turn. The copyable prompt a person reads
     // (`Service.bootPrompt`) never carries it, and keeps `--git`.
-    const engineText = readText(await this.engine(
-      ['--boot-prompt', String(phase)],
-      { ...LOCK_MIRROR_ENV, ...(this.gatesPolicy().answer === 'delegated' ? { PE_GATE_DELEGATE: '1' } : {}) },
-    ));
+    const engineText = readText(await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV, ...this.issuePolicyEnv() }));
     if (!engineText.trim()) {
       await this.release(phase, owner);
       this.halt(`the engine produced no boot prompt for phase ${phase}`, phase, 'plan-unreadable');
@@ -4423,7 +4534,10 @@ export abstract class RunnerLoop extends RunnerControl {
       + skillDirective(extraSkills) + mcpDirective(ownMcp, mcp.degraded)
       + credentialsDirective(record.credentialsMissing ?? [])
       + ultracodeDirective(ultracodeOn(state, own))
-      + unattendedDirective(SCRIPTS_REF, state.slug, phase, { budgetMs: budget.budgetMs, source: budget.source })
+      + unattendedDirective(SCRIPTS_REF, state.slug, phase, {
+        budgetMs: budget.budgetMs, source: budget.source,
+        ...(budget.waitsMax !== undefined ? { waitsMax: budget.waitsMax, waitsSource: budget.waitsSource ?? 'default' } : {}),
+      })
       // The console's commit, and the session's skill copy when it is at
       // another one (#151) — after the contract, before a peer's mail.
       + consoleSkillDirective(this.consoleSkillFacts())
@@ -4554,8 +4668,11 @@ export abstract class RunnerLoop extends RunnerControl {
     // so a red already there is inherited, never charged to it. Once per phase
     // per run, at a FRESH first boarding: never a resume, never a phase the
     // board already reads started, both of which stand on the phase's own
-    // work. Before the boarding is stamped, so a measured baseline is not
-    // counted as the session's working time.
+    // work. Since control-tower phase 105 (#190) it no longer holds the
+    // boarding: what is not reused runs BESIDE the session, in a clean
+    // checkout of this head, and the verdict awaits it. Only a repository git
+    // will not export is still measured here first — before the boarding is
+    // stamped, so that wait is not counted as the session's working time.
     if (!resuming && !resumeId && record.attempts === 0 && !record.baseline
       && board.states[phase] === 'ready' && this.deps.verifyBaseline?.() === true) {
       await this.takeBaseline(phase);
@@ -4593,6 +4710,8 @@ export abstract class RunnerLoop extends RunnerControl {
     record.attemptStartedAt = boardedAt;
     // The hint is spent: the session it asked for is about to exist.
     if (hint) delete record.boardingHint;
+    // …and a wrap-up's kept lane is taken (control-tower phase 109, #192).
+    delete record.keepsLane;
     // …and so is the retry override, for the same reason and at the same
     // moment. Journalled first, verbatim: the record is about to lose it, and
     // "why did phase 7 run on Opus that once" has to stay answerable from the
@@ -4891,6 +5010,134 @@ export abstract class RunnerLoop extends RunnerControl {
       return await this.settleStrategy(strategy, branch);
     } finally {
       state.settledAt ??= new Date(this.now().getTime()).toISOString();
+    }
+  }
+
+  /**
+   * Is the run's work on its trunk? If not, park the run `unlanded` and say
+   * so — returns true when it parked (control-tower phase 112, #184).
+   *
+   * Measured on a hub console: a run settled `keep` and reported `run.finished
+   * {outstanding: []}` while its ROOT repository's `pe/<slug>` held the last
+   * two phases' docs, conflicting with `main` in six files and never pushed —
+   * the plan read closed complete, and the work existed on one local branch
+   * nobody was told about. So a run that owns a branch finishes only when every
+   * repository's run branch — each mount of its mirror, the root's included,
+   * or its one repository — passes `landingProofs`: tree containment in
+   * `origin/<trunk>` (`git merge-tree --write-tree <trunk> <tip>` writing
+   * `<trunk>^{tree}`, never `git cherry`), asked in each repository itself.
+   * Anything else is not a silent keep: the run PARKS, kind `unlanded`, with
+   * ONE errand naming the branch, the repository and the files — the card's
+   * first action opens a merge errand tree — and keeps its trees, because a
+   * parked run is resumable. Only a person's press relaunches it
+   * (`PRESS_ONLY_HALT_KINDS`): the board cannot change what is outstanding,
+   * a landing can, and Recover & continue proves it again.
+   */
+  private async parkUnlanded(board: Board, settled?: string | null): Promise<boolean> {
+    const state = this.state!;
+    if (state.gitMode !== 'new-branch') return false;
+    const names = this.laneNamesFor(0);
+    const mounts = state.mountedRepos?.length ? state.mountedRepos : undefined;
+    let proofs: LandingProof[];
+    try {
+      proofs = await landingProofs({
+        root: state.root, runBranch: names.runBranch,
+        ...(mounts ? { mounts } : {}),
+        ...(mounts && state.workRoot ? { integration: state.workRoot } : {}),
+        ...(state.mirrorSettled?.mounts.length ? { settled: state.mirrorSettled.mounts } : {}),
+      });
+    } catch (error) {
+      proofs = [{
+        mount: '', branch: names.runBranch, tip: '', into: '', state: 'unknown', files: [],
+        detail: (error as Error)?.message ?? String(error),
+      }];
+    }
+    const unlanded = proofs.filter((proof) => proof.state !== 'contained');
+    this.record('run.landing-proof', {
+      branch: names.runBranch, landed: !unlanded.length, repos: proofs,
+    });
+    if (!unlanded.length) {
+      // Landed since the park — a person's Recover & continue after the merge:
+      // the errand that asked for it is answered, and goes with the record.
+      if (state.unlanded) {
+        if (state.errand?.at === state.unlanded.at) state.errand = null;
+        delete state.unlanded;
+      }
+      return false;
+    }
+
+    const where = (proof: LandingProof): string => (proof.mount
+      ? `\`${proof.mount}\``
+      : mounts ? 'the root repository' : 'the repository');
+    const trunkOf = (proof: LandingProof): string => proof.into.replace(/^origin\//, '') || 'its trunk';
+    const parts = unlanded.map((proof) => (proof.state === 'conflicted'
+      ? `${proof.branch} conflicts with ${trunkOf(proof)} in ${proof.files.join(', ')} (${where(proof)})`
+      : proof.state === 'ahead'
+        ? `${proof.branch} in ${where(proof)} holds changes ${proof.into} does not hold: ${proof.files.join(', ') || 'its own commits'}`
+        : `${proof.branch} in ${where(proof)} could not be proved against its trunk: ${proof.detail ?? 'git did not answer'}`));
+    const conflicted = unlanded.filter((proof) => proof.state === 'conflicted');
+    const policy = landPolicyOf(state.landing);
+    const into = unlanded[0]!.into || 'its trunk';
+    const at = new Date(this.now().getTime()).toISOString();
+    // The phase the errand tree is made for: the last one this run finished.
+    const finalPhase = Math.max(0, ...Object.values(state.phases)
+      .filter((record) => record.status === 'done').map((record) => record.phase), ...board.done);
+    const need = `${parts.join('; ')}.`;
+    const how = `Every phase of ${state.slug} is done, but its work is not on ${into} yet, so the run is parked, not `
+      + `finished — its landing is \`${policy}\`, and nothing moves \`${names.runBranch}\` onto the trunk by itself. `
+      + 'Open a merge errand tree (a checkout at the run branch that the console never prunes), merge '
+      + `${into} into it${conflicted.length ? ` and resolve ${conflicted.flatMap((proof) => proof.files).join(', ')}` : ''}, `
+      + `and land the result on ${trunkOf(unlanded[0]!)} — push it, or merge its pull request. Then Recover & continue: `
+      + `the run finishes once every repository's \`${names.runBranch}\` passes the landing proof `
+      + `(\`git merge-tree --write-tree ${into} <tip>\` writing \`${into}^{tree}\`).`;
+    const errand: Errand = { phase: 0, situation: 'unknown', tried: [], need, how, at };
+    // The settle's own sentence leads — what the strategy did is still true
+    // (a staging merge, a pull request opened) — and the landing follows it.
+    const reason = `${settled ? settled.trim().replace(/[.\s]+$/, '') : `every phase of ${state.slug} is done`}, `
+      + `but its work is not on ${into}: ${need}`;
+    state.unlanded = { at, phase: finalPhase || null, repos: unlanded };
+    state.errand = errand;
+    state.halt = { at, reason, kind: 'unlanded' };
+    setRunState(state, 'parked');
+    state.stoppedBy = 'system';
+    state.finishedReason = reason;
+    this.record('run.errand', { ...errand, reason: 'the run\'s branch is not on its trunk', by: 'runner' });
+    this.record('run.parked', {
+      outstanding: [], done: board.done,
+      unlanded: unlanded.map((proof) => ({
+        mount: proof.mount, branch: proof.branch, state: proof.state, into: proof.into, files: proof.files,
+      })),
+    });
+    return true;
+  }
+
+  /**
+   * Put every squash-landed run branch on what landed, at a boundary
+   * (control-tower phase 112, #183) — `reseatLandedBranch` holds the fences.
+   * Only the run's OWN checkout, never the shared root, never a run whose
+   * checkout is detached by design.
+   */
+  protected async reseatLanded(state: RunState): Promise<void> {
+    if (state.checkout !== 'worktree' || !state.workRoot || state.detachAt) return;
+    const runBranch = this.laneNamesFor(0).runBranch;
+    try {
+      const done = state.mountedRepos?.length
+        ? await reseatLandedMounts(state.workRoot, runBranch)
+        : await reseatLandedBranch({ source: state.root, dir: state.workRoot, mount: '', runBranch })
+          .then((out) => (out.reseated ? [out.reseated] : []));
+      this.noteReseated(done);
+    } catch (error) {
+      log.warn('runner.reseat', { slug: state.slug, error: (error as Error)?.message ?? String(error) });
+    }
+  }
+
+  /** One `run.branch-reseated` line per branch moved, carrying its proof. */
+  protected noteReseated(reseats: readonly Reseat[]): void {
+    for (const reseat of reseats) {
+      this.record('run.branch-reseated', {
+        ...reseat,
+        proof: `git merge-tree --write-tree ${reseat.into} ${reseat.from} wrote ${reseat.into}^{tree}`,
+      });
     }
   }
 
@@ -5750,6 +5997,11 @@ export abstract class RunnerLoop extends RunnerControl {
 
     const title = this.deps.planTitle?.(state.slug) ?? state.slug;
     const prBlock = pr ? `\n\n${prBlockText(branch, title)}` : '';
+    // The phase's landing word, as the landing engine reads it — a detached
+    // checkout owns no branch to land, so it is told nothing about one.
+    const landingHold = !state.detachAt
+      && landPolicyOf(this.deps.planLand?.(state.slug, phase) ?? state.landing) === 'hold';
+    const trunk = landingHold ? (await defaultBranchOf(state.root).catch(() => undefined)) ?? 'main' : 'main';
 
     this.record('phase.git-strategy', {
       mode: 'new-branch', branch, worktree, pr,
@@ -5785,6 +6037,18 @@ export abstract class RunnerLoop extends RunnerControl {
           + `  \`${branch}\` once the held tree is dealt with.\n`
         : `- Commit only to \`${branch}\`. Never commit to the default branch, never push\n`
           + `  the default branch, and do not create any other branch.\n`)
+      // What becomes of the branch, said plainly (control-tower phase 112,
+      // #184): a closing session on a hub wrote "the console lands it" into
+      // its handoff under `hold`, and the work sat on a local branch nobody
+      // landed. Under `hold` nothing does, and the run now parks until it has.
+      + (landingHold
+        ? `- Landing is \`hold\`: nothing moves \`${branch}\` onto \`${trunk}\` by itself —\n`
+          + `  the console never merges a run branch into the trunk or pushes the trunk.\n`
+          + `  The run finishes only once every repository's \`${branch}\` is held by\n`
+          + `  \`origin/${trunk}\` (a \`git merge-tree\` proof); until then it parks\n`
+          + `  \`unlanded\` with a merge errand. So never tell a reader that somebody will\n`
+          + `  land it: say in your handoff what is not on the trunk yet.\n`
+        : '')
       + `- Handoff, INDEX and lock commits in the docs repository follow the skill's\n`
       + `  usual rules — do not invent a separate branch just for docs.${mismatch}${prBlock}\n`;
   }

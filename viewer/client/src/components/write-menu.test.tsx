@@ -268,14 +268,18 @@ describe('the write menu', () => {
       target: { value: 'the approach did not survive contact' },
     });
 
-    await waitFor(() => expect(write).toHaveBeenCalled());
+    // The preview with the reason is the LAST call, and it may follow an
+    // earlier one: waiting for any call and then reading the last raced it
+    // under a full gate's load (control-tower phase 124). Wait for that call.
+    await waitFor(() =>
+      expect(write.mock.calls.at(-1)?.[0]).toMatchObject({
+        action: 'close-plan',
+        slug: 'demo',
+        status: 'abandoned',
+        reason: 'the approach did not survive contact',
+      }),
+    );
     expect(write.mock.calls.at(-1)![1]).toBe(true); // dry run, always
-    expect(write.mock.calls.at(-1)![0]).toMatchObject({
-      action: 'close-plan',
-      slug: 'demo',
-      status: 'abandoned',
-      reason: 'the approach did not survive contact',
-    });
   });
 
   it('confirms a reopen rather than firing it on one press', async () => {

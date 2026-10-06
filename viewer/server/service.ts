@@ -8,16 +8,16 @@
  */
 
 import { basename, join, resolve as resolvePath } from 'node:path';
-import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, manifestPushVerdict, sanitisePolicyPrefs } from '../shared/policy-model.js';
+import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, sanitisePolicyPrefs } from '../shared/policy-model.js';
 import { DECISION_KEYS, mergeDecisions } from '../shared/decisions-model.js';
-import { policyForKey, policyForPlan, policyPrefsOf } from './runner/policy.ts';
+import { policyForKey, policyPrefsOf } from './runner/policy.ts';
 import {
   planApprovedInstruction, planContinueReason, planHeldReason, planOf, planTextFile, type PlanDecision,
 } from './runner/plan-approval.ts';
 import { homedir } from 'node:os';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs';
 
-import { instanceId } from '../shared/instances.mjs';
+import { configDir, instanceId, stateHome } from '../shared/instances.mjs';
 import {
   INSTANCE, INSTANCE_STATE_DIR, SKILL_DIR, STATE_DIR, agentEnabled, checkRoot, distRev, rememberRoot, loadPrefs, prefDefault,
   savePrefs, serverIsStale, staticRoot, withAutomation,
@@ -130,7 +130,7 @@ import {
 } from './runner/freeze.ts';
 import type { BackgroundTask, LaneLiveness } from './runner/liveness.ts';
 import { inTurnWait, waitScope } from './runner/liveness.ts';
-import { pollLoopNotice, waitProcedure } from './runner/runner-core.ts';
+import { backgroundExitRefusal, pollLoopNotice, waitProcedure } from './runner/runner-core.ts';
 import { isStatusCapable, type PollVerdict } from '../shared/poll-loop.js';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
@@ -174,12 +174,15 @@ import {
   Approvals, classifyTool, matchedDenyRule, loadPolicy, loadPolicyFor, policyExtras, addPolicyRules, treeGuard,
   signInCall, signInJournalCommand, signInRefusal, type SignInCall,
   editPolicy, planPolicyPath, effectivePlanPolicyPath, notifyOutOfBand, carvedPolicy, suggestedRule,
-  autoApproveFor, neverAutoApproves, hitsHidden, matchedAskRule, publishingRule, questionRule, questionsOf, planRule,
+  autoApproveFor, neverAutoApproves, hitsHidden, matchedAskRule, publishingRule, questionRule, questionsOf, planRule, reshapeReason,
+  gateForgeCall, GATE_FORGE_RULE,
+  consoleForgeCall, consoleForgeException, consoleForgeRefusal, consolePorts, CONSOLE_FORGE_RULE, type ConsoleForge,
   parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED, EXTEND_CHOICES_MIN,
   PERMISSION_PROFILES, PROFILE_LABELS,
   DEFAULT_DENY, DEFAULT_ASK, DEFAULT_ALLOW, POLICY_PATH, PUSH_DENY,
   type Approval, type Evidence, type ManifestCheck, type PolicyScope, type PermissionProfile,
 } from './runner/approvals.ts';
+import { manifestVerdict } from './runner/manifest-verdict.ts';
 
 import {
   AUTO_GRANT_REASONS, ETA_POOL_MS, EVENT_BUFFER, HOOK_EVENTS_PER_MINUTE, HookPayloadError, HookRateError, INBOX_SOURCES, MAX_TIMER_MS, OUTCOME_INBOX_DEBOUNCE_MS, OUTCOME_INBOX_MAX_AGE_MS, PhaseClaimedError, RecoveryBusyError, UNSUPERVISED_WAIT_DEFAULT_MS, autoRecoveryClass, bucketLabel, describeExit, describeToolInput, effortOf, gitPorcelain, gitRead, lockView, modelAlias, recoveryActions, recoveryOwner, seedSkills, situationOfHalt, titleOf, type AutoRecoverResult, type Cached, type ControlResult, type DriveVehicle, type EtaPool, type EvidenceView, type LiveEvent, type LiveListener, type LockRelease, type PhaseDiagnosis, type PhaseLockView, type PhaseView, type PlanDetail, type PlanSummary, type QaOutcome, type RecoveryAction, type RouteView,
@@ -196,7 +199,7 @@ import { managedRoots, stagingHome, stagingNames } from './runner/worktree.ts';
 // siblings as undeclared names from 5.0.0 until this release.
 import { CONFLICT_POLICIES, LAND_POLICIES } from '../shared/landing-model.js';
 import { MESSAGING_WORDS } from '../shared/message-model.js';
-import { ISSUE_MODES } from '../shared/issues-model.js';
+import { ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
 
 export {
   HOOK_EVENTS_PER_MINUTE,
@@ -2025,14 +2028,9 @@ export class Service extends ServiceRecovery {
           // four of the eight kinds. `0` is the never-stat'd record, and that
           // is genuinely no clock, not 1970.
           updatedAt: record.activity > 0 ? new Date(record.activity).toISOString() : undefined,
-          // The operator's standing answer to "may a session clear a human
-          // gate itself?". A delegated gate raises no inbox row and no push:
-          // the boot prompt already briefs the phase to verify the conditions
-          // and record the clearance, and asking a person as well is asking
-          // for an act somebody has already delegated away.
-          gatesDelegated: policyForPlan(
-            'gates', mergeDecisions(record.plan?.decisions ?? [], record.decisionsTwin ?? []), policyPrefsOf(this.prefs),
-          )?.answer === 'delegated',
+          // No `gatesDelegated` (control-tower phase 107, #174): a gate row is
+          // raised only for a MANUAL gate, and a manual gate is a person's
+          // whatever the plan's `gates` row answers — delegation never hides it.
           qaMode: planQa,
           qaModes,
           qa: record.qa ?? [],
@@ -2352,6 +2350,9 @@ export class Service extends ServiceRecovery {
           approve: true,
           by,
           actor,
+          // A notification's Approve is a person's press (#174): its action
+          // token was minted for the push a person's device received.
+          person: true,
           // The receipt an operator reads six weeks later in gate-status.md has
           // to say HOW it was cleared: a tap on a lock screen is a different
           // act from a person sitting in front of the Gate card with the
@@ -2650,6 +2651,34 @@ export class Service extends ServiceRecovery {
 
     log.info('hook.stop-seen', { slug: state.slug, runId: state.id, phase });
 
+    // The session's own agents and monitors still at work (autopilot-token-
+    // drain phase 1). A lookup that throws is no evidence either way.
+    let awaiting: BackgroundTask[] = [];
+    try { awaiting = this.runnerByRunId(state.id)?.awaitingBackground?.(phase) ?? []; } catch { awaiting = []; }
+    // A session ends when its agents do (control-tower phase 109, #188): an
+    // EXIT — the board done, or a `partial`/`complete` declared — while one of
+    // them still writes the tree is refused through the same refuse-twice
+    // channel, with the two ways out. Waved through, the agent ran on for the
+    // CLI's ten-minute ceiling and was killed mid-edit: 14 uncommitted paths
+    // no handoff explained (ai-builder-v7 P16).
+    const refuseExit = (): Record<string, unknown> | null => {
+      if (!awaiting.length) return null;
+      const blocks = this.stopBlocks.get(sessionId) ?? 0;
+      if (blocks >= 2) return null;
+      if (this.stopBlocks.size > 512) this.stopBlocks.clear();
+      this.stopBlocks.set(sessionId, blocks + 1);
+      log.info('hook.stop-background', {
+        slug: state.slug, phase, sessionId, blocks: blocks + 1,
+        tasks: awaiting.map((task) => ({ id: task.id, type: task.taskType ?? null, tool: task.tool ?? null })),
+      });
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'Stop', decision: 'block',
+          reason: backgroundExitRefusal(phase, state.slug, awaiting, Date.now()),
+        },
+      };
+    };
+
     let qaOwed = false;
     try {
       const board = await this.board(state.slug);
@@ -2670,7 +2699,7 @@ export class Service extends ServiceRecovery {
             qaOwed = verdict === 'pending' || verdict === 'none' || verdict === '';
           }
         } catch { qaOwed = false; }
-        if (!qaOwed) return allow;
+        if (!qaOwed) return refuseExit() ?? allow;
       }
     } catch {
       return allow;
@@ -2679,7 +2708,7 @@ export class Service extends ServiceRecovery {
     const declared = readOutcome(outcomeFileFor(state.root, state.slug, state.id, phase), {
       slug: state.slug, phase, ...(entry?.startedAt ? { notBefore: entry.startedAt } : {}),
     });
-    if (declared) return allow;
+    if (declared) return (declared.status === 'partial' || declared.status === 'complete' ? refuseExit() : null) ?? allow;
 
     // A turn that ends while this session's own agents or monitors are still
     // working is a WAIT, not an exit (autopilot-token-drain phase 1): measured
@@ -2687,10 +2716,7 @@ export class Service extends ServiceRecovery {
     // completion starts a new turn. Holding that turn instead is what left a
     // session nothing to do but poll its reviewer — 311 status-only calls in
     // one phase. A background SHELL is not in the list: it dies with the turn,
-    // so a session ending on one is still told to finish or declare. A lookup
-    // that throws is no evidence either way, and the decision below stands.
-    let awaiting: BackgroundTask[] = [];
-    try { awaiting = this.runnerByRunId(state.id)?.awaitingBackground?.(phase) ?? []; } catch { awaiting = []; }
+    // so a session ending on one is still told to finish or declare.
     if (awaiting.length) {
       log.info('hook.stop-awaiting', {
         slug: state.slug, phase, sessionId,
@@ -2784,18 +2810,7 @@ export class Service extends ServiceRecovery {
     // Read per call, not per run: a profile switched mid-run has to change the
     // very next classification, and the settings file the child already loaded
     // cannot be reloaded. This is the path that makes the switch immediate.
-    const profile: PermissionProfile = run?.permissionProfile ?? 'guarded';
-    // The openPr carve-out rides the same read: for a new-branch run that will
-    // open a PR, bare `git push` is an ask (a card, one human tap) instead of a
-    // deny — and `gh pr create` stays an ask even under `trusted`.
-    const policy = carvedPolicy(
-      loadPolicyFor(run?.slug ?? null), profile,
-      run?.gitMode === 'new-branch' && run.openPr !== false,
-      // …and the publish carve-out (phase 8): a plan that lands by pull
-      // request boards landing sessions whose `gh pr create`/`gh pr merge`
-      // ask under every profile. The push is never theirs — the wall stands.
-      run ? this.planPublishes(run.slug) : false,
-    );
+    const { profile, policy } = this.policyForRun(run);
 
     // The hook fires on every matching tool, so most calls have to be answered
     // here without troubling anyone. Only what the policy marks `ask` becomes a
@@ -2811,6 +2826,14 @@ export class Service extends ServiceRecovery {
       cwd: typeof body.cwd === 'string' ? body.cwd : null,
       runRoot: run.root,
       runTrees: managedRoots({ root: run.root, consoleDir: consoleRunsDir(run.root) }),
+      // The run's OWN checkout, for the detach rule (control-tower phase 112,
+      // #183): only an isolated run has one, and a detached-by-design one owns
+      // no branch a detach could break.
+      ...(run.checkout === 'worktree' && run.workRoot ? {
+        ownTree: run.workRoot,
+        runBranch: run.gitMode === 'new-branch' ? `pe/${run.slug}` : null,
+        detached: Boolean(run.detachAt),
+      } : {}),
     }) : null;
     if (guard?.verdict === 'deny') {
       const bashCommand = (input as { command?: unknown } | null)?.command;
@@ -2859,6 +2882,74 @@ export class Service extends ServiceRecovery {
             permissionDecision: 'deny',
             permissionDecisionReason: signInRefusal(
               call, `bash ${this.flags.scriptsDir}/phase-outcome.sh ${run.slug} ${phase ?? '<N>'}`,
+            ),
+          },
+        };
+      }
+    }
+
+    // The gate-forge guard (control-tower phase 107, #174): a manual gate is a
+    // person's, and its approval counts only from a person's door. A session
+    // setting the console's own door, or writing the gate file with the file
+    // tools, is denied before it runs — outside `policy` like the sign-in
+    // guard, so no profile, strike or allow rule reaches it — and journalled,
+    // never stamped on the record: there is nothing here a person may widen.
+    if (verdict !== 'deny' && run) {
+      let forged: string | null = null;
+      try { forged = gateForgeCall(toolName, input); } catch { forged = null; }
+      if (forged) {
+        const bashCommand = (input as { command?: unknown } | null)?.command;
+        try {
+          this.runnerByRunId(run.id)?.note('phase.tool-denied', {
+            tool: toolName, rule: GATE_FORGE_RULE, why: forged,
+            ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+          }, phase ?? undefined);
+        } catch { /* the deny stands */ }
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: `blocked by the console (rule: ${GATE_FORGE_RULE}): ${forged}. `
+              + 'A session never clears a manual gate: hand off and declare it — '
+              + `\`bash ${this.flags.scriptsDir}/phase-outcome.sh ${run.slug} ${phase ?? '<N>'} needs-human --needs gates --reason "<what the gate needs>"\`.`,
+          },
+        };
+      }
+    }
+
+    // The console-forge guard (control-tower phase 129, #218): a session never
+    // presses its own console. A supervised call to a route or CLI verb in
+    // `AUTHORITY_ROUTES` — answering a card, editing the policy, raising its
+    // run's permissions, approving a gate, proving a person's step — or a write
+    // into the console's state or config directories is denied before it runs.
+    // Outside `policy` like `gate-forge`, so no profile, strike or allow rule
+    // reaches it; the one door through is the plan's own `permission.destructive`
+    // row naming the press for this phase, read as phase 107's auto-grant reads
+    // it. Journalled, never stamped on the record: nothing here is a person's
+    // to widen from a card.
+    if (verdict !== 'deny' && run) {
+      let forged: ConsoleForge | null = null;
+      try {
+        forged = consoleForgeCall(toolName, input, {
+          stateDir: stateHome(), configDir: configDir(), ports: consolePorts(this.flags.port),
+          cwd: typeof body.cwd === 'string' ? body.cwd : null,
+        }, (forge) => this.forgeExcepted(run, phase, forge));
+      } catch { forged = null; }
+      if (forged) {
+        const bashCommand = (input as { command?: unknown } | null)?.command;
+        try {
+          this.runnerByRunId(run.id)?.note('phase.tool-denied', {
+            tool: toolName, rule: CONSOLE_FORGE_RULE, verb: forged.verb, why: forged.why,
+            ...(forged.path ? { path: forged.path } : {}),
+            ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+          }, phase ?? undefined);
+        } catch { /* the deny stands */ }
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: consoleForgeRefusal(
+              forged, `bash ${this.flags.scriptsDir}/phase-outcome.sh ${run.slug} ${phase ?? '<N>'}`,
             ),
           },
         };
@@ -3193,6 +3284,28 @@ export class Service extends ServiceRecovery {
       };
     }
 
+    // The row allows this push in its bare form, and this call is not that
+    // form (control-tower phase 107, #186): a `git add` beside it, a `$( … )`
+    // that writes, a branch the shell computes, a bare `git push`, a push in a
+    // here-doc. Answered AT ONCE, naming the form to re-run alone — a card here
+    // sat an hour, three times in two hours of one release phase, for an act
+    // the plan permits in writing. Never a card, never the timeout.
+    if (run && manifest?.answer === 'deny') {
+      const bashCommand = (input as { command?: unknown } | null)?.command;
+      this.runnerByRunId(run.id)?.note('phase.approval-reshaped', {
+        tool: toolName, rule: manifest.rule, why: manifest.why, bareForm: manifest.bareForm ?? null,
+        answeredBy: manifest.key, row: { value: manifest.value, source: manifest.source },
+        ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+      }, phase ?? undefined);
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: reshapeReason(manifest),
+        },
+      };
+    }
+
     const { approval, decided } = this.approvals.request({
       runId: run?.id ?? 'unknown',
       slug: run?.slug ?? 'unknown',
@@ -3218,7 +3331,10 @@ export class Service extends ServiceRecovery {
     // failure must never cost the decision (a hook that throws fails OPEN).
     const asking = run && phase != null ? this.runnerByRunId(run.id) : null;
     try {
-      asking?.enterPersonWait(phase!, { id: approval.id, until: approval.expiresAt, on: `approval card: ${toolName}` });
+      asking?.enterPersonWait(phase!, {
+        id: approval.id, until: approval.expiresAt, on: `approval card: ${toolName}`, tool: true,
+        ...(typeof body.tool_use_id === 'string' && body.tool_use_id ? { toolUseId: body.tool_use_id } : {}),
+      });
     } catch (error) { log.warn('hook.person-wait-failed', { runId: run?.id ?? null, phase, error: String(error) }); }
     let outcome: Awaited<typeof decided>;
     try {
@@ -3514,8 +3630,22 @@ export class Service extends ServiceRecovery {
     run: RunState, phase: number | null, rule: string,
   ): { rule: string; value: string; source: string } | null {
     const row = this.destructiveRow(run, phase);
-    if (!row || !destructiveExceptions(row.value).includes(rule)) return null;
+    // Read for THIS phase (control-tower phase 107, #205): a rule the row
+    // names for other phases only is no exception here.
+    if (!row || !destructiveExceptions(row.value, { phase }).includes(rule)) return null;
     return { rule, value: row.value.slice(0, 200), source: row.source };
+  }
+
+  /**
+   * Does the plan's `permission.destructive` row name this forged press for
+   * the running phase (control-tower phase 129)? Read for THIS phase, as the
+   * auto-grant reads the row (`destructiveExceptions`), by the press's own CLI
+   * form; never the console's own files. Every press on a line is asked.
+   */
+  private forgeExcepted(run: RunState, phase: number | null, forged: ConsoleForge): boolean {
+    const row = this.destructiveRow(run, phase);
+    if (!row) return false;
+    return consoleForgeException(destructiveExceptions(row.value, { phase }), forged) !== null;
   }
 
   /**
@@ -3535,12 +3665,15 @@ export class Service extends ServiceRecovery {
 
   /**
    * What this plan's `permission.destructive` row answers for ONE publishing
-   * call (control-tower phase 84, #112) — or null when the call publishes
-   * nothing or no row is answered. A row that allows the whole rule answers
-   * it; for a `git push` the row may instead NAME branches
-   * (`manifestPushVerdict`), and then only a plain push of those, with
-   * read-only neighbours, is answered. The run branch is `pe/<slug>` under the
-   * new-branch strategy, so "the run branch" in a row reads as that.
+   * call (control-tower phase 84, #112; phase 107, #186, #205) — or null when
+   * the call publishes nothing or no row is answered. Judged by
+   * `manifestVerdict` on what the line RUNS, for THIS phase: a whole rule or a
+   * command the row names for the phase answers `allow`; a push of a branch
+   * it names, with read-only company, answers `allow`; the same push in a
+   * shape the row cannot answer as it stands answers `deny`, naming the bare
+   * form; anything else is null, a person's card. The run branch is
+   * `pe/<slug>` under the new-branch strategy, so "the run branch" in a row
+   * reads as that.
    */
   private manifestAnswerFor(run: RunState, phase: number | null, toolName: string, input: unknown): ManifestCheck | null {
     const rule = publishingRule(toolName, input);
@@ -3548,13 +3681,55 @@ export class Service extends ServiceRecovery {
     const row = this.destructiveRow(run, phase);
     if (!row) return null;
     const base = { key: 'permission.destructive' as const, rule, value: row.value.slice(0, 200), source: row.source };
-    if (destructiveExceptions(row.value).includes(rule)) return { ...base, answer: 'allow', why: `the row allows ${rule}` };
     const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
-    if (rule !== PUSH_DENY || typeof command !== 'string') {
-      return { ...base, answer: null, why: `the row does not name ${rule} as an exception` };
+    if (typeof command !== 'string') {
+      return destructiveExceptions(row.value, { phase }).includes(rule)
+        ? { ...base, answer: 'allow', why: `the row allows ${rule}` }
+        : { ...base, answer: null, why: `the row does not name ${rule} as an exception` };
     }
-    const verdict = manifestPushVerdict(command, row.value, { runBranch: run.gitMode === 'new-branch' ? `pe/${run.slug}` : null });
-    return { ...base, answer: verdict.answer, why: verdict.why, ...(verdict.branch ? { branch: verdict.branch } : {}) };
+    const verdict = manifestVerdict(command, row.value, {
+      runBranch: run.gitMode === 'new-branch' ? `pe/${run.slug}` : null, phase,
+    });
+    // The row answers the publishing act ALONE. What else the line runs is
+    // judged as if it ran on its own: one this run's policy would not simply
+    // allow — an ask, a hold — makes the answer a `deny` naming the bare form,
+    // so a manifest exception never carries an unrelated command past the ask
+    // list (control-tower phase 107).
+    if (verdict.answer === 'allow' && verdict.companions?.length) {
+      const { profile, policy } = this.policyForRun(run);
+      const asked = verdict.companions.find((text) => classifyTool('Bash', { command: text }, policy, profile) !== 'allow');
+      if (asked) {
+        return {
+          ...base, rule: verdict.rule ?? rule, answer: 'deny',
+          why: `a command beside it is one this run asks about on its own: ${asked.slice(0, 120)}`,
+          ...(verdict.bareForm ? { bareForm: verdict.bareForm } : {}),
+        };
+      }
+    }
+    return {
+      ...base, rule: verdict.rule ?? rule, answer: verdict.answer, why: verdict.why,
+      ...(verdict.branch ? { branch: verdict.branch } : {}),
+      ...(verdict.bareForm ? { bareForm: verdict.bareForm } : {}),
+    };
+  }
+
+  /**
+   * The policy one run's calls are classified under, read per call: its
+   * profile, with the openPr carve-out — for a new-branch run that will open a
+   * PR, bare `git push` is an ask (a card, one human tap) instead of a deny,
+   * and `gh pr create` stays an ask even under `trusted` — and the publish
+   * carve-out (phase 8): a plan that lands by pull request boards landing
+   * sessions whose `gh pr create`/`gh pr merge` ask under every profile. The
+   * push is never theirs — the wall stands. A call with no run is `guarded`.
+   */
+  private policyForRun(run: RunState | null | undefined): { profile: PermissionProfile; policy: ReturnType<typeof carvedPolicy> } {
+    const profile: PermissionProfile = run?.permissionProfile ?? 'guarded';
+    const policy = carvedPolicy(
+      loadPolicyFor(run?.slug ?? null), profile,
+      run?.gitMode === 'new-branch' && run.openPr !== false,
+      run ? this.planPublishes(run.slug) : false,
+    );
+    return { profile, policy };
   }
 
   /** The broker's re-read at settle time (#112): the run that raised the card, live or stored. */
@@ -3905,6 +4080,10 @@ export class Service extends ServiceRecovery {
     if (patch.density === 'comfortable' || patch.density === 'compact') picked.density = patch.density;
     if (typeof patch.model === 'string') picked.model = patch.model;
     if (typeof patch.sort === 'string') picked.sort = patch.sort;
+    // The Issues desk's added repositories (control-tower phase 118): an array
+    // REPLACES the list, filtered through the one gate a name must pass before
+    // `gh --repo` sees it. Anything that is not an array is dropped.
+    if (Array.isArray(patch.issueRepos)) picked.issueRepos = issueReposOf(patch.issueRepos);
     if (typeof patch.attachDefaultSkills === 'boolean') picked.attachDefaultSkills = patch.attachDefaultSkills;
     if (typeof patch.qaByDefault === 'boolean') picked.qaByDefault = patch.qaByDefault;
     if (patch.gitMode === 'default-branch' || patch.gitMode === 'new-branch') picked.gitMode = patch.gitMode;

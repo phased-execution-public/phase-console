@@ -267,6 +267,8 @@ export type InboxErrand = {
   tried: readonly string[];
   need: string;
   how: string;
+  /** An act not due yet (control-tower phase 121) — the ledger's *Coming up* row, never this one. */
+  upcoming?: boolean;
   at: string;
   /** The human step the errand is (`Errand.step`, control-tower phase 44) — a protected edit's act and path. */
   step?: { kind: string; act?: string; path?: string };
@@ -341,6 +343,12 @@ export type InboxRun = {
   halt?: { at?: string; reason?: string; phase?: number; kind?: string } | null;
   /** The run-level errand — a wall with no phase to hang it on. */
   errand?: InboxErrand | null;
+  /**
+   * Set with the `unlanded` park (control-tower phase 112, #184): every phase
+   * is done and a run branch is not on its trunk. `phase` is the one the merge
+   * errand tree is made for.
+   */
+  unlanded?: { phase?: number | null } | null;
   /**
    * Keyed by phase number as a string; `plan` is a plan-wide repair slot.
    *
@@ -461,13 +469,6 @@ export type InboxPlan = {
    * moment "this ask is new again" could be true.
    */
   updatedAt?: string;
-  /**
-   * `prefs.delegateHumanGates` — the operator has told the console a session
-   * may clear a `human` gate itself. A delegated gate raises no row: the boot
-   * prompt briefs the phase to verify each condition and record the clearance,
-   * so asking a person as well is asking for an act somebody already delegated.
-   */
-  gatesDelegated?: boolean;
   /** `Service.qaMode(slug)` — engine `--qa-mode`. */
   qaMode?: { mode: string; reason?: string };
   /** Per-phase regimes for phases stating their own `- **QA:**` — gathered
@@ -646,7 +647,7 @@ export type InboxFacts = {
     allowAgent?: boolean;
     allowAccounts?: boolean;
     allowMcp?: boolean;
-    /** `--allow-publish` — what Approve on an issue draft needs (phase 12). */
+    /** `--allow-publish` — what Approve on an issue draft needed until phase 115, and still implies. */
     allowPublish?: boolean;
   };
   /**
@@ -996,7 +997,8 @@ function errandStep(errand: InboxErrand, phase: number | null | undefined, planP
 
 function errandsOf(run: InboxRun): InboxErrand[] {
   const phased = Object.entries(run.recoveries ?? {})
-    .filter(([key, slot]) => slot?.errand && /^\d+$/.test(key))
+    // An act not due yet is the ledger's *Coming up* row, never a needs-you errand (phase 121).
+    .filter(([key, slot]) => slot?.errand && !slot.errand.upcoming && /^\d+$/.test(key))
     .map(([, slot]) => slot!.errand!)
     .sort((a, b) => a.phase - b.phase);
   return [...phased, ...(run.errand ? [run.errand] : [])];
@@ -1073,6 +1075,11 @@ function errandDrafts(facts: InboxFacts): Draft[] {
       // #123): the card names WHERE the errand's commands run, because the run's
       // own mirror is pruned on the console's schedule and this tree is not.
       const tree = phase != null ? run.phases?.[String(phase)]?.errandTree : undefined;
+      // The run's work is not on its trunk (control-tower phase 112, #184): the
+      // row says which branch and which files in its title, it is a conflict,
+      // and its first action opens a merge errand tree for the last phase.
+      const unlanded = phase == null && !live && run.halt?.kind === 'unlanded';
+      const landingPhase = unlanded ? positivePhase(run.unlanded?.phase ?? undefined) : null;
       out.push({
         kind: 'errand',
         severity: 'needs-you',
@@ -1080,8 +1087,10 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         slug: run.slug,
         ...(phase != null ? { phase } : {}),
         runId: run.id,
-        title: `${run.slug} — ${phase != null ? `phase ${phase} needs you` : 'needs you'}`,
-        ...familyOf(errand.situation),
+        title: unlanded
+          ? `${run.slug} — ${errand.need.replace(/\.$/, '')}`
+          : `${run.slug} — ${phase != null ? `phase ${phase} needs you` : 'needs you'}`,
+        ...(unlanded ? { category: { word: 'conflict' as const, label: HALT_CATEGORY_LABELS.conflict } } : familyOf(errand.situation)),
         need: errand.need,
         how: tree
           ? `${liveErrandHow(errand, (phase != null ? run.phases?.[String(phase)] : null) as Parameters<typeof liveErrandHow>[1])} Run its commands in the errand tree ${tree.dir} — a stable checkout at the pushed `
@@ -1092,7 +1101,26 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         since: stableSince(errand.at, run.halt?.at, run.updatedAt),
         href: planHref(run.slug, 'run'),
         actions: [
-          ...(planPending
+          ...(unlanded
+            ? [
+                ...(landingPhase != null ? [{
+                  verb: 'errand-tree',
+                  label: 'Open a merge errand tree',
+                  endpoint: runVerb(run.slug, 'errand-tree'),
+                  method: 'POST' as const,
+                  body: { phase: landingPhase },
+                  ...gatedBy('run', flags.allowRun),
+                }] : []),
+                // Once it has landed: prove it again, and finish.
+                {
+                  verb: 'recover',
+                  label: 'Recover & continue',
+                  endpoint: runVerb(run.slug, 'recover'),
+                  method: 'POST' as const,
+                  ...gatedBy('run', flags.allowRun),
+                },
+              ]
+          : planPending
             ? [
                 {
                   verb: 'approve-plan',
@@ -1530,11 +1558,12 @@ function planDrafts(facts: InboxFacts): Draft[] {
       for (const phase of phases) {
         if (!phase.gated) continue;
         if (!phase.gate) continue;
-        // The whole decision is `deriveAttention`'s, and the three cases it
-        // subtracts are the ones that used to raise a row nobody could act on:
-        // an `ai` gate (the phase's own session clears it), a delegated one
-        // (the operator already said a session may), and one on a phase the
-        // board is not calling ready — an act that would change nothing today.
+        // The whole decision is `deriveAttention`'s, and the cases it subtracts
+        // are the ones that used to raise a row nobody could act on: an `ai`
+        // gate (the phase's own session clears it) and one on a phase the board
+        // is not calling ready — an act that would change nothing today. A
+        // MANUAL gate is never subtracted as "delegated" any more (control-tower
+        // phase 107, #174): it is a person's whatever the `gates` row says.
         // Asked here rather than re-derived, because the push category and the
         // chip must agree with this row about which gates are a person's.
         const raises = deriveAttention({
@@ -1542,7 +1571,6 @@ function planDrafts(facts: InboxFacts): Draft[] {
           gate: {
             kind: phase.gateKind,
             clear: phase.gate.clear,
-            delegated: plan.gatesDelegated === true,
             approved: phase.gate.approved === true,
           },
         }).some((draft) => draft.kind === 'gate');
@@ -3227,7 +3255,7 @@ function conflictDrafts(facts: InboxFacts): Draft[] {
  * One row per draft a person owes a decision on.
  *
  * `pending-approval` is the ask: Approve files it on the repository through
- * the console's one writer (behind `--allow-publish`, so the action carries
+ * the console's one writer (behind the filing flag, so the action carries
  * the flag when the console lacks it), Discard drops it, and the two Edits
  * let a person fix the title or rewrite the body before it goes out — the
  * words are a session's, and they reach everyone who reads the repository.
@@ -3271,11 +3299,14 @@ function issueDrafts(facts: InboxFacts): Draft[] {
       words ? (words.length > 300 ? `${words.slice(0, 300)}…` : words) : '',
     ].filter(Boolean).join(' ') || (operator ? 'An issue ticket drafted this from a complaint.' : 'A session drafted this outside its phase.');
     const endpoint = (verb: string) => runVerb(draft.slug, `issues/${encodeURIComponent(draft.id)}/${verb}`);
-    const publish = facts.flags?.allowPublish;
+    // The flag Approve needs, and its name: `--allow-publish` until phase 115;
+    // since then the narrower `--allow-issues`, which publish implies.
+    let filing = facts.flags?.allowPublish === true;
+    let filingFlag = 'publish';
     const actions: InboxAction[] = held
       ? [{ verb: 'discard', label: 'Discard', endpoint: endpoint('discard'), method: 'POST' }]
       : [
-        { verb: 'approve', label: 'Approve', endpoint: endpoint('file'), method: 'POST', ...gatedBy('publish', publish) },
+        { verb: 'approve', label: 'Approve', endpoint: endpoint('file'), method: 'POST', ...gatedBy(filingFlag, filing) },
         { verb: 'discard', label: 'Discard', endpoint: endpoint('discard'), method: 'POST' },
         {
           verb: 'edit-title', label: 'Edit title', endpoint: endpoint('edit'), method: 'POST',
@@ -3303,7 +3334,7 @@ function issueDrafts(facts: InboxFacts): Draft[] {
       how: held
         ? `${draft.note ?? `Held until phase ${phase} has landed`} — the console moves it to Approve by itself; Discard drops it now.`
         : `Approve files it on the repository through the console's own writer, with the plan's labels and a provenance footer${
-          publish ? '' : ' — this console was started without --allow-publish, so Approve is held until it is restarted with it'
+          filing ? '' : ` — this console was started without --allow-${filingFlag}, so Approve is held until it is restarted with it`
         }. Discard drops it. Edit the title or rewrite the body first if a session's words need a person's.${
           draft.note && !held ? ` (${draft.note})` : ''}`,
       since: draft.stateAt,
@@ -3391,7 +3422,7 @@ function messageDrafts(facts: InboxFacts): Draft[] {
 export type InboxHumanStep = Pick<
   HumanStep, 'id' | 'kind' | 'title' | 'where' | 'slug' | 'phase' | 'runId' | 'declaredAt' | 'until'
   | 'openUrl' | 'openCommand' | 'proof' | 'code' | 'lines'
-> & Partial<Pick<HumanStep, 'state' | 'birth'>>;
+> & Partial<Pick<HumanStep, 'state' | 'birth' | 'dueWhen' | 'dueAt'>>;
 
 /**
  * A person's turn (control-tower phase 41): one `needs-you` row per open
@@ -3425,25 +3456,33 @@ function humanStepDrafts(facts: InboxFacts): Draft[] {
   const out: Draft[] = [];
   for (const step of facts.humanSteps ?? []) {
     if (!step?.slug || closed.has(step.slug)) continue;
+    // Phase 0 is the plan itself — an act under its `## Operator errands`
+    // (control-tower phase 121): a row of the plan, with no phase of its own.
+    const own = Number(step.phase) === 0;
     const phase = positivePhase(step.phase);
-    if (phase == null) continue;
+    if (phase == null && !own) continue;
     const meta = KIND_META[step.kind];
     if (!meta) continue;
     const open = step.openUrl ? `open ${step.openUrl}` : step.openCommand ? `run \u0060${step.openCommand}\u0060` : '';
+    const scope = own ? `${step.slug} (the plan's own)` : `${step.slug} phase ${phase}`;
+    // *Coming up* (control-tower phase 121, #182): an act born before it is
+    // due is shown, never a summons — it becomes one when its ref lands.
+    const upcoming = step.state === 'upcoming';
     out.push({
       kind: 'human-step',
-      severity: 'needs-you',
+      severity: upcoming ? 'fyi' : 'needs-you',
       subject: step.id,
       slug: step.slug,
-      phase,
+      ...(phase != null ? { phase } : {}),
       ...(step.runId ? { runId: step.runId } : {}),
-      title: `Your turn — ${meta.label.toLowerCase()} for ${step.slug} phase ${phase}`,
+      title: `${upcoming ? 'Coming up' : 'Your turn'} — ${meta.label.toLowerCase()} for ${scope}`,
       // The family its kind lights on the Tower's annunciator (control-tower phase 42).
       ...(HUMAN_STEP_CATEGORY[step.kind]
         ? { category: { word: HUMAN_STEP_CATEGORY[step.kind]!, label: HALT_CATEGORY_LABELS[HUMAN_STEP_CATEGORY[step.kind]!] } }
         : {}),
       need: `${step.title}${step.code ? ` — code ${step.code}` : ''}`,
-      how: `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}${open ? `: ${open}` : ''}`
+      how: `${upcoming && step.dueWhen ? `Not yet — due when ${step.dueWhen} lands; then, ` : ''}`
+        + `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}${open ? `: ${open}` : ''}`
         + `${step.lines?.length ? ` (${step.lines.map((line, i) => `${i + 1}. ${line}`).join(' ')})` : ''}`
         + `. ${step.proof ? `${step.proof} proves it` : `What proves it: ${meta.proof}`}; when it is done, press I did it — check.`,
       humanStep: humanStepView({
@@ -3453,11 +3492,14 @@ function humanStepDrafts(facts: InboxFacts): Draft[] {
         ...(step.openCommand ? { openCommand: step.openCommand } : {}),
         ...(step.code ? { code: step.code } : {}),
         ...(step.proof ? { proof: step.proof } : {}),
+        ...(step.dueWhen ? { dueWhen: step.dueWhen } : {}),
         check: true,
       }),
-      since: step.declaredAt,
+      // A step that came due is a new summons: an ack given to its *Coming up*
+      // row is older than this, so it no longer hides the row (phase 121).
+      since: !upcoming && step.dueAt ? step.dueAt : step.declaredAt,
       ...(step.until ? { expiresAt: step.until } : {}),
-      href: phaseHref(step.slug, phase),
+      href: phase != null ? phaseHref(step.slug, phase) : planHref(step.slug),
       actions: humanStepActions(step.id),
     });
   }

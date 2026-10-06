@@ -78,10 +78,12 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { accessSync, constants as fsConstants, existsSync, readdirSync, statSync } from 'node:fs';
+import { constants as osConstants } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { log } from '../log.ts';
+import { groupMembers } from '../pid.ts';
 // `signals.ts` and not a local kill: verification children are the one
 // child-spawning path in `server/` the ladder did not cover, and the ladder is
 // the ONLY place that signals a process (test/invariants.test.ts greps for it).
@@ -181,6 +183,11 @@ const VERBS = new Set([
   // every phase of a real plan. Bounded like everything else by the
   // per-command timeout.
   'sleep',
+  // The macOS keychain, for one read: a credential step is proved by
+  // `security find-generic-password -s <service>`, which prints the item's
+  // attributes and never its secret (#201). Gated by subcommand below, like
+  // docker — a lead alone would let `dump-keychain` through.
+  'security',
 ]);
 
 /**
@@ -312,6 +319,21 @@ const DOCKER_READ_ONLY = new Set([
 const DOCKER_VERBS = new Set(['docker', 'docker-compose']);
 
 /**
+ * The keychain subcommands that only look (control-tower phase 111, #201).
+ * Without `-w` or `-g` each prints an item's attributes and exits 0 when it
+ * exists — exactly what a credential step's proof asks. Everything else
+ * `security` does (`add-*`, `delete-*`, `dump-keychain`, `export`,
+ * `unlock-keychain`, interactive `-i`) writes, unlocks or prints secrets.
+ */
+const KEYCHAIN_LOOKUPS = new Set(['find-generic-password', 'find-internet-password']);
+
+/**
+ * `-w` prints the password alone and `-g` prints it beside the attributes.
+ * Read per token, so a short-flag cluster cannot hide either (`-gs x`, `-aw`).
+ */
+const KEYCHAIN_PRINTS_SECRET = /^-[A-Za-z]*[gw]/;
+
+/**
  * Docker subcommands a `- **Setup:**` bullet may run that §Verification may not.
  *
  * The bring-up half, and nothing else. `down` is absent deliberately —
@@ -409,6 +431,27 @@ const REACHES_OUT: Record<string, (segment: string) => string | null> = {
   'redis-cli': (c) => (/\b(get|keys|scan|info|ping|ttl|type|llen|exists|dbsize)\b/i.test(c)
     ? null
     : 'runs a Redis command that is not demonstrably a read'),
+  // The keychain: the two lookups, never a form that prints the secret. The
+  // subcommand must lead — a global flag before it (`-i`, `-q`) is refused
+  // rather than walked past, since `-i` is the interactive shell.
+  security: (c) => {
+    const rest = headOf(tokenize(c)).slice(1);
+    const sub = rest[0];
+    if (!sub || !KEYCHAIN_LOOKUPS.has(sub)) {
+      return `is not one of the read-only keychain lookups (${[...KEYCHAIN_LOOKUPS].join(', ')})`;
+    }
+    // A `$` or a backtick expands at run time — `$'-w'` and `$FLAG` reach
+    // `security` as `-w` — so what it would be passed is the shell's to say,
+    // not this judge's. Quotes and escapes are already read through.
+    const expands = rest.slice(1).find((token) => /[$`]/.test(token));
+    if (expands) {
+      return `passes an expansion the judge cannot read (\`${expands.slice(0, 12)}\`); a keychain proof names its flags and its item literally`;
+    }
+    const prints = rest.slice(1).find((token) => KEYCHAIN_PRINTS_SECRET.test(token));
+    return prints
+      ? `prints the secret (\`${prints.slice(0, 8)}\`); a proof needs only the item's attributes`
+      : null;
+  },
 };
 REACHES_OUT['docker-compose'] = REACHES_OUT.docker;
 
@@ -1393,9 +1436,28 @@ const REFUSED_PORT = /(?:(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):|\bport )
  *    on (`ownPorts`, `LaneSignals.ownPorts`): the server ended with the
  *    session, before the console's verification ran (vca P13/P14 on :8151).
  * A command its clock cut is never one — that is `verify-timeout`'s.
+ *
+ * And since control-tower phase 106 (#185) a fourth, asked first: a line that
+ * failed within `MISSING_DEPS_FAST_MS` naming a package that is not installed
+ * (or a binary from one), in a directory whose `node_modules` — or the
+ * `.venv` it runs from — really is absent (`missingDependency`; `cwd` is
+ * where the line ran). A superproject mirror mounts every repository fresh,
+ * with nothing installed, and ai-builder-v7 P15's `cd hetzner && npm run
+ * verify:local` read red in 1.7 s as an ordinary pre-existing red.
  */
-export function environmentOf(row: Pick<VerifyRun, 'ok' | 'code' | 'output' | 'timedOut'>, ownPorts: readonly number[] = []): string | null {
+export function environmentOf(
+  row: Pick<VerifyRun, 'ok' | 'code' | 'output' | 'timedOut'> & Partial<Pick<VerifyRun, 'command' | 'ms'>>,
+  ownPorts: readonly number[] = [],
+  cwd?: string,
+): string | null {
   if (row.ok || row.timedOut) return null;
+  if (cwd && row.command && typeof row.ms === 'number' && row.ms < MISSING_DEPS_FAST_MS) {
+    const absent = missingDependency(row.command, row.output ?? '', cwd);
+    if (absent) {
+      return `the dependencies are not installed here — ${absent}, and it failed in ${limitWords(row.ms)}: `
+        + 'install the dependencies (a `- **Setup:**` line such as `npm ci` or `python3 -m venv .venv`) — the machine, not the work';
+    }
+  }
   if (row.code === 127) return 'exit 127: the shell could not find a command it was given — a fact about this machine, not the work';
   const precondition = PRECONDITION_LINE.exec(row.output ?? '');
   if (precondition) return `a precondition failed: ${precondition[0].trim().slice(0, 200)}`;
@@ -1408,6 +1470,137 @@ export function environmentOf(row: Pick<VerifyRun, 'ok' | 'code' | 'output' | 't
     }
   }
   return null;
+}
+
+/**
+ * How fast a missing dependency fails (control-tower phase 106, #185): a line
+ * whose `node_modules` or `.venv` is absent dies in its first second or two
+ * (1.7 s on ai-builder-v7 P15). Past this the same words are a suite's own red
+ * — one that ran for minutes and then named a module is reporting on the work.
+ */
+export const MISSING_DEPS_FAST_MS = 5_000;
+
+/**
+ * What a package that is not installed prints: node's CommonJS and ESM
+ * spellings of a BARE specifier — never a relative one, which is the work's
+ * own broken import whatever is installed — and a shell's missing binary (a
+ * package script's `vitest` with no `node_modules/.bin`).
+ */
+const BARE_MODULE = /Cannot find (?:module|package) '([^'./][^']*)'/;
+const NOT_FOUND = /(?:command not found|: not found)\s*$/m;
+/** A virtualenv binary a line runs: `.venv/bin/pytest`, `tb/.venv/bin/python`. */
+const VENV_BIN = /(?:^|[\s;&|(])((?:[^\s;&|()'"`]*\/)?\.venv)\/bin\/\S/;
+
+/**
+ * The directory a line's dependencies would have to be installed in: its cwd,
+ * moved by a leading `cd <dir> &&` and then by a package manager's own
+ * directory flag (`npm --prefix`, `-C`, `--dir`, `--cwd`).
+ */
+function lineDir(command: string, cwd: string): { dir: string; rest: string } {
+  let dir = cwd;
+  let rest = command.trim();
+  const cd = /^cd\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s*(?:&&|;)\s*/.exec(rest);
+  if (cd) {
+    dir = resolve(dir, cd[1] ?? cd[2] ?? cd[3]!);
+    rest = rest.slice(cd[0].length);
+  }
+  const flag = /(?:^|\s)(?:--prefix|-C|--dir|--cwd)(?:=|\s+)(?:'([^']+)'|"([^"]+)"|([^\s;&|]+))/.exec(rest);
+  if (flag && /^(?:npm|pnpm|yarn|npx)\b/.test(rest)) dir = resolve(dir, flag[1] ?? flag[2] ?? flag[3]!);
+  return { dir, rest };
+}
+
+/** Is there a `node_modules` where node would look for one — here or in any directory above? */
+function nodeModulesAbove(dir: string): boolean {
+  let at = resolve(dir);
+  for (let depth = 0; depth < 64; depth += 1) {
+    if (existsSync(join(at, 'node_modules'))) return true;
+    const up = dirname(at);
+    if (up === at) return false;
+    at = up;
+  }
+  return false;
+}
+
+/** A path as a person reads it beside the line: relative to where the line ran. */
+function shownFrom(cwd: string, path: string): string {
+  const rel = relative(cwd, path);
+  return rel && !rel.startsWith('..') && !isAbsolute(rel) ? rel : path;
+}
+
+/**
+ * Why a fast red is a dependency that is not installed, or null — the line's
+ * `.venv` is not there, or its output names a package (or a package's binary)
+ * in a node project with no `node_modules` anywhere node would look. Never on
+ * the output's word alone: a `Cannot find module 'x'` beside an installed
+ * `node_modules` is the work's red.
+ */
+function missingDependency(command: string, output: string, cwd: string): string | null {
+  const { dir, rest } = lineDir(command, cwd);
+  const venv = VENV_BIN.exec(rest);
+  if (venv) {
+    const at = resolve(dir, venv[1]!);
+    if (!existsSync(at)) return `\`${shownFrom(cwd, at)}\` is absent`;
+  }
+  const bare = BARE_MODULE.exec(output);
+  if ((bare || NOT_FOUND.test(output)) && existsSync(join(dir, 'package.json')) && !nodeModulesAbove(dir)) {
+    return `\`${shownFrom(cwd, join(dir, 'node_modules'))}\` is absent${bare ? ` (${bare[0]})` : ''}`;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * A clean export, and what it cannot hold (control-tower phase 106, #191)
+ * ------------------------------------------------------------------ */
+
+/** `../sibling/…` — a relative path that climbs out of where it is read from. */
+const CLIMB = /(?:^|[\s'"=(:,])((?:\.\.\/)+[^\s'"`;&|()<>,]+)/g;
+
+/** The repository root holding `dir`: the nearest ancestor with a `.git` entry (a linked worktree's is a file). */
+function repoTopOf(dir: string): string {
+  let at = resolve(dir);
+  for (let depth = 0; depth < 64; depth += 1) {
+    if (existsSync(join(at, '.git'))) return at;
+    const up = dirname(at);
+    if (up === at) break;
+    at = up;
+  }
+  return resolve(dir);
+}
+
+/** An empty directory — what an unmounted submodule leaves behind. */
+function isEmptyDir(path: string): boolean {
+  try { return statSync(path).isDirectory() && readdirSync(path).length === 0; } catch { return false; }
+}
+
+/**
+ * The siblings `text` names that the working tree has and a clean export of it
+ * does not (control-tower phase 106, #191): each `../x` that climbs out of the
+ * repository the line runs in, cut to its first component past the climb, that
+ * resolves from `inPlace` and not from `cwd`. A path neither tree has is not
+ * the export's doing — the line is red in place too — so it is never named.
+ */
+export function unprovidedSiblings(text: string, cwd: string, inPlace: string): string[] {
+  const top = repoTopOf(cwd);
+  const out = new Set<string>();
+  for (const match of text.matchAll(CLIMB)) {
+    const parts = match[1]!.replace(/[)\].,:;]+$/, '').split('/');
+    let up = 0;
+    while (parts[up] === '..') up += 1;
+    if (!parts[up]) continue;
+    const sibling = [...parts.slice(0, up), parts[up]].join('/');
+    const there = resolve(cwd, sibling);
+    if (there === top || there.startsWith(`${top}${sep}`)) continue;
+    const here = resolve(inPlace, sibling);
+    if ((!existsSync(there) || isEmptyDir(there)) && existsSync(here) && !isEmptyDir(here)) out.add(sibling);
+  }
+  return [...out];
+}
+
+/** The `environment` sentence for siblings an export could not provide. */
+function siblingWords(siblings: readonly string[], ran: boolean): string {
+  const named = siblings.map((sibling) => `\`${sibling}\``).join(', ');
+  return `the clean export cannot provide ${named} — the working tree has it beside the repository and a checkout of the `
+    + `commit does not (${ran ? 'its output names it' : 'not run'}); the machine, not the work`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1445,6 +1638,26 @@ export type VerifyOptions = {
   purpose?: 'verify' | 'baseline' | 'attribution' | 'wip-gate';
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Run every command at this lower priority (`nice -n`, control-tower phase
+   * 105): a baseline measured BESIDE a working session must not take the
+   * machine from it. Absent: the console's own priority, as before.
+   */
+  nice?: number;
+  /**
+   * Awaited before each command runs, once `onStart` has named it — the
+   * baseline's seat under the machine-load guard (control-tower phase 105,
+   * phase 100's guard): new work waits while the machine is loaded.
+   */
+  gate?: (command: string) => Promise<void>;
+  /**
+   * A command's process is up — `stage: 'setup'` for a `Setup:` command.
+   * What lets the run record the process its lane is waiting on, so a reader
+   * that does not know the run is live still has a fact to read (#173).
+   */
+  onChild?: (pid: number, command: string, stage: 'setup' | 'verify') => void;
+  /** A `Setup:` command is about to run — the bring-up half of `onStart`. */
+  onSetupStart?: (command: string, index: number, total: number) => void;
   onStart?: (command: string, index: number, total: number) => void;
   /**
    * One command SETTLED — the half that was missing.
@@ -1501,6 +1714,13 @@ export type VerifyOptions = {
    * (control-tower phase 89, `environmentOf`).
    */
   ownPorts?: readonly number[];
+  /**
+   * `cwd` is a clean EXPORT standing in for this directory of the working tree
+   * (control-tower phase 106, #191): a line naming a sibling (`../x`) the
+   * working tree has and the export does not is `environment` — not run when
+   * the line itself names it, and so classified when its red output does.
+   */
+  inPlace?: string;
 };
 
 /**
@@ -1583,6 +1803,24 @@ const MAX_OUTPUT = 16 * 1024 * 1024;
  * seconds to clean up and fifteen.
  */
 const KILL_GRACE_MS = 5_000;
+
+/**
+ * How long a command's streams get to drain after its LEADER exits before
+ * whatever still holds them is a straggler — named, stopped through the
+ * ladder, and the line settled on the leader's own code (control-tower phase
+ * 106, #168). tamagui P4's sweep started Metro as `( … nohup yarn start … & )`;
+ * the redirect covered `yarn` alone, the backgrounded subshell kept the
+ * command's stdout, and `close` — which needs the streams' EOF — waited 50+
+ * minutes on a sweep that had passed. Draining a pipe takes milliseconds.
+ */
+export const LEADER_DRAIN_GRACE_MS = 2_000;
+
+/**
+ * After the ladder, how long the streams get to reach EOF before they are let
+ * go regardless: what still holds them left the group, and no signal of ours
+ * reaches it.
+ */
+const STREAM_RELEASE_MS = 1_000;
 
 /**
  * The two `notRun` reasons the MACHINE writes about its own behaviour — a
@@ -1710,13 +1948,30 @@ export async function verifyPhase(
       opts.onDone?.(row, index, runnable.length);
       continue;
     }
+    if (opts.gate) {
+      await opts.gate(command);
+      if (opts.signal?.aborted) {
+        notRun.push({ text: condense(command), reason: STOPPED_SKIP_REASON });
+        continue;
+      }
+    }
     const limit = opts.timeoutFor?.(command) ?? opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    let result = await runOne(command, { ...opts, timeoutMs: limit });
+    // An export that cannot hold what the line names is checked BEFORE the line
+    // runs (control-tower phase 106, #191): a sibling the working tree has and
+    // a clean checkout does not would make it red by construction.
+    const lacking = opts.inPlace && opts.inPlace !== opts.cwd ? unprovidedSiblings(command, opts.cwd, opts.inPlace) : [];
+    let result: VerifyRun = lacking.length
+      ? { command, ok: false, code: 1, ms: 0, output: '', environment: siblingWords(lacking, false) }
+      : await runOne(command, { ...opts, timeoutMs: limit });
     // The machine, not the work (control-tower phase 89): said on the row, and
     // never retried — an unchanged precondition fails the same way twice, and
     // vca's verifier retried exactly that twice without changing anything.
-    const environment = environmentOf(result, opts.ownPorts);
-    if (environment) result = { ...result, environment };
+    if (!result.environment) {
+      const shown = !result.ok && !result.timedOut && opts.inPlace && opts.inPlace !== opts.cwd
+        ? unprovidedSiblings(result.output, opts.cwd, opts.inPlace) : [];
+      const environment = environmentOf(result, opts.ownPorts, opts.cwd) ?? (shown.length ? siblingWords(shown, true) : null);
+      if (environment) result = { ...result, environment };
+    }
     ran.push(result);
     // One recorded retry for a command that ran and exited red. Measured:
     // three spurious full-suite reds in one night, each judged green later —
@@ -1732,7 +1987,14 @@ export async function verifyPhase(
     // session, and a second cut is `verify-timeout` — which is not a red.
     // A command that EXITS 124 by itself is a red like any other: the clock's
     // cut is `timedOut`, and the abort signal's is excluded here by name.
-    if (!result.ok && !result.environment && !opts.signal?.aborted) {
+    //
+    // Never for a BASELINE (control-tower phase 105, #190 ask 1): the retry
+    // rescues a flaky VERDICT, whose red re-opens a phase. A baseline's red
+    // decides nothing — it names what was red before the phase touched the
+    // tree — and its retry was a second full suite (ai-builder-v7 P3's red
+    // `task verify:local`, 702 s, run again before its session could board).
+    // Its row stands as measured: red once, not retried.
+    if (!result.ok && !result.environment && !opts.signal?.aborted && opts.purpose !== 'baseline') {
       // Never past the ceiling — unless the plan's own word already was, and
       // then never below it.
       const again = result.timedOut
@@ -1816,9 +2078,11 @@ async function runSetup(
   // hours of preamble nothing will ever mark red. Bring-up that has not
   // returned in ten minutes is not going to.
   const bounded = { ...opts, timeoutMs: Math.min(opts.timeoutMs ?? SETUP_TIMEOUT_MS, SETUP_TIMEOUT_MS) };
-  for (const command of commands.slice(0, MAX_SETUP_COMMANDS)) {
+  const listed = commands.slice(0, MAX_SETUP_COMMANDS);
+  for (const [index, command] of listed.entries()) {
     if (opts.signal?.aborted) return undefined;
-    const result = await runOne(command, bounded);
+    opts.onSetupStart?.(command, index, listed.length);
+    const result = await runOne(command, bounded, 'setup');
     if (!result.ok) {
       return { ok: false, command: condense(command), output: result.output };
     }
@@ -1848,6 +2112,59 @@ export function hardenedPath(path: string | undefined): { path: string; added: s
   return { path: [...current, ...added].join(':'), added };
 }
 
+/** Where `nice` lives on every machine this console runs on (macOS and Linux alike). */
+const NICE_BIN = '/usr/bin/nice';
+
+/**
+ * The environment every §Verification and `Setup:` command runs under — built
+ * in ONE place, because the baseline's reuse key digests exactly this
+ * (`verifyEnvDigest`), and a digest of a different environment from the one
+ * the commands get would vouch for runs it never saw.
+ *
+ * The SESSION's environment, made non-interactive by the specific switches —
+ * `NO_COLOR`, `TERM=dumb`, and a stdin that is closed (`runOne`'s `'ignore'`):
+ * nothing can wait on a prompt, and nothing is told it is somewhere else. It
+ * used to add `CI=1` as well (control-tower phase 106, #195), and suites read
+ * `CI` as "this is the CI infrastructure": app-backend's preview-store tests
+ * skip on a laptop whose Redis wants a password and ERROR under `CI`, so a line
+ * green in the session's shell was red every time the console ran it. A `CI`
+ * the console itself inherited still passes through untouched — whoever
+ * started it with one meant it.
+ */
+function commandEnv(env: NodeJS.ProcessEnv | undefined): { env: NodeJS.ProcessEnv; added: string[] } {
+  const base = { ...(env ?? process.env) };
+  const hardened = hardenedPath(base.PATH);
+  return { env: { ...base, PATH: hardened.path, NO_COLOR: '1', TERM: 'dumb' }, added: hardened.added };
+}
+
+/**
+ * The variables of that environment a measurement depends on — what moves the
+ * digest. Not the whole environment: a console's own variables (`PE_*`, a
+ * session id, a trace parent) change with every start and no command reads
+ * them, and a digest over them would never match twice.
+ */
+export const ENV_DIGEST_KEYS: readonly string[] = [
+  'PATH', 'CI', 'TERM', 'NO_COLOR', 'NODE_OPTIONS', 'NODE_ENV', 'LANG', 'LC_ALL', 'TZ', 'SHELL', 'HOME',
+];
+
+/**
+ * The environment half of a baseline's reuse key (control-tower phase 105,
+ * #190 ask 3): a measurement stands in for another only when both ran under
+ * the same environment — the machine (platform, architecture, the console's
+ * Node), the variables in `ENV_DIGEST_KEYS` as the commands receive them, and
+ * the `Setup:` preamble that brought the stack up. Sixteen hex characters.
+ */
+export function verifyEnvDigest(opts: { env?: NodeJS.ProcessEnv; setupText?: string }): string {
+  const { env } = commandEnv(opts.env);
+  const setup = opts.setupText?.trim() ? extractCommands(opts.setupText, 'setup').commands.map(foldCommand) : [];
+  const facts = {
+    platform: process.platform, arch: process.arch, node: process.version,
+    env: Object.fromEntries(ENV_DIGEST_KEYS.map((key) => [key, env[key] ?? null])),
+    setup,
+  };
+  return createHash('sha256').update(JSON.stringify(facts)).digest('hex').slice(0, 16);
+}
+
 /**
  * One §Verification command, in a process group of its own.
  *
@@ -1866,13 +2183,12 @@ export function hardenedPath(path: string | undefined): { path: string; added: s
  * which rung it took, because a 124 that does not say whether the children
  * were reaped is a 124 nobody can act on.
  */
-function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
+function runOne(command: string, opts: VerifyOptions, stage: 'setup' | 'verify' = 'verify'): Promise<VerifyRun> {
   const started = Date.now();
-  const base = { ...(opts.env ?? process.env) };
-  const hardened = hardenedPath(base.PATH);
-  if (hardened.added.length && !pathAmendWarned) {
+  const { env, added } = commandEnv(opts.env);
+  if (added.length && !pathAmendWarned) {
     pathAmendWarned = true;
-    log.warn('verify.path-amended', { added: hardened.added });
+    log.warn('verify.path-amended', { added });
   }
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return new Promise((resolve) => {
@@ -1889,12 +2205,21 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
     const failingOut = new FailureScanner();
     const failingErr = new FailureScanner();
 
-    const child = spawn('bash', ['-c', command], {
+    // A niced command (a baseline beside a working session, control-tower
+    // phase 105) starts under `nice` itself, which execs the shell in place:
+    // the same pid, and every process the command forks inherits the priority
+    // from its first instruction — no window in which it ran at full speed.
+    const niced = opts.nice && existsSync(NICE_BIN) ? [NICE_BIN, '-n', String(opts.nice)] : [];
+    const argv = [...niced, 'bash', '-c', command];
+    const child = spawn(argv[0]!, argv.slice(1), {
       cwd: opts.cwd,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...base, PATH: hardened.path, NO_COLOR: '1', TERM: 'dumb', CI: '1' },
+      env,
     });
+    if (child.pid) {
+      try { opts.onChild?.(child.pid, command, stage); } catch { /* a listener never stops the command */ }
+    }
 
     // `execFile`'s maxBuffer, kept by hand: stop ACCUMULATING past the cap
     // rather than killing the command over it. Only the tail is ever reported,
@@ -1922,15 +2247,62 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
     // still undefined and, worse, would claim the command was cleaned up while
     // its grandchildren were still being chased.
     let ending: Promise<void> | null = null;
-    const end = (reason: 'timeout' | 'abort'): void => {
-      if (settled || cut) return;
-      cut = reason;
-      if (child.pid == null) return;
-      // The group, not the pid. And no interrupt first: a `bash -c` has no
-      // turn to close, so SIGINT would buy the command nothing but a delay.
+    // The group, not the pid — and the GROUP is what the ladder now asks about
+    // too (control-tower phase 106, #168), so a group whose leader is gone is
+    // still reached. No interrupt first: a `bash -c` has no turn to close, so
+    // SIGINT would buy the command nothing but a delay.
+    const ladder = (): Promise<void> => {
+      if (ending || child.pid == null) return ending ?? Promise.resolve();
       ending = killLadder(child.pid, { killAfterMs: KILL_GRACE_MS, interrupt: false }).then((verdict) => {
         how = verdict;
       }, () => { /* the process vanished mid-ladder; `how` stays unset */ });
+      return ending;
+    };
+
+    // The leader's own exit, from `exit` — the code the line is judged on even
+    // when something it left behind keeps its streams open (#168).
+    let leaderCode: number | null = null;
+    let stragglers: { pid: number; comm?: string }[] = [];
+    let heldOutside = false;
+    // After the ladder the streams get a moment to reach EOF; past it they are
+    // let go, because what still holds them LEFT the group (a detached child,
+    // a `setsid`) and no signal of ours reaches it. No line outlives its clock
+    // plus the ladder plus this.
+    const letGo = (): void => {
+      const release = setTimeout(() => {
+        if (settled) return;
+        heldOutside = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        void finish(leaderCode ?? 1);
+      }, STREAM_RELEASE_MS);
+      release.unref?.();
+    };
+    // The leader exited and the streams are still open: name what is left in
+    // its group, stop it, and settle on the leader's code.
+    let reaping: Promise<void> | null = null;
+    const reap = (): Promise<void> => {
+      reaping ??= (async () => {
+        if (settled || child.pid == null) return;
+        const left = await groupMembers(child.pid).catch(() => []);
+        // The streams closed while the group was being listed: the line ended
+        // by itself, and nothing of it is a straggler.
+        if (settled) return;
+        stragglers = left;
+        await ladder();
+        if (!settled) letGo();
+      })();
+      return reaping;
+    };
+
+    const end = (reason: 'timeout' | 'abort'): void => {
+      if (settled || cut) return;
+      // The leader exited BEFORE the clock: its code stands and what is left is
+      // a straggler's, never a cut — tamagui P4's sweep had passed (#168).
+      if (reason === 'timeout' && leaderCode !== null) { void reap(); return; }
+      cut = reason;
+      if (child.pid == null) return;
+      void ladder().then(() => { if (!settled) letGo(); });
     };
 
     const timer = setTimeout(() => { end('timeout'); }, timeoutMs);
@@ -1938,15 +2310,30 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
     const onAbort = (): void => { end('abort'); };
     opts.signal?.addEventListener('abort', onAbort, { once: true });
 
+    let drain: NodeJS.Timeout | null = null;
+    child.on('exit', (code, signal) => {
+      leaderCode = typeof code === 'number' ? code : signal ? 128 + (osConstants.signals[signal] ?? 0) : 1;
+      if (settled || cut) return;
+      drain = setTimeout(() => { void reap(); }, LEADER_DRAIN_GRACE_MS);
+      drain.unref?.();
+    });
+
     const finish = async (code: number): Promise<void> => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (drain) clearTimeout(drain);
       if (ending) await ending;
       opts.signal?.removeEventListener('abort', onAbort);
       const killed = cut !== null || Boolean(opts.signal?.aborted);
-      const output = `${out}${err}`.trim();
+      const notes = [
+        ...(stragglers.length ? [`[left ${stragglers.length} process${stragglers.length === 1 ? '' : 'es'} in its group after it exited `
+          + `(${stragglers.map((entry) => `${entry.pid}${entry.comm ? ` ${entry.comm}` : ''}`).join(', ')}) — stopped]`] : []),
+        ...(heldOutside ? ['[a process outside its group still held its output when it ended — let go, not waited on]'] : []),
+      ];
+      const output = [`${out}${err}`.trim(), ...notes].filter(Boolean).join('\n');
       const failures = [...new Set([...failingOut.end(), ...failingErr.end()])].slice(0, FAILURE_CAP);
+      if (stragglers.length) log.warn('verify.stragglers', { command: condense(command), pids: stragglers.map((entry) => entry.pid) });
       resolve({
         command,
         // A killed command proves nothing — report it red, but say why.
@@ -1954,18 +2341,20 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
         code: killed ? 124 : code,
         ms: Date.now() - started,
         output: (killed ? `[timed out or cancelled]\n${output}` : output).slice(-KEEP_OUTPUT),
-        ...(how ? { how } : {}),
+        ...(how && killed ? { how } : {}),
         // The CLOCK cut it — not the abort signal, and not an exit 124 of its
         // own (control-tower phase 83, #95). Only this is `verify-timeout`.
         ...(cut === 'timeout' && !opts.signal?.aborted ? { timedOut: true } : {}),
         limitMs: timeoutMs,
         ...(failures.length ? { failures } : {}),
+        ...(stragglers.length ? { stragglers } : {}),
       });
     };
 
-    // `close`, not `exit`: the streams must be drained before the output is
-    // read, or a fast-failing command reports an empty log.
-    child.on('close', (code) => { void finish(typeof code === 'number' ? code : 1); });
+    // `close`, not `exit`, for the OUTPUT: the streams must be drained before
+    // it is read, or a fast-failing command reports an empty log. The CODE is
+    // the leader's, from `exit`, whenever it came first.
+    child.on('close', (code) => { void finish(leaderCode ?? (typeof code === 'number' ? code : 1)); });
     child.on('error', () => { void finish(1); });
   });
 }

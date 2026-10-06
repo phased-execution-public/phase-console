@@ -95,6 +95,42 @@ describe('the situation line in the header', () => {
     expect(money.getAttribute('href')).toBe('#/insights');
   });
 
+  it('names the phase a baseline holds the lane for — never `phase ?` (control-tower phase 105, #193)', async () => {
+    // ai-builder-v7 P8, 2026-10-03 01:35Z: `activePhase` null, no session, the
+    // record `pending`, and the console 9 lines into the phase's baseline.
+    const at = new Date(Date.now() - 600_000).toISOString();
+    runs.mockResolvedValue([
+      run({
+        activePhase: null,
+        phases: { '8': { phase: 8, status: 'pending', attempts: 0, costUsd: 0 } } as never,
+        verifying: {
+          '8': {
+            phase: 8,
+            purpose: 'baseline',
+            command: 'pytest tests/unit',
+            index: 9,
+            total: 10,
+            startedAt: at,
+            commandStartedAt: at,
+            pid: 789,
+          },
+        },
+      }),
+    ]);
+    mount(<HeaderSituation state={STATE} phone={false} />);
+    const line = await screen.findByTestId('situation-line');
+    await within(line).findByRole('link', { name: 'demo is running — P8 baseline 9/10' });
+    expect(line.textContent).not.toContain('phase ?');
+  });
+
+  it('says only that a run is running when no lane names a phase — never `phase ?`', async () => {
+    runs.mockResolvedValue([run({ activePhase: null, phases: {} as never })]);
+    mount(<HeaderSituation state={STATE} phone={false} />);
+    const line = await screen.findByTestId('situation-line');
+    await within(line).findByRole('link', { name: 'demo is running' });
+    expect(line.textContent).not.toContain('?');
+  });
+
   /**
    * The desk header is ONE row of a fixed height. Its parts used to shrink past
    * their own words in a no-wrap row and paint over each other (measured on the

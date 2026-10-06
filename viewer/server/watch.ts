@@ -55,6 +55,28 @@ function fingerprint(dirs: string[]): string {
   return `${Math.round(newest)}:${count}`;
 }
 
+/**
+ * A watched name (relative to the watched directory, as `fs.watch` reports it)
+ * that is noise rather than a change: editor scratch and swap files, dotfiles
+ * other than `.locks`, and — since 2026-10-05 — atomic-write scratch names.
+ *
+ * Every writer of this tree saves through a scratch name and a rename: Claude
+ * Code writes `<file>.tmp.<pid>.<hex>`, the scripts `<file>.tmp.$$`
+ * (`phase-lock.sh` inside `.locks/`), `new-handoff.sh` `<file>.draft.$$`. The
+ * rule only dropped a name ENDING in `.tmp`, so all of those reached the
+ * store, and a plans-directory scratch name maps to no slug — which made the
+ * batch "structural": a full rescan, and every plan's caches forgotten.
+ * Measured on the live console 2026-10-05: 588 engine reads queued behind 8
+ * slots, pages at 100–325 s, one plan-writing session keeping it from ever
+ * draining. Dropping the scratch name loses nothing: the rename to the real
+ * name is an event of its own. A name that ends in `.md` is a document's own
+ * name, never a scratch one — a plan may be called `release.draft.md`.
+ */
+export function isWatchNoise(name: string): boolean {
+  if (/(^|\/)\.(?!locks)|~$|\.swp$|\.tmp$/.test(name)) return true;
+  return /\.(?:tmp|draft)\.[^/]+$/.test(name) && !name.endsWith('.md');
+}
+
 export class DocsWatcher {
   /**
    * Watchers are held with their directory so a single failure can be removed
@@ -111,8 +133,10 @@ export class DocsWatcher {
           this.sawEvent = true;
           if (!filename) return;
           const name = String(filename);
-          // Editor scratch files and swap files are noise, not changes.
-          if (/(^|\/)\.(?!locks)|~$|\.swp$|\.tmp$/.test(name)) return;
+          // Editor scratch files, swap files and atomic-write scratch names
+          // are noise, not changes (`isWatchNoise`). An ignored event still
+          // proves the watch is alive — `sawEvent` is set above it.
+          if (isWatchNoise(name)) return;
           this.pending.add(join(dir, name));
           this.schedule();
         });

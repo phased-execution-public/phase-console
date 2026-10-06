@@ -349,6 +349,22 @@ test('SLF-7: the noop latch rides the RUN — two passes over identical evidence
   assert.equal(healing.lines.filter((l) => l.event === 'run.converge').length, 1);
 });
 
+test('HS-4: a STALE heal — the run moved on while the pass read it — writes no latch, keeps no fingerprint, and says so on its line (control-tower phase 110, #178)', async () => {
+  const halted = run({ status: 'halted', halt: { at: '', reason: 'phase 2 did not verify', phase: 2, kind: 'verify-failed' } }, [{ phase: 2, status: 'failed' }]);
+  const deps = stubDeps(halted, {
+    heal: async () => ({ launched: false, stale: true, reason: 'the run moved on while this pass read it — phase 2 has a newer attempt than this pass read (2 > 1)' }),
+  });
+  const out = await executeConvergence(planConvergence(facts({ runs: [halted], lastNoop: null })), deps);
+  assert.equal(out.launched, false);
+  assert.equal(out.noop, null, 'no fingerprint for evidence that is gone');
+  assert.equal(halted.converge ?? null, null, 'no latch written onto a run that is somebody else\'s now');
+  const lines = deps.lines.filter((l) => l.event === 'run.converge');
+  assert.equal(lines.length, 1, 'the pass is still journalled — once');
+  assert.equal(lines[0]!.data.stale, true);
+  // …so the next pass over the same evidence looks again rather than skipping it as unchanged.
+  assert.equal(planConvergence(facts({ runs: [halted], lastNoop: out.noop })).actions[0]!.kind, 'heal');
+});
+
 test('SLF-7: a refused cmd: row with a past nextDueAt does not move the fingerprint — stable across two minutes', () => {
   const parked = run({ status: 'parked', halt: { at: '', reason: 'phase 2 needs a person', phase: 2, kind: 'needs-human' } }, [{
     phase: 2, status: 'parked',

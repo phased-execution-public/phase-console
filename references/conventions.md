@@ -369,7 +369,13 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
   detached at the PUSHED run branch in every repository the run mounts, locked, and never pruned by
   the console — not in the run's own mirror, which the console prunes on its own schedule. The errand
   card names the tree once it exists, and `validate.sh` warns on a handoff `!` line that points into a
-  run tree.
+  run tree. A session never DETACHES its run's own checkout either (`git switch --detach`, `git checkout
+  <commit>` — denied as `run-tree-detach`): the console refuses the next boarding over a detached mount.
+  A release that squash-merged the run branch needs no detach — once the trunk holds every change of the
+  branch (a `git merge-tree` proof), the console re-seats `pe/<slug>` on `origin/<trunk>` itself, before
+  its own verification and at every boundary. A run finishes only when every repository's run branch is
+  on `origin/<trunk>` by that same proof; otherwise it parks `unlanded`, and its card opens a merge errand
+  tree.
 - **A scoped run finishes when its phases do** (`onlyPhases`, the console's "Run only this";
   control-tower phase 90, #154). The run boards only the phases it was asked for and FINISHES when
   those settle — `run.finished {onlyPhases}`, with a `finishedReason` naming the scope — whatever else
@@ -532,17 +538,32 @@ engine and the console):
 - **human** (`Gate-check: manual <who/what>`; a `*(GATED)*` heading with no directive at all reads as
   **ai** since 5.0.0 — `scripts/gates.env` `GATE_DEFAULT` — and fails `validate.sh`, F24) — a
   person does the Gates bullet's numbered steps, then approves: the console's phase-page **Gate
-  card**, or `scripts/gate-approve.sh <slug> <N> --by "<who>" --note "<what was done>"`. Sessions and
-  the autopilot stop at an unapproved human gate — **unless it is delegated**, which is the shipped
-  answer since 5.0.0. The `gates` decision decides: the plan's `## Decisions` row first, then this
-  console's `policy.gates` answer (Settings ▸ Automation ▸ *Delegate human gates* folds into it, **on by
-  default**), then the shipped `delegated`. Delegation does not
-  make the gate the session's judgement to make: the boot prompt requires evidence it can cite for each
-  condition, records the clearance as `by: ai-session-delegated`, and STOPS with the condition named
-  (`phase-outcome.sh … blocked --needs gates --reason`) the moment one cannot be verified — a visual sign-off nobody
-  has given, a credential it lacks, a preview nobody has looked at. A delegated gate whose Gates bullet
-  states **no condition** a session could evidence is not boarded: it stays `gated` for a person. Answer
-  `operator` in the plan's `gates` row when its gates mean what they say.
+  card**, or `scripts/gate-approve.sh <slug> <N> --by "<who>" --note "<what was done>"` in a person's
+  own terminal. Sessions and the autopilot stop at an unapproved human gate, and **a gate the plan
+  marks `manual` is a person's whatever the `gates` decision says** (control-tower phase 107, #174 —
+  an unattended session read a plan's "all permissions" as delegating one, recorded its own
+  `ai-session-delegated` approval and changed production data). Three things hold it:
+  - **never delegated** — the runner asks the engine for the gate's kind (`--gate-kind`: `human` for
+    `manual` and for a type it does not know) and never boards a session on one; the boot prompt tells
+    a session to STOP and declare `phase-outcome.sh … needs-human --needs gates`;
+  - **refused at the door** — `gate-approve.sh` names its DOOR from its own environment, never from
+    `--by`: `session` (`PE_OWNER=autopilot/*|console/*`, `PE_OUTCOME_FILE`, `PE_SESSION_KIND`,
+    `CLAUDECODE=1`), `console` (the console's own write for a person's press: the Gate card from a
+    browser, a phone's signed Approve, a supervisor-chat act a person confirmed), `terminal` (stdin is a
+    tty, no session marker) or `script` (anything else). A manual gate is approved only through
+    `console` or `terminal`, and never by an `ai-*`, `autopilot*` or `console/*` approver; a revoke is
+    taken from any door;
+  - **ignored when read** — the door is recorded in `gate-status.md`'s `Door` column, and
+    `--gate-status` honours a manual row only when a person's door wrote it, so a door-less legacy row
+    or a hand-written one opens nothing.
+  The `gates` decision still answers the rest of the human family — an overdue `deadline`/`by` gate,
+  which the engine reports as `OVERDUE`: the plan's `## Decisions` row first, then this console's
+  `policy.gates` answer (Settings ▸ Automation ▸ *Let a session clear an overdue gate* folds into it, **on by
+  default**), then the shipped `delegated`. Delegation does not make the gate the session's judgement
+  to make: the boot prompt requires evidence it can cite for each condition and STOPS with the
+  condition named (`phase-outcome.sh … blocked --needs gates --reason`) the moment one cannot be
+  verified. A delegated gate whose verdict states **no condition** a session could evidence is not
+  boarded: it stays `gated` for a person.
 - **auto** (`date` / `deadline` / `by` / `phase` / `phases` / `plan` / `cmd`) — the engine evaluates
   it by itself. `cmd` executes only under `PHASE_EXEC_GATES=1` — the autopilot's deliberate opt-in;
   page views and boot prompts never execute a gate command, and report **`unevaluated:`** when they
@@ -664,8 +685,11 @@ on it), and — from phase 43 — lets the person open it again, proves it, and 
 
 A session declares one with `phase-outcome.sh <slug> <N> needs-human --needs <key> --step <kind>
 --title "<what>" [--open-url <http(s) link> | --open-command "<cmd>"] [--where host|any]
-[--proof <ref>] [--step-line "<step>"]… [--code <device code>] [--credential <id>]`, hands off
-`in-progress`, and stops. The sixteen kinds are `scripts/human-steps.env`'s. Three rules:
+[--proof <ref>] [--step-line "<step>"]… [--code <device code>] [--credential <id>] [--due-when <ref>]`,
+hands off `in-progress`, and stops. The seventeen kinds are `scripts/human-steps.env`'s; `--act` is
+`--step operator-act`, the operator's own act — a command or a click path — and `--due-when <ref>`
+keeps any step `upcoming` (shown under *Coming up*, announced once, when the ref lands) until it is
+due (control-tower phase 121). Three rules:
 
 - **Never run the sign-in yourself.** In a `-p` session it hangs on a browser or a prompt nobody sees.
 - **Never put a secret in a flag.** A value shaped like a token, a password, a one-time code or a URL

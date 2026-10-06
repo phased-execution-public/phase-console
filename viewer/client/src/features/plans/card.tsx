@@ -86,10 +86,15 @@ export function PlanCard({ row, index }: { row: PlanRow; index: number }) {
         {/* `max-w-full` and no `shrink-0`: the wrapper has to be allowed to
             give way, or the `truncate` inside it has nothing to truncate
             against and a plan naming fourteen repos pushes the card 700px
-            past the viewport. */}
-        <span className="ml-auto flex min-w-0 max-w-full items-center gap-2 text-2xs text-ink-faint">
+            past the viewport.
+            `flex-wrap` and the tag's `3ch` floor (#203): on a phone a range
+            estimate and the time used to fill the row, and the tag — the one
+            part allowed to shrink — gave way to ZERO pixels, gone rather than
+            truncated. Now the time drops to a line of its own first, and the
+            tag never draws narrower than an ellipsis it can show. */}
+        <span className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-2 gap-y-0.5 text-2xs text-ink-faint">
           {row.repos.length > 0 && (
-            <span className="min-w-0 truncate font-mono" title={repoLabel(row.repos).title}>
+            <span className="min-w-[3ch] max-w-full truncate font-mono" title={repoLabel(row.repos).title}>
               {repoLabel(row.repos).text}
             </span>
           )}

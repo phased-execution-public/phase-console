@@ -36,7 +36,9 @@ import { BAYS, bayOf, describeRun, type RunCtx } from '@shared/status-model.js';
 import { HALT_CATEGORIES, isHaltCategory, type HaltCategory } from '@shared/halt-categories.js';
 import { haltView } from '@shared/halt-view.js';
 import { countsTowardAttention } from '@shared/attention-model.js';
+import { ciRefusalsOf, type CiRefusal } from '@shared/ci-refusal.js';
 import type { InboxItem, QueueEntry, RunState, VerifyingLane } from '@/lib/api';
+import { isUpcomingItem } from '@/components/human-step-words';
 import type { Departure, NowLane } from '@/features/runs/lanes-model';
 import { queueEntryFor } from '../queue-words';
 import { verifyingLanes } from '../verifying-lane';
@@ -100,8 +102,19 @@ export interface TowerModel {
   counts: Record<Bay, number>;
   /** The open human steps — a person's turn each (control-tower phase 42): *Your turn (n)*. */
   steps: InboxItem[];
+  /**
+   * The acts not due yet, in the inbox's own order — *Coming up* (control-tower
+   * phase 121, #182): drawn after what is due, counted in no bay, lighting no lamp.
+   */
+  upcoming: InboxItem[];
   /** The Settled bay's two numbers, and the local midnight "today" starts at. */
   settled: { today: number; dormant: number; since: number };
+  /**
+   * Repositories GitHub is refusing to run CI for — ONE state each, however
+   * many phases of however many runs wait behind it (control-tower phase 111,
+   * #166). The wall is the repository's, so the diagnosis is too.
+   */
+  ciRefused: CiRefusal[];
 }
 
 export interface TowerFilter {
@@ -143,10 +156,11 @@ function newestBySlug(runs: readonly RunState[]): Map<string, RunState> {
 /**
  * Is this inbox row a person's turn on a ledger step — the summons a step
  * puts on its run (control-tower phase 42)? A folded card (a gate, a
- * question) is drawn by the same card but summons through its own kind.
+ * question) is drawn by the same card but summons through its own kind, and
+ * an act not due yet summons nobody: it is *Coming up* (phase 121).
  */
 export function isStepItem(item: Pick<InboxItem, 'kind' | 'humanStep' | 'ack'>): boolean {
-  return item.kind === 'human-step' && Boolean(item.humanStep?.stepId) && !item.ack;
+  return item.kind === 'human-step' && Boolean(item.humanStep?.stepId) && !item.ack && !isUpcomingItem(item);
 }
 
 /**
@@ -276,11 +290,13 @@ export function towerModel(input: TowerInput): TowerModel {
     annunciator: lampsOf(placed, loose),
     counts: countsOf(bays, loose, departures),
     steps: inbox.filter(isStepItem),
+    upcoming: inbox.filter(isUpcomingItem),
     settled: {
       today: settledBay.filter((t) => !t.dormant && t.touched >= midnight).length,
       dormant: settledBay.filter((t) => t.dormant).length,
       since: midnight,
     },
+    ciRefused: ciRefusalsOf(runs),
   };
 }
 
@@ -310,6 +326,11 @@ export function filterTower(model: TowerModel, filter: TowerFilter): TowerModel 
   );
   // A plan's ready phase has stopped for nothing, so no family holds it.
   const ready = category || keep ? [] : model.ready.filter((d) => bySlug(d.slug));
+  // A person's turn, due or coming up, narrows as its family's rows do.
+  const stepShown = (item: InboxItem) =>
+    bySlug(item.slug ?? item.title) &&
+    (!category || categoryOfItem(item) === category) &&
+    (!keep || keep.itemIds.has(item.id));
 
   return {
     runs: model.runs.filter((t) => bySlug(t.run.slug) && inFamily(t)),
@@ -318,16 +339,16 @@ export function filterTower(model: TowerModel, filter: TowerFilter): TowerModel 
     loose: looseShown,
     annunciator,
     counts: countsOf(bays, looseShown, ready),
-    steps: model.steps.filter(
-      (item) =>
-        bySlug(item.slug ?? item.title) &&
-        (!category || categoryOfItem(item) === category) &&
-        (!keep || keep.itemIds.has(item.id)),
-    ),
+    steps: model.steps.filter(stepShown),
+    upcoming: model.upcoming.filter(stepShown),
     settled: {
       today: bays.settled.filter((t) => !t.dormant && t.touched >= model.settled.since).length,
       dormant: bays.settled.filter((t) => t.dormant).length,
       since: model.settled.since,
     },
+    // A repository's refusal is no halt family's, so only the text narrows it.
+    ciRefused: model.ciRefused
+      .map((item) => ({ ...item, phases: item.phases.filter((p) => bySlug(p.slug)) }))
+      .filter((item) => item.phases.length > 0),
   };
 }

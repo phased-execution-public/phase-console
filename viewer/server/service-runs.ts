@@ -92,7 +92,9 @@ import { PreludeRefusal, preludeFor, resolvedManifest, scopedSteps, type Deliver
 import type { PreludeStep, SkillApiFacts } from './prelude.ts';
 import { GitStrategyRefusal, type GitStrategyLine } from './prelude.ts';
 import { credentialsHeld } from './credentials-probe.ts';
-import { doctorReport, skipped, type DoctorDeps, type DoctorInstance, type DoctorReport, type UnitFacts } from './doctor.ts';
+import {
+  doctorReport, presenceDirs, skipped, type DoctorDeps, type DoctorInstance, type DoctorReport, type PresenceDir, type UnitFacts,
+} from './doctor.ts';
 // The unit row is Pro by location (the free tree has no launchd unit): the
 // export is stripped from doctor.ts there, so the import goes with it.
 import { probeAccounts, probeCredentials, probeDelivery, probeMcp } from './prelude.ts';
@@ -160,13 +162,13 @@ import {
   screenDeclaration, screenedFields,
 } from './runner/wait-budget.ts';
 import { OWN_LOCK_WATCH_REFUSAL, type SwitchWhen } from '../shared/run-lifecycle.js';
-import { liveErrandHow, pollableRefs, unpollableRefs } from './watch-refs.ts';
+import { liveErrandHow, pollableRefs, unpollableRefs, type WatchState } from './watch-refs.ts';
 import {
   Runner, applySettings, settingsBefore, VERIFICATION_PARK_NOTE, MCP_PARK_NOTE,
   type AskResult, type RecoverMode, type RunSettingsPatch, type StartOptions,
 } from './runner/runner.ts';
 import { spentBudgetPark } from './runner/runner-loop.ts';
-import { Scheduler, lockLapsed, planRemainingEta, type HolderEta, type LockView, type QueueEntry } from './runner/scheduler.ts';
+import { Scheduler, isExternalWall, lockLapsed, planRemainingEta, type HolderEta, type LockView, type QueueEntry } from './runner/scheduler.ts';
 import { offeredModels } from './runner/models.ts';
 import {
   continueMcpParkedRecord, mcpParkDueAt, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult,
@@ -210,20 +212,21 @@ import { MESSAGING_WORDS, type MessagingWord } from '../shared/message-model.js'
 import { ISSUE_MODES, type IssueMode } from '../shared/issues-model.js';
 import {
   clearBudgetHold,
-  applyErrandAnswer, autoResolveRun, childrenOf, retirePhaseHalt, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, pidHoldsWork, procIdentity,
+  applyErrandAnswer, autoResolveRun, childrenOf, retirePhaseHalt, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, pidHoldsWork, procIdentity, syncWaitClock,
   reconcileRecordsAgainstBoard, resetForRetry, resetStreak, resolveRunsAgainst, retireSettledErrands, retryOverrideFrom, saveRun,
   slugsNeedingBoard, runDir, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText, setRunState,
   type BoardingBrief, type Errand, type McpPolicy, type PhaseOptions, type PreflightWarning, type RungRecord, type RunState, type RunVerifyApprovals, type VerifySummary, clearWatchBookkeeping, isSessionGone,
   journalOf, runIsOver, prepareReboard, chargeDeclaration, consumeDeclaration, DECLARATION_REFUSED_EVENT, type DeclarationCharge,
   type Actor, type PressAnswer, type PressLaunch, accountPool, type AccountChoice,
   identityChangeWords, identityEcho, keepAccountInPool, keepNotes, RUN_NOTE_MAX, type RunNote,
+  dismissedByPerson, SCRIPT_BY, type RunResolution,
 } from './runner/state.ts';
 import {
   RECOVER_MAX_PER_PHASE, resumePolicyInstruction, resumePolicyWhy, sessionLostInstruction,
 } from './runner/runner-core.ts';
 import { appendRuling } from './runner/rulings.ts';
 import { resumePolicy, type ResumePolicy } from './runner/usage.ts';
-import { asActor, doorActor, isPersonsAct, pressActor, stoppedByOf, unattributedActor, type StartActor } from './actor.ts';
+import { asActor, doorActor, isAutomatic, isPersonsAct, pressActor, stoppedByOf, unattributedActor, type StartActor } from './actor.ts';
 import { ceilingSentence } from './start-ceiling.ts';
 import {
   consumeOutcome, ignoreOutcome, inboxOutcomePhase, outcomeFileFor, outcomeInboxDir, peekWrittenAt, readOutcome,
@@ -298,15 +301,42 @@ export type WaitAnswer =
 /**
  * What a Resume press did (control-tower phase 77, #102): took back a pause the
  * live loop had not reached, or started a settled one again — or the refusal,
- * with its reason, when there was no pause to act on.
+ * with its reason, when there was no pause to act on. Since control-tower phase
+ * 110 (#176) a stopped run is started again the same way, so `from` names
+ * whichever status it stood in.
  */
 export type ResumeAnswer =
   | {
     ok: true;
     run: RunState;
-    resumed: { runId: string; from: 'pausing' | 'paused'; act: 'pause-cancelled' | 'relaunched' };
+    resumed: { runId: string; from: 'pausing' | ResumableStatus; act: 'pause-cancelled' | 'relaunched' };
   }
   | { ok: false; status: number; error: string };
+
+/**
+ * The settled statuses Resume starts again through the one door: a settled
+ * pause (#102), and a run that stopped — parked, halted, or interrupted by its
+ * console's exit (control-tower phase 110, #176). The supervisor's remedy for
+ * a parked run with ready work pressed `resume`, and every press was refused.
+ */
+type ResumableStatus = 'paused' | 'parked' | 'halted' | 'interrupted';
+const RESUMED_FROM: readonly ResumableStatus[] = ['paused', 'parked', 'halted', 'interrupted'];
+
+/**
+ * Why an AUTOMATIC press may not start this stopped run again (#176), or null.
+ * A person's press lifts every one of them; a door's never does.
+ */
+function automaticResumeRefusal(run: RunState): string | null {
+  const kind = run.halt?.kind;
+  if (run.status === 'halted' && kind && PRESS_ONLY_HALT_KINDS.includes(kind)) {
+    return `its ${kind} halt is lifted by a person's press, never an automatic one.`;
+  }
+  if (run.stoppedBy === 'operator') return 'a person stopped it, and only a person\'s press brings it back.';
+  if (dismissedByPerson(run.resolved)) {
+    return `a person dismissed it (${run.resolved?.by ?? 'unnamed'} at ${run.resolved?.at}), and only a person's press brings it back.`;
+  }
+  return null;
+}
 
 /**
  * One queued plan's ordering advice — what it would cost to let it go first.
@@ -841,6 +871,8 @@ export abstract class ServiceRuns extends ServiceLive {
           ...(step.windowMinutes !== undefined ? { windowMinutes: step.windowMinutes } : {}),
           ...(step.autoOpen ? { auto_open: step.autoOpen } : {}),
           ...(step.credential ? { credential: step.credential } : {}),
+          // Upcoming until its ref lands (control-tower phase 121).
+          ...(step.due ? { due_when: step.due } : {}),
         },
       });
     }
@@ -968,7 +1000,12 @@ export abstract class ServiceRuns extends ServiceLive {
       // the door, not at three in the morning.
       humanSteps: async () => {
         const done = (await this.board(slug).catch(() => null))?.done ?? [];
-        return scopedSteps((phase) => humanStepsFor(plan, phase), phases, { onlyPhases: options.onlyPhases, done });
+        // The plan's own acts (`## Operator errands`, phase 0 — control-tower
+        // phase 121) are asked of every run, scoped or not: no phase owns them.
+        return [
+          ...humanStepsFor(plan, 0).map((step) => ({ phase: 0, step })),
+          ...scopedSteps((phase) => humanStepsFor(plan, phase), phases, { onlyPhases: options.onlyPhases, done }),
+        ];
       },
       probeStep: async (ref) => {
         const verdict = await this.watchClock.probeNow(ref);
@@ -1025,6 +1062,8 @@ export abstract class ServiceRuns extends ServiceLive {
         return { status: verdict.status, ok: verdict.ok, reason: verdict.reason, ...(verdict.warnings ? { warnings: verdict.warnings } : {}) };
       },
       hooks: async () => this.hooksStatus(),
+      // Every pooled account's config dir, not the login's alone (#194).
+      presence: async () => this.presenceByAccount(),
       skillCopy: () => this.skillCopy(),
       unit: async () => {
         let facts: UnitFacts | null = null;
@@ -1080,6 +1119,18 @@ export abstract class ServiceRuns extends ServiceLive {
    */
   protected drivingRun(slug: string): RunState | null {
     return this.liveRunner(slug)?.current() ?? null;
+  }
+
+  /**
+   * This console's own issue word — Settings ▸ Issues ▸ "File problems a run
+   * finds outside its phase" (control-tower phase 115) — which a run with no
+   * word of its own files under, and which the tighten-only rule therefore
+   * reads that run as (`issuesModeLoosens`). `undefined` where there is none:
+   * the rule reads that as `off`.
+   */
+  consoleIssueWord(): string | undefined {
+    let word: string | undefined;
+    return word;
   }
 
   /** The live run if there is one, otherwise the last one recorded on disk. */
@@ -1449,16 +1500,31 @@ export abstract class ServiceRuns extends ServiceLive {
    * disagrees and it can be taken back. Goes through `editStoredRun`, so it
    * works on a run no loop is driving — which is every run this is used on.
    */
-  resolveRun(slug: string, runId: string, opts: { note?: string; by?: string; actor?: Actor } = {}): RunState | null {
+  async resolveRun(slug: string, runId: string, opts: { note?: string; by?: string; actor?: Actor } = {}): Promise<RunState | null> {
     const actor = opts.actor ?? asActor(opts.by ?? 'console', 'Service.resolveRun');
+    // What the board read ready at the dismissal (control-tower phase 110,
+    // #176), so work that turns ready AFTER it reads as new. Unreadable, the
+    // dismissal records none — the shape every older dismissal has.
+    let ready: number[] | null = null;
+    try {
+      const board = await this.board(slug);
+      if (!board.error) ready = [...board.ready].sort((a, b) => a - b);
+    } catch { /* recorded without a ready set */ }
     return this.editStoredRunById(slug, runId, (state) => {
-      state.resolved = {
+      const resolved: RunResolution = {
         at: new Date().toISOString(),
         auto: false,
         reason: 'dismissed by the operator',
         by: opts.by ?? actor.by,
         ...(opts.note ? { note: opts.note } : {}),
+        ...(ready ? { ready } : {}),
       };
+      // …worded as who made it: a watchdog's API call was recorded "dismissed
+      // by the operator", and converge then pinned the run as a person's.
+      if (!dismissedByPerson(resolved)) {
+        resolved.reason = `dismissed by ${resolved.by === SCRIPT_BY ? 'a script' : 'an unnamed caller'}, not a person`;
+      }
+      state.resolved = resolved;
       // A dismissal replaces an earlier "put it back" — otherwise the veto
       // would outlive the decision it was vetoing.
       state.reopenedAt = null;
@@ -3018,9 +3084,13 @@ export abstract class ServiceRuns extends ServiceLive {
    * started again through the one door, naming nothing but the run: its own
    * settings stand (RS-1..3). The answer names which of the two happened.
    *
-   * A `pausing` record with no loop behind it is not this verb's: the read
-   * path already calls it `interrupted` (its console went away mid-pause),
-   * and bringing an interrupted run back is Continue's — refused here, saying so.
+   * A STOPPED run is started again the same way (control-tower phase 110,
+   * #176): parked, halted, or interrupted by its console's exit — Continue,
+   * naming nothing but the run, so its own settings stand. The supervisor's
+   * remedy for a parked run with ready work pressed this verb, and every press
+   * read "No pause … Continue brings it back" while the run sat for 6.6 hours.
+   * An automatic press still never lifts what only a person may: a halt in
+   * `PRESS_ONLY_HALT_KINDS`, a run a person stopped, or one a person dismissed.
    */
   async resumeRun(slug: string, actor: StartActor): Promise<ResumeAnswer> {
     const runner = this.liveRunner(slug);
@@ -3029,14 +3099,17 @@ export abstract class ServiceRuns extends ServiceLive {
       return { ok: true, run: runner.current() ?? live, resumed: { runId: live.id, from: 'pausing', act: 'pause-cancelled' } };
     }
     const stored = !runner && this.root?.ok ? latestRun(this.root.path, slug, this.liveRunIds()) : null;
-    if (!stored || stored.status !== 'paused') {
+    const from = stored && RESUMED_FROM.find((status) => status === stored.status);
+    if (!stored || !from) {
       const is = live ?? stored;
-      const continues = is && ['parked', 'halted', 'interrupted'].includes(is.status);
       return {
         ok: false, status: 409,
-        error: `No pause of ${slug} to take back or lift — `
-          + (is ? `its run is ${is.status}${continues ? '; Continue brings it back' : ''}.` : 'it has no run.'),
+        error: `No pause of ${slug} to take back or lift — ` + (is ? `its run is ${is.status}.` : 'it has no run.'),
       };
+    }
+    if (from !== 'paused' && isAutomatic(actor)) {
+      const refused = automaticResumeRefusal(stored);
+      if (refused) return { ok: false, status: 409, error: `${slug} was not resumed — ${refused}` };
     }
     // Under a hold that binds this plan the start below would only queue behind
     // it: a 200 that changes nothing, which is what an operator got for seven
@@ -3046,12 +3119,103 @@ export abstract class ServiceRuns extends ServiceLive {
     if (held) {
       return { ok: false, status: 409, error: `${slug} was not resumed — ${fleetHoldSentence(held)}.` };
     }
+    // A run whose phases wait on parks (control-tower phase 111, #179) reads
+    // `paused` with no loop behind it. A person's Continue cuts the windows
+    // that have nothing real left to wait for — or refuses, saying why, when
+    // the relaunch could only park the run again on the same clock, which is
+    // what it did 72 s after the press. An automatic press cuts nothing.
+    if (!isAutomatic(actor)) {
+      const cut = await this.cutWaitsForResume(slug, stored, actor);
+      if (!cut.ok) return { ok: false, status: 409, error: `${slug} was not resumed — ${cut.why}` };
+    }
     try {
       const run = await this.startRun(slug, { actor: actor, resumeRunId: stored.id });
-      return { ok: true, run, resumed: { runId: stored.id, from: stored.status, act: 'relaunched' } };
+      return { ok: true, run, resumed: { runId: stored.id, from, act: 'relaunched' } };
     } catch (error) {
       return { ok: false, status: 409, error: (error as Error).message };
     }
+  }
+
+  /**
+   * A person's Continue on a run waiting on parks (control-tower phase 111,
+   * #179). Each phase whose window is still ahead is asked what it waits on:
+   *
+   *   - a WATCHDOG park is the console's own inference — cut;
+   *   - a declared wait is re-asked NOW, ref by ref, through the watch clock's
+   *     one-ref probe: one that has landed cuts the window (#179's second
+   *     shape: a satisfied `cmd:` ref sat 12 minutes, its resume undone);
+   *   - a wait still standing refuses the resume, naming the ref and what it
+   *     read — when nothing was cut and nothing else is ready, since the
+   *     relaunch would only park it again; the account's usage window always.
+   *
+   * A cut writes the window's end as NOW, which the loop admits as an expired
+   * wait and resumes the phase's own session; `phase.wait-cut` says who cut
+   * which park. Nothing is written when anything refuses.
+   */
+  private async cutWaitsForResume(
+    slug: string, stored: RunState, actor: StartActor,
+  ): Promise<{ ok: true } | { ok: false; why: string }> {
+    const now = Date.now();
+    const waiting = Object.values(stored.phases ?? {})
+      .filter((record) => record?.status === 'waiting' && record.parkedUntil && Date.parse(record.parkedUntil) > now)
+      .sort((a, b) => a.phase - b.phase);
+    const cuts: { phase: number; was: string; parker: string; ref?: string; read?: string }[] = [];
+    const standing: string[] = [];
+    for (const record of waiting) {
+      const declared = record.declared;
+      if (declared?.by === 'watchdog') {
+        cuts.push({ phase: record.phase, was: record.parkedUntil!, parker: 'watchdog' });
+        continue;
+      }
+      if (record.usageWall) {
+        return { ok: false, why: `phase ${record.phase} waits on its account's usage window until ${record.parkedUntil} — switch the run's account, or let the window open` };
+      }
+      const refs = pollableRefs(declared?.watch ?? record.watch ?? []);
+      const reads: string[] = [];
+      let landed: WatchState | null = null;
+      for (const target of refs) {
+        const verdict = await this.watchClock.probeNow(target.ref);
+        if (verdict.state === 'landed') { landed = verdict; break; }
+        reads.push(`${target.ref} (${verdict.state}${verdict.detail ? `: ${verdict.detail}` : ''})`);
+      }
+      if (landed) {
+        cuts.push({
+          phase: record.phase, was: record.parkedUntil!, parker: declared?.by ?? 'session', ref: landed.ref,
+          ...(landed.detail ? { read: landed.detail } : {}),
+        });
+        continue;
+      }
+      standing.push(refs.length
+        ? `phase ${record.phase} waits on ${reads.join(', ')}, which has not landed; it resumes when it does, `
+          + `or at ${record.parkedUntil} — Retry the phase to board it now`
+        : `phase ${record.phase} waits until ${record.parkedUntil} on a wait that names no ref the console can check — `
+          + 'Retry the phase to board it now');
+    }
+    // Nothing cut, a wait still standing, and nothing else for the loop to
+    // board: the relaunch would only park the run again. Said, not done.
+    if (!cuts.length && standing.length) {
+      const board = await this.board(slug).catch(() => null);
+      const parked = new Set(waiting.map((record) => record.phase));
+      const other = board && !board.error ? board.ready.filter((phase) => !parked.has(phase)) : [];
+      if (!other.length) return { ok: false, why: standing[0]! };
+    }
+    if (!cuts.length || !this.root?.ok) return { ok: true };
+    const at = new Date(now).toISOString();
+    this.editStoredRunById(slug, stored.id, (run) => {
+      for (const cut of cuts) {
+        const record = run.phases[String(cut.phase)];
+        if (record?.status === 'waiting') record.parkedUntil = at;
+      }
+      syncWaitClock(run);
+    });
+    const journal = Journal.for(this.root.path, slug, stored.id);
+    for (const cut of cuts) {
+      journal.append('phase.wait-cut', {
+        by: actor.by ?? 'operator', parker: cut.parker, was: cut.was,
+        ...(cut.ref ? { ref: cut.ref, read: cut.read ?? null } : {}),
+      }, cut.phase);
+    }
+    return { ok: true };
   }
 
   /* ---------------- identity and login continuity (control-tower phase 91) ---------------- */
@@ -3072,7 +3236,7 @@ export abstract class ServiceRuns extends ServiceLive {
     const live = this.liveRunIds();
     for (const plan of this.store?.list() ?? []) {
       let runs: RunState[] = [];
-      try { runs = listRuns(this.root.path, plan.slug); } catch { continue; }
+      try { runs = listRuns(this.root.path, plan.slug, live); } catch { continue; }
       for (const state of runs) {
         if (live.has(state.id) || runIsOver(state)) continue;
         if (this.parkStoredOnIdentity(state, now)) parked += 1;
@@ -3336,7 +3500,7 @@ export abstract class ServiceRuns extends ServiceLive {
       : this.editStoredRun(slug, (state) => {
         const patched = translate(state);
         const before = { ...settingsBefore(state, patched), ...extra.before };
-        applySettings(state, patched);
+        applySettings(state, patched, this.consoleIssueWord());
         // Journalled like the live branch's `run.reconfigured` (control-tower
         // phase 77, #101 — #22's rule for an edit no loop made): a stored run
         // whose `resumeOnRestart` changed with no line saying so could not
@@ -4248,6 +4412,17 @@ export abstract class ServiceRuns extends ServiceLive {
     // `resolved` does NOT refuse here: an explicit click is a new instruction.
     const gate = await this.preRecoveryGate(slug, target, phase, { verb: true });
     if (gate === 'superseded') return target;
+    // A phase parked on a declared EXTERNAL wall is not asked "are you done?"
+    // (control-tower phase 111, #204). The three done-checks can only fail a
+    // phase waiting on the outside world, and that failure re-judged the wall
+    // `failed`/`no-handoff` — under the card's own recommended verb. Its
+    // Recheck asks the wall's refs instead, and is not held to the RCV-4
+    // ledger below: a probe of the world is new evidence every time.
+    const walled = target.phases[String(phase)];
+    if (mode === 'recheck' && walled && (walled.status === 'parked' || walled.status === 'waiting')
+      && isExternalWall(walled, target.recoveries?.[String(phase)]?.errand)) {
+      return this.recheckWall(slug, target, phase, opts.by ?? 'console');
+    }
     // …but a click over evidence the LAST recovery already ran under is not a
     // new instruction (RCV-4): it cannot change anything, and 16 of 127
     // recoveries re-halted within seconds having changed nothing. Refused,
@@ -4284,6 +4459,39 @@ export abstract class ServiceRuns extends ServiceLive {
     if (!opts.settled) return armed;
     await runner.wait();
     return runner.current() ?? armed;
+  }
+
+  /**
+   * Recheck on a declared external wall (control-tower phase 111, #204): the
+   * wall's own refs, probed NOW through the watch clock. A landing is offered
+   * exactly as the scheduler offers one, so the phase's own session resumes;
+   * anything else is ONE `run.recheck` line naming each ref and what it read,
+   * with the wall, its halt, its errand and the record left as they were.
+   */
+  private async recheckWall(slug: string, target: RunState, phase: number, by: string): Promise<RunState> {
+    const record = target.phases[String(phase)];
+    const answer = await this.watchClock.recheck(slug, target, phase);
+    const refs = answer.refs.map((r) => ({
+      ref: r.ref, state: r.state, ...(r.detail ? { detail: r.detail.slice(0, 200) } : {}),
+    }));
+    if (answer.landed) {
+      journalOf(target)('run.recheck', {
+        phase, verdict: 'landed', wall: true, by, ref: answer.landed.ref,
+        ...(answer.landed.detail ? { read: answer.landed.detail.slice(0, 200) } : {}),
+        resumed: answer.outcome === 'resumed', refs,
+      }, phase);
+    } else {
+      journalOf(target)('run.recheck', {
+        phase, verdict: 'waiting', wall: true, by, refs,
+        ...(refs.length ? {} : {
+          why: record?.declared?.watch?.length
+            ? 'every ref the declaration names was refused or retired — nothing will land it; Retry the phase'
+            : 'the declaration names no ref the console can check — a person settles it, then Retry',
+        }),
+      }, phase);
+    }
+    const root = this.root?.path;
+    return (root ? loadRun(root, slug, target.id, this.liveRunIds()) : null) ?? target;
   }
 
   /**
@@ -5185,6 +5393,19 @@ export abstract class ServiceRuns extends ServiceLive {
     return hooksStatus({ skillDir: SKILL_DIR });
   }
 
+  /**
+   * The presence hook in every config dir this console's pooled accounts run
+   * sessions from (control-tower phase 108, #194) — the login's for the
+   * machine login and a token, each profile's own. What `doctor`'s presence
+   * row reads; a profile is provisioned at its next spawn (`envFor`).
+   */
+  presenceByAccount(): PresenceDir[] {
+    return presenceDirs(
+      this.accounts.accountIds().map((id) => ({ id, dir: this.accounts.configDirFor(id) })),
+      (settingsPath) => hooksStatus({ skillDir: SKILL_DIR, settingsPath }),
+    );
+  }
+
   /** Write the four entries (behind `--allow-writes` — the file is outside the console's own state). */
   installSessionHook(): HooksWrite {
     if (!this.flags.allowWrites) throw new Error('Installing the session hook edits ~/.claude/settings.json — restart with --allow-writes.');
@@ -5584,13 +5805,11 @@ export abstract class ServiceRuns extends ServiceLive {
             ...spent.data, reason: declared.reason ?? null, requested: new Date(wait.requested).toISOString(),
             budgetRemainingMs: wait.budgetRemainingMs,
           }, phase);
-          journal.append('phase.errand', { ...spent.errand }, phase);
+          if (spent.errand) journal.append('phase.errand', { ...spent.errand }, phase);
           saveRun(state);
           this.emit('run:state', { state });
           // A spent budget announces as one (control-tower phase 14, #40).
-          if (spent.errand.budget) {
-            this.announceBudget({ slug, runId: state.id, phase, state: 'spent', fact: spent.errand.budget });
-          }
+          this.announceBudget({ slug, runId: state.id, phase, state: 'spent', fact: spent.fact });
           verdict = 'parked';
         } else if (wait?.verdict === 'park') {
           const until = new Date(wait.until).toISOString();
@@ -5981,7 +6200,7 @@ export abstract class ServiceRuns extends ServiceLive {
     const root = this.root?.path;
     if (!root) return null;
     const run = this.runners.get(slug)?.current()
-      ?? listRuns(root, slug).find((r) => r.phases[String(phase)]);
+      ?? listRuns(root, slug, this.liveRunIds()).find((r) => r.phases[String(phase)]);
     if (!run) return null;
 
     const record = run.phases[String(phase)];
@@ -6196,9 +6415,16 @@ export abstract class ServiceRuns extends ServiceLive {
       // `gates` row, else this console's word, else the shipped `delegated`).
       // Without it the classifier called a delegated gate a person's, so the
       // ladder wrote an errand for a phase the runner would happily have booted.
-      gateDelegated: () => policyForPlan(
-        'gates', mergeDecisions(record?.plan?.decisions ?? [], record?.decisionsTwin ?? []), policyPrefsOf(this.prefs),
-      )?.answer === 'delegated',
+      // Never for a gate the plan marks MANUAL (control-tower phase 107, #174):
+      // that one is a person's whatever the row says, exactly as the runner
+      // reads it — the kind from the plan text, `gates.env`'s split.
+      gateDelegated: (_slug, phase) => {
+        const detail = record?.plan?.phases[phase];
+        if (gateKindOf(detail?.gateCheck, detail?.gated ?? false, this.gateVocab) === 'human') return false;
+        return policyForPlan(
+          'gates', mergeDecisions(record?.plan?.decisions ?? [], record?.decisionsTwin ?? []), policyPrefsOf(this.prefs),
+        )?.answer === 'delegated';
+      },
       // The registry hit for the phase's lock holder: a live or ended session it names.
       registry: (_slug, phase, run) => {
         const l = record ? lockFor(record, phase) : undefined;

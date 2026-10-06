@@ -199,6 +199,7 @@ describe('automation preference coverage', () => {
     expect((await renderedPrefs({})).filter((k) => k === 'policy')).toHaveLength(1);
   });
 
+
   it('every exemption names a preference that still exists', async () => {
     // An exemption that outlives its preference is a comment nobody will read
     // and a name nobody will grep — the same rot the UNDOCUMENTED_FLAGS

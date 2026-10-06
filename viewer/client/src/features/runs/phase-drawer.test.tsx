@@ -263,3 +263,69 @@ describe('the drawer’s QA section', () => {
     expect(screen.queryByTestId('drawer-qa')).toBeNull();
   });
 });
+
+describe('the drawer shows what the BASELINE said, as it shows a verdict’s red (control-tower phase 106, #195)', () => {
+  const withBaseline = (commands: unknown[]): RunState =>
+    ({
+      id: 'r1',
+      slug: 'alpha',
+      phases: {
+        '3': {
+          phase: 3,
+          status: 'running',
+          baseline: {
+            at: '2026-10-03T12:00:00.000Z',
+            tree: 'a'.repeat(40),
+            head: 'b'.repeat(40),
+            concurrent: true,
+            commands,
+          },
+        },
+      },
+    }) as never;
+
+  it('names a red baseline line with its failing tests and the tail of its output', () => {
+    view(
+      withBaseline([
+        { command: 'npm test', ok: true, code: 0, from: 'measured' },
+        {
+          command: 'task verify:local',
+          ok: false,
+          code: 1,
+          from: 'measured',
+          once: true,
+          failures: ['preview store › round-trip'],
+          tail: '# AuthenticationError: invalid password\n# fail 1',
+        },
+      ]),
+    );
+    const section = screen.getByText('Red before this phase began:').closest('div')!.parentElement!;
+    expect(within(section).getByText('task verify:local')).toBeTruthy();
+    expect(within(section).queryByText('npm test')).toBeNull();
+    expect(section.textContent).toContain('preview store › round-trip');
+    expect(section.textContent).toContain('AuthenticationError: invalid password');
+  });
+
+  it('says why a line could not run at all — the machine, not a red the phase inherited', () => {
+    view(
+      withBaseline([
+        {
+          command: 'cd hetzner && npm run verify:local',
+          ok: false,
+          code: 1,
+          from: 'measured',
+          environment: 'the dependencies are not installed here — `hetzner/node_modules` is absent',
+          tail: "Error: Cannot find module 'tsx'",
+        },
+      ]),
+    );
+    const section = screen.getByText('Red before this phase began:').closest('div')!.parentElement!;
+    expect(section.textContent).toContain('could not run here');
+    expect(section.textContent).toContain('hetzner/node_modules');
+  });
+
+  it('is absent when every baseline line was green — the common case', () => {
+    view(withBaseline([{ command: 'npm test', ok: true, code: 0, from: 'measured' }]));
+    expect(screen.queryByText('Red before this phase began:')).toBeNull();
+  });
+});

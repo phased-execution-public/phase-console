@@ -51,6 +51,7 @@ import { relativeTime } from '@/lib/format';
 import { Duration, RelativeTime, Sheet, SheetContent, Tabs, TabsList, TabsTrigger } from '@/components/ui';
 import { AttentionMark, ViewBadge } from '@/components/ui/status';
 import { describeWord, type StatusView } from '@shared/status-model.js';
+import { checkLabel } from '@/features/runs/check-words';
 import { endedLabel, foreignVehicle, otherSessions, type NowLane } from '@/features/runs/lanes-model';
 import type { ForeignSession, PhaseTask, TerminalSession } from '@/lib/api';
 import { TaskLine } from '@/features/runs/task-summary';
@@ -241,14 +242,18 @@ export function sessionRows(input: {
 
   for (const lane of input.lanes ?? []) {
     const card = pending.find((a) => a.runId === lane.runId && (a.phase == null || a.phase === lane.phase));
+    // The console's own check on the phase, when one runs (control-tower phase
+    // 105, #193): the row says which line of which pass, and it is live — a
+    // baseline before boarding is half an hour of work with no session in it.
+    const check = lane.check ? checkLabel(lane.check) : null;
     rows.push({
       key: `lane:${lane.key}`,
       kind: 'lane',
       label: `${lane.planTitle} · P${lane.phase}`,
       ...(lane.title ? { detail: lane.title } : {}),
-      note: lane.frozen ? 'frozen' : lane.status === 'running' ? null : lane.status,
+      note: lane.frozen ? 'frozen' : (check ?? (lane.status === 'running' ? null : lane.status)),
       href: planHref(lane.slug, 'run'),
-      live: lane.status === 'running',
+      live: lane.status === 'running' || check != null,
       ...(lane.startedAt
         ? { startedAt: Date.parse(lane.startedAt), createdAt: Date.parse(lane.startedAt) }
         : {}),

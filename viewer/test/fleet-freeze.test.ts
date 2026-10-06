@@ -346,6 +346,10 @@ for (const mechanism of MECHANISMS) {
  * look. A new site is not a bug — `retryPhase` and `recoverPlan` are here and
  * are operator doors. What is a bug is a new site nobody ruled on.
  */
+// Start seams the service hands an edition's own modules: none in the free
+// tree, so the count below is the free tree's own there.
+let SEAM_SITES = 0;
+let SEAM_NOTE = '';
 const START_SITES: { file: string; count: number; note: string }[] = [
   {
     file: 'server/service-base.ts',
@@ -356,7 +360,7 @@ const START_SITES: { file: string; count: number; note: string }[] = [
   },
   {
     file: 'server/service-runs.ts',
-    count: 10,
+    count: 10 + SEAM_SITES,
     note: 'retryPhase (an operator door that nonetheless QUEUES — it funnels into a phase, and '
       + "every phase goes through admit()) · recoverPlan (goes through: its halt path uses the "
       + "EXEMPT `button` trigger — and refuses 409 first under a hold that binds the plan, #93) · "
@@ -372,7 +376,7 @@ const START_SITES: { file: string; count: number; note: string }[] = [
       + '(`repairCheckout`, control-tower phase 90 — an operator door, refused 409 under a hold that '
       + 'binds the plan, as Resume is) · a person\'s raise of a spent run budget (`raiseBudget`, '
       + 'control-tower phase 14 — an operator door: the raise is a person\'s Continue, started under '
-      + '`pressActor`, and a phase-scoped raise goes through `pressRetry` instead)',
+      + '`pressActor`, and a phase-scoped raise goes through `pressRetry` instead)' + SEAM_NOTE,
   },
   {
     file: 'server/service-recovery.ts',

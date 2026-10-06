@@ -32,7 +32,8 @@ import {
   type SessionCaps,
 } from './session-record.ts';
 import { loadModelsEnv } from './models.ts';
-import { contextWindowOf, costMismatch, MAX_TOKEN_ATTEMPTS, priceUsage, type TokenAttempt } from './usage.ts';
+import { proofsFile } from './proofs.ts';
+import { contextWindowOf, CostDrift, costMismatch, MAX_TOKEN_ATTEMPTS, priceRowOf, priceUsage, type TokenAttempt } from './usage.ts';
 import type { PollLoopState } from '../../shared/poll-loop.js';
 import { writeMcpConfigFile, type McpConfigDoc } from '../mcp/config.ts';
 import { RELAY_HOST_SERVER, RELAY_HOST_TOOL, relayHostConfig } from '../relay-host.ts';
@@ -78,7 +79,7 @@ import { stoppedByOf } from '../actor.ts';
 import {
   childrenOf, loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
-  settleInFlightRecords, runDir,
+  settleInFlightRecords, runDir, THIS_CONSOLE,
   type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind, type SessionMode,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
@@ -115,6 +116,7 @@ import { taskSummary } from '../../shared/task-model.js';
 import {
   PHASE_WORK_MODES, closeAttemptWindow, clocksDigest, openSessionWindow, phaseClocks, type PhaseClocks,
 } from '../../shared/phase-clocks.js';
+
 
 /* ------------------------------------------------------------------ *
  * The progress frame
@@ -213,6 +215,8 @@ export abstract class RunnerBase {
   protected abstract confirmed(phase: number): Promise<boolean>;
   /** The phase's §Verification baseline at its first boarding (control-tower phase 83, #103) — `RunnerAttempt`. */
   protected abstract takeBaseline(phase: number): Promise<void>;
+  /** Every baseline still measuring beside a session, awaited (control-tower phase 105). */
+  protected abstract settleBaselines(): Promise<void>;
   protected abstract boardingWipBlock(phase: number, lane: Lane): Promise<string>;
   protected abstract disarmLivenessTicker(): void;
   protected abstract endLaneStall(phase: number): void;
@@ -442,6 +446,48 @@ export abstract class RunnerBase {
    */
   protected laneRoot(phase: number): string {
     return this.lanes.get(phase)?.worktree ?? this.state!.workRoot ?? this.state!.root;
+  }
+
+  /**
+   * Where this phase's §Verification runs: the lane's root, moved by the
+   * plan's `**Verify in:**` when that names a directory inside it — and why
+   * not, when it does not (it escapes the root, or there is no such
+   * directory), the root then standing in. Quiet: the verdict journals a
+   * refusal (`RunnerAttempt.verifyCwd`); telling a session where its lines are
+   * judged (`proofEnv`) is not a verdict.
+   */
+  protected async verifyDirOf(phase: number): Promise<{ dir: string; root: string; declared?: string; refused?: string }> {
+    const root = resolve(this.laneRoot(phase));
+    const declared = (await this.deps.verifyIn?.(this.state!.slug, phase))?.trim();
+    if (!declared) return { dir: root, root };
+    const target = resolve(root, declared);
+    if (!(target === root || target.startsWith(`${root}/`))) {
+      return { dir: root, root, declared, refused: 'it resolves outside the repository root' };
+    }
+    try {
+      if (!statSync(target).isDirectory()) throw new Error('not a directory');
+    } catch {
+      return { dir: root, root, declared, refused: 'no such directory under the repository root' };
+    }
+    return { dir: target, root, declared };
+  }
+
+  /**
+   * What a phase's session needs to record a proof the console will honour
+   * (control-tower phase 106, #196): the ledger `phase-outcome.sh … verified`
+   * writes, the directory this phase's lines are JUDGED in (`PE_VERIFY_DIR` —
+   * the proof's tree is keyed there, whatever the session's shell stands on)
+   * and the run root a relative `--in` is resolved against (`PE_RUN_ROOT`).
+   * ai-builder-v7 P14 recorded `--in .` from inside a submodule; five proofs
+   * were keyed by the submodule's tree and refused at the verdict.
+   */
+  protected async proofEnv(phase: number): Promise<Record<string, string>> {
+    const { dir, root } = await this.verifyDirOf(phase);
+    return {
+      PE_PROOFS_FILE: proofsFile(this.state!.root, this.state!.slug),
+      PE_VERIFY_DIR: dir,
+      PE_RUN_ROOT: root,
+    };
   }
 
   /**
@@ -697,8 +743,49 @@ export abstract class RunnerBase {
    * Pro on both lines, the import above and this one — the defect
    * `messagingEnv` documents, not repeated: the free tree's method is a body
    * that returns `{}`, and every spawn site spreads it without knowing.
+   *
+   * The ledger, then the POLICY the session files under (control-tower phase
+   * 114) — `issuePolicyEnv`, the same words its boot prompt was rendered from.
    */
   protected issuesEnv(): Record<string, string> {
+    const state = this.state;
+    if (!state) return {};
+    return {
+      ...this.issuePolicyEnv(),
+    };
+  }
+
+  /**
+   * This console's own issue word (Settings ▸ Issues, control-tower phase
+   * 115) — what the tighten-only rule reads a run with no word of its own as
+   * (`issuesModeLoosens`). `undefined` where there is none, which it reads as
+   * `off`.
+   */
+  protected consoleIssueWord(): string | undefined {
+    let word: string | undefined;
+    return word;
+  }
+
+  /**
+   * `issuesEnv`'s policy half (control-tower phase 114): the words a session
+   * files under, and nothing that names a ledger — so the boot prompt can be
+   * rendered from them too. `--boot-prompt` reads them through
+   * `phase-graph.sh --issue-policy`, the one resolver `phase-issue.sh` itself
+   * enforces, so the line a session READS and the script it RUNS cannot differ.
+   *
+   * - `PE_ISSUES_MODE` and `PE_ISSUES_SOURCE` — the console's part of the ONE
+   *   resolver (control-tower phase 115, `pro/issues/policy.ts`): the run's own
+   *   `Issues:` word (phase 15, the launch form's), else this console's
+   *   Settings ▸ Issues, with the level it came from. The script reads it only
+   *   where the plan said nothing, so the plan still comes first.
+   * - `PE_ISSUES_SUGGEST` — whether a `--suggest` draft is taken: Settings ▸
+   *   Issues ▸ "Also file improvement suggestions" (off unless a person turned
+   *   it on, operator decision 16).
+   * - `PE_ISSUE_REPOS` — the estate's keys as the repository page lists them
+   *   (`repoInventory`: `root`, then every initialised submodule's path), which
+   *   `--repo auto` resolves a `--where` against.
+   */
+  protected issuePolicyEnv(): Record<string, string> {
     const state = this.state;
     if (!state) return {};
     return {
@@ -1002,8 +1089,12 @@ export abstract class RunnerBase {
    */
   protected shuttingDown = false;
 
+  /** The console's memory of a drifting price (control-tower phase 109, #202) — its own when the service hands none. */
+  protected readonly costDrift: CostDrift;
+
   constructor(deps: RunnerDeps) {
     this.deps = deps;
+    this.costDrift = deps.costDrift ?? new CostDrift();
   }
 
   /**
@@ -1209,6 +1300,8 @@ export abstract class RunnerBase {
         ...livenessOf(lane.phase, lane.signals, stallThresholds(this.deps.stallThresholds?.())),
         // The unbooked half of the run's spend (`LaneLiveness.spentUsd`).
         ...(lane.sessionUsd ? { spentUsd: lane.sessionUsd } : {}),
+        // Running, and unreachable — said up front (control-tower phase 109, #170).
+        ...(lane.inputClosed ? { input: { open: false, closedAt: lane.inputClosed.at, cause: lane.inputClosed.cause } } : {}),
       }))
       .sort((a, b) => a.phase - b.phase);
   }
@@ -1346,6 +1439,10 @@ export abstract class RunnerBase {
         ...(lane.procStartedAt ?? previous?.procStartedAt
           ? { procStartedAt: lane.procStartedAt ?? previous!.procStartedAt }
           : {}),
+        // Who launched it (control-tower phase 110, #175) — stamped with the
+        // pid at spawn, and only the lane's own: a previous entry for this
+        // phase may be an earlier console's child, and its launcher is not ours.
+        ...(lane.launcher ? { launcher: lane.launcher } : {}),
         // WHERE this session is editing, and on WHAT branch — the lane's own
         // answer only, deliberately NOT carried forward from `previous` the way
         // `procStartedAt` is.
@@ -1406,8 +1503,13 @@ export abstract class RunnerBase {
     const lane = this.lanes.get(phase);
     if (lane) {
       lane.pid = pid;
-      if (pid != null) lane.procStartedAt = new Date().toISOString();
-      else delete lane.procStartedAt;
+      if (pid != null) {
+        lane.procStartedAt = new Date().toISOString();
+        lane.launcher = { ...THIS_CONSOLE };
+      } else {
+        delete lane.procStartedAt;
+        delete lane.launcher;
+      }
       this.syncMirror();
       return;
     }
@@ -1420,12 +1522,14 @@ export abstract class RunnerBase {
         pid, phase,
         sessionId: state.phases[String(phase)]?.sessionId ?? '',
         startedAt: new Date().toISOString(),
+        // Launched here, now (#175): the fact an orphan is judged by.
+        launcher: { ...THIS_CONSOLE },
       };
   }
 
   protected attachHandle(phase: number, handle: SpawnHandle | null): void {
     const lane = this.lanes.get(phase);
-    if (lane) { lane.handle = handle; this.syncMirror(); return; }
+    if (lane) { lane.handle = handle; delete lane.inputClosed; this.syncMirror(); return; }
     this.handle = handle;
   }
 
@@ -1463,11 +1567,15 @@ export abstract class RunnerBase {
   protected async waitBudgetOf(phase: number): Promise<WaitBudget> {
     let budget: WaitBudget = this.waitBudgets.get(phase) ?? DEFAULT_WAIT_BUDGET;
     try {
-      const [line, refs] = await Promise.all([
+      const [line, refs, count] = await Promise.all([
         this.engine(['--wait-budget', String(phase)]),
         this.engine(['--waits-on', String(phase)]),
+        // The plan's declared-wait count (control-tower phase 121, #40).
+        this.engine(['--wait-count', String(phase)]),
       ]);
-      if (line.code === 0) budget = waitBudgetFrom(line.stdout, refs.code === 0 ? refs.stdout : '', dateOfRef);
+      if (line.code === 0) {
+        budget = waitBudgetFrom(line.stdout, refs.code === 0 ? refs.stdout : '', dateOfRef, count.code === 0 ? count.stdout : '');
+      }
     } catch { /* unreadable: the last answer stands */ }
     this.waitBudgets.set(phase, budget);
     return budget;
@@ -1831,6 +1939,11 @@ export abstract class RunnerBase {
    * blocks nothing and corrects nothing; it is the evidence a wrong booking
    * (a re-reported total, a CLI that changes what it reports) leaves behind. A
    * session with no calls, or on a model with no measured price, is not judged.
+   *
+   * Each model at its OWN rates (control-tower phase 109, #202), and a ratio
+   * its fresh sessions all sit at is the price drifting, not the bookings: the
+   * console's `CostDrift` announces it once (`phase.cost-drift`) and is quiet
+   * about the sessions it explains for the rest of the day.
    */
   protected corroborateSpend(
     phase: number, mode: SessionMode, request: SpawnRequest, outcome: SpawnOutcome,
@@ -1839,17 +1952,29 @@ export abstract class RunnerBase {
     const tokens = outcome.tokens;
     if (!tokens || tokens.calls <= 0) return;
     const record = this.state?.phases[String(phase)];
-    const model = record?.actualModel ?? request.model ?? record?.model ?? null;
+    const model = outcome.resolvedModel ?? record?.actualModel ?? request.model ?? record?.model ?? null;
     const priced = priceUsage(model, tokens);
     const mismatch = costMismatch({ booked: booking.booked, priced, delegated });
     if (!mismatch || priced === null) return;
     const round4 = (usd: number) => Math.round(usd * 10_000) / 10_000;
-    this.record('phase.cost-mismatch', {
+    const figures = {
       mode, sessionId: outcome.sessionId ?? null, model, resumed: Boolean(request.resume),
       bookedUsd: round4(booking.booked), pricedUsd: round4(priced), reportedUsd: round4(booking.reported),
       markUsd: round4(booking.mark), direction: mismatch.direction, ratio: mismatch.ratio,
       calls: tokens.calls, delegated,
-    }, phase);
+    };
+    const verdict = this.costDrift.note({
+      model: priceRowOf(model) ?? String(model), ratio: mismatch.ratio, direction: mismatch.direction,
+      fresh: !request.resume && !delegated, at: this.now().getTime(),
+    });
+    if (verdict.kind === 'explained') return;
+    if (verdict.kind === 'drift') {
+      this.record('phase.cost-drift', {
+        ...figures, model: priceRowOf(model) ?? model, ratio: verdict.ratio, sessions: verdict.sessions, since: verdict.since,
+      }, phase);
+      return;
+    }
+    this.record('phase.cost-mismatch', figures, phase);
   }
 
   /**

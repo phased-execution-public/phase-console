@@ -253,7 +253,7 @@ test('DB-3: a declared window past the budget is granted what is left, and the d
   } finally { h.cleanup(); }
 });
 
-test('DB-3: a block whose budget is already spent is the budgets park — waiting on its refs with no clock, never failed', async () => {
+test('DB-3: a block whose budget is already spent waits on its refs with no clock — never failed, and no errand while a ref polls', async () => {
   const h = harness([1], { budgetLine: '1\tphase' });
   try {
     const runner = new Runner({
@@ -274,7 +274,11 @@ test('DB-3: a block whose budget is already spent is the budgets park — waitin
     assert.equal(record.declared?.status, 'blocked', 'still the session\'s block');
     assert.equal(record.declared?.budgetSpent?.ledger, 'budget');
     assert.deepEqual(record.declared?.watch, [SIBLING_REF], 'its refs still watched');
-    assert.equal(state.recoveries?.['1']?.errand?.decisionKey, 'budgets');
+    // Its ref still polls, so it is a WAIT on that ref, never a `budgets`
+    // errand to re-check it by hand (control-tower phase 121, #40).
+    assert.equal(state.recoveries?.['1']?.errand, undefined);
+    assert.ok((record.note ?? '').startsWith(`waiting on ${SIBLING_REF} — its wait budget is spent`), record.note);
+    assert.equal(state.status, 'waiting', 'the run waits on the ref, never parked with nothing ready');
     assert.equal(state.consecutiveFailures, 0);
     const lines = journal(h.root, state);
     assert.equal(lines.find((l) => l.event === 'phase.wait-budget-spent')?.data.parked, true);

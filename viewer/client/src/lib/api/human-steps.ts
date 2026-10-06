@@ -54,6 +54,10 @@ export type HumanStepRecord = {
   credential?: string;
   autoOpen?: 'host';
   until?: string;
+  /** The watch ref an `upcoming` step waits on before it is due (control-tower phase 121). */
+  dueWhen?: string;
+  /** When that ref landed and the step became due — its window starts here, not at the birth. */
+  dueAt?: string;
   state: HumanStepState;
   declaredAt: string;
   /** When it reached the state it is in. */

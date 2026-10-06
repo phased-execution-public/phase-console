@@ -49,9 +49,10 @@ import { type ConvergeClock, REAL_CLOCK } from './converge.ts';
 import type { RunState, PhaseRecord } from './runner/state.ts';
 import {
   pollableRefs, probeWatchRef, nextDueFor, declaredWindowOf, WATCH_FLOOR_MS, WATCH_CMD_TIMEOUT_MS,
-  MAX_CMD_RUNS_PER_PHASE, MAX_WATCH_REFS, watchEligible, cmdRefProblem,
-  type WatchProbeDeps, type WatchRefTarget, type WatchState,
+  MAX_CMD_RUNS_PER_PHASE, MAX_WATCH_REFS, watchEligible, cmdRefProblem, notRunDetail,
+  type WatchProbeDeps, type WatchRefTarget, type WatchState, backstopVerdict,
 } from './watch-refs.ts';
+import { recordUnitExit } from './watch-unit.ts';
 import { isOwnLockRef, waitBudgetEndOf } from './runner/wait-budget.ts';
 import { stepProofOf, stepWindowEndOf } from './human-steps.ts';
 import { OWN_LOCK_WATCH_REFUSAL } from '../shared/run-lifecycle.js';
@@ -125,12 +126,20 @@ export type WatchSchedulerDeps = {
   phaseDone?: WatchProbeDeps['phaseDone'];
   /** `verify:<slug>/<N>` — the declaring phase's red lines on a new head (`verify-watch.ts`). */
   verifyProbe?: WatchProbeDeps['verifyProbe'];
+  /** `unit:<host>/<unit>` (control-tower phase 121) — the service's one `UnitProber`. */
+  unitProbe?: WatchProbeDeps['unitProbe'];
   /**
    * The run policy's verdict on a command WITHOUT running it — `verify.ts`
    * `judgeCommand` — asked by the ingest probe, so a `cmd:` ref the console
    * would never run is refused at declaration however `watchCmdRefs` is set.
    */
   judgeCommand?: (command: string) => string | null;
+  /**
+   * A `gh-run` GitHub never started (control-tower phase 111, #166): said to
+   * the service when a row first reads it — and again only when what it reads
+   * changes — so the phase's ONE errand names the budget as it stands.
+   */
+  onNotRun?: (slug: string, state: RunState, phase: number, verdict: WatchState) => void;
 };
 
 /** A phase record's answer to `phase:<slug>/<N>` — `done` is the console's final word (#129). */
@@ -298,107 +307,11 @@ export class WatchScheduler {
       for (const record of Object.values(state.phases ?? {})) {
         const due = this.dueFor(slug, record, now, sink, poked);
         if (!due.length) continue;
-        for (const target of due) {
-          // A row that already says `landed` is due for RE-DELIVERY, not for a
-          // second probe: `gh` is rate-limited and a `cmd:` ref runs a command.
-          // The stored verdict is the world's final answer; re-asking for it
-          // would cost a network round trip to be told the same thing.
-          const known = record.watchState?.refs.find((r) => r.ref === target.ref);
-          // …except a `phase:` ref (control-tower phase 88, #129): its answer is
-          // the console's own record, free to read, and NOT final — a phase
-          // re-opened by its §Verification (phase 62) or by reconcile (phase
-          // 79) un-lands every ref that waited on it. So it is re-read.
-          const reread = target.kind === 'phase' && known?.state === 'landed';
-          const settledLanding = reread && this.landingSettled(record, target.ref);
-          const selfRef = selfRefProblem(target, slug, record.phase);
-          // A `cmd:` ref the console MINTED runs only when the operator said so
-          // (SLF-8): written once as `unknown`, with no clock, never asked again.
-          // `unknown`, not `refused` — the console did not judge the command, it
-          // did not ask; the same word `watchCmdRefs` off gets.
-          const mintedHeld = target.kind === 'cmd' && this.mintedHeld(record, target.ref);
-          // A `cmd:` ref RUNS something on every pass, for as long as the phase
-          // is parked — on a cadence that backs off (`WATCH_CMD_BACKOFF_MS`),
-          // until the phase's WAIT BUDGET ends (control-tower phase 6, #19),
-          // with a run-count backstop behind both. Either end is a refusal in
-          // words, so an operator sees a state rather than a silence.
-          //
-          // …except on a park whose budget is already SPENT (control-tower
-          // phase 45, #59): that phase waits on its refs alone, with no clock
-          // of its own, so the budget's end is not the end of the watch — the
-          // run-count backstop below is what bounds it.
-          //
-          // …and a phase parked on a HUMAN STEP has no wait budget at all
-          // (control-tower phase 43): its `cmd:` refs run until the step's
-          // window ends, which for a `third-party-approval` is days, not the
-          // eight hours `waitBudgetEndOf` would read for an unstamped park.
-          const stepEnd = stepWindowEndOf(record);
-          const budgetEnd = target.kind === 'cmd' && !record.declared?.budgetSpent
-            ? (stepEnd !== undefined ? stepEnd : waitBudgetEndOf(record)) : null;
-          // A `lock:` ref naming THIS phase's own lock never lands (#42): the
-          // console holds that lock for the phase and releases it at the
-          // session's closeout, so its release is the phase's own teardown and
-          // never the event it waited for. Asked before everything, a stored
-          // `landed` row included — a declaration an older console armed is
-          // refused here, in words, once, and retired from the rotation.
-          const ownLock = target.kind === 'lock' && isOwnLockRef(target.ref, slug, record.phase);
-          const verdict: WatchState = ownLock
-            ? { ref: target.ref, state: 'refused' as const, detail: `names phase ${record.phase}'s own lock — ${OWN_LOCK_WATCH_REFUSAL}` }
-            : selfRef
-            ? { ref: target.ref, state: 'refused' as const, detail: selfRef }
-            : known?.state === 'landed' && !reread
-            ? { ref: known.ref, state: 'landed', ...(known.detail ? { detail: known.detail } : {}) }
-            : mintedHeld
-              ? { ref: target.ref, state: 'unknown' as const, detail: 'console-minted cmd ref — not run (watchMintedCmdRefs is off)' }
-              : target.kind === 'cmd' && (known?.runs ?? 0) >= MAX_CMD_RUNS_PER_PHASE
-                ? {
-                  ref: target.ref, state: 'refused' as const,
-                  detail: `run ${MAX_CMD_RUNS_PER_PHASE} times without landing — this console will not run it again`,
-                }
-                : budgetEnd !== null && now >= budgetEnd
-                  ? {
-                    ref: target.ref, state: 'refused' as const,
-                    detail: `${stepEnd !== undefined ? "the human step's window" : "the phase's wait budget"} ended `
-                      + `${new Date(budgetEnd).toISOString()} after ${known?.runs ?? 0} runs — this console will not run it again`,
-                  }
-                  : await this.ask(target);
-          const refusedByName = ownLock || Boolean(selfRef);
-          if (this.apply(slug, state, record, target, verdict, now, {
-            terminal: mintedHeld || refusedByName || (settledLanding && verdict.state === 'landed'),
-            retire: refusedByName,
-          })) changed = true;
-          // A settled landing re-read and still landed is not a new landing:
-          // offering it again would re-deliver what the healer already closed.
-          if (verdict.state === 'landed' && !settledLanding) landings.push({ phase: record.phase, landed: verdict });
-        }
+        const asked = await this.askRecord(slug, state, record, due, now, (target) => this.ask(target));
+        if (asked.changed) changed = true;
+        landings.push(...asked.landings);
       }
-      // The healer's own bookkeeping — the charge, the `deliveredAt` stamp,
-      // the save — happens inside `resumeOnWatchLanded`, beside the rollback
-      // that can revoke it. This loop acts on exactly one answer: `done`
-      // retires the row. It used to stamp the receipt here, AFTER the healer's
-      // `.catch` could have run, which is how a rollback's delete became a
-      // no-op and a landing was gated for ever (QA round 3, H1).
-      for (const { phase, landed } of landings) {
-        let outcome: WatchLandingOutcome = 'deferred';
-        try {
-          outcome = (await this.deps.onLanded?.(slug, state, phase, landed)) ?? 'deferred';
-        } catch (error) {
-          // A throwing healer is a DEFERRAL, not a delivery: the landing was
-          // not acted on, so it must not be charged as though it had been.
-          log.warn('watch.landed-failed', { slug, phase, ref: landed.ref, error });
-        }
-        if (outcome !== 'done') continue;
-        const record = state.phases[String(phase)];
-        const row = record?.watchState?.refs.find((r) => r.ref === landed.ref);
-        if (row && row.nextDueAt !== undefined) { delete row.nextDueAt; changed = true; }
-        // …and the answer is kept ON THE RECORD (control-tower phase 87, #126).
-        // A landed row with no due time reads "due" to `dueFor`, so deleting the
-        // clock alone offered the same landing again every minute and retired it
-        // again, for as long as the declaration stood.
-        if (record && !record.watchLandedDone?.includes(landed.ref)) {
-          record.watchLandedDone = [...(record.watchLandedDone ?? []), landed.ref];
-          changed = true;
-        }
-      }
+      if ((await this.offerLandings(slug, state, landings)).changed) changed = true;
       if (changed || sink.changed) {
         try { this.deps.save?.(slug, state); } catch { /* the verdict matters more than the write */ }
       }
@@ -406,6 +319,183 @@ export class WatchScheduler {
     // Re-armed from the SAME snapshot this pass acted on — the records were
     // mutated in place, so their fresh `nextDueAt` values are already here.
     this.arm(runs);
+  }
+
+  /**
+   * Recheck on a phase parked on a declared wall (control-tower phase 111,
+   * #204). The card's recommended verb promised "check its watch refs", and
+   * ran the three done-checks instead — which a phase waiting on the outside
+   * world can only fail, so the wall was re-judged `no-handoff`. Here the
+   * declaration's refs are asked NOW: every row due at once (a cadence is the
+   * timer's economy, not a person's), each probed fresh around the pass cache
+   * (`asked` may hold a verdict a back-off old), folded through the verdict a
+   * pass reaches, and a landing offered to the healer exactly as a pass offers
+   * it — which resumes the phase's own session.
+   *
+   * A recheck that finds nothing landed WRITES nothing: the wall, its halt and
+   * its rows read exactly as they did, and the caller journals what each ref
+   * read. The copy it was handed is the caller's to discard.
+   */
+  async recheck(slug: string, state: RunState, phase: number): Promise<{
+    refs: WatchState[]; landed: WatchState | null; outcome: WatchLandingOutcome | null;
+  }> {
+    const record = state.phases[String(phase)];
+    if (!record) return { refs: [], landed: null, outcome: null };
+    try { this.passRuns = this.deps.runs(); } catch { this.passRuns = []; }
+    const now = this.clock.now();
+    const due = this.dueFor(slug, record, Number.POSITIVE_INFINITY);
+    const fresh = (target: WatchRefTarget): Promise<WatchState> =>
+      this.probeOf(target, WATCH_CMD_TIMEOUT_MS).catch((error): WatchState => ({
+        ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160),
+      }));
+    const asked = await this.askRecord(slug, state, record, due, now, fresh);
+    const landed = asked.landings[0]?.landed ?? null;
+    if (!landed) return { refs: asked.verdicts, landed: null, outcome: null };
+    const offered = await this.offerLandings(slug, state, asked.landings.slice(0, 1));
+    try { this.deps.save?.(slug, state); } catch { /* the landing is offered again by the timer */ }
+    return { refs: asked.verdicts, landed, outcome: offered.outcomes[0] ?? null };
+  }
+
+  /**
+   * One record's due refs, asked and folded in — the body of a pass, shared
+   * with `recheck`. `ask` is the pass cache on the timer and a fresh probe on
+   * a person's press. Answers whether the record changed, the landings to
+   * offer, and every verdict reached (in `due` order).
+   */
+  private async askRecord(
+    slug: string, state: RunState, record: PhaseRecord, due: WatchRefTarget[], now: number,
+    ask: (target: WatchRefTarget) => Promise<WatchState>,
+  ): Promise<{ changed: boolean; landings: { phase: number; landed: WatchState }[]; verdicts: WatchState[] }> {
+    let changed = false;
+    const landings: { phase: number; landed: WatchState }[] = [];
+    const verdicts: WatchState[] = [];
+    for (const target of due) {
+      // A row that already says `landed` is due for RE-DELIVERY, not for a
+      // second probe: `gh` is rate-limited and a `cmd:` ref runs a command.
+      // The stored verdict is the world's final answer; re-asking for it
+      // would cost a network round trip to be told the same thing.
+      const known = record.watchState?.refs.find((r) => r.ref === target.ref);
+      // …except a `phase:` ref (control-tower phase 88, #129): its answer is
+      // the console's own record, free to read, and NOT final — a phase
+      // re-opened by its §Verification (phase 62) or by reconcile (phase
+      // 79) un-lands every ref that waited on it. So it is re-read.
+      const reread = target.kind === 'phase' && known?.state === 'landed';
+      const settledLanding = reread && this.landingSettled(record, target.ref);
+      const selfRef = selfRefProblem(target, slug, record.phase);
+      // A `cmd:` ref the console MINTED runs only when the operator said so
+      // (SLF-8): written once as `unknown`, with no clock, never asked again.
+      // `unknown`, not `refused` — the console did not judge the command, it
+      // did not ask; the same word `watchCmdRefs` off gets.
+      const mintedHeld = target.kind === 'cmd' && this.mintedHeld(record, target.ref);
+      // A `cmd:` ref RUNS something on every pass, for as long as the phase
+      // is parked — on a cadence that backs off (`WATCH_CMD_BACKOFF_MS`),
+      // until the phase's WAIT BUDGET ends (control-tower phase 6, #19),
+      // with a run-count backstop behind both. Either end is a refusal in
+      // words, so an operator sees a state rather than a silence.
+      //
+      // …except on a park whose budget is already SPENT (control-tower
+      // phase 45, #59): that phase waits on its refs alone, with no clock
+      // of its own, so the budget's end is not the end of the watch — the
+      // run-count backstop below is what bounds it.
+      //
+      // …and a phase parked on a HUMAN STEP has no wait budget at all
+      // (control-tower phase 43): its `cmd:` refs run until the step's
+      // window ends, which for a `third-party-approval` is days, not the
+      // eight hours `waitBudgetEndOf` would read for an unstamped park.
+      const stepEnd = stepWindowEndOf(record);
+      const budgetEnd = target.kind === 'cmd' && !record.declared?.budgetSpent
+        ? (stepEnd !== undefined ? stepEnd : waitBudgetEndOf(record)) : null;
+      // A `lock:` ref naming THIS phase's own lock never lands (#42): the
+      // console holds that lock for the phase and releases it at the
+      // session's closeout, so its release is the phase's own teardown and
+      // never the event it waited for. Asked before everything, a stored
+      // `landed` row included — a declaration an older console armed is
+      // refused here, in words, once, and retired from the rotation.
+      const ownLock = target.kind === 'lock' && isOwnLockRef(target.ref, slug, record.phase);
+      const answer: WatchState = ownLock
+        ? { ref: target.ref, state: 'refused' as const, detail: `names phase ${record.phase}'s own lock — ${OWN_LOCK_WATCH_REFUSAL}` }
+        : selfRef
+        ? { ref: target.ref, state: 'refused' as const, detail: selfRef }
+        : known?.state === 'landed' && !reread
+        ? { ref: known.ref, state: 'landed', ...(known.detail ? { detail: known.detail } : {}) }
+        : mintedHeld
+          ? { ref: target.ref, state: 'unknown' as const, detail: 'console-minted cmd ref — not run (watchMintedCmdRefs is off)' }
+          : target.kind === 'cmd' && (known?.runs ?? 0) >= MAX_CMD_RUNS_PER_PHASE
+            ? {
+              ref: target.ref, state: 'refused' as const,
+              detail: `run ${MAX_CMD_RUNS_PER_PHASE} times without landing — this console will not run it again`,
+            }
+            : budgetEnd !== null && now >= budgetEnd
+              ? {
+                ref: target.ref, state: 'refused' as const,
+                detail: `${stepEnd !== undefined ? "the human step's window" : "the phase's wait budget"} ended `
+                  + `${new Date(budgetEnd).toISOString()} after ${known?.runs ?? 0} runs — this console will not run it again`,
+              }
+              : await ask(target);
+      // A run GitHub refused for money, whose budget now has room (#166): the
+      // room is the landing, but only against a reading that found the budget
+      // spent — room at first sight says the budget is not what refused it.
+      const read: WatchState = answer.state === 'pending' && answer.notRun?.headroom === true
+        && known?.notRun?.headroom === false && known.notRun.run === answer.notRun.run
+        ? { ...answer, state: 'landed', detail: notRunDetail(answer.notRun, true) }
+        : answer;
+      // A BACKSTOP that passed before its live ref (control-tower phase 121,
+      // #181) lands saying so — the date passed, the job did not end.
+      const verdict: WatchState = known?.state === 'landed' ? read : backstopVerdict(record, target, read);
+      const refusedByName = ownLock || Boolean(selfRef);
+      if (this.apply(slug, state, record, target, verdict, now, {
+        terminal: mintedHeld || refusedByName || (settledLanding && verdict.state === 'landed'),
+        retire: refusedByName,
+      })) changed = true;
+      verdicts.push(verdict);
+      // A settled landing re-read and still landed is not a new landing:
+      // offering it again would re-deliver what the healer already closed.
+      // A `unit:` job's ending goes into the wait history (control-tower phase
+      // 121, #181): `Result=` and the exit time, on the park it ended.
+      if (verdict.state === 'landed' && recordUnitExit(record, verdict)) changed = true;
+      if (verdict.state === 'landed' && !settledLanding) landings.push({ phase: record.phase, landed: verdict });
+    }
+    return { changed, landings, verdicts };
+  }
+
+  /**
+   * Offer each landing to the healer. The healer's own bookkeeping — the
+   * charge, the `deliveredAt` stamp, the save — happens inside
+   * `resumeOnWatchLanded`, beside the rollback that can revoke it. This acts
+   * on exactly one answer: `done` retires the row. It used to stamp the
+   * receipt here, AFTER the healer's `.catch` could have run, which is how a
+   * rollback's delete became a no-op and a landing was gated for ever (QA
+   * round 3, H1).
+   */
+  private async offerLandings(
+    slug: string, state: RunState, landings: readonly { phase: number; landed: WatchState }[],
+  ): Promise<{ changed: boolean; outcomes: WatchLandingOutcome[] }> {
+    let changed = false;
+    const outcomes: WatchLandingOutcome[] = [];
+    for (const { phase, landed } of landings) {
+      let outcome: WatchLandingOutcome = 'deferred';
+      try {
+        outcome = (await this.deps.onLanded?.(slug, state, phase, landed)) ?? 'deferred';
+      } catch (error) {
+        // A throwing healer is a DEFERRAL, not a delivery: the landing was
+        // not acted on, so it must not be charged as though it had been.
+        log.warn('watch.landed-failed', { slug, phase, ref: landed.ref, error });
+      }
+      outcomes.push(outcome);
+      if (outcome !== 'done') continue;
+      const record = state.phases[String(phase)];
+      const row = record?.watchState?.refs.find((r) => r.ref === landed.ref);
+      if (row && row.nextDueAt !== undefined) { delete row.nextDueAt; changed = true; }
+      // …and the answer is kept ON THE RECORD (control-tower phase 87, #126).
+      // A landed row with no due time reads "due" to `dueFor`, so deleting the
+      // clock alone offered the same landing again every minute and retired it
+      // again, for as long as the declaration stood.
+      if (record && !record.watchLandedDone?.includes(landed.ref)) {
+        record.watchLandedDone = [...(record.watchLandedDone ?? []), landed.ref];
+        changed = true;
+      }
+    }
+    return { changed, outcomes };
   }
 
   /* ---------------------------------------------------------------- *
@@ -724,6 +814,7 @@ export class WatchScheduler {
       : probeWatchRef(target, {
         now: this.clock.now(),
         lockFree: this.deps.lockFree,
+        ...(this.deps.unitProbe ? { unitProbe: this.deps.unitProbe } : {}),
         ...(this.deps.cmdRefsEnabled?.() && this.deps.runCommand
           ? { runCommand: (command: string) => this.deps.runCommand!(command, cmdTimeoutMs) }
           : {}),
@@ -777,6 +868,7 @@ export class WatchScheduler {
       ...(verdict.detail ? { detail: verdict.detail } : {}),
       checkedAt: at,
       ...(record.declared?.minted?.includes(verdict.ref) ? { minted: true as const } : {}),
+      ...(verdict.notRun ? { notRun: verdict.notRun } : {}),
       ...(runs ? { runs } : {}),
       ...(() => {
         // A terminal verdict (a held minted ref) gets no clock: nothing will
@@ -833,6 +925,9 @@ export class WatchScheduler {
             ref: verdict.ref, scheme: target.kind, state: verdict.state, detail: verdict.detail ?? null,
           }, record.phase);
         } catch { /* a journal must never break the poll */ }
+      }
+      if (verdict.state === 'pending' && verdict.notRun) {
+        try { this.deps.onNotRun?.(slug, state, record.phase, verdict); } catch { /* the errand must never break the poll */ }
       }
     }
     return transitioned;

@@ -204,3 +204,34 @@ test('SEV-10 — the reader returns the newest lines when a limit is given', () 
   );
   rmSync(dir, { recursive: true, force: true });
 });
+
+test('SEV-11 — a /clear leaves the replaced session one `superseded` line, in the shape phase 13 reads (#172)', () => {
+  const { reg, dir } = registry({
+    now: () => new Date('2026-09-18T12:00:03.000Z'),
+    pidAlive: () => true,
+    procStart: () => Date.parse('2026-09-18T11:00:00.000Z'),
+  });
+  reg.ingest(hook({ session_id: 'old', pid: 87367, at: '2026-09-18T12:00:00.000Z' }));
+  reg.ingest(hook({ session_id: 'old', pid: 87367, event: 'SessionEnd', reason: 'clear', at: '2026-09-18T12:00:01.000Z' }));
+  reg.ingest(hook({ session_id: 'new', pid: 87367, source: 'clear', at: '2026-09-18T12:00:01.500Z' }), 'inbox');
+  reg.ingest(hook({ session_id: 'new', pid: 87367, event: 'Stop', at: '2026-09-18T12:00:02.000Z' }));
+  reg.ingest(hook({ session_id: 'new', pid: 87367, source: 'compact', at: '2026-09-18T12:00:02.500Z' }));
+
+  assert.deepEqual(
+    readSessionEvents(dir, 'old').map((one) => one.event),
+    ['SessionStart', 'SessionEnd', 'superseded'],
+    'the replaced session’s sequence ends where it was replaced, and only once',
+  );
+  const raw = readFileSync(sessionEventsFile(dir, 'old'), 'utf8').trim().split('\n');
+  const line = JSON.parse(raw.at(-1)!) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(line).sort(), ['appliedAt', 'at', 'event', 'lateMs', 'payload', 'v', 'via'].sort());
+  assert.equal(line.at, '2026-09-18T12:00:01.500Z', 'the successor’s start is the moment of the hand-over');
+  assert.equal(line.via, 'inbox', 'the door the successor’s start came through');
+  assert.equal(line.lateMs, 1500);
+  assert.deepEqual(line.payload, { by: 'new', pid: 87367 }, 'who replaced it, in which process');
+  assert.ok(
+    !readSessionEvents(dir, 'new').some((one) => one.event === 'superseded'),
+    'the successor’s own log never carries the line',
+  );
+  rmSync(dir, { recursive: true, force: true });
+});

@@ -17,15 +17,17 @@
  *     sha256(CLAUDE_CONFIG_DIR)>` for a redirected profile.
  *
  * Every process this module spawns goes through an injectable `Exec`, because
- * tests must never talk to a real keychain — and neither may CI.
+ * tests must never talk to a real keychain — and neither may CI. A test that
+ * forgets to inject one meets the belt in `realExec` instead of the keychain.
  */
 
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
+import { testProcess } from '../../shared/instances.mjs';
 import { log } from '../log.ts';
 import { ACCOUNTS_DIR, profileConfigDir, type AccountMeta } from './store.ts';
 
@@ -44,8 +46,52 @@ export type Exec = (
 
 const EXEC_TIMEOUT_MS = 20_000;
 
-export const realExec: Exec = (file, args, opts) =>
-  new Promise((resolve, reject) => {
+/**
+ * Whether this process is kept away from the login keychain (control-tower
+ * phase 116, #200): a test process, or one whose sandbox says so.
+ *
+ * A suite run used to write a spare account's token into the operator's real
+ * login keychain and delete it again (`auto-recovery.test.ts` RCV-10/ACC-3.2,
+ * on a real `Service`). The verdict then hung on whether the keychain was
+ * unlocked, and an account the operator had named "Spare" would have had its
+ * token overwritten and then deleted by a test. So the markers the state belt
+ * reads (`testProcess`) refuse every `security` subcommand here but a lookup
+ * (`KEYCHAIN_READS`), and so does `PHASE_CONSOLE_KEYCHAIN=0`, which
+ * `test/state-sandbox.ts` sets for a file run with plain `node` and for every
+ * console a test spawns. Production carries none of them.
+ */
+export function keychainRefused(env: NodeJS.ProcessEnv = process.env, argv: string[] = process.argv): boolean {
+  return env.PHASE_CONSOLE_KEYCHAIN === '0' || testProcess(env, argv);
+}
+
+/**
+ * The `security` subcommands a test may still run: the two that only look up
+ * an item (the twin of `runner/verify.ts`'s `KEYCHAIN_LOOKUPS`). Every real
+ * `Service` reads the machine login's item to judge whether that login is
+ * signed in, and the run-start door refuses a run whose every account is signed
+ * out — so a refused READ turned real-`Service` tests red whenever the login was
+ * judged, which is a timing question under load. What #200 is about is a test
+ * that writes, replaces or deletes an item, and every one of those is refused.
+ */
+export const KEYCHAIN_READS: ReadonlySet<string> = new Set(['find-generic-password', 'find-internet-password']);
+
+/** The belt's refusal: no child was started, and the sentence names the fix. */
+export class KeychainRefused extends Error {
+  constructor(subcommand: string | undefined) {
+    super(
+      `a test reached for the macOS login keychain (security ${subcommand ?? ''}) — no test may write, replace or `
+      + "delete an item in the operator's keychain: give Accounts, Credentials or McpCredentials a stub exec and "
+      + "platform 'linux'",
+    );
+    this.name = 'KeychainRefused';
+  }
+}
+
+export const realExec: Exec = (file, args, opts) => {
+  if (basename(file) === 'security' && !KEYCHAIN_READS.has(args[0] ?? '') && keychainRefused()) {
+    return Promise.reject(new KeychainRefused(args[0]));
+  }
+  return new Promise((resolve, reject) => {
     const child = execFile(
       file,
       args,
@@ -63,6 +109,7 @@ export const realExec: Exec = (file, args, opts) =>
       child.stdin?.end(opts.input);
     }
   });
+};
 
 /**
  * The one sentence a caller may see when the keychain will not take a secret.
@@ -118,7 +165,11 @@ export async function keychainStore(exec: Exec, service: string, secret: string)
       ],
       { input: `${secret}\n${secret}\n` },
     );
-  } catch {
+  } catch (error) {
+    // The belt's refusal started no child and carries no secret, and it is the
+    // sentence a test's author needs — "unlock the login keychain" is the one
+    // thing they must not do.
+    if (error instanceof KeychainRefused) throw error;
     // Nothing from the child crosses this line. See KEYCHAIN_STORE_FAILED.
     throw new Error(KEYCHAIN_STORE_FAILED);
   }

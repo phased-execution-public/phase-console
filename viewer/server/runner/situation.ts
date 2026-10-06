@@ -172,8 +172,10 @@ export type PhaseEvidence = {
   /** The gate as the engine answers it (`--gate-status`): kind `clear|manual|ai|blocked|OVERDUE|…`. */
   gate: { clear: boolean; kind: string; detail?: string } | null;
   /**
-   * Has the operator delegated human gates on this console
-   * (`Prefs.delegateHumanGates`)? A delegated gate is not a person's to clear:
+   * Is this phase's gate delegated on this console — the `gates` answer
+   * (`Prefs.delegateHumanGates`) is `delegated` AND the plan did not mark the
+   * gate `manual`, which is a person's whatever the answer (control-tower
+   * phase 107, #174)? A delegated gate is not a person's to clear:
    * the boot prompt briefs the session to verify each condition against evidence
    * it can cite, so the phase is boardable and the ladder owns it.
    *
@@ -219,8 +221,13 @@ export type EvidenceDeps = {
   lock?: (slug: string, phase: number) => Promise<LockEvidence | null> | LockEvidence | null;
   qa?: (slug: string, phase: number) => Promise<PhaseEvidence['qa']> | PhaseEvidence['qa'];
   health?: (slug: string) => Promise<PhaseEvidence['health']> | PhaseEvidence['health'];
-  /** `Prefs.delegateHumanGates` — see `PhaseEvidence.gateDelegated`. */
-  gateDelegated?: () => boolean;
+  /**
+   * `Prefs.delegateHumanGates` for THIS phase — see `PhaseEvidence.gateDelegated`.
+   * Per phase since control-tower phase 107 (#174): a gate the plan marks
+   * manual is a person's whatever the policy says, so the answer depends on
+   * which gate is asked about.
+   */
+  gateDelegated?: (slug: string, phase: number) => boolean;
   gate?: (slug: string, phase: number) => Promise<PhaseEvidence['gate']> | PhaseEvidence['gate'];
   /**
    * The phase's resolved MCP policy. Without it `PhaseEvidence.mcp.policy` was
@@ -495,7 +502,7 @@ export async function collectEvidence(
         }
         : null),
     gate: gate ?? (record?.gate ? { clear: record.gate.clear, kind: record.gate.kind, detail: record.gate.detail } : null),
-    ...(deps.gateDelegated?.() === true ? { gateDelegated: true } : {}),
+    ...(deps.gateDelegated?.(slug, phase) === true ? { gateDelegated: true } : {}),
     mcp: record?.mcpDegraded?.length
       ? {
         unreachable: record.mcpDegraded.map((d) => d.id),

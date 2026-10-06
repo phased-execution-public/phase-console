@@ -291,8 +291,8 @@ export const REMEDIES = Object.freeze([
   remedy('halted-with-ready-work', {
     category: 'stops',
     evidence:
-      'the run is halted or parked, its halt is not one only a person may lift, and the board has ready phases',
-    remedy: 'resume the run',
+      'the run is halted or parked, its halt is not one only a person may lift, and the board has ready phases — new since a dismissal, when there was one',
+    remedy: 'continue the run with its own settings',
     verb: 'resume',
     autonomy: 'press',
     cap: { perHour: 2 },
@@ -453,6 +453,7 @@ export const CHAT_EVENTS = Object.freeze(
     'supervisor.chat-started',
     'supervisor.chat-thread',
     'supervisor.chat-cap-raised',
+    'supervisor.chat-switched',
     'supervisor.chat-ended',
   ]),
 );
@@ -492,6 +493,22 @@ export function needsConfirm(confirm, tool) {
 }
 
 /**
+ * The model and effort a chat answers with (control-tower phase 119): the
+ * `--model` and `--effort` its process was started with, where a blank or a
+ * null is no choice at all and the machine's own default answers. Two are the
+ * same when both halves are — the question the console asks before it hands a
+ * message to a live process (a different answer ends that process at the
+ * message boundary), and the one the dock asks before it says a switch waits
+ * for the next message.
+ * @param {{ model?: string | null, effort?: string | null } | null | undefined} a
+ * @param {{ model?: string | null, effort?: string | null } | null | undefined} b
+ * @returns {boolean}
+ */
+export function sameChatPair(a, b) {
+  return (a?.model || null) === (b?.model || null) && (a?.effort || null) === (b?.effort || null);
+}
+
+/**
  * What *Ask the supervisor* carries into a chat (control-tower phase 28): the
  * thing a person pressed it on — a run (a strip), one phase of a run (the
  * phase drawer), or the stop that halted it (a halt card). The client draws
@@ -500,14 +517,23 @@ export function needsConfirm(confirm, tool) {
  * (`pro/supervisor/prompt.ts` `contextPreamble`), so the chat reads what the
  * operator was looking at before it answers.
  */
-export const CHAT_CONTEXT_KINDS = Object.freeze(/** @type {const} */ (['run', 'phase', 'halt', 'detection']));
+export const CHAT_CONTEXT_KINDS = Object.freeze(
+  /** @type {const} */ ([
+    'run',
+    'phase',
+    'halt',
+    'detection',
+  ]),
+);
 
 /** @typedef {(typeof CHAT_CONTEXT_KINDS)[number]} ChatContextKind */
 
 /**
  * A `detection` (control-tower phase 102) is one thing the supervisor saw, and
  * names its situation — the words the chat is told to read before it answers.
- * @typedef {{ kind: ChatContextKind, slug: string, phase?: number, runId?: string, situation?: SupervisorSituation }} ChatContext
+ * An `issues` context (control-tower phase 120) carries the repository's
+ * estate key in `slug` and the numbers in `issues`.
+ * @typedef {{ kind: ChatContextKind, slug: string, phase?: number, runId?: string, situation?: SupervisorSituation, issues?: number[] }} ChatContext
  */
 
 const CONTEXT_SLUG_RE = /^[\w.-]{1,128}$/;

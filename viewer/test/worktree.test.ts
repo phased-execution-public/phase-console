@@ -1774,13 +1774,21 @@ test('pruneMirror keeps a dirty mount AND the superproject mount that contains i
   const mounts = (res as { mounts: { rel: string; source: string }[] }).mounts;
   const made = await ensureMirror({ names, runId: 'r2', slug: 'demo', mounts });
   assert.equal(made.ok, true, made.detail);
-  writeFileSync(join(names.integration, 'app', 'core', 'wip.txt'), 'uncommitted\n');
+  // A TRACKED edit is work (control-tower phase 112, #184: an untracked file
+  // alone no longer pins a mount — it is preserved under `stale-mounts/`).
+  writeFileSync(join(names.integration, 'app', 'core', 'core.txt'), 'uncommitted\n');
+  writeFileSync(join(names.integration, 'web', 'gen.json'), '{"generated":true}\n');
 
   const pruned = await pruneMirror({ integration: names.integration, mounts });
   assert.ok(pruned.kept.some((k) => k.endsWith(join('app', 'core'))), 'the dirty mount is kept');
   assert.ok(pruned.kept.some((k) => k.endsWith(`${sep}app`)), 'and so is the superproject that contains it');
-  assert.ok(pruned.removed.some((k) => k.endsWith(`${sep}web`)), 'an unrelated clean mount still goes');
-  assert.equal(readFileSync(join(names.integration, 'app', 'core', 'wip.txt'), 'utf8'), 'uncommitted\n',
+  assert.deepEqual(pruned.held.map((one) => [one.mount, one.paths]), [['app/core', ['core.txt']]],
+    'only the mount holding work is named, with its paths — its parent is kept FOR it');
+  assert.ok(pruned.removed.some((k) => k.endsWith(`${sep}web`)), 'a mount holding only untracked files still goes');
+  assert.deepEqual(pruned.preserved.map((one) => [one.mount, one.paths]), [['web', ['gen.json']]]);
+  assert.equal(readFileSync(join(pruned.preserved[0]!.to, 'gen.json'), 'utf8'), '{"generated":true}\n',
+    'moved under the run\'s stale-mounts/, never deleted');
+  assert.equal(readFileSync(join(names.integration, 'app', 'core', 'core.txt'), 'utf8'), 'uncommitted\n',
     'the uncommitted work is exactly where it was');
 });
 
@@ -1814,10 +1822,10 @@ test('the sweep clears a dead run\'s mirror — manifest or crash shape alike �
   const resC = await resolveMounts(root, ['web']);
   const mountsC = (resC as { mounts: { rel: string; source: string }[] }).mounts;
   assert.equal((await ensureMirror({ names: c, runId: 'r-dirty', slug: 'demo', mounts: mountsC })).ok, true);
-  writeFileSync(join(c.integration, 'web', 'wip.txt'), 'uncommitted\n');
+  writeFileSync(join(c.integration, 'web', 'index.html'), 'uncommitted\n');
   const prunedC = await pruneRun(root, { stateDir, runId: 'r-dirty', slug: 'demo', phases: [] });
   assert.ok(prunedC.kept.some((k) => k.endsWith(`${sep}web`)), 'pruneRun keeps the dirty mount');
-  assert.equal(existsSync(join(c.integration, 'web', 'wip.txt')), true,
+  assert.equal(readFileSync(join(c.integration, 'web', 'index.html'), 'utf8'), 'uncommitted\n',
     'the run directory terminal did NOT fire over a kept mirror');
   const treeC = await pruneRunTree(root, { stateDir, runId: 'r-dirty', slug: 'demo' });
   assert.ok(treeC.kept.some((k) => k.endsWith(`${sep}web`)), 'pruneRunTree diverts to the mirror rule too');

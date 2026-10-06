@@ -89,7 +89,7 @@ tab() { printf '\t'; }
   run pg bad-human-steps --lint
   [ "$status" -eq 1 ]
   assert_contains "$output" 'phase 1: human-step-superseded — "- **Human step:** the owner signs the release'
-  assert_contains "$output" 'is the 5.1.0 <who, what, proof ref> spelling, which nothing reads; write it as "- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host]" (F37)'
+  assert_contains "$output" 'is the 5.1.0 <who, what, proof ref> spelling, which nothing reads; write it as "- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]" (F37)'
 }
 
 @test "lint: an unknown kind fails by name (F37)" {
@@ -239,7 +239,7 @@ outcome_env() {
   # shellcheck source=/dev/null
   . "$PE_DIR/scripts/human-steps.env"
   set -- $HUMAN_STEP_KINDS
-  [ "$#" -eq 16 ]
+  [ "$#" -eq 17 ]
   for kind in $HUMAN_STEP_KINDS; do
     extra=""
     [ "$kind" = secret-entry ] && extra="--credential some-id"
@@ -248,4 +248,87 @@ outcome_env() {
     [ "$status" -eq 0 ] || { echo "$kind refused: $output"; return 1; }
     rm -f "$PE_OUTCOME_FILE"
   done
+}
+
+# ---- the operator act (control-tower phase 121, #182) --------------------------
+
+@test "--human-steps 0: the plan's own act under ## Operator errands, with its due ref as a ninth field" {
+  setup_docs operator-acts operator-acts
+  run pg operator-acts --human-steps 0
+  [ "$status" -eq 0 ]
+  expected="operator-act$(tab)restart the hub console on the new build$(tab)phase-console update hub --when-idle$(tab)cmd:\"curl -sf http://127.0.0.1:4123/api/state\"$(tab)host$(tab)$(tab)$(tab)$(tab)phase:operator-acts/2"
+  [ "$output" = "$expected" ]
+}
+
+@test "--human-steps N: an act's due: ref is the ninth field; a step without one keeps its eight" {
+  setup_docs operator-acts operator-acts
+  run pg operator-acts --human-steps 2
+  [ "$status" -eq 0 ]
+  [ "$output" = "operator-act$(tab)push the release tag$(tab)git push origin v1.0.0$(tab)gh:acme/app#run/42$(tab)any$(tab)$(tab)$(tab)$(tab)date:2026-10-06T09:00:00Z" ]
+  run pg operator-acts --human-steps 3
+  [ "$status" -eq 0 ]
+  [ "$output" = "browser-login$(tab)sign the gh CLI in$(tab)gh auth login --web$(tab)cmd:\"gh auth status\"$(tab)host$(tab)$(tab)$(tab)" ]
+}
+
+@test "--human-steps: the bare listing leads with the plan's own acts, as phase 0" {
+  setup_docs operator-acts operator-acts
+  run pg operator-acts --human-steps
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 3 ]
+  case "${lines[0]}" in "0$(tab)operator-act$(tab)restart the hub"*) : ;; *) echo "$output"; return 1 ;; esac
+  case "${lines[1]}" in "2$(tab)operator-act$(tab)push the release tag"*) : ;; *) echo "$output"; return 1 ;; esac
+}
+
+@test "lint: an operator act lints clean; a due: that names no watch scheme fails by name (F37)" {
+  setup_docs operator-acts operator-acts
+  run pg operator-acts --lint
+  [ "$status" -eq 0 ]
+  printf '%s\n' '- **Human step:** operator-act · rotate the key · due: next tuesday' >> "$DOCS_ROOT/docs/plans/operator-acts.md"
+  run pg operator-acts --lint
+  [ "$status" -ne 0 ]
+  assert_contains "$output" 'human-step-field-invalid — due: "next tuesday" is not a watch ref'
+}
+
+@test "lint: a due: in a scheme's name but not its shape fails too — a date with no time, a phase with no number" {
+  for bad in 'date:2026-10-06' 'phase:operator-acts' 'unit:-oProxyCommand=x/y' 'gh:acme/app' 'cmd:""'; do
+    setup_docs operator-acts operator-acts
+    printf '%s\n' "- **Human step:** operator-act · rotate the key · due: \`$bad\`" >> "$DOCS_ROOT/docs/plans/operator-acts.md"
+    run pg operator-acts --lint
+    [ "$status" -ne 0 ] || { echo "accepted: $bad"; false; }
+    assert_contains "$output" "due: \"$bad\" is not a watch ref the console can poll"
+  done
+}
+
+@test "outcome: --act is --step operator-act, and --due-when rides it as the step's due_when" {
+  outcome_env
+  run pe_outcome demo 8 needs-human --needs external --act --title "Push the release tag" \
+    --open-command "git push origin v1.0.0" --due-when "gh:acme/app#run/42" --proof "gh:acme/app#pr/7"
+  [ "$status" -eq 0 ]
+  grep -q '"step": {"kind": "operator-act", "title": "Push the release tag", "open_command": "git push origin v1.0.0", "where": "host", "proof": "gh:acme/app#pr/7", "due_when": "gh:acme/app#run/42"},' "$PE_OUTCOME_FILE"
+}
+
+@test "outcome: --due-when works with any --step; --act with another --step, or a due-when alone, is exit 2" {
+  outcome_env
+  run pe_outcome demo 8 needs-human --needs credential --step browser-login --title "Sign in" --due-when "date:2026-10-06T09:00:00Z"
+  [ "$status" -eq 0 ]
+  grep -q '"due_when": "date:2026-10-06T09:00:00Z"' "$PE_OUTCOME_FILE"
+  rm -f "$PE_OUTCOME_FILE"
+  run pe_outcome demo 8 needs-human --needs external --act --step decision --title "x"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" '--act is --step operator-act'
+  run pe_outcome demo 8 needs-human --needs external --due-when "phase:demo/7"
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+@test "outcome: a due-when nothing could ever probe is refused — no scheme, a cmd: with a variable, our own lock" {
+  outcome_env
+  run pe_outcome demo 8 needs-human --needs external --act --title "x" --due-when "next tuesday"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" '--due-when refused'
+  run pe_outcome demo 8 needs-human --needs external --act --title "x" --due-when 'cmd:"test -f $HOME/done"'
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 8 needs-human --needs external --act --title "x" --due-when "lock:demo/8"
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
 }

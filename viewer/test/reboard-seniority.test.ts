@@ -222,3 +222,27 @@ test('RS-1: the boarding order is journalled when seniority moved it — which p
   assert.equal(rows[0].clock, 'hint');
   assert.deepEqual(rows[0].ahead, [2], 'and the fresh phases it went ahead of');
 });
+
+/* ------------------------------------------------------------------ *
+ * RS-7 — a wrap-up's kept lane is a rank (control-tower phase 109, #192)
+ * ------------------------------------------------------------------ */
+
+test('RS-7: a phase that kept its lane boards ahead of an older queue clock — journalled by its own clock, `lane-kept`', async () => {
+  const h = boardHarness({ states: { 1: 'done', 2: 'in-progress', 3: 'ready' } });
+  const run = stored(h.root, (state) => {
+    phaseRecord(state, 1).status = 'done';
+    // Phase 3 is graph-ready and has waited three hours; phase 2 handed off at
+    // a wrap-up a minute ago with its own work uncommitted in the shared tree.
+    Object.assign(phaseRecord(state, 3), { status: 'pending', queueSince: ago(3 * 60 * MIN) });
+    Object.assign(phaseRecord(state, 2), {
+      status: 'pending', attempts: 1, boardingHint: hint(ago(MIN)),
+      keepsLane: { at: ago(MIN), reason: 'context', sessionId: 'sess-2', paths: 4 },
+    });
+  });
+  await h.runner.start({ slug: 'demo', root: h.root, resumeRunId: run.id, maxParallel: 1 } as never);
+  await h.runner.wait();
+  assert.deepEqual(h.spawned, [2, 3], 'the kept lane first, however young its clock');
+  const moved = journalled(h, 'phase.seniority').find((line) => line.phase === 2);
+  assert.equal(moved?.clock, 'lane-kept');
+  assert.deepEqual(moved?.ahead, [3]);
+});

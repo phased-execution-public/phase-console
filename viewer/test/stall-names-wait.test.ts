@@ -15,7 +15,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { buildInbox, type InboxFacts } from '../server/inbox.ts';
-import { applyEvent, evaluateStall, livenessOf, newLaneSignals, stallThresholds } from '../server/runner/liveness.ts';
+import {
+  applyEvent, creditHeldTime, evaluateStall, livenessOf, newLaneSignals, stallThresholds,
+} from '../server/runner/liveness.ts';
+import { VERIFY_ENV_FALLBACK } from '../server/runner/verify-env.ts';
 import type { StreamEvent } from '../server/runner/spawn.ts';
 
 const T0 = Date.parse('2026-09-26T10:00:00Z');
@@ -72,6 +75,23 @@ test('AC-4: the lane\'s wire view carries the last finished call, so a card can 
   ]);
   const view = livenessOf(3, signals);
   assert.deepEqual(view.lastCall, { tool: 'Bash', summary: 'npm ci', since: new Date(T0).toISOString(), ok: true });
+});
+
+test('#206: a call held on a person\'s card names its wait from when the card let it go, not from when it was asked', () => {
+  const env = VERIFY_ENV_FALLBACK;
+  const signals = newLaneSignals(T0);
+  applyEvent(signals, {
+    kind: 'tool', id: 't1', name: 'Bash', summary: 'until gh run view 77 --json status | grep -q completed; do sleep 30; done',
+  }, T0, env);
+  creditHeldTime(signals, { toolUseId: 't1', since: T0, until: T0 + 3 * MIN });
+  const thresholds = stallThresholds();
+  assert.notEqual(evaluateStall(signals, thresholds, T0 + 6 * MIN, { verifyEnv: env })?.signal, 'external-wait',
+    'three of its six minutes were spent on the card');
+  const stall = evaluateStall(signals, thresholds, T0 + 9 * MIN, { verifyEnv: env });
+  assert.equal(stall?.signal, 'external-wait');
+  assert.equal(stall!.since, new Date(T0 + 3 * MIN).toISOString(), 'the wait began when the card let the call go');
+  assert.match(stall!.detail, /open for 6 min/);
+  assert.match(stall!.detail, /gh run view 77/);
 });
 
 test('AC-4: the inbox row a person reads names the command the silent lane is inside', () => {

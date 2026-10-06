@@ -103,14 +103,16 @@ test('approving a manual gate flips the live verdict to clear, revoking restores
   assert.equal(before?.clear, false);
   assert.equal(before?.kind, 'manual');
 
-  const approved = await svc.approveGate('gatey', 1, { approve: true, by: 'operator', note: 'keys minted + exported' });
+  // The Gate card from a browser — a person's press, the only one a MANUAL gate
+  // opens to (control-tower phase 107, #174; manual-gate-person-only.test.ts).
+  const approved = await svc.approveGate('gatey', 1, { approve: true, by: 'operator', note: 'keys minted + exported', person: true });
   assert.equal(approved.ok, true, approved.detail);
   assert.equal(approved.gate?.clear, true);
   assert.match(approved.gate?.detail ?? '', /approved by operator/);
 
   const file = join(lib.root, 'docs', 'handoffs', 'gatey', 'gate-status.md');
   assert.ok(existsSync(file), 'the clearance sidecar exists');
-  assert.match(readFileSync(file, 'utf8'), /\| 1 \| yes \| operator \| \d{4}-\d{2}-\d{2} \| keys minted \+ exported \|/);
+  assert.match(readFileSync(file, 'utf8'), /\| 1 \| yes \| operator \| \d{4}-\d{2}-\d{2} \| keys minted \+ exported \| console \|/);
   // The sidecar is NOT the QA table — recording an approval must not flip QA on.
   assert.ok(!existsSync(join(lib.root, 'docs', 'handoffs', 'gatey', 'test-status.md')));
   assert.equal((await svc.qaMode('gatey')).mode, 'off');

@@ -21,9 +21,11 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, type Dirent,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import {
   BRANCH_CAP, DIFF_FILE_CAP, GRAPH_LIMIT_MAX, PATCH_BYTES_MAX, SETTLE_CAP, SETTLE_EVENT_NAMES,
@@ -38,11 +40,25 @@ import type { RunState } from '../server/runner/state.ts';
 
 const SEP = '\x00';
 
-/** The environment every fixture `git` runs under. */
+/**
+ * The environment every fixture `git` runs under — hermetic (control-tower
+ * phase 116, #169). No global or system config reaches it, so nothing the
+ * machine configures (a signing program, a hooks path, an fsmonitor, scheduled
+ * maintenance) can act on a fixture mid-build, and it never collects garbage:
+ * `gc.auto=0` and `maintenance.auto=false` ride as command-line config
+ * (`GIT_CONFIG_COUNT`, git's `-c` in the environment), so the bulk writers
+ * below carry them too. The inherited `GIT_*` environment is dropped whole —
+ * a `GIT_DIR` from a hook would otherwise build the fixture in somebody else's
+ * repository.
+ */
 function fixtureEnv(): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_'))),
     LC_ALL: 'C',
+    GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'gc.auto', GIT_CONFIG_VALUE_0: '0',
+    GIT_CONFIG_KEY_1: 'maintenance.auto', GIT_CONFIG_VALUE_1: 'false',
     GIT_AUTHOR_NAME: 'p8', GIT_AUTHOR_EMAIL: 'p8@example.invalid',
     GIT_COMMITTER_NAME: 'p8', GIT_COMMITTER_EMAIL: 'p8@example.invalid',
   };
@@ -50,7 +66,58 @@ function fixtureEnv(): NodeJS.ProcessEnv {
 
 /** `git`, throwing on failure — a broken FIXTURE must not read as a finding. */
 function git(cwd: string, ...args: string[]): string {
-  return String(execFileSync('git', args, { cwd, encoding: 'utf8', env: fixtureEnv() })).trim();
+  return fixtureGit(cwd, args);
+}
+
+/** One fixture `git`, `input` on its stdin; a failure says what the repository looked like. */
+function fixtureGit(cwd: string, args: string[], input?: string): string {
+  try {
+    return String(execFileSync('git', args, {
+      cwd, encoding: 'utf8', env: fixtureEnv(), ...(input === undefined ? {} : { input }),
+    })).trim();
+  } catch (error) {
+    throw fixtureFailure(cwd, args, error);
+  }
+}
+
+/**
+ * What the repository looked like when a fixture command failed (#169).
+ * Phase 103's gate lost a run to `git commit` answering "fatal: could not
+ * parse HEAD" once in 360 commits, and the test threw before it captured
+ * anything that could name a cause. Read from the files, never asked of git:
+ * when git cannot parse HEAD, git is the one witness that cannot answer.
+ */
+function fixtureFailure(cwd: string, args: string[], error: unknown): Error {
+  const read = (path: string): string => {
+    try { return readFileSync(path, 'utf8'); } catch (e) { return `(unreadable: ${(e as NodeJS.ErrnoException).code ?? String(e)})`; }
+  };
+  // A linked worktree's `.git` is a file naming its git dir; refs live in the common dir.
+  const dotGit = join(cwd, '.git');
+  const pointer = /^gitdir: (.+)$/m.exec(existsSync(dotGit) && !statSync(dotGit).isDirectory() ? read(dotGit) : '');
+  const gitDir = pointer ? resolve(cwd, pointer[1].trim()) : dotGit;
+  const common = existsSync(join(gitDir, 'commondir')) ? resolve(gitDir, read(join(gitDir, 'commondir')).trim()) : gitDir;
+  const loose: string[] = [];
+  const walk = (dir: string, prefix: string): void => {
+    let entries: Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.isDirectory()) walk(join(dir, entry.name), `${prefix}${entry.name}/`);
+      else loose.push(`${prefix}${entry.name} ${read(join(dir, entry.name)).trim()}`);
+    }
+  };
+  walk(join(common, 'refs', 'heads'), 'refs/heads/');
+  const packedFile = join(common, 'packed-refs');
+  const packed = existsSync(packedFile) ? read(packedFile).split('\n').filter((line) => / refs\/heads\//.test(line)) : [];
+  const reflog = read(join(gitDir, 'logs', 'HEAD')).trimEnd().split('\n').slice(-5);
+  const refs = [...loose.slice(0, 12), ...packed.slice(0, 4)];
+  return new Error([
+    `fixture command failed in ${cwd}: git ${args.join(' ')}`,
+    String((error as Error)?.message ?? error).trimEnd(),
+    `.git/HEAD: ${read(join(gitDir, 'HEAD')).trimEnd()}`,
+    `refs (${loose.length} loose, ${packed.length} packed): ${refs.join(' · ') || '(none)'}`,
+    `reflog (HEAD, last ${reflog.length}):`,
+    ...reflog.map((line) => `  ${line}`),
+  ].join('\n'), { cause: error });
 }
 
 const trash: string[] = [];
@@ -122,17 +189,57 @@ function bulkCommits(root: string, count: number, nameOf: (n: number) => string)
       + `reset refs/heads/${nameOf(n)}\nfrom :${n + 1}\n\n`,
     );
   }
-  execFileSync('git', ['fast-import', '--quiet'], { cwd: root, env: fixtureEnv(), input: stream.join('') });
+  fixtureGit(root, ['fast-import', '--quiet'], stream.join(''));
   git(root, 'reset', '-q', '--hard');
 }
 
 /** Each of `names` as a branch at HEAD, written by ONE `git update-ref --stdin`. */
 function branchesAtHead(root: string, names: string[]): void {
   const tip = git(root, 'rev-parse', 'HEAD');
-  execFileSync('git', ['update-ref', '--stdin'], {
-    cwd: root, env: fixtureEnv(), input: names.map((name) => `create refs/heads/${name} ${tip}\n`).join(''),
-  });
+  fixtureGit(root, ['update-ref', '--stdin'], names.map((name) => `create refs/heads/${name} ${tip}\n`).join(''));
 }
+
+/* ================================================================== *
+ * The fixture itself (control-tower phase 116, #169)
+ * ================================================================== */
+
+test('the fixture\'s git is hermetic: no global or system config reaches it, and it never collects garbage', () => {
+  // A hostile machine: a global and a system config that sign every commit
+  // with a program that always fails, and collect garbage after every one.
+  const hostile = mkdtempSync(join(tmpdir(), 'p116-hostile-git-'));
+  trash.push(hostile);
+  const config = join(hostile, 'gitconfig');
+  writeFileSync(config, '[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n[gc]\n\tauto = 1\n[maintenance]\n\tauto = true\n');
+  const saved = { global: process.env.GIT_CONFIG_GLOBAL, system: process.env.GIT_CONFIG_SYSTEM };
+  process.env.GIT_CONFIG_GLOBAL = config;
+  process.env.GIT_CONFIG_SYSTEM = config;
+  try {
+    const { root } = fixture();
+    advance(root, 'pe/demo', 1);
+    const foreign = git(root, 'config', '--list', '--show-origin').split('\n')
+      .filter((line) => line.startsWith('file:') && !line.startsWith('file:.git/config\t'));
+    assert.deepEqual(foreign, [], 'a fixture git read config from outside its own repository');
+    assert.equal(git(root, 'config', '--get', 'gc.auto'), '0');
+    assert.equal(git(root, 'config', '--get', 'maintenance.auto'), 'false');
+  } finally {
+    for (const [name, value] of [['GIT_CONFIG_GLOBAL', saved.global], ['GIT_CONFIG_SYSTEM', saved.system]] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('a fixture git that fails says what the repository looked like — HEAD, the refs, the reflog', () => {
+  const { root } = fixture();
+  writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/\n');
+  assert.throws(() => git(root, 'commit', '-q', '--allow-empty', '-m', 'after'), (error: Error) => {
+    assert.match(error.message, /git commit -q --allow-empty -m after/);
+    assert.match(error.message, /^\.git\/HEAD: ref: refs\/heads\/$/m);
+    assert.match(error.message, /refs \(2 loose, 0 packed\): refs\/heads\/main [0-9a-f]{40} · refs\/heads\/pe\/demo [0-9a-f]{40}/);
+    assert.match(error.message, /^reflog \(HEAD, last 3\):\n {2}.*commit \(initial\): base 1\n {2}.*commit: base 2\n {2}.*commit: base 3$/m);
+    return true;
+  });
+});
 
 /* ================================================================== *
  * Parsers — fixtures, not repositories
@@ -1263,13 +1370,24 @@ test('G-DIFF: a diff too large to read says so, and never "nothing changed"', as
   // 26 000-file range parsed to ZERO rows — rendered as "nothing changed" over
   // a range that changed everything.
   const { root } = fixture();
-  execFileSync('mkdir', ['-p', join(root, 'gen')]);
-  for (let n = 0; n < 26_000; n += 1) {
-    const name = `gen/${String(n).padStart(6, '0')}-${'a-deliberately-long-pathname-segment-'.repeat(4)}so-the-stat-overflows-past-four-megabytes.txt`;
-    writeFileSync(join(root, name), `${name}\n`);
-  }
-  git(root, 'add', '-A');
-  git(root, 'commit', '-q', '-m', 'a very large change');
+  // What overflows the stat is its pathnames, so the fixture is built for
+  // them (control-tower phase 116): 5 500 files five 177-character directories
+  // deep — 904 bytes a path, under the 1 024 a Mac allows — sharing one blob,
+  // written by ONE `git fast-import`. That is ~4.99 MB of `--numstat -z`
+  // against a 4 MiB cap. The 26 000 file writes, `add -A` and stat over 26 000
+  // distinct blobs this used to take ran past 100 s under load, and the stat
+  // alone past `diffStatDetailed`'s own 15 s read, which answers an empty diff.
+  const head = git(root, 'symbolic-ref', 'HEAD');
+  const tip = git(root, 'rev-parse', 'HEAD');
+  const deep = ['gen', ...'abcde'].map((letter) => (letter === 'gen' ? letter : `${letter}-${'a-deliberately-long-directory-name-'.repeat(5)}`)).join('/');
+  const subject = 'a very large change\n';
+  const stream = [
+    'blob\nmark :1\ndata 2\nx\n\n',
+    `commit ${head}\ncommitter p8 <p8@example.invalid> ${Math.floor(Date.now() / 1000)} +0000\n`,
+    `data ${Buffer.byteLength(subject)}\n${subject}from ${tip}\n`,
+  ];
+  for (let n = 0; n < 5_500; n += 1) stream.push(`M 100644 :1 ${deep}/${String(n).padStart(6, '0')}.txt\n`);
+  fixtureGit(root, ['fast-import', '--quiet'], `${stream.join('')}\n`);
 
   const diff = await repoDiff(root, { base: 'HEAD~1', tip: 'HEAD' });
   assert.ok(diff, 'the range resolves');

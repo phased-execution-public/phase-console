@@ -276,9 +276,11 @@ test('REG-2 / REG-3 (iv): with no console answering, the hook drains its own inb
     assert.equal(registered.status, 0, registered.stderr);
     const shell = spawnSync(process.execPath, [join(SKILL_DIR, 'viewer', 'shared', 'instances.mjs'), 'shell', '--root', real], { env, encoding: 'utf8' });
     const stateDir = /^state_dir=(.*)$/m.exec(shell.stdout)![1];
-    const hook = (event: string, sessionId: string) => spawnSync('/bin/bash', [join(SKILL_DIR, 'scripts', 'session-hook.sh')], {
+    // Two sessions are two processes: since control-tower phase 108 (#172) a
+    // SessionStart in a pid another record names ends that record (a `/clear`).
+    const hook = (event: string, sessionId: string, pid: number = process.pid) => spawnSync('/bin/bash', [join(SKILL_DIR, 'scripts', 'session-hook.sh')], {
       input: JSON.stringify({ session_id: sessionId, hook_event_name: event, cwd: real, transcript_path: `/t/${sessionId}.jsonl`, source: 'startup' }),
-      env, encoding: 'utf8', cwd: real, timeout: 20_000,
+      env: { ...env, CLAUDE_PID: String(pid) }, encoding: 'utf8', cwd: real, timeout: 20_000,
     });
 
     const first = hook('SessionStart', 's-hook-first');
@@ -288,14 +290,14 @@ test('REG-2 / REG-3 (iv): with no console answering, the hook drains its own inb
     const firstRecord = JSON.parse(readFileSync(join(stateDir, 'sessions', 's-hook-first.json'), 'utf8'));
     assert.equal(firstRecord.lastEvent.via, 'cli', 'drained by the hook\'s own ingest, with no console');
 
-    const second = hook('SessionStart', 's-hook-second');
+    const second = hook('SessionStart', 's-hook-second', process.ppid);
     assert.equal(second.status, 0, second.stderr);
     const context = JSON.parse(second.stdout.trim()).hookSpecificOutput.additionalContext as string;
     assert.match(context, /this Claude session's id is s-hook-second/);
     assert.match(context, /The session registry shows one other live Claude session in this repository: s-hook-f/);
 
     // Any other event drains in the background and returns at once.
-    const stop = hook('Stop', 's-hook-second');
+    const stop = hook('Stop', 's-hook-second', process.ppid);
     assert.equal(stop.status, 0);
     assert.equal(stop.stdout, '', 'a Stop says nothing to the session');
     let turns = 0;

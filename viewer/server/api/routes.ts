@@ -19,7 +19,7 @@ import { parseLockFilter } from '../locks.ts';
 import { DECISION_KEYS } from '../../shared/decisions-model.js';
 import type { AccountRequirement, PressAnswer } from '../runner/state.ts';
 import { classify as classifyAccess } from './access.ts';
-import { actorOfRequest } from './actor.ts';
+import { actorOfRequest, agentClassOf } from './actor.ts';
 import { createSseWriter } from './sse.ts';
 import { PolicyRuleError } from '../runner/approvals.ts';
 import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
@@ -65,7 +65,7 @@ import {
   type IsolationMode, type SettleStrategy,
 } from '../../shared/worktree-model.js';
 import { CONFLICT_POLICIES, LAND_POLICIES, type ConflictPolicy, type LandPolicy } from '../../shared/landing-model.js';
-import { ISSUE_MODES, type IssueMode } from '../../shared/issues-model.js';
+import { DEFAULT_ISSUES, ISSUE_MODES, type IssueMode } from '../../shared/issues-model.js';
 import { MESSAGING_WORDS, type MessagingWord } from '../../shared/message-model.js';
 import {
   branchExists, issuesModeLoosens, lockedSettingRefusals, type RefusedSetting, type RunSettingsPatch,
@@ -321,6 +321,16 @@ function guardWebhooks(req: IncomingMessage, service: Service): string | null {
  */
 function guardCsrf(req: IncomingMessage): string | null {
   return guardMutation(req, null);
+}
+
+/**
+ * Is this request a PERSON's press (control-tower phase 107, #174)? The Gate
+ * card in a browser, or a person the remote proxy vouched for. A script — curl
+ * from a session, a fetch from a tool — is not one, whatever `by` its body
+ * offers. The one test both doors that approve a gate ask (phase 129, #218).
+ */
+function personsPress(req: IncomingMessage, actor: { remoteUser?: string | null }): boolean {
+  return agentClassOf(req.headers['user-agent']) === 'browser' || actor.remoteUser != null;
 }
 
 function guardMutation(req: IncomingMessage, disabled: string | null): string | null {
@@ -2921,12 +2931,14 @@ async function routeApi(
             return true;
           }
           const body = await readBody(req);
+          const actor = actorOfRequest(req, service.flags, body);
           const outcome = await service.approveGate(slug, phase, {
             approve: body.approve !== false,
             by: typeof body.by === 'string' ? body.by : undefined,
             note: typeof body.note === 'string' ? body.note : undefined,
             continueRun: body.continueRun === true,
-            actor: actorOfRequest(req, service.flags, body),
+            actor,
+            person: personsPress(req, actor),
           });
           // On refusal, `error` carries the detail so ApiError.message says
           // WHY rather than "Request failed (409)".
@@ -3995,7 +4007,7 @@ async function routeApi(
             if (!runId) { json(res, 400, { error: 'a runId is required' }); return true; }
             const actor = actorOfRequest(req, service.flags, body);
             const run = verb === 'resolve'
-              ? service.resolveRun(slug, runId, {
+              ? await service.resolveRun(slug, runId, {
                 note: typeof body.note === 'string' ? body.note.slice(0, 500) : undefined,
                 by: actor.by,
                 actor,
@@ -4382,12 +4394,22 @@ async function routeApi(
             // …and `issuesMode` may only TIGHTEN: loosening it would let the
             // sessions already boarded file on the repository under a word
             // nobody launched them with.
+            // A run with no word of its own files under this console's
+            // (phase 115), so it is judged by that word: moving a `draft` run
+            // to `off` on a console that files would widen it.
             if (ISSUE_MODES.includes(body.issuesMode as never)) {
               const live = await service.runFor(slug);
-              if (live && issuesModeLoosens(live, body.issuesMode as string)) {
+              const consoleWord = service.consoleIssueWord();
+              if (live && issuesModeLoosens(live, body.issuesMode as string, consoleWord)) {
+                const at = live.issuesMode
+                  ? `is at ${live.issuesMode}`
+                  : `has no word of its own and files under this console's (${consoleWord ?? 'off'})`;
+                const widened = body.issuesMode === DEFAULT_ISSUES && live.issuesMode
+                  ? `; ${DEFAULT_ISSUES} would hand it this console's ${consoleWord}`
+                  : '';
                 json(res, 409, {
-                  error: `A run's issues word may only tighten mid-run (file → draft → off) — this run is at `
-                    + `${live.issuesMode ?? 'off'}. Stop the run and start it again to widen it.`,
+                  error: `A run's issues word may only tighten mid-run (file → draft → off) — this run ${at}${widened}. `
+                    + 'Stop the run and start it again to widen it.',
                 });
                 return true;
               }
@@ -4598,9 +4620,29 @@ async function routeApi(
         return true;
       }
 
+      // A gate's door is the REQUEST's, never the body's (control-tower phase
+      // 129, #218): `door: 'console'` in a body once let any caller past
+      // guardWrite approve a MANUAL gate through the console's own door.
+      delete body.door;
       const plan = planWrite(body, { root: root.path, docsDir: root.docsDir });
       if (url.searchParams.get('dry') === '1') {
         json(res, 200, { dryRun: true, command: `${plan.script} ${plan.args.join(' ')}`, description: plan.description });
+        return true;
+      }
+      // …so an approval here asks what the gate route asks: the same Service
+      // door, the same person test, the same refusal of a manual gate.
+      if (body.action === 'gate-approve') {
+        const actor = actorOfRequest(req, service.flags, body as Record<string, unknown>);
+        const outcome = await service.approveGate(String(body.slug), Number(body.phase), {
+          approve: body.revoke !== true,
+          by: body.by,
+          note: body.reason,
+          actor,
+          person: personsPress(req, actor),
+        });
+        json(res, outcome.ok ? 200 : 409, {
+          ...outcome, ...(outcome.ok ? {} : { error: outcome.detail }), description: plan.description,
+        });
         return true;
       }
       const outcome = await runWrite(plan, { scriptsDir: service.flags.scriptsDir, root: root.path });

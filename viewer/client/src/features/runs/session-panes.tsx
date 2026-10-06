@@ -44,7 +44,7 @@ import { LANE_STATUSES, type NowLane } from '@/features/runs/lanes-model';
 import { ActivityPanels } from './activity';
 import { AskBox } from './ask-box';
 import { LiveConsole, forPhase, useLiveLines, useSessionStream } from './console';
-import { holderLabel, sessionHolderText } from './queue-words';
+import { holderEvidenceText, holderLabel, sessionHolderText } from './queue-words';
 
 /**
  * Phase records that deserve a pane of their own.
@@ -395,6 +395,13 @@ export function QueuedPane({
                       {holder.session ? <ReleaseHold sessionId={holder.session} /> : null}
                     </span>
                   )}
+                  {holder.kind === 'session' && holderEvidenceText(holder) && (
+                    // What the hold rests on (control-tower phase 108, #180),
+                    // so a wrong reading is visible before anyone releases it.
+                    <span className="block text-ink-faint" data-testid="holder-evidence">
+                      {holderEvidenceText(holder)}
+                    </span>
+                  )}
                   {holder.kind === 'lock' && holder.leaseUntil != null && (
                     // The lease is the holder's promise to lapse — the honest
                     // answer to "how long can this possibly block me".
@@ -465,4 +472,10 @@ export function ReleaseHold({ sessionId }: { sessionId: string }) {
 }
 
 // The queue's words live in a leaf, so the plan page can use them without this file.
-export { holderLabel, queueEntryFor, sessionHolderText, waitingLabel } from './queue-words';
+export {
+  holderEvidenceText,
+  holderLabel,
+  queueEntryFor,
+  sessionHolderText,
+  waitingLabel,
+} from './queue-words';

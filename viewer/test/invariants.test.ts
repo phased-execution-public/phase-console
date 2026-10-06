@@ -144,6 +144,18 @@ test('clause 1: only signals.ts SIGNALS a process, and only pid.ts ASKS about on
   assert.ok(probes.length >= 1, 'the probe itself must still be visible to this lint');
 });
 
+test('clause 1: the GROUP is asked about in the same one place — `kill(-pgid, 0)` lives in pid.ts and the ladder asks it (#168)', () => {
+  // A ladder that asked only whether its LEADER lived answered `gone` for a
+  // group whose leader had exited while a member held the command's stdout —
+  // tamagui P4 hung 50+ minutes on exactly that. The group question is still a
+  // question, so it lives where every other one does.
+  const groupProbes = hits(/process\.kill\(\s*-[^,)]*,\s*0\s*\)/);
+  assert.deepEqual(filesOf(groupProbes), ['pid.ts'],
+    'the group probe is pid.ts\'s — a second kill(-pgid, 0) is a second opinion about one process group');
+  const signals = SOURCES.find((s) => s.rel === 'runner/signals.ts')!.lines.join('\n');
+  assert.match(signals, /groupState\(/, 'the ladder asks about the group, not only the leader pid');
+});
+
 test('clause 1: only pid.ts shells `ps`', () => {
   // Any call whose first argument is the string `ps`. Matching the function
   // NAMES instead would be evaded by `import { execFileSync as e }`, and

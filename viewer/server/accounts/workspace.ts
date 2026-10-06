@@ -42,17 +42,30 @@
  *  · `hasTrustDialogAccepted: true` for each root the runner will spawn in,
  *    merged into the profile's `.claude.json` — the same edit the CLI's own
  *    error message tells a person to make by hand.
+ *  · the session-presence hook (control-tower phase 108, #194) — this
+ *    console's `session-hook.sh` entry for each event it answers, and nothing
+ *    else of the login's `hooks`. Measured on hub 4123 on 2026-10-03: a run
+ *    that switched to a profile at a boundary spawned 13 phase sessions and the
+ *    registry saw none of them, because the hook lives in the login's
+ *    `settings.json`, a profile inherits no `hooks`, and the run's own policy
+ *    settings carry no `SessionStart`. Installed with the installer the login's
+ *    is (`installHooks`): merged, idempotent, a stale entry refreshed in place,
+ *    a person's own hooks kept, a file that does not parse refused. A profile is
+ *    the console's workspace, so this is provisioning like the links above —
+ *    every session the console spawns there reports presence, and `doctor`
+ *    checks each pooled account's config dir for it.
  *
  * Fail-open on purpose: provisioning is a convenience the spawn must never
  * die on. A failure logs and the session boots as it would have before —
- * degraded, but no worse than yesterday. The plugins and settings steps each
- * fail open on their own, so neither can cost the trust write that comes
- * after them.
+ * degraded, but no worse than yesterday. The plugins, settings and presence
+ * steps each fail open on their own, so none can cost the trust write that
+ * comes after them.
  */
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { installHooks } from '../hooks-install.ts';
 import { log } from '../log.ts';
 
 /**
@@ -71,6 +84,8 @@ const CLI_REGISTERED_MARKETPLACES: ReadonlySet<string> = new Set(['claude-plugin
  * The `settings.json` keys a profile inherits from the login when it lacks
  * them. Exactly these two: `permissions`, `hooks`, `model` and `env` are the
  * login's own business, and a run's are set by the console's policy files.
+ * The one hook a profile does get — presence — is installed on its own
+ * (`installPresence`), never copied from the login.
  */
 const INHERITED_SETTINGS = ['enabledPlugins', 'extraKnownMarketplaces'] as const;
 
@@ -79,6 +94,10 @@ export function ensureProfileWorkspace(
   trustRoots: string[],
   skillsSource: string = join(homedir(), '.claude', 'skills'),
   loginDir: string = join(homedir(), '.claude'),
+  opts: {
+    /** The skill checkout whose `session-hook.sh` the presence entries run — `SKILL_DIR` from `Accounts`; absent installs none. */
+    hookSkillDir?: string | null;
+  } = {},
 ): void {
   try {
     mkdirSync(configDir, { recursive: true });
@@ -93,6 +112,7 @@ export function ensureProfileWorkspace(
 
     linkPlugins(configDir, join(loginDir, 'plugins'));
     inheritPluginSettings(configDir, join(loginDir, 'settings.json'));
+    if (opts.hookSkillDir) installPresence(configDir, opts.hookSkillDir);
 
     if (trustRoots.length) {
       const file = join(configDir, '.claude.json');
@@ -200,6 +220,21 @@ function inheritPluginSettings(configDir: string, loginSettings: string): void {
     log.info('accounts.workspace.settings-inherited', { configDir, keys: inherited });
   } catch (error) {
     log.warn('accounts.workspace.settings-failed', { configDir, error: (error as Error).message });
+  }
+}
+
+/**
+ * The presence entries into the profile's `settings.json` (#194) — through the
+ * login's own installer, so the rules are the same: only entries of ours are
+ * written or refreshed, every other byte is kept, and a file that does not
+ * parse is a person's to fix (`installHooks` refuses it; logged, never thrown).
+ */
+function installPresence(configDir: string, skillDir: string): void {
+  try {
+    const out = installHooks({ skillDir, settingsPath: join(configDir, 'settings.json'), mode: 0o600 });
+    if (out.changed) log.info('accounts.workspace.presence-installed', { configDir, command: out.status.command });
+  } catch (error) {
+    log.warn('accounts.workspace.presence-failed', { configDir, error: (error as Error).message });
   }
 }
 

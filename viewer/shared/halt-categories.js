@@ -158,6 +158,9 @@ export const HUMAN_STEP_CATEGORY = Object.freeze({
   'interactive-prompt': 'environment',
   captcha: 'external',
   'email-link': 'external',
+  // A command or a click path only the operator runs (control-tower phase 121):
+  // an act at the machine, like an interactive prompt or a cable.
+  'operator-act': 'environment',
 });
 
 /**
@@ -175,6 +178,7 @@ const KIND_CATEGORY_OVERRIDE = Object.freeze({
   'worktree-merge': 'conflict',
   'landing-conflict': 'conflict',
   'isolation-refused': 'conflict',
+  unlanded: 'conflict',
   'interrupted-by-restart': 'conflict',
   'nothing-ready': 'conflict',
   'operator-stop': 'operator',
@@ -232,6 +236,7 @@ export const CAUSE_SENTENCE = Object.freeze({
   'identity-changed': 'The run’s account now signs in as somebody else.',
   'verify-timeout': 'A verification command ran past its time limit twice.',
   'isolation-refused': 'The run asked for a checkout of its own and could not have one.',
+  unlanded: 'Every phase is done, but the run’s branch is not on its trunk yet.',
 });
 
 /**

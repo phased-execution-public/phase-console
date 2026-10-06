@@ -125,18 +125,42 @@ Sign in again under Settings ▸ Accounts, or register another account and move 
 
 A session that cannot go on says why: it is *blocked*, or *waiting on the outside*. When it also
 names something the console can check on its own — a GitHub run or pull request, a date, another
-phase's lock or result, a command that exits 0 — the stop is a wait and not a failure.
+phase's lock or result, a job on another machine, a command that exits 0 — the stop is a wait and not
+a failure.
 
 - The phase parks as **Waiting**. It is never recorded failed, it charges no streak and it raises no
   halt. When a ref lands, the phase's own session resumes in its lane, told what landed.
-- The wait has a budget: eight hours in all by default, from the phase's `Waits on:` line or the
-  plan's `Wait budget:`. When it is spent the phase does not fail. It parks for you with one errand
-  that states the arithmetic — allowed, spent, left — and offers **+30m**, **+60m** or an amount you
-  type, with **Raise and retry**. A wait budget lives in the plan, so this needs `--allow-writes`.
+- A date beside another ref is a backstop, not a second thing to wait for. The phase wakes the moment
+  the ref lands; if the date passes first, its session is told that the ref has *not* landed and what
+  it last read.
+- The wait has a budget: four declared waits and eight hours parked in all, by default. The phase's
+  `Waits on:` line or the plan's `Wait budget:` raises the hours, and a `Wait count:` line the number
+  of waits. When the budget is spent while a ref the phase named is still being checked, the console
+  keeps checking that ref as before and resumes the phase the moment it lands; the run itself looks
+  again every six hours. Only when nothing is left to check — a date alone, or every ref refused —
+  does it park for you, with one errand that states the arithmetic: allowed, spent, left. For the
+  hours, the errand offers **+30m**, **+60m** or an amount you type, with **Raise and retry**; a wait
+  budget lives in the plan, so this needs `--allow-writes`. For the count, the phase's **Retry** opens
+  it again.
 
 A block that names nothing the console can check, or only a ref it already waited out, is a real
 stop: it goes to the ladder, then to an errand. If every ref a phase declared was refused, the card
 says *None of the refs it declared can land*, because nothing will resume the phase by itself.
+
+## A job on another machine
+
+A wait can name a systemd unit on another machine: `unit:<host>/<unit>`, such as
+`unit:build-box/nightly-build.service`. Every five minutes the console asks that machine whether the
+unit is still running, over one ssh connection per host that every wait on it shares. The wait lands
+at the first check after the unit stops — finished, failed or stopped by hand — and its history
+records the unit's result and when it exited. A unit the host's systemd does not know is refused.
+
+The host is a name, not an address. Its address, user, key and port live in the machine profile,
+`~/.config/phase-console/fleet.json`, under `hosts.<name>`. A wait on a host the profile does not name
+is refused, and none of those details is written into a run's record. The
+connection never asks for a password, so the key must already let a plain `ssh` in. When ssh fails,
+the wait says what kind of failure it was, such as a refused login or a host it cannot reach, and
+never quotes ssh's own output.
 
 ## What is yours, and what is the loop's
 

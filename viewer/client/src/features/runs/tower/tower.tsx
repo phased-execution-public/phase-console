@@ -34,6 +34,7 @@ import type { ConsoleState, ConvergeStatusView, QueueAdvice, QueueEntry } from '
 import { usePrefs } from '@/lib/prefs';
 import { BoardHeader, SuggestedOrder } from '../board';
 import { Annunciator } from './annunciator';
+import { CiRefusedLines } from './ci-refused';
 import { TowerBays } from './bays';
 import { filterTower, type Bay, type TowerModel } from './tower-model';
 
@@ -115,6 +116,7 @@ export function Tower({
         pressed={category}
         onPress={(next) => setPrefs({ towerCategory: next ?? '' })}
       />
+      <CiRefusedLines items={shown.ciRefused} />
 
       {filtered && (
         <p

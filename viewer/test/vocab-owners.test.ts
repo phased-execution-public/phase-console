@@ -144,6 +144,7 @@ import { REFUSAL_CAUSES, SITUATIONS, parseSituationKey } from '../shared/situati
 import { RUNG_DRIVERS, RUNG_FAILURE_CAUSES, RUNG_VEHICLES } from '../shared/ladder-model.js';
 import { HALT_HOLDER_KINDS, HALT_HOLDER_VERBS } from '../shared/recovery-model.js';
 import { HALT_CATEGORIES } from '../shared/halt-categories.js';
+import { AUTHORITY_VERBS } from '../shared/door-model.js';
 import { POLICY_CLASSES, POLICY_SOURCES } from '../shared/policy-model.js';
 import { RELAY_MODES } from '../shared/run-settings.js';
 import {
@@ -189,6 +190,9 @@ import {
   ISSUE_ACTIONS,
   ISSUE_STATES,
   ISSUE_FIELDS,
+  ISSUE_TYPES,
+  ISSUE_SEVERITIES,
+  ISSUE_LABELS,
 } from '../shared/issues-model.js';
 import {
   HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_BULLET_KEYS, SECRET_QUERY_KEYS,
@@ -791,6 +795,10 @@ const VOCABULARIES: {
    * the halt card, the errand card, the inbox row and the approve page all read
    * the family through the owner — a second list would be a second opinion. */
   { name: 'halt categories', members: HALT_CATEGORIES, owner: 'shared/halt-categories.js' },
+  /* The owner door's presses (control-tower phase 129, #218): the hook guard
+   * `console-forge` and its test read ONE table, `AUTHORITY_ROUTES`; the verbs
+   * a denial journals are its rows' names. */
+  { name: 'authority verbs', members: AUTHORITY_VERBS, owner: 'shared/door-model.js' },
 
   /* The wait axis's reasons. `run-lifecycle.js` compares against each member
    * in turn (`recorded === 'external' || …`) because `status-vocab.js`, the
@@ -900,10 +908,14 @@ const VOCABULARIES: {
    * `RUN_PRIORITIES`, aliased by identity, so it is already registered — under
    * its real owner, two entries above. Registering the alias as well would
    * make that owner an offender against itself. */
-  { name: 'issue modes', members: ISSUE_MODES, owner: 'shared/issues-model.js' },
+  { name: 'issue modes', members: ISSUE_MODES, owner: 'shared/issue-modes.js' },
   { name: 'issue actions', members: ISSUE_ACTIONS, owner: 'shared/issues-model.js' },
   { name: 'issue states', members: ISSUE_STATES, owner: 'shared/issues-model.js' },
   { name: 'issue fields', members: ISSUE_FIELDS, owner: 'shared/issues-model.js' },
+  /* What a draft is, how bad, and what it is labelled (control-tower phase 114). */
+  { name: 'issue types', members: ISSUE_TYPES, owner: 'shared/issues-model.js' },
+  { name: 'issue severities', members: ISSUE_SEVERITIES, owner: 'shared/issues-model.js' },
+  { name: 'issue labels', members: ISSUE_LABELS, owner: 'shared/issues-model.js' },
   /* A person's turn (control-tower phase 41): the sixteen kinds, the eight
    * states, the plan bullet's keys and the URL parameters whose value is a
    * secret. `HUMAN_STEP_WHERE` (`host, any`) and the one-word lists are not
@@ -1112,7 +1124,11 @@ test('every `situation:` literal under server/ parses to a SITUATIONS member —
 test('START_DOORS is the census — fifteen doors, owned once — and the actor shape is spelled once', () => {
   // Fourteen from chapter 02 of the sep-review audit, and `trigger` since
   // control-tower phase 98 (#137): a stored trigger's act is automatic.
-  assert.equal(START_DOORS.length, 16, 'the audit counted fourteen automatic-start doors; phase 98 added the trigger, phase 101 the supervisor');
+  // Pro adds Solve with autopilot's door (control-tower phase 120) after the
+  // nine `startRun` doors, so the census is sixteen in the free tree.
+  const proDoors: string[] = [];
+  assert.equal(START_DOORS.length, 16 + proDoors.length, 'the audit counted fourteen automatic-start doors; phase 98 added the trigger, phase 101 the supervisor');
+  assert.deepEqual(START_DOORS.slice(9, 9 + proDoors.length), proDoors, 'a Pro startRun door follows the nine');
   assert.deepEqual(START_DOORS.slice(-2), ['trigger', 'supervisor'], 'the trigger and the supervisor ride their verb\'s own door, so they follow the five that are not startRun sites');
   assert.equal(new Set(START_DOORS).size, START_DOORS.length, 'no door may be listed twice');
   for (const door of START_DOORS) assert.match(door, /^[a-z][a-z0-9-]*$/, `${door} is not a kebab-case word`);

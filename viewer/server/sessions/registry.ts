@@ -145,7 +145,16 @@ function revive(record: SessionRecord): void {
   delete record.reason;
   delete record.endedBy;
   delete record.endedDetectedAt;
+  delete record.supersededBy;
 }
+
+/**
+ * How far a replaced record's last evidence of life may sit past its
+ * successor's start and still be the record that start replaced: the hook
+ * stamps whole seconds, so a `/clear`'s SessionEnd and the SessionStart after
+ * it often share one.
+ */
+export const SUPERSEDE_SLACK_MS = 2_000;
 
 /** End a wait episode, leaving the record of how it ended. */
 function closeWait(record: SessionRecord, at: string, outcome: WaitOutcome): void {
@@ -298,8 +307,19 @@ export type SessionRecord = {
    * look, which is how a record once claimed 17.3 hours it did not live (REG-9).
    */
   endedAt?: string;
-  /** Who said it ended: the session's own SessionEnd, or the probe finding its process gone. */
+  /** Who said it ended: the session's own SessionEnd, the probe finding its process gone, or a successor's start. */
   endedBy?: PresenceEndSource;
+  /**
+   * Another session started in THIS session's process (control-tower phase
+   * 108, #172): a `/clear` — or an in-process `/resume` — fires SessionEnd for
+   * this id and SessionStart for a new one, and the process carries on as the
+   * new one. One process is one session at a time, so this id is over whatever
+   * the pid probe says: presence `ended`, never `unknown`. Cleared by evidence
+   * of life after it (a resume back to this id). The claim a lock names it by
+   * is a different question — `ServiceBase.declarerPresence` keeps that one
+   * `unknown` while the process lives (PRS-1).
+   */
+  supersededBy?: { sessionId: string; at: string };
   /**
    * An operator's release of this session's hold on the queue (control-tower
    * phase 82, #119) — "not touching this repository" (no `until`: while it
@@ -806,7 +826,15 @@ export function applyEvent(prev: SessionRecord | undefined, p: HookPayload, nowI
   if (p.pid) base.pid = p.pid;
   if (p.root) base.root = p.root;
   base.events = (base.events ?? 0) + 1;
-  const stale = base.endedAt != null && Date.parse(at) < Date.parse(base.endedAt);
+  // An event from before the hand-over to a successor is history too (#172):
+  // the process stopped speaking for this id the moment the successor started,
+  // so only a START of this id after that moment (a resume back to it) is life.
+  const handedOver = base.supersededBy
+    ? (p.event === 'SessionStart'
+      ? Date.parse(at) < Date.parse(base.supersededBy.at)
+      : Date.parse(at) <= Date.parse(base.supersededBy.at))
+    : false;
+  const stale = (base.endedAt != null && Date.parse(at) < Date.parse(base.endedAt)) || handedOver;
   if (Date.parse(at) > Date.parse(base.lastSeen)) base.lastSeen = at;
   switch (p.event) {
     case 'SessionStart':
@@ -926,6 +954,11 @@ export function presenceOf(
   // belonged to a `ugrep` read `unknown`, then "stuck", for hours. So an ended
   // record comes back only when its recorded start time still matches — and a
   // record with no start time has nothing to match, so the end stands.
+  //
+  // And a record whose process has since started ANOTHER session is over,
+  // whatever the probe says (#172): that is exactly the `/clear` the rule above
+  // keeps alive, once the new session has arrived to say whose the process is.
+  if (record.supersededBy) return 'ended';
   if (record.endedAt) {
     if (!record.pid || !probe || !record.procStartedAt) return 'ended';
     let answer: boolean | ProcessState;
@@ -1327,8 +1360,53 @@ export class SessionRegistry {
     };
     this.records.set(next.sessionId, next);
     this.persist(next);
+    // The session this start replaced in the same process is over (#172) —
+    // ended BEFORE the start is announced, so the first view anybody reads of
+    // the new session already shows the old one gone.
+    if (payload.event === 'SessionStart') this.supersedeInProcess(next, new Date(at).toISOString(), { via, lateMs, history }, appliedAt);
     this.opts.onChange?.(next, payload.event, { via, lateMs, history });
     return next;
+  }
+
+  /**
+   * A SessionStart for a new id in a pid that other records name ends those
+   * records at once (control-tower phase 108, #172). `/clear` fires SessionEnd
+   * for the old id and SessionStart for the new one in the SAME process, and an
+   * ended record whose process still runs reads `unknown` (PRS-1) — so before
+   * this every `/clear`ed id of a live terminal kept matching its pid, and kept
+   * holding the queue, for as long as the terminal was open.
+   *
+   * One process is one session at a time, so any OTHER record naming the pid
+   * whose last evidence of life is no later than this start is the one it
+   * replaced: it keeps a reported end, gains the successor's start as the
+   * evidence of one it never reported (`endedBy: 'successor'`, at its last
+   * evidence of life — REG-9), and its end is announced like any other, which
+   * is what polls the queue. A record that showed life after this start is
+   * left alone, and nothing here touches another pid.
+   */
+  private supersedeInProcess(successor: SessionRecord, atIso: string, meta: ChangeMeta, appliedAt: Date): void {
+    if (!successor.pid || successor.endedAt) return;
+    const startMs = Date.parse(atIso);
+    for (const record of this.records.values()) {
+      if (record.sessionId === successor.sessionId || record.pid !== successor.pid || record.probe || record.supersededBy) continue;
+      const seen = Date.parse(record.lastSeen);
+      if (Number.isFinite(seen) && seen > startMs + SUPERSEDE_SLACK_MS) continue;
+      record.supersededBy = { sessionId: successor.sessionId, at: atIso };
+      if (!record.endedAt) {
+        record.endedAt = Number.isFinite(seen) ? record.lastSeen : atIso;
+        record.endedBy = 'successor';
+        delete record.endedDetectedAt;
+      }
+      closeWait(record, atIso, 'ended');
+      // The socket is the PROCESS's, and the process is the successor's now.
+      delete record.messaging;
+      this.persist(record);
+      this.appendEvent({
+        v: 1, at: atIso, appliedAt: appliedAt.toISOString(), lateMs: meta.lateMs, via: meta.via,
+        event: 'superseded', payload: { by: successor.sessionId, pid: successor.pid },
+      }, record.sessionId);
+      this.opts.onChange?.(record, 'SessionEnd', meta);
+    }
   }
 
   /**
@@ -1627,6 +1705,21 @@ export class SessionRegistry {
     if (this.opts.pidAlive === null) return false;
     if (this.opts.pidAlive) return this.opts.pidAlive(pid);
     return processState(pid) !== 'gone';
+  }
+
+  /**
+   * Is the PROCESS a record names still there — by its `(pid, start time)`
+   * identity when the record carries one (#73), by the pid alone when it does
+   * not. What a `/clear`ed record's claim is judged by (#172): its session is
+   * over, its process may not be.
+   */
+  processLive(record: Pick<SessionRecord, 'pid' | 'procStartedAt'>): boolean {
+    const pid = record.pid;
+    if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
+    if (!record.procStartedAt) return this.pidLive(pid);
+    if (this.opts.pidAlive === null) return false;
+    if (this.opts.pidAlive) return this.opts.pidAlive(pid, record.procStartedAt);
+    return processState(pid, { startedAt: record.procStartedAt, slackMs: IDENTITY_SLACK_MS }) !== 'gone';
   }
 
   /**

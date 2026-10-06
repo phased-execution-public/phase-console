@@ -17,8 +17,10 @@ PE_SCRIPTS="$PE_DIR/scripts"
 # means to exercise. A test sets what it needs; nothing leaks in.
 unset PE_LOCK_MIRROR PE_OWNER PE_SESSION_ID PE_SCOPE PE_BRANCH PE_WORKTREE \
   PE_OUTCOME_FILE PE_TASKS_FILE PE_RULINGS_FILE PE_PROOFS_FILE PE_ISSUES_FILE \
+  PE_VERIFY_DIR PE_RUN_ROOT \
   PE_MESSAGES_FILE PE_MSG_TOKEN PE_TRACE_ID PE_SPAN_ID \
-  PE_MCP_SERVERS PE_ACCOUNTS PE_CREDENTIALS CLAUDE_CODE_SESSION_ID
+  PE_MCP_SERVERS PE_ACCOUNTS PE_CREDENTIALS CLAUDE_CODE_SESSION_ID \
+  PE_SESSION_KIND PE_GATE_DOOR PE_GATE_DELEGATE CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ATTENDED
 SYS_BASH="/bin/bash"
 
 # --- runners (each forces the 3.2 system bash) --------------------------------
@@ -30,7 +32,13 @@ pe_newho()    {                                                "$SYS_BASH" "$PE_
 pe_nextp()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/next-phase-prompt.sh"  "$@"; }
 pe_hostatus() { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/handoff-status.sh"     "$@"; }
 qa_record()   { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/qa-record.sh"          "$@"; }
-gate_approve(){ DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/gate-approve.sh"       "$@"; }
+# gate-approve.sh names the DOOR an approval came through from its environment
+# (control-tower phase 107, #174): a terminal on stdin is a person's door, so
+# stdin is always /dev/null here — a run from a person's shell and a run under
+# the console must answer alike. `gate_approve_console` is the console's door,
+# the one a manual gate's approval goes through in a test.
+gate_approve(){ DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/gate-approve.sh"       "$@" </dev/null; }
+gate_approve_console(){ PE_GATE_DOOR=console gate_approve "$@"; }
 # phase-outcome.sh needs no DOCS_ROOT — it writes $PE_OUTCOME_FILE, or (unsupervised)
 # the console's inbox for the root it derives the way phase-lock.sh does.
 pe_outcome()  {                                                "$SYS_BASH" "$PE_SCRIPTS/phase-outcome.sh"     "$@"; }
@@ -69,7 +77,7 @@ pe_close()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TOD
 # and red from inside a run, which is the one place it is most likely to be run.
 # TRACEPARENT rides with them: it is the W3C spelling of the same context.
 scrub_pe_env() {
-  unset PE_SCOPE PE_OWNER PE_SESSION_ID PE_OUTCOME_FILE PE_RULINGS_FILE PE_TASKS_FILE PE_MCP_SERVERS \
+  unset PE_SCOPE PE_OWNER PE_SESSION_ID PE_OUTCOME_FILE PE_RULINGS_FILE PE_TASKS_FILE PE_MCP_SERVERS PE_ISSUES_SUGGEST PE_ISSUE_REPOS \
     PE_MESSAGES_FILE PE_MSG_TOKEN PE_ISSUES_FILE PE_ISSUES_MODE PE_TRACE_ID PE_SPAN_ID TRACEPARENT PE_PROOFS_FILE \
     PE_LOCK_MIRROR
   # A declaration never asks a real console (phase-outcome.sh's ingest probe, control-tower

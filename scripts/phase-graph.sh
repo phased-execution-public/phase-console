@@ -49,6 +49,7 @@
 #   phase-graph.sh <slug> --human-steps [N] # the `- **Human step:**` bullets as TSV: kind, what, open, proof, where,
 #                                         # window minutes, auto-open, credential (no N: every phase, led by `N<TAB>`)
 #   phase-graph.sh <slug> --checkout N    # the phase's `- **Checkout:**` branch, verbatim
+#   phase-graph.sh <slug> --verify-in N   # the phase's `**Verify in:**` directory, one line (empty: the root)
 #   phase-graph.sh <slug> --floor [N]     # phase N's `- **Wall-clock floor:**` bullet in MINUTES,
 #                                         # rounded up; with no N, every phase that declares a readable
 #                                         # one as N<TAB>minutes, ascending order; nothing when none do
@@ -75,7 +76,7 @@
 # Run from the repo root that owns docs/, or set DOCS_ROOT.
 set -euo pipefail
 
-slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--verified|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--permission-mode [N]|--model-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--verify-timeout [N]|--waits-on N|--human-steps [N]|--checkout N|--floor [N]|--land [N]|--landing N|--base-branch|--gitlink [N]|--conflict-policy|--isolation [N]|--clash-zones|--issues [N]|--messaging|--notes N|--boot-prompt N|--boot-fanout "N M …"|--session-plan [model|budget]]}"
+slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--verified|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--permission-mode [N]|--model-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--verify-timeout [N]|--waits-on N|--human-steps [N]|--checkout N|--verify-in N|--floor [N]|--land [N]|--landing N|--base-branch|--gitlink [N]|--conflict-policy|--isolation [N]|--clash-zones|--issues [N]|--messaging|--notes N|--boot-prompt N|--boot-fanout "N M …"|--session-plan [model|budget]]}"
 mode="${2:-board}"
 arg="${3:-}"
 
@@ -580,7 +581,7 @@ gate_kind() {  # gate_kind <phase> → human|ai|auto|none
 # is the operator's override, the same philosophy as a QA waiver. A separate
 # file from test-status.md on purpose — that file's very existence switches QA
 # gating on, and recording a gate approval must never flip an unrelated regime.
-gate_approved() {  # gate_approved <phase> → "yes<TAB>by<TAB>date" | "no"
+gate_approved() {  # gate_approved <phase> → "yes<TAB>by<TAB>date<TAB>door" | "no"
   local f="$DOCS_ROOT/docs/handoffs/${slug}/gate-status.md"
   [ -f "$f" ] || { echo no; return; }
   sed 's/–/-/g; s/—/-/g' "$f" | awk -F'|' -v want="$1" '
@@ -590,12 +591,41 @@ gate_approved() {  # gate_approved <phase> → "yes<TAB>by<TAB>date" | "no"
     ing && /^[[:space:]]*\|/ {
       seen=1; ph=trim($2); gsub(/[*`]/,"",ph); ph=trim(ph)
       if (ph != want) next
-      if (tolower(trim($3)) == "yes") printf "yes\t%s\t%s\n", trim($4), trim($5)
+      # $7 is the Door cell (control-tower phase 107); a row written before it
+      # existed has none, and reads as no named door.
+      if (tolower(trim($3)) == "yes") printf "yes\t%s\t%s\t%s\n", trim($4), trim($5), trim($7)
       else print "no"
       found=1; exit
     }
     END { if (!found) print "no" }
   '
+}
+
+# The doors whose approval clears a MANUAL gate (control-tower phase 107, #174):
+# the console's own write path for a person's press, and a person's terminal.
+# gate-approve.sh names the door from its environment — never from `--by`.
+_person_door() { case "$1" in console|terminal) return 0 ;; *) return 1 ;; esac; }
+
+# Does an approval clear phase <N>'s gate? Every kind but `human` is cleared by
+# any approved row, as it always was; a manual gate (kind `human`) only by a row
+# a person's door wrote. An unattended session once cleared one as
+# `ai-session-delegated` and went on to change production data: the row's `By`
+# is text the writer chose, so the door is the witness. The one reader behind
+# --gate-status, the boot prompt and the board, so the three never disagree.
+gate_clearance() {  # gate_clearance <phase> → "clear<TAB>by<TAB>date" | "ignored<TAB>why" | "none"
+  local ga by on door where
+  ga="$(gate_approved "$1")"
+  case "$ga" in yes*) ;; *) echo none; return ;; esac
+  by="$(printf '%s\n' "$ga" | cut -f2)"
+  on="$(printf '%s\n' "$ga" | cut -f3)"
+  door="$(printf '%s\n' "$ga" | cut -f4)"
+  if [ "$(gate_kind "$1")" = human ] && ! _person_door "$door"; then
+    if [ -n "$door" ]; then where="the $door door"; else where="no named door"; fi
+    printf 'ignored\tan approval recorded through %s (by %s) does not clear a manual gate — a person approves it on the Gate card or in a terminal\n' \
+      "$where" "${by:-nobody}"
+    return
+  fi
+  printf 'clear\t%s\t%s\n' "$by" "$on"
 }
 
 # A real YYYY-MM-DD, not merely something shaped like one. Shape alone let
@@ -687,6 +717,16 @@ _gate_cmd() {  # _gate_cmd <command-string>
   return 1
 }
 
+# A set of phase numbers as ONE comma-delimited string, ",1,2,3,", from any
+# shape the engine or a person writes: `--verified`'s `1 2 3`, `--memory-block`'s
+# `1, 2, 3`, a gate's own `1,2,3` or `10 11`. Separators are NORMALISED to one
+# comma, never deleted — deleting the spaces of `1 2 … 22` is how that set came
+# to read as the one number `12…22` and no multi-phase gate could clear (#167).
+# The delimiters on both ends keep "1" from matching inside "11".
+_phase_set() {  # _phase_set <list>
+  printf ',%s,' "$(printf '%s' "$1" | tr -s ', \t' ',' | sed 's/^,//; s/,$//')"
+}
+
 # Are these phases of ANOTHER plan done? Delegates to this same script rather
 # than re-reading a second plan's handoffs here — one implementation of "done".
 _gate_plan() {  # _gate_plan <slug:phases>
@@ -706,11 +746,10 @@ _gate_plan() {  # _gate_plan <slug:phases>
   # clear straight through it. Still delegated to this same script rather than
   # re-reading a second plan's handoffs here — one implementation of "verified".
   done_line="$(DOCS_ROOT="$DOCS_ROOT" "$0" "$other" --verified 2>/dev/null || true)"
-  # Comma-delimited on both sides so "1" cannot match inside "11".
   local done_set
-  done_set=",$(printf '%s' "$done_line" | tr -d ' '),"
+  done_set="$(_phase_set "$done_line")"
   missing=""
-  for q in $(printf '%s' "$list" | tr ',' ' '); do
+  for q in $(_phase_set "$list" | tr ',' ' '); do
     case "$q" in ''|*[!0-9]*) continue ;; esac
     case "$done_set" in
       *",$q,"*) ;;
@@ -2022,6 +2061,321 @@ verification_setup_advisories() {
   return 0
 }
 
+# F39 `setup-deps-missing`: a §Verification line that runs a package-manager
+# script or a `.venv/bin/*` binary in repository X, in a phase whose resolved
+# Setup installs nothing for X — ADVISORY, never a gate (control-tower phase
+# 106, #185 ask 1). A run's isolated checkout — a superproject mirror above
+# all — mounts every scoped repository as a fresh worktree, and a fresh
+# worktree has no node_modules and no .venv: `cd hetzner && npm run
+# verify:local` read red in 1.7 s at baseline, in a phase whose code was green,
+# because its Setup made another repository's venv and nothing installed
+# hetzner. F17 (the lead is not on this machine) and F22 (bring-up inside
+# §Verification) each miss that shape, so it is its own id.
+#
+# Advisory like F22 and F32, and for their reason: it is a claim about how the
+# plan is WRITTEN, made where the author can still act on it. A phase it
+# names may well pass — a tree that already has its dependencies, an ancestor
+# install a workspace hoists — and the console's runtime half (VE-3) records a
+# red with a missing-dependency signature as `environment`, not as a red. The
+# phases scanned are F22's exactly: an open plan's not-done phases.
+#
+# The rule, decided with the phase rather than inferred:
+#   · A line's directory X starts at the phase's `**Verify in:**` (empty: the
+#     root `.`) — read by `verify_in_directive`, the one reader `--verify-in`
+#     prints — and moves with each `cd <dir>` before the command in the line
+#     (`&&`, `;`, `||` alike), then with the package manager's own directory
+#     flag (`npm --prefix|-C`, `pnpm -C|--dir`, `yarn --cwd`). A `.venv/bin/<x>`
+#     lead means the directory holding that `.venv`. Paths are normalised
+#     (`./`, `a/./b`, `a/b/..`, a trailing `/`; `.` for the root).
+#   · Each Setup command — `setup_for_phase`'s answer, the plan-wide line then
+#     the phase's own bullet — is resolved the SAME way and from the same
+#     place, because the runner hands Setup and §Verification one cwd. So a
+#     Setup `cd app/app-frontend && pnpm install` under `Verify in:
+#     app/app-frontend` installs nothing (its cd fails), and the line says
+#     where Setup runs whenever that is not the root: 78 phases of four hub
+#     plans carry exactly that Setup (2026-10-03), green only because their
+#     shared checkout already had node_modules.
+#   · A script run is `npm run|run-script|test|t|start|stop|restart|exec|x`,
+#     `npx`, `pnpm run|test|exec|<script>`, `yarn run|test|<script>`, and any
+#     `.venv/bin/*` binary. An install is not one (`npm ci` in §Verification is
+#     F22's), and neither is `node`, `bash` or `git`.
+#   · An install for X is a Setup command resolved to X, of the line's own
+#     ECOSYSTEM — node: `npm ci|install|i`, `pnpm install|i`, `yarn install`
+#     (or a bare `yarn`); python: `pip install`, `python3 -m pip install`,
+#     `<venv>/bin/pip install`, `uv sync`, `uv pip install`, `uv venv`,
+#     `python3 -m venv`, `virtualenv`, `poetry install`. A venv made in
+#     hetzner is no install for hetzner's npm script (#185's phase 21).
+#   · Read as the shell reads it: a fenced command continued with a trailing
+#     backslash is ONE line, `bash -c '…'` / `sh -c '…'` runs its quoted text
+#     (its `cd` included), a trailing `# comment` is dropped, and a `( … )`
+#     subshell's parentheses are not words.
+#   · Silent where it cannot be true: a directory the run does not mount —
+#     absolute, `~`, above the root — or one nobody can place without running
+#     the line (`cd -`, `cd "$(…)"`, a `$VAR`) is not judged, and neither is a
+#     phase whose Verify in is prose rather than a path (the console falls
+#     back to the root for it; the prose is the defect, not the Setup).
+# One line per (phase, repository, ecosystem), naming the first line found.
+#
+# The word lists stay HERE, not in scripts/verify.env: that file is the
+# vocabulary the lint SHARES with the console's runner (verify-env.ts parses
+# it, a drift test pins the two), and no runtime reader asks these words.
+#
+# One awk per phase reads the candidates F17/F18 read (`_verification_reach
+# … spans`), with the Verify-in directory and the Setup commands in its
+# environment; its hits come back through a here-document, never a process
+# substitution (the bash 3.2 allocator, #17). A phase whose reach names no
+# package manager and no venv is skipped before anything else is read.
+verification_setup_deps_advisories() {
+  local p cands vin setup wide out cmd what x deps fix base where
+  wide="$(plan_setup)"
+  for p in "${PHASES[@]}"; do
+    _is_done "$p" && continue
+    cands="$(_verification_reach "$p" Verification spans)"
+    case "$cands" in *npm*|*npx*|*yarn*|*.venv/bin/*) ;; *) continue ;; esac
+    vin="$(verify_in_directive "$p")"
+    # A Verify in that is prose rather than a path is no directory, and the
+    # console falls back to the root for it: not this lint's question.
+    case "$vin" in *[[:space:]]*) continue ;; esac
+    setup="$(setup_for_phase "$p" "$wide")"
+    out="$(printf '%s\n' "$cands" | F39_VIN="$vin" F39_SETUP="$setup" awk '
+      function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+      function unquote(s) {
+        if (length(s) >= 2 && (s ~ /^".*"$/ || s ~ /^\047.*\047$/)) s = substr(s, 2, length(s) - 2)
+        return s
+      }
+      # ./a → a, a/./b → a/b, a/b/.. → a, a/ → a; nothing at all → "."
+      function norm(p,    n, seg, st, k, i, out, abs) {
+        p = unquote(p)
+        abs = (substr(p, 1, 1) == "/")
+        n = split(p, seg, "/")
+        k = 0
+        for (i = 1; i <= n; i++) {
+          if (seg[i] == "" || seg[i] == ".") continue
+          if (seg[i] == ".." && k > 0 && st[k] != "..") { k--; continue }
+          st[++k] = seg[i]
+        }
+        out = ""
+        for (i = 1; i <= k; i++) out = out (i > 1 ? "/" : "") st[i]
+        if (abs) return "/" out
+        return (out == "") ? "." : out
+      }
+      # rel, joined onto base — an absolute, home or variable path stands alone
+      function under(base, rel) {
+        rel = unquote(rel)
+        if (rel == "") return norm(base)
+        if (rel ~ /^[\/~$]/ || base == ".") return norm(rel)
+        return norm(base "/" rel)
+      }
+      function dirof(p) {
+        p = unquote(p)
+        if (p !~ /\//) return "."
+        sub(/\/[^\/]*$/, "", p)
+        return (p == "") ? "/" : p
+      }
+      # The path from `from` to `to`, both normalised — how Setup, which runs
+      # in the Verify-in directory, has to spell the repository.
+      function relto(from, to,    n, seg, i, up) {
+        if (to ~ /^\// || from == to) return (from == to) ? "." : to
+        if (from == ".") return to
+        if (index(to, from "/") == 1) return substr(to, length(from) + 2)
+        if (from ~ /^\.\.(\/|$)/ || from ~ /^\//) return to
+        n = split(from, seg, "/"); up = ""
+        for (i = 1; i <= n; i++) up = up (i > 1 ? "/" : "") ".."
+        return (to == ".") ? up : up "/" to
+      }
+      function venvtarget(j,    t) {   # the first operand from word j on
+        for (; j <= NW; j++) {
+          t = W[j]
+          if (t == "--prompt") { j++; continue }
+          if (t ~ /^-/) continue
+          return t
+        }
+        return ""
+      }
+      # ONE simple command: KIND (cd · install · script · ""), its FAMily,
+      # its TOOL, and the directory it names relative to where it runs (DIR).
+      function classify(seg,    i, j, t, lead, sb, sb2, venv, x, asked) {
+        KIND = ""; FAM = ""; TOOL = ""; DIR = ""
+        seg = trim(seg)
+        gsub(/^[({ \t]+|[)} \t]+$/, "", seg)
+        sub(/^\$ /, "", seg)
+        NW = split(seg, W, /[ \t]+/)
+        i = 1
+        while (i <= NW) {
+          t = W[i]
+          if (t == "!" || t == "time" || t == "command" || t == "nice" || t == "nohup" || t == "env") { i++; continue }
+          if (t == "timeout") { i += 2; continue }
+          if (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { i++; continue }
+          break
+        }
+        if (i > NW) return
+        lead = W[i]
+        if (lead == "cd") {
+          for (j = i + 1; j <= NW && (W[j] == "--" || W[j] ~ /^-[A-Za-z@]+$/); j++) ;
+          KIND = "cd"; DIR = (j <= NW) ? W[j] : "~"
+          return
+        }
+        if (lead == "npm" || lead == "pnpm" || lead == "yarn" || lead == "npx") {
+          FAM = "node"; TOOL = lead; sb = ""; asked = 0
+          for (j = i + 1; j <= NW; j++) {
+            t = W[j]
+            if (t == "--") break
+            if (index(DIRFLAG[lead], " " t " ")) { if (j < NW) DIR = W[++j]; continue }
+            if (t ~ /^-/ && t ~ /=/) {
+              if (index(DIRFLAG[lead], " " substr(t, 1, index(t, "=") - 1) " ")) { DIR = t; sub(/^[^=]*=/, "", DIR) }
+              continue
+            }
+            if (index(VALFLAG[lead], " " t " ")) { j++; continue }
+            if (t == "--version" || t == "-v" || t == "--help" || t == "-h") asked = 1
+            if (t ~ /^-/) continue
+            if (sb == "") sb = t
+            # Past an npx command, or an exec or dlx, the words belong to that
+            # command, never to the package manager.
+            if (lead == "npx" || sb == "exec" || sb == "dlx" || lead == "npm" && sb == "x") break
+          }
+          if (lead == "npx") { KIND = "script"; return }
+          if (lead == "npm") {
+            if (index(NPM_INSTALL, " " sb " ")) KIND = "install"
+            else if (index(NPM_SCRIPT, " " sb " ")) KIND = "script"
+            return
+          }
+          if (lead == "pnpm") {
+            if (sb == "") return
+            if (index(PNPM_INSTALL, " " sb " ")) KIND = "install"
+            else if (!index(PNPM_OTHER, " " sb " ")) KIND = "script"
+            return
+          }
+          if (sb == "") { if (!asked) KIND = "install"; return }   # a bare yarn installs
+          if (index(YARN_INSTALL, " " sb " ")) KIND = "install"
+          else if (!index(YARN_OTHER, " " sb " ")) KIND = "script"
+          return
+        }
+        # A path ending bin/<x>: a venv binary, pip and python included.
+        if (match(lead, /(^|\/)bin\/[^\/]+$/)) {
+          x = lead; sub(/^.*\//, "", x)
+          venv = lead; sub(/\/?bin\/[^\/]+$/, "", venv)
+          FAM = "python"; TOOL = "venv"
+          if (x ~ /^pip[0-9.]*$/ && W[i + 1] == "install") { KIND = "install"; DIR = dirof(venv); return }
+          if (x ~ /^python[0-9.]*$/ && W[i + 1] == "-m") {
+            if (W[i + 2] == "pip" && W[i + 3] == "install") { KIND = "install"; DIR = dirof(venv); return }
+            if (W[i + 2] == "venv" || W[i + 2] == "virtualenv") { KIND = "install"; DIR = dirof(venvtarget(i + 3)); return }
+          }
+          if (venv ~ /(^|\/)\.venv$/) { KIND = "script"; DIR = dirof(venv) }
+          return
+        }
+        FAM = "python"
+        if (lead ~ /^pip[0-9.]*$/) { if (W[i + 1] == "install") KIND = "install"; return }
+        if (lead ~ /^python[0-9.]*$/ && W[i + 1] == "-m") {
+          if (W[i + 2] == "pip" && W[i + 3] == "install") KIND = "install"
+          else if (W[i + 2] == "venv" || W[i + 2] == "virtualenv") { KIND = "install"; DIR = dirof(venvtarget(i + 3)) }
+          return
+        }
+        if (lead == "virtualenv") { KIND = "install"; DIR = dirof(venvtarget(i + 1)); return }
+        if (lead == "uv" || lead == "poetry") {
+          sb = ""; sb2 = ""
+          for (j = i + 1; j <= NW; j++) {
+            t = W[j]
+            if (t == "--directory" || t == "--project" || lead == "poetry" && t == "-C") { if (j < NW) DIR = W[++j]; continue }
+            if (t ~ /^--(directory|project)=/) { DIR = t; sub(/^[^=]*=/, "", DIR); continue }
+            if (t ~ /^-/) continue
+            if (sb == "") sb = t
+            else if (sb2 == "") sb2 = t
+          }
+          if (lead == "poetry") { if (sb == "install") KIND = "install"; return }
+          if (sb == "sync" || sb == "pip" && sb2 == "install") KIND = "install"
+          else if (sb == "venv") { KIND = "install"; DIR = (DIR == "" ? "" : DIR "/") dirof(sb2 == "" ? ".venv" : sb2) }
+        }
+      }
+      # A directory the run does not mount, or one nobody can place without
+      # running the line: absolute, home, an expansion, a quote fragment, or
+      # above the root. F39 says nothing about a line there.
+      function unplaced(d) { return d ~ /^[\/~]/ || d ~ /^\.\.(\/|$)/ || d ~ /[$`"\047(]/ }
+      # One command line, from BASE: every simple command in it, with each
+      # `cd` before it moving where the rest runs. "setup" records the
+      # installs; "verify" reports a script run its repository never got.
+      function walk(line, mode,    parts, n, k, cwd, x, key, r, fix, what, c, q) {
+        line = trim(line)
+        c = line                                    # quoted as written
+        # bash -c and sh -c run their quoted text, a cd included.
+        if (match(line, /^(bash|sh) +-c +/)) {
+          q = substr(line, RLENGTH + 1, 1)
+          if ((q == "\047" || q == "\"") && substr(line, length(line), 1) == q)
+            line = substr(line, RLENGTH + 2, length(line) - RLENGTH - 2)
+        }
+        sub(/[ \t]+#[^\047"]*$/, "", line)          # a trailing comment
+        gsub(/&&|\|\||;|\|/, "\001", line)
+        n = split(line, parts, "\001")
+        cwd = BASE
+        for (k = 1; k <= n; k++) {
+          classify(parts[k])
+          if (KIND == "cd") {
+            if (DIR == "-" || DIR ~ /[$`(]/) return
+            cwd = under(cwd, DIR)
+            continue
+          }
+          if (KIND == "") continue
+          x = under(cwd, DIR)
+          key = FAM SUBSEP x
+          if (mode == "setup") { if (KIND == "install") HAVE[key] = 1; continue }
+          if (KIND != "script" || unplaced(x) || (key in HAVE) || (key in SAID)) continue
+          SAID[key] = 1
+          r = relto(BASE, x)
+          if (TOOL == "pnpm") { what = "a pnpm script"; fix = (r == ".") ? "pnpm install" : "pnpm -C " r " install" }
+          else if (TOOL == "yarn") { what = "a yarn script"; fix = (r == ".") ? "yarn install" : "yarn --cwd " r " install" }
+          else if (TOOL == "venv") {
+            what = "a .venv binary"
+            fix = ((r == ".") ? "" : "cd " r " && ") "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+          }
+          else { what = (TOOL == "npx") ? "an npx command" : "an npm script"; fix = (r == ".") ? "npm ci" : "npm --prefix " r " ci" }
+          gsub(/[\t\037]/, " ", c)
+          if (length(c) > 120) c = substr(c, 1, 117) "..."
+          printf "%s\037%s\037%s\037%s\037%s\037%s\n", c, what, x, (FAM == "node") ? "node_modules" : ".venv", fix, BASE
+        }
+      }
+      # A line ending in a backslash goes on: judge it whole, once.
+      function feed(s, mode) {
+        s = (PEND[mode] == "") ? s : PEND[mode] " " trim(s)
+        PEND[mode] = ""
+        if (s ~ /\\[ \t]*$/) { sub(/[ \t]*\\[ \t]*$/, "", s); PEND[mode] = s; return }
+        walk(s, mode)
+      }
+      BEGIN {
+        NPM_INSTALL = " ci clean-install ic install-clean isntall-clean install i in ins inst insta instal isnt isnta isntal isntall add install-test it install-ci-test cit "
+        NPM_SCRIPT = " run run-script rum urn test tst t start stop restart exec x "
+        PNPM_INSTALL = " install i add install-test it "
+        PNPM_OTHER = " remove rm uninstall un update up upgrade link ln unlink import rebuild rb prune fetch patch patch-commit patch-remove audit list ls ll la outdated why licenses env setup store server init deploy doctor config c get set dlx create publish pack root bin self-update help completion cat-file cat-index find-hash approve-builds ignored-builds "
+        YARN_INSTALL = " install add "
+        YARN_OTHER = " remove upgrade up upgrade-interactive why info init config cache global link unlink pack publish login logout bin version versions list licenses audit autoclean check create dlx generate-lock-entry help import outdated owner policies team tag unplug set plugin rebuild constraints explain npm patch patch-commit search stage dedupe "
+        # Each tool its own: the flag that names a directory, and the flags
+        # that take a value (npm -w names a workspace; pnpm -w takes none).
+        DIRFLAG["npm"] = " --prefix -C "; DIRFLAG["npx"] = " --prefix -C "
+        DIRFLAG["pnpm"] = " -C --dir ";   DIRFLAG["yarn"] = " --cwd "
+        VALFLAG["npm"] = " -w --workspace --loglevel --registry --cache --userconfig "
+        VALFLAG["npx"] = " -p --package -c --call --loglevel --registry "
+        VALFLAG["pnpm"] = " --filter -F --reporter --loglevel --workspace-concurrency --store-dir "
+        VALFLAG["yarn"] = " --mutex --network-timeout --cache-folder --modules-folder --registry --global-folder --link-folder --use-yarnrc "
+        BASE = norm(ENVIRON["F39_VIN"])
+        ns = split(ENVIRON["F39_SETUP"], S, "\n")
+        for (q = 1; q <= ns; q++) feed(S[q], "setup")
+        if (PEND["setup"] != "") walk(PEND["setup"], "setup")
+      }
+      { feed($0, "verify") }
+      END { if (PEND["verify"] != "") walk(PEND["verify"], "verify") }
+    ')"
+    [ -n "$out" ] || continue
+    while IFS=$'\037' read -r cmd what x deps fix base; do
+      [ -n "$cmd" ] || continue
+      where=""
+      [ "$base" = . ] || where=" (Setup runs where §Verification does, in \`$base\`)"
+      printf 'F39 phase %s: setup-deps-missing — `%s` runs %s in `%s` and the phase'"'"'s Setup installs nothing for `%s`%s: a run'"'"'s isolated checkout mounts it with no %s, so the line fails before it tests anything; add the install (e.g. "- **Setup:** %s") to §Phase %s\n' \
+        "$p" "$cmd" "$what" "$x" "$x" "$where" "$deps" "$fix" "$p"
+    done <<EOF
+$out
+EOF
+  done
+  return 0
+}
+
 # F23: an expected failure stated in PROSE beside a command — ADVISORY, never a
 # gate.
 #
@@ -2224,9 +2578,11 @@ plan_setup() {
 # the phase's own `- **Setup:**` bullet. One command per line, in order — the
 # order matters, because the shared stack has to be up before a phase's extra
 # step against it can work.
-setup_for_phase() {  # setup_for_phase <phase>
+setup_for_phase() {  # setup_for_phase <phase> [the plan-wide line, already read]
   local wide
-  wide="$(plan_setup)"
+  # A caller walking every phase (lint F39) reads the plan-wide line ONCE and
+  # hands it in — the same answer, without an awk over §Session budget per phase.
+  if [ "$#" -ge 2 ]; then wide="$2"; else wide="$(plan_setup)"; fi
   {
     [ -n "$wide" ] && printf '%s\n' "$wide" | grep -oE '`[^`]+`' | tr -d '`'
     _setup_commands "$1"
@@ -2459,12 +2815,23 @@ waits_on_refs() {  # waits_on_refs <phase> → one ref per line: backticked span
 # nothing ever parsed it, so a plan carrying it asked for a step the console
 # never saw. The reader skips it and F37 names it with the new grammar. The
 # JS twin is `humanStepsFor` in parse/plan.ts (engine-parity holds them).
-HUMAN_STEP_GRAMMAR='- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host]'
+HUMAN_STEP_GRAMMAR='- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]'
 
+# Phase 0 is the plan ITSELF (control-tower phase 121): its own acts are bullets
+# under `## Operator errands`, which no phase owns — an act the operator owes the
+# run, like restarting a console once a release is out. Every other phase reads
+# its `### Phase N` block.
 human_step_bodies() {  # human_step_bodies <phase> → each bullet's body after its label, one per line
-  phase_block "$1" \
+  if [ "$1" = 0 ]; then _section 2 "operator errands"; else phase_block "$1"; fi \
     | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}human[[:space:]]+step\*{0,2}[[:space:]]*:' \
     | sed -E 's/^[^:]*:[[:space:]]*//; s/^\*{1,2}[[:space:]]*//; s/[[:space:]]+$//' || true
+}
+
+# The phases that may carry a step: 0 when the plan's own errands declare one,
+# then every phase of the graph.
+human_step_phases() {
+  [ -n "$(human_step_bodies 0)" ] && printf '0\n'
+  printf '%s\n' "${PHASES[@]}"
 }
 
 _hs_trim() { sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
@@ -2475,7 +2842,7 @@ _hs_trim() { sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
 _human_step_parse() {  # _human_step_parse <body>
   local tab fields field key value n=0 keyed=0 kind_field word pair
   tab="$(printf '\t')"
-  HS_KIND=""; HS_WHAT=""; HS_OPEN=""; HS_PROOF=""; HS_WHERE=""; HS_WINDOW=""; HS_AUTO=""; HS_CRED=""; HS_BAD=""
+  HS_KIND=""; HS_WHAT=""; HS_OPEN=""; HS_PROOF=""; HS_WHERE=""; HS_WINDOW=""; HS_AUTO=""; HS_CRED=""; HS_DUE=""; HS_BAD=""
   fields="$(printf '%s\n' "$1" | sed -E "s/[[:space:]]*·[[:space:]]*/$tab/g" | tr "$tab" '\n')"
   while IFS= read -r field; do
     n=$((n + 1))
@@ -2495,6 +2862,7 @@ _human_step_parse() {  # _human_step_parse <body>
       window) HS_WINDOW="$value" ;;
       auto-open) HS_AUTO="$(printf '%s' "$value" | tr 'A-Z' 'a-z')" ;;
       credential) HS_CRED="$value" ;;
+      due) HS_DUE="$value" ;;
     esac
   done <<EOF
 $fields
@@ -2528,6 +2896,22 @@ EOF
     printf '%s' "$HS_CRED" | grep -qE '^[a-z0-9][a-z0-9._-]{0,63}$' \
       || { HS_BAD="credential: \"$HS_CRED\" is not a registry id (a-z, 0-9, . _ -)"; return 3; }
   fi
+  # `due:` is a watch ref the console polls (control-tower phase 121): the step
+  # is `upcoming` until it lands, so a value that fits no scheme's SHAPE would
+  # hold it back for ever — refused here, as phase-outcome.sh's door refuses
+  # it. The JS twin is `shared/human-step-model.js` `dueRefOk`.
+  if [ -n "$HS_DUE" ]; then
+    local due_body="${HS_DUE#*:}"
+    case "$HS_DUE" in
+      gh:*) printf '%s' "$HS_DUE" | grep -Eq '^gh:[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*#(run|pr)/[0-9]+$' ;;
+      date:*|until:*) printf '%s' "$due_body" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}' ;;
+      lock:*|phase:*|verify:*) printf '%s' "$due_body" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*/0*[1-9][0-9]*$' ;;
+      cmd:*) due_body="${due_body#\"}"; due_body="${due_body%\"}"; due_body="${due_body#\'}"; due_body="${due_body%\'}"
+        printf '%s' "$due_body" | grep -q '[^ 	]' ;;
+      unit:*) printf '%s' "$HS_DUE" | grep -Eq '^unit:[A-Za-z0-9][A-Za-z0-9._-]{0,62}/[A-Za-z0-9][A-Za-z0-9@._:-]{0,254}$' ;;
+      *) false ;;
+    esac || { HS_BAD="due: \"$HS_DUE\" is not a watch ref the console can poll — gh:<owner/repo>#run/<id>, date:<ISO8601 instant>, lock:|phase:|verify:<slug>/<N>, cmd:\"<command>\" or unit:<host>/<unit>"; return 3; }
+  fi
   # A URL-shaped `open:` (a scheme before the first colon) must be http(s);
   # anything else is a command, which only the embedded terminal runs.
   if printf '%s' "$HS_OPEN" | grep -qE '^[A-Za-z][A-Za-z0-9+.-]*:[^[:space:]]'; then
@@ -2538,13 +2922,16 @@ EOF
 }
 
 # The phase's well-formed steps, one per line:
-#   kind<TAB>what<TAB>open<TAB>proof<TAB>where<TAB>window-minutes<TAB>auto-open<TAB>credential
+#   kind<TAB>what<TAB>open<TAB>proof<TAB>where<TAB>window-minutes<TAB>auto-open<TAB>credential[<TAB>due]
+# The ninth field is printed only when the bullet names a `due:` ref, so every
+# line written before control-tower phase 121 reads byte for byte as it did.
 human_steps_for_phase() {  # human_steps_for_phase <phase>
   local body
   while IFS= read -r body; do
     [ -z "$body" ] && continue
     _human_step_parse "$body" || continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$HS_KIND" "$HS_WHAT" "$HS_OPEN" "$HS_PROOF" "$HS_WHERE" "$HS_WINDOW" "$HS_AUTO" "$HS_CRED"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$HS_KIND" "$HS_WHAT" "$HS_OPEN" "$HS_PROOF" "$HS_WHERE" "$HS_WINDOW" "$HS_AUTO" "$HS_CRED"
+    if [ -n "$HS_DUE" ]; then printf '\t%s\n' "$HS_DUE"; else printf '\n'; fi
   done <<EOF
 $(human_step_bodies "$1")
 EOF
@@ -2558,7 +2945,7 @@ EOF
 # lint a typo is a step the launch door never asks for.
 human_step_issues() {
   local p body rc
-  for p in "${PHASES[@]}"; do
+  for p in $(human_step_phases); do
     while IFS= read -r body; do
       [ -z "$body" ] && continue
       rc=0; _human_step_parse "$body" || rc=$?
@@ -2579,7 +2966,7 @@ EOF
 # person's word can ever close it, and the launch door cannot pre-clear it.
 human_step_advisories() {
   local p kind what
-  for p in "${PHASES[@]}"; do
+  for p in $(human_step_phases); do
     # awk picks the steps with no proof: a tab is IFS whitespace, so `read`
     # alone would fold an empty `open` into the next field and read `where`
     # as the proof. Kind and what are never empty, so reading those two is safe.
@@ -2620,6 +3007,41 @@ verify_timeout_for_phase() {  # verify_timeout_for_phase <phase> → minutes<TAB
   if [ -n "$m" ]; then printf '%s\tphase\n' "$m"; return 0; fi
   m="$(plan_verify_timeout)"
   [ -n "$m" ] && printf '%s\tplan\n' "$m"
+  return 0
+}
+
+# ---- How many waits a phase may DECLARE (control-tower phase 121, #40) -------
+# `**Wait count:** <n>` in §Session budget raises the console's own four for
+# every phase; `- **Wait count:** <n>` in a `### Phase N` block raises it for
+# that phase alone. A whole number from 1 to 99 — anything else is silence, so
+# the console's default stands. The JS twin is `waitCountFor` in parse/plan.ts.
+_count_word() {  # _count_word <text> → the first whole number 1..99, or nothing
+  printf '%s\n' "$1" | tr -d '`*' | awk '{
+    if (!match($0, /^[[:space:]]*[0-9]+([^0-9A-Za-z]|$)/)) exit
+    n = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", n); n = n + 0
+    if (n >= 1 && n <= 99) print n
+    exit
+  }' || true
+}
+
+plan_wait_count() {  # plan_wait_count → n, or nothing
+  local body
+  body="$(_section 2 "session budget" \
+    | grep -iE '^[[:space:]>]*\*{0,2}wait[[:space:]]+count\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*//; s/^\*{1,2}[[:space:]]*//')" || true
+  [ -n "$body" ] && _count_word "$body"
+  return 0
+}
+
+wait_count_for_phase() {  # wait_count_for_phase <phase> → n<TAB>phase|plan, or nothing
+  local body n
+  body="$(phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}wait[[:space:]]+count\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*//; s/^\*{1,2}[[:space:]]*//')" || true
+  n=""; [ -n "$body" ] && n="$(_count_word "$body")"
+  if [ -n "$n" ]; then printf '%s\tphase\n' "$n"; return 0; fi
+  n="$(plan_wait_count)"
+  [ -n "$n" ] && printf '%s\tplan\n' "$n"
   return 0
 }
 
@@ -2983,6 +3405,54 @@ checkout_directive() {  # checkout_directive <phase> -> the branch, or ""
     || true
 }
 
+# `**Verify in:** <dir>` — the directory phase N's §Verification commands mean,
+# relative to the repository root; empty means the root itself. Setup runs in
+# the same directory (the runner hands both the one cwd), which is why lint
+# F39 resolves a Setup command and a §Verification line from the same place.
+#
+# Read by the CONSOLE's rule, not by `checkout_directive`'s, because the two
+# readers answer one question — where the console judges a phase's lines —
+# and `phase-outcome.sh verified` asks this one: `bullet(labelledBullets(raw),
+# 'Verify in')` in viewer/server/parse/plan.ts (markdown.ts holds both). So:
+#   · the label is BOLD (`**Verify in:**`, or `**Verify in**:`), matched by
+#     prefix and case-insensitively — an unbolded `Verify in:` line is not the
+#     field to either reader;
+#   · at either indent: a top-level bullet, or one nested under
+#     `- **Verification:**` (with nothing open yet, up to three spaces of
+#     indent still count as top level; deeper than that is skipped);
+#   · the FIRST in document order, never one inside a fenced block (a fenced
+#     example of the bullet is not the bullet);
+#   · the value is the rest of the label's own line, trimmed. A continuation
+#     line the JS reader would append to a top-level bullet's body is not part
+#     of a directory, and no directory has one.
+# One deliberate difference: bold and backticks are stripped from the value,
+# as `checkout_directive` strips them (a plan that writes `` `trade/backend` ``
+# means trade/backend); the JS field is the raw text, trimmed.
+verify_in_directive() {  # verify_in_directive <phase> -> the directory (no newline), or ""
+  # Read to the end rather than `exit` at the hit: the writer's exit stays
+  # ordinary (no broken pipe), and a phase block is a screen of text.
+  phase_block "$1" | awk '
+    found { next }
+    /^[ \t]*(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    {
+      if (!match($0, /^[ \t]*[-*][ \t]+/)) next
+      rest = substr($0, RLENGTH + 1)
+      if (rest !~ /^\*\*[^*]+\*\*/) next          # a bullet, but not a labelled one
+      match($0, /^[ \t]*/); indent = RLENGTH
+      if (!open && indent > 3) next               # nothing open: deeper is not a field
+      open = 1
+      label = substr(rest, 3); sub(/\*\*.*$/, "", label)
+      gsub(/^[ \t]+|[ \t]+$/, "", label); sub(/:$/, "", label)
+      if (tolower(label) !~ /^verify in/) next
+      v = rest; sub(/^\*\*[^*]+\*\*/, "", v); sub(/^:/, "", v)
+      gsub(/[*`]/, "", v); gsub(/^[ \t]+|[ \t]+$/, "", v)
+      printf "%s", v
+      found = 1
+    }
+  ' || true
+}
+
 # `- **Wall-clock floor:** <duration>` — the phase's FIXED wall-clock floor: a
 # full `gates.sh` run, a CD wait — the least time it can take no matter how
 # small its Size tag (Size weights CONTEXT for the ladder; this is a clock).
@@ -3163,6 +3633,7 @@ isolation_for_phase() {  # isolation_for_phase [phase] -> shared|worktree<TAB>so
 issues_for_phase() {  # issues_for_phase [phase] -> off|draft|file<TAB>source
   _resolve_directive "${1:-}" 'Issues' 'Issues' "$ISSUE_MODES" "$DEFAULT_ISSUES"
 }
+
 
 plan_conflict_policy() {  # -> halt|park|rebase-session<TAB>source
   _resolve_directive '' 'Conflicts' '' "$CONFLICT_POLICIES" "$DEFAULT_CONFLICT"
@@ -3958,6 +4429,7 @@ compute_groups() {  # compute_groups <budget>
 BP_MARKS=0
 _bp_mark() { [ "$BP_MARKS" = 1 ] && printf '\036%s\n' "$1"; return 0; }
 
+
 boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   local p="$1" bp_show="$2" bp_pad dep_lines d pad hf sk mc sp gk ga gc_text ga_by ga_on gs
   local bp_notes bp_n dec_rows sc root_tok lock_git _bpn
@@ -4034,11 +4506,11 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   _bp_mark gate
   if [ "${GATED[$p]:-no}" = yes ]; then
     gk="$(gate_kind "$p")"
-    ga="$(gate_approved "$p")"
+    gcl="$(gate_clearance "$p")"
     gc_text="$(gate_conditions "$p")"
-    case "$ga" in
-      yes*)
-        ga_by="$(printf '%s\n' "$ga" | cut -f2)"; ga_on="$(printf '%s\n' "$ga" | cut -f3)"
+    case "$gcl" in
+      clear*)
+        ga_by="$(printf '%s\n' "$gcl" | cut -f2)"; ga_on="$(printf '%s\n' "$gcl" | cut -f3)"
         printf '✅ GATED phase — gate already approved by %s on %s. Proceed straight to the work.\n' "${ga_by:-someone}" "${ga_on:-an unrecorded date}"
         ;;
       *)
@@ -4056,35 +4528,23 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
             printf 'STOP, report exactly what is missing and what you verified, and hand it to the operator.\n'
             ;;
           human)
-            if [ "${PE_GATE_DELEGATE:-0}" = "1" ]; then
-              # The operator delegated this gate's verification to the session.
-              # `gate-status.md`'s own header already names an AI session that
-              # verified the conditions as a legitimate approver, and plans in
-              # the wild record exactly that (`by: ai-session-delegated`). The
-              # safety is NOT that the session is trusted to judge — it is that
-              # a condition it cannot verify from evidence STOPS it, with the
-              # unverified condition named, rather than being waved through.
-              printf '🤖 GATED phase (human, DELEGATED to you) — verify it yourself before implementing.\n'
-              printf 'The operator has delegated this gate. Conditions, verbatim:\n'
-              printf '%s\n' "$gc_text" | sed 's/^/    /'
-              printf 'For EACH condition: verify it against evidence you can actually read (a command you\n'
-              printf 'run, a file, a URL you fetch, a CI status). Quote that evidence.\n'
-              printf -- '- Every condition verified → record it and continue into the phase:\n'
-              printf -- '    %s/gate-approve.sh %s %s --by "ai-session-delegated" --note "<condition: evidence, per condition>"\n' "$CMD" "$slug" "$bp_show"
-              printf -- '- ANY condition you cannot verify from evidence — a visual judgement nobody has made,\n'
-              printf -- '  a credential you lack, a person'"'"'s sign-off, a preview nobody has looked at — STOP.\n'
-              printf -- '  Do not approve it, do not implement past it, and say exactly which condition and why:\n'
-              printf -- '    %s/phase-outcome.sh %s %s blocked --needs gates --reason "<the condition you could not verify>"\n' "$CMD" "$slug" "$bp_show"
-              printf 'Never record an approval you cannot cite evidence for. A gate approved on a guess is\n'
-              printf 'worse than a gate that stopped the run.\n'
-            else
-              printf '🧍 GATED phase (human) — STOP: a person must clear this gate before implementation.\n'
-              printf 'Operator steps:\n'
-              printf '%s\n' "$gc_text" | sed 's/^/    /'
-              printf 'Ask the operator to do these steps and approve the gate — Phase Console → plan → phase %s\n' "$bp_show"
-              printf -- '→ Gate card, or: %s/gate-approve.sh %s %s --by "<who>" --note "<what was done>"\n' "$CMD" "$slug" "$bp_show"
-              printf 'Do NOT implement past an unapproved human gate.\n'
-            fi
+            # A MANUAL gate is a person's, whatever the plan's `gates` row or
+            # this console's `delegateHumanGates` says (control-tower phase 107,
+            # #174). This block briefed a session to verify the gate and clear
+            # it itself under `PE_GATE_DELEGATE=1`, and an unattended session
+            # did — `ai-session-delegated` — then changed production data on
+            # the strength of it. So it never tells a session to clear one, the
+            # runner never boards one for a session, and gate-approve.sh
+            # refuses a session's approval of one anyway.
+            printf '🧍 GATED phase (human) — STOP: a person must clear this gate before implementation.\n'
+            printf 'Operator steps:\n'
+            printf '%s\n' "$gc_text" | sed 's/^/    /'
+            case "$gcl" in ignored*) printf '(%s.)\n' "$(printf '%s\n' "$gcl" | cut -f2)" ;; esac
+            printf 'Ask the operator to do these steps and approve the gate — Phase Console → plan → phase %s\n' "$bp_show"
+            printf -- '→ Gate card, or in their own terminal: %s/gate-approve.sh %s %s --by "<who>" --note "<what was done>"\n' "$CMD" "$slug" "$bp_show"
+            printf 'Do NOT implement past an unapproved human gate, and never approve it yourself: the script\n'
+            printf 'refuses a session'"'"'s approval of a manual gate. Unattended, hand off and declare what it needs:\n'
+            printf '    %s/phase-outcome.sh %s %s needs-human --needs gates --reason "<what the gate needs>"\n' "$CMD" "$slug" "$bp_show"
             ;;
           *)
             gs="$(PHASE_EXEC_GATES=0 DOCS_ROOT="$DOCS_ROOT" "$0" "$slug" --gate-status "$p" 2>/dev/null || true)"
@@ -4426,6 +4886,7 @@ case "$mode" in
       _advise F17 verification_lead_advisories
       _advise F18 verification_cwd_advisories
       _advise F22 verification_setup_advisories
+      _advise F39 verification_setup_deps_advisories
       _advise F23 verification_expected_failure_advisories
       _advise F19 deadlock_advisories
       _advise F28 land_needs_lane_advisories
@@ -4474,6 +4935,17 @@ case "$mode" in
     # has none. The console reads `main`/`master`/`default` as "detach at the
     # default branch"; every other value is documentation.
     [ -n "$arg" ] && checkout_directive "$arg"
+    printf '\n'
+    exit 0
+    ;;
+  --verify-in)
+    # The phase's `**Verify in:**` directory, one line — bold and backticks
+    # stripped, an empty line when it has none (the repository root), read by
+    # the console's own rule (`verify_in_directive`). Where §Verification and
+    # Setup run; `phase-outcome.sh verified` asks it where the console judges
+    # a line.
+    [ -z "$arg" ] && { printf 'usage: --verify-in <phase>\n' >&2; exit 2; }
+    verify_in_directive "$arg"
     printf '\n'
     exit 0
     ;;
@@ -4580,6 +5052,19 @@ case "$mode" in
     fi
     exit 0
     ;;
+  --wait-count)
+    # How many waits a phase may declare, and which line said so: the phase's
+    # `Wait count:` bullet, else the plan's line (control-tower phase 121, #40).
+    # Nothing is silence — the console's own four then apply.
+    if [ -n "$arg" ]; then
+      case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+      wait_count_for_phase "$arg"
+    else
+      wc_n="$(plan_wait_count)"
+      [ -n "$wc_n" ] && printf '%s\tplan\n' "$wc_n"
+    fi
+    exit 0
+    ;;
   --verify-timeout)
     # How long one §Verification command may run, and which line said so: the
     # phase's `Verify timeout:` bullet, else the plan's line (control-tower
@@ -4608,11 +5093,12 @@ case "$mode" in
     # auto-open<TAB>credential. With a phase, that phase's; with none, every
     # phase's, each line led by `N<TAB>`. Nothing when there are none — and a
     # bullet the lint refuses (F37) is not a step.
+    # Phase 0 is the plan's own (`## Operator errands`, control-tower phase 121).
     if [ -n "$arg" ]; then
-      case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+      case " 0 ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
       human_steps_for_phase "$arg"
     else
-      for p in "${PHASES[@]}"; do
+      for p in $(human_step_phases); do
         human_steps_for_phase "$p" | awk -v p="$p" '{ print p "\t" $0 }'
       done
     fi
@@ -4843,17 +5329,20 @@ case "$mode" in
     [ -z "$arg" ] && { echo "usage: --gate-status <phase>" >&2; exit 2; }
     gc="$(gate_check_directive "$arg")"
     # A recorded approval clears ANY gate kind — the operator's override from
-    # the console's Gate card, or an AI session's recorded clearance. Checked
-    # only for phases that actually carry a gate, so an ungated phase still
-    # answers "clear (no gate)".
+    # the console's Gate card, or an AI session's recorded clearance — except
+    # that a MANUAL gate counts only a row a person's door wrote (#174; see
+    # gate_clearance). Checked only for phases that actually carry a gate, so
+    # an ungated phase still answers "clear (no gate)".
+    gate_note=""
     if [ -n "$gc" ] || [ "$(is_gated "$arg")" = yes ]; then
-      ga="$(gate_approved "$arg")"
-      case "$ga" in
-        yes*)
-          ga_by="$(printf '%s\n' "$ga" | cut -f2)"
-          ga_on="$(printf '%s\n' "$ga" | cut -f3)"
+      gcl="$(gate_clearance "$arg")"
+      case "$gcl" in
+        clear*)
+          ga_by="$(printf '%s\n' "$gcl" | cut -f2)"
+          ga_on="$(printf '%s\n' "$gcl" | cut -f3)"
           printf 'clear (approved by %s on %s)\n' "${ga_by:-someone}" "${ga_on:-an unrecorded date}"
           exit 0 ;;
+        ignored*) gate_note="$(printf '%s\n' "$gcl" | cut -f2)" ;;
       esac
     fi
     if [ -z "$gc" ]; then
@@ -4905,8 +5394,10 @@ case "$mode" in
         # conditions, do the work to make them true, and record the clearance
         # via gate-approve.sh". The boot prompt carries the full duty.
         echo "ai: ${gval:-$(gate_conditions_line "$arg")}"; exit 1 ;;
-      manual) echo "manual: $gval"; exit 1 ;;
-      *)      echo "manual: $gc"; exit 1 ;;
+      # A set-aside approval is named beside the conditions, so the Gate card
+      # and the errand say why the row on file did not open the gate.
+      manual) echo "manual: $gval${gate_note:+ — $gate_note}"; exit 1 ;;
+      *)      echo "manual: $gc${gate_note:+ — $gate_note}"; exit 1 ;;
     esac
     ;;
   --verified)
@@ -4920,8 +5411,9 @@ case "$mode" in
     # knew the difference; nothing had ever asked it across a plan boundary,
     # because there was no arm to ask through.
     #
-    # Same shape as `--memory-block`'s `done:` value, so `_gate_plan` reads
-    # either with the same two lines.
+    # SPACE-separated — NOT the shape of `--memory-block`'s `done:` value
+    # (`1, 2, 3`), whatever this comment once claimed. `_gate_plan` reads either
+    # through `_phase_set`, which normalises the separators (#167).
     vf=""
     for p in "${PHASES[@]}"; do
       _is_verified "$p" && vf="$vf $p"
@@ -5125,7 +5617,11 @@ for p in "${PHASES[@]}"; do
     gmark=" 🔒GATED"
     gk="$(gate_kind "$p")"
     [ "$gk" != none ] && gmark=" 🔒GATED·${gk}"
-    case "$(gate_approved "$p")" in yes*) gmark="${gmark} ✓approved" ;; esac
+    # An approval a manual gate set aside (#174) is never painted approved.
+    case "$(gate_clearance "$p")" in
+      clear*)   gmark="${gmark} ✓approved" ;;
+      ignored*) gmark="${gmark} ✗approval not a person's" ;;
+    esac
   fi
   case "$state" in
     done)        icon="✅"; extra=""

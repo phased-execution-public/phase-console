@@ -79,7 +79,7 @@ export class Store {
     const { plansDir, handoffsDir } = this.root;
 
     for (const file of plansDir ? safeList(plansDir) : []) {
-      if (!file.endsWith('.md') || file === 'README.md') continue;
+      if (!isPlanFile(file)) continue;
       const slug = file.replace(/\.md$/, '');
       this.records.set(slug, this.readPlan(slug, join(plansDir!, file)));
     }
@@ -101,6 +101,11 @@ export class Store {
 
   /** Re-read the plans touched by these paths. Returns the affected slugs. */
   refresh(paths: string[]): string[] {
+    // A path under the plans directory that is not a plan file names no plan
+    // and changes no roster — see `ignores`. It used to fall through to the
+    // `!slug` arm below, so every scratch file a save made rescanned the world.
+    paths = paths.filter((p) => !this.ignores(p));
+    if (!paths.length) return [];
     const slugs = new Set<string>();
     for (const path of paths) {
       const slug = this.slugForPath(path);
@@ -134,12 +139,37 @@ export class Store {
     return [...slugs];
   }
 
+  /**
+   * A watched path the store does not model, so a batch of them changes
+   * nothing (2026-10-05, the engine-queue-588 incident): anything under the
+   * plans directory that is not a DIRECT child `<slug>.md` plan file — a
+   * save's scratch name (`<slug>.md.tmp.<pid>.<hex>`), a file in a
+   * subdirectory (`plans/observability-plane/x.md`), a loose `.json`, the
+   * README `scan()` skips.
+   *
+   * `slugForPath` answered undefined for most of those and a plan that does
+   * not exist for the rest (`x` for a subdirectory's `x.md`, `README`), and
+   * `refresh` reads either as a roster change: a wholesale rescan that
+   * returned every slug, and the watcher then forgot every plan's cached
+   * answers. The watched directory ITSELF is not ignored — that is the
+   * deaf-heartbeat flush, which knows something changed but not what, and
+   * still rescans.
+   */
+  ignores(path: string): boolean {
+    const { plansDir } = this.root;
+    if (!plansDir || !path.startsWith(plansDir)) return false;
+    const rest = path.slice(plansDir.length).replace(/^[/\\]+/, '');
+    return rest !== '' && !isPlanFile(rest);
+  }
+
   /** The plan a watched path belongs to, or undefined for a path no slug owns (a watched directory itself). */
   slugForPath(path: string): string | undefined {
     const { plansDir, handoffsDir } = this.root;
     if (plansDir && path.startsWith(plansDir)) {
-      const file = basename(path);
-      return file.endsWith('.md') ? file.replace(/\.md$/, '') : undefined;
+      // Only a direct child `<slug>.md` is a plan (`ignores`) — never the
+      // basename of a deeper file, which named a plan that does not exist.
+      const rest = path.slice(plansDir.length).replace(/^[/\\]+/, '');
+      return isPlanFile(rest) ? rest.replace(/\.md$/, '') : undefined;
     }
     if (handoffsDir && path.startsWith(handoffsDir)) {
       const rest = path.slice(handoffsDir.length).replace(/^[/\\]/, '');
@@ -247,6 +277,16 @@ export function lockOnlySlugs(paths: readonly string[], slugOf: (path: string) =
 
 function isDir(path: string): boolean {
   try { return statSync(path).isDirectory(); } catch { return false; }
+}
+
+/**
+ * A plan file's name, relative to the plans directory: `<slug>.md`, a direct
+ * child, never the README. One definition for `scan()` (what is a plan) and
+ * `slugForPath`/`ignores` (what a watch event names), so the two cannot
+ * disagree — a name one of them rejects was a rescan on every write to it.
+ */
+function isPlanFile(name: string): boolean {
+  return /^[^/\\]+\.md$/.test(name) && name !== 'README.md';
 }
 
 /**

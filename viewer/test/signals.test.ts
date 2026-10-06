@@ -275,3 +275,42 @@ test('the shutdown ladder is awaited, and inside the console\'s drain budget', (
   assert.match(read('runner/runner-control.ts'), /onShutdown\(this\.shutdownKey\(runId\), \(context\) => this\.checkpointForShutdown\(context\)\)/,
     'the drive loop\'s handler forwards the context');
 });
+
+test('killLadder: a group whose LEADER has exited is still signalled — the group is probed, never only the leader (#168)', async () => {
+  // tamagui P4: the sweep's bash (the leader) exited, a backgrounded Metro
+  // subshell in its group held stdout, and at the timeout the ladder asked
+  // whether the LEADER lived, heard `gone`, and signalled nobody for 50 min.
+  const r = recorder();
+  let members = true;
+  const how = await killLadder(92, {
+    signal: r.signal,
+    interrupt: false,
+    alive: () => false,                // the leader is gone
+    groupAlive: () => members,         // its group is not
+    sleep: async () => { if (r.sent.some((s) => s.signal === 'SIGTERM')) members = false; },
+  });
+  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGTERM'], 'the group still gets the wake and the ask');
+  assert.equal(how, 'exited');
+});
+
+test('killLadder: a group that ignores SIGTERM after its leader left still meets the SIGKILL backstop', async () => {
+  const r = recorder();
+  const how = await killLadder(91, {
+    signal: r.signal, interrupt: false, alive: () => false, groupAlive: () => true, sleep: noSleep,
+  });
+  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGTERM', 'SIGKILL']);
+  assert.equal(how, 'killed');
+});
+
+test('killLadder: `gone` means the leader AND its group are gone', async () => {
+  const r = recorder();
+  const how = await killLadder(90, { signal: r.signal, alive: () => false, groupAlive: () => false, sleep: noSleep });
+  assert.deepEqual(r.sent, [], 'nothing left to signal');
+  assert.equal(how, 'gone');
+});
+
+test('the shipped ladder probes the group through pid.ts — the one place that asks about a process', () => {
+  const src = read('runner/signals.ts');
+  assert.match(src, /import \{[^}]*\bgroupState\b[^}]*\} from '\.\.\/pid\.ts'/, 'the group probe is pid.ts\'s, not a second kill(0)');
+  assert.match(read('pid.ts'), /export function groupState\(/);
+});

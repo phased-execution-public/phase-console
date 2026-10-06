@@ -35,6 +35,8 @@
  *   gh           `gh auth status`
  *   publish      `--allow-publish`: may this console push `pe/*` branches and
  *                file issues at all (advisory — off is a fine console)
+ *   issues       `--allow-issues`: may this console file, comment on and label
+ *                issues (advisory; `--allow-publish` implies it)          (Pro)
  *   environment  the environment doctor's issues (PATH, a foreign home, push) BLOCKING
  *   console      a console answering on the instance's port, and healthy     BLOCKING when unhealthy
  */
@@ -51,8 +53,8 @@ import { spawnHelperFacts, type SpawnHelperFacts } from './pty/spawn-helper.ts';
 import { skillCopyVerdict, type SkillCopyReport } from './skill-copy.ts';
 
 export type DoctorRowId =
-  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'skill' | 'unit' | 'node' | 'pty'
-  | 'cli' | 'gh' | 'publish' | 'git' | 'environment' | 'console';
+  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'presence' | 'skill' | 'unit' | 'node' | 'pty'
+  | 'cli' | 'gh' | 'publish' | 'issues' | 'git' | 'environment' | 'console';
 
 export type DoctorRow = {
   id: DoctorRowId;
@@ -87,6 +89,13 @@ export type DoctorDeps = {
   credentials: () => Promise<ProbeVerdict>;
   delivery: () => Promise<ProbeVerdict>;
   hooks: () => Promise<HooksStatus | null>;
+  /**
+   * Every config dir the pooled accounts run sessions from, with what each
+   * one's settings carry of the presence hook (control-tower phase 108, #194)
+   * — `presenceDirs`, read by both deps builders. Absent (an older deps
+   * builder) is a `skip`; `null` means the accounts could not be read.
+   */
+  presence?: () => Promise<PresenceDir[] | null>;
   /**
    * Which skill copy each Claude Code config dir's sessions load, against the
    * console's commit — `skill-copy.ts`, the one reader (#151). Absent (an
@@ -198,6 +207,65 @@ export function hooksVerdict(status: HooksStatus | null): ProbeVerdict {
     return { status: 'fail', ok: false, reason: `${status.path} points at another checkout's session-hook.sh — run phase-console install-hooks from this one` };
   }
   return { status: 'ok', ok: true, reason: `installed in ${status.path}, pointing at this copy` };
+}
+
+/** One config dir sessions run from, the pooled accounts that use it, and its presence hook. */
+export type PresenceDir = { dir: string; accounts: string[]; status: HooksStatus | null };
+
+/**
+ * The pool, grouped by the config dir each account's sessions read their
+ * settings from (control-tower phase 108, #194): the login's `~/.claude` for
+ * the machine login and every token account, each profile's own directory —
+ * and what `settings.json` there carries of the presence hook. `read` is the
+ * installer's status for one file (`hooksStatus`), and a read that throws is
+ * `null` rather than a crash.
+ */
+export function presenceDirs(
+  accounts: readonly { id: string; dir: string }[],
+  read: (settingsPath: string) => HooksStatus | null,
+): PresenceDir[] {
+  const byDir = new Map<string, string[]>();
+  for (const account of accounts) byDir.set(account.dir, [...(byDir.get(account.dir) ?? []), account.id]);
+  return [...byDir].map(([dir, ids]) => {
+    let status: HooksStatus | null;
+    try { status = read(join(dir, 'settings.json')); } catch { status = null; }
+    return { dir, accounts: ids, status };
+  });
+}
+
+/**
+ * The `presence` row (#194): a session reports presence only where its config
+ * dir's `settings.json` runs the hook, and a profile's is not the login's — a
+ * run that moved to one went dark to the registry while the `hooks` row, which
+ * reads the login alone, stayed green. Never blocking: the console installs the
+ * entries into a profile at the next session it starts under it, and the row
+ * names the command that does it now.
+ */
+export function presenceVerdict(dirs: readonly PresenceDir[] | null): ProbeVerdict {
+  if (!dirs) return skipped('the pooled accounts could not be read');
+  if (!dirs.length) return skipped('no account is registered');
+  const who = (one: PresenceDir) => one.accounts.join(', ');
+  const short = dirs.filter((one) => !one.status || one.status.parseError || !one.status.installed || one.status.stale);
+  if (!short.length) {
+    return {
+      status: 'ok', ok: true,
+      reason: `installed in every pooled account's config dir (${dirs.length}): ${dirs.map((one) => `${who(one)} → ${one.dir}`).join('; ')}`,
+    };
+  }
+  const why = (one: PresenceDir): string => {
+    const path = join(one.dir, 'settings.json');
+    if (!one.status) return `${who(one)}: ${path} could not be read`;
+    if (one.status.parseError) return `${who(one)}: ${path} does not parse — ${one.status.parseError}`;
+    if (one.status.stale) return `${who(one)}: ${path} points at another checkout's session-hook.sh`;
+    return `${who(one)}: ${one.status.partial ? 'partially installed' : 'not installed'} in ${path}`;
+  };
+  return {
+    status: 'fail', ok: false,
+    reason: `${short.length} of ${dirs.length} config dir${dirs.length === 1 ? '' : 's'} without the presence hook — `
+      + `sessions there are invisible to the registry: ${short.map(why).join('; ')}`,
+    warnings: short.map((one) => `phase-console install-hooks --settings ${join(one.dir, 'settings.json')}`
+      + ' — or let the console install it at the next session it starts under that account'),
+  };
 }
 
 
@@ -412,6 +480,10 @@ export async function doctorReport(deps: DoctorDeps): Promise<DoctorReport> {
   rows.push(row('credentials', 'Credentials (machine login)', true, await settle(deps.credentials, 'the credential probe')));
   rows.push(row('delivery', 'Delivery channel', false, await settle(deps.delivery, 'the delivery probe')));
   rows.push(row('hooks', 'Session-presence hooks', true, hooksVerdict(await deps.hooks().catch(() => null))));
+  // Never blocking: a profile's hook is provisioned at its next session (#194).
+  rows.push(row('presence', 'Presence on every account', false, deps.presence
+    ? presenceVerdict(await deps.presence().catch(() => null))
+    : skipped('this deps builder does not read the pooled accounts')));
   // Never blocking: a skill at another commit still runs a console — it is
   // told (and the inbox and the boot prompt say so), not stopped.
   rows.push(row('skill', 'Skill copy', false, skillCopyVerdict(safeSkillCopy(deps))));
@@ -446,6 +518,7 @@ function safeIssues(deps: DoctorDeps): EnvIssue[] {
 function safePublish(deps: DoctorDeps): boolean {
   try { return deps.publish?.() === true; } catch { return false; }
 }
+
 
 function safeSkillCopy(deps: DoctorDeps): SkillCopyReport | null {
   try { return deps.skillCopy?.() ?? null; } catch { return null; }

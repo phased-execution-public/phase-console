@@ -234,6 +234,39 @@ test('an unknown repository KEY is a 404, and a remote-less key is a 200 that sa
   assert.equal((beta.body as Payload).repos[1].reason, 'no-remote');
 });
 
+test('a repository the operator ADDED refreshes by its key; one nobody added is a 404 (control-tower phase 118)', async () => {
+  const asked: string[][] = [];
+  const outside = JSON.stringify([{
+    number: 3, title: 'An outside issue', state: 'OPEN',
+    labels: [{ name: 'enhancement' }, { name: 'awaiting-plan' }, { name: 'severity:medium' }],
+    assignees: [], author: { login: 'octocat' }, createdAt: '2026-09-01T09:00:00Z',
+    updatedAt: '2026-09-01T10:00:00Z', closedAt: null, url: 'https://github.com/octo/outside/issues/3',
+  }]);
+  const run: GhRunner = async (args) => { asked.push(args); return { ok: true, stdout: outside, stderr: '' }; };
+  const store = new IssuesStore({
+    root: () => estate(), stateDir: temp('p118r-state-'), run, added: () => ['octo/outside'],
+  });
+  const service = fakeService(store);
+
+  const listed = (await call(service, 'GET', '/api/issues')).body as Payload & { repos: { kind: string }[] };
+  assert.deepEqual(listed.repos.map((r) => r.key), ['root', 'beta', 'github:octo/outside']);
+  assert.equal(listed.repos[2].kind, 'added');
+  assert.equal(asked.length, 0, 'listing an added repository never fetches it');
+
+  const out = await call(service, 'POST', '/api/issues/refresh', { body: { repo: 'github:octo/outside' } });
+  assert.equal(out.status, 200);
+  assert.deepEqual(asked.map((args) => args.slice(0, 4)), [['issue', 'list', '--repo', 'octo/outside']]);
+  const row = (out.body as { repos: { key: string; issues: { author?: string; triage?: unknown }[] }[] })
+    .repos.find((r) => r.key === 'github:octo/outside')!;
+  assert.equal(row.issues[0].author, 'octocat');
+  assert.deepEqual(row.issues[0].triage,
+    { category: 'enhancement', severity: 'medium', plan: { state: 'needs-plan' } });
+
+  const nobody = await call(service, 'POST', '/api/issues/refresh', { body: { repo: 'github:octo/elsewhere' } });
+  assert.equal(nobody.status, 404, 'only a name the operator added — a caller cannot make one up');
+  assert.equal(asked.length, 1);
+});
+
 test('any other method on /api/issues is a 405 that names the two verbs', async () => {
   const store = new IssuesStore({
     root: () => undefined, stateDir: temp('p15r-state-'), run: async () => ({ ok: true, stdout: '[]', stderr: '' }),

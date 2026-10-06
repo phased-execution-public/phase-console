@@ -6,8 +6,9 @@
  *      `HUMAN_STEP_KINDS` — and `KIND_META` is the only place a kind's icon
  *      and label are read: the card draws them from it, and no other client
  *      source spells a kind's label out;
- *   2. *Open again* stands in every state short of `proven`, counts its opens,
- *      and never navigates away from the card;
+ *   2. *Open again* stands in every open state a person can act in (all but
+ *      `upcoming`, which is not due yet), counts its opens, and never
+ *      navigates away from the card;
  *   and the rules the card carries beside them: a device code is large,
  *   selectable and copyable; a secret leaves the page the moment it is sent;
  *   a check that did not land says what the proof read; a folded card leads
@@ -176,7 +177,10 @@ describe('Open again (criterion 2)', () => {
   it.each([...HUMAN_STEP_STATES])('in state %s', (state) => {
     mount(stepItem('browser-login', { state }));
     const again = screen.queryByTestId('step-open-again');
-    if ((HUMAN_STEP_OPEN_STATES as readonly string[]).includes(state)) expect(again).toBeTruthy();
+    // `upcoming` is open but not due (control-tower phase 121): the ledger
+    // refuses an open until its due-when ref lands, so the card offers none.
+    if ((HUMAN_STEP_OPEN_STATES as readonly string[]).includes(state) && state !== 'upcoming')
+      expect(again).toBeTruthy();
     else expect(again).toBeNull();
   });
 

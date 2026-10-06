@@ -1833,6 +1833,15 @@ export class Scheduler {
    * Lanes, policies and capacity (control-tower phase 100, #135 C D G)
    * ---------------------------------------------------------------- */
 
+  /**
+   * The machine-load guard's reading now, for work that is not an admission —
+   * a baseline measured beside a working session waits on it too
+   * (control-tower phase 105). Null when no guard is wired.
+   */
+  loadReading(): ReturnType<typeof loadReading> | null {
+    return this.loadNow();
+  }
+
   /** The machine-load guard's reading now, or null when no guard is wired. */
   private loadNow(): ReturnType<typeof loadReading> | null {
     let sample: LoadSample | null | undefined;

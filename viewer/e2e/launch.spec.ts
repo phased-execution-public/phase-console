@@ -33,8 +33,18 @@ async function scrollers(root: Locator): Promise<string[]> {
   );
 }
 
-/** Does a tap at the centre of `target` land on it (or inside it)? */
+/**
+ * Does a tap at the centre of `target` land on it (or inside it)?
+ *
+ * Asked only of an ENABLED target: a disabled button takes no pointer events,
+ * so `elementFromPoint` answers its parent row and the hit test measures
+ * nothing. Launch stays disabled while the plan's decisions are read ("Reading
+ * this plan's decisions…"), and under a full gate's load that read lands after
+ * the sheet is drawn — red in 2 of 2 gates at control-tower phase 124, green
+ * alone. So wait for the read to land, not for the clock.
+ */
 async function wins(page: Page, target: Locator): Promise<{ wins: boolean; what: string }> {
+  await expect(target).toBeEnabled();
   await still(page);
   return target.evaluate((el) => {
     const r = el.getBoundingClientRect();
@@ -81,7 +91,8 @@ test('a phone launch is one scroller under a fixed footer, and Launch wins its t
   await still(page);
   const after = await launch.boundingBox();
   expect(Math.round(after!.y)).toBe(Math.round(before!.y));
-  expect((await wins(page, launch)).wins).toBe(true);
+  const scrolled = await wins(page, launch);
+  expect(scrolled.wins, `after the scroll the tap lands on ${scrolled.what}`).toBe(true);
 
   // A tile pushes its controls inside the same scroller…
   await sheet.getByRole('button', { name: /^(Edit|Answer) Money and stops$/ }).click();

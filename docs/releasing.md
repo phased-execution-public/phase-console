@@ -69,12 +69,13 @@ wrapper does the two things `prepack` does that the assertions need (the pack `t
 `.ts` sibling, because `viewer/server/fallback-sw.js` is real tracked source sitting among the ~148
 emitted files. `--keep` leaves the tarball in place and prints its path, and `--tree DIR` packs
 another checkout of this repository, which is how a tag behind `HEAD` is released.
-The tarball is **8.8 MB** — 973 entries, 24 MB unpacked, measured at **6.0.0** with the pack `tsc`
-emit in place, which is what a release actually packs (5.1.0 was 7.1 MB and 693 entries, 5.0.0
-5.9 MB and 599, 4.0.0 4.7 MB and 503; 6.0 added the status model and its shared vocabularies, the
-person's-turn, queue, lock, clock and budget models, the run's new probes, ledgers and reports, and
-the emitted `.js` beside each; the free tarball is 755 entries).
-`assert-tarball.sh` prints the same 973: this
+The tarball is **9.2 MB** — 1011 entries, 27 MB unpacked, measured at **6.1.0** with the pack `tsc`
+emit in place, which is what a release actually packs (6.0.0 was 8.8 MB and 973 entries, 5.1.0
+7.1 MB and 693, 5.0.0 5.9 MB and 599, 4.0.0 4.7 MB and 503; 6.0 added the status model and its shared
+vocabularies, the person's-turn, queue, lock, clock and budget models, the run's new probes, ledgers
+and reports, and the emitted `.js` beside each, and 6.1 the issue, door and CI-refusal vocabularies,
+the unit watch and the shell reader; the free tarball was 755 entries at 6.0.0).
+`assert-tarball.sh` prints the same 1011: this
 tarball carries no directory entries, so the older note about `tar -tzf` counting them no longer
 applies, and the two numbers agreeing is now the expected answer rather than a discrepancy to
 explain. It was ~36 MB until 3.1 shipped the screencast from a
@@ -85,6 +86,94 @@ slack: `server/http/static.ts` serves them and never compresses at request time,
 `check-dist.mjs` gates first paint on the bytes that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
+
+## Upgrading to 6.1.0
+
+The root `package.json` says 6.1.0, and `CHANGELOG.md` carries its section. 6.1.0 is a minor version:
+nothing a 6.0 plan writes stops parsing, and each new door stays closed until a plan line, a flag or a
+person opens it. Four behaviours did move, and each is the first bullet of its section below: a run is
+settled only once it has landed, a manual gate is a person's alone, a session can no longer press its
+own console, and a §Verification line no longer runs with `CI=1`. What follows is what an operator, a
+plan author or a session running an older copy will notice, in the order they are likely to notice it.
+
+### The run: settled means landed, and waits that reach outside the checkout
+
+- **A run is settled only once it has landed.** A run that owns a branch reads `finished` only when
+  every repository's `pe/<slug>` — each mirror mount, the root's included — is held by
+  `origin/<trunk>`, proved by tree containment (`git merge-tree --write-tree`, never `git cherry`).
+  Until then it parks `unlanded`, a new run-level halt kind, with one merge errand whose card opens a
+  merge errand tree; 6.0 called the same run finished. Under `landing: hold` nothing moves the branch
+  onto the trunk by itself. Once a release squash-merges the branch, the console re-seats it on
+  `origin/<trunk>` in the run's own checkout (`run.branch-reseated`).
+- **A wait can watch a job on another machine.** `--watch unit:<host>/<unit>` asks a systemd unit
+  whether it still runs — over one shared ssh connection per host, every five minutes — and lands the
+  moment the unit leaves `activating`/`active`. The host's address, user, key and port are
+  `hosts.<name>` in the machine profile, `~/.config/phase-console/fleet.json`; a host not named there
+  is refused.
+- **A date beside a live ref is a backstop**: the ref wakes the phase, and the date only bounds the
+  wait. **A plan raises its own wait count** with `**Wait count:** <n>` in §Session budget or
+  `- **Wait count:** <n>` on a phase (1–99), read by `phase-graph.sh --wait-count [N]` and written by
+  `wait-budget.sh --count`. A park on a spent count or budget whose watch ref still polls is now a
+  wait on that ref, looked at again every six hours, rather than an errand.
+- **The operator's acts are one queue.** A seventeenth kind of person's turn, `operator-act`, starts in
+  a ninth state, `upcoming`: listed under *Coming up*, unannounced, until its due-when ref lands, then
+  due with one `NOW: <command>` notification. A session declares one with `phase-outcome.sh …
+  needs-human --act --due-when <ref>`; a plan writes a `due: <ref>` field on its `- **Human step:**`
+  bullet, in a phase or under `## Operator errands`.
+- **Recheck on a declared external wall asks the wall**: it probes the declaration's watch refs, and a
+  landed one resumes the phase's own session. **A CI run GitHub never started is not a red CI**: a
+  watched run that failed with every job unstarted under the spending-limit annotation reads
+  `not-run (billing)`, keeps the wait open and raises one errand per repository.
+
+### Plans and sessions: a person's gate, what a session may press, and the scripts
+
+- **A manual gate is a person's.** A gate the plan marks `manual` is never delegated to a session,
+  whatever the `gates` row says. `gate-approve.sh` names its door from its own environment, never from
+  `--by`, and records it in a new `Door` column of `gate-status.md`; `--gate-status` honours a manual
+  approval only when a person's door — the console's Gate card or a person's own terminal — wrote it.
+  A row written before 6.1 names no door, so it no longer clears its manual gate: approve it again.
+- **A session cannot press its own console.** A supervised session's HTTP client (`curl`, `wget`,
+  `http`, `xh`) against a console's approval, policy, run-settings, gate or person's-step routes
+  (`viewer/shared/door-model.js` lists them), and its writes into the console's state or config
+  directories, are denied before they run, on every profile (`console-forge`). A phase that must press
+  one names that press's CLI form in the plan's `permission.destructive` row.
+- **A §Verification line runs in the session's environment.** The console no longer sets `CI=1`, so a
+  suite that changed its behaviour on `CI` runs as it does in the session; non-interactivity comes from
+  `NO_COLOR`, `TERM=dumb` and a closed stdin. A red line keeps its failing tests and its tail, a line
+  whose `node_modules` or `.venv` is missing is `environment` rather than red, and a new advisory lint,
+  **F39** `setup-deps-missing`, names such a line before any run meets it — add the install to the
+  phase's `- **Setup:**`. `phase-graph.sh <slug> --verify-in N` reads a phase's `Verify in:`.
+- **A session's turn ends after its own agents.** While a background subagent or monitor the session
+  launched still runs, the Stop hook refuses a `partial` or `complete` exit (twice at most) and names
+  the two ways out: wait for it in one bounded foreground call, or stop it and record what it was doing.
+- **The scripts move with the plugin**, as at 6.0: a 6.0.0 `phase-outcome.sh` has no `--act` or
+  `--due-when` and knows no `unit:` ref, and a 6.0.0 `phase-graph.sh` has no `--wait-count` or
+  `--verify-in` arm. Move the runtime console's scripts and the plugin together before a boot prompt
+  tells a session to use them.
+
+### The console: the Issues desk, the baseline and the price table
+
+- **Repo ▸ Issues is the Issues desk.** It reads a repository's whole issue list (up to 2,000), each
+  issue's category, severity and plan status derived once in `viewer/shared/issues-model.js`; every
+  column sorts, the sort and the filters live in the URL, and a repository an operator adds by
+  `owner/name` is read-only and marked as outside this console.
+- **The pre-session baseline runs beside the session**, in a clean checkout of the boarding head,
+  niced and held by the load guard; the session hears it as a note, a red baseline line is recorded
+  `red once (not retried)`, and only the verdict retries.
+- **Spend is priced per model.** Opus 5.5 has its own row in the price table, matched by the whole
+  model id, so its sessions no longer journal a false `phase.cost-mismatch`.
+
+
+### Packaging: what the tarball gained
+
+- The root `package.json` `files` allowlist gained four shared modules — `viewer/shared/door-model.js`,
+  `viewer/shared/ci-refusal.js`, `viewer/shared/issue-modes.js` and `viewer/shared/launch-presets.js`
+  — and the free tree's allowlist the same four. `launch-presets` left the never-ship list, because a
+  server module now builds a plan's decisions from it.
+- `.github/scripts/assert-tarball.sh` asserts the new runtime files: those four,
+  `viewer/server/watch-unit.ts`, `viewer/server/issues/fixes.ts`,
+  `viewer/server/runner/shell-reading.ts` and `viewer/server/runner/manifest-verdict.ts`.
+
 
 ## Upgrading to 6.0.0
 

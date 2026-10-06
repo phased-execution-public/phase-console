@@ -317,10 +317,11 @@ export function verbActions(context: CommandContext): CommandAction[] {
     {
       id: 'do:repo-issues',
       group: GROUPS.do,
-      label: 'Issues across every repository',
-      hint: 'The estate’s open work — and one click from a set of it to a plan',
+      label: 'The Issues desk',
+      hint: 'A repository’s whole issue list — category, severity, plan status — and one click from a set of it to a plan',
       icon: CircleDot,
-      keywords: 'issue issues github backlog bug estate plan from issues author label assignee',
+      keywords:
+        'issue issues desk github backlog bug enhancement category severity triage estate plan from issues plan status author label assignee',
       run: (ctx) => ctx.go(repoHref('issues')),
     },
     {

@@ -264,6 +264,15 @@ test('budget and turn caps resume the same session rather than restarting it', (
   if (turns.kind === 'resume') assert.equal(turns.raise, 'turns');
 });
 
+test('the API safeguard banner is not a refusal of the task: it is a safeguard-flag a fresh session answers (#177)', () => {
+  const banner = 'API Error: Opus 5.5\'s safeguards flagged this message (https://www.anthropic.com/legal/aup). '
+    + 'This sometimes happens with safe, normal conversations. Details: `[reasoning_extraction]` · Request ID: req_0123456789abcdef';
+  const d = classify(stop({ subtype: 'success', isError: true, terminalReason: 'api_error', stopReason: 'refusal', text: banner }));
+  assert.equal(d.kind, 'safeguard-flag');
+  assert.equal(d.kind === 'safeguard-flag' && d.requestId, 'req_0123456789abcdef');
+  assert.equal(d.kind === 'safeguard-flag' && d.classifier, 'reasoning_extraction');
+});
+
 test('a refusal is not retried', () => {
   const d = classify(stop({ subtype: 'error_during_execution', stopReason: 'refusal', text: '' }));
   assert.equal(d.kind, 'needs-human');

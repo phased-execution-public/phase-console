@@ -44,6 +44,28 @@ Settings › Notifications, delay a reminder until they end; the reminder is not
 If you cannot do a step, press **I can't do this** and say why. The step becomes an errand carrying
 your reason, and it will not repeat.
 
+## Acts that come due later
+
+Some steps are not a sign-in but a task only you carry out: a command to run where the console cannot,
+or a few clicks on somebody else's dashboard, such as publishing a release once its build has finished.
+A plan can name such a step ahead of time, or a session can declare one, together with what makes it
+due: a ref of the kind a wait names, such as a build finishing or a date passing.
+
+Until that ref lands, the step is **Coming up**. It is listed at the foot of the Tower's Needs-you bay
+and on the approve page, after what is due now, with its command ready to copy. It sends nothing and
+reminds no one, and its window has not started. The only thing you can do with it yet is **I can't do
+this**.
+
+When the ref lands, the step is due, with one notification: `NOW:` and the command to run, or the step's
+title when it is a click path. The card then offers **Open in terminal** for a command, or **Open the
+link** or **I did it — check** for a click path. When the step's proof holds, it is done and the phase that
+needed it carries on.
+If the console cannot check the ref at all, the step comes due at once and says why.
+
+In a plan, such a step is a `- **Human step:** operator-act · … · due: <ref>` bullet, in a phase or
+under `## Operator errands` for the plan as a whole. A session declares one with `phase-outcome.sh …
+needs-human --act --due-when <ref>`.
+
 ## From your phone
 
 A turn's push carries two buttons. **Open** goes straight to the step's card, and **I did it** runs the

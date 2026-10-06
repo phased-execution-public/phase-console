@@ -196,3 +196,4 @@ session, and the lock is a queue to wait in while the session lives and **debris
 ends** — released without waiting for the lease. Presence is three-valued: live, ended, unknown;
 nothing is ever released on a guess. A hand session's `phase-outcome.sh` declarations reach the
 console too, so a person's *waiting-external* or *partial* drives the same machinery as a lane's.
+

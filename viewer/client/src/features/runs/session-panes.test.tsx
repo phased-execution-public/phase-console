@@ -27,6 +27,7 @@ import {
   ReplayNote,
   SessionPanes,
   crossLaneId,
+  holderEvidenceText,
   holderLabel,
   laneId,
   lanesAcross,
@@ -448,6 +449,36 @@ describe('a terminal session holding the queue (control-tower phase 82, #119)', 
   it('is what the run card and the table cell say, never a bare "queued"', () => {
     expect(waitingLabel(entry({ waitingOn: [terminal()] }))).toBe(
       'queued — waiting on your terminal session f118dfd4, pid 78963 — scope app (from what it edited)',
+    );
+  });
+
+  // control-tower phase 108, #180: the queue card said "waiting on a session"
+  // while `/api/queue` already knew the hold rested on memory writes outside
+  // the root. The evidence is the line that tells a real edit from a wrong one.
+  it('names what a touched hold rests on, newest first; a declared or unknown hold has no second line', () => {
+    const touched = terminal({ evidence: ['edited app/src/b.ts at 08:47Z', 'named alpha P2'] });
+    expect(holderEvidenceText(touched)).toBe('held because it edited app/src/b.ts at 08:47Z; named alpha P2');
+    expect(holderEvidenceText(terminal({ evidence: [] }))).toBeNull();
+    expect(
+      holderEvidenceText(
+        terminal({ scopeBasis: 'unknown', evidence: ['opened in the root, nothing touched yet'] }),
+      ),
+    ).toBeNull();
+    expect(
+      holderEvidenceText(terminal({ scopeBasis: 'declared', evidence: ['declared PE_SCOPE app'] })),
+    ).toBeNull();
+  });
+
+  it('the queued card prints the evidence under the terminal it names', () => {
+    mount(
+      <QueuedPane
+        phase={4}
+        entry={entry({ waitingOn: [terminal({ evidence: ['edited app/src/b.ts at 08:47Z'] })] })}
+      />,
+    );
+    expect(screen.getByTestId('holder-session').textContent).toContain('your terminal session f118dfd4');
+    expect(screen.getByTestId('holder-evidence').textContent).toBe(
+      'held because it edited app/src/b.ts at 08:47Z',
     );
   });
 });

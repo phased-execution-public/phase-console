@@ -36,10 +36,21 @@
 import { useMemo } from 'react';
 import { CircleDot, CircleCheck, ExternalLink, RefreshCw } from 'lucide-react';
 import { Badge, Empty, type BadgeTone } from '@/components/ui';
+import { OpsBadge } from '@/components/ui/status';
 import { DataTable, type Column } from '@/components/data-table';
-import type { Issue, IssueReason, IssuesPayload, RepoIssues } from '@/lib/api';
+import type { Issue, IssueReason, IssuesPayload, IssueTriage, RepoIssues } from '@/lib/api';
 import { relativeTime, elapsedWords, plural } from '@/lib/format';
 import { phaseHref } from '@shared/routes.js';
+import {
+  ISSUE_CATEGORIES,
+  ISSUE_PLAN_STATES,
+  ISSUE_SEVERITY_WORDS,
+  triageOf,
+  type IssueCategory,
+  type IssuePlanState,
+  type IssueSeverityWord,
+} from '@shared/issues-model.js';
+import { repoHref } from './routes';
 
 /**
  * How many issues one ticket may carry — `TICKET_ISSUES_MAX` on the server.
@@ -89,7 +100,7 @@ export type IssueRow =
   { kind: 'issue'; repo: RepoIssues; issue: Issue; ref: string } | { kind: 'repo'; repo: RepoIssues };
 
 export interface IssueFilter {
-  /** A repository KEY (`root`, or a submodule path). Absent = every repository. */
+  /** A repository KEY (`root`, a submodule path, or `github:<owner/name>` for an added one). Absent = every repository. */
   repo?: string;
   /** `open` · `closed` · `all`. The default is `open` and the control says so. */
   state: 'open' | 'closed' | 'all';
@@ -101,9 +112,170 @@ export interface IssueFilter {
    * 12) — the ones carrying a provenance. Absent = everyone's.
    */
   filed?: 'sessions';
+  /** The desk's three readings (control-tower phase 118) — each one word of its vocabulary, or absent. */
+  category?: IssueCategory;
+  severity?: IssueSeverityWord;
+  plan?: IssuePlanState;
 }
 
 export const DEFAULT_FILTER: Readonly<IssueFilter> = Object.freeze({ state: 'open' });
+
+/**
+ * What the desk reads off an issue: the server's derivation when it sent one,
+ * else the SAME function run here (`shared/issues-model.js`) — so an issue
+ * from a server before 6.1 is read exactly as a new one would be, less the
+ * phase only the server's plans can name.
+ */
+export function triageOfIssue(issue: Issue): IssueTriage {
+  return issue.triage ?? triageOf(issue);
+}
+
+/** One word of a vocabulary from the URL, or nothing — a value the vocabulary lacks is no filter. */
+export function wordOf<W extends string>(words: readonly W[], value: string | undefined): W | undefined {
+  return value !== undefined && (words as readonly string[]).includes(value) ? (value as W) : undefined;
+}
+
+/* ---------------- sorting (control-tower phase 118) ---------------- */
+
+/** The columns the desk sorts by, as the URL spells them (`?sort=`). */
+export const ISSUE_SORT_IDS = [
+  'number',
+  'title',
+  'category',
+  'severity',
+  'status',
+  'labels',
+  'assignee',
+  'author',
+  'updated',
+] as const;
+export type IssueSortId = (typeof ISSUE_SORT_IDS)[number];
+export type SortDir = 'ascending' | 'descending';
+export interface IssueSort {
+  id: IssueSortId;
+  dir: SortDir;
+}
+
+/**
+ * Where a column's first press points: the newest number and the latest update
+ * first, the worst severity first, and everything else from the top of its
+ * own order. A second press reverses it.
+ */
+export const SORT_DEFAULT_DIR: Readonly<Record<IssueSortId, SortDir>> = Object.freeze({
+  number: 'descending',
+  title: 'ascending',
+  category: 'ascending',
+  severity: 'descending',
+  status: 'ascending',
+  labels: 'ascending',
+  assignee: 'ascending',
+  author: 'ascending',
+  updated: 'descending',
+});
+
+/** A sort read from the URL, or none — the payload's own order, newest first per repository. */
+export function sortFrom(query: Record<string, string | undefined>): IssueSort | undefined {
+  const id = wordOf(ISSUE_SORT_IDS, query.sort);
+  if (!id) return undefined;
+  const dir = query.dir === 'asc' ? 'ascending' : query.dir === 'desc' ? 'descending' : SORT_DEFAULT_DIR[id];
+  return { id, dir };
+}
+
+const SEVERITY_RANK = (word: IssueSeverityWord) =>
+  ISSUE_SEVERITY_WORDS.length - ISSUE_SEVERITY_WORDS.indexOf(word);
+
+/**
+ * A row's sort value. `undefined` is "nothing to compare" — an issue with no
+ * author, no assignee, no labels — and sorts after every real value whichever
+ * the direction, because an empty cell is not the smallest name.
+ */
+function sortValue(row: Extract<IssueRow, { kind: 'issue' }>, id: IssueSortId): string | number | undefined {
+  const { issue } = row;
+  switch (id) {
+    case 'number':
+      return issue.number;
+    case 'title':
+      return issue.title;
+    case 'category':
+      return ISSUE_CATEGORIES.indexOf(triageOfIssue(issue).category);
+    case 'severity':
+      // Ranked so that DESCENDING is worst first: critical is the largest.
+      return SEVERITY_RANK(triageOfIssue(issue).severity);
+    case 'status':
+      return ISSUE_PLAN_STATES.indexOf(triageOfIssue(issue).plan.state);
+    case 'labels':
+      return issue.labels.length ? [...issue.labels].sort((a, b) => a.localeCompare(b)).join(' ') : undefined;
+    case 'assignee':
+      return issue.assignees[0];
+    case 'author':
+      return issue.author || undefined;
+    case 'updated': {
+      const at = Date.parse(issue.updatedAt);
+      return Number.isNaN(at) ? undefined : at;
+    }
+  }
+}
+
+/**
+ * The rows in the order a sort asks for — stable, so rows that tie keep the
+ * payload's order, and a repository row (a repository with nothing to show)
+ * always after the issues: it is a note about the estate, not a datum to rank.
+ */
+export function sortIssueRows(rows: readonly IssueRow[], sort: IssueSort | undefined): IssueRow[] {
+  if (!sort) return [...rows];
+  const flip = sort.dir === 'ascending' ? 1 : -1;
+  const keyed = rows.map((row, index) => ({
+    row,
+    index,
+    value: row.kind === 'issue' ? sortValue(row, sort.id) : undefined,
+  }));
+  keyed.sort((a, b) => {
+    if (a.row.kind !== b.row.kind) return a.row.kind === 'repo' ? 1 : -1;
+    if (a.value === undefined || b.value === undefined) {
+      if (a.value === b.value) return a.index - b.index;
+      return a.value === undefined ? 1 : -1;
+    }
+    const order =
+      typeof a.value === 'number' && typeof b.value === 'number'
+        ? a.value - b.value
+        : String(a.value).localeCompare(String(b.value));
+    return order * flip || a.index - b.index;
+  });
+  return keyed.map((entry) => entry.row);
+}
+
+/**
+ * A link to the desk with one change: the filters and the sort it carries now,
+ * the patch over them, and every default left out — a URL that states every
+ * default is a URL nobody can read the interesting part of. `issue` opens the
+ * inspector and belongs only to the patch.
+ */
+export function deskHref(
+  current: IssueFilter,
+  sort: IssueSort | undefined,
+  patch: Partial<IssueFilter> & { issue?: string; sort?: IssueSort | null },
+): string {
+  const next = { ...current, ...patch };
+  const order = patch.sort === null ? undefined : (patch.sort ?? sort);
+  return repoHref('issues', {
+    repo: next.repo,
+    state: next.state === DEFAULT_FILTER.state ? undefined : next.state,
+    label: next.label,
+    q: next.q,
+    filed: next.filed,
+    category: next.category,
+    severity: next.severity,
+    plan: next.plan,
+    sort: order?.id,
+    dir:
+      order && order.dir !== SORT_DEFAULT_DIR[order.id]
+        ? order.dir === 'ascending'
+          ? 'asc'
+          : 'desc'
+        : undefined,
+    issue: patch.issue,
+  });
+}
 
 /**
  * `owner/repo#12` — the only spelling the ticket door accepts.
@@ -124,6 +296,12 @@ function matches(repo: RepoIssues, issue: Issue, filter: IssueFilter): boolean {
   if (filter.state === 'open' && !isOpen(issue)) return false;
   if (filter.state === 'closed' && isOpen(issue)) return false;
   if (filter.label && !issue.labels.includes(filter.label)) return false;
+  if (filter.category || filter.severity || filter.plan) {
+    const triage = triageOfIssue(issue);
+    if (filter.category && triage.category !== filter.category) return false;
+    if (filter.severity && triage.severity !== filter.severity) return false;
+    if (filter.plan && triage.plan.state !== filter.plan) return false;
+  }
   const q = filter.q?.trim().toLowerCase();
   if (!q) return true;
   // The number is searched with and without its `#`, because both are how a
@@ -137,6 +315,7 @@ function matches(repo: RepoIssues, issue: Issue, filter: IssueFilter): boolean {
     repo.nameWithOwner ?? '',
     ...issue.labels,
     ...issue.assignees,
+    issue.author ?? '',
   ]
     .join('\n')
     .toLowerCase();
@@ -253,7 +432,9 @@ export function RepoCell({ repo, freshness = true }: { repo: RepoIssues; freshne
   const title =
     repo.state === 'unknown'
       ? `${REASON_BLURB[repo.reason ?? 'failed']} (${ageLine(repo)})`
-      : `${repo.kind} · scope token ${repo.scopeToken} · ${ageLine(repo)}`;
+      : repo.kind === 'added'
+        ? `outside this console · ${ageLine(repo)}`
+        : `${repo.kind} · scope token ${repo.scopeToken} · ${ageLine(repo)}`;
   return (
     <span className="flex min-w-0 flex-wrap items-center gap-1.5">
       <code className="min-w-0 truncate font-mono text-2xs text-ink" title={title}>
@@ -309,6 +490,24 @@ export function BodyPreview({ issue, lines = 3 }: { issue: Issue; lines?: number
   );
 }
 
+/** Where an issue stands in a plan: the state, and which plan and phase when it names one. */
+export function PlanCell({ issue }: { issue: Issue }) {
+  const { plan } = triageOfIssue(issue);
+  const where = plan.slug
+    ? `${plan.slug}${plan.phases?.length ? ` · phase${plan.phases.length > 1 ? 's' : ''} ${plan.phases.join(', ')}` : ''}`
+    : undefined;
+  return (
+    <span className="flex min-w-0 flex-col items-start gap-0.5">
+      <OpsBadge vocab="issue-plan" word={plan.state} />
+      {where && (
+        <span className="min-w-0 break-words font-mono text-2xs text-ink-faint" data-testid="plan-where">
+          {where}
+        </span>
+      )}
+    </span>
+  );
+}
+
 /* ---------------- the table ---------------- */
 
 export interface IssueBoardProps {
@@ -322,6 +521,9 @@ export interface IssueBoardProps {
   /** Ask this one repository again. Absent where the console may not. */
   onRefresh?: (repoKey: string) => void;
   refreshing?: boolean;
+  /** The sort in force (`?sort=`), and what a press on a column asks for. Absent = the payload's own order. */
+  sort?: IssueSort;
+  onSort?: (id: IssueSortId) => void;
 }
 
 export function IssueBoard({
@@ -332,11 +534,19 @@ export function IssueBoard({
   onOpen,
   onRefresh,
   refreshing = false,
+  sort,
+  onSort,
 }: IssueBoardProps) {
-  const rows = useMemo(() => boardRows(payload, filter), [payload, filter]);
+  const rows = useMemo(() => sortIssueRows(boardRows(payload, filter), sort), [payload, filter, sort]);
 
-  const columns = useMemo<Column<IssueRow>[]>(
-    () => [
+  const columns = useMemo<Column<IssueRow>[]>(() => {
+    // A sortable column says which way its next press points: the way it
+    // already points when it is the sort in force (the header's arrow), its own
+    // default otherwise.
+    const by = (id: IssueSortId): Pick<Column<IssueRow>, 'sort'> => ({
+      sort: { id, dir: sort?.id === id ? sort.dir : SORT_DEFAULT_DIR[id] },
+    });
+    const all: Column<IssueRow>[] = [
       {
         id: 'pick',
         head: '',
@@ -376,6 +586,7 @@ export function IssueBoard({
         identity: true,
         priority: 1,
         min: 92,
+        ...by('number'),
         // Deliberately NOT `card: 'title'`, though it was. `CardList` takes the
         // FIRST column marked `title`, so with two of them the card's headline
         // was `#41` and the issue's actual title dropped into the labelled
@@ -404,6 +615,7 @@ export function IssueBoard({
         priority: 1,
         min: 200,
         card: 'title',
+        ...by('title'),
         cell: (row) =>
           row.kind === 'repo' ? (
             <span className="min-w-0 break-words text-2xs text-ink-muted" data-testid="repo-row-reason">
@@ -428,9 +640,51 @@ export function IssueBoard({
           ),
       },
       {
+        id: 'category',
+        head: 'Category',
+        priority: 3,
+        min: 140,
+        card: 'meta',
+        ...by('category'),
+        cell: (row) =>
+          row.kind === 'repo' ? (
+            <span className="text-2xs text-ink-faint">{UNKNOWN}</span>
+          ) : (
+            <OpsBadge vocab="issue-category" word={triageOfIssue(row.issue).category} />
+          ),
+      },
+      {
+        id: 'severity',
+        head: 'Severity',
+        priority: 2,
+        min: 132,
+        card: 'meta',
+        ...by('severity'),
+        cell: (row) =>
+          row.kind === 'repo' ? (
+            <span className="text-2xs text-ink-faint">{UNKNOWN}</span>
+          ) : (
+            <OpsBadge vocab="issue-severity" word={triageOfIssue(row.issue).severity} />
+          ),
+      },
+      {
+        id: 'status',
+        head: 'Plan status',
+        priority: 2,
+        min: 160,
+        card: 'meta',
+        ...by('status'),
+        cell: (row) =>
+          row.kind === 'repo' ? (
+            <span className="text-2xs text-ink-faint">{UNKNOWN}</span>
+          ) : (
+            <PlanCell issue={row.issue} />
+          ),
+      },
+      {
         id: 'repo',
         head: 'Repository',
-        priority: 2,
+        priority: 3,
         min: 140,
         card: 'meta',
         // A repository ROW already has a State column carrying its reason, and
@@ -453,6 +707,7 @@ export function IssueBoard({
         head: 'Labels',
         priority: 4,
         min: 140,
+        ...by('labels'),
         cell: (row) =>
           row.kind === 'repo' || row.issue.labels.length === 0 ? (
             <span className="text-2xs text-ink-faint">{UNKNOWN}</span>
@@ -475,6 +730,7 @@ export function IssueBoard({
         head: 'Assignee',
         priority: 5,
         min: 120,
+        ...by('assignee'),
         cell: (row) =>
           row.kind === 'repo' || row.issue.assignees.length === 0 ? (
             <span className="text-2xs text-ink-faint">unassigned</span>
@@ -485,11 +741,27 @@ export function IssueBoard({
           ),
       },
       {
+        id: 'author',
+        head: 'Author',
+        priority: 5,
+        min: 120,
+        ...by('author'),
+        cell: (row) =>
+          row.kind === 'repo' || !row.issue.author ? (
+            <span className="text-2xs text-ink-faint">{UNKNOWN}</span>
+          ) : (
+            <span className="min-w-0 break-words text-2xs text-ink-muted">{row.issue.author}</span>
+          ),
+      },
+      {
         id: 'age',
         head: 'Updated',
-        priority: 3,
+        // 2, beside severity and plan status: what moved last is the third
+        // question a triage asks, and the one the default order answers.
+        priority: 2,
         min: 108,
         card: 'meta',
+        ...by('updated'),
         cell: (row) => {
           // No `whitespace-nowrap` on either branch. Under `table-fixed` a cell
           // that refuses to wrap does not widen its column, it escapes it — the
@@ -511,7 +783,8 @@ export function IssueBoard({
       {
         id: 'state',
         head: 'State',
-        priority: 2,
+        // Folds before the plan status, which says more: `fixed` is closed.
+        priority: 4,
         // 132, not 92, and the 40 px is not slack. The widest thing this column
         // holds is a repository row's reason badge — `never-fetched` measures
         // 105 px — and the cell adds `--tile-pad-x` on both sides. A track of 92
@@ -534,9 +807,11 @@ export function IssueBoard({
             <StateCell issue={row.issue} />
           ),
       },
-    ],
-    [selected, onToggle, onOpen, filter],
-  );
+    ];
+    // One repository picked: every row is that repository, and the picker says
+    // which — a column repeating it on every row would only push a real one out.
+    return filter.repo ? all.filter((column) => column.id !== 'repo') : all;
+  }, [selected, onToggle, onOpen, filter, sort]);
 
   return (
     <DataTable
@@ -544,6 +819,10 @@ export function IssueBoard({
       columns={columns}
       rows={rows}
       getRowKey={rowKey}
+      {...(sort ? { activeSort: sort.id } : {})}
+      {...(onSort ? { onSort: (id: string) => onSort(id as IssueSortId) } : {})}
+      // Two thousand rows is a whole repository now: only the window in view is drawn.
+      virtual
       rowClassName={(row) => (row.kind === 'repo' ? 'bg-ground-deep/30' : undefined)}
       detail={(row) => <RowDetail row={row} {...(onRefresh ? { onRefresh } : {})} refreshing={refreshing} />}
       empty={
@@ -554,7 +833,7 @@ export function IssueBoard({
           <Empty
             icon={<CircleDot size={20} aria-hidden />}
             title="No issue here was filed by a session"
-            body="A session files one only where its plan allows it — `Issues: draft` in §Session budget holds each draft in the inbox for your Approve, `Issues: file` files at once under --allow-publish. The default is off."
+            body="A session files one only where filing is allowed — the plan’s `Issues:` line first, then the run’s own word, then this console’s own setting — and only a console started with the flag for it files at all; `draft` holds each one in the inbox for your Approve."
           />
         ) : (
           <Empty
@@ -701,7 +980,8 @@ export function RepoActions({
       )}
       {repo.truncated && (
         <span className="text-2xs text-ink-faint" data-testid="repo-truncated">
-          More issues exist than one page holds — {plural(repo.issues.length, 'row')} shown.
+          This repository holds more issues than the desk reads at once — the newest{' '}
+          {plural(repo.issues.length, 'issue')} are shown.
         </span>
       )}
     </div>

@@ -858,24 +858,30 @@ test('a waived plan does not classify a done phase as QA-blocked', () => {
   assert.equal(classifySituation({ ...base, qa: { mode: 'on' } } as never).id, 'qa-pending');
 });
 
-test('a delegated human gate is the ladder\'s, not a person\'s', () => {
+test('a delegated human-family verdict is the ladder\'s, not a person\'s', () => {
   // `delegateHumanGates` reaches the RUNNER (a gated phase boots like an `ai`
   // one) but never reached the classifier — so a phase already recorded `gated`
   // from before the operator turned delegation on still classified
   // `gated-manual`, actor `person`, rungs `[]`. The ladder writes the errand at
   // once and never boards it: delegation silently did nothing for exactly the
   // phases that were already stuck, which are the ones an operator turns it on
-  // for.
+  // for. Since control-tower phase 107 (#174) delegation never reaches a gate
+  // the plan marks MANUAL — the service answers `gateDelegated` false for one
+  // (`evidenceDeps`) — so the case here is a deadline gate's overdue verdict.
   const base = {
     phase: 2, board: 'ready' as const,
     handoff: { exists: false }, lock: null, qa: null, health: [],
     work: { did: false, why: '' },
-    gate: { clear: false, kind: 'manual', detail: 'the owner approves the copy' },
+    gate: { clear: false, kind: 'OVERDUE', detail: 'deadline 2000-01-01 passed' },
   };
   assert.equal(classifySituation({ ...base } as never).id, 'gated-manual',
-    'by default a human gate is a person\'s');
+    'by default an overdue verdict is a person\'s');
   assert.notEqual(classifySituation({ ...base, gateDelegated: true } as never).id, 'gated-manual',
     'delegated, it is something the ladder can board');
+  // A manual gate whose evidence says "not delegated" is a person's — which is
+  // what the service now answers for every manual gate, delegated or not.
+  const manual = { ...base, gate: { clear: false, kind: 'manual', detail: 'the owner approves the copy' } };
+  assert.equal(classifySituation({ ...manual } as never).id, 'gated-manual');
 });
 
 /* ------------------------------------------------------------------ *

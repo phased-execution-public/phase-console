@@ -93,6 +93,8 @@ export type PreludeStep = {
   windowMinutes?: number;
   autoOpen?: 'host';
   credential?: string;
+  /** The watch ref it is `upcoming` until (control-tower phase 121); phase 0 is the plan's own. */
+  due?: string;
 };
 
 export type Prelude = {
@@ -269,6 +271,7 @@ export async function doorSteps(
       ...(step.windowMinutes !== undefined ? { windowMinutes: step.windowMinutes } : {}),
       ...(step.autoOpen ? { autoOpen: step.autoOpen } : {}),
       ...(step.credential ? { credential: step.credential } : {}),
+      ...(step.due ? { due: step.due } : {}),
     };
     if (!step.proof || !probe) return base;
     try {

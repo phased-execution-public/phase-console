@@ -2057,3 +2057,49 @@ test('CR-3: "use credits past plan limits" is per account and OFF by default; sw
     assert.equal(accounts.setOverage('nobody', true).ok, false, 'an unknown account is refused');
   } finally { accounts.stop(); }
 });
+
+/* ---------------- one login, one pool (control-tower phase 110, #187) ---------------- */
+
+test('HP-2: the pool is the login — two registrations of one login answer one pool key, the picker never offers the leaving login even on its forecast, and another seat of the same organisation is a pool of its own', async () => {
+  const now = Date.now();
+  const HOUR = 3_600_000;
+  const accounts = makeAccounts({
+    now: () => now,
+    fetchFn: (async () => { throw new TypeError('fetch failed'); }) as typeof fetch,
+    learnedFile: join(STATE_SANDBOX, `learned-hp2-${Math.random().toString(16).slice(2)}.json`),
+  });
+  const signIn = (dir: string, email: string, org: string) => {
+    writeFileSync(join(dir, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: `tok-${dir.length}-${email}`, refreshToken: `r-${email}`, expiresAt: now + HOUR, subscriptionType: 'max' },
+    }));
+    writeFileSync(join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: email, organizationUuid: org, organizationName: 'An org' } }));
+  };
+  // The incident's shape: the same person registered twice, and a second seat.
+  const a = accounts.beginProfile('support-a');
+  const b = accounts.beginProfile('support-b');
+  const c = accounts.beginProfile('info');
+  try {
+    signIn(a.dir, 'support@example.com', 'org-e462');
+    signIn(b.dir, 'Support@Example.com', 'org-e462');
+    signIn(c.dir, 'info@example.com', 'org-e462');
+    const meters = {
+      five_hour: { utilization: 43, resetsAt: new Date(now + 4 * HOUR).toISOString() },
+      seven_day: { utilization: 30, resetsAt: new Date(now + 60 * HOUR).toISOString() },
+    };
+    for (const id of [a.id, b.id, c.id]) plantMeters(accounts, id, { buckets: meters, fetchedAt: new Date(now).toISOString() });
+
+    const poolOf = (accounts as unknown as { poolOf?: (id: string) => string }).poolOf?.bind(accounts);
+    assert.ok(poolOf, 'the facade answers which pool an account spends — one key, the picker\'s own');
+    assert.equal(poolOf(a.id), poolOf(b.id), 'two registrations of one login are one pool (the email\'s case is not a second person)');
+    assert.notEqual(poolOf(a.id), poolOf(c.id), 'another seat of the same organisation has a meter of its own');
+    assert.ok(poolOf('nobody-registered').length > 0, 'an account no login names is a pool of one');
+
+    // The usage-wall switch reads the forecast to the wall's reset: it ranks pools, never the leaving login.
+    const plan = accounts.switchCandidates(a.id, undefined, { nowMs: now, until: now + 2 * HOUR, pool: [a.id, b.id, c.id] });
+    assert.deepEqual(plan.ranked, [c.id], 'support-b is the meter being left');
+    assert.ok(!accounts.rankAccounts(b.id, undefined, now).includes(a.id), 'and leaving support-b never lands on support-a');
+  } finally {
+    for (const id of [a.id, b.id, c.id]) await accounts.remove(id);
+    accounts.stop();
+  }
+});

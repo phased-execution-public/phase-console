@@ -125,6 +125,8 @@ export type WaitScope = 'local' | 'external';
  */
 const LOOPBACK_HOST = '(localhost|127\\.[0-9.]+|\\[::1\\]|0\\.0\\.0\\.0)([:/\\s\'"]|$)';
 const LOOPBACK_URL = `https?://${LOOPBACK_HOST}`;
+/** A loopback host cut short by the end of the text — `127`, `local`, `[::` — or no host at all. */
+const CUT_LOOPBACK = '(?:127[0-9.]*|l(?:o(?:c(?:a(?:l(?:h(?:o(?:s(?:t)?)?)?)?)?)?)?)?|\\[(?::(?::1?)?)?|0(?:\\.[0-9.]*)?)?';
 
 /**
  * Text that names something on THIS machine, produced by THIS session.
@@ -190,8 +192,11 @@ const REMOTE_TARGET = new RegExp(
   // however its output is redirected.
   '[a-z0-9_./-]*(deploy|ship|release|provision|rollout)[a-z0-9_.-]*\\.(sh|bash|py)'
   // Any URL but a loopback one: `http://127.0.0.1:8197` is a server the
-  // session started, and it used to outrank `LOCAL_JOB` here (AUD-34).
-  + `|https?://(?!${LOOPBACK_HOST})`,
+  // session started, and it used to outrank `LOCAL_JOB` here (AUD-34). Nor one
+  // the summary's cap cut before its host was whole — `…=http://127` at the end
+  // of the text named no remote host, and read as one (control-tower phase 111,
+  // #179).
+  + `|https?://(?!${LOOPBACK_HOST})(?!${CUT_LOOPBACK}$)`,
 );
 
 /**
@@ -456,9 +461,36 @@ export const WATCH_ONESHOT_LEADS = new Set([
  */
 export function waitScope(summary: string, opts: { ownPids?: readonly number[] } = {}): WaitScope {
   const folded = foldWhitespace(summary);
+  // A loop on nothing but the clock is the session timing ITSELF — its own
+  // fixture's window, a pause it chose (control-tower phase 111, #179). What
+  // follows its `done` is what it does once the time comes, never what it
+  // waits on, so it cannot make the wait somebody else's.
+  if (clockLoop(folded)) return 'local';
   if (remoteWait(folded)) return 'external';
   if (LOCAL_JOB.test(folded)) return 'local';
   return ownPidProbe(folded, opts.ownPids ?? []) ? 'local' : 'external';
+}
+
+/** A loop condition that reads nothing but the clock: `[ "$(date +%s)" -ge "$t" ]`, `(( SECONDS < 600 ))`. */
+const CLOCK_CONDITION = /^(?:\[\[?|test|\(\()\s.*(?:\$\(\s*date\b[^)]*\)|\bSECONDS\b|\bEPOCHSECONDS\b)/;
+
+/** The statements a clock loop's body may hold: it paces, and says so. */
+const PACING = /^(?:sleep [0-9.]+[smh]?|true|:|echo\b.*|printf\b.*)$/;
+
+/**
+ * Is this command, before anything after its loop, a wait on the clock alone?
+ * Its condition reads the time and no other command, and its body only paces.
+ * The subject of such a wait is the session's own schedule, whatever the line
+ * goes on to run once the time comes (control-tower phase 111, #179).
+ */
+export function clockLoop(folded: string): boolean {
+  const loop = /(?:^|[;&|({] *)(?:until|while) (.+?);? *do (.+?);? *done(?:$|[\s;&|)])/.exec(folded);
+  if (!loop) return false;
+  const condition = loop[1]!.trim();
+  if (!CLOCK_CONDITION.test(condition)) return false;
+  // Another substitution in the condition reads something besides the clock.
+  if (/\$\(|`/.test(condition.replace(/\$\(\s*date\b[^)]*\)/g, ''))) return false;
+  return loop[2]!.split(/\s*;\s*/).every((statement) => PACING.test(statement.trim()));
 }
 
 /**
@@ -594,9 +626,37 @@ function joinChain(signals: LaneSignals, summary: string, at: number, env: Verif
   return key;
 }
 
-/** A chain is live while one of its calls is open, or its last one ended inside the gap. */
+/**
+ * A chain is live while one of its calls is open, or its last one ended inside
+ * the gap — unless the session is in ANOTHER wait by then: the gap is for the
+ * seconds between two slices of one wait, and a window kept open across a
+ * different one fired 2 min 20 s into a sanctioned own-job wait, on a call
+ * that had returned (control-tower phase 111, #206).
+ */
 function chainLive(signals: Pick<LaneSignals, 'openTools'>, chain: WaitChain, at: number): boolean {
-  return signals.openTools.some((tool) => tool.chain === chain.key) || at - chain.lastAt <= WAIT_CHAIN_GAP_MS;
+  if (signals.openTools.some((tool) => tool.chain === chain.key)) return true;
+  if (signals.openTools.some((tool) => tool.chain && tool.chain !== chain.key)) return false;
+  return at - chain.lastAt <= WAIT_CHAIN_GAP_MS;
+}
+
+/**
+ * Time a call spent held on a person's approval card is not time it waited on
+ * anything (control-tower phase 111, #206): the PreToolUse hook held it before
+ * it ran, and no session can avoid the card — one allowed late enough used to
+ * convert straight into a checkpoint. Credited by moving the call's clock, and
+ * its chain's, forward by the time held. The call is the one the hook named,
+ * else the newest open Bash call that went out before the card went up.
+ */
+export function creditHeldTime(signals: LaneSignals, held: { toolUseId?: string; since: number; until: number }): void {
+  const ms = held.until - held.since;
+  if (!(ms > 0)) return;
+  const bash = signals.openTools.filter((tool) => tool.name === EXTERNAL_WAIT_TOOL);
+  const tool = (held.toolUseId ? bash.find((t) => t.id === held.toolUseId) : undefined)
+    ?? [...bash].reverse().find((t) => t.since <= held.since);
+  if (!tool) return;
+  tool.since = Math.min(tool.since + ms, held.until);
+  const chain = tool.chain ? signals.waitChains?.find((c) => c.key === tool.chain) : undefined;
+  if (chain) chain.since = Math.min(chain.since + ms, held.until);
 }
 
 /**
@@ -781,7 +841,7 @@ function maskData(statement: Statement): string {
 }
 
 /** The last path segment of a word: `/bin/bash` is `bash`, `.` is `.`. */
-function basename(word: string): string {
+export function basename(word: string): string {
   return word.replace(/^.*\//, '');
 }
 
@@ -801,7 +861,7 @@ const PLAIN_WORD = /^[\w./:@-]*$/;
  * first assignment with a quoted space, and every unlisted spelling of a
  * shell then fell to the masked path where its payload is data.
  */
-function shellWords(text: string): string[] {
+export function shellWords(text: string): string[] {
   const src = text.replace(/\\\r?\n/g, ' ');
   const out: string[] = [];
   let current = '';
@@ -810,6 +870,17 @@ function shellWords(text: string): string[] {
   const n = src.length;
   while (i < n) {
     const c = src[i] ?? '';
+    // `$'…'` is a word with C escapes the shell resolves (control-tower phase
+    // 107): `$'git' push` runs `git push`, so the reader must see that.
+    if (c === '$' && src[i + 1] === "'") {
+      const decoded = ansiC(src, i + 2);
+      current += decoded.text;
+      started = true;
+      i = decoded.end;
+      continue;
+    }
+    // `$"…"` is a double-quoted word (translated by locale, which changes no command).
+    if (c === '$' && src[i + 1] === '"') { i += 1; continue; }
     if (c === "'") {
       const end = src.indexOf("'", i + 1);
       current += src.slice(i + 1, end < 0 ? n : end);
@@ -863,6 +934,36 @@ function shellWords(text: string): string[] {
   return out;
 }
 
+/** Escapes an ANSI-C quoted string (`$'…'`) resolves; `\0` NUL is dropped, as the shell ends the string there. */
+const ANSI_C_ESCAPES: Readonly<Record<string, string>> = {
+  a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?',
+};
+
+/** The text of a `$'…'` word whose body starts at `from`, and the index just past its closing quote. */
+function ansiC(src: string, from: number): { text: string; end: number } {
+  let text = '';
+  let i = from;
+  while (i < src.length && src[i] !== "'") {
+    if (src[i] !== '\\') { text += src[i]; i += 1; continue; }
+    const next = src[i + 1] ?? '';
+    const hex = /^x([0-9A-Fa-f]{1,2})/.exec(src.slice(i + 1, i + 4));
+    const uni = /^(?:u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8}))/.exec(src.slice(i + 1, i + 10));
+    const oct = /^[0-7]{1,3}/.exec(src.slice(i + 1, i + 4));
+    if (hex) { text += String.fromCharCode(parseInt(hex[1] ?? '0', 16)); i += 1 + hex[0].length; continue; }
+    if (uni) {
+      const code = parseInt(uni[1] ?? uni[2] ?? '0', 16);
+      text += code <= 0x10ffff ? String.fromCodePoint(code) : '';
+      i += 1 + uni[0].length;
+      continue;
+    }
+    if (oct) { text += String.fromCharCode(parseInt(oct[0], 8) & 0xff); i += 1 + oct[0].length; continue; }
+    if (next === 'c' && src[i + 2] !== undefined) { text += String.fromCharCode((src.charCodeAt(i + 2) & 0x1f)); i += 3; continue; }
+    text += ANSI_C_ESCAPES[next] ?? `\\${next}`;
+    i += 2;
+  }
+  return { text: text.replace(/\0[\s\S]*$/, ''), end: Math.min(src.length, i + 1) };
+}
+
 /**
  * Leads that RUN what they are handed — as an argument (`bash -c`, `eval`),
  * as their input (`bash` at the end of a pipe), on another machine (`ssh`),
@@ -899,7 +1000,7 @@ function shellRunsItsArgument(words: string[]): boolean {
   return true; // bare, or flags only: stdin is the program
 }
 
-function executes(text: string): boolean {
+export function executes(text: string): boolean {
   const raw = shellWords(text.trim().replace(/^[({!\s]+/, ''));
   for (const word of raw) {
     const assign = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(word);
@@ -926,7 +1027,7 @@ function executes(text: string): boolean {
 }
 
 /** `git [-C dir] [-c k=v] <sub> …`: the subcommand, and the option values before it. */
-function gitParts(words: string[]): { sub: string; options: string[] } {
+export function gitParts(words: string[]): { sub: string; options: string[] } {
   const options: string[] = [];
   let i = 1;
   while (i < words.length && (words[i] ?? '').startsWith('-')) {
@@ -987,7 +1088,7 @@ const RUNNER_SUBCOMMANDS = new Set(['run', 'exec', 'dlx', 'x', 'tool']);
  * runners stepped over, quotes resolved, a line continuation read as the
  * whitespace it is.
  */
-function leadWords(text: string): string[] {
+export function leadWords(text: string): string[] {
   const words = shellWords(text.trim().replace(/^[({!\s]+/, ''));
   let i = 0;
   while (i < words.length) {
@@ -1046,10 +1147,78 @@ export type Statement = {
   substitutions: { start: number; end: number; body: string }[];
   /** Quoted strings at this statement's own level — data, to most commands. */
   quotes: { start: number; end: number }[];
+  /**
+   * Split out of a here-doc body a SHELL reads (`bash <<EOF`, `cat <<EOF | sh`)
+   * — code, but code that arrived as a here-doc, which a reader may want to
+   * name (control-tower phase 107, #189).
+   */
+  fromHeredoc?: boolean;
 };
 
+/**
+ * One here-doc as `splitStatements` met it, for a caller that asks
+ * (control-tower phase 107, #189): its body, whether its delimiter was QUOTED
+ * (`<<'EOF'`, `<<"EOF"`, `<<\EOF` — the body is then literal), and whether a
+ * shell reads it as code. An UNQUOTED body is expanded by the shell before its
+ * command reads it, so its `$( … )` and backticks run whatever the command is.
+ */
+export type HereDoc = { body: string; quoted: boolean; code: boolean };
+
+/**
+ * The here-doc operator at `at` (`<<` or `<<-`) and its DELIMITER WORD, read
+ * as bash reads it (control-tower phase 107): the word runs to the first
+ * unquoted metacharacter, quote removal gives the terminator, and ANY quoting
+ * in it — `'EOF'`, `"EOF"`, `\EOF`, `E"OF"` — makes the body literal. A
+ * terminator read short (`<<E"OF"` as `E`, `<<END!` as `END`) never meets its
+ * line, and a body that runs to the end of the text swallows the commands
+ * after it. Null when no word follows (a syntax error the shell refuses).
+ */
+function heredocWord(text: string, at: number): { terminator: string; quoted: boolean; strip: boolean; end: number } | null {
+  let i = at + 2;
+  const strip = text[i] === '-';
+  if (strip) i += 1;
+  while (text[i] === ' ' || text[i] === '\t') i += 1;
+  let terminator = '';
+  let quoted = false;
+  const n = Math.min(text.length, at + 400);
+  while (i < n && !/[\s;&|<>()]/.test(text[i] ?? ' ')) {
+    const c = text[i] ?? '';
+    if (c === "'") {
+      const end = text.indexOf("'", i + 1);
+      if (end < 0) return null;
+      terminator += text.slice(i + 1, end);
+      quoted = true;
+      i = end + 1;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < n && text[j] !== '"') {
+        if (text[j] === '\\' && j + 1 < n) { terminator += text[j + 1]; j += 2; continue; }
+        terminator += text[j];
+        j += 1;
+      }
+      if (j >= n) return null;
+      quoted = true;
+      i = j + 1;
+    } else if (c === '\\') {
+      terminator += text[i + 1] ?? '';
+      quoted = true;
+      i += 2;
+    } else if (c === '$' && text[i + 1] === "'") {
+      const end = text.indexOf("'", i + 2);
+      if (end < 0) return null;
+      terminator += text.slice(i + 2, end);
+      quoted = true;
+      i = end + 1;
+    } else {
+      terminator += c;
+      i += 1;
+    }
+  }
+  return terminator || quoted ? { terminator, quoted, strip, end: i } : null;
+}
+
 /** What the scanner is inside of. Only the last entry decides what a character means. */
-type Context = 'sq' | 'dq' | 'ansi' | 'backtick' | 'subst' | 'param' | 'paren' | 'brace' | 'case' | 'arith';
+type Context = 'sq' | 'dq' | 'ansi' | 'backtick' | 'subst' | 'param' | 'paren' | 'brace' | 'case' | 'arith' | 'arithb';
 
 /** Words that open a compound at a statement's lead, and the ones that close it. */
 const COMPOUND_OPEN = new Set(['until', 'while', 'for', 'select', 'if']);
@@ -1067,6 +1236,29 @@ const MAX_HEREDOCS_PER_LINE = 8;
  */
 const LINE_SHELL_WORD =
   /(?:^|[\s|;&(])(?:[^\s|;&()]*\/)?(?:bash|sh|zsh|dash|ksh|fish|eval|source|ssh|\.)(?=$|[\s|;&)])/;
+
+/** The shells whose stdin is their program — the same words `LINE_SHELL_WORD` spells, by basename. */
+const SHELL_BASENAMES: ReadonlySet<string> = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'eval', 'source', 'ssh', '.']);
+
+/**
+ * Does any word of the line name a shell, so a here-doc on it is CODE
+ * (control-tower phase 107, #189)? `LINE_SHELL_WORD` reads the raw text, which
+ * a quote or a backslash in the shell word defeats — `"sh" <<EOF`, `b\ash
+ * <<EOF` and `s""h <<EOF` all run the body as a script, yet the regex, looking
+ * for `sh` bounded by separators, saw none and called the body data. So the
+ * words are ALSO read quote-removed, which is how bash looks a command up: a
+ * union, so this only ever turns MORE bodies into code — the safe direction,
+ * never a push called data. Over-reading a data owner (`echo bash <<EOF`) as
+ * code only raises a card the regex already raised.
+ */
+function lineRunsHeredocAsCode(line: string): boolean {
+  if (LINE_SHELL_WORD.test(line)) return true;
+  try {
+    return shellWords(line).some((w) => SHELL_BASENAMES.has(basename(w)));
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Split a command into the statements bash would run, in order.
@@ -1087,7 +1279,7 @@ const LINE_SHELL_WORD =
  * back as one `malformed` statement rather than an exception or a silent
  * exemption.
  */
-export function splitStatements(text: string, depth = 0): Statement[] {
+export function splitStatements(text: string, depth = 0, docs?: HereDoc[]): Statement[] {
   const out: Statement[] = [];
   const stack: Context[] = [];
   const top = (): Context | undefined => stack[stack.length - 1];
@@ -1114,9 +1306,11 @@ export function splitStatements(text: string, depth = 0): Statement[] {
   /** Parentheses open inside `$((…))` / `((…))`. */
   let arithDepth = 0;
   /** Here-docs announced on the current line, consumed at its end. */
-  let heredocs: { terminator: string; strip: boolean }[] = [];
+  let heredocs: { terminator: string; strip: boolean; quoted: boolean }[] = [];
   /** Here-doc bodies a shell will read, split after the command itself. */
   const codeBodies: string[] = [];
+  /** Here-doc bodies that never met their delimiter — reported as malformed. */
+  const unclosed: string[] = [];
 
   const isWs = (c: string | undefined): boolean => c === ' ' || c === '\t' || c === '\r';
   const nested = (): boolean => stack.some((c) => c !== 'dq' && c !== 'param' && c !== 'arith');
@@ -1171,7 +1365,7 @@ export function splitStatements(text: string, depth = 0): Statement[] {
       }
       for (const span of spans) {
         if (span.start < from || span.end > to) continue;
-        const bodyFrom = span.start + (text[span.start] === '$' ? 2 : 1);
+        const bodyFrom = span.start + (text[span.start] === '`' ? 1 : 2);
         statement.substitutions.push({
           start: span.start - from - lead,
           end: span.end - from - lead,
@@ -1216,20 +1410,26 @@ export function splitStatements(text: string, depth = 0): Statement[] {
     // Whether a shell reads the body is decided by the whole line, now that
     // the line is known: the owner, a wrapper's shell, or a pipe's far end.
     const line = text.slice(text.lastIndexOf('\n', newline - 1) + 1, newline);
-    const code = LINE_SHELL_WORD.test(line);
+    const code = lineRunsHeredocAsCode(line);
     const nothingYet = text.slice(start, i).trim() === '';
     const bodyStart = i;
     for (const doc of pending) {
       const lines: string[] = [];
+      let closed = false;
       while (i < n) {
         let eol = text.indexOf('\n', i);
         if (eol < 0) eol = n;
         const lineText = text.slice(i, eol).replace(/\r$/, '');
         i = Math.min(n, eol + 1);
-        if ((doc.strip ? lineText.replace(/^\t+/, '') : lineText) === doc.terminator) break;
+        if ((doc.strip ? lineText.replace(/^\t+/, '') : lineText) === doc.terminator) { closed = true; break; }
         lines.push(lineText);
       }
+      // A body that never meets its delimiter is one this reader may have
+      // misjudged (control-tower phase 107): said as MALFORMED, so a caller
+      // that must never be weaker than the raw reading reads the raw text too.
+      if (!closed && lines.length) unclosed.push(lines.join('\n'));
       if (code && lines.length) codeBodies.push(lines.join('\n'));
+      docs?.push({ body: lines.join('\n'), quoted: doc.quoted, code });
     }
     blanks.push({ start: bodyStart, end: i });
     if (nothingYet) start = i;
@@ -1281,6 +1481,24 @@ export function splitStatements(text: string, depth = 0): Statement[] {
       i += 1;
       continue;
     }
+    if (t === 'arithb') {
+      // `$[ … ]`, the older arithmetic: `<<` is a shift here too, never a
+      // here-doc (control-tower phase 107 — read as one, a line `2` after
+      // `echo $[ 1 << 2 ]` closed a "body" that hid the commands bash runs).
+      if (c === '\\') { i += 2; continue; }
+      if (c === '[') { arithDepth += 1; i += 1; continue; }
+      if (c === ']') {
+        if (arithDepth > 0) { arithDepth -= 1; i += 1; continue; }
+        stack.pop();
+        i += 1;
+        continue;
+      }
+      if (c === '$' && text[i + 1] === '(') { openSub(i); stack.push('subst'); i += 2; continue; }
+      if (c === "'") { stack.push('sq'); i += 1; continue; }
+      if (c === '"') { stack.push('dq'); i += 1; continue; }
+      i += 1;
+      continue;
+    }
     if (t === 'arith') {
       // Arithmetic: `<<` is a shift, `)` closes only in pairs.
       if (c === '\\') { i += 2; continue; }
@@ -1329,6 +1547,7 @@ export function splitStatements(text: string, depth = 0): Statement[] {
     if (c === '$' && text[i + 1] === "'") { openQuoted(i); stack.push('ansi'); i += 2; continue; }
     if (c === '$' && text[i + 1] === '"') { openQuoted(i); stack.push('dq'); i += 2; continue; }
     if (c === '$' && text[i + 1] === '(' && text[i + 2] === '(') { stack.push('arith'); arithDepth = 0; i += 3; continue; }
+    if (c === '$' && text[i + 1] === '[') { stack.push('arithb'); arithDepth = 0; i += 2; continue; }
     if (c === '$' && text[i + 1] === '(') { openSub(i); stack.push('subst'); i += 2; continue; }
     if (c === '$' && text[i + 1] === '{') { stack.push('param'); i += 2; continue; }
     if (c === '`') { openSub(i); stack.push('backtick'); i += 1; continue; }
@@ -1341,15 +1560,18 @@ export function splitStatements(text: string, depth = 0): Statement[] {
     }
     if (c === '<' && text[i + 1] === '<' && text[i + 2] !== '<'
       && (i === 0 || isWs(text[i - 1]) || text[i - 1] === '\n' || ';&|('.includes(text[i - 1] ?? 'x'))) {
-      const doc = /^<<(-?)\s*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][A-Za-z0-9_.-]*))/.exec(text.slice(i, i + 200));
+      const doc = heredocWord(text, i);
       if (doc) {
         if (heredocs.length < MAX_HEREDOCS_PER_LINE) {
-          heredocs.push({ terminator: doc[2] ?? doc[3] ?? doc[4] ?? '', strip: doc[1] === '-' });
+          heredocs.push({ terminator: doc.terminator, strip: doc.strip, quoted: doc.quoted });
         }
-        i += doc[0].length;
+        i = doc.end;
         continue;
       }
     }
+    // A process substitution runs its body, like `$( … )` (control-tower phase
+    // 107): recorded as a substitution, so a reader sees the command inside.
+    if ((c === '<' || c === '>') && text[i + 1] === '(') { openSub(i); stack.push('subst'); i += 2; continue; }
     if (c === '(' && text[i + 1] === '(') {
       stack.push('arith');
       arithDepth = 0;
@@ -1412,9 +1634,15 @@ export function splitStatements(text: string, depth = 0): Statement[] {
     i += 1;
   }
   emit(n, false, false, stack.length > 0 || compound > 0);
+  for (const body of unclosed) {
+    out.push({ text: body, backgrounded: false, pipedInto: false, malformed: true, substitutions: [], quotes: [] });
+  }
   for (const body of codeBodies) {
-    if (depth < MAX_NESTING) out.push(...splitStatements(body, depth + 1));
-    else out.push({ text: body, backgrounded: false, pipedInto: false, malformed: true, substitutions: [], quotes: [] });
+    if (depth < MAX_NESTING) {
+      for (const statement of splitStatements(body, depth + 1, docs)) out.push({ ...statement, fromHeredoc: true });
+    } else {
+      out.push({ text: body, backgrounded: false, pipedInto: false, malformed: true, substitutions: [], quotes: [], fromHeredoc: true });
+    }
   }
   return out;
 }
@@ -1640,6 +1868,12 @@ export type LaneSilence = {
 export type LaneLiveness = {
   phase: number;
   /**
+   * The live session's input, once it has CLOSED (control-tower phase 109,
+   * #170): a lane that is running and cannot be steered, asked or told
+   * anything says so here, with when and why. Absent while the input is open.
+   */
+  input?: { open: boolean; closedAt?: string; cause?: string };
+  /**
    * Which attempt of the phase these clocks belong to, and when its process
    * started (ISO, the child record's own `procStartedAt`) — control-tower
    * phase 80, #99. A lane's liveness is its LIVE process's: an attempt the loop
@@ -1857,6 +2091,12 @@ export type LaneSignals = {
    */
   backgroundTasks?: BackgroundTask[];
   /**
+   * The agents and monitors a session's PROCESS ended with still running —
+   * the CLI's ceiling stopped them (control-tower phase 109, #188), newest
+   * last, at most eight. What the attempt's settle names to the next boarding.
+   */
+  endedWithProcess?: BackgroundTask[];
+  /**
    * The poll-loop guard's tracker for this session (autopilot-token-drain
    * phase 2, `shared/poll-loop.js`): the PreToolUse hook folds in the calls it
    * can judge (`Runner.observeToolCall`), and `applyEvent` every other call the
@@ -1902,7 +2142,15 @@ export type BackgroundTask = {
   ownedBySubagent?: boolean;
   /** When the task started (ms). */
   since: number;
+  /** The tool call that started it — what a background agent's own words name as their parent (#188). */
+  toolUseId?: string;
+  /** A background agent's newest words, and when (control-tower phase 109, #188) — what a killed one was last doing. */
+  lastText?: string;
+  lastAt?: number;
 };
+
+/** How much of a background agent's newest words a lane keeps (#188). */
+export const BACKGROUND_LAST_TEXT = 300;
 
 type OpenToolAt = { id: string; name: string; since: number; summary?: string; chain?: string };
 
@@ -2237,6 +2485,13 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number,
     case 'background': {
       const tasks = (signals.backgroundTasks ??= []);
       const i = tasks.findIndex((task) => task.id === event.taskId);
+      // One the process ended with still running (control-tower phase 109,
+      // #188): kept, words and all, for the attempt's settle to name.
+      if (i >= 0 && event.op === 'ended' && event.status === 'process-exited' && wakesTheSession(tasks[i]!)) {
+        const ended = (signals.endedWithProcess ??= []);
+        ended.push({ ...tasks[i]! });
+        if (ended.length > 8) ended.shift();
+      }
       if (i >= 0) tasks.splice(i, 1);
       if (event.op === 'started') {
         tasks.push({
@@ -2245,8 +2500,20 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number,
           ...(event.tool ? { tool: event.tool } : {}),
           ...(event.description ? { description: event.description } : {}),
           ...(event.ownedBySubagent ? { ownedBySubagent: true } : {}),
+          ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
         });
         if (tasks.length > MAX_OPEN_TOOLS) tasks.shift();
+      }
+      break;
+    }
+    case 'subagent': {
+      // A background agent's own words, newest kept (control-tower phase 109,
+      // #188): if it is killed after its session handed off, the next attempt
+      // is told what it was last doing.
+      const task = signals.backgroundTasks?.find((one) => one.toolUseId && one.toolUseId === event.parent);
+      if (task && event.text.trim()) {
+        task.lastText = `${task.lastText ?? ''}${event.text}`.slice(-BACKGROUND_LAST_TEXT);
+        task.lastAt = at;
       }
       break;
     }
@@ -2277,6 +2544,32 @@ export function wakesTheSession(task: Pick<BackgroundTask, 'taskType' | 'tool' |
   if (task.ownedBySubagent) return false;
   if (task.taskType === 'local_agent') return true;
   return task.taskType === 'local_bash' && task.tool === 'Monitor';
+}
+
+/**
+ * The session's OWN background work still running — every task the CLI
+ * tracks for it that no subagent owns (control-tower phase 111, #206). A
+ * checkpoint signals the session's whole process group, so this work ends
+ * with it; the watchdog judges a wait held over it on the own-job rungs.
+ */
+export function ownBackgroundWork(signals: Pick<LaneSignals, 'backgroundTasks'>): BackgroundTask[] {
+  return (signals.backgroundTasks ?? []).filter((task) => !task.ownedBySubagent);
+}
+
+/**
+ * When a clock loop's wait ends, if the command says so — the instant its
+ * target is computed from (`date -j -f … '2026-10-01T07:54:40Z' +%s`) — and it
+ * is still ahead (control-tower phase 111, #179). A park on such a loop is
+ * bounded by it, not by a fixed window; anything else answers null, because a
+ * park is bounded by what is known, never by a guess.
+ */
+export function knownEndOf(summary: string, now: number): number | null {
+  const folded = foldWhitespace(summary);
+  if (!clockLoop(folded)) return null;
+  const ahead = [...folded.matchAll(/\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z)\b/g)]
+    .map((match) => Date.parse(match[1]!))
+    .filter((at) => Number.isFinite(at) && at > now);
+  return ahead.length ? Math.max(...ahead) : null;
 }
 
 /** The outstanding background tasks that will wake the session, oldest first. */

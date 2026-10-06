@@ -442,6 +442,86 @@ test('EC6: a watcher flush naming only a directory does not bump an unrelated pl
 });
 
 /* ------------------------------------------------------------------ *
+ * TF-3/TF-4 (2026-10-05, engine queue 588) — a path that is not a plan
+ * is not a roster change, and a rescan forgets only what it changed
+ * ------------------------------------------------------------------ */
+
+test('TF-3: a plans-directory path that is not a plan file neither rescans nor names a plan; the directory itself still rescans', () => {
+  const lib = library();
+  try {
+    addPlan(lib.root, 'read-path-saved');
+    const check = checkRoot(lib.root);
+    assert.equal(check.ok, true);
+    const plans = check.plansDir!;
+    const store = new Store(check);
+    store.scan();
+    let scans = 0;
+    const scan = store.scan.bind(store);
+    store.scan = () => { scans++; scan(); };
+
+    // What a save leaves for an instant, and what lives beside the plans without being one.
+    const scratchName = join(plans, 'read-path-saved.md.tmp.2831.842a2de19a90');
+    writeFileSync(scratchName, 'half a plan');
+    mkdirSync(join(plans, 'observability-plane'));
+    const nested = join(plans, 'observability-plane', 'x.md');
+    writeFileSync(nested, '# not a plan\n');
+    const readme = join(plans, 'README.md');
+    writeFileSync(readme, '# the plans\n');
+
+    for (const path of [scratchName, nested, join(plans, 'observability-plane'), readme]) {
+      assert.deepEqual(store.refresh([path]), [], `${path} is not a plan: it must name none`);
+      assert.equal(store.slugForPath(path), undefined, `${path} must not map to a slug`);
+    }
+    assert.equal(scans, 0,
+      'a path that is not a plan file made the batch structural — a wholesale rescan, then every plan forgotten');
+    assert.equal(store.get('x'), undefined, 'a subdirectory file named a plan that does not exist');
+    assert.equal(store.slugForPath(join(plans, 'read-path-saved.md')), 'read-path-saved', 'a plan file still names its plan');
+
+    // The deaf-heartbeat flush passes the WATCHED DIRECTORY: something changed, not what.
+    store.refresh([plans]);
+    assert.equal(scans, 1, 'the plans directory itself must still rescan');
+  } finally {
+    lib.cleanup();
+  }
+});
+
+test('TF-4: a rescan forgets only the plans that moved or were named — an untouched plan keeps its cached board; a flush still forgets all', async (t) => {
+  const lib = library();
+  t.after(lib.cleanup);
+  for (const slug of ['read-path-edited', 'read-path-untouched', 'read-path-gone']) addPlan(lib.root, slug);
+  const svc = service(t, lib.root);
+  const boards = (svc as unknown as { boards: Map<string, unknown> }).boards;
+  for (const slug of ['read-path-edited', 'read-path-untouched', 'read-path-gone']) await svc.board(slug);
+  const kept = boards.get('read-path-untouched');
+  const edited = boards.get('read-path-edited');
+  assert.ok(kept && edited && boards.has('read-path-gone'), 'precondition: every board is cached');
+  const told: string[][] = [];
+  svc.onEvent((event, data) => { if (event === 'changed') told.push([...(data as { slugs: string[] }).slugs].sort()); });
+
+  // One plan is edited, one deleted, and a new plan file arrives: a roster
+  // change, so the store answers with a full rescan that returns every slug.
+  const editedPath = join(lib.root, 'docs', 'plans', 'read-path-edited.md');
+  writeFileSync(editedPath, `${readFileSync(editedPath, 'utf8')}\n<!-- edited -->\n`);
+  rmSync(join(lib.root, 'docs', 'plans', 'read-path-gone.md'));
+  rmSync(join(lib.root, 'docs', 'handoffs', 'read-path-gone'), { recursive: true });
+  addPlan(lib.root, 'read-path-new');
+  // The watcher's own entry point, called directly: no debounce or fs-event timing in the proof.
+  (svc as unknown as { onChange(paths: string[]): void }).onChange([join(lib.root, 'docs', 'plans', 'read-path-new.md')]);
+
+  assert.equal(boards.get('read-path-untouched'), kept,
+    'a rescan dropped the cached board of a plan it neither named nor moved — on the live console, every '
+      + 'plan\'s, on every save: 588 engine reads queued');
+  assert.notEqual(boards.get('read-path-edited'), edited, 'the plan that moved must drop its cached board');
+  assert.equal(boards.has('read-path-gone'), false, 'a deleted plan counts as moved');
+  assert.deepEqual(told.at(-1), ['read-path-edited', 'read-path-new'],
+    'only the plans the batch changed are news downstream — not every plan the rescan returned');
+
+  // A flush names no path: it knows something changed but not what, so nothing is kept (PR-1c).
+  (svc as unknown as { onChange(paths: string[]): void }).onChange([join(lib.root, 'docs', 'plans')]);
+  assert.notEqual(boards.get('read-path-untouched'), kept, 'a directory flush must still forget every plan');
+});
+
+/* ------------------------------------------------------------------ *
  * PR-2..5 (control-tower phase 55, #44) — the page never waits on the
  * slowest script, and never shows an empty board for a live run.
  * ------------------------------------------------------------------ */

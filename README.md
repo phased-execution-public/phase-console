@@ -96,7 +96,6 @@ Do not turn on a flag I did not agree to, and do not start a phase run to
 "test" it — a run edits my repository.
 ```
 
----
 
 ## Reach it from your phone
 
@@ -149,12 +148,13 @@ The long version, including push notifications and exactly what is enforced → 
 [QA gating](docs/qa-gating.md) · [Safety rails](docs/safety-rails.md) · [Phase Console](docs/console.md) · [Metrics](docs/metrics.md) ·
 [Install by hand](docs/install.md) · [Versioning & releases](docs/releasing.md) · [Reference](docs/reference.md)
 
-5.1 lets many plans work one repository at once — a checkout per run, one trace id through everything a run does,
-notes that reach a phase before it starts; 5.0 added `phase-console doctor`, the [decisions](docs/decisions.md) a run starts with, and the relay — [docs/controls.md](docs/controls.md).
+6.1 reads a repository's whole issue list on one desk — each issue's category, severity and where it
+stands in a plan — lets a wait name a job on another machine (`unit:<host>/<unit>`) and keep a date only
+as its backstop, and lists the acts only you can do under *Coming up* until they are due.
 
-Needs Claude Code, plus `bash` and `git`. The console adds Node 22.18+ (or 23.6+) and has **no
-runtime dependencies**. Releases: `vX.Y.Z` tags with a GitHub Release carrying the packed tarball,
-cut by hand — see the [CHANGELOG](CHANGELOG.md).
+
+Needs Claude Code, plus `bash` and `git`. The console adds Node 22.18+ (or 23.6+) and has **no runtime dependencies**.
+Releases: `vX.Y.Z` tags with a GitHub Release carrying the packed tarball, cut by hand — see the [CHANGELOG](CHANGELOG.md).
 
 ## Licensing
 

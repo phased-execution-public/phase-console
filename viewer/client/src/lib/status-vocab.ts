@@ -326,6 +326,7 @@ const STOP_KIND_HELP: Record<string, string> = {
     'queued behind another lane working in the same repository — nobody is being asked for anything',
   mcp: 'an MCP server this phase names would not connect — nobody is being asked for anything',
   declared: 'the session said so itself',
+  watchdog: 'the console parked it by itself — its watchdog, not the session',
   verification: 'its §Verification ran and was red',
   ladder: 'the ladder spent its rungs or its dollars',
   interrupted: 'the console died with the session open',

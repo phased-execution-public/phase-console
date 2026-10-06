@@ -54,7 +54,7 @@
  * that is a question, not a signal.)
  */
 
-import { forgetPid, processState } from '../pid.ts';
+import { forgetPid, groupState, processState } from '../pid.ts';
 
 /** Send one signal to a pid's process GROUP, falling back to the pid alone. */
 export type SignalFn = (pid: number, signal: NodeJS.Signals) => void;
@@ -112,6 +112,13 @@ export type LadderOptions = {
   signal?: SignalFn;
   interruptSignal?: SignalFn;
   alive?: (pid: number) => boolean;
+  /**
+   * Is anything left in the pid's GROUP (control-tower phase 106, #168)? The
+   * shipped answer is `pid.ts`'s `groupState` — unless the caller seams
+   * `alive`: a caller that answers the existence question itself owns all of
+   * it, and a real group probe of a made-up pid would ask about a stranger's.
+   */
+  groupAlive?: (pid: number) => boolean;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 };
@@ -224,7 +231,14 @@ async function goneWithin(
  */
 export async function killLadder(pid: number, options: LadderOptions = {}): Promise<LadderEnding> {
   const send = options.signal ?? groupSignal;
-  const alive = options.alive ?? stillThere;
+  const leader = options.alive ?? stillThere;
+  // The GROUP is asked too (control-tower phase 106, #168): a leader that has
+  // exited while a member of its group still holds the command's stdio is
+  // exactly the case `-pid` exists for. Asking about the leader alone answered
+  // `gone` there, and the ladder signalled nobody while tamagui P4's Metro
+  // held a §Verification open for 50 minutes.
+  const group = options.groupAlive ?? (options.alive ? () => false : (id: number) => groupState(id) === 'alive');
+  const alive = (id: number): boolean => leader(id) || group(id);
   const sleep = options.sleep ?? wait;
   const now = options.now ?? Date.now;
   const grace = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;

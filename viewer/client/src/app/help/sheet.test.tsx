@@ -239,18 +239,21 @@ describe('the section is cards, not a wall', () => {
     expect(within(panel).getAllByRole('heading', { level: 3 }).length).toBeGreaterThan(6);
   });
 
-  it('gives every card in every section an accessible name', async () => {
-    for (const section of SECTIONS) {
-      const { unmount } = renderHelp(section.id);
+  // One test per section, each under its own budget: every section in one
+  // test outran the 20 s bound under a full gate's load (control-tower phase
+  // 124), and a red now names the section it is about.
+  it.each(SECTIONS.map((section) => section.id))(
+    'gives every card in the %s section an accessible name',
+    async (id) => {
+      renderHelp(id);
       const panel = await panelOf();
       const summaries = [...panel.querySelectorAll('summary')];
-      expect(summaries.length, `${section.id} rendered no cards`).toBeGreaterThan(1);
+      expect(summaries.length, `${id} rendered no cards`).toBeGreaterThan(1);
       for (const summary of summaries) {
-        expect(summary.textContent?.trim(), `${section.id}: a card with no name`).toBeTruthy();
+        expect(summary.textContent?.trim(), `${id}: a card with no name`).toBeTruthy();
       }
-      unmount();
-    }
-  });
+    },
+  );
 
   it('renders a group band as a real heading above its cards', async () => {
     const banded = SECTIONS.find((s) => outlineOf(s.id).groups.some((g) => g.banded));

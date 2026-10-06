@@ -788,6 +788,25 @@ export interface PhaseLandingRepo {
   };
 }
 
+/** One phase's §Verification baseline — `server/runner/state.ts` `VerifyBaseline`. */
+export interface PhaseBaseline {
+  at: string;
+  tree: string | null;
+  head: string | null;
+  concurrent?: boolean;
+  commands: {
+    command: string;
+    chain?: string;
+    ok: boolean;
+    code: number;
+    failures?: string[];
+    tail?: string;
+    environment?: string;
+    from: 'reused' | 'measured';
+    once?: true;
+  }[];
+}
+
 export interface PhaseRecord {
   phase: number;
   status: PhaseStatus;
@@ -850,6 +869,8 @@ export interface PhaseRecord {
       nextDueAt?: number;
       /** The console minted it from a refused in-turn wait, rather than the session declaring it. */
       minted?: true;
+      /** A CI run GitHub never started — what the probe read (control-tower phase 111, #166). */
+      notRun?: CiNotRunView;
     }>;
   };
   /** How many waiting-external parks this phase has DECLARED (capped by the runner). */
@@ -903,6 +924,13 @@ export interface PhaseRecord {
   /** Servers this phase asked for and boarded without. Absent when all connected. */
   mcpDegraded?: McpDegradation[];
   verification?: VerifySummary;
+  /**
+   * What the phase's §Verification lines read on the tree it boarded on —
+   * mirrors `server/runner/state.ts` `VerifyBaseline`. Since control-tower
+   * phase 106 a red line keeps its failing tests and an output `tail` (#195),
+   * and a line the machine stopped says why (`environment`, #185).
+   */
+  baseline?: PhaseBaseline;
   /**
    * Where this phase's landing has got to (many-plans-one-repo phase 8) —
    * mirrors `server/runner/state.ts` `PhaseLanding`. Absent on every phase
@@ -1167,6 +1195,10 @@ export interface VerifyingLane {
   exported?: boolean;
   /** The console's own pid — the process whose children the commands are. */
   pid: number;
+  /** The pass is in its `Setup:` preamble — `command` is the bring-up command (control-tower phase 105). */
+  stage?: 'setup';
+  /** The running command's own process (control-tower phase 105, #173). */
+  child?: { pid: number; procStartedAt: string };
 }
 
 export interface RunState {
@@ -1829,9 +1861,15 @@ export interface Approval {
     rule: string;
     value: string;
     source: string;
-    answer: 'allow' | null;
+    /**
+     * `deny`: the row allows the push only in its bare form (`bareForm`) —
+     * answered at once, or by the manifest when an automatic actor settled
+     * the card (control-tower phase 107, #186); never on a card that waits.
+     */
+    answer: 'allow' | 'deny' | null;
     why: string;
     branch?: string;
+    bareForm?: string;
   };
   createdAt: string;
   expiresAt: string;
@@ -2407,11 +2445,16 @@ export const runsApi = {
       ...(accountId ? { accountId } : {}),
     }),
   // `resumed` says which of the two it did (control-tower phase 77, #102):
-  // took back a pause not yet reached, or started a settled pause again.
+  // took back a pause not yet reached, or started a settled pause again — or,
+  // since control-tower phase 110 (#176), a parked, halted or interrupted run.
   runResume: (slug: string) =>
     post<
       RunEnvelope & {
-        resumed?: { runId: string; from: 'pausing' | 'paused'; act: 'pause-cancelled' | 'relaunched' };
+        resumed?: {
+          runId: string;
+          from: 'pausing' | 'paused' | 'parked' | 'halted' | 'interrupted';
+          act: 'pause-cancelled' | 'relaunched';
+        };
       }
     >(`/api/run/${q(slug)}/resume`),
   /**
@@ -2581,3 +2624,22 @@ export const runsApi = {
   /* ---- the convergence loop ---- */
   converge: () => request<ConvergeStatusView>('/api/converge'),
 };
+
+/** A CI run GitHub never started, as the watch row carries it (`server/watch-refs.ts` `CiNotRun`). */
+export interface CiNotRunView {
+  cause: string;
+  repo: string;
+  run: string;
+  attempt?: number;
+  jobs: number;
+  annotation: string;
+  budgets?: Array<{
+    scope: 'repository' | 'organization';
+    name: string;
+    amount: number;
+    consumed: number;
+    stops: boolean;
+  }>;
+  unreadable?: string;
+  headroom?: boolean;
+}

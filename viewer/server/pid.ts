@@ -167,25 +167,71 @@ export function setPsReader(reader: PsReader | null): PsReader {
 }
 
 function defaultReadPs(pid: number): Promise<PsRow | null> {
+  // `rss` and `pcpu` ride the ONE `ps` this console is allowed to shell —
+  // they are free here and a second probe for them would be a second reader,
+  // which `invariants.test.ts` clause 1 refuses and which is exactly how two
+  // answers about one process came to disagree. They sit BEFORE `lstart`
+  // because `lstart` is the only column with spaces in it and so must stay
+  // last for `parsePs` to split on whitespace at all.
+  return shellPs(['-o', 'stat=,comm=,rss=,pcpu=,lstart=', '-p', String(pid)])
+    .then((stdout) => (stdout === null ? null : parsePs(stdout)));
+}
+
+/**
+ * The one `ps` this console shells — every reader above and below goes
+ * through it. Null when `ps` could not answer: a non-zero exit is `ps` saying
+ * "no such process", but so is a missing `ps`, and "could not read" is never
+ * an answer (the callers separate the two with `kill(0)`).
+ */
+function shellPs(args: readonly string[]): Promise<string | null> {
   return new Promise((resolve) => {
     // `'ps'` stays on the same line as the call, deliberately:
     // `invariants.test.ts` greps for `('ps',` and asserts it appears exactly
     // once in `server/`. A line break between them would make the one reader
     // invisible to the lint that exists to keep it the only one.
-    // `rss` and `pcpu` ride the ONE `ps` this console is allowed to shell —
-    // they are free here and a second probe for them would be a second reader,
-    // which `invariants.test.ts` clause 1 refuses and which is exactly how two
-    // answers about one process came to disagree. They sit BEFORE `lstart`
-    // because `lstart` is the only column with spaces in it and so must stay
-    // last for `parsePs` to split on whitespace at all.
-    execFile('ps', ['-o', 'stat=,comm=,rss=,pcpu=,lstart=', '-p', String(pid)],
-      { encoding: 'utf8', timeout: 1_000 },
-      // A non-zero exit is `ps` saying "no such process" — but so is a missing
-      // `ps`. The caller separates them with `kill(0)`; here, "could not read"
-      // is null and is never an answer.
-      (error, stdout) => resolve(error ? null : parsePs(String(stdout))),
-    );
+    execFile('ps', [...args], { encoding: 'utf8', timeout: 2_000, maxBuffer: 8 * 1024 * 1024 },
+      (error, stdout) => resolve(error ? null : String(stdout)));
   });
+}
+
+/**
+ * Is anything left in this process GROUP? (control-tower phase 106, #168.)
+ *
+ * The leader's own state is `processState`'s question; this is the group's,
+ * and the two differ exactly when it matters: tamagui P4's sweep exited — its
+ * bash was the group LEADER — while a backgrounded Metro subshell in the same
+ * group held the command's stdout, and a ladder that asked only about the
+ * leader heard `gone` and signalled nobody for 50 minutes. `kill(-pgid, 0)`:
+ * `EPERM` means a member exists and is not ours to signal — still there.
+ */
+export function groupState(pgid: number): 'alive' | 'gone' {
+  if (!Number.isInteger(pgid) || pgid <= 1) return 'gone';
+  try {
+    process.kill(-pgid, 0);
+    return 'alive';
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM' ? 'alive' : 'gone';
+  }
+}
+
+/**
+ * The live members of a process group — the processes a command left behind
+ * when its leader exited (control-tower phase 106, #168), so the record can
+ * NAME them before they are stopped. Zombies are not listed: they have exited
+ * and hold nothing. Empty when `ps` could not answer.
+ */
+export async function groupMembers(pgid: number): Promise<{ pid: number; comm?: string }[]> {
+  if (!Number.isInteger(pgid) || pgid <= 1) return [];
+  const stdout = await shellPs(['-A', '-o', 'pid=,pgid=,stat=,comm=']);
+  if (stdout === null) return [];
+  const members: { pid: number; comm?: string }[] = [];
+  for (const line of stdout.split('\n')) {
+    const row = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (!row || Number(row[2]) !== pgid || stateOf(row[3]) === 'zombie') continue;
+    const comm = row[4].trim();
+    members.push({ pid: Number(row[1]), ...(comm ? { comm: comm.split('/').pop() ?? comm } : {}) });
+  }
+  return members;
 }
 
 function parsePs(out: string): PsRow | null {
@@ -291,18 +337,23 @@ function evictStale(now: number): void {
  * already knows, which is what keeps this off the event loop.
  */
 function refresh(pid: number, now: number): Sample | null {
+  // A probe already out IS the refresh: asking the reader again would start a
+  // second `ps` whose answer nobody keeps. Checked BEFORE the reader runs —
+  // checked after, the map deduplicated the bookkeeping and not the
+  // subprocess, and a burst of asks on a busy loop spawned one `ps` each until
+  // the process ran out of descriptors (control-tower phase 123).
+  if (inflight.has(pid)) return null;
+
   const raw = readPs(pid);
   if (!isThenable(raw)) return store(pid, now, raw);
 
-  if (!inflight.has(pid)) {
-    const settled = raw.then(
-      (row) => store(pid, Date.now(), row),
-      // A reader that threw is a reader that could not answer, which is the
-      // same fact as `ps` failing: null, never a state.
-      () => null,
-    ).finally(() => { inflight.delete(pid); });
-    inflight.set(pid, settled);
-  }
+  const settled = raw.then(
+    (row) => store(pid, Date.now(), row),
+    // A reader that threw is a reader that could not answer, which is the
+    // same fact as `ps` failing: null, never a state.
+    () => null,
+  ).finally(() => { inflight.delete(pid); });
+  inflight.set(pid, settled);
   return null;
 }
 

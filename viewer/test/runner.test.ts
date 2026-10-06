@@ -90,6 +90,8 @@ type Repo = {
   setSlowBoard: (yes: boolean) => void;
   /** Same, for the gate subprocess — the first await of boarding a phase. */
   setSlowGate: (yes: boolean) => void;
+  /** A slow gate check has begun: its one-second window is open. */
+  gateChecking: () => boolean;
   /** The phase's `Size:` the engine reports — what its session caps are derived from. */
   setSize: (phase: number, size: 'S' | 'M' | 'L') => void;
   cleanup: () => void;
@@ -173,13 +175,23 @@ case "$mode" in
     ;;
   --gate-status)
     # Stretched on demand, like the board: the gate is the FIRST subprocess of
-    # boarding, and the pause-during-boarding tests need a window to press in.
-    [ -f "$S/slow-gate" ] && sleep 1
+    # boarding, and the pause-during-boarding tests need a window to press in —
+    # the marker says the window is open (control-tower phase 116).
+    [ -f "$S/slow-gate" ] && { : > "$S/gate-checking"; sleep 1; }
     # Echoes whether the caller opted into cmd-gate execution — pins that the
     # runner really passes PHASE_EXEC_GATES=1 (it claimed to for months and did not).
     [ -f "$S/gate-echo-env" ] && { echo "manual: exec=\${PHASE_EXEC_GATES:-0}"; exit 1; }
     if [ -f "$S/gate-$arg" ]; then cat "$S/gate-$arg"; exit 1; fi
     echo "clear (no gate)"
+    ;;
+  --gate-kind)
+    # The gate's KIND (human|ai|auto|none), which the real engine reads off the
+    # plan text: a file a test wrote, else the verdict's own word — the runner
+    # asks it before delegating a closed human-family gate (#174).
+    if [ -f "$S/gate-kind-$arg" ]; then cat "$S/gate-kind-$arg"
+    elif [ -f "$S/gate-$arg" ]; then
+      case "$(cat "$S/gate-$arg")" in manual:*) echo human ;; ai:*) echo ai ;; *) echo auto ;; esac
+    else echo none; fi
     ;;
   --qa-mode)
     # maybeQaVerdict asks this first and treats a non-zero exit as a no.
@@ -263,6 +275,7 @@ echo "VALIDATE OK"
     setLintFail: (yes) => yes ? writeFileSync(join(state, 'lint-fail'), '') : rmSync(join(state, 'lint-fail'), { force: true }),
     setSlowBoard: (yes) => yes ? writeFileSync(join(state, 'slow-board'), '') : rmSync(join(state, 'slow-board'), { force: true }),
     setSlowGate: (yes) => yes ? writeFileSync(join(state, 'slow-gate'), '') : rmSync(join(state, 'slow-gate'), { force: true }),
+    gateChecking: () => existsSync(join(state, 'gate-checking')),
     setSize: (phase, size) => writeFileSync(join(state, `size-${phase}`), `${size}\n`),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
@@ -296,8 +309,9 @@ function runner(
   spawn: SpawnFn,
   verification: string | undefined = '`true`',
   phaseDefaults?: (slug: string, phase: number) => { model?: string; effort?: string } | undefined,
-  extra: Partial<ConstructorParameters<typeof Runner>[0]> = {},
+  extra: Partial<ConstructorParameters<typeof Runner>[0]> & { sleep?: (ms: number) => Promise<void> } = {},
 ) {
+  const { sleep, ...options } = extra;
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const instance = new Runner({
     scriptsDir: r.scripts,
@@ -309,8 +323,15 @@ function runner(
     // the console runs minted refs (`watchMintedCmdRefs`, control-tower phase
     // 88, #121 item 3); the switch-off park is wait-chains.test.ts MR-2.
     mintedCmdRefs: () => true,
-    ...extra,
+    ...options,
   });
+  // The Runner's waits — a retry's backoff, a connectivity or usage wait — are
+  // real clock time in production, and `sleep` is the harness's own: the Runner
+  // takes no such option, so a test that passed one waited every backoff out
+  // anyway (control-tower phase 116 — RF-3 sat through three 60 s retries of an
+  // interrupted session and timed out under a 180 s bound). Installed on the
+  // instance, it shadows the Runner's timer for every wait.
+  if (sleep) Object.assign(instance, { sleep });
   return { instance, events };
 }
 
@@ -4999,13 +5020,24 @@ test("a new halt clears a stale resolution but keeps a person's reopen-veto", as
 
 const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Until boarding's slow gate check has begun — the one-second window the
+ * boarding tests press in. A fixed 300 ms lost that race under load: the pause
+ * landed before boarding, and nothing was abandoned to write down
+ * (control-tower phase 116). Bounded, so a gate that never runs fails on the
+ * assertions rather than on a hang.
+ */
+async function untilGateChecking(r: Repo): Promise<void> {
+  for (let i = 0; i < 1500 && !r.gateChecking(); i++) await sleepMs(20);
+}
+
 test('a pause armed while the gate is checked starts nothing and queues nothing', async () => {
   const r = repo();
   r.setSlowGate(true);
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
-  await sleepMs(300); // inside the 1s gate subprocess for phase 1
+  await untilGateChecking(r); // inside the 1s gate subprocess for phase 1
   assert.equal(instance.pause('test'), true);
   await instance.wait();
 
@@ -5034,7 +5066,7 @@ test('the run does not claim a phase until it genuinely starts', async () => {
   const made = runner(r, spawn);
   instance = made.instance;
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
-  await sleepMs(300); // mid-gate: boarding, not started
+  await untilGateChecking(r); // mid-gate: boarding, not started
   const midBoarding = instance.current()!.activePhase;
   await instance.wait();
 
@@ -5704,7 +5736,9 @@ test('the wait budget is finite: a phase that keeps re-filing the same wait park
     assert.equal(state.phases['1'].halt, undefined);
     // The sentence names WHICH ledger ran out — the declared waits, here, not
     // the hours (WAI-5: the park must say which allowance was spent).
-    assert.match(state.phases['1'].note ?? '', /already declared 4 wait\(s\) — the most one phase may \(4\)/);
+    // …and where that number came from (control-tower phase 121, #40: a plan's
+    // `Wait count:` raises it).
+    assert.match(state.phases['1'].note ?? '', /already declared 4 wait\(s\) — the most one phase may \(4, the console default\)/);
     assert.equal(state.recoveries?.['1']?.errand?.decisionKey, 'budgets');
   } finally { r.cleanup(); }
 });
@@ -7829,12 +7863,14 @@ test('park() does not claim the run is parked while its lanes are still editing 
   } finally { release(); r.cleanup(); }
 });
 
-test('a human gate stops the run — unless the operator delegated it', async () => {
-  // The plan author wrote `human`, and by default that is a wall the run does
-  // not cross: the phase records `gated` and the loop moves on. An operator who
-  // wants a plan to run unattended can delegate the VERIFICATION to the phase's
-  // own session — which `gate-status.md`'s own header already names as a
-  // legitimate approver, and which real plans record as `ai-session-delegated`.
+test('a MANUAL gate stops the run whatever the gates row says; delegation reaches only an overdue verdict (#174)', async () => {
+  // The plan author wrote `manual`, and that is a wall the run does not cross:
+  // the phase records `gated` and the loop moves on. Until control-tower phase
+  // 107 the shipped `gates: delegated` booted the phase's own session to verify
+  // the gate and record `ai-session-delegated` — and an unattended session did,
+  // then changed production data. A manual gate is a person's now, delegated
+  // or not; what delegation still reaches is a human-family VERDICT on a gate
+  // the plan did not mark manual (an overdue deadline).
   const r = repo();
   r.setGate(1, 'manual: the owner approves the copy');
   const seen: number[] = [];
@@ -7846,9 +7882,8 @@ test('a human gate stops the run — unless the operator delegated it', async ()
     assert.deepEqual(seen, [], 'and nothing was booted past it');
   } finally { r.cleanup(); }
 
-  // The SHIPPED default since 5.0.0 (phase 11, operator decision 11: `gates:
-  // delegated`): a harness that says nothing boards the phase to evidence the
-  // gate, and the journal names the row and the source.
+  // The SHIPPED default (`gates: delegated`): a harness that says nothing still
+  // holds a manual gate — the journal names the row, its source, and why.
   const r0 = repo();
   r0.setGate(1, 'manual: the owner approves the copy');
   const seen0: number[] = [];
@@ -7856,10 +7891,14 @@ test('a human gate stops the run — unless the operator delegated it', async ()
   try {
     await shipped.start({ slug: 'demo', root: r0.root, autonomy: 'keep-going', onlyPhases: [1] });
     await shipped.wait();
-    assert.deepEqual(seen0, [1], 'delegated by default');
-    const [line] = journalled(events0, 'phase.gate-delegated');
+    assert.equal(shipped.current()!.phases['1'].status, 'gated');
+    assert.deepEqual(seen0, [], 'a manual gate is never delegated by default');
+    assert.deepEqual(journalled(events0, 'phase.gate-delegated'), [], 'and no delegation is journalled');
+    const [line] = journalled(events0, 'phase.gated');
     assert.equal(line.decisionKey, 'gates');
     assert.equal(line.source, 'default');
+    assert.match(String(line.why), /a gate the plan marks manual is a person's/);
+    assert.match(shipped.current()!.phases['1'].note ?? '', /manual is a person's/);
   } finally { r0.cleanup(); }
 
   // A plan row outranks the console: `gates: operator` in the manifest holds
@@ -7882,10 +7921,60 @@ test('a human gate stops the run — unless the operator delegated it', async ()
     assert.deepEqual(seen1, []);
   } finally { r1.cleanup(); }
 
-  // A delegated gate that states NO condition cannot be evidenced: it stops at
-  // boarding, before the spend, and the journal says why.
+  // The console's own delegation switch on, explicitly: a manual gate STILL
+  // holds — the act #174 forbids is exactly this boarding.
+  const r2 = repo();
+  r2.setGate(1, 'manual: the owner approves the copy');
+  const seen2: number[] = [];
+  const { instance: switched, events } = runner(r2, workingSession(r2, seen2), '`true`', undefined, {
+    delegateHumanGates: () => true,
+  });
+  try {
+    await switched.start({ slug: 'demo', root: r2.root, autonomy: 'keep-going', onlyPhases: [1] });
+    await switched.wait();
+    assert.deepEqual(seen2, [], 'no session is booted to clear a manual gate');
+    const journal = events
+      .filter((e) => e.event === 'run:journal')
+      .map((e) => (e.data as { event: string }).event);
+    assert.ok(!journal.includes('phase.gate-delegated'), `no delegation line, got: ${journal.join(',')}`);
+    assert.ok(journal.includes('phase.gated'));
+  } finally { r2.cleanup(); }
+
+  // A kind the engine cannot name — a failed read, an unknown word — is a
+  // person's gate too: the safe side of a manual gate.
+  const r5 = repo();
+  r5.setGate(1, 'manual: the owner approves the copy');
+  writeFileSync(join(r5.root, '.stub', 'gate-kind-1'), 'not-a-kind\n');
+  const seen5: number[] = [];
+  const { instance: unread } = runner(r5, workingSession(r5, seen5), '`true`', undefined, { delegateHumanGates: () => true });
+  try {
+    await unread.start({ slug: 'demo', root: r5.root, autonomy: 'keep-going', onlyPhases: [1] });
+    await unread.wait();
+    assert.deepEqual(seen5, []);
+    assert.equal(unread.current()!.phases['1'].status, 'gated');
+  } finally { r5.cleanup(); }
+
+  // What delegation still reaches: an OVERDUE verdict on a deadline gate (kind
+  // auto — the plan never marked it a person's) boots the phase, journalled as
+  // a delegated gate rather than an ai-clearable one.
+  const r4 = repo();
+  r4.setGate(1, 'OVERDUE: deadline 2000-01-01 passed (today 2026-10-04)');
+  const seen4: number[] = [];
+  const { instance: overdue, events: events4 } = runner(r4, workingSession(r4, seen4), '`true`', undefined, {
+    delegateHumanGates: () => true,
+  });
+  try {
+    await overdue.start({ slug: 'demo', root: r4.root, autonomy: 'keep-going', onlyPhases: [1] });
+    await overdue.wait();
+    assert.deepEqual(seen4, [1], 'an overdue deadline is still the session\'s to take, delegated');
+    assert.equal(journalled(events4, 'phase.gate-delegated').length, 1);
+    assert.equal(journalled(events4, 'phase.gate-ai').length, 0, 'a delegated gate is not an ai gate');
+  } finally { r4.cleanup(); }
+
+  // A delegated verdict that states NO condition cannot be evidenced: it stops
+  // at boarding, before the spend, and the journal says why.
   const r3 = repo();
-  r3.setGate(1, 'manual:');
+  r3.setGate(1, 'OVERDUE:');
   const seen3: number[] = [];
   const { instance: bare, events: events3 } = runner(r3, workingSession(r3, seen3));
   try {
@@ -7897,26 +7986,6 @@ test('a human gate stops the run — unless the operator delegated it', async ()
     assert.match(String(gated.why), /states no condition a session could evidence/);
     assert.match(bare.current()!.phases['1'].note ?? '', /no condition a session could evidence/);
   } finally { r3.cleanup(); }
-
-  // Delegated: the same gate boots the phase, and the journal says which kind of
-  // clearance this was — a delegated human gate is not an ai-clearable one, and
-  // an audit has to be able to tell them apart.
-  const r2 = repo();
-  r2.setGate(1, 'manual: the owner approves the copy');
-  const seen2: number[] = [];
-  const { instance: delegated, events } = runner(r2, workingSession(r2, seen2), '`true`', undefined, {
-    delegateHumanGates: () => true,
-  });
-  try {
-    await delegated.start({ slug: 'demo', root: r2.root, autonomy: 'keep-going', onlyPhases: [1] });
-    await delegated.wait();
-    assert.deepEqual(seen2, [1], 'the session is booted to verify the gate itself');
-    const journal = events
-      .filter((e) => e.event === 'run:journal')
-      .map((e) => (e.data as { event: string }).event);
-    assert.ok(journal.includes('phase.gate-delegated'), `expected a delegation line, got: ${journal.join(',')}`);
-    assert.ok(!journal.includes('phase.gate-ai'), 'a delegated human gate is not an ai gate');
-  } finally { r2.cleanup(); }
 });
 
 /* ------------------------------------------------------------------ *

@@ -531,3 +531,45 @@ test('SR-7 — a pinned phase is open until it settles, a pin outside the scope 
     assert.ok(read.phases['11']!.queueControl?.pin, 'and the pin is still there for the run that continues it');
   } finally { r.cleanup(); }
 });
+
+/* ------------------------------------------------------------------ *
+ * A scoped run that completes the plan proves its landing (phase 112, #184)
+ * ------------------------------------------------------------------ */
+
+test('SL-1 (scoped): a scoped run that finishes the WHOLE board proves the landing; one with phases left finishes as before', async () => {
+  const { drive, git, harness, journal, superRoot } = await import('./lane-harness.ts');
+  const { writeFileSync: write } = await import('node:fs');
+  // Phase 1 left for a scoped run of phase 2 to complete the board — its
+  // root commit never reached main.
+  {
+    const { root } = superRoot();
+    const h = harness(root, { 1: 'web', 2: 'repo' }, { planScope: () => ['web', 'repo'] }, (request, runner) => {
+      if (!/BOOT phase 2\b/.test(request.prompt)) return;
+      const workRoot = String(runner.current()?.workRoot);
+      write(join(workRoot, 'NOTES.md'), 'phase 2\n');
+      git(workRoot, 'add', 'NOTES.md');
+      git(workRoot, 'commit', '-q', '-m', 'p2: notes');
+    });
+    writeFileSync(join(h.state, 'done'), '1\n');
+    const state = await drive(h, { onlyPhases: [2] }) as unknown as RunState;
+    assert.equal(state.status, 'parked', `${String(state.finishedReason)}`);
+    assert.equal(state.halt?.kind, 'unlanded');
+    assert.deepEqual(journal(root, 'run.finished'), []);
+    assert.equal(journal(root, 'run.landing-proof').length, 1);
+  }
+  // A scoped run that leaves phases for later is mid-plan: its branch is still
+  // being built, so no landing is owed yet.
+  {
+    const { root } = superRoot();
+    const h = harness(root, { 1: 'web', 2: 'repo' }, { planScope: () => ['web', 'repo'] }, (request, runner) => {
+      if (!/BOOT phase 1\b/.test(request.prompt)) return;
+      const web = join(String(runner.current()?.workRoot), 'web');
+      write(join(web, 'index.html'), 'phase 1\n');
+      git(web, 'commit', '-q', '-am', 'p1: web');
+    });
+    const state = await drive(h, { onlyPhases: [1] }) as unknown as RunState;
+    assert.equal(state.status, 'finished');
+    assert.match(String(state.finishedReason), /scoped to phase 1/);
+    assert.deepEqual(journal(root, 'run.landing-proof'), []);
+  }
+});

@@ -90,6 +90,10 @@ export function sandbox(label = 'console'): ConsoleSandbox {
       XDG_CONFIG_HOME: configHome,
       XDG_STATE_HOME: stateHome,
       PHASE_CONSOLE_SELF_UPDATE: '0',
+      // …and never writes the login keychain (#200's belt). A node test's
+      // console would inherit the marker from state-sandbox.ts; the browser
+      // tour's fixture imports no sandbox, so the marker is handed over here.
+      PHASE_CONSOLE_KEYCHAIN: '0',
       NODE_OPTIONS: [process.env.NODE_OPTIONS, STEADY_LOAD].filter(Boolean).join(' '),
     },
     cleanup: () => {

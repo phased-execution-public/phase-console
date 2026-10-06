@@ -147,18 +147,29 @@ export function stateHome(env = process.env) {
 }
 
 /**
+ * Whether this process is a test: node's runner marks its children
+ * (`NODE_TEST_CONTEXT`) and Vitest its workers, and a file run under `--test`
+ * says so in its argv. Production sets none of these. The one reading, for both
+ * belts — the state directories here, the login keychain in
+ * `server/accounts/credentials.ts`.
+ */
+export function testProcess(env = process.env, argv = process.argv) {
+  return Boolean(
+    env.NODE_TEST_CONTEXT ||
+    env.VITEST ||
+    argv.includes('--test') ||
+    argv.some((a) => a.startsWith('--test-')),
+  );
+}
+
+/**
  * A TEST process that resolves the operator's real state/config directories is
  * a leak in the making. It throws rather than warns, with the fix in the
  * message; production never sets the test markers.
  */
 function guardTestState(resolved, real, envName) {
   const env = process.env;
-  const testing =
-    env.NODE_TEST_CONTEXT ||
-    env.VITEST ||
-    process.argv.includes('--test') ||
-    process.argv.some((a) => a.startsWith('--test-'));
-  if (!testing || env.PHASE_CONSOLE_ALLOW_REAL_STATE) return;
+  if (!testProcess(env) || env.PHASE_CONSOLE_ALLOW_REAL_STATE) return;
   if (resolved === real) {
     throw new Error(
       `a test process resolved the REAL ${envName === 'XDG_STATE_HOME' ? 'state' : 'config'} ` +

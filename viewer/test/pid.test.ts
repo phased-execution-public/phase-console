@@ -15,7 +15,7 @@ import test from 'node:test';
 
 import {
   processResources,
-  CLAUDE_COMM, forgetPid, pidAlive, processState, setPsReader, type PsReader,
+  CLAUDE_COMM, forgetPid, pidAlive, processState, processStateAsync, setPsReader, type PsReader, type PsRow,
 } from '../server/pid.ts';
 import { presenceOf } from '../server/sessions/registry.ts';
 
@@ -179,5 +179,31 @@ test('the resources ride the one ps, and are absent rather than zero when it did
 
     // A pid nobody has probed costs no subprocess to ask about.
     assert.equal(processResources(999_999), null);
+  } finally { setPsReader(restore); forgetPid(); }
+});
+
+test('one ps per pid in flight: a burst of asks inside one tick starts ONE probe, and the awaited ask joins it', async () => {
+  // Control-tower phase 123. `refresh` started the reader BEFORE it looked for
+  // a probe already out, so the single-flight map deduplicated the bookkeeping
+  // and not the subprocess: every ask on a stale sample spawned another `ps`.
+  // A presence backlog applied on a busy loop asked ≈3,500 times about a few
+  // live pids; each `ps` held three pipe descriptors until the loop could reap
+  // it, the process crossed OPEN_MAX (10,240), and from then on EVERY spawn in
+  // it failed EBADF — `sessions-presence.test.ts`'s cascade (phase 116).
+  let calls = 0;
+  let answer: (row: PsRow | null) => void = () => {};
+  const pending = new Promise<PsRow | null>((resolve) => { answer = resolve; });
+  const restore = setPsReader(() => { calls++; return pending; });
+  try {
+    forgetPid();
+    for (let i = 0; i < 200; i++) {
+      assert.equal(processState(SELF), 'running', 'answered from what kill(0) proves while the probe is out');
+    }
+    const awaited = processStateAsync(SELF);
+    assert.equal(calls, 1, 'two hundred asks and an awaited one, inside one tick: one ps');
+    answer({ stat: 'T', comm: 'claude', lstart: 'Sat Aug 22 20:30:07 2026' });
+    assert.equal(await awaited, 'stopped', 'the awaited ask joined the probe already out');
+    assert.equal(processState(SELF), 'stopped', 'and its answer is the sample every later ask reads');
+    assert.equal(calls, 1, 'a fresh sample costs no subprocess');
   } finally { setPsReader(restore); forgetPid(); }
 });

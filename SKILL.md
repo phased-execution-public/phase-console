@@ -11,7 +11,7 @@ allowed-tools:
   - Glob
   - Agent
 metadata:
-  version: 6.2.0
+  version: 6.2.1
 ---
 
 # Phased Execution

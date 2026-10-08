@@ -89,6 +89,13 @@ slack: `server/http/static.ts` serves them and never compresses at request time,
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
 
+## Upgrading to 6.2.1
+
+The root `package.json` says 6.2.1, and `CHANGELOG.md` carries its section. 6.2.1 is a patch with
+nothing to migrate: an end-to-end fixture of the free tree named the paid package, and now names a
+neutral one (#282). Nothing an operator, a plan author or a session does changes.
+
+
 ## Upgrading to 6.2.0
 
 The root `package.json` says 6.2.0, and `CHANGELOG.md` carries its section. 6.2.0 is a minor version:

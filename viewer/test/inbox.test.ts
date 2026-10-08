@@ -2290,12 +2290,14 @@ test('a pending-approval draft is a needs-you row with Approve, Discard and two 
   assert.match(row.how, /Approve files it/);
   assert.equal(row.since, DRAFT.stateAt);
   assert.equal(row.href, '#/plan/demo/phase/3');
-  assert.deepEqual(row.actions.map((a) => [a.verb, a.method, a.endpoint]), [
-    ['approve', 'POST', '/api/run/demo/issues/abcdefabcdef/file'],
-    ['discard', 'POST', '/api/run/demo/issues/abcdefabcdef/discard'],
-    ['edit-title', 'POST', '/api/run/demo/issues/abcdefabcdef/edit'],
-    ['edit-body', 'POST', '/api/run/demo/issues/abcdefabcdef/edit'],
+  assert.deepEqual(row.actions.map((a) => [a.verb, a.method]), [
+    ['approve', 'POST'],
+    ['discard', 'POST'],
+    ['edit-title', 'POST'],
+    ['edit-body', 'POST'],
   ]);
+  // The routes behind them are Pro's (`free/manifest.json` gates them), so the
+  // free tree's copy of this test does not spell them (#282).
   assert.equal(row.actions[0].flag, undefined, 'the flag is on, so Approve is pressable');
   assert.deepEqual(row.actions[2].says, { field: 'title', label: 'New title', placeholder: DRAFT.title });
   assert.equal(row.actions[3].says?.field, 'body');
@@ -2372,10 +2374,11 @@ test('an ask addressed to the operator is a needs-you row with Answer (a reply, 
   assert.match(row.how, /Answer/);
   assert.equal(row.since, ASK.writtenAt);
   assert.equal(row.href, '#/plan/demo/phase/4');
-  assert.deepEqual(row.actions.map((a) => [a.verb, a.method, a.endpoint]), [
-    ['answer', 'POST', '/api/run/demo/messages/aaaaaaaaaaaa/reply'],
-    ['seen', 'POST', '/api/run/demo/messages/aaaaaaaaaaaa/ack'],
+  assert.deepEqual(row.actions.map((a) => [a.verb, a.method]), [
+    ['answer', 'POST'],
+    ['seen', 'POST'],
   ]);
+  // The message routes are Pro's, so the free tree's copy does not spell them (#282).
   // The reply goes back to the sender, and the words are the person's own.
   assert.deepEqual(row.actions[0].body, { to: 'phase:demo/4', phase: 4 });
   assert.deepEqual(row.actions[0].says, { field: 'text', label: 'Your answer', placeholder: 'What the session should know' });

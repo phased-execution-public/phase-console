@@ -350,7 +350,6 @@ test('CF-5: reads, the hooks, the session\'s own doors, the skill\'s scripts and
     'wget -qO- http://127.0.0.1:4130/api/run/demo/settings',
     'http :4130/api/human-steps',
     'curl -s -X POST -H "Authorization: Bearer $PE_HOOK_TOKEN" http://127.0.0.1:4130/hooks/declaration -d @decl.json',
-    `curl -s -X POST -H "Authorization: Bearer $PE_MSG_TOKEN" http://127.0.0.1:4130/api/run/demo/messages -d '{"to":"phase:demo/3","text":"hi"}'`,
     `curl -X POST http://localhost:3000/api/write -d '{"title":"draft"}'`,
     `curl -X POST https://api.example.com/api/approvals/a1 -d '{}'`,
     'echo http://127.0.0.1:4130/api/runs | xargs curl -s',
@@ -463,7 +462,6 @@ test('CF-5: the reader takes a path the way the router does', () => {
   assert.equal(authorityRouteOf(null, '/api/run/demo/settings')?.verb, 'run-settings', 'an unread method is any method');
   assert.equal(authorityRouteOf('GET', '/api/policy'), null, 'a read presses nothing');
   assert.equal(authorityRouteOf('POST', '/api/approvals'), null, 'the card list is not a card');
-  assert.equal(authorityRouteOf('POST', '/api/run/demo/messages'), null);
   assert.equal(authorityRouteOf('POST', '/hooks/declaration'), null);
   assert.equal(new Set(AUTHORITY_PRESSES).size, AUTHORITY_PRESSES.length, 'one row per press');
   for (const row of AUTHORITY_ROUTES) {

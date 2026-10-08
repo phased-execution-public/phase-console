@@ -20,6 +20,19 @@ into a web form at the moment of release.
 
 ## [Unreleased]
 
+## [6.2.1] - 2026-10-08
+
+**The public tree names no paid package.** A patch to 6.2.0, with nothing to migrate: two strings in
+an end-to-end fixture named the paid package, and 6.2.1 gives the fixture a neutral package name. The
+free tree stays MIT. Nothing a 6.2 plan, session or console does changes.
+
+### Fixed
+- **The tests name no paid package and no paid route** (#282). An end-to-end fixture
+  (`viewer/e2e/fixture/seed.ts`) named the paid package in an item's proof and in a permission's
+  command; both now name a neutral one, `acme-widget`. Two server suites, `inbox.test.ts` and
+  `console-forge.test.ts`, spelled routes only the paid tree serves; the free tree's copies assert each
+  action's verb and method instead.
+
 ## [6.2.0] - 2026-10-08
 
 **Your turn.** 6.2 gives every act only a person can do one page, one shape and one road back to the

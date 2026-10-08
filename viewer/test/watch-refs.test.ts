@@ -253,3 +253,21 @@ test('a PR lands when it leaves OPEN, whichever door it takes', () => {
   assert.equal(prLanded({ state: 'CLOSED' }), 'landed');
   assert.equal(prLanded({}), 'unknown');
 });
+
+test('phase 132: credential:<id> is read by presence — the ids credentials-probe knows, and nothing else', async () => {
+  const { probeWatchRef, WATCH_SCHEMES } = await import('../server/watch-refs.ts');
+  assert.ok((WATCH_SCHEMES as readonly string[]).includes('credential'));
+  for (const id of ['gh', 'claude', 'claude-login', 'env:DEPLOY_KEY', 'keychain:phase-console-npm-token', 'file:~/.npmrc']) {
+    assert.deepEqual(parseWatchRef(`credential:${id}`), { kind: 'credential', id, ref: `credential:${id}` });
+  }
+  for (const bad of ['credential:', 'credential:npm', 'credential:env:', 'credential:keychain:a b']) {
+    assert.equal(parseWatchRef(bad), null, `${bad} is no ref`);
+  }
+  const target = parseWatchRef('credential:env:DEPLOY_KEY')!;
+  const said = (status: 'ok' | 'fail' | 'skip') => ({ credentialProbe: async () => ({ status, reason: `read ${status}` }) });
+  assert.equal((await probeWatchRef(target, said('ok'))).state, 'landed');
+  assert.equal((await probeWatchRef(target, said('fail'))).state, 'pending');
+  assert.equal((await probeWatchRef(target, said('skip'))).state, 'unknown');
+  assert.equal((await probeWatchRef(target, {})).state, 'unknown', 'no prober, no guess');
+  assert.equal(nextDueFor(target, 'pending', 0), WATCH_POLL_MS.credential);
+});

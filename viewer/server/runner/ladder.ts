@@ -69,6 +69,8 @@ export type RungCause = (typeof RUNG_FAILURE_CAUSES)[number];
 export type RungDriver = (typeof RUNG_DRIVERS)[number];
 import type { SettledRungOutcome } from '../../shared/run-lifecycle.js';
 import { budgetFact, budgetHeadline, type BudgetFact } from '../../shared/budget-model.js';
+import { GRANT_SCOPE_WORDS } from '../../shared/turn-model.js';
+import { grantEndWords, type GrantRow } from '../permissions/grants.ts';
 
 export type SituationId = (typeof SITUATIONS)[number];
 
@@ -883,8 +885,8 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     how: 'Provide it where the handoff says, then Resume the session with an instruction or Retry.',
   },
   'blocked-declared:permission': {
-    need: "A tool the run's permission policy refused — the session named the act and the path it was denied.",
-    how: "If the act is one you would let an unattended agent do, widen the policy for this plan (Settings ▸ Permissions, or the plan's autopilot.json) and Retry; otherwise do that step by hand, then Resume the session with an instruction. Never strike a deny rule to get a phase through.",
+    need: 'A permission the AI lacks — the session named the act, and the wall the console recorded for its lane says what stopped it.',
+    how: "Your turn holds a permission item for it, with the command, why the phase needs it, the wall and its risk: Grant (what it does today is written on it), Deny — the session is told to find another way — or I'll do it myself, which makes the command your own act; your I've done this carries the session on. Settings ▸ Permissions shows and reverses a strike. A wall marked never offers no grant: do the step by hand.",
   },
   'blocked-declared:protected-path': {
     need: "An edit the CLI's own wall reserves for an interactive session — a path such as `.claude/**`, which no unattended session may change whatever this console allows.",
@@ -1113,9 +1115,10 @@ export function errandFor(
           need: `The run's permission policy refused ${denied.tool}`
             + (denied.command ? ` \`${denied.command.replace(/\s+/g, ' ').slice(0, 200)}\`` : '')
             + ` under the rule \`${denied.rule}\`.`,
-          how: `Approve the "widen" card to strike \`${denied.rule}\` for this plan and resume the session `
-            + '(Settings ▸ Permissions shows and reverses the strike), or do that step by hand and Resume the '
-            + 'session with an instruction. A deny rule struck here is struck for every future run of this plan.',
+          how: `Your turn holds a permission item for it. Its Grant is the widen card: it strikes \`${denied.rule}\` for this `
+            + 'plan and carries the session on (Settings ▸ Permissions shows and reverses the strike) — a deny rule struck here '
+            + "is struck for every future run of this plan; Deny tells the session to find another way; I'll do it myself "
+            + "makes the command your own act, and your I've done this carries the session on.",
         }
         // A wall this console recorded no rule for (#43): the errand names
         // what the session declared — the act, the rule it quoted, the path —
@@ -1188,6 +1191,17 @@ export function widenCard(input: {
     tool: { name: denied.tool, input: denied.command ? { command: denied.command } : {} },
     suggestedRule: denied.rule,
   };
+}
+
+/**
+ * The sentence a session reads when a person's grant covers what stopped it
+ * (control-tower phase 149, #212): what was granted, how far it reaches, until
+ * when — and to run it again. The one road back carries it.
+ */
+export function grantedInstruction(row: Pick<GrantRow, 'rule' | 'scope' | 'until' | 'command'>): string {
+  return `The operator granted \`${row.rule}\` for ${GRANT_SCOPE_WORDS[row.scope]} until ${grantEndWords(row)} — run it again`
+    + `${row.command ? `: \`${row.command.slice(0, 200)}\`` : ''}. Carry on with the phase from where it stopped; `
+    + 'do not declare blocked on that rule again while the grant lives.';
 }
 
 /** The instruction the resumed session reads once its rule was widened. */

@@ -148,9 +148,10 @@ The long version, including push notifications and exactly what is enforced → 
 [QA gating](docs/qa-gating.md) · [Safety rails](docs/safety-rails.md) · [Phase Console](docs/console.md) · [Metrics](docs/metrics.md) ·
 [Install by hand](docs/install.md) · [Versioning & releases](docs/releasing.md) · [Reference](docs/reference.md)
 
-6.1 reads a repository's whole issue list on one desk — each issue's category, severity and where it
-stands in a plan — lets a wait name a job on another machine (`unit:<host>/<unit>`) and keep a date only
-as its backstop, and lists the acts only you can do under *Coming up* until they are due.
+6.2 puts every act only you can do on one page, **Your turn** (`#/turn`): why only you, a guide to follow, a check
+when you press *I've done this — check*, a grant with a scope and an end for a permission the AI lacks (and a never list
+no grant covers), an optional **owner key** that proves a press is yours, and *Handled by the AI*. 6.1 brought the
+Issues desk, waits on another machine's job (`unit:<host>/<unit>`) and the acts that come due later, under *Coming up*.
 
 
 Needs Claude Code, plus `bash` and `git`. The console adds Node 22.18+ (or 23.6+) and has **no runtime dependencies**.

@@ -10,6 +10,7 @@ import type { IncomingMessage } from 'node:http';
 
 import { headerValue, hostnameOf, IDENTITY_HEADER, isLoopbackHost } from './access.ts';
 import type { Flags } from '../config.ts';
+import { stampedDoor, transportDoor } from '../owner/door.ts';
 import type { Actor, ActorVia } from '../runner/state.ts';
 
 /* ------------------------------------------------------------------ *
@@ -47,12 +48,20 @@ export const ACTOR_REASON_MAX = 500;
 /**
  * The derived actor for one HTTP request.
  *
- * `by` is the body's label when it offers one, else the proxy's login, else
- * the class of thing that asked. `via`, `origin` and `remoteUser` come from
- * the transport alone. The identity header is read only under `--remote`:
- * without it `classify()` never checks the header, so nothing has vouched
- * for it, and a loopback caller could write any name it liked into the
+ * `by` is the body's label when it offers one, else the verified login, else
+ * the class of thing that asked. `via`, `origin`, `remoteUser` and `pressDoor`
+ * come from the transport alone. The identity header is read only under
+ * `--remote`: without it `classify()` never checks the header, so nothing has
+ * vouched for it, and a loopback caller could write any name it liked into the
  * record.
+ *
+ * `pressDoor` (control-tower phase 131, #208) is the door the request PROVED —
+ * the one the router stamped (`owner/door.ts` `doorOfRequest`: a session's
+ * token, the supervisor's bearer, a verified device), else the transport's own
+ * reading. `by` never moves it: a script that says `by: operator` is recorded
+ * `local` with that label. A device the fleet supervisor verified arrives on
+ * loopback with its login asserted, and that login is `remoteUser` — the
+ * journal names the phone, where it used to read `operator · local`.
  *
  * `reason` is the body's own why, when it gives one (control-tower phase 96,
  * #142) — the one field here the caller writes in full, because it is the
@@ -61,7 +70,7 @@ export const ACTOR_REASON_MAX = 500;
  */
 export function actorOfRequest(
   req: Pick<IncomingMessage, 'headers'>,
-  flags: Partial<Pick<Flags, 'remoteHosts'>>,
+  flags: Partial<Pick<Flags, 'remoteHosts' | 'remoteUsers'>>,
   body: { by?: unknown; reason?: unknown } | null | undefined = undefined,
 ): Actor {
   const offered = typeof body?.by === 'string' ? body.by.trim().slice(0, ACTOR_LABEL_MAX) : '';
@@ -70,12 +79,14 @@ export function actorOfRequest(
   // `remoteHosts` is always an array on a real console; a harness's flags may
   // carry no such key, and a route must not 500 for want of one.
   const remote = (flags.remoteHosts ?? []).length > 0;
-  const remoteUser = remote && !loopback ? headerValue(req.headers[IDENTITY_HEADER]) : null;
+  const door = stampedDoor(req) ?? transportDoor(req, flags);
+  const proxied = remote && !loopback ? headerValue(req.headers[IDENTITY_HEADER]) : null;
+  const remoteUser = proxied ?? (door.door === 'device' ? door.label : null);
   const agent = agentClassOf(req.headers['user-agent']);
   const via: ActorVia = agent === 'cli' ? 'cli' : 'api';
   const origin = loopback ? 'local' : host;
   const by = offered || remoteUser || (agent === 'browser' || agent === 'cli' ? 'operator' : 'script');
   const reason = typeof body?.reason === 'string' ? body.reason.trim().slice(0, ACTOR_REASON_MAX) : '';
-  return { by, via, origin, remoteUser, ...(reason ? { reason } : {}) };
+  return { by, via, origin, remoteUser, pressDoor: door.door, ...(reason ? { reason } : {}) };
 }
 

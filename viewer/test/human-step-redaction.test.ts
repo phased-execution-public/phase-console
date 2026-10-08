@@ -16,11 +16,11 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const { HumanStepLedger, declareHumanStep, stepJournalFields, storeStepSecret } = await import('../server/human-steps.ts');
+const { HumanStepLedger, declareHumanStep, stepJournalFields } = await import('../server/human-steps.ts');
 const { readOutcome } = await import('../server/runner/outcome.ts');
 const { Journal } = await import('../server/runner/journal.ts');
 const { Transcript } = await import('../server/runner/transcript.ts');
@@ -140,24 +140,68 @@ test('a device code is the one code a step shows on purpose — in the push and 
   }
 });
 
-test('a secret-entry secret reaches the credential registry and none of the five sinks', async () => {
-  const state = mkdtempSync(join(tmpdir(), 'pc-redaction-secret-'));
+test('a secret sent to a secret-entry item reaches no sink at all — refused, never stored (control-tower phase 133)', async () => {
+  const { Service } = await import('../server/service.ts');
+  const { SKILL_DIR, INSTANCE_STATE_DIR } = await import('../server/config.ts');
+  const { handleApi } = await import('../server/api/routes.ts');
+  const root = mkdtempSync(join(tmpdir(), 'pc-redaction-secret-'));
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  const svc = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: true, allowRun: true, allowAccounts: true,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
   try {
+    svc.push.announce = (() => null) as never;
+    assert.equal(svc.open(root).ok, true);
     const secret = `npm_${'S'.repeat(36)}`;
-    const dir = join(state, 'secrets');
-    mkdirSync(dir, { recursive: true });
-    const ledger = new HumanStepLedger(join(state, 'human-steps.ndjson'));
-    const step = declareHumanStep({ ledger, announce: () => true }, {
+    const step = svc.recordHumanStep({
       slug: 'demo', phase: 3, birth: 'session', step: { kind: 'secret-entry', title: 'Paste the npm token', credential: 'npm-token' },
-    })!;
-    const stored = await storeStepSecret({ dir, platform: 'linux' }, 'npm-token', secret);
-    ledger.move(step.id, 'checking', { by: 'person', stored: stored.stored });
-    log.info('human-steps.redaction-probe', { stepId: step.id, stored: stored.stored });
-    assert.equal(readFileSync(join(dir, 'npm-token'), 'utf8'), `${secret}\n`, 'the registry holds it');
-    assert.ok(!readFileSync(ledger.file, 'utf8').includes(secret), 'the ledger does not');
-    assert.ok(!JSON.stringify(recent(500)).includes(secret), 'the log does not');
-    assert.ok(!JSON.stringify(stepJournalFields(ledger.get(step.id)!)).includes(secret), 'a journal line would not');
+    });
+    assert.ok(step && !('refused' in step));
+    let said = '';
+    const req = {
+      method: 'POST', headers: { 'x-phase-console': '1', host: '127.0.0.1:4130' }, on() { return this; },
+      [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify({ secret })); },
+    };
+    const res = { req, writeHead() { return this; }, end(chunk: unknown) { said += String(chunk ?? ''); }, on() { return this; } };
+    await handleApi({ service: svc } as never, req as never, res as never, new URL(`http://127.0.0.1/api/human-steps/${(step as { id: string }).id}/check`));
+    assert.match(said, /never takes a secret/);
+    log.info('human-steps.redaction-probe', { stepId: (step as { id: string }).id });
+    for (const [sink, text] of [
+      ['the answer', said],
+      ['the ledger', readFileSync(join(INSTANCE_STATE_DIR, 'human-steps.ndjson'), 'utf8')],
+      ['the log', JSON.stringify(recent(500))],
+      ['a journal line', JSON.stringify(stepJournalFields(svc.humanStepsNow().get((step as { id: string }).id)!))],
+    ] as const) {
+      assert.equal(text.includes(secret), false, `${sink} never holds it`);
+    }
+    const secrets = join(INSTANCE_STATE_DIR, 'secrets');
+    assert.ok(!existsSync(secrets) || readdirSync(secrets).length === 0, 'and nothing was stored anywhere');
   } finally {
-    rmSync(state, { recursive: true, force: true });
+    svc.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a guide, proof words and what was tried never carry a planted value into the ledger or the journal (control-tower phase 130)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turn-redaction-'));
+  try {
+    const file = join(dir, 'human-steps.ndjson');
+    const ledger = new HumanStepLedger(file);
+    const guide = `Why.\n\n## Steps\n1. Paste the token\n   \`\`\`sh\n   gh auth login --with-token ${TOKEN}\n   \`\`\`\n`;
+    const raised = declareHumanStep({ ledger, announce: () => true }, {
+      slug: 'demo', phase: 4, birth: 'session',
+      step: {
+        kind: 'operator-act', title: `Rotate it, password=${PASSWORD}`, proof_type: 'attest',
+        guide: { text: guide }, proof_words: `the code ${CODE} is gone`, tried: `curl https://x.example/cb?code=${QUERY_SECRET}`,
+      },
+    });
+    assert.ok(raised && !('refused' in raised), 'the item is raised — a person’s turn is never lost to a bad field');
+    const step = raised as { guide?: unknown; id: string };
+    assert.equal(step.guide, undefined, 'a guide that fails the secret screen is dropped, never stored');
+    assert.deepEqual(scan('ledger', readFileSync(file, 'utf8')), []);
+    assert.deepEqual(scan('journal fields', JSON.stringify(stepJournalFields(raised as never))), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

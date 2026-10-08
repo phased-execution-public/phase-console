@@ -47,6 +47,9 @@ function baseline(): Dist {
       'sessions-bbbb.js': 'export const Sessions = 1;\n',
       'settings-cccc.js': 'export const Settings = 1;\n',
       'insights-dddd.js': 'export const Insights = 1;\n',
+      // Your turn (control-tower phase 137): the page's own lazy chunk, found by
+      // the attribute only it writes.
+      'turn-zzzz.js': 'export const Turn = { "data-turn-page": "" };\n',
       // Phase 4's two. A destination chunk missing from the precache is a page
       // absent from the offline shell, so the gate names each one — which means
       // the baseline has to carry each one too.
@@ -515,3 +518,33 @@ test('no chunk spelling the hover card fails — the guard would find nothing to
   assert.ok(failures(out).some((l) => l.includes('the hover card is built')), out);
 });
 
+
+test('Your turn is a lazy chunk of its own — found by data-turn-page, never first paint', () => {
+  const { ok, out } = runGate(baseline());
+  assert.ok(ok, out);
+  assert.match(out, /✓ Your turn is in a chunk of its own \(turn-zzzz\.js\)/);
+  assert.match(out, /✓ first paint's static graph carries no Your turn/);
+  assert.match(out, /✓ the document never modulepreloads Your turn/);
+});
+
+test('Your turn folded into the entry fails, and so does no chunk carrying it at all', () => {
+  const folded = baseline();
+  folded.assets['index-aaaa.js'] += 'export const Turn = { "data-turn-page": "" };\n';
+  const one = runGate(folded);
+  assert.equal(one.ok, false);
+  assert.ok(failures(one.out).some((l) => l.includes('Your turn is in a chunk of its own')), one.out);
+
+  const gone = baseline();
+  delete gone.assets['turn-zzzz.js'];
+  const two = runGate(gone);
+  assert.equal(two.ok, false);
+  assert.ok(failures(two.out).some((l) => l.includes('Your turn is in a chunk of its own (none)')), two.out);
+});
+
+test('modulepreloading Your turn fails — every visitor would fetch it', () => {
+  const dist = baseline();
+  dist.html.preload.push('turn-zzzz.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('never modulepreloads Your turn')), out);
+});

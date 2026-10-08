@@ -960,3 +960,186 @@ test('SK-4: the stale limits are gone — no "at most 12 runs", no wait that end
   // …and the script refuses what the skill forbids, rather than cutting it.
   assert.ok(near(plain(outcomeEntry()), 'exits 2', '$'), 'the entry must say a `$` in a cmd: ref exits 2');
 });
+
+test('OD-9 (control-tower phase 131, #208): references/console-surface.md says what the code does — the four sentences the owner-desk audit caught', async () => {
+  const doc = read('references/console-surface.md').replace(/[`*]/g, '').replace(/\s+/g, ' ');
+  const { agentClassOf } = await import('../server/api/actor.ts');
+  const { pinnedNotesBlock } = await import('../server/runner/runner-core.ts');
+  const { PRESS_DOORS } = await import('../shared/door-model.js');
+
+  // 1. stdin: the runner closes it at the first result, so the doc may not promise it is held open.
+  assert.doesNotMatch(doc, /A supervised phase holds its stdin open/, 'the runner closes stdin at the first result');
+  assert.match(doc, /keeps its stdin open until its first completed turn/);
+  assert.match(read('viewer/server/runner/spawn.ts'), /stdin/, 'the file the doc names is where stdin is handled');
+
+  // 2. `btw` is `cli`: it names itself, and the actor reads that name as the CLI's.
+  assert.match(doc, /via is cli for phase-console and btw, which name themselves in their User-Agent/);
+  const userAgent = /-A '([^']+)'/.exec(read('bin/btw'))?.[1] ?? '';
+  assert.equal(agentClassOf(userAgent), 'cli', 'bin/btw sends a User-Agent the actor reads as the CLI');
+
+  // 3. A script's label is a label: the doc names the door that decides, and every word of it.
+  assert.doesNotMatch(doc, /A message a script sent is recorded as the script's, never as the operator's/,
+    'a body may say `by: operator`; the door, not the label, is what the console now trusts');
+  assert.match(doc, /A label is never who pressed: pressDoor is/);
+  assert.match(doc, /A script that says by: operator is recorded local, with its label/);
+  const proved = ['session', 'device', 'local'];
+  for (const door of proved) {
+    assert.ok((PRESS_DOORS as readonly string[]).includes(door), door);
+    assert.match(doc, new RegExp(`${door} for |else ${door}`), `the doc says how the ${door} door is proved`);
+  }
+
+});
+
+test('EC9 (control-tower phase 148, #208): `phase-console owner status|enroll|lock` exist in both trees\' bins, and USAGE\'s pair names them', async () => {
+  const read = (path: string) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8');
+  const verbs = ['status', 'enroll', 'lock'];
+  const module = read('bin/owner-verb.mjs');
+  for (const verb of verbs) assert.match(module, new RegExp(`word === '${verb}'`), `owner-verb.mjs answers ${verb}`);
+  // In the free tree `bin/phase-console.mjs` IS the override, and `free/` does not ship.
+  const bins = ['bin/phase-console.mjs'];
+  for (const bin of bins) {
+    assert.match(read(bin), /args\[0\] === 'owner'[\s\S]{0,240}bin', 'owner-verb\.mjs'[\s\S]{0,120}ownerVerb\(args\.slice\(1\)/, `${bin} dispatches owner`);
+  }
+  for (const usage of ['USAGE.md', 'USAGE.fa.md']) {
+    const text = read(usage);
+    for (const verb of verbs) assert.match(text, new RegExp(`phase-console owner ${verb}`), `${usage} names owner ${verb}`);
+  }
+  // The verb answers from the real CLI, with no console needed.
+  const { execFileSync } = await import('node:child_process');
+  const help = execFileSync(process.execPath, [fileURLToPath(new URL('../../bin/phase-console.mjs', import.meta.url)), 'owner', '--help'], { encoding: 'utf8' });
+  for (const verb of verbs) assert.match(help, new RegExp(`\\b${verb}\\b`), `owner --help names ${verb}`);
+});
+
+test('control-tower phase 149 (#212): `phase-console grants list|revoke|revoke-all` exist in both trees\' bins, and USAGE\'s pair names them', async () => {
+  const read = (path: string) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8');
+  const verbs = ['list', 'revoke', 'revoke-all'];
+  const module = read('bin/grants-verb.mjs');
+  for (const verb of verbs) assert.match(module, new RegExp(`word === '${verb}'`), `grants-verb.mjs answers ${verb}`);
+  // In the free tree `bin/phase-console.mjs` IS the override, and `free/` does not ship.
+  const bins = ['bin/phase-console.mjs'];
+  for (const bin of bins) {
+    assert.match(read(bin), /args\[0\] === 'grants'[\s\S]{0,240}bin', 'grants-verb\.mjs'[\s\S]{0,120}grantsVerb\(args\.slice\(1\)/, `${bin} dispatches grants`);
+  }
+  for (const usage of ['USAGE.md', 'USAGE.fa.md']) {
+    const text = read(usage);
+    for (const verb of verbs) assert.match(text, new RegExp(`phase-console grants ${verb}`), `${usage} names grants ${verb}`);
+  }
+  const { execFileSync } = await import('node:child_process');
+  const help = execFileSync(process.execPath, [fileURLToPath(new URL('../../bin/phase-console.mjs', import.meta.url)), 'grants', '--help'], { encoding: 'utf8' });
+  for (const verb of verbs) assert.match(help, new RegExp(`\\b${verb}\\b`), `grants --help names ${verb}`);
+});
+
+
+/* ------------------------------------------------------------------ *
+ * A person's turn, from the session's side (control-tower phase 140)
+ *
+ * `references/turn.md` is the detail of SKILL.md's Mode 2 rule. It names every word of the
+ * vocabularies a declaration is held to — reasons, kinds, proof types, the guard's rules and exits,
+ * the guide's limits, the doors — so each is asserted against its owner here, and every flag the
+ * declaration takes is one the script implements, both ways.
+ * ------------------------------------------------------------------ */
+
+/** The row of a markdown table whose first cell is `name` in backticks, or undefined. */
+const rowOf = (body: string, name: string): string | undefined =>
+  body.split('\n').find((line) => line.startsWith(`| \`${name}\` |`));
+
+/** The backticked words of one table cell, in order. */
+const ticked = (cell: string): string[] => [...cell.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+
+/** The flags of phase-outcome.sh that are not a person's turn — a ruling, a proof, progress, a wait. */
+const NOT_TURN_FLAGS = new Set([
+  '--by', '--cost-if-wrong', '--done', '--exit', '--for', '--in', '--kind', '--label', '--of', '--remember',
+  '--until', '--wait-minutes', '--watch',
+]);
+
+test('references/turn.md agrees with the code — reasons, kinds, proofs, the guard, the guide, the doors (phase 140)', async () => {
+  const turn = read('references/turn.md');
+  const {
+    WHY_PERSON, REASON_META, KIND_REASONS, PROOF_TYPES, GUARD_RULES, GUARD_REFUSAL_EXIT, G5_SENTENCE,
+    GRANT_SCOPES, HOST_COMMANDS, VERDICTS,
+  } = await import('../shared/turn-model.js');
+  const { HUMAN_STEP_KINDS } = await import('../shared/human-step-model.js');
+  const { GUIDE_MAX_STEPS, GUIDE_MAX_BYTES, GUIDE_HEADINGS } = await import('../shared/guide-grammar.js');
+  const { PRESS_DOORS, AUTHORITY_VERBS } = await import('../shared/door-model.js');
+  const kindReasons = KIND_REASONS as Record<string, readonly string[]>;
+  /** One `## ` section of the reference — the reasons and the kinds share two names, so each table is read in its own. */
+  const part = (heading: string): string => {
+    const at = turn.indexOf(`\n## ${heading}\n`);
+    assert.ok(at >= 0, `references/turn.md has a section "## ${heading}"`);
+    const next = turn.indexOf('\n## ', at + 4);
+    return turn.slice(at, next < 0 ? undefined : next);
+  };
+
+  // Every reason: its row, the label the page draws, and an example its own kind allows.
+  for (const why of WHY_PERSON) {
+    const row = rowOf(part('The reasons'), why);
+    assert.ok(row, `references/turn.md has a row for the reason ${why}`);
+    assert.ok(row.includes(REASON_META[why].label), `the ${why} row says "${REASON_META[why].label}"`);
+    assert.ok(row.includes(`--why ${why}`), `the ${why} row carries an example declaring --why ${why}`);
+    const kind = /--act\b/.test(row) ? 'operator-act' : /--step ([a-z-]+)/.exec(row)?.[1];
+    assert.ok(kind && kindReasons[kind]?.includes(why), `the ${why} example's kind (${kind}) allows ${why}`);
+  }
+  // Every kind: its row in the template table, with exactly the reasons the kind allows, default first.
+  for (const kind of HUMAN_STEP_KINDS) {
+    const row = rowOf(part('A template per kind'), kind);
+    assert.ok(row, `references/turn.md has a template row for the kind ${kind}`);
+    assert.deepEqual(ticked(row.split('|')[2]), [...kindReasons[kind]], `the ${kind} row lists its reasons in order`);
+  }
+  for (const type of PROOF_TYPES) assert.ok(turn.includes(`\`${type}\``), `references/turn.md names the proof type ${type}`);
+  for (const verdict of VERDICTS) assert.ok(turn.includes(`\`${verdict}\``), `references/turn.md names the verdict ${verdict}`);
+  // The guard: every rule a row, the refusal's exit, G5's own words, and the other exits.
+  for (const rule of GUARD_RULES) assert.ok(turn.includes(`| ${rule} |`), `references/turn.md has a row for ${rule}`);
+  for (const rule of ['G4', 'G5']) {
+    const row = turn.split('\n').find((line) => line.startsWith(`| ${rule} |`))!;
+    assert.ok(row.split('|').map((c) => c.trim()).includes(String(GUARD_REFUSAL_EXIT)), `the ${rule} row says exit ${GUARD_REFUSAL_EXIT}`);
+  }
+  assert.ok(turn.includes(G5_SENTENCE.split(':')[0]), 'references/turn.md quotes G5 in its own words');
+  for (const exit of [0, 2, 3, GUARD_REFUSAL_EXIT]) assert.ok(turn.includes(`**${exit}**`), `references/turn.md states exit ${exit}`);
+  // The guide grammar's limits and headings.
+  assert.match(turn, new RegExp(`At most ${GUIDE_MAX_STEPS} steps and ${GUIDE_MAX_BYTES / 1024} KB`));
+  for (const heading of Object.values(GUIDE_HEADINGS)) assert.ok(turn.includes(`## ${heading}`), `references/turn.md shows ## ${heading}`);
+  for (const field of ['Expect:', 'Warning:', 'Link:']) assert.ok(turn.includes(field), `references/turn.md shows ${field}`);
+  // The doors and the authority verbs; the scopes; the never list's host commands.
+  for (const door of PRESS_DOORS) assert.ok(rowOf(part('The doors'), door), `references/turn.md has a row for the door ${door}`);
+  for (const verb of AUTHORITY_VERBS) assert.ok(turn.includes(`\`${verb}\``), `references/turn.md names the authority verb ${verb}`);
+  for (const scope of GRANT_SCOPES) assert.ok(turn.includes(`\`${scope}\``), `references/turn.md names the scope ${scope}`);
+  for (const command of HOST_COMMANDS) assert.ok(turn.includes(`\`${command}\``), `references/turn.md names \`${command}\``);
+});
+
+test('references/turn.md names every flag of a person\'s turn, and none the script lacks (phase 140)', async () => {
+  const { scriptFlags } = await import('./script-flags.ts');
+  const turn = read('references/turn.md');
+  const flags = scriptFlags(read('scripts/phase-outcome.sh'));
+  const missing = [...flags].filter((flag) => !NOT_TURN_FLAGS.has(flag) && !turn.includes(flag)).sort();
+  assert.deepEqual(missing, [], `phase-outcome.sh takes these and references/turn.md never says so:\n  ${missing.join('\n  ')}`);
+  for (const flag of NOT_TURN_FLAGS) assert.ok(flags.has(flag), `NOT_TURN_FLAGS names ${flag}, which phase-outcome.sh no longer takes`);
+  const console = new Set([...read('viewer/server/config.ts').matchAll(/arg === '(--[a-z][a-z0-9-]*)'/g)].map((m) => m[1]));
+  const invented = [...new Set(turn.match(/--[a-z][a-z0-9-]*/g) ?? [])].filter((flag) => !flags.has(flag) && !console.has(flag));
+  assert.deepEqual(invented, [], `references/turn.md names flags nothing implements: ${invented.join(' ')}`);
+});
+
+test('SKILL.md\'s rule for a person\'s turn says the four things, and a denied tool is never pressed past (phase 140)', () => {
+  const skill = read('SKILL.md');
+  const start = skill.indexOf("**A person's turn is a human step, not prose.**");
+  assert.ok(start >= 0, "SKILL.md Mode 2 has the person's-turn rule");
+  const rule = skill.slice(start, skill.indexOf('**An unrelated problem**', start)).replace(/\s+/g, ' ');
+  for (const needle of [
+    '`references/turn.md`', '--why', '--guide', '--lang', '**Guide language:**', '--proof-words', 'handled --what', 'exit 4',
+  ]) assert.ok(rule.includes(needle), `SKILL.md's person's-turn rule names ${needle}`);
+  const denied = /- \*\*A denied tool is a decision, not a failure\.\*\*[\s\S]*?(?=\n- \*\*)/.exec(skill)?.[0] ?? '';
+  assert.ok(denied, 'SKILL.md keeps its denied-tool bullet');
+  assert.match(denied, /console-forge/, 'the denied-tool bullet says the session never presses its own console');
+  assert.match(denied, /references\/turn\.md/, 'the denied-tool bullet points at the permission block');
+});
+
+test('conventions, plan-format and the template carry Your turn as the code reads it (phase 140)', () => {
+  const conventions = read('references/conventions.md');
+  const turn = conventions.slice(conventions.indexOf("## A person's turn"), conventions.indexOf('\n## ', conventions.indexOf("## A person's turn") + 4));
+  assert.ok(turn.includes('`references/turn.md`'), "conventions §A person's turn points at references/turn.md");
+  assert.doesNotMatch(turn.replace(/\s+/g, ' '), /push naming \*Open\* and \*I did it\*/, 'a turn\'s push names its buttons by kind since phase 138');
+  assert.doesNotMatch(turn.replace(/\s+/g, ' '), /the person types it where the step opens/, 'the console never takes a secret since phase 133');
+  assert.ok(read('references/plan-format.md').includes('**Guide language:**'), 'plan-format.md documents the Guide language line');
+  const template = read('templates/plan.md');
+  assert.match(template, /Human step:\*\*[^\n]*· why: /, "the template's Human step example carries a why:");
+  assert.match(template, /Guide language:/, 'the template offers the Guide language line');
+});

@@ -150,10 +150,11 @@ export const ROUTE_TABLE: Record<string, RouteEntry> = {
 
   /* ---- pages a destination has not absorbed yet ---- */
   plan: page(() => import('@/features/plans/detail')),
-  // The phone surface every push links to. Its own chunk on purpose: it is
-  // opened cold on a phone, over whatever signal is there at 2am, and it must
-  // not drag `marked`, the DAG maths or the rail in behind it.
-  approve: page(() => import('@/features/approve')),
+  // Your turn (control-tower phase 137) — every act only a person can do, and
+  // where every step push lands. Its own chunk on purpose: it is opened cold
+  // on a phone, over whatever signal is there at 2am, and it must not drag
+  // the DAG maths or the rail's pages in behind it — nor ride in first paint.
+  turn: page(() => import('@/features/turn')),
   // The whole queue (control-tower phase 99, #135) — its own chunk: the Tower
   // links to it, and nothing on the home page needs its table.
   queue: page(() => import('@/features/queue')),
@@ -163,6 +164,9 @@ export const ROUTE_TABLE: Record<string, RouteEntry> = {
   source: page(() => import('@/features/settings/source')),
 
   /* ---- aliases: a head whose new home already exists ---- */
+  // 6.2 (control-tower phase 137): the phone answer page became Your turn, so
+  // its address — and a push's `?step=<id>` — lands on the page and the item.
+  approve: redirect(REDIRECTS.approve),
   // 6.0 (control-tower phase 21): the Tower absorbed Now's bands, so Now's
   // address lands on it — each `?focus=` on the bay that took its question.
   now: redirect(REDIRECTS.now),

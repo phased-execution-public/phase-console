@@ -64,6 +64,8 @@ import {
   type RecoveryVerdict,
 } from './runner/approvals.ts';
 import type { HaltKind, RunState } from './runner/state.ts';
+import type { DeclareInput } from './human-steps.ts';
+import { questionTurnInput } from './turn/index.ts';
 
 /** What a hook call carries that the relay reads. */
 export type QuestionEnvelope = {
@@ -123,6 +125,12 @@ export type RelayDeps = {
     context: { slug: string; phase: number; runId: string; approvalId?: string },
   ): void;
   tagFor(...parts: (string | number)[]): string;
+  /**
+   * Raise a question the console will not answer as a `decision` item of Your
+   * turn (control-tower phase 132, #209) — true when the item stands, its ONE
+   * push the item's, in the words given. Absent or false: the relay announces.
+   */
+  raiseTurn?(input: DeclareInput, message: { title: string; body: string; detail?: string }): boolean;
   appendRuling(slug: string, ruling: RelayRuling): void;
   /** The rule table in force: shipped defaults, then this console's `relayRules`. */
   rules(): readonly RelayRule[];
@@ -601,14 +609,28 @@ export class Relay {
         phase, 'needs-human',
       );
     } catch (error) { log.warn('relay.bookkeeping-failed', { what: 'park', runId: run.id, phase, error: String(error) }); }
+    const message = {
+      title: `A question needs you — ${run.slug} phase ${phase}`,
+      body: `${first.question.slice(0, 240)} — not answered by rule: ${label}.`,
+      detail: first.options.map((option) => option.label).join(' · ').slice(0, 200),
+    };
+    // A `decision` item that keeps the question's options (control-tower phase
+    // 132, #209) — never a prose errand with its options gone. Its push is the
+    // one announcement; with no door wired, the relay says it itself.
+    let raised = false;
     try {
-      this.deps.announce('needs-you', {
-        title: `A question needs you — ${run.slug} phase ${phase}`,
-        body: `${first.question.slice(0, 240)} — not answered by rule: ${label}.`,
-        tag: this.deps.tagFor('needs-you', run.slug, phase, 'question', first.key),
-        detail: first.options.map((option) => option.label).join(' · ').slice(0, 200),
-      }, { slug: run.slug, phase, runId: run.id });
-    } catch (error) { log.warn('relay.bookkeeping-failed', { what: 'announce', runId: run.id, phase, error: String(error) }); }
+      const sessionId = envelope.sessionId ?? run.phases?.[String(phase)]?.sessionId;
+      raised = this.deps.raiseTurn?.(questionTurnInput(
+        { slug: run.slug, phase, runId: run.id, ...(sessionId ? { sessionId } : {}) }, first, label,
+      ), message) ?? false;
+    } catch (error) { log.warn('relay.bookkeeping-failed', { what: 'raise', runId: run.id, phase, error: String(error) }); }
+    if (!raised) {
+      try {
+        this.deps.announce('needs-you', {
+          ...message, tag: this.deps.tagFor('needs-you', run.slug, phase, 'question', first.key),
+        }, { slug: run.slug, phase, runId: run.id });
+      } catch (error) { log.warn('relay.bookkeeping-failed', { what: 'announce', runId: run.id, phase, error: String(error) }); }
+    }
     const outcome = `bash ${this.deps.scriptsDir}/phase-outcome.sh ${run.slug} ${phase}`;
     return {
       kind: 'unanswerable',

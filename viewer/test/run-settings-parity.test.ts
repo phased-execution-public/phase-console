@@ -171,6 +171,12 @@ test('the start-only fields are the four a patch must never carry', () => {
   // answer to the plan git lines it will not honour is asked before anything
   // spawns, and a run already running has spawned.
   //
+  // `autoOpen` joined them in control-tower phase 139: the links the launch
+  // form showed in full, which the launch door may open a plan's
+  // `auto-open: host` step for — a launch decision about a door a running run
+  // has already passed, and a patch that carried it would be a way to open
+  // things on the machine with no form in front of the person.
+  //
   // `resumeOnRestart`, `relay` and `accounts` LEFT in control-tower phase 77
   // (#101): they are the prelude's answers, but answers about the run's
   // future — what a restart does, who answers a question, which accounts pay
@@ -181,7 +187,7 @@ test('the start-only fields are the four a patch must never carry', () => {
   // live QA fields, for a side effect rather than an impossibility — turning
   // it on writes `test-status.md` — so the settings door takes it behind the
   // person's confirmation (`QA_CONFIRM`) and `--allow-writes`.
-  assert.deepEqual([...START_ONLY_FIELDS].sort(), ['accountId', 'acknowledgedWaivers', 'gitStrategyAck', 'manifestOverride', 'resumeRunId', 'startAfter', 'verifyAnswers']);
+  assert.deepEqual([...START_ONLY_FIELDS].sort(), ['accountId', 'acknowledgedWaivers', 'autoOpen', 'gitStrategyAck', 'manifestOverride', 'resumeRunId', 'startAfter', 'verifyAnswers']);
 });
 
 test('PHASE_OPTION_FIELDS matches the route filter that keeps a phase honest', () => {

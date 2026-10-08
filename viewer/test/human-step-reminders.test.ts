@@ -47,7 +47,7 @@ function world(windowMinutes?: number) {
   ledger.move(declared.id, 'notified', { by: 'console', verb: 'notify', pushed: true });
   const reminded: number[] = [];
   const expired: HumanStep[] = [];
-  const tick = (opts: { quiet?: { start: string; end: string } } = {}) => tickHumanSteps({
+  const tick = (opts: { quiet?: { start: string; end: string } | { start: string; end: string }[] } = {}) => tickHumanSteps({
     ledger, now: now, minuteOf: utcMinute, ...(opts.quiet ? { quiet: opts.quiet } : {}),
     remind: (_step, n) => { reminded.push(n); return true; },
     expired: (step) => { expired.push(step); },
@@ -61,7 +61,8 @@ function world(windowMinutes?: number) {
 
 /** Walk the clock to `until`, ticking every `stepMs`; answer the moments (after T0) a reminder fired. */
 function walk(
-  w: ReturnType<typeof world>, until: number, opts: { quiet?: { start: string; end: string }; stepMs?: number } = {},
+  w: ReturnType<typeof world>, until: number,
+  opts: { quiet?: { start: string; end: string } | { start: string; end: string }[]; stepMs?: number } = {},
 ): number[] {
   const fired: number[] = [];
   const stride = opts.stepMs ?? 5 * MIN;
@@ -101,6 +102,25 @@ test('HS-6 — quiet hours defer a reminder to their end, never drop it', () => 
     assert.equal(outsideQuiet(T0 + 13 * HOUR, { start: '12:00', end: '14:00' }, utcMinute), T0 + 14 * HOUR);
     assert.equal(outsideQuiet(T0 + 15 * HOUR, { start: '12:00', end: '14:00' }, utcMinute), T0 + 15 * HOUR);
     assert.equal(outsideQuiet(T0 + 15 * HOUR, null, utcMinute), T0 + 15 * HOUR, 'no quiet hours, no deferral');
+  } finally { w.cleanup(); }
+});
+
+test('HS-6 (control-tower phase 138) — ONE quiet-hours setting, the devices’: a reminder waits while EVERY device that hears it is quiet, to the first one’s end', () => {
+  const w = world(10 * 24 * 60);
+  try {
+    // Notified at 00:00: the first reminder falls at 00:15. The phone sleeps
+    // 22:00–07:00 and the tablet 23:00–06:00 — nobody would hear it until six.
+    const phone = { start: '22:00', end: '07:00' };
+    const tablet = { start: '23:00', end: '06:00' };
+    assert.equal(nextReminderAt(w.step(), { quiet: [phone, tablet], minuteOf: utcMinute }), T0 + 6 * HOUR, 'the first device to wake hears it');
+    assert.deepEqual(walk(w, T0 + 6 * HOUR + 55 * MIN, { quiet: [phone, tablet] }), [6 * HOUR], 'one reminder, when the first window ends — deferred, never dropped');
+    // A device awake at the moment it falls due: no wait at all.
+    const day = { start: '09:00', end: '17:00' };
+    assert.equal(outsideQuiet(T0 + 15 * MIN, [phone, day], utcMinute), T0 + 15 * MIN);
+    // No device window to wait out (none subscribed, or one with none): no wait.
+    assert.equal(outsideQuiet(T0 + 15 * MIN, [], utcMinute), T0 + 15 * MIN);
+    // One device's window reads exactly as the single window always did.
+    assert.equal(outsideQuiet(T0 + 13 * HOUR, [{ start: '12:00', end: '14:00' }], utcMinute), T0 + 14 * HOUR);
   } finally { w.cleanup(); }
 });
 

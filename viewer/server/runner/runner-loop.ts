@@ -122,6 +122,8 @@ import type { Runner } from './runner.ts';
 import { RunnerControl } from './runner-control.ts';
 import { enter, runTraceId } from '../trace.ts';
 import { INSTANCE } from '../config.ts';
+import { credentialTurnInput, mcpTurnInput } from '../turn/index.ts';
+import type { HumanStep } from '../human-steps.ts';
 
 /** A closeout brief's turn cap, as the brief composed it. */
 const closeoutBriefTurns = (value: number): Cap => ({ value, source: 'closeout', basis: 'a closeout brief' });
@@ -2988,6 +2990,14 @@ export abstract class RunnerLoop extends RunnerControl {
         this.policyFor(situation.key));
       errand.need = `The credential${missing.length === 1 ? '' : 's'} the plan names for phase ${phase} and this console does not hold: `
         + `${missing.map((m) => `\`${m.id}\` (${m.reason})`).join('; ')}.`;
+      // A missing credential is an item of Your turn (control-tower phase 132,
+      // #209): a `secret-entry` per id whose proof is `credential:<id>` —
+      // presence by name, the value never taken — and the errand IS the first,
+      // so the item's own push is the one announcement.
+      const items = missing
+        .map((m) => this.deps.humanStep?.(credentialTurnInput({ slug: state.slug, phase, runId: state.id }, m.id, m.reason)) ?? null)
+        .filter((step): step is HumanStep => step !== null && !('refused' in step));
+      if (items[0]) errand.stepId = items[0].id;
       slot.errand = errand;
       record.endedAt ??= errand.at;
       this.record('phase.errand', { ...errand, label: situation.label, reason: 'credential policy is require', by: 'preflight' }, phase);
@@ -4295,6 +4305,12 @@ export abstract class RunnerLoop extends RunnerControl {
       this.record('phase.mcp-preflight-parked', {
         reason: mcp.park, servers: mcp.degraded.map((row) => row.id), timeoutMs,
       }, phase);
+      // Each server a person must sign in is an item of Your turn (phase 132).
+      for (const row of mcp.degraded) {
+        this.deps.humanStep?.(mcpTurnInput({ slug: state.slug, phase, runId: state.id }, {
+          id: row.id, detail: row.detail ?? mcpReasonText(row.reason),
+        }));
+      }
       this.emit('phase', { phase, status: 'parked', note: mcp.park, mcpPark: record.mcpPark, timeoutMs });
       return true;
     }
@@ -4690,6 +4706,7 @@ export abstract class RunnerLoop extends RunnerControl {
     // console re-board that never reaches a spawn carries them forward.
     delete record.cause;
     delete record.toolDenied;
+    delete record.walls;
     // A usage wall ends with its park (#78): whatever this attempt parks on
     // next is its own, and a wall it meets writes a fresh one.
     delete record.usageWall;

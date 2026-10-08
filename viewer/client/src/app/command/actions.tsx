@@ -30,6 +30,7 @@ import {
   runHref,
   runsHref,
   settingsHref,
+  turnHref,
   type Route,
 } from '@/app/routes';
 import type { ConsoleState, PlanSummary, RunState } from '@/lib/api';
@@ -139,6 +140,19 @@ export function navigationActions(context: CommandContext): CommandAction[] {
     keywords: item.note,
     run: (ctx) => ctx.go(item.id),
   }));
+
+  // Your turn (control-tower phase 137): a head, not a destination, so the
+  // nav's list does not carry it — it is offered here by name, and by what a
+  // person reaching for it would type. No glyph of its own: the palette is
+  // first paint, and a label needs none.
+  items.push({
+    id: 'go:turn',
+    group: GROUPS.go,
+    label: 'Your turn',
+    hint: 'Everything only you can do, each with its guide',
+    keywords: 'needs me needs you approve answer person human step task todo guide check',
+    run: (ctx) => ctx.go(turnHref()),
+  });
 
   items.push({
     id: 'go:help',

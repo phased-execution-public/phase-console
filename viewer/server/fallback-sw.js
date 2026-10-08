@@ -111,6 +111,7 @@ const MAX_NOTIFICATION_ACTIONS = 2;
 /** Restates `shared/sw-push.js` `ANSWER_RECEIPTS`; held to it by test. */
 const ANSWER_RECEIPTS = {
   allow: 'Allowed. The session is carrying on.',
+  grant: 'Granted at its narrowest scope. The session resumes by itself; Settings ▸ Permissions can take it back.',
   deny: 'Denied. The session was told.',
   approve: 'Gate approved. The phase can board.',
   check: 'Sent. The console is running the proof; you will be reminded if it does not land.',

@@ -105,7 +105,7 @@ test('approving a manual gate flips the live verdict to clear, revoking restores
 
   // The Gate card from a browser — a person's press, the only one a MANUAL gate
   // opens to (control-tower phase 107, #174; manual-gate-person-only.test.ts).
-  const approved = await svc.approveGate('gatey', 1, { approve: true, by: 'operator', note: 'keys minted + exported', person: true });
+  const approved = await svc.approveGate('gatey', 1, { approve: true, by: 'operator', note: 'keys minted + exported', door: 'local' });
   assert.equal(approved.ok, true, approved.detail);
   assert.equal(approved.gate?.clear, true);
   assert.match(approved.gate?.detail ?? '', /approved by operator/);

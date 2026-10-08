@@ -9,6 +9,7 @@
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
 import { parkOnStep, stepJournalFields } from '../human-steps.ts';
+import { refusalFields } from '../turn/guard.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { cpus, homedir, loadavg } from 'node:os';
@@ -62,6 +63,7 @@ import {
   clockOf, ENGINE_BUSY_BACKOFF_MS, inputCloseWords, reboardResumeBrief, resumePolicyInstruction, resumePolicyWhy, sessionLostInstruction,
 } from './runner-core.ts';
 import type { RungRecord } from './state.ts';
+import { wallOfHookDenial, withWall, type RecordedWall } from '../permissions/walls.ts';
 import { accountPool, applyErrandAnswer, identityChangeWords, identityEcho, keepAccountInPool, launcherAlive, manifestEcho, rankInPool, type ErrandAnswer } from './state.ts';
 import {
   childrenOf, endLockWait, loadRun, newRun, orphanAdvice, phaseRecord, procIdentity, retirePhaseHalt, retireSettledErrands, runDir, saveRun, pidAlive, pidHoldsWork, IN_FLIGHT, SETTLED,
@@ -2043,6 +2045,9 @@ export abstract class RunnerControl extends RunnerBase {
       PE_PROOFS_FILE: undefined,
       PE_VERIFY_DIR: undefined,
       PE_RUN_ROOT: undefined,
+      // The sessions' handled file (control-tower phase 136): what a reviewer
+      // did is not what the phase's session handled instead of asking.
+      PE_HANDLED_FILE: undefined,
       // The issue ledger too (phase 12): per PLAN rather than per attempt, but
       // a console started by a session of plan A must not hand plan A's
       // ledger to a reviewer of plan B — every site that wants it states it
@@ -3799,7 +3804,21 @@ export abstract class RunnerControl extends RunnerBase {
       // unless the plan says otherwise, because an accepted inbox nobody sends
       // to costs the session nothing.
       messaging: this.messagingOn(),
+      // This run's live grants below plan scope (control-tower phase 149): the
+      // rule lowered for this run only while the grant lives; the next write
+      // after it ends raises it again.
+      ...(this.deps.grantsLowered ? { lowered: this.deps.grantsLowered(runId) } : {}),
     }));
+  }
+
+  /**
+   * Write this run's settings again from what holds NOW (control-tower phase
+   * 149): a grant applied or ended, a policy file a grant edited. The child
+   * already running keeps what it loaded — the hook enforces a grant's scope
+   * for it — and the next one loads this.
+   */
+  refreshSettings(): void {
+    this.rearmSettings();
   }
 
   /**
@@ -5494,7 +5513,30 @@ export abstract class RunnerControl extends RunnerBase {
   /** The line's number in the run's journal (the chat's action card links to it), or null. */
   note(event: string, data: Record<string, unknown> = {}, phase?: number): number | null {
     if (!this.state) return null;
-    return this.record(event, data, phase);
+    const line = this.record(event, data, phase);
+    // Every refusal this console's hook makes — a deny rule, every guard — is
+    // a wall the lane met (control-tower phase 135, #212): kept on its record
+    // beside the journal line, so a permission declaration can cite it (G5).
+    if (event === 'phase.tool-denied' && typeof phase === 'number' && typeof data.tool === 'string') {
+      try {
+        this.noteWall(phase, wallOfHookDenial({
+          tool: data.tool, rule: typeof data.rule === 'string' ? data.rule : null, command: data.command,
+        }, this.now().toISOString()));
+      } catch { /* the refusal stands; the record is bookkeeping */ }
+    }
+    return line;
+  }
+
+  /**
+   * A wall this console recorded for one lane (control-tower phase 135, #212)
+   * — the evidence a `permission` item cites: newest last, a repeat moved to
+   * the end, at most `WALLS_KEPT`, cleared at a boarding with `toolDenied`.
+   */
+  noteWall(phase: number, wall: RecordedWall): void {
+    const record = this.state?.phases[String(phase)];
+    if (!record) return;
+    record.walls = withWall(record.walls, wall);
+    this.persist();
   }
 
   /**
@@ -5834,12 +5876,18 @@ export abstract class RunnerControl extends RunnerBase {
           // A HUMAN STEP from a session this run did not spawn (control-tower
           // phase 41): recorded and announced once, and the phase waits on a
           // PERSON — no external-wait budget charged (`parkOnStep`).
-          const step = declared.status === 'needs-human' && declared.step
+          const raised = declared.status === 'needs-human' && declared.step
             ? this.deps.humanStep?.({
               slug: state.slug, phase, birth: 'session', step: declared.step, runId: state.id,
               ...(declared.session_id ? { sessionId: declared.session_id } : {}),
             }) ?? null
             : null;
+          // Refused by the guard at ingest (control-tower phase 130): no item.
+          const step = raised && !('refused' in raised) ? raised : null;
+          if (raised && 'refused' in raised) {
+            record.note = `${record.note ?? 'the session asked for a person'} — the guard refused it (${raised.refused.rule}): ${raised.refused.sentence}`;
+            this.record('phase.turn-refused', { ...refusalFields(raised.refused) }, phase);
+          }
           if (step) {
             parkOnStep(record, step, by === 'unsupervised' ? 'unsupervised' : 'session', record.declared.at);
             this.record('phase.human-step', stepJournalFields(step), phase);

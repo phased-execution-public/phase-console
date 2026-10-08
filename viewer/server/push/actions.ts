@@ -46,6 +46,20 @@
  * or tear something down, and a mis-tap on a lock screen is not the interaction
  * that should be able to do either. Those keep the button they have always had:
  * Open.
+ *
+ * ------------------------------------------------------------------
+ * Held to the `device` door (control-tower phase 138, #215)
+ * ------------------------------------------------------------------
+ *
+ * A signed lock-screen action is the `device` door (phase 131), and the door
+ * table (`shared/door-model.js` `DOOR_MAY`) is the one answer to what a paired
+ * device may press: low and medium grants, answers, declines. So an item's
+ * lock screen offers only those (`lockScreenOf`): a permission item's *Allow*
+ * is a grant at its NARROWEST offered scope where the device may make it, a
+ * high one's first button opens the item instead, a never one offers no grant
+ * at all, and *Deny* is a decline. The press is read against the same table
+ * again on arrival (`Service.performInboxAction`), and the grant engine judges
+ * its own risk a third time — a token is never the authority.
  */
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -54,6 +68,9 @@ import { join } from 'node:path';
 
 import { log } from '../log.ts';
 import { PUSH_DIR } from './vapid.ts';
+import { HUMAN_STEP_PUSH_ACTIONS, type StepPushAction } from './catalogue.ts';
+import { doorMay, OWNER_DOOR_MODES, pressRiskOf, type AuthorityVerb, type PressDoor } from '../../shared/door-model.js';
+import { groupOf, riskOf } from '../../shared/turn-model.js';
 
 /**
  * How long a notification's buttons stay live.
@@ -69,6 +86,11 @@ export const PUSH_ACTION_TTL_MS = 12 * 60 * 60_000;
 /** The verbs a notification button may carry, and what each is called on it. */
 export const PUSH_ACTION_VERBS = Object.freeze({
   allow: 'Allow',
+  // A permission item's *Allow* (control-tower phase 138, #215): a grant at
+  // the item's NARROWEST offered scope, signed only where the `device` door
+  // may press it (`lockScreenGrant`). Declared beside `allow` so it, too, is
+  // always left of Deny.
+  grant: 'Allow',
   deny: 'Deny',
   approve: 'Approve',
   // An approval card's expiry warning (control-tower phase 97, #140): the
@@ -271,4 +293,79 @@ export function notificationButtons(verbs: readonly string[]): PushActionButton[
     .filter((verb) => wanted.has(verb))
     .slice(0, MAX_NOTIFICATION_ACTIONS)
     .map((verb) => ({ action: verb, title: PUSH_ACTION_VERBS[verb] }));
+}
+
+/* ------------------------------------------------------------------ *
+ * The lock screen, held to the `device` door (control-tower phase 138, #215)
+ * ------------------------------------------------------------------ */
+
+/** The door every lock-screen press comes through (phase 131): a signed action is a paired device's. */
+export const LOCK_SCREEN_DOOR: PressDoor = 'device';
+
+/**
+ * May the lock screen press this authority at this risk ON ITS OWN — the
+ * `device` row of the door table as written (`enrolled`)? Never the
+ * unenrolled console's leniency, which lets a device press whatever a script
+ * could: a button on a lock screen offers only what the door itself may make.
+ */
+export function lockScreenMay(verb: AuthorityVerb, risk: string = pressRiskOf(verb)): boolean {
+  return doorMay(LOCK_SCREEN_DOOR, verb, { risk, mode: OWNER_DOOR_MODES[1] }) === 'press';
+}
+
+/** A permission item's block, as much as the lock screen reads of it. */
+export type LockScreenPermission = {
+  wall: string; family?: string; scopes?: readonly string[]; never?: unknown;
+};
+
+/**
+ * The grant a lock screen may make for a permission item: its NARROWEST
+ * offered scope, priced by `riskOf` (wall × family × scope), when the `device`
+ * door may press a grant at that risk — low or medium. Null for a never item
+ * (no scope is offered through any door) and for a high one: its button opens
+ * the item, where the rule is typed and the owner key touched.
+ */
+export function lockScreenGrant(permission: LockScreenPermission | null | undefined): { scope: string; risk: string } | null {
+  if (!permission || permission.never) return null;
+  const scope = permission.scopes?.[0];
+  if (!scope) return null;
+  const risk = riskOf({ wall: permission.wall, family: permission.family ?? 'any', scope });
+  return lockScreenMay('grant', risk) ? { scope, risk } : null;
+}
+
+/** What `lockScreenOf` reads of an item. */
+export type LockScreenItem = { kind: string; proofType?: string; permission?: LockScreenPermission | null };
+
+/**
+ * One item's lock screen: the buttons its push NAMES, in order (the step
+ * block's `actions` — `open` is the worker's own, every other one a verb the
+ * token signs), and the verbs signed. Two at most, the platform cap.
+ *
+ *   - a permission item a device may grant — *Allow* (`grant`, its narrowest
+ *     scope) and *Deny* (`deny`, a decline);
+ *   - a high or never one — *Open* (the item's page) and *Deny*;
+ *   - a decision — *Open* alone: its answer is one of its options, on the page,
+ *     and a check of an unanswered one would only send it back;
+ *   - an act — *Open* and *I did it* (`check`, run the proof now).
+ *
+ * A grant and a decline are read from the door table, at their own risk; a
+ * grant the device may not make is never signed. *I did it* only asks the
+ * console to run the item's proof — the verdict is the probe's or the
+ * checker's, and a person's word only where the item names no proof
+ * (`runCheck`, which asks the door again) — so it stays an act's, as it was.
+ */
+export function lockScreenOf(item: LockScreenItem): { buttons: StepPushAction[]; verbs: PushActionVerb[] } {
+  const open = HUMAN_STEP_PUSH_ACTIONS[0];
+  const button = (verb: PushActionVerb): StepPushAction => ({ action: verb, title: PUSH_ACTION_VERBS[verb] });
+  if (item.kind === 'permission') {
+    const grant = lockScreenGrant(item.permission);
+    const deny = lockScreenMay('decline');
+    const verbs: PushActionVerb[] = [...(grant ? ['grant' as const] : []), ...(deny ? ['deny' as const] : [])];
+    const buttons = [...(grant ? [] : [open]), ...verbs.map(button)].slice(0, MAX_NOTIFICATION_ACTIONS);
+    return { buttons, verbs };
+  }
+  // A decision by what it IS, whatever state it is in now (`groupOf` without one).
+  if (groupOf({ kind: item.kind, ...(item.proofType ? { proofType: item.proofType } : {}) }) === 'decide') {
+    return { buttons: [open], verbs: [] };
+  }
+  return { buttons: [...HUMAN_STEP_PUSH_ACTIONS], verbs: ['check'] };
 }

@@ -530,13 +530,19 @@ DEFAULT_PERMISSION_MODE="acceptEdits"
 # A person's turn (control-tower phase 41) — the OWNER is
 # viewer/shared/human-step-model.js, twin scripts/human-steps.env. Read by
 # --human-steps and the F37/F38 lints here; by phase-outcome.sh (--step).
-HUMAN_STEP_KINDS="browser-login device-code one-time-code secret-entry claude-login mcp-login os-prompt os-permission third-party-approval physical person-check decision protected-path interactive-prompt captcha email-link"
+HUMAN_STEP_KINDS="browser-login device-code one-time-code secret-entry claude-login mcp-login os-prompt os-permission third-party-approval physical person-check decision protected-path interactive-prompt captcha email-link operator-act permission"
 HUMAN_STEP_WHERE="host any"
 HUMAN_STEP_AUTO_OPEN="host"
-HUMAN_STEP_BULLET_KEYS="open proof where window auto-open credential"
-HUMAN_STEP_DEFAULT_WHERE="browser-login:host device-code:any one-time-code:host secret-entry:any claude-login:host mcp-login:host os-prompt:host os-permission:host third-party-approval:any physical:host person-check:any decision:any protected-path:host interactive-prompt:host captcha:any email-link:any"
+HUMAN_STEP_BULLET_KEYS="open proof where window auto-open credential due why effort unblocks guide"
+HUMAN_STEP_DEFAULT_WHERE="browser-login:host device-code:any one-time-code:host secret-entry:any claude-login:host mcp-login:host os-prompt:host os-permission:host third-party-approval:any physical:host person-check:any decision:any protected-path:host interactive-prompt:host captcha:any email-link:any operator-act:host permission:any"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/human-steps.env" ] && . "$SCRIPT_DIR/human-steps.env"
+# Your turn (control-tower phase 130) — the OWNER is viewer/shared/turn-model.js,
+# twin scripts/turn.env: the reasons a bullet's `why:` may name, per kind.
+WHY_PERSON="permission identity secret money legal decision physical reach third-party reserved"
+KIND_REASONS=""
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/turn.env" ] && . "$SCRIPT_DIR/turn.env"
 
 # The decision manifest's vocabulary (chapter 13 §1.1) — the OWNER is
 # viewer/shared/decisions-model.js and scripts/decisions.env is its bash twin,
@@ -2843,6 +2849,7 @@ _human_step_parse() {  # _human_step_parse <body>
   local tab fields field key value n=0 keyed=0 kind_field word pair
   tab="$(printf '\t')"
   HS_KIND=""; HS_WHAT=""; HS_OPEN=""; HS_PROOF=""; HS_WHERE=""; HS_WINDOW=""; HS_AUTO=""; HS_CRED=""; HS_DUE=""; HS_BAD=""
+  HS_WHY=""; HS_EFFORT=""; HS_UNBLOCKS=""; HS_GUIDE=""
   fields="$(printf '%s\n' "$1" | sed -E "s/[[:space:]]*·[[:space:]]*/$tab/g" | tr "$tab" '\n')"
   while IFS= read -r field; do
     n=$((n + 1))
@@ -2863,6 +2870,10 @@ _human_step_parse() {  # _human_step_parse <body>
       auto-open) HS_AUTO="$(printf '%s' "$value" | tr 'A-Z' 'a-z')" ;;
       credential) HS_CRED="$value" ;;
       due) HS_DUE="$value" ;;
+      why) HS_WHY="$(printf '%s' "$value" | tr 'A-Z' 'a-z')" ;;
+      effort) HS_EFFORT="$value" ;;
+      unblocks) HS_UNBLOCKS="$value" ;;
+      guide) HS_GUIDE="$value" ;;
     esac
   done <<EOF
 $fields
@@ -2912,6 +2923,39 @@ EOF
       *) false ;;
     esac || { HS_BAD="due: \"$HS_DUE\" is not a watch ref the console can poll — gh:<owner/repo>#run/<id>, date:<ISO8601 instant>, lock:|phase:|verify:<slug>/<N>, cmd:\"<command>\" or unit:<host>/<unit>"; return 3; }
   fi
+  # Your turn's four (control-tower phase 130): a reason the kind allows, the
+  # minutes it takes, the phases it unblocks, and a guide file under the docs
+  # root. The JS twin is `parseHumanStepBody` (engine-parity holds them).
+  if [ -n "$HS_WHY" ]; then
+    case " $WHY_PERSON " in
+      *" $HS_WHY "*) : ;;
+      *) HS_BAD="why: \"$HS_WHY\" is not a reason (want one of: $WHY_PERSON)"; return 3 ;;
+    esac
+    local reasons="" rpair
+    for rpair in $KIND_REASONS; do [ "${rpair%%:*}" = "$HS_KIND" ] && reasons="${rpair#*:}"; done
+    case ",$reasons," in
+      *",$HS_WHY,"*) : ;;
+      *) HS_BAD="why: \"$HS_WHY\" is not a reason a $HS_KIND step is asked for (its reasons: $(printf '%s' "$reasons" | tr ',' ' '))"; return 3 ;;
+    esac
+  fi
+  if [ -n "$HS_EFFORT" ]; then
+    value="$(duration_minutes "$HS_EFFORT")"
+    [ -z "$value" ] && { HS_BAD="effort: \"$HS_EFFORT\" is not a duration (5m, 1h)"; return 3; }
+    HS_EFFORT="$value"
+  fi
+  if [ -n "$HS_UNBLOCKS" ]; then
+    value="$(printf '%s' "$HS_UNBLOCKS" | tr -d ' ')"
+    printf '%s' "$value" | grep -qE '^0*[1-9][0-9]{0,4}(,0*[1-9][0-9]{0,4})*$' \
+      || { HS_BAD="unblocks: \"$HS_UNBLOCKS\" is not phase numbers (12,13)"; return 3; }
+    HS_UNBLOCKS="$(printf '%s' "$value" | sed -E 's/(^|,)0+([1-9])/\1\2/g')"
+  fi
+  if [ -n "$HS_GUIDE" ]; then
+    case "$HS_GUIDE" in
+      /*|*..*|*' '*) HS_BAD="guide: \"$HS_GUIDE\" is not a path under the docs root (relative, no .., no spaces)"; return 3 ;;
+    esac
+    printf '%s' "$HS_GUIDE" | grep -qE '^[A-Za-z0-9._/-]+\.md$' \
+      || { HS_BAD="guide: \"$HS_GUIDE\" is not a markdown file under the docs root"; return 3; }
+  fi
   # A URL-shaped `open:` (a scheme before the first colon) must be http(s);
   # anything else is a command, which only the embedded terminal runs.
   if printf '%s' "$HS_OPEN" | grep -qE '^[A-Za-z][A-Za-z0-9+.-]*:[^[:space:]]'; then
@@ -2922,16 +2966,20 @@ EOF
 }
 
 # The phase's well-formed steps, one per line:
-#   kind<TAB>what<TAB>open<TAB>proof<TAB>where<TAB>window-minutes<TAB>auto-open<TAB>credential[<TAB>due]
-# The ninth field is printed only when the bullet names a `due:` ref, so every
-# line written before control-tower phase 121 reads byte for byte as it did.
+#   kind<TAB>what<TAB>open<TAB>proof<TAB>where<TAB>window-minutes<TAB>auto-open<TAB>credential
+#     [<TAB>due[<TAB>why<TAB>effort-minutes<TAB>unblocks<TAB>guide]]
+# The ninth field is printed only when the bullet names a `due:` ref or one of
+# the four after it (control-tower phase 130), and those four only when it names
+# one of them — so every line written before reads byte for byte as it did.
 human_steps_for_phase() {  # human_steps_for_phase <phase>
   local body
   while IFS= read -r body; do
     [ -z "$body" ] && continue
     _human_step_parse "$body" || continue
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$HS_KIND" "$HS_WHAT" "$HS_OPEN" "$HS_PROOF" "$HS_WHERE" "$HS_WINDOW" "$HS_AUTO" "$HS_CRED"
-    if [ -n "$HS_DUE" ]; then printf '\t%s\n' "$HS_DUE"; else printf '\n'; fi
+    if [ -n "$HS_WHY$HS_EFFORT$HS_UNBLOCKS$HS_GUIDE" ]; then
+      printf '\t%s\t%s\t%s\t%s\t%s\n' "$HS_DUE" "$HS_WHY" "$HS_EFFORT" "$HS_UNBLOCKS" "$HS_GUIDE"
+    elif [ -n "$HS_DUE" ]; then printf '\t%s\n' "$HS_DUE"; else printf '\n'; fi
   done <<EOF
 $(human_step_bodies "$1")
 EOF
@@ -2976,6 +3024,18 @@ human_step_advisories() {
         "$p" "$kind" "$(printf '%s' "$what" | cut -c1-60)"
     done <<EOF
 $(human_steps_for_phase "$p" | awk -F'\t' '$1 != "" && $4 == "" { print $1 "\t" $2 }')
+EOF
+    # F40 `human-step-no-why` (control-tower phase 130) — ADVISORY, never a
+    # gate: a step that says nothing of why only a person fits it is given its
+    # kind's default reason, marked inferred on the item.
+    while IFS="$(printf '\t')" read -r kind what; do
+      [ -z "$kind" ] && continue
+      local reasons="" rpair
+      for rpair in $KIND_REASONS; do [ "${rpair%%:*}" = "$kind" ] && reasons="${rpair#*:}"; done
+      printf 'F40 phase %s: human-step-no-why — the %s step "%s" names no why:, so it is given its kind'"'"'s default (%s), marked inferred; add why: <reason>\n' \
+        "$p" "$kind" "$(printf '%s' "$what" | cut -c1-60)" "${reasons%%,*}"
+    done <<EOF
+$(human_steps_for_phase "$p" | awk -F'\t' '$1 != "" && $10 == "" { print $1 "\t" $2 }')
 EOF
   done
   return 0

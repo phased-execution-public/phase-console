@@ -49,7 +49,7 @@ export const NOTIFICATION_BADGE = '/icons/icon-badge-96.png';
  * @property {{action: string, title: string}[]|null} [actions]
  * @property {string|null} [callback]
  * @property {{id?: string, name?: string}|null} [console] which console spoke (zero-touch phase 17, FLT-4)
- * @property {{id?: unknown, kind?: unknown, where?: unknown, code?: unknown}|null} [step] a person's turn (control-tower phase 41/42)
+ * @property {{id?: unknown, kind?: unknown, where?: unknown, code?: unknown, actions?: unknown}|null} [step] a person's turn (control-tower phase 41/42; its named buttons since 138)
  */
 
 /**
@@ -163,19 +163,34 @@ export const MAX_NOTIFICATION_ACTIONS = 2;
  * @returns {NotificationAction[]|undefined}
  */
 export function notificationActions(data) {
-  // A person's turn (control-tower phase 42): *Open* — the step's card, one
-  // tap from the lock screen — and *I did it*, the signed check the server
-  // bound to the token, when it did. Open is the worker's own and posts
-  // nothing; the check is answered through `/api/push/action` like any other.
-  if (stepOf(data)) {
-    const signed =
-      Array.isArray(data.actions) && data.callback
-        ? data.actions.find((entry) => entry && entry.action === 'check' && typeof entry.title === 'string')
-        : undefined;
-    return [
-      { action: STEP_OPEN_ACTION, title: 'Open' },
-      ...(signed ? [{ action: 'check', title: signed.title }] : []),
-    ].slice(0, MAX_NOTIFICATION_ACTIONS);
+  // A person's turn (control-tower phase 42; held to the `device` door since
+  // phase 138): the buttons the step block NAMES, in its order — *Open*, the
+  // worker's own, which opens the item and posts nothing, and each other one
+  // only when the server SIGNED it (the token's list beside a callback): *I
+  // did it* on an act, *Allow* (a grant at the narrowest scope) and *Deny* on
+  // a permission item a device may grant, *Open* and *Deny* on a high one. A
+  // named button nobody signed is not drawn — a grant without its token is not
+  // a grant — and when nothing is left the item itself is the one button.
+  const step = stepOf(data);
+  if (step) {
+    const signed = Array.isArray(data.actions) && data.callback ? data.actions : [];
+    const named = step.actions ?? STEP_DEFAULT_ACTIONS;
+    /** @type {NotificationAction[]} */
+    const out = [];
+    for (const entry of named) {
+      if (entry.action === STEP_OPEN_ACTION) {
+        out.push({ action: STEP_OPEN_ACTION, title: 'Open' });
+        continue;
+      }
+      const press = signed.find(
+        (one) => one && one.action === entry.action && typeof one.title === 'string' && one.title,
+      );
+      if (press) out.push({ action: press.action, title: press.title });
+    }
+    return (out.length ? out : [{ action: STEP_OPEN_ACTION, title: 'Open' }]).slice(
+      0,
+      MAX_NOTIFICATION_ACTIONS,
+    );
   }
   if (Array.isArray(data.actions)) {
     const clean = data.actions
@@ -333,6 +348,10 @@ export function decisionRequest(approvalId, decision) {
  */
 export const ANSWER_RECEIPTS = Object.freeze({
   allow: 'Allowed. The session is carrying on.',
+  // A permission item's Allow (control-tower phase 138): the grant a lock
+  // screen may make is the item's narrowest, and every grant can be revoked.
+  grant:
+    'Granted at its narrowest scope. The session resumes by itself; Settings ▸ Permissions can take it back.',
   deny: 'Denied. The session was told.',
   approve: 'Gate approved. The phase can board.',
   // A person's turn (control-tower phase 42): the press runs the proof on the
@@ -392,32 +411,70 @@ export function resubscribeRequest(subscription, label = 'a browser (re-register
 export const STEP_OPEN_ACTION = 'open';
 
 /**
- * The step a payload is about — `{id, kind, where, code?}` — when its kind is
- * one this worker knows (`HUMAN_STEP_KINDS`), else null: a step of a kind a
- * newer console added is drawn as a plain link, never half a card.
+ * What a step payload from before control-tower phase 138 names — it carried
+ * no list of its own: *Open*, and *I did it* when the token signed it.
+ */
+const STEP_DEFAULT_ACTIONS = Object.freeze([
+  Object.freeze({ action: STEP_OPEN_ACTION, title: 'Open' }),
+  Object.freeze({ action: 'check', title: 'I did it' }),
+]);
+
+/**
+ * The buttons a step block names, cleaned: each `{action, title}` a pair of
+ * non-empty strings, at most the platform's cap — or undefined when it names
+ * none (an older payload), which reads as `STEP_DEFAULT_ACTIONS`.
+ *
+ * @param {unknown} raw
+ * @returns {{action: string, title: string}[]|undefined}
+ */
+function stepActionsOf(raw) {
+  if (!Array.isArray(raw)) return undefined;
+  return raw
+    .filter(
+      (entry) =>
+        entry &&
+        typeof entry === 'object' &&
+        typeof entry.action === 'string' &&
+        entry.action &&
+        typeof entry.title === 'string' &&
+        entry.title,
+    )
+    .slice(0, MAX_NOTIFICATION_ACTIONS)
+    .map((entry) => ({ action: entry.action, title: entry.title }));
+}
+
+/**
+ * The step a payload is about — `{id, kind, where, code?, actions?}` — when
+ * its kind is one this worker knows (`HUMAN_STEP_KINDS`), else null: a step of
+ * a kind a newer console added is drawn as a plain link, never half a card.
+ * `actions` is the lock screen's list the server named (control-tower phase
+ * 138), kept on the notification so a press hours later still finds it.
  *
  * @param {PushPayload} data
- * @returns {{id: string, kind: string, where: 'host'|'any', code?: string}|null}
+ * @returns {{id: string, kind: string, where: 'host'|'any', code?: string, actions?: {action: string, title: string}[]}|null}
  */
 export function stepOf(data) {
   const step = data && typeof data === 'object' ? /** @type {Record<string, unknown>} */ (data).step : null;
   if (!step || typeof step !== 'object') return null;
-  const { id, kind, where, code } = /** @type {Record<string, unknown>} */ (step);
+  const { id, kind, where, code, actions } = /** @type {Record<string, unknown>} */ (step);
   if (typeof id !== 'string' || !id || typeof kind !== 'string') return null;
   if (!(/** @type {readonly string[]} */ (HUMAN_STEP_KINDS).includes(kind))) return null;
+  const named = stepActionsOf(actions);
   return {
     id,
     kind,
     where: where === 'host' ? 'host' : 'any',
     ...(typeof code === 'string' && DEVICE_CODE_RE.test(code) ? { code } : {}),
+    ...(named ? { actions: named } : {}),
   };
 }
 
 /**
- * Where a step's notification lands — its card on the phone's answer page
- * (`#/approve?step=<id>`), under whatever path the payload's own url is
- * mounted at (a console under the fleet's `/c/<id>/`), clamped to this origin
- * like every click. One tap from the lock screen to the whole step.
+ * Where a step's notification lands — its item on Your turn (`#/turn/<id>`,
+ * control-tower phase 137; `#/approve?step=<id>` before it, which still
+ * redirects there), under whatever path the payload's own url is mounted at
+ * (a console under the fleet's `/c/<id>/`), clamped to this origin like every
+ * click. One tap from the lock screen to the whole guide.
  *
  * @param {{url?: string, step?: {id?: string}|null}|null|undefined} info the notification's `data`
  * @param {string} origin
@@ -427,6 +484,6 @@ export function stepTarget(info, origin) {
   const base = new URL(clickTarget(info, origin));
   const id = info?.step?.id;
   if (typeof id !== 'string' || !id) return base.href;
-  base.hash = `/approve?step=${encodeURIComponent(id)}`;
+  base.hash = `/turn/${encodeURIComponent(id)}`;
   return base.href;
 }

@@ -14,6 +14,10 @@
  * Off by default (`digest` in the catalogue), hourly when on. Pure: the
  * service gathers the facts and announces the result through
  * `Service.announce`, so the gates every other category obeys hold here too.
+ *
+ * Since control-tower phase 138 (#215) it leads with Your turn — how many
+ * items need the person, how many a check sent back, how many things the AI
+ * handled — counted from the page's own answer, so the two never disagree.
  */
 
 /** How often the digest is composed while its category is on. */
@@ -28,6 +32,15 @@ export type DigestPark = { slug: string; phase: number | null; reason: string };
 export type DigestDetection = { slug: string; phase: number | null; text: string };
 export type DigestUndelivered = { category: string; title: string; at: string };
 
+/**
+ * Your turn, counted (control-tower phase 138, #215) — read from the page's own
+ * answer (`GET /api/turn`), so the digest and the page never disagree: how many
+ * items need the person now (*Do now* and *Decide*), how many of those a check
+ * sent back, and how many things the AI handled instead of asking — since the
+ * last digest, or in the last hour before the first.
+ */
+export type DigestTurn = { needYou: number; cameBack: number; handled: number; handledSince: 'digest' | 'hour' };
+
 export type DigestFacts = {
   now: number;
   approvals: DigestApproval[];
@@ -37,6 +50,8 @@ export type DigestFacts = {
   undelivered: DigestUndelivered[];
   /** How many were lost in all, when more than were kept. */
   undeliveredTotal?: number;
+  /** Your turn's counts; absent where the turn could not be read. */
+  turn?: DigestTurn | null;
 };
 
 function where(slug: string, phase: number | null): string {
@@ -48,20 +63,44 @@ function plural(count: number, one: string, many: string): string {
 }
 
 /**
+ * Your turn's line, or null when it has nothing to say: "Your turn: 3 need you
+ * — 1 came back from a check · 4 handled by the AI since the last digest".
+ * A part with nothing in it is left out.
+ */
+export function turnLine(turn: DigestTurn | null | undefined): string | null {
+  if (!turn || (!turn.needYou && !turn.handled)) return null;
+  const need = turn.needYou ? `${turn.needYou} ${turn.needYou === 1 ? 'needs' : 'need'} you` : 'nothing needs you';
+  const back = turn.needYou && turn.cameBack ? ` — ${turn.cameBack} came back from a check` : '';
+  const handled = turn.handled
+    ? ` · ${turn.handled} handled by the AI ${turn.handledSince === 'digest' ? 'since the last digest' : 'in the last hour'}`
+    : '';
+  return `Your turn: ${need}${back}${handled}`;
+}
+
+/**
  * The digest's title and body, or null when there is nothing to say — no
- * decision waiting, nothing parked, nothing detected, nothing lost. Silence is
- * the good news, and a digest that says "nothing" every hour is how the
- * category gets turned off.
+ * decision waiting, nothing parked, nothing detected, no item needing the
+ * person, nothing lost. Silence is the good news, and a digest that says
+ * "nothing" every hour is how the category gets turned off — so what the AI
+ * handled is said beside something that waits, never on its own.
+ *
+ * Your turn leads (control-tower phase 138, #215): it is the page's own count
+ * of everything that asks the person for an act, the itemised lines below it
+ * are the ones with a clock. The title keeps counting those lines; with none,
+ * it is Your turn's count.
  */
 export function composeDigest(facts: DigestFacts): { title: string; body: string } | null {
   const lines: string[] = [];
+  const needYou = facts.turn?.needYou ?? 0;
+  const turn = turnLine(facts.turn);
+  if (turn) lines.push(turn);
   for (const card of facts.approvals) {
     const waited = Math.max(0, Math.round((facts.now - Date.parse(card.createdAt)) / 60_000));
     lines.push(`${where(card.slug, card.phase)} — ${card.title} (waiting ${waited} min; expires ${card.expiresAt.slice(11, 16)}Z)`);
   }
   for (const park of facts.parks) lines.push(`${where(park.slug, park.phase)} parked — ${park.reason}`);
   for (const found of facts.detections) lines.push(`${where(found.slug, found.phase)} — ${found.text}`);
-  const waiting = lines.length;
+  const waiting = facts.approvals.length + facts.parks.length + facts.detections.length;
 
   const lost = facts.undelivered;
   const lostTotal = Math.max(facts.undeliveredTotal ?? lost.length, lost.length);
@@ -70,10 +109,12 @@ export function composeDigest(facts: DigestFacts): { title: string; body: string
     lines.push(`Did not arrive: ${newest.join('; ')}`);
     if (lostTotal > lost.length) lines.push(`and ${lostTotal - lost.length} more`);
   }
-  if (!lines.length) return null;
+  if (!waiting && !needYou && !lostTotal) return null;
 
   const title = waiting
     ? plural(waiting, 'thing waits on you', 'things wait on you')
-    : `${plural(lostTotal, 'notification', 'notifications')} did not arrive`;
+    : needYou
+      ? `Your turn: ${plural(needYou, 'thing needs you', 'things need you')}`
+      : `${plural(lostTotal, 'notification', 'notifications')} did not arrive`;
   return { title, body: lines.join('\n') };
 }

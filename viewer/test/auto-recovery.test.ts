@@ -35,6 +35,7 @@ const { SKILL_DIR } = await import('../server/config.ts');
 const { Service, autoRecoveryClass } = await import('../server/service.ts');
 const { consumeDeclaration, loadRun, newRun, phaseRecord, runDir, saveRun } = await import('../server/runner/state.ts');
 const { RECOVER_MAX_PER_PHASE } = await import('../server/runner/runner-core.ts');
+const { PUSH_DENY_CARVED } = await import('../server/runner/approvals.ts');
 const { WatchScheduler } = await import('../server/watch-scheduler.ts');
 const { PhaseClaimedError } = await import('../server/service-core.ts');
 const { WATCH_REDELIVER_SERIES_MS, liveErrandHow, redeliverAfter } = await import('../server/watch-refs.ts');
@@ -2556,6 +2557,16 @@ test('ACC-8.12 (TRS-10/LFC-3): on a stopped run the healer offers the widen-rule
     assert.equal(climbed?.rung, 'widen-rule');
     assert.equal(climbed?.outcome, 'running');
     assert.equal(climbed?.cardId, card!.id);
+    // The widen rung's ask is ONE permission item (control-tower phase 135):
+    // the card is its Grant — the permanent plan strike, labelled as what it is.
+    const items = svc.humanStepsNow().open().filter((step) => step.kind === 'permission' && step.slug === 'alpha');
+    assert.equal(items.length, 1, 'one permission item');
+    assert.equal(items[0]!.permission?.wall, 'deny');
+    assert.equal(items[0]!.permission?.rule, 'Bash(git push:*)');
+    assert.equal(items[0]!.permission?.command, 'git push origin pe/alpha');
+    assert.equal(items[0]!.permission?.grant?.effect, 'strike');
+    assert.equal((items[0]!.permission?.grant as { approvalId?: string } | undefined)?.approvalId, card!.id);
+    assert.match(items[0]!.permission?.grant?.label ?? '', /revocable from Settings ▸ Permissions/, 'the widen card is the mechanism a grant answers (phase 149)');
     // A second pass while the card is up settles nothing and offers nothing more.
     const again = await svc.maybeAutoRecover('alpha');
     assert.equal(again.launched, false, again.reason);
@@ -2569,7 +2580,22 @@ test('ACC-8.12 (TRS-10/LFC-3): on a stopped run the healer offers the widen-rule
     // own session is resumed through the recover verb — no new boarding.
     assert.equal(svc.decideApproval(card!.id, 'allow', 'operator', undefined).ok, true);
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.deepEqual(edits.at(-1), { scope: 'plan', slug: 'alpha', remove: { deny: ['Bash(git push:*)'] }, by: 'operator' });
+    // The widen card's Allow is a GRANT since control-tower phase 149: the
+    // engine strikes the rule for this plan with its row — never a policy
+    // edit of the healer's own.
+    assert.equal(edits.filter((edit) => (edit as { remove?: unknown }).remove).length, 0, 'no policy edit beside the engine');
+    const [row] = svc.grantsNow().list();
+    assert.ok(row, 'the Allow wrote a grant row');
+    assert.deepEqual(
+      { scope: row.scope, wall: row.wall, rule: row.rule, card: row.card, by: row.by, slug: row.slug, state: row.state },
+      { scope: 'plan', wall: 'deny', rule: 'Bash(git push:*)', card: card!.id, by: 'operator', slug: 'alpha', state: 'live' },
+    );
+    // Lifting the push wall carves the never list into the same file, in the same row (phase 149).
+    assert.deepEqual(
+      row.changed.map((change) => `${change.kind}:${(change as { op?: string }).op}:${(change as { rule?: string }).rule}`),
+      ['policy:strike:Bash(git push:*)', ...PUSH_DENY_CARVED.map((rule) => `policy:add:${rule}`)],
+    );
+    svc.grantsNow().revokeAll('test');
     assert.equal(sessions.length, 1);
     assert.equal(sessions[0].phase, 2);
     assert.equal(sessions[0].mode, 'resume');

@@ -231,7 +231,7 @@ Some rows resolve from lines in this section — `**Credentials:**` + `**Credent
 `- **Human step:**`, `- **Person-check:**`). Answers that arrive later go to a twin the engine
 merges over the table, written only by `scripts/decisions.sh`. The human-step bullet has one grammar
 since control-tower phase 41 — `- **Human step:** <kind> · <what> · open: <url or command> · proof:
-<ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]`, one of seventeen
+<ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]`, one of eighteen
 kinds — legal under the plan's `## Operator errands` heading too, as the plan's own act — and the
 5.1.0 `<who, what, proof ref>` spelling it replaced fails the lint by name (F37).
 

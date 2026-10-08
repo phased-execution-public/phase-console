@@ -222,7 +222,7 @@ console's id, so two consoles never overwrite each other's cards. That namespaci
 once, at 5.0.0: a card delivered before the upgrade stands beside its successor rather than being
 replaced by it.
 
-**Nineteen categories, per device**, because a phone and a laptop rarely want the same ones. This
+**Twenty categories, per device**, because a phone and a laptop rarely want the same ones. This
 table is the catalogue (`viewer/server/push/catalogue.ts`), and a test holds it to it — if the two
 ever disagree, the catalogue is right:
 
@@ -230,7 +230,7 @@ ever disagree, the catalogue is right:
 |---|---|---|
 | **Permission needed** | on | A session is blocked on a decision only you can make — a command outside its rules, a gate, or a check it cannot make itself. Nothing proceeds until you answer. |
 | **Session waiting on you** | on | A Claude session is stopped at a permission prompt or a question — a lane of the autopilot, one you ran in a terminal, or an agent session. The body is the question itself, with the plan and phase when the console can tell which, never the directory. A lane whose phase already has a card waiting in the approval queue is not pushed twice. The row is resolved when the wait is answered or the session ends, and a wait still unanswered after an hour is pushed once more. A question a relayed session asks arrives here too, answered by rule when its window closes unless you answer first. |
-| **A phase needs you** | on | A phase did its work and stopped at something no automation may sign off — a check written as prose, a verification only a person can make, or a human step: a sign-in, a code, a secret, an approval only you can give, named with Open and I did it (and, for a device code, the code). It is not failed and not finished; it is waiting, and it will keep waiting. |
+| **A phase needs you** | on | A phase did its work and stopped at something no automation may sign off — a check written as prose, a verification only a person can make, or a human step: a sign-in, a code, a secret, a permission, an approval only you can give. A push for an item opens the item itself (`#/turn/<id>`), with the buttons a paired device may press (below) — and, for a device code, the code. It is not failed and not finished; it is waiting, and it will keep waiting. |
 | **Gate needs a person** | on | A phase is held at a gate only a person may clear — a physical act, a third party, a credential no session holds. The board will call the phase ready the moment it is approved and not one second before, so nothing else moves and nothing else will ask. |
 | **QA verdict owed or failed** | on | A finished phase still owes its QA verdict, or QA recorded a fail. Either way the plan gates on it: every dependent phase is held until pass or waived is recorded, and nothing records one by itself. Sent only after the console's own chase (the at-finish dispatcher, then the ladder) left the verdict owed. |
 | **Run halted** | on | A run stopped on something that must not be automated past — a failed verification, a phase that would not settle. Includes a run that was interrupted with nothing driving it. |
@@ -246,7 +246,8 @@ ever disagree, the catalogue is right:
 | **Usage climbing** | on | Early warning while a window fills — 80% is "plan your afternoon", 95% is "the next long phase will not finish" — and, hours ahead, an account serving live runs that its measured burn will wall: when, when it resets, and which runs are burning it (2 hours before by default). On by default since control-tower phase 92 (#141): the warning that could have said "walls ≈10:50, resets in four days" was off. The wall itself still announces under Usage limits. The lead is the `usageForecastLeadHours` preference (hours, default 2); `usageForecastHold: true` also holds new admissions on that account until the window resets. |
 | **Budget spent or running low** | on | A budget that can stop work reached 80% or ran out — a phase's wait (its `Waits on:` max or the plan's `Wait budget:`), a phase's or the run's dollars, the recovery ladder's cap, the failure streak. The first line says which budget and the arithmetic — `60m wait budget · 39.7m accrued · 20.3m left · asked for 90m` — and what spent it; the run page's card beside it raises the budget where it was declared (the plan's line for a wait, the run's setting for dollars and rungs, Clear streak for the streak) and retries in one press. Once per budget per attempt; not urgent (control-tower phase 14, #40). |
 | **Issue drafted by a session** | on | A session tripped over a problem outside its phase and drafted an issue for it (the plan's `Issues:` word allows it). Under `draft` it waits in the inbox for your Approve, Discard or edit; under `file` it was filed at once and this tells you what landed. Not urgent: nothing is spending while a draft waits, and a filed issue is a record, not a wall. |
-| **Hourly digest** | off | A summary instead of a stream: once an hour, every decision waiting on you with how long it has waited and when it expires, every parked run and every stalled session — and, once the channel answers again, the notifications an outage kept from arriving. Nothing waiting sends nothing. Off by default: the categories above already say each thing as it happens. |
+| **Hourly digest** | off | A summary instead of a stream: once an hour, Your turn first — `Your turn: 3 need you — 1 came back from a check · 4 handled by the AI since the last digest`, counted from the page's own answer — then every decision waiting on you with how long it has waited and when it expires, every parked run and every stalled session — and, once the channel answers again, the notifications an outage kept from arriving. Nothing waiting sends nothing: what the AI handled is said beside something that waits, never on its own. Off by default: the categories above already say each thing as it happens. |
+| **Permission granted** | on | A grant was applied (control-tower phase 149): who granted which rule, through which door, for how far — this call, this phase, this plan, this repository or always — until when, and exactly what it changed. Every grant is a row Settings ▸ Permissions lists and revokes, and the push opens there, at that grant (`#/settings/permissions?grant=<id>`, control-tower phase 138); the session it answered resumes by itself. Not urgent: it records authority given, it asks nothing of you. |
 
 **Login needs renewing** (under *Usage limits*, control-tower phase 91). A signed-in account's
 access token lapses every few hours; while the console runs it renews each one through the Claude
@@ -262,11 +263,12 @@ never needs renewing — the account card and the start door offer it.
 
 Five are sent **urgent** — *Permission needed*, *Session waiting on you*, *A phase needs you*,
 *QA verdict owed or failed* and *Run halted* — because they are the ones that mean nothing moves
-until you act; urgent interrupts a focus mode and buzzes a wrist. The other fourteen arrive quietly.
+until you act; urgent interrupts a focus mode and buzzes a wrist. The other fifteen arrive quietly.
 A channel that always buzzes is a channel you turn off, and the notification it gets turned off for
-is the one that mattered.
+is the one that mattered. A REMINDER of a person's turn is never urgent, whatever its category: it is
+a repeat, not news, so it never breaks through a device's quiet hours (below).
 
-A gate is deliberately one of the quiet twelve, and it is the distinction the split exists for: it
+A gate is deliberately one of the quiet fifteen, and it is the distinction the split exists for: it
 waits on a decision rather than on a session parked dead with a hook open, and nothing is spending
 while it waits.
 
@@ -280,20 +282,42 @@ When a run needs an act only you can do — a sign-in that opens a browser, a de
 paste, an approval on somebody else's dashboard — the push says so as *A phase needs you*, titled
 "Your turn: …" with the kind and the phase, and its body says what to do and where: *at the machine
 the console runs on* for a step that must be done there, nothing added for one you can do from the
-phone. A `device-code` step puts the code itself in the body, so the phone is enough. The push names
-two actions, *Open* and *I did it*. **I did it** is a real button: pressing it runs the step's proof
-on the console, and a proof that lands resumes the phase's own session told what was proven — one
-that does not land is simply said, and the step waits on. *Open* is the tap: it opens the phase,
-where the step's inbox row offers *I did it — check*, *Snooze an hour* and *I can't do this*. No code
-you type, token or password is ever in a push — only a device code, which is useless without your
-own signed-in browser.
+phone. A `device-code` step puts the code itself in the body, so the phone is enough. **Every push for
+an item opens the item** — Your turn's `#/turn/<id>`, expanded with its guide and its buttons — the tap
+on the body and *Open* alike, and the bell's row and a webhook's link go to the same address (control-tower
+phase 138). No code you type, token or password is ever in a push — only a device code, which is useless
+without your own signed-in browser.
+
+**The lock screen offers only what a paired device may press.** A pressed button is a signed action,
+and a signed action is the `device` door: the door table lets it make low and medium grants, answers and
+declines — nothing else on its own (`viewer/shared/door-model.js`, the one table every door is read
+from). So the buttons an item's push carries are read from that table, never written by hand:
+
+| The item | Its two buttons | Why |
+|---|---|---|
+| an act — a sign-in, a code, a token, somebody else's approval | *Open* · **I did it** | *I did it* runs the item's proof on the console; a proof that lands resumes the phase's own session told what was proven, one that does not is said, and the item waits on. |
+| a permission item at low or medium risk — the wall an ask or an allow list, priced at its narrowest scope | **Allow** · **Deny** | *Allow* grants it at the NARROWEST scope the item offers (this one call), through the `device` door, exactly as the item's own Grant would; *Deny* tells the session to find another way. |
+| a permission item at high risk — a deny-wall rule, a capability, a profile raise | *Open* · **Deny** | A high grant needs the rule typed and, with an owner key, the key touched: the first button opens the item, where both are. The console reads the table again when a press arrives, so a grant pressed anyway is refused and the item opens. |
+| a permission item on the never list — a guard, a credential, a forced push, the host family | *Open* · **Deny** | No grant is offered through any door; the item says why, and the manual path. |
+| a decision — options to choose between | *Open* | Its answer is one of its options, on the page; a check of an unanswered decision would only send it back. |
+
+iOS draws no buttons at all and shows the notification, so there the tap is the whole answer: it opens
+the item.
+
+One turn is one push (control-tower phase 132). The errand a parked phase writes for the same step —
+or for a person errand, a credential the preflight found missing, a question the relay will not
+answer — is the same item, not a second card: it pushes nothing of its own, and its row's button is
+*I've done this — check* on that item. Every push for an item, the first and each reminder, rides one
+tag, so the phone holds one notification per item.
 
 A step you have not done is **reminded**: 15 minutes after the first push, then an hour after that,
 six hours after that, then daily — each gap counted from the last reminder or from your last open or
 check, whichever is later. A reminder replaces the step's notification rather than stacking beside it
 ("Still your turn … Reminder 2"). *Snooze* holds the next reminder back (an hour, a day at most), and
-the **reminder quiet hours** (`reminderQuiet`, `HH:MM`–`HH:MM` on the console's clock) defer one that
-falls inside them to their end — deferred, never dropped. Reminders stop when the step is proven,
+reminders obey **the devices' own quiet hours** — the one quiet-hours setting there is (below): a
+reminder that falls due while every device that would hear it is inside its window waits for the first
+one to end — deferred, never dropped — and, being a repeat rather than news, it never breaks through a
+quiet window the way an urgent first push may. Reminders stop when the step is proven,
 when you press *I can't do this* (it becomes an errand carrying your reason), or when it is
 withdrawn; a step whose window closes (seven days when it names none) expires into an errand too, so
 nothing reminds for ever.
@@ -323,6 +347,15 @@ and the delivery ledger reads `quiet` for the device rather than reading as a fa
 **Urgent still gets through** by default (an approval held until morning stops the fleet dead until
 morning); untick it on a device that must never buzz at night. Times are on the console's own clock.
 
+**It is the only quiet-hours setting for notifications** (control-tower phase 138, #215). A person's
+turn's reminders obey it: one falls due while every device that hears *A phase needs you* is inside its
+window, and it waits for the first of them to end; a reminder is never urgent, so it never breaks
+through. A device with no window — or no device at all — is always awake, and a reminder goes out when
+it is due. The reminders' own quiet hours, the `reminderQuiet` preference of earlier versions, are
+gone: a config that still holds one has it moved, once, at boot, onto every device with no window of
+its own (a device with its own keeps it), and the key is removed (`push.quiet-migrated` in the log). A
+page from before the change that still sends it is treated the same way, and nothing stores it again.
+
 Not the scheduler's *Quiet hours* in `docs/controls.md` — those stop phases **boarding**; these stop
 pushes **reaching one device**. The two are independent and the names collide on purpose: both mean
 "not now", about different things.
@@ -334,13 +367,16 @@ Some notifications carry buttons, and pressing one answers without opening anyth
 | Button | On | What it does |
 |---|---|---|
 | **Allow** | Permission needed | Answers the card. The session unblocks where it stands. |
-| **Deny** | Permission needed | Answers the card the other way; the session is told. |
+| **Allow** | A phase needs you — a permission item a paired device may grant: low or medium risk at the narrowest scope it offers (control-tower phase 138) | Grants it at that scope — this one call — through the `device` door, as the item's own Grant would: the item settles, the session resumes by itself, and a *Permission granted* push opens Settings ▸ Permissions at the grant. Never on a high or never item: there the first button is the tap that opens the item. |
+| **Deny** | Permission needed; a permission item | Answers the card the other way, or denies the item; either way the session is told and finds another way. |
 | **Approve** | Gate needs a person, when the gate is a person's to clear (`manual`, or overdue) — never an `ai`/`auto` gate | Records the gate clearance in `gate-status.md` and lets the phase board. |
 | **Extend 2 h** | Permission needed — the T-15 and T-5 warning a card sends before it runs out, beside **Allow** | Moves the card's deadline two hours later. Inside the hook call's hour it simply moves; past it the session is told no at the hour and the card stands for twelve hours, and allowing it then resumes the phase with that one call granted once. |
-| **I did it** | A phase needs you — a human step ("Your turn: …") | Runs the step's proof on the console. A proof that lands marks the step proven and resumes the phase's own session saying what was proven; one that does not land records what it read, and the step waits on. A step that names no proof is proven on your word. |
+| **I did it** | A phase needs you — an act ("Your turn: …") | Runs the step's proof on the console. A proof that lands marks the step proven and resumes the phase's own session saying what was proven; one that does not land records what it read, and the step waits on. A step that names no proof is proven on your word. |
 
 Android and desktop render them. **iOS ignores the array and shows the notification**, which is the
-correct degradation — tapping it opens `#/approve`, below, where the same buttons are.
+correct degradation — tapping it opens the item (`#/turn/<id>`) or Your turn (`#/approve` lands there,
+below), where the same buttons are. Which of them an item's push carries is the table in *Your turn — a human step on the
+phone*, above: only what the `device` door may press.
 
 Three things this deliberately cannot do, and the reasons are worth knowing before you rely on it:
 
@@ -356,27 +392,27 @@ Three things this deliberately cannot do, and the reasons are worth knowing befo
   which is exactly what every button did before this existed.
 
 A relayed question carries no buttons: a button may allow or deny, never choose one of several
-labels, so its answer is a tap on `#/approve`.
+labels, so its answer is a tap on Your turn (`#/approve` lands there), where its options are cards.
 
 
-### `#/approve` — the whole queue, thumb-sized
+### `#/approve` — the whole queue, thumb-sized: now Your turn
 
-`https://your-console/#/approve` is a page with nothing on it but what needs you and can be answered
-from here: one column of cards, buttons big enough to hit, and no rail. Bookmark it, or reach it
-from any notification.
+`https://your-console/#/approve` — the address every push linked to until 6.2, and the one bookmarks
+hold — and `#/approve?step=<id>` land in one hop on **Your turn**: `#/turn`, and `#/turn/<id>` for one item
+(control-tower phase 137). That page is the phone's whole queue: one column of cards under *Do now*, *Needs
+one detail from you*, *Coming up*, *Being checked*, *Done* and *Handled by the AI*, each item with why only
+you, its guide as steps and its ONE primary action, in buttons big enough to hit. Bookmark `#/turn`, or reach
+it from any notification.
 
-It shows an item only when this console can actually act on it — a remedy behind a capability you
-did not start the console with is not drawn as a dead button, it is counted in one line at the foot.
-A `Session waiting on you` item follows the same rule. A lane of the autopilot that the console can
-place on a plan and phase carries **Answer it**, and your words reach that lane's session as an
-instruction for the rest of the phase (behind `--allow-run`). A session stopped at its own terminal
-prompt has no action here — the console genuinely cannot answer for it — so it is counted at the foot,
-and you answer it where it runs.
+A `Session waiting on you` is an item like the rest. A lane of the autopilot that the console can place on a
+plan and phase carries **Answer it**, and your words reach that lane's session as an instruction for the
+rest of the phase (behind `--allow-run`). A session stopped at its own terminal prompt has no action — the
+console genuinely cannot answer for it — and its card says so: you answer it where it runs.
 
-Where the console can carry your words — evidence on a gate, a reason on a permission card, the answer
-to a lane — the card has a text field, and on Chrome and Safari a **microphone button** beside it that
-dictates into it. Firefox has no speech API, so there is no button there rather than a dead one.
-Dictation fills the field; it never presses the button.
+Where the action carries your words — evidence on a gate, a reason on a permission card, the answer to a
+lane — the card has a text field, and on Chrome and Safari a **microphone button** beside it that dictates
+into it. Firefox has no speech API, so there is no button there rather than a dead one. Dictation fills the
+field; it never presses the button.
 
 ## Step 7 · Alerts with no browser involved at all *(optional)*
 

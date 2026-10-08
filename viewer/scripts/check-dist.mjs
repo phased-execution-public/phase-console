@@ -564,6 +564,42 @@ check(
 
 
 /*
+ * Your turn (control-tower phase 137, #214): the page, its item card and its
+ * guide are one lazy chunk, found by CONTENT — `data-turn-page`, the attribute
+ * only the page writes. First paint sat at 189.1 of its 190 KB when the page
+ * was built, and the card brings the human-step model's tables, the guide's
+ * grammar and the decision card with it: in the entry, or reachable from it by
+ * a static import, or modulepreloaded, every visitor would download all of it.
+ */
+{
+  const turnChunks = assets.filter(
+    (name) =>
+      name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes('data-turn-page'),
+  );
+  check(
+    `Your turn is in a chunk of its own (${turnChunks.join(', ') || 'none'})`,
+    turnChunks.length > 0 && entryMatch !== null && !turnChunks.includes(entryMatch[1]),
+    "Your turn is reached through the router's `page()` (a dynamic import); if no chunk carries " +
+      'data-turn-page, or the entry does, it was folded into what every visitor downloads.',
+  );
+  if (entryMatch) {
+    const firstPaint = chunkClosure(entryMatch[1]);
+    const pulled = [...firstPaint].filter((name) => turnChunks.includes(name));
+    check(
+      `first paint's static graph carries no Your turn (${firstPaint.size} chunks walked)`,
+      pulled.length === 0,
+      `${pulled.join(', ')} is reachable from the entry by static imports — import features/turn lazily.`,
+    );
+  }
+  const preloadedTurn = turnChunks.filter((name) => preloaded.includes(name));
+  check(
+    'the document never modulepreloads Your turn',
+    preloadedTurn.length === 0,
+    `modulepreloaded: ${preloadedTurn.join(', ')} — a preloaded chunk is fetched by every visitor on first paint.`,
+  );
+}
+
+/*
  * The status model's word tables and its icon map stay out of first paint
  * (control-tower phase 16).
  *

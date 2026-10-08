@@ -203,10 +203,15 @@ self.addEventListener('notificationclick', (event) => {
     callback?: string | null;
     step?: { id?: string } | null;
   };
-  // A person's turn lands on its card — the body's tap and *Open* alike — one
-  // tap from the lock screen to the whole step (control-tower phase 42).
+  // A person's turn lands on its item — `#/turn/<id>`, the body's tap and
+  // *Open* alike — one tap from the lock screen to the whole step (control-tower
+  // phases 42 and 137). Since phase 138 the buttons beside it are only what the
+  // `device` door may press: *I did it* on an act, *Allow* and *Deny* on a
+  // permission a device may grant, *Open* and *Deny* on a high-risk one — so a
+  // risky grant is made on the page, never from here.
   const target = info.step ? stepTarget(info, self.location.origin) : clickTarget(info, self.location.origin);
-  // Which button, checked against the ones this notification actually offered.
+  // Which button, checked against the ones this notification actually offered
+  // — a button the server named but did not sign was never drawn, and is no press.
   const verb = actionOf(event.action, info);
   const decision = decisionOf(event.action);
 

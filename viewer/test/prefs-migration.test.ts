@@ -29,11 +29,16 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+
 import {
   sanitiseAutomation,
   toAutomation,
   fromAutomation,
   migrateAutomation,
+  migrateReminderQuiet,
+  instancePrefsFile,
   withAutomation,
   type Prefs,
 } from '../server/config.ts';
@@ -61,7 +66,8 @@ test('the round-trip is lossless for all forty', () => {
 
 test('the groups are the ones the plan named, and nothing is stranded', () => {
   const object = toAutomation(FLAT);
-  const groups = ['accounts', 'caps', 'defaults', 'git', 'mcp', 'policy', 'recover', 'schedule', 'stall', 'watch'];
+  // `check` is the check's own group (control-tower phase 134, #211).
+  const groups = ['accounts', 'caps', 'check', 'defaults', 'git', 'mcp', 'policy', 'recover', 'schedule', 'stall', 'watch'];
   assert.deepEqual(Object.keys(object).sort(), groups);
   // The schedule is the one group that IS its value rather than a bag of
   // scalars — it is coerced by `sanitiseSchedule` beside the rules it has to
@@ -215,6 +221,101 @@ test('the published object never disagrees with the flat keys beside it', () => 
     fromAutomation(toAutomation(flat)),
     'the derived view lost something',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * ONE quiet-hours setting (control-tower phase 138, #215)
+ *
+ * The reminders had quiet hours of their own (`reminderQuiet`, phase 43) and
+ * every push device had its own — two settings for one question, which could
+ * disagree. The device's is the one: `reminderQuiet` moves onto every device
+ * that has no window of its own, and is dropped.
+ * ------------------------------------------------------------------ */
+
+test('QH-1: reminderQuiet moves onto every device with no window of its own; a device with one keeps it; the key is dropped', () => {
+  const plan = migrateReminderQuiet(
+    { reminderQuiet: { start: '22:30', end: '07:15' }, theme: 'dark' },
+    [{ id: 'phone' }, { id: 'laptop', quiet: { start: '23:00', end: '06:00', allowUrgent: false } }],
+  );
+  assert.deepEqual(plan, {
+    quiet: { start: '22:30', end: '07:15', allowUrgent: true },
+    devices: ['phone'],
+    kept: ['laptop'],
+    prefs: { theme: 'dark' },
+  }, 'urgent still gets through, as a window opened on a device does; nothing else in the preferences moves');
+});
+
+test('QH-2: idempotent — with no key there is nothing to do, however many times it runs', () => {
+  assert.equal(migrateReminderQuiet({ theme: 'dark' }, [{ id: 'phone' }]), null);
+  const once = migrateReminderQuiet({ reminderQuiet: { start: '22:00', end: '08:00' } }, [{ id: 'phone' }])!;
+  // The second run reads what the first one wrote: the key gone, the device holding the window.
+  assert.equal(migrateReminderQuiet(once.prefs, [{ id: 'phone', quiet: once.quiet }]), null);
+});
+
+test('QH-3: a malformed window is dropped, never half-honoured — quiet hours nobody asked for must not exist', () => {
+  for (const junk of [{ start: '25:00', end: '07:00' }, { start: '22:00', end: '22:00' }, { start: '22:00' }, 'night', 42, null]) {
+    const plan = migrateReminderQuiet({ reminderQuiet: junk } as never, [{ id: 'phone' }]);
+    assert.deepEqual(plan, { quiet: null, devices: [], kept: [], prefs: {} }, `${JSON.stringify(junk)} moved somewhere`);
+  }
+});
+
+test('QH-4: with no device subscribed there is nothing to be quiet on — the key is still dropped', () => {
+  assert.deepEqual(
+    migrateReminderQuiet({ reminderQuiet: { start: '22:00', end: '08:00' } }, []),
+    { quiet: { start: '22:00', end: '08:00', allowUrgent: true }, devices: [], kept: [], prefs: {} },
+  );
+});
+
+test('QH-5: at boot the console moves it onto its devices and writes the config without it — and a second boot changes nothing', async () => {
+  const { Push } = await import('../server/push/index.ts');
+  const { Service } = await import('../server/service.ts');
+  const { join } = await import('node:path');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { generateKeyPairSync, randomBytes } = await import('node:crypto');
+  const browser = () => {
+    const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = publicKey.export({ format: 'jwk' }) as { x: string; y: string };
+    const point = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]);
+    return {
+      endpoint: `https://push.example.com/sub/qh5-${randomBytes(4).toString('hex')}`,
+      keys: { p256dh: point.toString('base64url'), auth: randomBytes(16).toString('base64url') },
+    };
+  };
+  // The register the console will load: one device with no window, one with its own.
+  const register = new Push([]);
+  for (const device of register.list()) register.unsubscribe(device.id);
+  const phone = register.subscribe(browser(), undefined, 'phone') as { id: string };
+  const laptop = register.subscribe(browser(), undefined, 'laptop') as { id: string };
+  register.setQuiet(laptop.id, { start: '23:00', end: '06:00', allowUrgent: false });
+  // A config written before phase 138.
+  const file = instancePrefsFile();
+  mkdirSync(dirname(file), { recursive: true });
+  const before = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown> : {};
+  writeFileSync(file, `${JSON.stringify({ ...before, reminderQuiet: { start: '22:00', end: '07:30' } }, null, 2)}\n`, 'utf8');
+
+  const boot = () => new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  const first = boot();
+  try {
+    const quietOf = (svc: InstanceType<typeof Service>, id: string) => svc.push.list().find((d) => d.id === id)?.quiet;
+    assert.deepEqual(quietOf(first, phone.id), { start: '22:00', end: '07:30', allowUrgent: true }, 'the device with none took it');
+    assert.deepEqual(quietOf(first, laptop.id), { start: '23:00', end: '06:00', allowUrgent: false }, 'the device with its own kept it');
+    assert.ok(!('reminderQuiet' in (first as unknown as { prefs: object }).prefs), 'gone from the preferences in memory…');
+    assert.ok(!('reminderQuiet' in (JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>)), '…and on disk');
+  } finally { first.close(); }
+
+  // The person changes the phone's window afterwards; a second boot must not undo it.
+  const again = new Push([]);
+  again.setQuiet(phone.id, { start: '21:00', end: '06:30', allowUrgent: true });
+  const second = boot();
+  try {
+    assert.deepEqual(second.push.list().find((d) => d.id === phone.id)?.quiet, { start: '21:00', end: '06:30', allowUrgent: true });
+  } finally {
+    second.close();
+    for (const device of second.push.list()) second.push.unsubscribe(device.id);
+  }
 });
 
 test('a write through the real door leaves the two shapes agreeing', async () => {

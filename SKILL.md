@@ -11,7 +11,7 @@ allowed-tools:
   - Glob
   - Agent
 metadata:
-  version: 6.1.0
+  version: 6.2.0
 ---
 
 # Phased Execution
@@ -64,7 +64,7 @@ can pull and continue); the skill itself lives wherever it was installed. The pl
 roadmap; handoffs **link** to it and never re-list all phases. The handoff holds
 operational next-session state. Memory holds durable facts. Full schemas/templates:
 `references/plan-format.md`, `references/handoff-format.md`, `references/conventions.md`,
-`references/sizing.md`.
+`references/sizing.md`, and for a person's turn `references/turn.md`.
 
 ## Phases are a DAG, not a line
 
@@ -116,10 +116,16 @@ runs inside machinery it should not mistake for a malfunction. The short version
 - **A denied tool is a decision, not a failure.** The run's permission profile (`guarded` · `trusted` ·
   `bypass`) moves only what a person is *asked* about; the `deny` wall is identical in all three and holds
   with the console dead. Do the work that does not need the denied tool and record the rest as an operator
-  errand under **Outstanding** — never route around the wall. The console offers a deny-list denial back
-  to the operator as a **widen card** (Allow strikes that rule for this plan and resumes your own
-  session); if the phase cannot proceed without the tool, declare `phase-outcome.sh <slug> <N> blocked
-  --needs permission --rule "<rule>" --command "<command>"` and stop. (Identical *across profiles* — not
+  errand under **Outstanding** — never route around the wall, and never press the console to lower it:
+  the hook denies a supervised session's call to any authority route or verb of any console on the
+  machine, however it is carried (`console-forge`). If the phase cannot proceed without the tool,
+  declare the wall you met — `phase-outcome.sh <slug> <N> blocked --needs permission --rule "<rule>"
+  --command "<command>"` — and stop. When the console recorded that wall for your lane it raises ONE
+  permission item on Your turn (else exit 4: nothing refused this — run it), and a person answers it with
+  a grant at a scope — this call, this phase, this plan, this repository, always — a denial, or *I'll do
+  it myself*; you are resumed with the answer. The never list (a forced push, `sudo`, a protected path, a
+  secret's value, …) has no grant: say what remains instead. `references/turn.md` §A permission
+  block. (Identical *across profiles* — not
   immutable: an operator can strike a built-in rule out of the wall, per plan or globally, and that
   strike then applies to every profile at once.)
 - **Never wait on somebody else's clock inside a turn — and never poll.** A supervised session's `Bash`
@@ -498,19 +504,37 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    (`--remember global` asks the owning console to make it this console's `policy.<key>` answer — the
    words must be an answer word for the key). `references/conventions.md` §Rulings.
    **A person's turn is a human step, not prose.** When the work needs an act only a person can do —
-   a sign-in that opens a browser, a device code, a token to paste, a prompt at the machine, an
-   approval on somebody else's dashboard — declare it typed, hand off `in-progress`, and stop:
+   a sign-in that opens a browser, a device code, a secret only they hold, money, terms, a decision
+   the plan left open, hands at a device, a system you cannot reach, somebody else's approval —
+   declare it typed, hand off `in-progress`, and stop:
    ```
    bash scripts/phase-outcome.sh <slug> <N> needs-human --needs credential \
-     --step browser-login --title "Sign the gh CLI in to the acme org" \
-     --open-command "gh auth login" --proof 'cmd:"gh auth status"'
+     --step browser-login --title "Sign the gh CLI in to the acme org" --why identity \
+     --guide <guide file> --open-command "gh auth login" --proof 'cmd:"gh auth status"'
    ```
    Never run the sign-in yourself: in a `-p` session it hangs on a browser nobody sees, and the
-   console refuses it before it runs, naming this declaration filled in. Never put a
-   code, a token or a password in any flag — the script refuses it; the person types it where the
-   step opens. The console reminds the person, watches your `--proof` (and runs it when they press
-   *I did it*), and resumes THIS session told what was proven — so name the proof you would check
-   yourself. `references/conventions.md` §A person's turn.
+   console refuses it before it runs, naming this declaration filled in. Never put a code, a token
+   or a password in any flag — the script refuses it, and the console never takes a secret either:
+   the item tells the person where to store it. The item appears on **Your turn** (`#/turn`); the
+   console announces it once, checks it when the person presses *I've done this — check*, and resumes
+   THIS session with what was proven or answered. Five things make it an item a person can act on
+   (control-tower phases 130–136):
+   **give the reason** — `--why <reason>`, one of ten, held to what the kind allows
+   (`scripts/turn.env`); **write the guide** — `--guide <file>`: a why paragraph, numbered steps with
+   their commands, and "If it goes wrong" — in the language the plan names (a `**Guide language:**`
+   line in §Session budget, else English), passed as `--lang`; **state the proof in words** — a
+   `--proof` ref the console reads, or `--proof-words` a checker reads the person's evidence against,
+   or `--proof-type attest` for their bare word, by name (a decision's answer is its own proof:
+   `--option`, `--recommended`, `--allow-decline`, `--decision-key`); **never ask for what you can do
+   yourself** — the guard refuses, with exit 4, a declared `permission`, `reserved` or `reach` reason
+   when this run's own policy would let you run every command its guide asks for (run them), and a
+   `reach` with no `--tried`; did it, and it failed? declare again with `--tried "<what you ran and
+   how it failed>"` (a proof that already holds raises nothing: exit 3, carry on); and **record what
+   you handled** — when you got past a wall within your rights, or did yourself what you might have
+   asked for, say so with `phase-outcome.sh <slug> <N> handled --what "<what>" [--link commit:<sha>]`,
+   one row on Your turn's *Handled by the AI*, never an outcome. The grammar, a template per kind, the
+   guard's seven rules, a permission block and the doors: `references/turn.md`; the lifecycle:
+   `references/conventions.md` §A person's turn.
 
 ### Mode 3 — `phase-finish` (phase is done)
 
@@ -725,9 +749,9 @@ refuses to start when the console's and the skill's do not meet, naming the half
   `decision-state-unknown`, `decision-source-unknown` are the same tier). **Since 6.0.0 a fifth:**
   `human-step-superseded`, `human-step-kind-unknown` and `human-step-field-invalid` (**F37** — a
   `- **Human step:**` bullet the reader skips: the 5.1.0 `<who, what, proof ref>` spelling, named in the
-  line with the grammar that replaced it; a kind that is not one of the seventeen; a field, `where`,
+  line with the grammar that replaced it; a kind that is not one of the eighteen; a field, `where`,
   `window`, `auto-open`, `credential`, `due` or `open:` link the grammar cannot read).
-  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F39** on stderr, which
+  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F40** on stderr, which
   never changes the exit code: F15 an unregistered MCP server, credential or account ·
   F16 a verification that waits on an external clock · F17 a lead binary not installed here ·
   F18 a cwd-sensitive lead with no `**Verify in:**` · F19 a plan that cannot progress at all ·
@@ -749,7 +773,9 @@ refuses to start when the console's and the skill's do not meet, naming the half
   **F39** a §Verification line that runs a package-manager script or a `.venv/bin/*` binary in a
   repository the phase's Setup never installs (`setup-deps-missing`) — a run's isolated checkout
   mounts it with no `node_modules`/`.venv`, so it goes red before it tests anything; Setup runs in
-  the `Verify in:` directory, so spell the install's path from there (the lint names the line to add).
+  the `Verify in:` directory, so spell the install's path from there (the lint names the line to add) ·
+  **F40** a `Human step:` that names no `why:` (`human-step-no-why`) — it is given its kind's default
+  reason, marked inferred on the item.
   `references/plan-format.md` has the full reasoning for each), **`--qa-mode [N]`** (the QA regime: `off` ·
   `on <reason>` · `waived <reason>` — with no argument the PLAN's, and with a phase number that phase's
   resolved answer naming which level decided it, since `- **QA:** on|off` in a §Phase section beats the
@@ -822,7 +848,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   <TAB>window-minutes<TAB>auto-open<TAB>credential`, and a ninth field, the `due:` ref, when the bullet
   names one — `where` resolved to the kind's default when the bullet is silent; with no argument, every
   phase's, each line led by `N<TAB>`, phase `0` being the plan's own acts under its `## Operator errands`
-  heading; a bullet the lint refuses (F37) is not a step; the seventeen kinds are
+  heading; a bullet the lint refuses (F37) is not a step; the eighteen kinds are
   `scripts/human-steps.env`'s),
   **`--decisions [N]`**
   (the decision manifest as it HOLDS — the plan's `## Decisions` rows with
@@ -861,7 +887,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   the next number); `none` forces the final-phase closeout (which prints the `qa-full` brief only for
   QA-`on` plans).
 - `scripts/validate.sh <slug>` — deterministic validator: structural lint of the plan
-  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F39 on stderr) **plus**
+  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F40 on stderr) **plus**
   handoff body/consistency checks (valid status, required sections, `depends_on` agreeing with the graph).
   Run before trusting a board or finishing a phase.
 - `scripts/phase-lock.sh <slug> <claim|release|status|list|conflicts|mirror> <N> [--owner ID] [--lease S]
@@ -959,7 +985,10 @@ refuses to start when the console's and the skill's do not meet, naming the half
 - `scripts/phase-outcome.sh <slug> <N> <complete|waiting-external|blocked|needs-human|partial|no-defect>
   [--reason TEXT] [--watch REF]… [--wait-minutes N | --until ISO8601] [--needs KEY] [--rule TEXT]
   [--command TEXT] [--step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any]
-  [--proof REF] [--step-line TEXT]… [--code CODE] [--credential ID] [--due-when REF]] [--act]` — the
+  [--proof REF] [--step-line TEXT]… [--code CODE] [--credential ID] [--due-when REF | --due ISO]
+  [--why REASON] [--guide FILE [--lang CODE]] [--effort MIN] [--unblocks PHASES] [--proof-type TYPE]
+  [--proof-words TEXT] [--option ID=LABEL[::CONSEQUENCE]]… [--recommended ID] [--allow-decline] [--decision-key KEY]
+  [--window DURATION] [--tried TEXT]] [--act]` — the
   session→runner channel: ONE atomic JSON file at `$PE_OUTCOME_FILE`, read once and consumed.
   **A parking declaration that names `--watch` refs asks the console first** (`POST /hooks/declaration`,
   20 s at most): when a ref has ALREADY landed, nothing is written or parked and the script **exits 3**
@@ -985,7 +1014,10 @@ refuses to start when the console's and the skill's do not meet, naming the half
   5 minutes over ONE shared ssh connection per host, whose address, user, key and port come from
   `hosts.<host>` in the machine profile `~/.config/phase-console/fleet.json` — a host not named there is
   refused, and none of it is written into the run record — and its `Result=` and exit time land in the
-  wait history) · `lock:<slug>/<phase>` (nothing holds that scope any more —
+  wait history) · `credential:<id>` (the credential is PRESENT, read by name and never its value —
+  `credential:gh`, `credential:claude`, `credential:env:<NAME>`, `credential:keychain:<service>`,
+  `credential:file:<path>`; the proof a `secret-entry` step names, so storing the secret proves it with
+  nothing read back) · `lock:<slug>/<phase>` (nothing holds that scope any more —
   somebody ELSE's lock: one naming the declaring phase is refused, exit 2, because the only release it
   could see is its own closeout's) · `phase:<slug>/<N>` (the console's RECORD of sibling phase N reads
   done, after its §Verification — the way to wait on a sibling, re-probed the moment that phase moves;
@@ -1016,7 +1048,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   **`--step KIND` makes a `needs-human` a HUMAN STEP** (control-tower phase 41) — refused on every
   other status: the ask becomes a typed record the console holds in its ledger, raises as ONE
   `human-step` inbox row and ONE `needs-you` push, and parks with wait kind `person`, charging no
-  external-wait budget. KIND is one of the seventeen (`scripts/human-steps.env`); `--title` (required)
+  external-wait budget. KIND is one of the eighteen (`scripts/human-steps.env`); `--title` (required)
   says what the person must do, `--open-url` (http or https only) or `--open-command` what to open,
   `--where host|any` where (default: the kind's), `--proof` the watch ref that proves it, `--step-line`
   a numbered step (repeatable), `--code` a device code (`device-code` only), `--credential` the
@@ -1031,6 +1063,24 @@ refuses to start when the console's and the skill's do not meet, naming the half
   (or the console finds it never can) the step is due, with ONE push, `NOW: <command>`; its proof
   landing clears it and resumes the phase that needed it. A plan declares the same act with a `due: <ref>` field on its `- **Human step:**`
   bullet — in a phase, or under `## Operator errands` for the plan itself.
+  **Your turn's flags** (control-tower phase 130, #207): `--why REASON` — why only a person fits it,
+  one of `scripts/turn.env`'s `WHY_PERSON` that the kind allows (`KIND_REASONS`; refused by name,
+  exit 2, otherwise), and when it is absent the kind's default is recorded, marked inferred;
+  `--guide FILE` — the full guide in the grammar of `viewer/shared/guide-grammar.js` (at most 20 steps
+  and 24 KB, http(s) links only, every line through the secret screen), `--lang CODE` its language;
+  `--effort MIN`, `--due ISO` (the same as `--due-when date:ISO`), `--unblocks PHASES` (`12,13`),
+  `--window DURATION` (`90m`, `2h`, `3d`); `--proof-type probe|answer|judgement|attest|grant` and
+  `--proof-words TEXT` — a step needs a proof ref or proof words unless its answer is the result, and
+  `attest` is the person's word only when named (exit 2 otherwise); a decision's `--option
+  ID=LABEL[::CONSEQUENCE]` (repeatable), `--recommended ID`, `--allow-decline` and `--decision-key KEY`
+  (a `decision` step only: the `## Decisions` row its answer is written to, through `decisions.sh`,
+  before the session is resumed — control-tower phase 140); `--tried TEXT` —
+  what the session tried and how it failed. **The guard** runs at the door and again at ingest:
+  exit 4 refuses a declared `permission`/`reserved` reason whose every guide command this run's own
+  policy allows (the commands named — run them), and a `reach` with no `--tried`; a command a rule
+  stops re-shapes the item as a `permission` item naming the wall; raised again with `--tried` it is
+  accepted and marked overruled; the same item declared by another lane is ONE item with another
+  waiter. A proof that already reads true raises nothing (exit 3).
   Its second
   shape, **`… <N> ruling --what … [--why …] [--kind ambiguity|deviation|deferral] [--cost-if-wrong …]
   [--for <M|next|all>]
@@ -1059,6 +1109,16 @@ refuses to start when the console's and the skill's do not meet, naming the half
   console's inbox task file), journalled `phase.progress` on the task in progress at the next tool
   result, and drawn as that task's bar in the phase report. Never an outcome; `1 ≤ --of`,
   `--done ≤ --of`, and a malformed call exits 2 having written nothing.
+  Its fifth shape, **`… <N> handled --what TEXT [--note TEXT] [--link REF]…`** (control-tower phase
+  136), records what the session did INSTEAD of asking a person — a command it found it could run, a
+  wall it worked around within its rights — as one row of Your turn's *handled* log: one line to
+  `$PE_HANDLED_FILE`, else `handled-sessions.ndjson` under the console's instance state — the
+  sessions' own file, never the console's `handled.ndjson`, and every line of it reads as a session's
+  whatever it claims. Never an
+  outcome. `--link` (at most 8) is held to a commit (`commit:<sha>`, a GitHub commit URL), a pull
+  request (`pr:[owner/name]#<n>`, a GitHub pull URL), an issue (`issue:[owner/name]#<n>`, `#<n>`, a
+  GitHub issue URL) or a journal line (`journal:<slug>/<runId>#<line>`); any other link, or a value
+  shaped like a secret in any field, exits 2 having written nothing.
 - `scripts/decisions.sh <slug> [--phase N] answer <key> --value TEXT | waive <key> --reason TEXT |
   promote --from-ruling <id> --key <key> | list` — the deterministic writer for the decision
   manifest's mutable twin, `docs/handoffs/<slug>/decisions.md`, which `--decisions` merges OVER the

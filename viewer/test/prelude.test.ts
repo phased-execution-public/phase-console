@@ -21,9 +21,10 @@ import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { MANIFEST_BLOCKING } from '../shared/policy-model.js';
 import {
   PreludeRefusal, manifestRows, preludeFor, probeAccounts, probeCredentials, probeDelivery, probeMcp, probeTrees, resolvedManifest,
-  gitStrategyLines, probeGitStrategy, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps,
-  type AccountFacts, type PreludeDeps,
+  gitStrategyLines, probeGitStrategy, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps, doorOpens, doorSteps, itemOf,
+  type AccountFacts, type PreludeDeps, type PreludeStep,
 } from '../server/prelude.ts';
+import { HumanStepLedger, sanitiseStep } from '../server/human-steps.ts';
 import {
   credentialsHeld, forgetCredentialProbes, heldIdsCached, knownCredentialId, probeCredential,
 } from '../server/credentials-probe.ts';
@@ -620,4 +621,193 @@ test('the launch door: nothing declared skips; a probe that throws leaves the st
   // A console with no plan in front of it (the doctor) asks nothing at all.
   const doctor = await preludeFor('demo', {}, deps());
   assert.equal(doctor.probes['human-steps'].status, 'skip');
+});
+
+test('phase 132: every credential id the preflight probes is a credential: proof the watch clock reads — and only those', async () => {
+  const { parseWatchRef } = await import('../server/watch-refs.ts');
+  const { credentialProof } = await import('../server/turn/index.ts');
+  for (const id of ['gh', 'claude', 'claude-login', 'env:DEPLOY_KEY', 'keychain:svc', 'file:~/.netrc']) {
+    assert.equal(knownCredentialId(id), true, id);
+    assert.equal(parseWatchRef(credentialProof(id))?.kind, 'credential', `credential:${id} is a proof`);
+  }
+  for (const id of ['npm', 'aws-prod']) {
+    assert.equal(knownCredentialId(id), false);
+    assert.equal(parseWatchRef(credentialProof(id)), null, `${id} has no probe, so it is no proof`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The launch door opens a plan's `auto-open: host` step (control-tower phase 139)
+ *
+ * §Architecture 12's safety floor, promised since phase 41: a step the PLAN
+ * marked `auto-open: host` opens on the machine at the launch door — and only
+ * there, only behind a flag, only a link, only one the person was shown in full.
+ * `doorOpens` is that rule as a pure function; every clause below is one way for
+ * a step not to open.
+ * ------------------------------------------------------------------ */
+
+const LOGIN = 'https://vercel.com/login?next=/cli';
+const FLAGGED = { shown: [LOGIN], allowTerminal: true, allowAgent: false };
+
+/** One plan-declared step as the launch door lists it, marked to open on the host. */
+function doorStep(over: Partial<PreludeStep> = {}): PreludeStep {
+  return {
+    phase: 2, kind: 'browser-login', what: 'Sign in to Vercel', where: 'host', state: 'unchecked',
+    open: { url: LOGIN }, autoOpen: 'host', ...over,
+  };
+}
+
+test('doorOpens: a plan step that said auto-open: host opens for a link the form showed — owed or unchecked, in the plan\'s order', () => {
+  assert.deepEqual(
+    doorOpens([doorStep()], FLAGGED),
+    [{ phase: 2, kind: 'browser-login', what: 'Sign in to Vercel', url: LOGIN }],
+  );
+  assert.equal(doorOpens([doorStep({ state: 'needed' })], FLAGGED).length, 1, 'a proof that ran and does not hold is owed as much as none');
+  // Each listed step is judged on its own: the unmarked one in the middle opens nothing.
+  const approval = 'https://github.com/apps/acme/installations/new';
+  const opens = doorOpens(
+    [doorStep(), doorStep({ phase: 3, what: 'No auto-open word', autoOpen: undefined }), doorStep({ phase: 4, what: 'Approve the app', open: { url: approval } })],
+    { ...FLAGGED, shown: [LOGIN, approval] },
+  );
+  assert.deepEqual(opens.map((open) => [open.phase, open.url]), [[2, LOGIN], [4, approval]]);
+});
+
+test('doorOpens: nothing opens on a console that may not open anything on the machine — and either flag is enough', () => {
+  assert.deepEqual(doorOpens([doorStep()], { ...FLAGGED, allowTerminal: false, allowAgent: false }), []);
+  assert.equal(doorOpens([doorStep()], { ...FLAGGED, allowTerminal: false, allowAgent: true }).length, 1, '--allow-agent alone suffices');
+  assert.equal(doorOpens([doorStep()], { ...FLAGGED, allowTerminal: true, allowAgent: false }).length, 1, '--allow-terminal alone suffices');
+});
+
+test('doorOpens: only a link the form SHOWED opens, exactly as spelled — another spelling, a longer or shorter link, or nothing shown, opens nothing', () => {
+  for (const shown of [
+    [], // a door that showed nothing: converge, a webhook, bin/
+    [`${LOGIN}/`], [LOGIN.toUpperCase()], [` ${LOGIN}`], [`${LOGIN} `], // other spellings of it
+    ['https://vercel.com/login'], [`${LOGIN}&x=1`], // a prefix of it, and a longer one
+    ['https://example.com/'], // a different link altogether
+  ]) {
+    assert.deepEqual(doorOpens([doorStep()], { ...FLAGGED, shown }), [], JSON.stringify(shown));
+  }
+  assert.equal(doorOpens([doorStep()], { ...FLAGGED, shown: ['https://example.com/', LOGIN] }).length, 1, 'one among several shown');
+});
+
+test('doorOpens: never a command, and never a link that is not http(s) — whatever the form sent back', () => {
+  for (const link of ['file:///etc/hosts', 'ftp://files.example.com/x', 'javascript:alert(1)', 'vscode://file/etc/hosts', 'mailto:a@example.com', 'http://', 'https:///nohost']) {
+    // Hand-built — `doorSteps` itself would make each of these a command — so the rule
+    // is held on its own, not by the door that lists the steps.
+    assert.deepEqual(doorOpens([doorStep({ open: { url: link } })], { ...FLAGGED, shown: [link] }), [], link);
+  }
+  assert.deepEqual(
+    doorOpens([doorStep({ open: { command: 'vercel login' } })], { ...FLAGGED, shown: ['vercel login'] }), [],
+    'a command is the terminal\'s, run on a person\'s Enter',
+  );
+  assert.deepEqual(doorOpens([doorStep({ open: undefined })], FLAGGED), [], 'a step with nothing to open');
+});
+
+test('doorOpens: a pre-cleared step needs nobody, and a step with a due-when is not asked yet — neither opens', () => {
+  assert.deepEqual(doorOpens([doorStep({ state: 'pre-cleared' })], FLAGGED), []);
+  assert.deepEqual(doorOpens([doorStep({ due: 'date:2099-01-01T00:00:00Z' })], FLAGGED), []);
+  assert.deepEqual(doorOpens([doorStep({ due: 'phase:demo/2' })], FLAGGED), []);
+  assert.deepEqual(doorOpens([doorStep({ autoOpen: undefined })], FLAGGED), [], 'the plan did not say auto-open');
+});
+
+test('doorOpens over the real door: the plan bullet\'s own words, through doorSteps, open one link and nothing else', async () => {
+  const registrar = 'https://registrar.example/renew';
+  const listed = [
+    { phase: 2, step: { kind: 'browser-login', what: 'Sign in to Vercel', where: 'host', open: LOGIN, autoOpen: 'host' } },
+    { phase: 3, step: { kind: 'browser-login', what: 'Sign the gh CLI in', where: 'host', open: 'gh auth login --web', autoOpen: 'host' } },
+    { phase: 4, step: { kind: 'physical', what: 'Plug the test phone in', where: 'host' } },
+    { phase: 5, step: { kind: 'operator-act', what: 'Renew the domain', where: 'host', open: registrar, autoOpen: 'host', due: 'date:2099-01-01T00:00:00Z' } },
+    { phase: 6, step: { kind: 'browser-login', what: 'Read the docs', where: 'any', open: 'https://docs.example/' } },
+  ] as never[];
+  const steps = await doorSteps(listed, undefined);
+  const opens = doorOpens(steps, { shown: [LOGIN, registrar, 'https://docs.example/', 'gh auth login --web'], allowTerminal: true, allowAgent: false });
+  assert.deepEqual(opens.map((open) => open.phase), [2], 'a command, a bare step, a step not due and a link with no auto-open word stay shut');
+});
+
+test('a session\'s step never carries auto-open: the ledger drops the word from every birth but the plan', () => {
+  const offered = { kind: 'browser-login', title: 'Sign in to Vercel', open_url: LOGIN, auto_open: 'host' };
+  for (const birth of ['session', 'console', 'supervisor'] as const) {
+    const clean = sanitiseStep(offered, birth)!;
+    assert.equal(clean.step.autoOpen, undefined, birth);
+    assert.ok(clean.dropped.includes('auto-open'), `${birth}: offered, and not kept`);
+    assert.equal(clean.step.openUrl, LOGIN, 'the link itself is kept — only the self-opening is dropped');
+  }
+  const plan = sanitiseStep(offered, 'plan')!;
+  assert.equal(plan.step.autoOpen, 'host');
+  assert.deepEqual(plan.dropped, []);
+  // The other spelling is read the same way, and `host` is the only word there is.
+  assert.equal(sanitiseStep({ kind: 'browser-login', title: 'Sign in', autoOpen: 'host' }, 'session')!.step.autoOpen, undefined);
+  assert.equal(sanitiseStep({ ...offered, auto_open: 'anywhere' }, 'plan')!.step.autoOpen, undefined);
+});
+
+test('itemOf: the open step of THIS plan, born plan, with the same phase, kind and title — a session\'s or another plan\'s is not it', () => {
+  const held = (over: Record<string, unknown> = {}) => ({
+    id: 'hs-1', slug: 'demo', birth: 'plan', phase: 2, kind: 'browser-login', title: 'Sign in to Vercel', ...over,
+  });
+  assert.equal(itemOf(doorStep(), [held()], 'demo'), 'hs-1');
+  assert.equal(itemOf(doorStep({ what: '  Sign in to Vercel  ' }), [held()], 'demo'), 'hs-1', 'the title is trimmed, as the door asks it');
+  for (const [why, other] of [
+    ['a session declared the same words', held({ birth: 'session' })],
+    ['the console raised the same words', held({ birth: 'console' })],
+    ['the supervisor raised them', held({ birth: 'supervisor' })],
+    ['another plan asked the same', held({ slug: 'other' })],
+    ['another phase', held({ phase: 3 })],
+    ['another kind', held({ kind: 'device-code' })],
+    ['another title', held({ title: 'Sign in to Netlify' })],
+  ] as const) assert.equal(itemOf(doorStep(), [other], 'demo'), undefined, why);
+  assert.equal(itemOf(doorStep(), [held({ birth: 'session', id: 'hs-s' }), held({ id: 'hs-p' })], 'demo'), 'hs-p', 'the plan\'s own is found past a session\'s');
+  assert.equal(itemOf(doorStep(), [], 'demo'), undefined);
+});
+
+test('itemOf over a real ledger: the plan\'s step is found, a session\'s of the same words is not, and a settled one is no longer open', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-door-item-'));
+  try {
+    const ledger = new HumanStepLedger(join(dir, 'human-steps.ndjson'));
+    const declare = (birth: 'plan' | 'session', slug = 'demo') => ledger.declare({
+      slug, phase: 2, birth, clean: sanitiseStep({ kind: 'browser-login', title: 'Sign in to Vercel', open_url: LOGIN }, birth)!.step,
+    });
+    const bySession = declare('session');
+    assert.equal(itemOf(doorStep(), ledger.open(), 'demo'), undefined, 'a session\'s step of the same words is another ask');
+    const byPlan = declare('plan');
+    assert.notEqual(byPlan.id, bySession.id);
+    assert.equal(itemOf(doorStep(), ledger.open(), 'demo'), byPlan.id);
+    assert.equal(itemOf(doorStep(), ledger.open(), 'other'), undefined, 'another plan\'s launch does not borrow it');
+    ledger.move(byPlan.id, 'dismissed', { by: 'tester', verb: 'dismiss' });
+    assert.equal(itemOf(doorStep(), ledger.open(), 'demo'), undefined, 'a settled step no longer asks');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the prelude names, on each owed step, the item that already asks for it — none on a pre-cleared step, a session\'s step or an unreadable ledger', async () => {
+  const listed = [{ phase: 2, step: STEP_BROWSER }, { phase: 3, step: STEP_APPROVAL }, { phase: 3, step: STEP_BARE }] as never[];
+  const probeStep = async (ref: string) => (ref.includes('vercel')
+    ? { landed: true, read: 'landed — exit 0' } : { landed: false, read: 'pending — exit 1' });
+  const held = [
+    // An earlier launch asked the pre-cleared step; nobody will ask it now, so no item is named for it.
+    { id: 'hs-browser', slug: 'demo', birth: 'plan', phase: 2, kind: 'browser-login', title: STEP_BROWSER.what },
+    { id: 'hs-approval', slug: 'demo', birth: 'plan', phase: 3, kind: 'third-party-approval', title: STEP_APPROVAL.what },
+    // A session declared the bare step's words: its own ask, not the plan's.
+    { id: 'hs-session', slug: 'demo', birth: 'session', phase: 3, kind: 'physical', title: STEP_BARE.what },
+  ];
+  const prelude = await preludeFor('demo', {}, deps({ humanSteps: async () => listed, probeStep, openSteps: () => held }));
+  const [browser, approval, bare] = prelude.humanSteps;
+  assert.equal(browser!.state, 'pre-cleared');
+  assert.equal(browser!.item, undefined);
+  assert.equal(approval!.item, 'hs-approval');
+  assert.equal(bare!.item, undefined);
+  // It rides the stored manifest's probe like every other field, and the ask itself is unchanged.
+  assert.equal(prelude.probes['human-steps'].ok, true);
+  assert.deepEqual(prelude.blocking, []);
+
+  // No ledger handed over (the doctor, a caller with none): nothing is named.
+  const bare2 = await preludeFor('demo', {}, deps({ humanSteps: async () => listed, probeStep }));
+  assert.deepEqual(bare2.humanSteps.map((step) => step.item), [undefined, undefined, undefined]);
+  // A ledger that throws is the same silence — the steps are still listed, the probe still ok.
+  const thrown = await preludeFor('demo', {}, deps({
+    humanSteps: async () => listed, probeStep, openSteps: () => { throw new Error('the ledger is unreadable'); },
+  }));
+  assert.equal(thrown.humanSteps.length, 3);
+  assert.deepEqual(thrown.humanSteps.map((step) => step.item), [undefined, undefined, undefined]);
+  assert.equal(thrown.probes['human-steps'].status, 'ok');
 });

@@ -126,9 +126,30 @@ the push service relays a notification about your plans without being able to re
 
 ## Answer it without opening anything
 
-Some notifications carry buttons — **Allow** and **Deny** on a permission card, **Approve** on a gate
-a person may clear. Pressing one answers it and shows a receipt; nothing opens. Android and desktop
-render them, iOS shows the notification without them, and tapping it lands on `#/approve`.
+Some notifications carry buttons. Pressing one answers it and shows a receipt; nothing opens. Android
+and desktop render them, and iOS shows the notification without them. Tapping a push about an item, or
+its **Open** button, opens the item on **Your turn**, at `#/turn/<id>`.
+
+A turn's buttons depend on what it asks, and a button is offered only if a paired device may press it:
+
+| It asks for | Its buttons |
+|---|---|
+| An act: a sign-in, a code, a token, somebody else's approval | **Open** · **I did it** |
+| A permission of low or medium risk | **Allow** · **Deny** |
+| A permission of high risk, or one the console never grants | **Open** · **Deny** |
+| A decision between options | **Open** |
+
+**I did it** runs the item's proof on the console: a proof that holds resumes the phase, and one that
+does not is said, and the item waits. **Allow** grants the permission at the narrowest scope the item
+offers; **Deny** tells the session to find another way. A permission card from the approval hook also
+carries **Allow** and **Deny**, and a gate a person may clear carries **Approve**.
+
+A lock-screen **Allow** is a paired device's press, which the console calls the `device` door, and it
+never grants a high-risk ask. A high-risk grant needs the rule typed back on the page and, on a console
+with an owner key, a touch of the key, so there the first button is **Open**. The console judges a grant
+three times — when it signs the button, when you press it, and in the grant engine — so a high grant
+forced through anyway is refused and the item opens instead. The Permissions guide covers grants and
+owner keys.
 
 A button may **answer** a question and may never **start or kill work**: Recover, Nudge, Freeze and
 Stop are deliberately not offered from a notification, because a mis-tap on a lock screen should not
@@ -136,17 +157,29 @@ be able to set a session running. The payload carries no address either — only
 one item and the verbs offered for it, good for twelve hours and spendable once. Anything expired,
 already answered, or since cleared opens the console instead.
 
-## `#/approve` — the phone queue
+## `#/turn` — Your turn on a phone
 
-One page, one column, nothing but what needs you and can be answered from here. Bookmark it; every
-push links to it.
+`#/turn` is the phone's queue now: **Your turn**, one page for every act only you can do. It replaced
+`#/approve`, and that address, with or without `?step=<id>`, still lands on the page in one hop, so an
+old bookmark or an old notification keeps working. A push about an item opens that item, at
+`#/turn/<id>`, already open. Bookmark `#/turn`.
 
-An item appears only when this console can act on it — a remedy behind a capability this console was
-not started with is counted at the foot rather than drawn as a dead button, and *Session waiting on
-you* never appears at all, because that session is stopped at its own terminal prompt and nothing
-here can answer for it.
+On a phone the items stack in one column, and the search, **Filters**, **Export** and **Print** share one
+line, with the five filters folded behind **Filters**, so the items rather than the controls are the
+first screen. Everything on an item works from the phone: its guide, a device code, a link, the check
+and **Snooze**. A command is shown with its copy buttons, and the page never runs it. Only an item
+marked *At the machine* needs you at the computer.
 
-Where your words can go somewhere — evidence on a gate, a reason on a permission card — the card has
+A permission of low or medium risk is granted with one press on its card, from the phone as from the
+lock screen. A high-risk grant is typed back on the page, and on a console with an owner key it also needs
+a touch of the key within the last five minutes. A press that a paired phone may not make is not lost:
+on a console with an owner key it waits as a request for the owner to confirm, and the card says it is
+asked of the owner, never done.
+
+An item of the kind **Do something by hand** that carries a link shows it whole, to copy or to type on
+the device in your hand.
+
+Where your words can go somewhere — evidence on an item, a reason on a permission card — the card has
 a field for them, with a **microphone** beside it on browsers that have one. Dictation fills the
 field; it never presses the button.
 

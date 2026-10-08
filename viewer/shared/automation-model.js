@@ -105,6 +105,13 @@ export const AUTOMATION_MAP = Object.freeze({
   // calls in a row before a lane reads as `looping`. Noticing only — no rung.
   stallLoopRun: ['stall', 'loopRun'],
 
+  // The check (control-tower phase 134, #211): whether a judgement proof gets
+  // a checking session, what it runs as, and when rejections escalate.
+  checkJudgement: ['check', 'judgement'],
+  checkModel: ['check', 'model'],
+  checkEffort: ['check', 'effort'],
+  turnEscalateAfter: ['check', 'escalateAfter'],
+
   // The five whose combinations used to fail silently, plus the worktree three.
   gitMode: ['git', 'mode'],
   isolation: ['git', 'isolation'],

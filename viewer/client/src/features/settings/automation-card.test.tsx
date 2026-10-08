@@ -76,11 +76,13 @@ describe('the automation defaults card', () => {
     // message each other unless a plan or an operator says otherwise — a Pro
     // row, so the free client suite (which `verify-free` runs on the stripped
     // tree) counts it only where it renders: `5 + PRO_ON`, never a bare 6.
+    // The seventh On is `checkJudgement` (control-tower phase 134): a proof only
+    // words can state is read by a checking session unless an operator says not.
     const PRO_ON = [
     ].length;
     const off = await screen.findAllByRole('button', { name: 'Off' });
     expect(off.length).toBe(5);
-    expect(screen.getAllByRole('button', { name: 'On' }).length).toBe(5 + PRO_ON);
+    expect(screen.getAllByRole('button', { name: 'On' }).length).toBe(6 + PRO_ON);
     // …and the card's OWN toggles are named, so the next addition says which.
     const toggles = Object.fromEntries(
       [...document.querySelectorAll('button[data-pref]')].map((el) => [
@@ -94,6 +96,7 @@ describe('the automation defaults card', () => {
       autoContinueRecovery: 'On',
       watchCmdRefs: 'On',
       watchMintedCmdRefs: 'Off',
+      checkJudgement: 'On',
       deleteMergedRunBranches: 'On',
       // The sixth row is the worktree root, added with the project-local lane
       // folder: a config from before the key reads as the project.

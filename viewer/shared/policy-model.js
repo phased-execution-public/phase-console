@@ -569,12 +569,30 @@ export function sanitisePolicyPrefs(value) {
  * the option words it names (`gh pr merge --squash --delete-branch` → verb
  * `gh pr merge`, options `--squash --delete-branch`) — a call is the named
  * command when it starts with the verb and carries every named option.
- * `phases` is null for every phase.
+ * `phases` is null for every phase; `sets` are the NAMED phase sets the clause
+ * wrote beside (or instead of) numbers — `the release phases` — which only a
+ * caller that knows the plan can resolve (`exceptionPhases`, `ctx.releasePhases`).
  * @typedef {object} DestructiveException
  * @property {string} rule
  * @property {string[]} verb
  * @property {string[]} options
  * @property {number[] | null} phases
+ * @property {string[]} sets
+ */
+
+/**
+ * The phases a clause is qualified for, as written: the numbers, and the named
+ * sets. `phases: null` with no set is every phase.
+ * @typedef {object} PhaseScope
+ * @property {number[] | null} phases
+ * @property {string[]} sets
+ */
+
+/**
+ * The phases named per clause — numbers and sets both; `null` is every phase.
+ * @typedef {object} ExceptionContext
+ * @property {number | null} [phase]
+ * @property {readonly number[] | null} [releasePhases]  the plan's release phases (`releasePhasesOf`), when the caller knows them
  */
 
 /**
@@ -594,10 +612,17 @@ export function sanitisePolicyPrefs(value) {
  *
  * A list opened that way CONTINUES across `;` into each following clause that
  * begins with a phase qualifier — `Phase 1 —`, `Phases 4/17/22 —`,
- * `Phases 4, 17 and 22:`, `every phase —` — and has no negation in it; a `.`
- * or a clause without one ends it. A clause's phases are its leading
- * qualifier, else one written in it ("in phases 4 and 17", "— phase 74 ONLY"),
- * else every phase. So ai-builder-v7's row — "deny, with these allow rows:
+ * `Phases 4, 17 and 22:`, `every phase —`, `the release phases —` — and has no
+ * negation in it; a `.` or a clause without one ends it. A clause's phases are
+ * its leading qualifier, else EVERY list written in it ("in phases 4 and 17",
+ * "— phase 74 ONLY", "in the release phases and in Phases 13, 15 and 21" — the
+ * union, not the first), else every phase. `the release phases` is a NAMED SET:
+ * the entry records it in `sets`, and `exceptionPhases` resolves it from the
+ * plan (`ctx.releasePhases`) — unresolved, it names nothing, so an unreadable
+ * qualifier narrows a grant and never widens one (issues-sweep-hub-tb-hz
+ * Phase 30, 2026-10-06: "in the release phases and in Phases 13, 15, 16, 21,
+ * 33, 40 and 41" read as the seven numbers alone, and every release phase's
+ * `gh pr create` went to a person's card). So ai-builder-v7's row — "deny, with these allow rows:
  * Phase 1 — `gh label create`, `gh issue create`; Phases 4/17/22 — `gh pr
  * create`, `gh pr merge --squash --delete-branch`, …; every phase — `git
  * push` of `pe/ai-builder-v7` …" — names `gh pr create` for phases 4, 17 and
@@ -637,10 +662,10 @@ export function destructiveCommandExceptions(value) {
       // The clause's own leading qualifier, else one leading the list after
       // the opener ("allow rows: Phase 1 — …"), else one written in it.
       const qualifier = continuing ? lead : leadingPhases(region);
-      const phases = qualifier ? qualifier.phases : writtenPhases(region);
+      const scope = qualifier ? qualifier.scope : (writtenPhases(region) ?? EVERY_PHASE);
       const body = continuing || !qualifier ? region : region.slice(qualifier.length);
       for (const [, raw] of body.matchAll(/`([^`]+)`/g)) {
-        const entry = exceptionOf(raw.trim(), phases, Boolean(classic));
+        const entry = exceptionOf(raw.trim(), scope, Boolean(classic));
         if (entry) out.push(entry);
       }
     }
@@ -652,10 +677,11 @@ export function destructiveCommandExceptions(value) {
 /**
  * The rules a `permission.destructive` value names as exceptions, as rule
  * strings — `destructiveCommandExceptions`, narrowed to the phase when one is
- * given (`ctx.phase`). Without a phase, every named rule, whatever its phases
+ * given (`ctx.phase`, resolved with `ctx.releasePhases` — see
+ * `exceptionPhases`). Without a phase, every named rule, whatever its phases
  * (the shape TRS-4's readers and the docs example were written against).
  * @param {string | null | undefined} value
- * @param {{ phase?: number | null }} [ctx]
+ * @param {ExceptionContext} [ctx]
  * @returns {string[]}
  */
 export function destructiveExceptions(value, ctx = {}) {
@@ -663,10 +689,98 @@ export function destructiveExceptions(value, ctx = {}) {
   return [
     ...new Set(
       destructiveCommandExceptions(value)
-        .filter((entry) => phase === null || entry.phases === null || entry.phases.includes(phase))
+        .filter((entry) => phase === null || exceptionHolds(entry, phase, ctx))
         .map((entry) => entry.rule),
     ),
   ];
+}
+
+/** Every phase: the scope of a clause that qualifies nothing. */
+const EVERY_PHASE = Object.freeze({ phases: null, sets: Object.freeze([]) });
+
+/**
+ * The named phase sets a row may write, each by the words that name it. One
+ * today: a plan's RELEASE phases, the ones whose title opens with `Release`
+ * (`releasePhasesOf`) — "allow `gh pr create` in the release phases".
+ */
+export const PHASE_SET_WORDS = Object.freeze({ release: String.raw`release[\s-]+phases?` });
+
+/** The alternation of every set's words, for the qualifier readers. */
+const SET_WORDS = Object.values(PHASE_SET_WORDS).join('|');
+
+/** The set a matched phrase names. */
+function setOf(phrase) {
+  for (const [set, words] of Object.entries(PHASE_SET_WORDS)) {
+    if (new RegExp(`^${words}$`, 'i').test(phrase)) return set;
+  }
+  return null;
+}
+
+/** The phases the caller resolved a named set to — none when it did not. */
+function resolvedSet(set, ctx) {
+  if (set === 'release' && Array.isArray(ctx.releasePhases)) return ctx.releasePhases;
+  return [];
+}
+
+/**
+ * The phases an exception holds for, resolved: the numbers it writes joined
+ * with each named set the caller resolved (`ctx.releasePhases`); `null` is
+ * every phase. A set the caller cannot resolve contributes nothing — an
+ * unreadable qualifier narrows, it never widens.
+ * @param {Pick<DestructiveException, 'phases' | 'sets'>} entry
+ * @param {ExceptionContext} [ctx]
+ * @returns {number[] | null}
+ */
+export function exceptionPhases(entry, ctx = {}) {
+  if (entry.phases === null) return null;
+  const out = new Set(entry.phases);
+  for (const set of entry.sets ?? []) for (const n of resolvedSet(set, ctx)) out.add(n);
+  return [...out].sort((a, b) => a - b);
+}
+
+/**
+ * Does an exception hold for this phase under this context?
+ * @param {Pick<DestructiveException, 'phases' | 'sets'>} entry
+ * @param {number} phase
+ * @param {ExceptionContext} [ctx]
+ */
+export function exceptionHolds(entry, phase, ctx = {}) {
+  const phases = exceptionPhases(entry, ctx);
+  return phases === null || phases.includes(phase);
+}
+
+/**
+ * The named sets a row writes that this context resolves to NO phase — a row
+ * saying `the release phases` in a plan with no phase titled `Release …`, or
+ * read by a caller that does not know the plan. What a lint names, so the
+ * ambiguity is the author's to fix before a session meets it as a card.
+ * @param {string | null | undefined} value
+ * @param {ExceptionContext} [ctx]
+ * @returns {string[]}
+ */
+export function unresolvedPhaseSets(value, ctx = {}) {
+  const used = new Set(destructiveCommandExceptions(value).flatMap((entry) => entry.sets));
+  return [...used].filter((set) => resolvedSet(set, ctx).length === 0);
+}
+
+/** A title that opens with the word `Release` — `Release B1 — aws → hetzner (box #1)`, `Release A *(GATED)*: …`. */
+export const RELEASE_TITLE = /^[\s*_`"'([]*release\b/i;
+
+/**
+ * The plan's release phases: the rows of its phase graph whose title opens
+ * with `Release`. The one definition of the set `the release phases` names
+ * in a `permission.destructive` row; the service reads it from the plan in its
+ * store and hands it to the readers as `ctx.releasePhases`.
+ * @param {readonly { phase: number; title?: string }[]} rows
+ * @returns {number[]}
+ */
+export function releasePhasesOf(rows) {
+  return rows
+    .filter(
+      (row) => typeof row?.title === 'string' && RELEASE_TITLE.test(row.title) && Number.isInteger(row.phase),
+    )
+    .map((row) => row.phase)
+    .sort((a, b) => a - b);
 }
 
 /** A negation that turns a continued clause into a refusal: "Phase 3 — never `gh pr merge`". */
@@ -691,30 +805,55 @@ function phaseNumbers(list) {
 
 /**
  * A clause's LEADING phase qualifier — `Phase 1 —`, `Phases 4/17/22 —`,
- * `every phase —` — and how many characters it takes, or null.
+ * `every phase —`, `the release phases —` — as a scope, and how many
+ * characters it takes, or null.
  * @param {string} text
- * @returns {{ phases: number[] | null; length: number } | null}
+ * @returns {{ scope: PhaseScope; length: number } | null}
  */
 function leadingPhases(text) {
   const every = /^\s*(?:(?:in|for)\s+)?(?:every|each|all)\s+phases?\b\s*[—–:-]\s*/i.exec(text);
-  if (every) return { phases: null, length: every[0].length };
+  if (every) return { scope: EVERY_PHASE, length: every[0].length };
+  const set = new RegExp(
+    String.raw`^\s*(?:(?:in|for)\s+)?(?:the\s+|every\s+|each\s+|all\s+)?(${SET_WORDS})\s*(?:only\b)?\s*[—–:-]\s*`,
+    'i',
+  ).exec(text);
+  if (set) {
+    const name = setOf(set[1]);
+    if (name) return { scope: { phases: [], sets: [name] }, length: set[0].length };
+  }
   const named = new RegExp(
     String.raw`^\s*(?:(?:in|for)\s+)?phases?\s+(${PHASE_LIST})\s*(?:only\b)?\s*[—–:]\s*`,
     'i',
   ).exec(text);
   if (!named) return null;
   const phases = phaseNumbers(named[1]);
-  return phases.length ? { phases, length: named[0].length } : null;
+  return phases.length ? { scope: { phases, sets: [] }, length: named[0].length } : null;
 }
 
-/** Phases written INSIDE a clause — "in phases 4 and 17", "— phase 74 ONLY" — or null for every phase. */
+/**
+ * Phases written INSIDE a clause — "in phases 4 and 17", "— phase 74 ONLY",
+ * "in the release phases" — every list and every named set in it, as one
+ * scope; or null when it writes none (every phase).
+ * @param {string} text
+ * @returns {PhaseScope | null}
+ */
 function writtenPhases(text) {
-  const found = new RegExp(String.raw`(?:\b(?:in|for|during)\s+|[—–]\s*)phases?\s+(${PHASE_LIST})`, 'i').exec(
-    text,
+  /** @type {number[]} */
+  const phases = [];
+  const lists = new RegExp(String.raw`(?:\b(?:in|for|during)\s+|[—–]\s*)phases?\s+(${PHASE_LIST})`, 'gi');
+  for (const found of text.matchAll(lists)) phases.push(...phaseNumbers(found[1]));
+  /** @type {string[]} */
+  const sets = [];
+  const named = new RegExp(
+    String.raw`(?:\b(?:in|for|during)\s+|[—–]\s*)(?:the\s+|every\s+|each\s+|all\s+|a\s+)?(${SET_WORDS})\b`,
+    'gi',
   );
-  if (!found) return null;
-  const phases = phaseNumbers(found[1]);
-  return phases.length ? phases : null;
+  for (const found of text.matchAll(named)) {
+    const set = setOf(found[1]);
+    if (set && !sets.includes(set)) sets.push(set);
+  }
+  if (!phases.length && !sets.length) return null;
+  return { phases: [...new Set(phases)], sets };
 }
 
 /**
@@ -722,11 +861,11 @@ function writtenPhases(text) {
  * reading for a list the word `allow` opened: any token, `git push` included,
  * as the rule it spells.
  * @param {string} token
- * @param {number[] | null} phases
+ * @param {PhaseScope} scope
  * @param {boolean} classic
  * @returns {DestructiveException | null}
  */
-function exceptionOf(token, phases, classic) {
+function exceptionOf(token, scope, classic) {
   if (!token) return null;
   const whole = /^([A-Za-z][\w-]*)\((.*)\)$/.exec(token);
   const command = whole ? (whole[1] === 'Bash' ? whole[2].replace(/:\*$/, '').trim() : '') : token;
@@ -746,7 +885,8 @@ function exceptionOf(token, phases, classic) {
     rule,
     verb: whole && whole[1] !== 'Bash' ? [] : verb,
     options: whole && whole[1] !== 'Bash' ? [] : options,
-    phases,
+    phases: scope.phases === null ? null : [...scope.phases],
+    sets: [...scope.sets],
   };
 }
 
@@ -817,10 +957,10 @@ const BRANCH_NAME = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/;
  *
  * With `ctx.phase`, a clause qualified for OTHER phases — `Phases 4/17 — push
  * to `release/x`` — names nothing for this one (control-tower phase 107, #205:
- * a phase-qualified list is read per phase); an unqualified clause is every
- * phase's.
+ * a phase-qualified list is read per phase, a named set through
+ * `ctx.releasePhases`); an unqualified clause is every phase's.
  * @param {string | null | undefined} value
- * @param {{ runBranch?: string | null; phase?: number | null }} [ctx]
+ * @param {ExceptionContext & { runBranch?: string | null }} [ctx]
  * @returns {string[]}
  */
 export function destructivePushBranches(value, ctx = {}) {
@@ -831,8 +971,8 @@ export function destructivePushBranches(value, ctx = {}) {
   for (const clause of clausesOf(value)) {
     const plain = clause.replace(/\*\*/g, '');
     if (phase !== null) {
-      const phases = leadingPhases(plain)?.phases ?? writtenPhases(plain);
-      if (phases && !phases.includes(phase)) continue;
+      const scope = leadingPhases(plain)?.scope ?? writtenPhases(plain);
+      if (scope && !exceptionHolds(scope, phase, ctx)) continue;
     }
     const phrase = /\bpush(?:es)?`?\s+(?:to|of)\s+/gi;
     for (let hit = phrase.exec(plain); hit; hit = phrase.exec(plain)) {

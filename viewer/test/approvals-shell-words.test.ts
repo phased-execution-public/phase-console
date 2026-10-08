@@ -266,3 +266,38 @@ test('AJ-8 (#189): a GLUED here-doc owner (no space before `<<`) never lets a pu
     assert.equal(classifyTool('Bash', { command }, carved, 'trusted'), 'deny', `a glued here-doc push is walled: ${command}`);
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * AJ-4 (control-tower phase 135, #212, exit criterion 7) — the three shapes
+ * the owner-desk audit found denied by `Bash(shutdown:*)` (pe-hub's journal,
+ * phases 46, 48 and 96: none ran a shutdown). Under phase 107's shell-word
+ * reader none matches a deny rule — a matcher question, never a grant — and a
+ * real shutdown still does.
+ * ------------------------------------------------------------------ */
+
+const { matchedDenyRule } = await import('../server/runner/approvals.ts');
+
+const SHUTDOWN_SHAPES = [
+  // A `phase-tasks.sh` reset whose task subjects name the word.
+  'S=/home/me/work/pe-hub/console/scripts/phase-tasks.sh; export DOCS_ROOT=/home/me/work/pe-hub\n'
+    + 'bash $S control-tower 46 reset\n'
+    + 'bash $S control-tower 46 create --subject "p46.task1 — survey: caps, the eight booking sites, closed(), the wrap-up steer, resumePolicy"\n'
+    + 'bash $S control-tower 46 create --subject "p46.task5 — the shutdown path: a drain that sees verification"',
+  // An `ls | grep` over test files whose pattern names it.
+  'cd /tmp/integration/phased-execution && ls viewer/test | grep -E "^(docs-parity|invariants|instances|lifecycle|self-restart-e2e|sessions|'
+    + 'access|static|http-access-log|zero-touch-e2e|fleet-census|dist-dir|terminal|inbox|debug-bundle|debug-index|reliability|log-rotation|'
+    + 'log-level|free-tree|shutdown|fleet-scopes)\\.test\\.ts$" | tr \'\\n\' \' \'',
+  // A `grep` whose pattern names the word.
+  "grep -rn -B3 '\\.\\.\\.actor\\b' . | grep -v node_modules | grep -E \"reason|'(run|phase|policy|shutdown|restart)\\.[a-z-]+'\" | cut -c1-200 | head -40",
+];
+
+test('AJ-4: the three audit shapes that matched `Bash(shutdown:*)` match no deny rule — a real shutdown still does', () => {
+  for (const command of SHUTDOWN_SHAPES) {
+    assert.notEqual(classifyTool('Bash', { command }, WALL, 'trusted'), 'deny', `not a shutdown: ${command.slice(0, 80)}`);
+    assert.equal(matchedDenyRule('Bash', { command }, WALL), null, `no rule names it: ${command.slice(0, 80)}`);
+  }
+  for (const command of ['shutdown -h now', 'sudo shutdown -r +5', 'cd /tmp && shutdown now']) {
+    assert.equal(classifyTool('Bash', { command }, WALL, 'trusted'), 'deny', command);
+  }
+  assert.equal(matchedDenyRule('Bash', { command: 'shutdown -h now' }, WALL), 'Bash(shutdown:*)');
+});

@@ -44,7 +44,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
 import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS } from '@shared/run-settings.js';
 import { shows } from './modes';
-import type { RunSetupField } from './schema';
+import { CONTEXT_FIELDS as SCHEMA_CONTEXT_FIELDS, type RunSetupField } from './schema';
 
 const { state, skills, runStart, runSettings, savePrefs, runPrelude } = vi.hoisted(() => ({
   state: vi.fn(),
@@ -143,7 +143,8 @@ const OWNED_BY: Record<string, string> = {
 };
 
 /** Context, not a value: supplied by the caller, never typed by an operator. */
-const CONTEXT_FIELDS = new Set(['resumeRunId']);
+// The schema's own list — facts about the launch no control carries (`resumeRunId`, `autoOpen`).
+const CONTEXT_FIELDS = new Set<string>(SCHEMA_CONTEXT_FIELDS);
 
 const CANONICAL = [...new Set<string>([...RUN_START_FIELDS, ...RUN_SETTINGS_FIELDS])];
 

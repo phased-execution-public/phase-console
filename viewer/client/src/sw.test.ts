@@ -212,11 +212,17 @@ describe('a human step’s push', () => {
       { action: STEP_OPEN_ACTION, title: 'Open' },
       { action: 'check', title: 'I did it' },
     ]);
+    // The step's named list rides too (control-tower phase 138): the press,
+    // hours later, finds the buttons the notification drew.
     expect((options.data as { step: unknown }).step).toEqual({
       id: 'human-step-1',
       kind: 'device-code',
       where: 'any',
       code: 'ABCD-1234',
+      actions: [
+        { action: 'open', title: 'Open' },
+        { action: 'check', title: 'I did it' },
+      ],
     });
   });
 
@@ -233,12 +239,13 @@ describe('a human step’s push', () => {
   test('a tap lands on the step’s card — under the console’s own mount, never another origin', () => {
     const origin = 'http://127.0.0.1:4123';
     const data = notificationOptions(STEP_PUSH as never).data as { url: string; step: { id: string } };
-    expect(stepTarget(data, origin)).toBe(`${origin}/#/approve?step=human-step-1`);
+    // Your turn, the item itself (control-tower phase 137) — `#/turn/<id>`.
+    expect(stepTarget(data, origin)).toBe(`${origin}/#/turn/human-step-1`);
     expect(stepTarget({ ...data, url: '/c/abc-hub/#/plan/alpha/run' }, origin)).toBe(
-      `${origin}/c/abc-hub/#/approve?step=human-step-1`,
+      `${origin}/c/abc-hub/#/turn/human-step-1`,
     );
     expect(stepTarget({ ...data, url: 'https://evil.test/#/x' }, origin)).toBe(
-      `${origin}/#/approve?step=human-step-1`,
+      `${origin}/#/turn/human-step-1`,
     );
   });
 
@@ -249,5 +256,83 @@ describe('a human step’s push', () => {
     // Only what the server signed; no Open it could not honour.
     expect((options as { actions?: unknown }).actions).toEqual([{ action: 'check', title: 'I did it' }]);
     expect(stepOf(odd as never)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The lock screen, held to the `device` door (control-tower phase 138, #215)
+ * — the real `notificationclick` listener, driven with a pressed button
+ * ------------------------------------------------------------------ */
+
+describe('a permission item’s push, pressed on the lock screen', () => {
+  const ALLOW = { action: 'grant', title: 'Allow' };
+  const DENY = { action: 'deny', title: 'Deny' };
+  const OPEN = { action: 'open', title: 'Open' };
+
+  /** A permission item's push as the server sends it: the named list, the signed buttons, the token. */
+  const itemPush = (named: object[], signed: object[]) => ({
+    title: 'Your turn: permission — alpha phase 3',
+    body: 'Bash(npm test:*) — the session needs it to run the suite.',
+    url: '/#/turn/step-p1',
+    category: 'needs-you',
+    actions: signed,
+    callback: 'tok.sig',
+    step: { id: 'step-p1', kind: 'permission', where: 'any', actions: named },
+  });
+
+  /** Press `action` on the notification `payload` produced, and wait for the worker to finish. */
+  async function press(action: string, payload: object, answer = 200) {
+    const scope = globalThis.self as unknown as {
+      clients: { openWindow: ReturnType<typeof vi.fn>; matchAll: ReturnType<typeof vi.fn> };
+      registration: { showNotification: ReturnType<typeof vi.fn> };
+    };
+    scope.clients.openWindow.mockClear();
+    scope.registration.showNotification.mockClear();
+    const fetch = vi.fn(async () => new Response('{}', { status: answer }));
+    vi.stubGlobal('fetch', fetch);
+    let done: Promise<unknown> = Promise.resolve();
+    listeners.get('notificationclick')!({
+      action,
+      notification: { close: vi.fn(), data: notificationOptions(payload as never).data },
+      waitUntil: (promise: Promise<unknown>) => {
+        done = promise;
+      },
+    });
+    await done;
+    vi.unstubAllGlobals();
+    return { fetch, openWindow: scope.clients.openWindow, shown: scope.registration.showNotification };
+  }
+
+  test('Allow posts the signed grant through the one route, and says what it did — nothing opens', async () => {
+    const { fetch, openWindow, shown } = await press('grant', itemPush([ALLOW, DENY], [ALLOW, DENY]));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('/api/push/action');
+    expect(JSON.parse(String(init.body))).toEqual({ token: 'tok.sig', action: 'grant', by: 'notification' });
+    expect(shown).toHaveBeenCalledWith(
+      'Phase Console',
+      expect.objectContaining({ body: ANSWER_RECEIPTS.grant }),
+    );
+    expect(openWindow).not.toHaveBeenCalled();
+  });
+
+  test('a high-risk item’s Open opens the item page and posts nothing', async () => {
+    const { fetch, openWindow } = await press('open', itemPush([OPEN, DENY], [DENY]));
+    expect(fetch).not.toHaveBeenCalled();
+    expect(openWindow).toHaveBeenCalledWith(`${ORIGIN}/#/turn/step-p1`);
+  });
+
+  test('a grant the console refuses — the door read again at the press — opens the item instead', async () => {
+    const { fetch, openWindow, shown } = await press('grant', itemPush([ALLOW, DENY], [ALLOW, DENY]), 403);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(shown).not.toHaveBeenCalled();
+    expect(openWindow).toHaveBeenCalledWith(`${ORIGIN}/#/turn/step-p1`);
+  });
+
+  test('a button the server did not sign is never posted', async () => {
+    // Named Allow, signed only Deny: pressing a grant the token never carried is no press.
+    const { fetch, openWindow } = await press('grant', itemPush([ALLOW, DENY], [DENY]));
+    expect(fetch).not.toHaveBeenCalled();
+    expect(openWindow).toHaveBeenCalledWith(`${ORIGIN}/#/turn/step-p1`);
   });
 });

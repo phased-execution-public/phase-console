@@ -232,6 +232,12 @@ count('engine_calls_total', ['phase-graph.sh', 'hit']);
 count('http_requests_total', ['2xx']);
 count('shell_commands_total', ['gh', 'true']);
 count('retention_removed_total', ['git-trace']);
+// Your turn's four (control-tower phases 134 and 136): a verdict, what its
+// checking session cost, a round that changed the turn, a thing the AI handled.
+count('turn_checks_total', ['checker', 'passed']);
+count('turn_check_usd_total', ['haiku'], 0.05);
+count('turn_rounds_total', ['clock']);
+count('turn_handled_total', ['guard']);
 
 test('a _total is a counter and a counter is a _total — the suffix is not decoration', () => {
   const parsed = parse(renderMetrics(FACTS));

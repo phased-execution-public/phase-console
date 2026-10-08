@@ -26,6 +26,7 @@
 import { marked } from 'marked';
 import { memo, useEffect, useMemo, useRef } from 'react';
 import { cn } from '@/lib/cn';
+import { copy } from '@/components/ui/toast';
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -62,8 +63,18 @@ export function sweep(root: ParentNode): void {
   }
 }
 
-/** Parse markdown to an inert, swept DocumentFragment. */
-export function toFragment(markdown: string, inline = false): DocumentFragment {
+/** Which way a text reads — the content's own, never the page's guess (control-tower phase 137). */
+export type TextDirection = 'ltr' | 'rtl';
+
+/**
+ * Parse markdown to an inert, swept DocumentFragment.
+ *
+ * After the sweep — so nothing in the content can supply one of its own —
+ * every `code` and `pre` reads left-to-right whatever surrounds it (a command
+ * is a command in any language), each fenced block gets its copy button, and
+ * a right-to-left text has its left-to-right runs isolated (`isolateRuns`).
+ */
+export function toFragment(markdown: string, inline = false, dir?: TextDirection): DocumentFragment {
   const template = document.createElement('template');
   const source = String(markdown);
   // `async: false` is what narrows marked's return type to a string; the option
@@ -72,8 +83,115 @@ export function toFragment(markdown: string, inline = false): DocumentFragment {
     ? marked.parseInline(source, { async: false })
     : marked.parse(source, { async: false });
   sweep(template.content);
+  for (const code of template.content.querySelectorAll('code, pre')) code.setAttribute('dir', 'ltr');
   if (!inline) wrapTables(template.content);
+  if (!inline) addCopyButtons(template.content);
+  if (dir === 'rtl') isolateRuns(template.content);
   return template.content;
+}
+
+/** The attribute this module's own copy buttons carry — the click is read off it. */
+const COPY_MARK = 'data-md-copy';
+
+/**
+ * A copy button on every fenced block (control-tower phase 137, #214): a guide
+ * a person follows is mostly commands, and selecting a block by hand on a
+ * phone is the step that goes wrong. Built HERE, after `sweep` — a `<button>`
+ * in the content is still removed — and pressed through one listener on the
+ * block (`useCopyButtons`), which copies the block's own text and never runs it.
+ */
+function addCopyButtons(root: DocumentFragment): void {
+  for (const pre of Array.from(root.querySelectorAll('pre'))) {
+    if (pre.parentElement?.classList.contains('md-code')) continue;
+    const wrap = document.createElement('div');
+    wrap.className = 'md-code';
+    pre.replaceWith(wrap);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'md-copy';
+    button.setAttribute(COPY_MARK, '');
+    button.textContent = 'Copy';
+    wrap.append(pre, button);
+  }
+}
+
+/**
+ * A run of left-to-right characters — printable ASCII words and the spaces
+ * BETWEEN them, as ONE run: isolated word by word, a right-to-left paragraph
+ * would lay "gh auth status" out as "status auth gh".
+ */
+const LTR_RUN = /[\x21-\x7e]+(?:[ \t]+[\x21-\x7e]+)*/g;
+
+/**
+ * Isolate every left-to-right run of a right-to-left text in a `<bdi
+ * dir="ltr">` — a ref (`github.com/login/device`), a number, a flag — so the
+ * bidi algorithm cannot reorder its neutral characters against the words
+ * around it. A command is already isolated (`code`, `pre`), and so is a link.
+ */
+function isolateRuns(root: DocumentFragment | Element): void {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const texts: Text[] = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if ((node.parentElement as Element | null)?.closest('code, pre, bdi, a')) continue;
+    texts.push(node as Text);
+  }
+  for (const text of texts) {
+    const value = text.data;
+    LTR_RUN.lastIndex = 0;
+    if (!LTR_RUN.test(value)) continue;
+    LTR_RUN.lastIndex = 0;
+    const parts: Node[] = [];
+    let at = 0;
+    for (let match = LTR_RUN.exec(value); match; match = LTR_RUN.exec(value)) {
+      // Punctuation alone (a sentence's full stop) is the paragraph's own: the
+      // bidi algorithm already puts it where a right-to-left reader expects it.
+      if (!/[A-Za-z0-9]/.test(match[0])) continue;
+      if (match.index > at) parts.push(document.createTextNode(value.slice(at, match.index)));
+      const bdi = document.createElement('bdi');
+      bdi.setAttribute('dir', 'ltr');
+      bdi.textContent = match[0];
+      parts.push(bdi);
+      at = match.index + match[0].length;
+    }
+    if (at < value.length) parts.push(document.createTextNode(value.slice(at)));
+    text.replaceWith(...parts);
+  }
+}
+
+/** What a block's copy button copies: the block's text, without the newline marked closes it with. */
+function blockText(button: Element): string {
+  return (button.parentElement?.querySelector('pre')?.textContent ?? '').replace(/\s+$/, '');
+}
+
+/**
+ * The one listener a block's copy buttons are pressed through. A listener on
+ * the block rather than a React handler, because the buttons are not React's:
+ * `replaceChildren` puts them there.
+ */
+function useCopyButtons(ref: React.RefObject<HTMLElement | null>, mounted: boolean): void {
+  useEffect(() => {
+    const node = ref.current;
+    if (!mounted || !node) return;
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const onClick = (event: MouseEvent) => {
+      const button = (event.target as Element | null)?.closest?.(`button[${COPY_MARK}]`);
+      if (!button || !node.contains(button)) return;
+      void copy(blockText(button), 'Copied').then((ok) => {
+        if (!ok) return;
+        button.textContent = 'Copied';
+        const timer = setTimeout(() => {
+          button.textContent = 'Copy';
+          timers.delete(timer);
+        }, 1400);
+        timers.add(timer);
+      });
+    };
+    node.addEventListener('click', onClick);
+    return () => {
+      node.removeEventListener('click', onClick);
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, [ref, mounted]);
 }
 
 /**
@@ -170,15 +288,18 @@ const inlineCache = new Map<string, DocumentFragment>();
  * render of the same text. `useRendered` already clones for its own reasons
  * (see below) and that clone is now load-bearing for this too.
  */
-function inlineFragment(text: string): DocumentFragment {
-  const hit = inlineCache.get(text);
+function inlineFragment(text: string, dir?: TextDirection): DocumentFragment {
+  // The direction is part of the key: a right-to-left text is drawn with its
+  // runs isolated, and the same words left-to-right are not.
+  const key = dir === 'rtl' ? `rtl\u0000${text}` : text;
+  const hit = inlineCache.get(key);
   if (hit) {
-    inlineCache.delete(text);
-    inlineCache.set(text, hit);
+    inlineCache.delete(key);
+    inlineCache.set(key, hit);
     return hit;
   }
-  const fragment = toFragment(text, true);
-  inlineCache.set(text, fragment);
+  const fragment = toFragment(text, true, dir);
+  inlineCache.set(key, fragment);
   if (inlineCache.size > INLINE_CACHE_MAX) {
     const oldest = inlineCache.keys().next();
     if (!oldest.done) inlineCache.delete(oldest.value);
@@ -191,11 +312,11 @@ export function inlineCacheSize(): number {
   return inlineCache.size;
 }
 
-function useRendered(text: string | undefined, inline: boolean) {
+function useRendered(text: string | undefined, inline: boolean, dir?: TextDirection) {
   const ref = useRef<HTMLElement>(null);
   const fragment = useMemo(
-    () => (text ? (inline ? inlineFragment(text) : toFragment(text, false)) : null),
-    [text, inline],
+    () => (text ? (inline ? inlineFragment(text, dir) : toFragment(text, false, dir)) : null),
+    [text, inline, dir],
   );
 
   useEffect(() => {
@@ -220,13 +341,24 @@ function useRendered(text: string | undefined, inline: boolean) {
 export interface MarkdownProps {
   text?: string;
   className?: string;
+  /**
+   * The CONTENT's language and the direction it reads in (control-tower phase
+   * 137) — a guide carries both, the grammar having taken the direction from
+   * the language (`shared/guide-grammar.js` `guideDirection`). Absent, the text
+   * reads in the page's; the chrome stays English either way.
+   */
+  lang?: string;
+  dir?: TextDirection;
 }
 
-/** Block markdown — headings, lists, tables, fenced code. */
-export function Markdown({ text, className }: MarkdownProps) {
-  const ref = useRendered(text, false);
+/** Block markdown — headings, lists, tables, fenced code, each block with its copy button. */
+export function Markdown({ text, className, lang, dir }: MarkdownProps) {
+  const ref = useRendered(text, false, dir);
+  useCopyButtons(ref, Boolean(text));
   if (!text) return null;
-  return <div className={cn('md', className)} ref={ref as React.RefObject<HTMLDivElement>} />;
+  return (
+    <div className={cn('md', className)} lang={lang} dir={dir} ref={ref as React.RefObject<HTMLDivElement>} />
+  );
 }
 
 /**
@@ -238,10 +370,17 @@ export function Markdown({ text, className }: MarkdownProps) {
  * title did not change do nothing at all — the cache above makes the parse
  * cheap, this makes it unnecessary.
  */
-export const MarkdownInline = memo(function MarkdownInline({ text, className }: MarkdownProps) {
-  const ref = useRendered(text, true);
+export const MarkdownInline = memo(function MarkdownInline({ text, className, lang, dir }: MarkdownProps) {
+  const ref = useRendered(text, true, dir);
   if (!text) return null;
-  return <span className={cn('md-inline', className)} ref={ref as React.RefObject<HTMLSpanElement>} />;
+  return (
+    <span
+      className={cn('md-inline', className)}
+      lang={lang}
+      dir={dir}
+      ref={ref as React.RefObject<HTMLSpanElement>}
+    />
+  );
 });
 
 /**

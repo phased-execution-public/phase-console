@@ -126,6 +126,21 @@ test('the heads 6.0 retired still resolve, and an address that names nothing lan
   assert.ok(DESTINATIONS.includes(DEFAULT_HEAD), `DEFAULT_HEAD '${DEFAULT_HEAD}' must be a destination`);
 });
 
+test('Your turn is a head, the old answer page still resolves, and the destinations are unchanged', () => {
+  // Control-tower phase 137 (#214, §Architecture 19): the page is a HEAD that
+  // lights Runs, never an eighth destination — "does anything need me?" already
+  // has a home, and the phone's four tab slots are spoken for. `#/approve` is
+  // where every step push landed for a month and every link in the wild still
+  // says it, so it stays a head (a redirect onto `#/turn`).
+  assert.ok(isRouteHead('turn'), "'turn' must be a route head");
+  assert.ok(isRouteHead('approve'), "'approve' is in pushes already on phones and must keep resolving");
+  assert.ok(!DESTINATIONS.includes('turn'), 'Your turn lights Runs; it is not a destination of its own');
+  assert.ok(!DESTINATIONS.includes('approve'), "'approve' was never a destination");
+  const free = ['runs', 'plans', 'sessions', 'repo', 'insights', 'debug', 'settings'];
+  assert.deepEqual(DESTINATIONS.filter((head) => free.includes(head)), free, 'the seven, in their order');
+  assert.deepEqual(DESTINATIONS.filter((head) => !free.includes(head)).sort(), DESTINATIONS.length > 7 ? ['chat', 'fleet'] : []);
+});
+
 test('toHash accepts every form this system produces for the same route', () => {
   // `plans` from code, `/plans` typed by hand, `#/plans` from the router, and
   // the `/#/plans` a server-built notification URL carries (it must be a URL

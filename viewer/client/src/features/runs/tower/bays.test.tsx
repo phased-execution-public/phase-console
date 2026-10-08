@@ -6,7 +6,8 @@
  *    a sibling run's BRANCH (phase 40, #41) — and the scope FENCE, with the
  *    fencing phase and its refs, and the folded errand's `alsoPhases` (phase
  *    6's fold, #19 — exit criterion 7).
- *  - Needs you carries the inbox rows no strip draws.
+ *  - Needs you is runs: the asks no strip draws are items of Your turn, and
+ *    the bay links there with the page's counts (control-tower phase 139).
  *  - Settled is quiet: folded until asked, and `?bay=` opens the bay it names.
  */
 
@@ -219,10 +220,11 @@ describe('the bays', () => {
     );
   });
 
-  it('carries the inbox rows no strip draws in Needs you, and not the one its run’s strip draws', () => {
+  it('draws no loose row in Needs you — the gate no strip draws is an item of the page it links to', () => {
     mount();
     const needs = within(bay('Needs you'));
-    expect(needs.getByText('A gate on gamma P3 wants a person')).toBeTruthy();
+    expect(needs.queryByText('A gate on gamma P3 wants a person')).toBeNull();
+    expect(needs.queryByTestId('bay-inbox')).toBeNull();
     expect(needs.queryByText('sign in')).toBeNull();
   });
 
@@ -264,7 +266,7 @@ describe('an empty Needs-you bay says when the loop next looks', () => {
         <TowerBays model={model} allowRun={false} converge={converge({ automatic: false })} />
       </QueryClientProvider>,
     );
-    expect(within(bay('Needs you')).getByText(/Nothing is waiting on you\. .*manual/)).toBeTruthy();
+    expect(within(bay('Needs you')).getByText(/No run is waiting on you\. .*manual/)).toBeTruthy();
     rerender(
       <QueryClientProvider client={client}>
         <TowerBays model={model} allowRun={false} converge={converge({ automatic: false })} filtered />

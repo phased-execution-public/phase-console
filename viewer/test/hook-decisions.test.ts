@@ -882,3 +882,56 @@ test('a run whose relay is NOT armed still answers a question by policy — the 
     service.close();
   }
 });
+
+test('every refusal the hook makes is a wall recorded on the lane that met it — a deny rule, and a guard (control-tower phase 135)', async () => {
+  const { Runner } = await import('../server/runner/runner.ts');
+  const service = new Service(flags as never);
+  const state = { id: 'r1', slug: 'demo', phases: { '2': { phase: 2, status: 'running' } } } as {
+    id: string; slug: string; phases: Record<string, { walls?: { wall: string; rule?: string; command?: string }[] }>;
+  };
+  const lane = {
+    state, record: () => 1, now: () => new Date('2026-10-07T10:00:00.000Z'), persist: () => {},
+    noteWall: Runner.prototype.noteWall,
+  };
+  (service as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+    busy: () => true,
+    current: () => ({ id: 'r1', slug: 'demo', activePhase: 2, permissionProfile: 'trusted' }),
+    note: (event: string, data: Record<string, unknown>, phase?: number) => Runner.prototype.note.call(lane as never, event, data, phase),
+    park: () => {},
+    isSpending: () => false,
+  });
+  try {
+    assert.equal(decision(await service.decideToolUse(bash('git push origin main'), 'r1')).permissionDecision, 'deny');
+    assert.equal(decision(await service.decideToolUse(bash('shutdown -h now'), 'r1')).permissionDecision, 'deny');
+    assert.equal(decision(await service.decideToolUse({
+      tool_name: 'Write', tool_input: { file_path: 'docs/handoffs/demo/gate-status.md', content: '| 3 | approved |' },
+    }, 'r1')).permissionDecision, 'deny');
+    assert.equal(decision(await service.decideToolUse(bash('ls viewer/test | grep -E "shutdown"'), 'r1')).permissionDecision, 'allow',
+      'a word in a pattern is no wall');
+    const walls = state.phases['2']!.walls ?? [];
+    assert.deepEqual(walls.map((w) => [w.wall, w.rule]), [
+      ['deny', 'Bash(git push:*)'], ['deny', 'Bash(shutdown:*)'], ['guard', 'gate-forge'],
+    ]);
+    assert.equal(walls[0]!.command, 'git push origin main');
+  } finally {
+    service.approvals.disarm();
+    service.close();
+  }
+});
+
+test('a live grant is read BEFORE the deny reply — the granted call answered in the grant\'s words, and the wall back once it ends (control-tower phase 149)', async () => {
+  const { service } = laned('trusted', { phases: { '2': { phase: 2, status: 'running', sessionId: 'sess-2' } } });
+  const applied = service.grantsNow().apply({
+    scope: 'phase', wall: 'deny', tool: 'Bash', rule: 'Bash(terraform apply:*)', slug: 'demo', phase: 2, runId: 'r1',
+    by: 'me', door: 'local', typed: 'Bash(terraform apply:*)',
+  });
+  assert.ok(applied.ok, JSON.stringify(applied));
+  const granted = decision(await service.decideToolUse({ ...bash('terraform apply -auto-approve'), session_id: 'sess-2' }, 'r1'));
+  assert.equal(granted.permissionDecision, 'allow');
+  assert.match(granted.permissionDecisionReason, /granted by me for this phase until the phase settles/);
+  service.grantsNow().end(applied.row.id, 'revoked', 'me');
+  const after = decision(await service.decideToolUse({ ...bash('terraform apply -auto-approve'), session_id: 'sess-2' }, 'r1'));
+  assert.equal(after.permissionDecision, 'deny', 'revoked, the wall stands again');
+  assert.match(after.permissionDecisionReason, /rule: Bash\(terraform apply:\*\)/);
+});
+

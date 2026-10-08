@@ -29,6 +29,7 @@ import {
   notifyCommand,
   rememberRoot,
   loadPrefs,
+  migrateReminderQuiet,
   savePrefs,
   serverIsStale,
   staticRoot,
@@ -146,14 +147,25 @@ import {
   tagFor,
   type CategoryId,
 } from './push/index.ts';
-import { SpentTokens, mintActionToken, notificationButtons } from './push/actions.ts';
+import { SpentTokens, lockScreenOf, mintActionToken, notificationButtons } from './push/actions.ts';
 import { humanStepPush, humanStepReminderPush, type HumanStepPush } from './push/catalogue.ts';
 import {
-  HUMAN_STEP_CLOCK_MS, HUMAN_STEPS_FILE, HumanStepLedger, declareHumanStep, type DeclareInput, type HumanStep,
+  HUMAN_STEP_CLOCK_MS, HUMAN_STEPS_FILE, HumanStepLedger, type DeclareInput, type HumanStep, type TurnRefused,
 } from './human-steps.ts';
+import { raiseTurn as raiseAtTheDoor } from './turn/index.ts';
+import { HANDLED_FILE, HandledLedger, handledOfJournal, type HandledInput, type HandledRow, type JournalLineSeen } from './turn/handled.ts';
+import { TurnRound, type RoundState } from './turn/round.ts';
+import { count } from './counters.ts';
+import { ruleFamilyOf, wallTurnInput, type RecordedWall, type TodayGrant } from './permissions/walls.ts';
+import { Grants, GRANTS_FILE, type GrantRow } from './permissions/grants.ts';
+import { ownerDoorMode } from './owner/door.ts';
+import { guardStep, type CommandJudge } from './turn/guard.ts';
+import { parseGuide } from '../shared/guide-grammar.js';
 import { KIND_META } from '../shared/human-step-model.js';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
-import { composeDigest, DIGEST_EVERY_MS, UNDELIVERED_KEEP, type DigestDetection, type DigestUndelivered } from './push/digest.ts';
+import {
+  composeDigest, DIGEST_EVERY_MS, UNDELIVERED_KEEP, type DigestDetection, type DigestTurn, type DigestUndelivered,
+} from './push/digest.ts';
 import { repoInfo, lastCommit, commitsTouching, type GitRepoInfo, type GitFileInfo } from './git.ts';
 import { findMemory, memoryIndexLines } from './memory.ts';
 import {
@@ -264,7 +276,7 @@ import {
 } from './runner/ladder.ts';
 import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
 import { policyPrefsOf } from './runner/policy.ts';
-import { credentialsHeld } from './credentials-probe.ts';
+import { credentialsHeld, probeCredential, type CredentialVerdict } from './credentials-probe.ts';
 import { asActor, describeActor, doorActor, viaOfTrigger, type StartActor } from './actor.ts';
 import { ceilingSentence, DEFAULT_STARTS_PER_HOUR, DEFAULT_USD_PER_HOUR, probeCeiling, StartCeiling, type CeilingRefusal, type CeilingVerdict } from './start-ceiling.ts';
 import type { WaitBudget } from './runner/wait-budget.ts';
@@ -308,7 +320,7 @@ import { spentBudgetPark } from './runner/runner-loop.ts';
 import { LADDER_SEEN_TTL_MS } from './runner/runner-core.ts';
 import { accessLedger } from './api/access.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
-import { Journal } from './runner/journal.ts';
+import { Journal, onJournalAppend } from './runner/journal.ts';
 import { CLOCK_MODEL, COST_MODEL, remeasureFromLedger, repriceFromLedger, type CapTable } from './runner/session-record.ts';
 import { journalFile } from './runner/run-paths.ts';
 import { sizingCensus, type CensusLine, type CensusRun, type SizingCensus } from './analysis/sizing-model.ts';
@@ -729,6 +741,14 @@ function machineProfileHooks(): { url: string; name?: string; categories?: strin
   } catch {
     return [];
   }
+}
+
+/** The words a source brings for its item's first push (control-tower phase 132) — an errand's, a relayed question's. */
+export type TurnMessage = { title: string; body: string; detail?: string };
+
+/** The ONE tag an item's pushes ride — its first push and every reminder — so a device holds one notification per item. */
+export function turnTagOf(step: Pick<HumanStep, 'id' | 'slug' | 'phase'>): string {
+  return tagFor('needs-you', step.slug, String(step.phase), `human-step-${step.id}`);
 }
 
 export abstract class ServiceBase {
@@ -1442,9 +1462,13 @@ export abstract class ServiceBase {
   protected digestTimer: NodeJS.Timeout | null = null;
   /** Notifications that reached no device since the channel last answered (#140, #108): the newest kept, all counted. */
   protected undelivered: { kept: DigestUndelivered[]; lost: number } = { kept: [], lost: 0 };
+  /** When the last digest went out — what its "handled since the last digest" counts from (control-tower phase 138). */
+  protected lastDigestAt: number | null = null;
   protected retentionTimer: NodeJS.Timeout | null = null;
   /** The human-step ledger (control-tower phase 41), made on first use — `humanStepsNow`. */
   protected humanStepLedger: HumanStepLedger | null = null;
+  /** The grant engine and its ledger (control-tower phase 149), made on first use — `grantsNow()`. */
+  protected grantLedger: Grants | null = null;
   /** The reminder clock's timer (control-tower phase 43) — `startHumanStepClock`. */
   protected humanStepTimer: NodeJS.Timeout | null = null;
 
@@ -1526,6 +1550,10 @@ export abstract class ServiceBase {
       });
     });
     this.push = new Push(flags.remoteUsers);
+    // ONE quiet-hours setting (control-tower phase 138, #215): a config that
+    // still holds the reminders' own window has it moved onto the devices
+    // before anything reads either.
+    this.adoptReminderQuiet(this.prefs);
     // `link` is a closure rather than a string because `flags.port` moves after
     // construction — `resolvePort` may pick a different one, and a payload that
     // baked in the requested port would send the operator to a console that is
@@ -1779,6 +1807,11 @@ export abstract class ServiceBase {
       },
       announce: (category, message, context) => this.announce(category, message, context),
       tagFor: (...parts) => tagFor(...parts),
+      // An unanswerable question is a `decision` item of Your turn (phase 132).
+      raiseTurn: (input, message) => {
+        const raised = this.raiseTurn(input, { message });
+        return Boolean(raised && !('refused' in raised));
+      },
       appendRuling: (slug, ruling) => {
         if (!this.root?.ok) return;
         appendRuling(rulingsFile(this.root.path, slug), {
@@ -1968,6 +2001,9 @@ export abstract class ServiceBase {
       // #125): a ref the policy would refuse is refused while the session can
       // still fix it, however `watchCmdRefs` is set.
       judgeCommand: (command) => judgeCommand(command),
+      // `credential:<id>` — a credential read by presence, never its value
+      // (control-tower phase 132): the proof a `secret-entry` item is given.
+      credentialProbe: (id) => this.credentialProbe(id),
       // `phase:<slug>/<N>` for a plan the pass did not load (#129): that plan's
       // latest run record, then its board when no run holds the phase.
       phaseDone: (slug, phase) => this.phaseDoneAnswer(slug, phase),
@@ -2992,18 +3028,33 @@ export abstract class ServiceBase {
    */
   protected startDigestClock(): void {
     if (this.digestTimer) clearInterval(this.digestTimer);
-    this.digestTimer = setInterval(() => { this.digestTick(); }, DIGEST_EVERY_MS);
+    this.digestTimer = setInterval(() => {
+      void this.digestTick().catch((error: unknown) => log.warn('digest.tick-failed', { error: (error as Error)?.message ?? String(error) }));
+    }, DIGEST_EVERY_MS);
     this.digestTimer.unref?.();
   }
 
   /**
-   * Compose and announce the digest, when its category is on (#140): every
-   * decision waiting with its deadline, every parked run, every detection, and
-   * what the channel failed to deliver. Nothing to say says nothing. Through
-   * `announce`, so the push, the notification inbox and the webhooks all have
-   * it and every gate the other categories obey holds.
+   * Compose and announce the digest, when its category is on (#140): Your turn
+   * first (control-tower phase 138, #215 — how many items need the person, how
+   * many a check sent back, how many things the AI handled since the last
+   * digest), then every decision waiting with its deadline, every parked run,
+   * every detection, and what the channel failed to deliver. Nothing to say
+   * says nothing. Through `announce`, so the push, the notification inbox and
+   * the webhooks all have it and every gate the other categories obey holds.
    */
-  digestTick(now = Date.now()): NotificationRecord | null {
+  async digestTick(now = Date.now()): Promise<NotificationRecord | null> {
+    if (!this.prefs.notify.digest) return null;
+    const since = this.lastDigestAt;
+    let turn: DigestTurn | null = null;
+    try {
+      const counted = await this.digestTurn(new Date(since ?? now - DIGEST_EVERY_MS).toISOString());
+      turn = counted ? { ...counted, handledSince: since === null ? 'hour' : 'digest' } : null;
+    } catch (error) {
+      // An unreadable turn is a digest without its first line, never no digest.
+      log.warn('digest.tick-failed', { part: 'turn', error: (error as Error)?.message ?? String(error) });
+    }
+    // Read after the turn's await: the category may have been switched off meanwhile.
     if (!this.prefs.notify.digest) return null;
     const digest = composeDigest({
       now,
@@ -3016,10 +3067,51 @@ export abstract class ServiceBase {
       detections: this.digestDetections(),
       undelivered: this.undelivered.kept,
       undeliveredTotal: this.undelivered.lost,
+      turn,
     });
     if (!digest) return null;
     this.undelivered = { kept: [], lost: 0 };
-    return this.announce('digest', { title: digest.title, body: digest.body.slice(0, 1_500), tag: tagFor('digest', String(now)) });
+    const record = this.announce('digest', { title: digest.title, body: digest.body.slice(0, 1_500), tag: tagFor('digest', String(now)) });
+    if (record) this.lastDigestAt = now;
+    return record;
+  }
+
+  /**
+   * ONE quiet-hours setting (control-tower phase 138, #215): the reminders'
+   * own window (`reminderQuiet`, phase 43) — from a config written before the
+   * change, or a page that still sends it — moves onto every push device that
+   * has no window of its own (`migrateReminderQuiet`, `config.ts`); a device
+   * with its own keeps it, and the key is never stored again. Idempotent: a
+   * preference without the key moves nothing. Logged once per move as
+   * `push.quiet-migrated`. Never throws — a window that could not move must not
+   * cost a boot or a save.
+   */
+  protected adoptReminderQuiet(source: object): void {
+    try {
+      // `Prefs` no longer declares the key: it is read here, from what disk or a page holds, and nowhere else.
+      const plan = migrateReminderQuiet(source as { reminderQuiet?: unknown }, this.push.list());
+      if (!plan) return;
+      for (const id of plan.devices) this.push.setQuiet(id, plan.quiet);
+      if (source === this.prefs) {
+        this.prefs = plan.prefs as Prefs;
+        savePrefs(this.prefs);
+      }
+      log.info('push.quiet-migrated', {
+        from: 'reminderQuiet', quiet: plan.quiet ?? 'malformed — dropped', devices: plan.devices.length, kept: plan.kept.length,
+      });
+    } catch (error) {
+      log.warn('push.quiet-migrated', { from: 'reminderQuiet', error: (error as Error)?.message ?? String(error) });
+    }
+  }
+
+  /**
+   * Your turn, counted for the digest (control-tower phase 138, #215): the open
+   * items that need the person, the ones a check sent back, and what the AI
+   * handled since `since`. `Service` reads it from the page's own answer
+   * (`turnAnswer`); null here, where there is no page to read.
+   */
+  protected async digestTurn(_since: string): Promise<Omit<DigestTurn, 'handledSince'> | null> {
+    return null;
   }
 
   /**
@@ -3423,7 +3515,61 @@ export abstract class ServiceBase {
     // Every write is news to an open page (control-tower phase 42): the step,
     // as it now reads, rides the `human-step` event — a patch, never a refetch.
     return (this.humanStepLedger ??= new HumanStepLedger(join(INSTANCE_STATE_DIR, HUMAN_STEPS_FILE), undefined,
-      (step) => this.emit('human-step', { step })));
+      (step) => { this.emit('human-step', { step }); this.stepChanged(step); }));
+  }
+
+  /** Told of every step the ledger writes, after the page is — the recovery half stops a check whose item settled (phase 134). */
+  protected stepChanged(_step: HumanStep): void { /* nothing here */ }
+
+  /**
+   * The grant engine (control-tower phase 149, #212) — the ONE writer of a
+   * rule on a person's behalf, and of `<instance state>/grants.ndjson`. What a
+   * grant does once applied or ended (the journal, the push, the run's
+   * settings, the items it covers) is the recovery half's (`grantApplied`,
+   * `grantEnded`).
+   */
+  grantsNow(): Grants {
+    return (this.grantLedger ??= new Grants({
+      file: join(INSTANCE_STATE_DIR, GRANTS_FILE),
+      // The engine reads the owner key itself: a caller's silence never skips the owner door.
+      enrolled: () => ownerDoorMode() === 'enrolled',
+      onApplied: (row) => this.grantApplied(row),
+      onEnded: (row) => this.grantEnded(row),
+    }));
+  }
+
+
+  /** A grant was applied — the recovery half journals it, announces it and acts on what it covers. */
+  protected grantApplied(_row: GrantRow): void { /* nothing here */ }
+
+  /** A grant ended — the recovery half journals it and raises the settings it lowered. */
+  protected grantEnded(_row: GrantRow): void { /* nothing here */ }
+
+  /** The console's clock for grants: what ran out, or whose phase settled, expires (phase 149) — how many ended. */
+  protected sweepGrants(): number { return 0; /* the recovery half reads the runs */ }
+
+  /**
+   * The widen card's Allow (phase 9) is a grant since phase 149: the rule
+   * struck from this plan's file BY THE ENGINE, with its row — never a policy
+   * edit of its own. The card's answer brings the door it came through and
+   * whether that door proved a fresh owner touch, and the engine judges the
+   * strike by them: on a console with an owner key it is the owner's. True when
+   * granted; else the engine's refusal — a never rule is never struck, whatever
+   * a card says.
+   */
+  protected widenGrant(
+    slug: string, rule: string, by: string,
+    at: { runId?: string | null; phase?: number | null; card?: string | null; door?: string | null; fresh?: boolean } = {},
+  ): true | string {
+    const tool = parseRule(rule)?.tool ?? 'Bash';
+    const applied = this.grantsNow().apply({
+      scope: 'plan', wall: 'deny', tool, rule, family: ruleFamilyOf({ tool, rule }),
+      slug, phase: at.phase ?? null, runId: at.runId ?? null, card: at.card ?? null, via: 'card', by, door: at.door ?? null,
+      ...(typeof at.fresh === 'boolean' ? { fresh: at.fresh } : {}),
+      reason: 'the widen card was allowed',
+    });
+    if (!applied.ok) log.warn('runner.widen-rule.failed', { slug, rule, error: applied.error });
+    return applied.ok ? true : applied.error;
   }
 
   /**
@@ -3434,8 +3580,27 @@ export abstract class ServiceBase {
    * turn that could not be written must not cost the park it rides.
    */
   recordHumanStep(input: DeclareInput): HumanStep | null {
+    const raised = this.raiseTurn(input);
+    return raised && !('refused' in raised) ? raised : null;
+  }
+
+  /**
+   * The one door into Your turn (control-tower phase 130, §Architecture 19):
+   * the guard at ingest — a session's declaration held to G1, G2 and G4 against
+   * its own run's policy — then the ledger, ONE item per wall (G7), one push.
+   * A refusal raises nothing and says why; the caller parks the phase on it.
+   */
+  raiseTurn(input: DeclareInput, opts: { message?: TurnMessage } = {}): HumanStep | TurnRefused | null {
     try {
-      return declareHumanStep({ ledger: this.humanStepsNow(), announce: (step) => this.announceHumanStep(step) }, input);
+      const judge = input.judge !== undefined ? input.judge
+        : input.birth === 'session' ? this.commandJudgeFor(input.runId ?? null) : null;
+      // The one door (`turn/index.ts`, control-tower phase 132): ONE item per
+      // source, and the item's ONE push — in the source's own words when it
+      // brings them (an errand, a relayed question), under the item's tag.
+      return raiseAtTheDoor(
+        { ledger: this.humanStepsNow(), announce: (step) => this.announceHumanStep(step, 0, opts.message) },
+        { ...input, judge },
+      );
     } catch (error) {
       log.warn('human-steps.ledger-unwritable', { slug: input.slug, phase: input.phase, error: (error as Error)?.message ?? String(error) });
       return null;
@@ -3443,23 +3608,89 @@ export abstract class ServiceBase {
   }
 
   /**
+   * The permission item a recorded wall is (control-tower phase 135, #212),
+   * raised through the one door — the widen rung's ask, a refused push, a
+   * declaration citing the wall. An item of the same wall still open for the
+   * lane whose Grant presses ANOTHER card is withdrawn first: it would press a
+   * card nobody holds any more. Answers the item's id, or null.
+   */
+  raisePermissionItem(input: {
+    slug: string; runId: string; phase: number; sessionId?: string;
+    wall: RecordedWall; need?: string | null; grant?: TodayGrant | null;
+  }): string | null {
+    try {
+      const at = { slug: input.slug, runId: input.runId, phase: input.phase, ...(input.sessionId ? { sessionId: input.sessionId } : {}) };
+      // A console with no owner key says so on a high item (phase 149).
+      const raise = wallTurnInput(at, input.wall, {
+        need: input.need ?? null, grant: input.grant ?? null, keyless: ownerDoorMode() === 'unenrolled',
+      });
+      const card = input.grant && 'approvalId' in input.grant ? input.grant.approvalId : null;
+      const ref = (raise.step as { source?: { ref?: string } }).source?.ref;
+      // An open item of this wall whose Grant presses a card nobody holds any
+      // more — a new card is raised, or its own has been answered or expired —
+      // is superseded rather than answered again with a dead button.
+      const pending = new Set(this.approvals.pending().map((approval) => approval.id));
+      const ledger = this.humanStepsNow();
+      for (const open of ledger.open()) {
+        const held = open.permission?.grant && 'approvalId' in open.permission.grant ? open.permission.grant.approvalId : null;
+        if (held && open.birth === 'console' && open.slug === input.slug && open.phase === input.phase
+          && (open.runId ?? '') === input.runId && open.source?.kind === 'wall' && open.source.ref === ref
+          && (card ? held !== card : !pending.has(held))) {
+          ledger.move(open.id, 'dismissed', { by: 'console', verb: 'dismiss', note: 'superseded — the card its Grant pressed is gone' });
+        }
+      }
+      const raised = this.raiseTurn(raise);
+      return raised && !('refused' in raised) ? raised.id : null;
+    } catch (error) {
+      log.warn('human-steps.ledger-unwritable', { slug: input.slug, phase: input.phase, error: (error as Error)?.message ?? String(error) });
+      return null;
+    }
+  }
+
+  /**
+   * The declaring run's own permission policy as a command judge — what G4
+   * asks "could the AI have run this itself?". Null when the run is unknown:
+   * the guard never refuses on a guess.
+   */
+  protected abstract commandJudgeFor(runId: string | null): CommandJudge | null;
+
+  /**
+   * One credential, read by presence — `credentials-probe.ts`, uncached, so a
+   * secret stored a moment ago is seen at the next check. Never the value.
+   */
+  protected credentialProbe(id: string): Promise<CredentialVerdict> {
+    return probeCredential(id);
+  }
+
+  /**
    * The one push a human step gets — true when it was announced — and, from
    * control-tower phase 43, each REMINDER (`n` > 0), under the same tag so a
-   * device holds one notification per step. *I did it* is a signed button
-   * (`answer`), bound to the step's inbox row.
+   * device holds one notification per step. Since phase 138 (#215) it opens
+   * the item (`#/turn/<id>`), and its lock screen is what the `device` door
+   * may press (`lockScreenOf`): an act's *Open* and *I did it*, a permission
+   * item's *Allow* (its narrowest grant, where a device may make it) or *Open*,
+   * and *Deny*; a decision's *Open*. Each signed verb is bound to the item's
+   * inbox row (`answer`). A reminder is announced NOT urgent: it is a repeat,
+   * never news, so it never breaks through a device's quiet hours.
    */
-  protected announceHumanStep(step: HumanStep, n = 0): boolean {
-    const facts = { ...step, label: KIND_META[step.kind].label };
+  protected announceHumanStep(step: HumanStep, n = 0, message?: TurnMessage): boolean {
+    const screen = lockScreenOf(step);
+    const facts = { ...step, label: KIND_META[step.kind].label, actions: screen.buttons };
     const push = n > 0 ? humanStepReminderPush(facts, n) : humanStepPush(facts);
+    // A source that brings its own words (control-tower phase 132) says them
+    // once, at the first push; every reminder is the item's.
+    const words = n === 0 && message ? { ...message, detail: message.detail ?? push.message.detail } : push.message;
     const record = this.announce('needs-you', {
-      ...push.message, tag: tagFor('needs-you', step.slug, String(step.phase), `human-step-${step.id}`),
+      ...words, tag: turnTagOf(step),
     }, {
-      slug: step.slug, phase: step.phase, ...(step.runId ? { runId: step.runId } : {}), step: push.step,
-      answer: {
-        item: inboxItemId({ kind: 'human-step', slug: step.slug, phase: step.phase, runId: step.runId, subject: step.id }),
-        verbs: ['check'],
-      },
-    });
+      slug: step.slug, phase: step.phase, ...(step.runId ? { runId: step.runId } : {}), step: push.step, stepId: step.id,
+      ...(screen.verbs.length ? {
+        answer: {
+          item: inboxItemId({ kind: 'human-step', slug: step.slug, phase: step.phase, runId: step.runId, subject: step.id }),
+          verbs: screen.verbs,
+        },
+      } : {}),
+    }, n > 0 ? { urgent: false } : {});
     return record !== null;
   }
 
@@ -3472,23 +3703,77 @@ export abstract class ServiceBase {
   /** An embedded terminal a human step opened has exited — its command's exit may prove the step. */
   protected abstract humanStepTerminalExited(id: string, code: number): Promise<unknown>;
 
+  /** Items a live grant now covers, and supervisor items whose subject settled — withdrawn (phase 136, `ServiceRecovery`). */
+  protected abstract turnCoveredPass(now?: number): string[];
+
+  /** Items returned `turnEscalateAfter` times and not yet escalated — escalated once (phase 136, `ServiceRecovery`). */
+  protected abstract turnEscalatePass(now?: number): string[];
+
+  /** Open proofs the console reads, read again on their back-off — the ids proven (phase 136, `ServiceRecovery`). */
+  protected abstract turnProofPass(now?: number): Promise<string[]>;
+
+  /** The round (control-tower phase 136): made once, on the human-step clock. */
+  protected turnRound: TurnRound | null = null;
+  /** The handled log (control-tower phase 136): `<instance state>/handled.ndjson`. */
+  protected handledLedger: HandledLedger | null = null;
+  /** The journal hook the round and the handled log hear every run's lines through. */
+  private journalHook: (() => void) | null = null;
+
+  /** The one writer of `handled.ndjson`, made on first use. */
+  handledNow(): HandledLedger {
+    return (this.handledLedger ??= new HandledLedger(join(INSTANCE_STATE_DIR, HANDLED_FILE)));
+  }
+
+  /** Record a thing handled — a failure is logged, never thrown into the act it records. */
+  protected recordHandled(input: HandledInput): HandledRow | null {
+    try {
+      const row = this.handledNow().record(input);
+      if (row) count('turn_handled_total', [row.source]);
+      return row;
+    } catch (error) {
+      log.warn('human-steps.ledger-unwritable', { file: HANDLED_FILE, error: (error as Error)?.message ?? String(error) });
+      return null;
+    }
+  }
+
   /**
-   * The reminder clock: once a minute, unref'd like every console clock. A
-   * pass that throws is logged and the clock keeps its schedule.
+   * The round (control-tower phase 136, #213): the grants' clock, the reminder
+   * clock's pass, the withdrawals, the escalations, the due pass and the
+   * proofs, in that order (`turn/round.ts`) — and ONE server-sent event,
+   * `turn`, when it changed the turn.
+   */
+  protected turnRoundNow(): TurnRound {
+    return (this.turnRound ??= new TurnRound({
+      grants: () => this.sweepGrants(),
+      clock: (now) => this.humanStepClockTick(now) as { reminded: string[]; expired: string[]; dismissed: string[] },
+      covered: (now) => this.turnCoveredPass(now),
+      escalate: (now) => this.turnEscalatePass(now),
+      due: (now) => this.humanStepDuePass(now) as Promise<{ due: string[]; proven: string[] }>,
+      proofs: (now) => this.turnProofPass(now),
+    }, {
+      emit: (state: RoundState) => {
+        count('turn_rounds_total', [state.trigger ?? 'clock']);
+        this.emit('turn', { round: state.n, at: state.at, changed: state.last });
+      },
+      failed: (pass, error) => log.warn('human-steps.clock-failed', { error: (error as Error)?.message ?? String(error), pass }),
+    }));
+  }
+
+  /** One line a run's journal wrote: a thing handled is recorded, and a round is woken. */
+  protected onJournalLine(line: JournalLineSeen): void {
+    const handled = handledOfJournal(line);
+    if (handled) this.recordHandled(handled);
+    this.turnRound?.poke(line.entry.event);
+  }
+
+  /**
+   * The human-step clock, which drives the round: once a minute, unref'd like
+   * every console clock, and a run's journal line wakes one too, debounced. A
+   * pass that throws is logged and the round carries on.
    */
   protected startHumanStepClock(): void {
-    if (this.humanStepTimer) clearInterval(this.humanStepTimer);
-    this.humanStepTimer = setInterval(() => {
-      try { this.humanStepClockTick(); } catch (error) {
-        log.warn('human-steps.clock-failed', { error: (error as Error)?.message ?? String(error) });
-      }
-      // Then the due pass (control-tower phase 121): it awaits probes, so it
-      // runs beside the tick, one at a time, and never throws into the clock.
-      this.humanStepDuePass().catch((error: unknown) => {
-        log.warn('human-steps.clock-failed', { error: (error as Error)?.message ?? String(error), pass: 'due' });
-      });
-    }, HUMAN_STEP_CLOCK_MS);
-    this.humanStepTimer.unref?.();
+    this.turnRoundNow().start(HUMAN_STEP_CLOCK_MS);
+    this.journalHook ??= onJournalAppend((line) => this.onJournalLine(line));
   }
 
 
@@ -4196,7 +4481,7 @@ export abstract class ServiceBase {
       // it is the only source for what the phase should do.
       verificationText: (slug, phase) => this.store?.get(slug)?.plan?.phases[phase]?.verification,
       // A person's turn (control-tower phase 41): the ledger, the one push.
-      humanStep: (input) => this.recordHumanStep(input),
+      humanStep: (input) => this.raiseTurn(input),
       // A watchdog park arms a minted cmd: ref only when it will run (#121 item 3).
       mintedCmdRefs: () => this.flags.allowRun && this.prefs.watchMintedCmdRefs === true,
       setupText: (slug, phase) => this.store?.get(slug)?.plan?.phases[phase]?.setup,
@@ -4585,14 +4870,18 @@ export abstract class ServiceBase {
       // rule for this plan once a person approved the card, and — when the
       // loop that offered it has since ended — resume the phase's own session
       // through the recover verb, which is the stopped-run door.
-      widenRule: (slug, rule, by) => {
-        this.editPolicy({ scope: 'plan', slug, remove: { deny: [rule] }, by });
-      },
+      // The widen card's Allow is a grant (control-tower phase 149): the rule
+      // struck from this plan's file by the engine, with its row.
+      widenRule: (slug, rule, by, at) => this.widenGrant(slug, rule, by, at),
+      // A run's grants below plan scope, lowered in the settings its next child loads.
+      grantsLowered: (runId) => this.grantsNow().lowered(runId),
       resumeOwnSession: (slug, phase, instruction, by) => {
         void this.recoverPhase(slug, phase, 'resume', { instruction, by }).catch((error) => {
           log.warn('runner.widen-rule.resume-failed', { slug, phase, error });
         });
       },
+      // The widen rung's ask is a permission ITEM (control-tower phase 135).
+      raisePermission: (input) => this.raisePermissionItem(input),
       accountKind: (accountId) => this.accounts.meta(accountId ?? DEFAULT_ACCOUNT_ID)?.kind,
       // A person's switch undone by the machine (#106) is never silent.
       onAccountSwitchReverted: (state, detail) => this.announceReversal(state, detail),
@@ -4782,6 +5071,10 @@ export abstract class ServiceBase {
       sessionKind?: 'shell' | 'claude' | null;
       /** Land on a Tower bay rather than the run — a supervisor's card (control-tower phase 102). */
       bay?: 'needs-you' | null;
+      /** The item a push is about — it opens `#/turn/<id>` (control-tower phase 138). */
+      stepId?: string | null;
+      /** The grant a `granted` push announces — it opens Settings ▸ Permissions ▸ Grants at it (phase 138). */
+      grantId?: string | null;
       /**
        * Answerable from the notification itself.
        *
@@ -6011,6 +6304,37 @@ export abstract class ServiceBase {
   probeDeclaration(body: { slug?: unknown; phase?: unknown; file?: unknown }): Promise<DeclaredProbeAnswer> {
     return answerDeclaredProbe(body, {
       root: this.root?.ok ? this.root.path : null,
+      // The guard at the door (control-tower phase 130): G1, G2, G4 and G6,
+      // while the session is still there to hear exit 2 or 4.
+      guard: (runId, step) => {
+        const guide = step.guide === undefined ? null
+          : parseGuide(typeof step.guide === 'string' ? step.guide : step.guide?.text, {
+            lang: typeof step.guide === 'object' ? step.guide?.lang : undefined,
+          });
+        if (guide && !guide.ok) return { ok: false, rule: 'G6', exit: 2, sentence: `--guide refused: ${guide.error}`.replace(/["\\]/g, "'") };
+        return guardStep({
+          kind: String(step.kind ?? ''),
+          ...(typeof step.title === 'string' ? { title: step.title } : {}),
+          ...(typeof step.why === 'string' && step.why_source !== 'inferred' ? { why: step.why } : {}),
+          ...(typeof step.proof_type === 'string' ? { proofType: step.proof_type } : {}),
+          ...(typeof step.proof === 'string' ? { proof: step.proof } : {}),
+          ...(typeof step.proof_words === 'string' ? { proofWords: step.proof_words } : {}),
+          guide: guide?.ok ? guide.guide : null,
+          ...(typeof step.open_command === 'string' ? { openCommand: step.open_command } : {}),
+          ...(typeof step.tried === 'string' ? { tried: step.tried } : {}),
+        }, { stage: 'door', judge: this.commandJudgeFor(runId) });
+      },
+      // G5's evidence (control-tower phase 135): the walls recorded for the
+      // declaring lane — the run the staged file names, else the plan's latest;
+      // null when no run of this console holds the phase (an interactive
+      // session's declaration is explained, never refused).
+      walls: (slug, runId, phase) => {
+        if (!this.root?.ok) return null;
+        const run = latestRun(this.root.path, slug, this.liveRunIds());
+        if (!run || (runId && run.id !== runId)) return null;
+        const record = run.phases[String(phase)];
+        return record ? (record.walls ?? []) : null;
+      },
       probe: (slug, phase, refs) => this.watchClock.probeDeclared(slug, phase, refs, { budgetMs: DECLARED_PROBE_BUDGET_MS }),
       journal: (slug, runId, kind, data, phase) => {
         if (!this.root?.ok) return;
@@ -6276,6 +6600,9 @@ export abstract class ServiceBase {
     this.digestTimer = null;
     if (this.humanStepTimer) clearInterval(this.humanStepTimer);
     this.humanStepTimer = null;
+    this.turnRound?.stop();
+    this.journalHook?.();
+    this.journalHook = null;
     if (this.retentionTimer) clearInterval(this.retentionTimer);
     this.retentionTimer = null;
     this.stopTriggers();

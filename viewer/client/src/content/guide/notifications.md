@@ -12,13 +12,13 @@ A category that is off leaves no trace anywhere. Worth stating, because the obvi
 silencing only the buzz — leaves the badge climbing and the inbox filling, which is how people end up
 ignoring the inbox entirely.
 
-## The nineteen categories
+## The twenty categories
 
 | Category | Tells you | Default |
 |---|---|---|
 | **Permission needed** | A session is blocked on a decision only you can make. Nothing proceeds until you answer. | On, urgent |
 | **Session waiting on you** | A Claude session hit a permission prompt or asked for input — an agent session, one you ran in a terminal, an autopilot lane with no permission card already up for it, or a question the relay is holding, with the seconds left before the console answers it by rule. Sent once more if an ask waits an hour unanswered. | On, urgent |
-| **A phase needs you** | A phase stopped at a check no automation may sign off. Not failed, not finished — waiting. | On, urgent |
+| **A phase needs you** | A phase stopped at a check no automation may sign off, or an item of **Your turn** waits on you: a sign-in, a code, a decision, a permission only you can give. Not failed, not finished — waiting. One item is announced once, and its reminders replace its notification. | On, urgent |
 | **Gate needs a person** | A phase is held at a gate only a person may clear. The board calls it ready the moment you approve it and not before. | On |
 | **QA verdict owed or failed** | A finished phase still owes its QA verdict, or QA recorded a fail — the plan gates on it, so every dependent is held until pass or waived is recorded. Sent only after the console's own chase left the verdict owed. | On, urgent |
 | **Run halted** | A run stopped on something that must not be automated past, or was interrupted with nothing driving it. | On, urgent |
@@ -27,12 +27,13 @@ ignoring the inbox entirely.
 | **Phase finished or failed** | Each phase as it lands, with what it cost. | On |
 | **Plan finished** | A run reached the end of its plan. | On |
 | **A session ended** | An agent session or terminal finished while you were not watching, or exited with an error. | On |
-| **Console problems** | The console degraded, its file watch went deaf, or it restarted after a crash. | On |
+| **Console problems** | The console degraded, its file watch went deaf, or it restarted after a crash — or an owner key was enrolled or removed. That change is pushed to every device that takes this category, written to the journal, and kept in the bell for a week. | On |
 | **Usage limits** | A Claude account hit a usage window, with when it resets and what the run did about it — and an account that needs signing in again. | On |
 | **Issue drafted by a session** | A session tripped over a problem outside its phase and drafted an issue for it, where the plan's `Issues:` word allows. Under `draft` it waits in the inbox for your Approve, Discard or edit; under `file` it was filed at once and this says what landed. | On |
 | **Usage climbing** | Early warning while a window fills: 80% and 95% crossings, and hours ahead of a wall an account's measured burn will reach. The meters show the same numbers all the time. | On |
 | **Budget spent or running low** | A budget that can stop work — a phase's wait, a phase's or the run's dollars, the recovery ladder's cap, the failure streak — reached 80% or ran out. The first line says which budget and the arithmetic (`60m wait budget · 39.7m accrued · 20.3m left · asked for 90m`) and what spent it; the run page's card raises it where it was declared and retries in one press. | On |
-| **Hourly digest** | Once an hour, a summary instead of a stream: every decision waiting on you with its deadline, every parked run and stalled session, and what an outage kept from arriving. Nothing waiting sends nothing. | **Off** |
+| **Permission granted** | Every grant is announced: who granted which rule, for how far, until when, and what it changed. Settings ▸ Permissions lists every grant and takes one back — and the push opens there, at that grant. | On |
+| **Hourly digest** | Once an hour, a summary instead of a stream: Your turn first — *Your turn: 3 need you — 1 came back from a check · 4 handled by the AI since the last digest* — then every decision waiting on you with its deadline, every parked run and stalled session, and what an outage kept from arriving. Nothing waiting sends nothing, and what the AI handled never sends a digest on its own. | **Off** |
 | **Work became ready** | A phase became startable — including because of work you finished yourself, elsewhere. | **Off** |
 | **Plans changed on disk** | Any plan or handoff was written. An agent editing a handoff mid-phase fires this. | **Off** |
 
@@ -47,9 +48,9 @@ buzzes a wrist for it would be turned off within a week. The console names which
 it saw (silent, spinning, stalemate, retrying, waiting on an external clock) and offers the verbs that
 answer one — steer the session, freeze it where it stands, stop that lane. With one exception below it
 does not act by itself. A phase inside its
-own §Verification is exempt, because a build is silent and fine. In the Tower's Needs-you bay a stalled lane
-becomes a row of its own only once it has been silent for half an hour: this notification arrives
-sooner, and it is the one you can dismiss.
+own §Verification is exempt, because a build is silent and fine. On Your turn a stalled lane becomes an
+item of its own only once it has been silent for half an hour: this notification arrives sooner, and it
+is the one you can dismiss.
 
 **Retrying** is the one signal with a different answer. A session pinned inside the CLI's own retry
 watchdog is alive and cannot reach the API, so nudging it does nothing — its row offers *freeze* and
@@ -118,6 +119,34 @@ the phone buzz for a category the console does not raise at all — which means 
 hiding a message that exists somewhere else.
 
 Setting push up on a phone is its own walk-through: **Mobile setup**.
+
+## Quiet hours, reminders and the lock screen
+
+**There is one quiet-hours setting: each device's own**, in **Settings ▸ Notifications ▸ Devices**.
+Inside a device's window nothing is pushed to it — the inbox still gets every record — and the urgent
+kinds still get through unless you untick that. The **reminders** of a person's turn obey the same
+windows: a reminder that falls due while every device that would hear it is quiet waits for the first
+one to wake, and a reminder is never urgent, so it never breaks through. A device with no window is
+always awake. The reminders' own quiet hours of earlier versions were moved onto your devices once,
+and are gone.
+
+One turn is announced once. An item's push carries one tag, and its reminders ride that tag, so a
+device holds one notification per item and each reminder replaces it. The errand a parked phase writes
+for the same step is the same item and pushes nothing of its own.
+
+A push about an item opens the item, on **Your turn**. Its buttons are only what a paired device may
+press, and they depend on what the item asks:
+
+- an act: **Open** and **I did it**;
+- a permission of low or medium risk, at its narrowest scope: **Allow** and **Deny**;
+- a permission of high risk, or one the console never grants: **Open** and **Deny**, because a risky
+  grant is typed on the page;
+- a decision: **Open** alone, because its answer is one of its options.
+
+A lock-screen **Allow** is the `device` door, and it never grants a high-risk ask. The console judges a
+grant three times — when it signs the button, when you press it, and in the grant engine — so a high
+grant forced through anyway is refused and the item opens instead. A **Permission granted** push opens
+Settings ▸ Permissions at that grant, where it can be revoked.
 
 ## The inbox, and getting it back to zero
 

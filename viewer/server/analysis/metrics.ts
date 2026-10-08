@@ -297,6 +297,13 @@ export const METRIC_FAMILIES: readonly (readonly [string, 'gauge' | 'counter', s
   ['phase_console_http_requests_total', 'counter', 'HTTP requests answered, by status class.'],
   ['phase_console_shell_commands_total', 'counter', 'Other child processes run through the seam, by binary and whether they exited 0.'],
   ['phase_console_retention_removed_total', 'counter', 'Files retention deleted, by sink.'],
+  // The check (control-tower phase 134): checks by who wrote the verdict and
+  // what it was (`none` — the checker produced none), and what the checking
+  // sessions cost, by model.
+  ['phase_console_turn_checks_total', 'counter', 'Checks of a person\'s items, by who wrote the verdict and what it was.'],
+  ['phase_console_turn_check_usd_total', 'counter', 'USD the checking sessions cost, by model.'],
+  ['phase_console_turn_rounds_total', 'counter', 'Rounds that changed Your turn, by what woke them (the clock or a journal line).'],
+  ['phase_console_turn_handled_total', 'counter', 'Things the AI handled instead of asking a person, by source.'],
 ];
 
 /** The counter families, in emission order, with the labels each is keyed by. */
@@ -311,6 +318,10 @@ const COUNTER_FAMILIES: readonly (readonly [CounterFamily, string, readonly stri
   ['http_requests_total', 'phase_console_http_requests_total', ['status']],
   ['shell_commands_total', 'phase_console_shell_commands_total', ['command', 'ok']],
   ['retention_removed_total', 'phase_console_retention_removed_total', ['sink']],
+  ['turn_checks_total', 'phase_console_turn_checks_total', ['by', 'verdict']],
+  ['turn_check_usd_total', 'phase_console_turn_check_usd_total', ['model']],
+  ['turn_rounds_total', 'phase_console_turn_rounds_total', ['trigger']],
+  ['turn_handled_total', 'phase_console_turn_handled_total', ['source']],
 ];
 
 /**

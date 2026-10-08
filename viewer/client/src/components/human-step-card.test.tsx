@@ -134,7 +134,7 @@ describe('every kind leads with its own action (criterion 1)', () => {
       'Open in terminal',
       'Enter it at the machine',
       'Approve',
-      'I did it — check',
+      "I've done this — check",
     ])
       expect(labels).toContain(label);
   });
@@ -237,17 +237,15 @@ describe('the rest of the card’s rules', () => {
     expect(screen.getByRole('button', { name: /Copy code/ })).toBeTruthy();
   });
 
-  it('a secret is sent by the check and never drawn again', async () => {
-    api.humanStepCheck.mockResolvedValue({ ok: true, check: { landed: true, read: 'stored' } });
+  it('a secret-entry card has no field for the value: it says where it goes, and the check sends nothing', async () => {
+    api.humanStepCheck.mockResolvedValue({ ok: true, check: { landed: true, read: 'landed — held' } });
     mount(stepItem('secret-entry'));
-    const field = screen.getByTestId('step-secret') as HTMLInputElement;
-    expect(field.type).toBe('password');
-    fireEvent.change(field, { target: { value: 'sk-live-secret-value-1234567890' } });
+    expect(screen.queryByTestId('step-secret')).toBeNull();
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(screen.getByTestId('step-secret-where').textContent).toMatch(/never takes the value/);
     fireEvent.click(screen.getByTestId('step-primary'));
-    expect(api.humanStepCheck).toHaveBeenCalledWith('s-secret-entry', 'sk-live-secret-value-1234567890');
-    expect(field.value).toBe('');
     await waitFor(() => expect(api.humanStepCheck).toHaveBeenCalledTimes(1));
-    expect(document.body.innerHTML).not.toContain('sk-live-secret-value');
+    expect(api.humanStepCheck).toHaveBeenCalledWith('s-secret-entry');
   });
 
   it('a check that did not land says what the proof read', async () => {

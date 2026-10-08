@@ -102,7 +102,15 @@ Since 6.0 (control-tower phase 21) the client is seven destinations in three ban
 under one shell (`client/src/app/`), with every older address still resolving. The design law is
 `viewer/docs/design.md` ("Control Tower 6.0"): every rule in it names the guard that holds it.
 `#/runs`, the Tower, is the home (`DEFAULT_HEAD`); Now is retired and each of its addresses lands on a Runs bay
-(`#/now?focus=inbox` → `#/runs?bay=needs-you`, `#/ready` → `#/runs?bay=ready`). The band is the
+(`#/now?focus=inbox` → `#/runs?bay=needs-you`, `#/ready` → `#/runs?bay=ready`). **Your turn**
+(`#/turn`, `features/turn/`, a lazy chunk; control-tower phases 130–139, 148 and 149) is a head that
+lights Runs: every act only a person can do as one item — why only they fit it, a guide, a proof the
+console checks — in five groups plus *Handled by the AI*, read from `GET /api/turn`, which the
+server's `turn/` folds from every source through one door (`raiseTurn`); `#/approve` lands there,
+and the approval, gate, question and errand cards elsewhere draw the item and link to it. A
+permission item is answered by a scoped grant (`server/permissions/grants.ts`, `grants.ndjson`), and
+an owner key (`server/owner/`, a passkey) is what lets a console tell its owner's press from any
+other door's. The band is the
 rail's grouping — a slim 80 px rail, a glyph over each name — and the situation line rides the shell
 header on every page. The phone tab bar is its own list, `TAB_BAR` in `app/shell/nav.ts` (Runs ·
 Plans · Sessions · Insights), and the rest are the More sheet.
@@ -153,6 +161,15 @@ establish — a vocabulary lives in `shared/` and is imported by identity by ser
   exclusions and unanswerable reasons, who answered, the relay rules, and `pickAnswer`.
 - `shared/cli-tools.js` — `CLI_TOOLS`, the tool names Claude Code provides, which is what a
   permission rule may name.
+- `shared/turn-model.js` — Your turn's words (control-tower phases 130–149; bash twin
+  `scripts/turn.env`): the ten reasons only a person fits (`WHY_PERSON`, `REASON_META`) and those each
+  kind allows (`KIND_REASONS`), the proof types, `VERDICTS`, the grant scopes, `GRANT_RISK` and the
+  never list's reasons, the page's `TURN_GROUPS`, `HANDLED_SOURCES`, the walls and the guard's exit
+  (`GUARD_REFUSAL_EXIT`, 4). `shared/guide-grammar.js` is the one guide parser, server and page alike.
+- `shared/door-model.js` — who pressed: the seven `PRESS_DOORS`, the `AUTHORITY_VERBS`, `DOOR_MAY` in
+  its two modes (no owner key: `local` presses what it always could; a key: a press through a door
+  that may not make it is a request the owner confirms) and `AUTHORITY_ROUTES`, the table the hook's
+  `console-forge` guard and the router both read.
 
 Add a state, a rung or a route in the shared file and nowhere else. Three copies that agree today
 are three copies that disagree the day a word is added — which is how a finished run gets painted as
@@ -312,7 +329,8 @@ rather than refusing.
   the package manager's own directory flag; Setup is resolved from the SAME directory, because the
   runner hands both one cwd, and an install counts only for its own ecosystem. Its word lists stay in
   `phase-graph.sh`, not `verify.env`: no runtime reader asks them. The advisory family is therefore
-  F15–F19, F22–F23, F28, F30, F32–F36, F38 and F39 — sixteen ids; F14 gates, and so do F26
+  F15–F19, F22–F23, F28, F30, F32–F36 and F38–F40 — seventeen ids (F40, `human-step-no-why`,
+  control-tower phase 130: a `Human step:` with no `why:`, given its kind's default reason); F14 gates, and so do F26
   (`note-target-unknown`), F27 (`land-word-unknown`), F29
   (`landed-gate-unknown-phase`), F31 (`permission-mode-unknown`, control-tower phase 11): a
   `Permission mode:` line or bullet whose word is not one of `scripts/permission.env`'s, which the

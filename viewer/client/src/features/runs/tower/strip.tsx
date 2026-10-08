@@ -39,17 +39,19 @@ import { clockWords, money, type LabelledClock } from '@/lib/format';
 import { usePrefs } from '@/lib/prefs';
 import { runRecoverVerb, type RunRecoverVerb } from '@/lib/run-recover';
 import { useRunLifecycle, type RunLifecycle } from '@/lib/run-lifecycle';
-import type { QueueEntry, RunState, VerifyingLane } from '@/lib/api';
+import type { InboxItem, QueueEntry, RunState, VerifyingLane } from '@/lib/api';
+import { useInboxActions } from '@/components/inbox-row';
 import type { NowLane } from '@/features/runs/lanes-model';
 import { LastActivity } from '../now-panel';
 import { StripDetail } from './strip-detail';
 import { stripModel, type StripAction, type StripModel } from './strip-model';
 import { WhyLine } from './why-line';
 
-/** The step card's one action, loaded with the card (control-tower phase 42). */
-const StepCard = lazy(() =>
-  import('@/components/human-step-card').then((m) => ({ default: m.HumanStepCard })),
-);
+/**
+ * A person's turn's one action: the run's oldest item's primary, loaded with
+ * the item row (control-tower phases 42 and 139).
+ */
+const ItemPrimary = lazy(() => import('@/features/turn/item-row'));
 
 /** How many expanded strips a person's preferences remember — the newest win. */
 const REMEMBERED = 40;
@@ -435,7 +437,7 @@ export function StripActionButton({
           </Button>
         }
       >
-        <StepCard item={action.item} variant="primary" testId="strip-action" />
+        <StripItemPrimary row={action.item} className={thumb} />
       </Suspense>
     );
   }
@@ -503,5 +505,24 @@ function StripPeek({ model, run }: { model: StripModel; run: RunState }) {
         ]}
       />
     </div>
+  );
+}
+
+/**
+ * The run's oldest item's ONE primary (control-tower phase 139, #216): a step's
+ * opener or check, a broker card's Allow, a gate's Approve — or, where a row
+ * cannot answer it (a high grant, a choice of options), the item on the page.
+ */
+function StripItemPrimary({ row, className }: { row: InboxItem; className: string }) {
+  const { perform, busy } = useInboxActions();
+  return (
+    <ItemPrimary
+      row={row}
+      primaryOnly
+      testId="strip-action"
+      className={className}
+      perform={perform}
+      {...(busy ? { busy } : {})}
+    />
   );
 }

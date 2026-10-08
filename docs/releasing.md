@@ -69,13 +69,15 @@ wrapper does the two things `prepack` does that the assertions need (the pack `t
 `.ts` sibling, because `viewer/server/fallback-sw.js` is real tracked source sitting among the ~148
 emitted files. `--keep` leaves the tarball in place and prints its path, and `--tree DIR` packs
 another checkout of this repository, which is how a tag behind `HEAD` is released.
-The tarball is **9.2 MB** — 1011 entries, 27 MB unpacked, measured at **6.1.0** with the pack `tsc`
-emit in place, which is what a release actually packs (6.0.0 was 8.8 MB and 973 entries, 5.1.0
-7.1 MB and 693, 5.0.0 5.9 MB and 599, 4.0.0 4.7 MB and 503; 6.0 added the status model and its shared
-vocabularies, the person's-turn, queue, lock, clock and budget models, the run's new probes, ledgers
-and reports, and the emitted `.js` beside each, and 6.1 the issue, door and CI-refusal vocabularies,
-the unit watch and the shell reader; the free tarball was 755 entries at 6.0.0).
-`assert-tarball.sh` prints the same 1011: this
+The tarball is **9.7 MB** — 1072 entries, 27 MB unpacked, measured at **6.2.0** with the pack `tsc`
+emit in place, which is what a release actually packs (6.1.0 was 9.2 MB and 1011 entries, 6.0.0
+8.8 MB and 973, 5.1.0 7.1 MB and 693, 5.0.0 5.9 MB and 599, 4.0.0 4.7 MB and 503; 6.0 added the status
+model and its shared vocabularies, the person's-turn, queue, lock, clock and budget models, the run's
+new probes, ledgers and reports, and the emitted `.js` beside each, 6.1 the issue, door and CI-refusal
+vocabularies, the unit watch and the shell reader, and 6.2 Your turn's server — `turn/`, `owner/` and
+`permissions/` — its two shared vocabularies and the `owner` and `grants` verbs; the free tarball was
+755 entries at 6.0.0).
+`assert-tarball.sh` prints the same 1072: this
 tarball carries no directory entries, so the older note about `tar -tzf` counting them no longer
 applies, and the two numbers agreeing is now the expected answer rather than a discrepancy to
 explain. It was ~36 MB until 3.1 shipped the screencast from a
@@ -86,6 +88,110 @@ slack: `server/http/static.ts` serves them and never compresses at request time,
 `check-dist.mjs` gates first paint on the bytes that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
+
+## Upgrading to 6.2.0
+
+The root `package.json` says 6.2.0, and `CHANGELOG.md` carries its section. 6.2.0 is a minor version:
+nothing a 6.1 plan writes stops parsing, and a console with no owner key presses as it did. What moved
+is how a person's turn is asked for and answered: a declaration gives a reason and a proof, a check
+comes back with a verdict, a permission ask is answered by a grant with a scope and an end, and the
+old cards draw one item on Your turn. What follows is what an operator, a plan author or a session
+running an older copy will notice, in the order they are likely to notice it.
+
+### Your turn: one page, and a check that comes back with a verdict
+
+- **`#/turn` is Your turn**, the page that lists every act only a person can do, in five groups plus
+  *Handled by the AI*; it lights Runs. `#/approve` and `#/approve?step=<id>` land on it in one hop
+  (`#/turn`, `#/turn/<id>`), so a bookmark keeps working, and a push opens `#/turn/<id>`.
+- **"Done — continue" is *I've done this — check*.** A person errand is an `operator-act` item, and
+  every check button reads *I've done this — check*. A check comes back with a verdict — passed,
+  rejected with exactly what to redo, or needs-info — and a probe that misses leaves the item
+  `returned`, where it used to read `notified`. A proof only words can state is read by a short
+  read-only checking session (`sonnet` at `low` by default; at most 12 turns, $0.50 and five minutes;
+  Settings ▸ Automation), and no session can mark its own item passed.
+- **The approval, gate, question and errand cards draw the item**: one row, its one primary action and
+  *Open on Your turn*. The Needs-you bay keeps runs, and *Your turn (n)* in the situation line counts
+  items and opens the page.
+- **The `secret-entry` field is gone.** The console never takes a secret: `check` refuses a body that
+  carries one, and the item names where the value goes instead — the keychain item
+  `phase-console-<id>` on macOS, a 0600 file elsewhere, or the item's own `credential:` place.
+
+### Plans and sessions: a reason, a guide, a proof, and exit 4
+
+- **The scripts move with the plugin.** `PE_API` is 2, and a run refuses to start when the console's
+  and the skill's stamps do not meet, naming the half to update. A 6.1 `phase-outcome.sh` takes none
+  of the flags below and never exits 4.
+- **A person's turn carries a reason.** A `needs-human --step` declaration says why only a person fits
+  it — `--why`, one of ten reasons, held to what its kind allows — and one that names none is given its
+  kind's default, marked inferred, so an older skill copy and `--act` keep working. It may carry a
+  guide (`--guide`, with `--lang`), `--effort`, `--due`, `--unblocks`, `--proof-type`, `--proof-words`,
+  `--option`, `--window` and `--tried`. A plan's `- **Human step:**` bullet gains `why:`, `effort:`,
+  `unblocks:` and `guide:`; a bullet with no `why:` draws the advisory **F40** `human-step-no-why`,
+  never a gate. `references/turn.md` is the session's reference for all of it.
+- **A step needs a proof.** A step with no `--proof`, no `--proof-words` and no answer for a result is
+  refused (exit 2); name `--proof-type attest` to take the person's word.
+- **Exit 4 is the guard's.** `phase-outcome.sh` exits 4 when a declaration asks a person for what the
+  AI could do itself — a `permission` or `reserved` reason whose every guide command the run's own
+  policy allows, a `reach` with no `--tried` — or when a permission block cites no wall the console
+  recorded (G5). Read 4 as "run it yourself", never as a malformed call; `--tried` is the answer when
+  running it failed.
+- **A decision names its `## Decisions` row**: `needs-human --step decision --decision-key KEY`, and the
+  person's answer is written to the plan's decisions table before the session is resumed with it.
+- **A guide line may not hold an invisible or direction-changing character** — a control character, a
+  zero-width space, a bidi embedding, override or isolate, a word joiner or a byte-order mark refuses
+  the guide at that line. The joiners and the direction marks (U+200C–U+200F) stay, so a Persian guide
+  reads as before.
+- **For readers of the vocabularies:** a person's turn has an eighteenth kind, `permission`, and
+  eleven states with `returned` and `declined`; `viewer/shared/turn-model.js` (twin `scripts/turn.env`)
+  and `viewer/shared/guide-grammar.js` are new owners, and `viewer/shared/door-model.js` owns the doors.
+
+### Permissions: a grant has a scope and an end
+
+- **Every Allow is a grant.** The approval card's Allow with *remember*, the widen card's Allow and a
+  standing card's one-time allow each write a grant — `call` (spent on use), `phase` (until it settles,
+  24 hours at most), `plan`, `repository` (a new policy layer between the plan's file and the
+  machine's) or `always` — as a row in `grants.ndjson` saying exactly what it changed, which a revoke
+  undoes exactly (Settings ▸ Permissions, `phase-console grants list|revoke|revoke-all`). The widen
+  card no longer strikes a rule from the plan for good. A grant below plan scope lowers the rule in
+  that run's settings until it ends, and for that long the CLI's own list does not hold the rule with
+  the console dead.
+- **Risk decides the press.** Low and medium are one press; high needs the rule typed back and, on a
+  console with an owner key, a touch of the key in the last five minutes; the never list — a forced
+  or deleting push, the host family, every guard, a protected path, a secret's value — offers no grant
+  through any door.
+- **`git send-pack` and `git http-push` are walled like `git push`**: two default deny rules, the same
+  on every profile. A plan that publishes through either names the rule in its `permission.destructive`
+  row, as it names `git push`.
+
+### The owner key: what changes for a script that presses the console
+
+- **Nothing until a key is enrolled.** A console with none behaves as before, and
+  `/api/state.ownerDoor` reads `unenrolled`. The link `phase-console owner enroll` prints enrols a
+  passkey at the machine; `phase-console owner status` says where the console stands, and
+  `phase-console owner lock` ends every owner session.
+- **Once one is**, an authority press from a script, the CLI, a browser with no key, a phone beyond its
+  low and medium answers or a session's token is answered 202 `{requested: true}` — recorded on its
+  item as "asked by <label> — confirm?" and pressed only when the owner confirms. A script reads 202 as
+  waiting for the owner, never as done. What the plan's manifest already allows still executes through
+  any door.
+- **`by` in a body is only a label.** The door a request proves is recorded as `pressDoor`, and a
+  request carrying a session's token presses no authority route its plan's `permission.destructive`
+  row does not name (403, `owner.door-refused`). A manual gate's person test is that door, not a
+  User-Agent.
+- **A turn's push names its buttons by kind**, and quiet hours are one setting, the device's: at the
+  first boot a console-wide `reminderQuiet` window moves onto every subscribed device that has none of
+  its own, and is dropped. The push catalogue has a twentieth category, `granted`.
+
+
+### Packaging: what the tarball gained
+
+- The root `package.json` `files` allowlist gained two shared modules, `viewer/shared/turn-model.js`
+  and `viewer/shared/guide-grammar.js`, and the free tree's allowlist the same two.
+- `.github/scripts/assert-tarball.sh` asserts the new runtime files: those two, the nine modules of
+  `viewer/server/turn/`, the six of `viewer/server/owner/`, `viewer/server/permissions/grants.ts` and
+  `viewer/server/permissions/walls.ts`, `bin/owner-verb.mjs`, `bin/grants-verb.mjs` and
+  `scripts/turn.env`.
+
 
 ## Upgrading to 6.1.0
 

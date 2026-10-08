@@ -194,6 +194,12 @@ test('sanitiseAutomation is the single coercion table', () => {
     stallEscalateMs: 2_700_000,
     // The sixth signal (phase 13): three identical failing tool calls in a row.
     stallLoopRun: 3,
+    // The check (control-tower phase 134): judgement on, the checking session
+    // on the alias `sonnet` at `low`, and three rejections escalate.
+    checkJudgement: true,
+    checkModel: 'sonnet',
+    checkEffort: 'low',
+    turnEscalateAfter: 3,
     // The boarding schedule is the one OBJECT here, coerced by its own
     // `sanitiseSchedule` beside the rules it has to agree with. Off, with
     // nothing in it: a console that has never set one boards at every hour,
@@ -456,6 +462,8 @@ test('every automation preference the loader accepts can also be SET', () => {
   // coercing it. Same rule as OBJECT_FLIPS: a new word-valued key fails here
   // until somebody names its other value.
   const WORD_FLIPS: Record<string, string> = {
+    checkModel: 'haiku',
+    checkEffort: 'high',
     gitMode: 'new-branch',
     reviewerPolicy: 'may-hold',
     mcpPolicy: 'require',
@@ -542,6 +550,40 @@ test('P7: the per-repository cap, the retention word and the base branch all hav
   // `worktreeSetup` does: a half-coerced value must never reach a git argv.
   assert.equal(sanitiseAutomation({ baseBranch: 12 } as never).baseBranch, 'origin/HEAD');
   assert.equal(sanitiseAutomation({ baseBranch: '  release/5.1  ' }).baseBranch, 'release/5.1');
+});
+
+test('QH-6 (control-tower phase 138, #215): reminderQuiet is no preference any more — a patch carrying it lands on the devices with no window, and is never stored', async () => {
+  const { generateKeyPairSync, randomBytes } = await import('node:crypto');
+  const browser = () => {
+    const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = publicKey.export({ format: 'jwk' }) as { x: string; y: string };
+    const point = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]);
+    return {
+      endpoint: `https://push.example.com/sub/qh6-${randomBytes(4).toString('hex')}`,
+      keys: { p256dh: point.toString('base64url'), auth: randomBytes(16).toString('base64url') },
+    };
+  };
+  writeConfig({});
+  const service = makeService();
+  try {
+    for (const device of service.push.list()) service.push.unsubscribe(device.id);
+    const phone = service.push.subscribe(browser(), undefined, 'phone') as { id: string };
+    const laptop = service.push.subscribe(browser(), undefined, 'laptop') as { id: string };
+    service.push.setQuiet(laptop.id, { start: '23:00', end: '06:00', allowUrgent: false });
+    // A page from before the change still sends the reminders' own window.
+    const saved = service.savePreferences({ reminderQuiet: { start: '22:15', end: '07:45' } } as never);
+    assert.ok(!('reminderQuiet' in saved), 'not a preference: never stored in memory');
+    assert.ok(!('reminderQuiet' in JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))), '…nor on disk');
+    const quietOf = (id: string) => service.push.list().find((d) => d.id === id)?.quiet;
+    assert.deepEqual(quietOf(phone.id), { start: '22:15', end: '07:45', allowUrgent: true }, 'the device with no window took it');
+    assert.deepEqual(quietOf(laptop.id), { start: '23:00', end: '06:00', allowUrgent: false }, 'a device with its own keeps its own');
+    // Turning the old setting off clears nothing: the windows are each device's now.
+    service.savePreferences({ reminderQuiet: null } as never);
+    assert.deepEqual(quietOf(phone.id), { start: '22:15', end: '07:45', allowUrgent: true });
+    for (const device of service.push.list()) service.push.unsubscribe(device.id);
+  } finally {
+    service.close();
+  }
 });
 
 test('PR-10 (control-tower phase 53, #56): a pref set to null returns to its shipped default, in memory and on disk', () => {

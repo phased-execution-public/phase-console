@@ -132,6 +132,7 @@ export const SUPERVISOR_SITUATIONS = Object.freeze(
 
 /** @typedef {(typeof SUPERVISOR_SITUATIONS)[number]} SupervisorSituation */
 
+
 /**
  * The families the Tower's annunciator counts DETECTIONS under (control-tower
  * phase 102, #145 E) — the supervisor's own, drawn beside the halt families
@@ -993,3 +994,4 @@ export const CHAT_HUMAN_STEP_TOOLS = Object.freeze([
   'human-step-open-again',
   'human-step-check-now',
 ]);
+

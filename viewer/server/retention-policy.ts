@@ -29,6 +29,13 @@ export type RetentionSink =
   | 'locks'
   | 'run-worktrees'
   | 'human-steps'
+  | 'turn-evidence'
+  // The grant ledger (control-tower phase 149): rotated past its cap; a live
+  // grant only the rotated copy holds is carried forward by its next read.
+  | 'grants'
+  // What the AI handled instead of asking (control-tower phase 136): rotated
+  // past its cap; the reader folds the rotated copy and the live file.
+  | 'handled'
   ;
 
 export type RetentionPolicy = {
@@ -84,6 +91,19 @@ export type RetentionPolicy = {
    * the next rotation replaces `.1`, bounding the ledger at twice this.
    */
   humanStepsRotateBytes: number;
+  /** `grants.ndjson` (control-tower phase 149), rotated to `.1` past this — the live grants carried forward. */
+  grantsRotateBytes: number;
+  /** `handled.ndjson` and `handled-sessions.ndjson` (control-tower phase 136), each rotated to `.1` past this — the reader folds both. */
+  handledRotateBytes: number;
+  /**
+   * `turn-evidence/` — what a person attached to an item (control-tower phase
+   * 133, #210), one file per content hash: a piece older than this many days
+   * goes. Evidence is read by a check and a checking session within hours; a
+   * month is the window a person might still ask what they sent.
+   */
+  turnEvidenceRetainDays: number;
+  /** …and the whole directory, oldest first past this. */
+  turnEvidenceMaxBytes: number;
   /**
    * A kept run worktree — a finished run's checkout, left by its `keep` or
    * `keep-on-failure` policy — past this many days (control-tower phase 56,
@@ -124,6 +144,10 @@ export const RETENTION_DEFAULTS: RetentionPolicy = Object.freeze({
   crashRetainDays: 14,
   locksRotateBytes: 4 * 1024 * 1024,
   humanStepsRotateBytes: 4 * 1024 * 1024,
+  grantsRotateBytes: 4 * 1024 * 1024,
+  handledRotateBytes: 4 * 1024 * 1024,
+  turnEvidenceRetainDays: 30,
+  turnEvidenceMaxBytes: 64 * 1024 * 1024,
   runWorktreeRetainDays: 14,
   runWorktreesMaxBytes: 2 * 1024 * 1024 * 1024,
 });
@@ -164,6 +188,10 @@ export function sanitiseRetention(parsed: Partial<RetentionPolicy> | undefined):
     crashRetainDays: positive('crashRetainDays'),
     locksRotateBytes: positive('locksRotateBytes'),
     humanStepsRotateBytes: positive('humanStepsRotateBytes'),
+    grantsRotateBytes: positive('grantsRotateBytes'),
+    handledRotateBytes: positive('handledRotateBytes'),
+    turnEvidenceRetainDays: positive('turnEvidenceRetainDays'),
+    turnEvidenceMaxBytes: positive('turnEvidenceMaxBytes'),
     runWorktreeRetainDays: positive('runWorktreeRetainDays'),
     runWorktreesMaxBytes: positive('runWorktreesMaxBytes'),
   };

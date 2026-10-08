@@ -1103,3 +1103,30 @@ test('SW-6: switch-account {dry: true} previews the lanes it would checkpoint an
     r.cleanup();
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * OD-1..2 (control-tower phase 131, #208) — who pressed is what the press proves
+ * ------------------------------------------------------------------ */
+
+test('OD-2: `bin/btw` names itself — its ask is recorded `via: cli` with its label, through the local door', async () => {
+  const { actorOfRequest } = await import('../server/api/actor.ts');
+  const btw = readFileSync(new URL('../../bin/btw', import.meta.url), 'utf8');
+  const userAgent = /-A '([^']+)'/.exec(btw)?.[1];
+  assert.ok(userAgent, 'btw sends a User-Agent of its own (it sent none, and read as a script)');
+  const actor = actorOfRequest({ headers: { host: '127.0.0.1:4123', 'user-agent': userAgent } }, {}, { by: 'btw' });
+  assert.equal(actor.via, 'cli');
+  assert.equal(actor.by, 'btw');
+  assert.equal(actor.pressDoor, 'local', 'a terminal proves nothing more than this machine');
+});
+
+test('OD-1/OD-2: a person\'s press keeps the door it came through beside the start door — a label moves neither', async () => {
+  const { actorOfRequest } = await import('../server/api/actor.ts');
+  const scripted = actorOfRequest({ headers: { host: '127.0.0.1:4123', 'user-agent': 'curl/8.7.1' } }, {}, { by: 'operator' });
+  assert.equal(scripted.by, 'operator', 'the label is recorded as offered');
+  assert.equal(scripted.pressDoor, 'local', 'and the door is what the request proved');
+  const started = pressActor(scripted);
+  assert.equal(started.door, 'operator', 'the start door a person\'s press opens');
+  assert.equal(started.pressDoor, 'local', 'the press door rides beside it into run.start');
+  assert.equal(doorActor('converge-heal', { by: 'console', via: 'timer', origin: 'pe-hub' }).pressDoor, undefined,
+    'an automatic door stamps nothing: its door is read off its clock');
+});

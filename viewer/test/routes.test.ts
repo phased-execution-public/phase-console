@@ -1598,16 +1598,16 @@ test('ACT-11: switch-account with no `by` records an actor derived from the requ
     extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'Mozilla/5.0 (Macintosh) AppleWebKit/605 Safari/605' },
   });
   assert.equal(out.status, 200, err(out));
-  assert.deepEqual(switched[0].slice(0, 3), ['demo', 'default', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }]);
+  assert.deepEqual(switched[0].slice(0, 3), ['demo', 'default', { by: 'operator', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' }]);
   // A script — curl, undici, nothing — is told apart from the operator.
   await call(service, 'POST', '/api/run/demo/switch-account', { body: { accountId: 'default' }, extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'curl/8.4.0' } });
   assert.equal((switched[1][2] as { by: string }).by, 'script');
   // The console's own CLI is the operator, over `cli`.
   await call(service, 'POST', '/api/run/demo/switch-account', { body: { accountId: 'default' }, extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'btw/1' } });
-  assert.deepEqual(switched[2][2], { by: 'operator', via: 'cli', origin: 'local', remoteUser: null });
+  assert.deepEqual(switched[2][2], { by: 'operator', via: 'cli', origin: 'local', remoteUser: null, pressDoor: 'local' });
   // A body may still LABEL `by`; the transport it cannot touch.
   await call(service, 'POST', '/api/run/demo/switch-account', { body: { accountId: 'default', by: 'a test' }, extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'curl/8.4.0' } });
-  assert.deepEqual(switched[3][2], { by: 'a test', via: 'api', origin: 'local', remoteUser: null });
+  assert.deepEqual(switched[3][2], { by: 'a test', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' });
   for (const call_ of switched) assert.notEqual((call_[2] as { by: string }).by, 'console');
 });
 
@@ -1622,12 +1622,12 @@ test('SHD-3: through the --remote proxy the actor carries the login and the host
     extraHeaders: { host: 'mac.tail1234.ts.net', 'tailscale-user-login': 'alice@github', 'user-agent': 'Mozilla/5.0 (iPhone) Safari/605' },
   });
   assert.equal(out.status, 200, err(out));
-  assert.deepEqual(stopped[0][2], { by: 'alice@github', via: 'api', origin: 'mac.tail1234.ts.net', remoteUser: 'alice@github' });
+  assert.deepEqual(stopped[0][2], { by: 'alice@github', via: 'api', origin: 'mac.tail1234.ts.net', remoteUser: 'alice@github', pressDoor: 'device' });
   // The same header on a loopback request vouches for nobody (classify() would have refused it upstream anyway).
   await call(service, 'POST', '/api/run/demo/stop', {
     body: {}, extraHeaders: { host: '127.0.0.1:4123', 'tailscale-user-login': 'alice@github', 'user-agent': 'curl/8' },
   });
-  assert.deepEqual(stopped[1][2], { by: 'script', via: 'api', origin: 'local', remoteUser: null });
+  assert.deepEqual(stopped[1][2], { by: 'script', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' });
 });
 
 test('SHD-3: restart and shutdown derive their actor, and a body with no `by` never reads console', async () => {
@@ -1641,8 +1641,8 @@ test('SHD-3: restart and shutdown derive their actor, and a body with no `by` ne
   await call(service, 'POST', '/api/restart', { body: {}, extraHeaders: { host: 'localhost:4123', 'user-agent': 'Mozilla/5.0' } });
   await call(service, 'POST', '/api/shutdown', { body: { confirm: true }, extraHeaders: { host: 'localhost:4123', 'user-agent': 'Mozilla/5.0' } });
   assert.deepEqual(seen, [
-    ['restart', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }, false],
-    ['shutdown', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }],
+    ['restart', { by: 'operator', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' }, false],
+    ['shutdown', { by: 'operator', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' }],
   ]);
 });
 
@@ -1664,7 +1664,7 @@ test('POST /api/accounts/:id/clear-retired: behind --allow-accounts, 404 for an 
   });
   assert.equal(out.status, 200, err(out));
   assert.deepEqual((out.body as { account: unknown }).account, view);
-  assert.deepEqual(cleared[0], ['work', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }], 'the clearance names who pressed it');
+  assert.deepEqual(cleared[0], ['work', { by: 'operator', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' }], 'the clearance names who pressed it');
 
   const missing = await call(service, 'POST', '/api/accounts/ghost/clear-retired', { body: {}, extraHeaders: { host: '127.0.0.1:4123' } });
   assert.equal(missing.status, 404);
@@ -1762,7 +1762,7 @@ test('POST /api/accounts/:id/probe-entitlement (phase 15): behind --allow-accoun
     assert.equal(body.probe.by, 'operator');
     assert.equal(body.probe.costUsd, 0.003);
     assert.equal(body.account.probe?.status, 'ok', 'the row the dashboard redraws carries the answer');
-    assert.deepEqual(asked[0], [id, { by: 'operator', via: 'api', origin: 'local', remoteUser: null }], 'the request\'s derived actor, never a console literal');
+    assert.deepEqual(asked[0], [id, { by: 'operator', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' }], 'the request\'s derived actor, never a console literal');
 
     // Written where every console reads it: the machine-wide learned store…
     const row = Object.values(accounts.learned.snapshot().credentials).find((c) => c.ids.includes(`route-test/${id}`));

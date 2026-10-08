@@ -45,7 +45,6 @@ import { ChevronRight, Radio } from 'lucide-react';
 import { api, type QueueEntry, type RunState } from '@/lib/api';
 import {
   keys,
-  useApiMutation,
   useApprovals,
   useAuth,
   useConsoleState,
@@ -56,21 +55,15 @@ import {
 } from '@/lib/queries';
 import { usePrefs } from '@/lib/prefs';
 import { relativeTime } from '@/lib/format';
-import { Button, Badge, Empty, PageError, Skeleton, toast } from '@/components/ui';
-import { ApprovalQueue, type Answer, type Decide, type Extend } from './approvals';
+import {
+  Button,
+  Badge,
+  Empty,
+  PageError,
+  Skeleton,
+} from '@/components/ui';
+import { ApprovalQueue } from './approvals';
 import { UndrivenCard } from './undriven';
-
-/**
- * What answering one approval card takes, named off the callback's own type —
- * so the two cannot drift and neither respells `allow`/`deny`.
- */
-type DecideArgs = {
-  id: Parameters<Decide>[0];
-  decision: Parameters<Decide>[1];
-  reason: Parameters<Decide>[2];
-  remember: Parameters<Decide>[3];
-  rule: Parameters<Decide>[4];
-};
 import { LiveConsole } from './console';
 import { isLive } from './defaults';
 import { LaneTabStrip, type LaneTabItem } from './lanes';
@@ -189,81 +182,6 @@ export default function RunsView({ route }: { route?: Route }) {
 
   const approvals = (queue ?? []).filter((a) => a.status === 'pending');
 
-  /**
-   * Answer a card, then re-read — the re-read in `onSettled`, never in the
-   * success leg.
-   *
-   * A card answered on a phone leaves this tab holding one that no longer
-   * exists; pressing it 404s, and that failure is exactly the case where
-   * re-reading matters most. `useApiMutation` is what holds that rule now, so
-   * the only thing written out here is what this particular write MEANS — and
-   * the bundle is `afterInboxAct`, deliberately the widest one there is: an
-   * inbox verb can approve a permission, recover a run, unblock a phase and
-   * clear a badge in one press.
-   *
-   * The toast is `onDone` rather than `say`, because the server answers three
-   * different ways: a rule it could not parse (a warning, not a failure), a
-   * rule it wrote (worth naming the file), and a plain answer.
-   */
-  const answer = useApiMutation<DecideArgs, Awaited<ReturnType<typeof api.decide>>>({
-    fn: ({ id, decision, reason, remember, rule }) => api.decide(id, decision, reason, remember, rule),
-    invalidates: keys.afterInboxAct(),
-    onDone: (result, { decision }) => {
-      if (result?.error) toast(result.error, 'warn');
-      else if (result?.wrote) {
-        toast(
-          `${decision === 'allow' ? 'Approved' : 'Denied'} · wrote ${result.wrote} (${result.scope})`,
-          'ok',
-        );
-      } else {
-        toast(decision === 'allow' ? 'Approved' : 'Denied', decision === 'allow' ? 'ok' : 'warn');
-      }
-    },
-  });
-  const { mutate: answerCard } = answer;
-  const decide: Decide = useCallback(
-    (id, decision, reason, remember, rule) => answerCard({ id, decision, reason, remember, rule }),
-    [answerCard],
-  );
-  // Not yet (control-tower phase 97, #140). The toast says which of the two
-  // things happened: the deadline moved, or the card will stand past its hook.
-  const { mutate: extendCard } = useApiMutation<
-    { id: string; minutes: number },
-    Awaited<ReturnType<typeof api.extend>>
-  >({
-    fn: ({ id, minutes }) => api.extend(id, minutes),
-    invalidates: keys.afterInboxAct(),
-    onDone: (result, { minutes }) => {
-      if (!result?.ok) toast(result?.error ?? 'the card could not be extended', 'warn');
-      else if (result.standing)
-        toast('Extended — past its hook call the card stands; allowing it then resumes the phase', 'ok');
-      else toast(`Extended ${minutes >= 60 ? `${minutes / 60} h` : `${minutes} min`}`, 'ok');
-    },
-  });
-  const extend: Extend = useCallback((id, minutes) => extendCard({ id, minutes }), [extendCard]);
-  // A pick on a relayed question (phase 14) — the same invalidation bundle as a
-  // card's answer, since it takes a card down too.
-  const pick = useApiMutation<
-    { slug: string; approvalId: string; key: string; label: string },
-    Awaited<ReturnType<typeof api.answerQuestion>>
-  >({
-    fn: ({ slug, approvalId, key, label }) => api.answerQuestion(slug, approvalId, [{ key, label }]),
-    invalidates: keys.afterInboxAct(),
-    onDone: (result, { label }) => {
-      if (!result?.ok) toast(result?.error ?? 'the question could not be answered', 'warn');
-      else
-        toast(
-          result.remaining ? `Answered “${label}” · ${result.remaining} left` : `Answered “${label}”`,
-          'ok',
-        );
-    },
-  });
-  const { mutate: pickOption } = pick;
-  const answerQuestion: Answer = useCallback(
-    (approval, key, label) => pickOption({ slug: approval.slug, approvalId: approval.id, key, label }),
-    [pickOption],
-  );
-
 
 
   /* ---------------- the fleet ---------------- */
@@ -359,13 +277,7 @@ export default function RunsView({ route }: { route?: Route }) {
       <div className="flex flex-col gap-4">
         {/* Then, always: a session parked with its hand up is the first thing
             on this page that is waiting on a person. */}
-        <ApprovalQueue
-          approvals={approvals}
-          allowRun={allowRun}
-          onDecide={decide}
-          onExtend={extend}
-          onAnswer={answerQuestion}
-        />
+        <ApprovalQueue />
 
         {/* Beside it, the other ask only a person answers: a phase the board
             reads in progress that nothing of its live run drives (#114). */}

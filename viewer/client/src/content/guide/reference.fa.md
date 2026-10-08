@@ -49,6 +49,8 @@
 | `phase-console install-hooks` | هوکِ حضورِ نشست را به <span dir="ltr">`~/.claude/settings.json`</span> اضافه می‌کند، تا کنسول بداند کدام نشست‌ها زنده‌اند. `uninstall-hooks` آن را برمی‌دارد؛ `hooks-status` می‌گوید هست یا نه. |
 | <span dir="ltr">`phase-console doctor [instance] [--json]`</span> | بررسی می‌کند این ماشین آماده‌ی اجرا هست یا نه: همان بررسی‌هایی که شروعِ یک اجرا انجام می‌دهد، بدونِ طرح — حساب‌ها، سرورهای MCP، loginِ `claude`، یک کانالِ تحویل، هوک‌های حضور، نسخه‌ی CLI در برابرِ کفِ relay، `gh auth status`. کدِ خروجِ ۱ اولین ردیفِ مسدودکننده‌ی ناموفق را نام می‌برد. |
 | <span dir="ltr">`phase-console sessions ingest [instance]`</span> | dropهای در صفِ هوکِ حضور را وقتی هیچ کنسولی اجرا نمی‌شود اعمال می‌کند — هوک وقتی POSTش کسی را پیدا نکند، خودش آن را اجرا می‌کند. تا وقتی کنسول جواب می‌دهد کاری نمی‌کند، چون همان کنسول صندوقِ ورودیِ خودش را تخلیه می‌کند. |
+| <span dir="ltr">`phase-console owner status \| enroll \| lock`</span> | کلیدِ مالک (owner key) از ترمینال. `status` می‌گوید کنسول `unenrolled`، `enrolled` یا `unlocked` است (یک کلید ثبت شده و این درخواست مالِ مالک است)، و کلیدها و درخواست‌های منتظر را فهرست می‌کند. `enroll` لینکِ یک‌بارمصرفِ کلیدِ اول را چاپ می‌کند، ده دقیقه معتبر و فقط برای یک بار: آن را در مرورگری روی همین ماشین باز کنید، و <span dir="ltr">`#/settings/permissions?enrol=<token>`</span> را باز می‌کند تا یک passkey ثبت شود. کنسولی که از قبل کلید دارد رد می‌کند؛ کلیدِ بعدی از مرورگری ثبت می‌شود که به‌عنوانِ مالک وارد شده. `lock` همین حالا هر نشستِ مالک را تمام می‌کند، پس فشارِ پرریسکِ بعدی دوباره کلید را می‌خواهد. <span dir="ltr">`--console <name\|port>`</span> مشخص می‌کند از کدام کنسول بپرسد، <span dir="ltr">`--json`</span> پاسخِ خام را چاپ می‌کند. یک نشستِ تحت نظارت (supervised) نمی‌تواند `enroll` یا `lock` را اجرا کند. |
+| <span dir="ltr">`phase-console grants list \| revoke <id> \| revoke-all`</span> | اجازه‌های دارای گستره از ترمینال. `list` هر اجازه را نشان می‌دهد، تازه‌ترین اول: قاعده و گستره‌اش، چه کسی و از کدام درگاه (door) داده، تا کِی، و چه چیزی را تغییر داد. <span dir="ltr">`revoke <id>`</span> یک اجازه‌ی زنده را تمام می‌کند و دقیقاً آنچه را تغییر داده بود برمی‌گرداند؛ `revoke-all` هر اجازه‌ی زنده را تمام می‌کند. پس‌گرفتن اختیار را برمی‌دارد، پس به کلیدِ مالک نیازی نیست. <span dir="ltr">`--reason <words>`</span>، <span dir="ltr">`--console <name\|port>`</span> و <span dir="ltr">`--json`</span> پرچم‌هایش‌اند. یک نشستِ تحت نظارت نمی‌تواند revoke کند. |
 
 <span dir="ltr">`./start`</span> معادلِ clone است، و یک **مخزن می‌گیرد، نه یک فعل**: اولین آرگومانِ ساده‌اش به <span dir="ltr">`--root`</span> تبدیل می‌شود.
 
@@ -67,7 +69,7 @@
 | `deadline 2026-12-01` (یا <span dir="ltr">`by …`</span>) | auto | فقط پیش از آن تاریخ — بعد از آن گیت OVERDUE خوانده می‌شود. |
 | <span dir="ltr">`cmd <command>`</span> | auto | دستور با کدِ ۰ خارج می‌شود. **اتوپایلوت آن را ارزیابی می‌کند (`PHASE_EXEC_GATES=1`)؛ دیدنِ صفحه‌ها هرگز آن را اجرا نمی‌کند** — اجرای دستوری که در یک سند نوشته شده ارزشِ یک opt-in صریح را دارد. |
 
-**تأیید کردن** — از راهِ کارتِ Gate صفحه‌ی فاز، یا <span dir="ltr">`scripts/gate-approve.sh <slug> <N> --by <who>`</span> — گیتی از **هر** نوع را رفع می‌کند: ردیف در `docs/handoffs/<slug>/gate-status.md` می‌نشیند، و لغوِ آن گیت را برمی‌گرداند. سرفصلِ <span dir="ltr">`*(GATED)*`</span> که هیچ Gate-checkای ندارد، به‌عنوانِ گیتِ **ai** خوانده می‌شود (پیش‌فرض از ۵.۰.۰) — و تا وقتی نویسنده نگوید کدام است، lintِ طرح را رد می‌کند.
+**تأیید کردن** — از راهِ کارتِ Gate صفحه‌ی فاز، یا <span dir="ltr">`scripts/gate-approve.sh <slug> <N> --by <who>`</span> — گیتی از **هر** نوع را رفع می‌کند: ردیف در `docs/handoffs/<slug>/gate-status.md` می‌نشیند، و لغوِ آن گیت را برمی‌گرداند. وقتی گیت همین حالا خواسته‌ی یک آدم است، کارت آن را به‌شکلِ یک مورد از **Your turn** می‌کشد و به آن‌جا پیوند می‌دهد، جایی که Approve شواهدش را می‌گیرد؛ هر گیتِ دیگر **Approve** و **Revoke**ِ خودِ طرح را نگه می‌دارد. سرفصلِ <span dir="ltr">`*(GATED)*`</span> که هیچ Gate-checkای ندارد، به‌عنوانِ گیتِ **ai** خوانده می‌شود (پیش‌فرض از ۵.۰.۰) — و تا وقتی نویسنده نگوید کدام است، lintِ طرح را رد می‌کند.
 
 ## نگه‌داشت‌های بازبینی
 
@@ -199,6 +201,57 @@ scripts/qa-record.sh <slug> N pass --report …   # record a QA result
 مجموعه‌ی کامل — بوت‌پرامپت‌ها، دسته‌بندیِ نشست‌ها، وضعیتِ گیت، ساخت اسکلتِ هندآف — در `docs/controls.md` است.
 
 </div>
+
+## Your turn: اسکریپت و endpointها
+
+نشستی که به یک آدم نیاز دارد آن را با <span dir="ltr">`phase-outcome.sh`</span> اعلام می‌کند. کنسول یک مورد در
+**Your turn** (نوبتِ شما) بالا می‌آورد، یک بار اعلامش می‌کند، بررسی‌اش می‌کند، و به نشست جواب برمی‌گرداند. مرجعِ
+خودِ نشست <span dir="ltr">`references/turn.md`</span> است؛ این‌ها واژه‌هایی‌اند که یک آدم با آن‌ها روبه‌رو می‌شود.
+
+<div dir="ltr">
+
+```bash
+scripts/phase-outcome.sh <slug> <N> needs-human --needs <key> --step <kind> --title "…" --why <reason> --guide <file>
+scripts/phase-outcome.sh <slug> <N> handled --what "…" [--note "…"] [--link <ref>]…
+```
+
+</div>
+
+| پرچمِ <span dir="ltr">`needs-human --step KIND`</span> | می‌گوید |
+|---|---|
+| <span dir="ltr">`--why REASON`</span> | چرا فقط یک آدم به آن می‌خورد: یکی از ده دلیل، محدود به آنچه نوعِ مورد اجازه می‌دهد. |
+| <span dir="ltr">`--guide FILE` · `--lang TAG`</span> | راهنمای کاملی که یک آدم دنبال می‌کند، و زبانش. راهنمای فارسی راست‌به‌چپ کشیده می‌شود. |
+| <span dir="ltr">`--effort MIN` · `--due ISO` · `--unblocks PHASES`</span> | چقدر طول می‌کشد، کِی موعدش می‌رسد، و کدام فازها را باز می‌کند. |
+| <span dir="ltr">`--proof-type TYPE` · `--proof-words TEXT`</span> | چگونه اثبات می‌شود: `probe`، `answer`، `judgement` یا `attest`، و کلماتی که یک نشستِ بررسی‌کننده در جایی می‌خواند که هیچ دستوری کارساز نیست. |
+| <span dir="ltr">`--option ID=LABEL[::CONSEQUENCE]` · `--recommended ID` · `--allow-decline`</span> | گزینه‌های یک تصمیم، گزینه‌ی پیشنهادی، و اینکه *Not doing this* پیشنهاد شود یا نه. |
+| <span dir="ltr">`--window DURATION`</span> | چقدر می‌تواند منتظر بماند، حداکثر هفت روز. |
+| <span dir="ltr">`--tried TEXT`</span> | نشست چه اجرا کرد و چگونه شکست خورد — پاسخ به یک ردّ. |
+
+کدِ خروج می‌گوید چه بر سرش آمد. `0`: نوشته شد. `2`: به‌خاطر شکلش رد شد — دلیلی که نوعِ مورد اجازه نمی‌دهد، نبودِ
+اثبات، یک راز در هر مقدار. `3`: اثبات از قبل برقرار است، پس چیزی بالا نمی‌آید و نشست ادامه می‌دهد. `4`:
+نگهبان ردش کرد، چون هوش مصنوعی می‌توانست خودش آن کار را بکند — هر دستوری که راهنمایش می‌خواهد دستوری است که
+سیاستِ خودِ اجرا اجازه‌اش را می‌دهد — یا چون یک بلاکِ مجوز به دیواری اشاره می‌کند که کنسول ثبت نکرده
+(*nothing refused this — run it*). هر ردّ ردیفی زیرِ *Handled by the AI* می‌شود.
+
+`handled` یک نتیجه نیست. آنچه را نشست به‌جای پرسیدن از یک آدم خودش انجام داد، به‌شکلِ یک ردیف زیرِ *Handled by the
+AI* ثبت می‌کند: <span dir="ltr">`--what`</span> می‌گوید چه، <span dir="ltr">`--note`</span> یک خط اضافه می‌کند، و
+تا هشت ref از <span dir="ltr">`--link`</span> به یک کامیت (<span dir="ltr">`commit:<sha>`</span>)، یک pull request
+(<span dir="ltr">`pr:[owner/name]#<n>`</span>)، یک issue (<span dir="ltr">`issue:[owner/name]#<n>`</span> یا
+<span dir="ltr">`#<n>`</span>)، یک خطِ ژورنال (<span dir="ltr">`journal:<slug>/<runId>#<line>`</span>) یا نشانیِ
+یک کامیت، pull request یا issueِ GitHub اشاره می‌کنند. مقداری که شکلِ یک راز داشته باشد رد می‌شود.
+
+| Endpoint | کاری که می‌کند |
+|---|---|
+| <span dir="ltr">`GET /api/turn`</span> | تنها خواندنِ Your turn: دوری که آن را خواند، تیتر، گروه‌ها با شمارششان، و آنچه رسیدگی شد. <span dir="ltr">`?seen=<ISO>`</span> ردیف‌های رسیدگی‌شده از آن زمان را می‌شمارد. |
+| <span dir="ltr">`GET /api/turn/:id`</span> | شرحِ یک مورد: چه می‌خواهد، راهنمایش، تلاش‌هایش، و اینکه چرا مالِ یک آدم است. |
+| <span dir="ltr">`POST /api/human-steps/:id/<verb>`</span> | یک فشار روی یک مورد: `check`، `snooze`، `cannot`، `ask`، `evidence`، `answer`، `decline`، `grant`، `deny`، `convert`، `rewrite` یا `override`. |
+| <span dir="ltr">`GET /api/permissions/grants`</span> | هر اجازه، تازه‌ترین اول. |
+| <span dir="ltr">`POST /api/permissions/grants/:id/revoke`</span> · <span dir="ltr">`POST /api/permissions/grants/revoke-all`</span> | یک اجازه‌ی زنده را تمام می‌کند، یا همه را. |
+
+<span dir="ltr">`answer`</span>، <span dir="ltr">`decline`</span>، <span dir="ltr">`deny`</span>،
+<span dir="ltr">`convert`</span>، <span dir="ltr">`grant`</span>، <span dir="ltr">`rewrite`</span>،
+<span dir="ltr">`override`</span> و دو revoke فشارهای اختیارند، مالِ یک آدم. راهنمای Permissions اجازه‌ها و کلیدِ مالک
+(owner key) را شرح می‌دهد.
 
 ## کیبورد
 

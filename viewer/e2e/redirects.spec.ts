@@ -29,6 +29,10 @@ const LANDS: readonly { from: string; to: string; title: string }[] = [
   { from: '#/search?q=cart', to: '#/runs?k=cart', title: 'Runs' },
   { from: '#/guide/mobile', to: '#/runs?help=mobile', title: 'Runs' },
   { from: '#/notifications', to: '#/runs?bell=1&panel=announcements', title: 'Runs' },
+  // The phone's answer page became Your turn (control-tower phase 137), and a
+  // push's step lands on its item — both in one hop.
+  { from: '#/approve', to: '#/turn', title: 'Your turn' },
+  { from: '#/approve?step=turn-now-signin', to: '#/turn/turn-now-signin', title: 'Your turn' },
   // Not a redirect at all: the Pro ledger's address stays what it was.
   { from: '#/runs?view=table', to: '#/runs?view=table', title: 'Runs' },
 ];

@@ -31,6 +31,23 @@ for p in \
   "viewer/server/watch-scheduler.ts" \
   "viewer/server/watch-unit.ts" \
   "viewer/server/declared-probe.ts" \
+  "viewer/server/turn/guard.ts" \
+  "viewer/server/permissions/walls.ts" \
+  "viewer/server/turn/fold.ts" \
+  "viewer/server/turn/index.ts" \
+  "viewer/server/turn/evidence.ts" \
+  "viewer/server/turn/verdict.ts" \
+  "viewer/server/turn/checker.ts" \
+  "viewer/server/turn/handled.ts" \
+  "viewer/server/turn/headline.ts" \
+  "viewer/server/turn/round.ts" \
+  "viewer/server/owner/door.ts" \
+  "viewer/server/owner/passkey.ts" \
+  "viewer/server/owner/registry.ts" \
+  "viewer/server/owner/session.ts" \
+  "viewer/server/owner/requests.ts" \
+  "viewer/server/owner/presses.ts" \
+  "viewer/server/permissions/grants.ts" \
   "viewer/server/verify-watch.ts" \
   "viewer/server/debug/index.ts" \
   "viewer/server/debug/sources.ts" \
@@ -76,6 +93,8 @@ for p in \
   "viewer/shared/issue-modes.js" \
   "viewer/shared/launch-presets.js" \
   "viewer/shared/human-step-model.js" \
+  "viewer/shared/turn-model.js" \
+  "viewer/shared/guide-grammar.js" \
   "viewer/shared/instances.mjs" \
   "viewer/shared/recovery-model.js" \
   "viewer/shared/halt-categories.js" \
@@ -160,6 +179,8 @@ for p in \
   "bin/diagnostics-verb.mjs" \
   "bin/report-verb.mjs" \
   "bin/run-verb.mjs" \
+  "bin/owner-verb.mjs" \
+  "bin/grants-verb.mjs" \
   "viewer/server/retention.ts" \
   "viewer/server/retention-policy.ts" \
   "viewer/server/debug/bundle.ts" \
@@ -198,6 +219,7 @@ for p in \
   "scripts/messages.env" \
   "scripts/issues.env" \
   "scripts/human-steps.env" \
+  "scripts/turn.env" \
   "scripts/permission.env" \
   "scripts/skill-api.env" \
   "templates/plan.md" \

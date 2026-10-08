@@ -66,13 +66,18 @@ import { budgetClause } from '../shared/ci-refusal.js';
 import { waitBudgetEndOf } from './runner/wait-budget.ts';
 import { shell } from './shell.ts';
 import { parseUnitRef, UNIT_POLL_MS, type UnitTarget } from './watch-unit.ts';
+import type { CredentialVerdict } from './credentials-probe.ts';
 
 /**
  * Every scheme this console will poll. The list is written here and nowhere
  * else. `unit` (control-tower phase 121, #181) is a systemd unit on another
- * machine, read over ssh (`watch-unit.ts`).
+ * machine, read over ssh (`watch-unit.ts`). `credential` (control-tower phase
+ * 132, #209) is a credential the console can name — `gh`, `claude`,
+ * `env:NAME`, `keychain:SERVICE`, `file:PATH` — read by PRESENCE through
+ * `credentials-probe.ts`, never its value: the proof a `secret-entry` item is
+ * given, so storing the secret proves it with nothing read back.
  */
-export const WATCH_SCHEMES = ['gh-run', 'gh-pr', 'date', 'lock', 'phase', 'verify', 'cmd', 'unit'] as const;
+export const WATCH_SCHEMES = ['gh-run', 'gh-pr', 'date', 'lock', 'phase', 'verify', 'cmd', 'unit', 'credential'] as const;
 export type WatchScheme = (typeof WATCH_SCHEMES)[number];
 
 export type WatchRefTarget =
@@ -85,7 +90,16 @@ export type WatchRefTarget =
   | { kind: 'verify'; slug: string; phase: number; ref: string }
   | { kind: 'cmd'; command: string; ref: string }
   /** `unit:<host>/<unit>` — the host is a NAME the machine profile resolves, never an address. */
-  | UnitTarget;
+  | UnitTarget
+  /** `credential:<id>` — a credential the console reads by presence (`credentials-probe.ts` ids). */
+  | { kind: 'credential'; id: string; ref: string };
+
+/**
+ * The ids a `credential:` ref names — exactly `credentials-probe.ts`
+ * `knownCredentialId`'s: `gh`, the machine login, and the three by-name kinds.
+ * `scripts/phase-outcome.sh` `_watch_problem` reads the same shape.
+ */
+export const CREDENTIAL_REF_ID_RE = /^(?:gh|claude|claude-login|(?:env|keychain|file):\S+)$/;
 
 export type WatchState = {
   ref: string;
@@ -173,6 +187,9 @@ export const WATCH_POLL_MS: Readonly<Record<WatchScheme, number>> = Object.freez
   cmd: 300_000,
   // One `systemctl show` over the host's multiplexed ssh — a fixed cadence.
   unit: UNIT_POLL_MS,
+  // A presence read (a `security` lookup, an env read, a stat) — cheap, and a
+  // person storing a secret wants it seen within the minute.
+  credential: 60_000,
 });
 
 /**
@@ -460,6 +477,10 @@ export function parseWatchRef(ref: string): WatchRefTarget | null {
     return Number.isSafeInteger(phase) && phase > 0 ? { kind, slug: m[1], phase, ref } : null;
   }
   if (ref.startsWith('unit:')) return parseUnitRef(ref);
+  if (ref.startsWith('credential:')) {
+    const id = ref.slice('credential:'.length).trim();
+    return CREDENTIAL_REF_ID_RE.test(id) ? { kind: 'credential', id, ref } : null;
+  }
   if (ref.startsWith('cmd:')) {
     // The conventional spelling quotes the command (`cmd:"npm test"`), because
     // that is what reads well in a `--watch` argument; the quotes are the
@@ -901,6 +922,8 @@ export type WatchProbeDeps = {
   verifyProbe?: (target: Extract<WatchRefTarget, { kind: 'verify' }>) => Promise<WatchState>;
   /** `unit:<host>/<unit>` — one `systemctl show` over the host's ssh master (`watch-unit.ts` `UnitProber`). */
   unitProbe?: (target: UnitTarget) => Promise<WatchState>;
+  /** `credential:<id>` — presence by name (`credentials-probe.ts` `probeCredential`); never the value. */
+  credentialProbe?: (id: string) => Promise<Pick<CredentialVerdict, 'status' | 'reason'>>;
 };
 
 /**
@@ -944,6 +967,15 @@ export async function probeWatchRef(
     try { return await opts.unitProbe(target); } catch (error) {
       return { ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160) };
     }
+  }
+  if (target.kind === 'credential') {
+    if (!opts.credentialProbe) return { ref: target.ref, state: 'unknown', detail: 'no credential prober wired' };
+    let verdict: Pick<CredentialVerdict, 'status' | 'reason'>;
+    try { verdict = await opts.credentialProbe(target.id); } catch (error) {
+      return { ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160) };
+    }
+    const state = verdict.status === 'ok' ? 'landed' : verdict.status === 'fail' ? 'pending' : 'unknown';
+    return { ref: target.ref, state, detail: verdict.reason.slice(0, 160) };
   }
   if (target.kind === 'cmd') {
     if (!opts.runCommand) return { ref: target.ref, state: 'unknown', detail: 'cmd refs are not being run' };

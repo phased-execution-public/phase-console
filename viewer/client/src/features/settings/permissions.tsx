@@ -25,7 +25,9 @@ import { api, type PolicyLists } from '@/lib/api';
 import type { PolicyAdvisoryKind } from '@shared/ops-vocab.js';
 import { cn } from '@/lib/cn';
 import { keys, toastError, useConsoleState, usePlans, usePolicy } from '@/lib/queries';
+import { GrantsCard } from './grants';
 import { SettingsSectionFrame, sectionFor } from './nav';
+import { OwnerKeysCard } from './owner-keys';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -765,7 +767,8 @@ function RuleChips({
 }
 
 /**
- * The Permissions section — the card in its own frame.
+ * The Permissions section — the grants, the owner keys (control-tower phase
+ * 138) and the rule editor, in their own frame.
  *
  * Its own export rather than a wrapper in `index.tsx` so that the lazy import
  * pulls the rule editor and this heading together; a section whose title lived
@@ -776,6 +779,8 @@ export function PermissionsSection() {
   const { data: state } = useConsoleState();
   return (
     <SettingsSectionFrame section={sectionFor('permissions')!}>
+      <GrantsCard />
+      <OwnerKeysCard />
       <PolicyCard allowWrites={Boolean(state?.allowWrites)} />
     </SettingsSectionFrame>
   );

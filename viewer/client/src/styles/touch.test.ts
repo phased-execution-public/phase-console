@@ -316,7 +316,7 @@ describe('the thumb floor is a hit area, not a class', () => {
    * positioned descendant it hit-tests ABOVE non-positioned siblings. Measured
    * twice, on two surfaces:
    *
-   *   **the approve card.** "Open where it lives" sits `gap-2` (8px) under
+   *   **the approve card** (now Your turn's item card). "Open where it lives" sits `gap-2` (8px) under
    *   Allow / Deny / Stop, so the overlay's top edge landed at y=497 against a
    *   button row ending at y=502 and `elementFromPoint` three pixels inside
    *   EVERY one of the three buttons answered the link. Five pixels, on the one
@@ -331,7 +331,11 @@ describe('the thumb floor is a hit area, not a class', () => {
    * jsdom computes no styles; the measurement lives in the register.
    */
   const BOX_FLOOR: Readonly<Record<string, number>> = Object.freeze({
-    'features/approve/index.tsx': 3, // "Open the console" · "Open where it lives" on an ask and on a step card (phase 42)
+    // Your turn (control-tower phase 137) — the approve page's three became the turn's links:
+    'features/turn/item-card.tsx': 2, // the facts' plan / phase / run / unblocks links, "Open where it lives"
+    'features/turn/index.tsx': 1, // "Repo ▸ Issues" under the toolbar
+    'features/turn/handled.tsx': 1, // a handled row's plan link
+    'features/turn/guide.tsx': 1, // a guide step's link, its address beneath it
     'features/insights/cost-vs-caps.tsx': 1, // Runs against their budgets
     'features/insights/portfolio.tsx': 2, // Locks · Stalled plans
     'features/insights/plan-cost.tsx': 1, // the per-phase spend list

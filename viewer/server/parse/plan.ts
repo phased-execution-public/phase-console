@@ -28,6 +28,7 @@ import {
   CREDENTIAL_ID_RE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BULLET_KEYS, HUMAN_STEP_WHERE, KIND_META, dueRefOk, humanStepKindOf,
   type HumanStepKind, type HumanStepWhere,
 } from '../../shared/human-step-model.js';
+import { reasonAllowed, type WhyPerson } from '../../shared/turn-model.js';
 import { parseDecisionsTable } from '../../shared/decisions-model.js';
 import { inPlanReviewers, PERMISSION_MODES, withWindowNote } from '../../shared/run-settings.js';
 import { MODEL_POLICIES, type ModelPolicy } from '../../shared/run-lifecycle.js';
@@ -1032,6 +1033,22 @@ export function parseHumanStepBody(body: string): HumanStepDirective | undefined
   // `upcoming` until it lands.
   const due = values.due;
   if (due && !dueRefOk(due)) return undefined;
+  // Your turn's four (control-tower phase 130) — `_human_step_parse`'s rules.
+  const why = values.why?.toLowerCase();
+  if (why && !reasonAllowed(kind, why)) return undefined;
+  let effortMinutes: number | undefined;
+  if (values.effort) {
+    effortMinutes = durationMinutes(values.effort);
+    if (effortMinutes === undefined) return undefined;
+  }
+  let unblocks: number[] | undefined;
+  if (values.unblocks) {
+    const list = values.unblocks.replace(/ /g, '');
+    if (!/^0*[1-9][0-9]{0,4}(,0*[1-9][0-9]{0,4})*$/.test(list)) return undefined;
+    unblocks = list.split(',').map(Number);
+  }
+  const guide = values.guide;
+  if (guide && (/^\/|\.\.|\s/.test(guide) || !/^[A-Za-z0-9._/-]+\.md$/.test(guide))) return undefined;
   return {
     kind, what, where,
     ...(open ? { open } : {}),
@@ -1040,6 +1057,10 @@ export function parseHumanStepBody(body: string): HumanStepDirective | undefined
     ...(autoOpen ? { autoOpen: 'host' as const } : {}),
     ...(credential ? { credential } : {}),
     ...(due ? { due } : {}),
+    ...(why ? { why: why as WhyPerson } : {}),
+    ...(effortMinutes !== undefined ? { effortMinutes } : {}),
+    ...(unblocks ? { unblocks } : {}),
+    ...(guide ? { guide } : {}),
   };
 }
 
@@ -1161,6 +1182,11 @@ export type HumanStepDirective = {
   credential?: string;
   /** The watch ref the step is `upcoming` until (control-tower phase 121). */
   due?: string;
+  /** Your turn (control-tower phase 130): the reason a person fits it, the minutes, the phases, the guide file. */
+  why?: WhyPerson;
+  effortMinutes?: number;
+  unblocks?: number[];
+  guide?: string;
 };
 
 /**
@@ -1178,10 +1204,14 @@ export function humanStepsFor(plan: Plan | undefined, phase: number): HumanStepD
  * only when the step names one.
  */
 export function humanStepLine(step: HumanStepDirective): string {
+  const turn = step.why || step.effortMinutes !== undefined || step.unblocks || step.guide;
   return [
     step.kind, step.what, step.open ?? '', step.proof ?? '', step.where,
     step.windowMinutes === undefined ? '' : String(step.windowMinutes), step.autoOpen ?? '', step.credential ?? '',
-    ...(step.due ? [step.due] : []),
+    ...(turn
+      ? [step.due ?? '', step.why ?? '', step.effortMinutes === undefined ? '' : String(step.effortMinutes),
+        step.unblocks ? step.unblocks.join(',') : '', step.guide ?? '']
+      : step.due ? [step.due] : []),
   ].join('\t');
 }
 

@@ -35,7 +35,10 @@ import {
   isAuthHalt,
   nothingReadySituation,
   HUMAN_STEP_CATEGORY,
+  REASON_CATEGORY,
+  humanStepCategory,
 } from '../shared/halt-categories.js';
+import { WHY_PERSON } from '../shared/turn-model.js';
 import { haltCtx, haltView } from '../shared/halt-view.js';
 import { HALT_HOLDER_KINDS, HALT_HOLDER_VERBS, HALT_KINDS, recoveryActionsFor } from '../shared/recovery-model.js';
 import { HALT_KIND_SITUATION } from '../shared/fact-map.js';
@@ -310,5 +313,22 @@ test('every kind of person\'s turn lights exactly one family — the operator ac
   for (const kind of HUMAN_STEP_KINDS) assert.ok(HALT_CATEGORIES.includes(HUMAN_STEP_CATEGORY[kind]!), `${kind}: a family`);
   // A command or a click path the operator runs is an act at the machine, like
   // an interactive prompt or a cable — never "Stopped by you", which is a stop.
-  assert.equal(HUMAN_STEP_CATEGORY['operator-act'], 'environment');
+  // Control-tower phase 130: an operator's act lights its REASON's family —
+  // the default reason (`reserved`) is a decision — and a permission item is one.
+  assert.equal(HUMAN_STEP_CATEGORY['operator-act'], 'decision');
+  assert.equal(HUMAN_STEP_CATEGORY.permission, 'decision');
+});
+
+test('an operator act lights the family of its REASON, and every reason has one (control-tower phase 130)', () => {
+  assert.deepEqual(Object.keys(REASON_CATEGORY).sort(), [...WHY_PERSON].sort(), 'keyed by exactly the reasons');
+  for (const why of WHY_PERSON) assert.ok(HALT_CATEGORIES.includes(REASON_CATEGORY[why]!), `${why}: a family`);
+  assert.equal(humanStepCategory('operator-act', 'identity'), 'credentials');
+  assert.equal(humanStepCategory('operator-act', 'secret'), 'credentials');
+  assert.equal(humanStepCategory('operator-act', 'physical'), 'environment');
+  assert.equal(humanStepCategory('operator-act', 'reach'), 'external');
+  assert.equal(humanStepCategory('operator-act', 'third-party'), 'external');
+  assert.equal(humanStepCategory('operator-act', 'money'), 'decision');
+  assert.equal(humanStepCategory('operator-act'), 'decision', 'no reason: the default reason, reserved');
+  assert.equal(humanStepCategory('browser-login', 'secret'), 'credentials', 'any other kind lights its own family');
+  assert.equal(humanStepCategory('permission', 'permission'), 'decision');
 });

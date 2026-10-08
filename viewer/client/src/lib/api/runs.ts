@@ -2111,8 +2111,13 @@ export interface PreludeStep {
   /** What the proof answered at the door, in its own words. */
   read?: string;
   windowMinutes?: number;
+  /** The plan's `auto-open: host` — opened on the machine at launch, once the door has shown its link. */
   autoOpen?: 'host';
   credential?: string;
+  /** The watch ref it is `upcoming` until (control-tower phase 121). */
+  due?: string;
+  /** The open item that already asks for it — a launch before this one raised it (control-tower phase 139). */
+  item?: string;
 }
 
 /** The launch draft's answers to probe 5 — fingerprints; waivers as `<phase>:<fp>`. */

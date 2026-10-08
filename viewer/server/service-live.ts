@@ -112,7 +112,9 @@ import {
   accountRung, errandFor, ladderCaps, nextRung, rungsFor, settleRung, type Rung,
 } from './runner/ladder.ts';
 import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
-import { asActor, pressActor } from './actor.ts';
+import { asActor, pressActor, pressDoorOf } from './actor.ts';
+import { isPersonDoor, type OwnerDoorMode, type PressDoor } from '../shared/door-model.js';
+import { ownerDoorMode } from './owner/door.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import {
   KIND_PROFILE, NO_HANDOFF_AUTO_RE, VERIFICATION_AUTO_RE, isRecoveryClass, recoveryActionsFor,
@@ -169,6 +171,11 @@ import { factsFor, splitSituation } from '../shared/fact-map.js';
 import type { Service } from './service.ts';
 import { ServiceBase, trimOldest, NOTIFIED_CAP } from './service-base.ts';
 import { parseQaRounds, type QaRoundRow } from './parse/folder.ts';
+import { errandIsItem, errandTurnInput } from './turn/index.ts';
+import { wallErrand } from './turn/fold.ts';
+import { guardWall } from './turn/guard.ts';
+import { answeredByItem, grantedByItem, ruleFamilyOf, wallOfHookDenial } from './permissions/walls.ts';
+import { callMatches, callSubject } from './permissions/grants.ts';
 import { readFileSync } from 'node:fs';
 
 /**
@@ -180,6 +187,34 @@ import { readFileSync } from 'node:fs';
 export const BOARD_RETRY_MS = 60_000;
 
 export abstract class ServiceLive extends ServiceBase {
+  /**
+   * A `blocked --needs permission` declaration's item (control-tower phase
+   * 135): G5 — the wall it cites among those recorded for its lane (the
+   * console's own deny with a rule included) — raised through the one door,
+   * whatever wall it was. False when nothing recorded a wall it names: the
+   * declaration is refused (journalled), and its errand stands as before.
+   */
+  protected raiseDeclaredWall(slug: string, runId: string, phase: number): boolean {
+    if (!this.root?.ok) return false;
+    const run = latestRun(this.root.path, slug, this.liveRunIds());
+    const record = run && run.id === runId ? run.phases[String(phase)] : undefined;
+    if (!record) return false;
+    const walls = [...(record.walls ?? [])];
+    const denied = record.toolDenied;
+    if (denied && denied.rule !== 'in-turn-wait' && !walls.some((wall) => wall.rule === denied.rule)) {
+      walls.push(wallOfHookDenial(denied, denied.at));
+    }
+    const verdict = guardWall({ rule: record.declared?.rule ?? null, command: record.declared?.command ?? null }, walls);
+    if (!verdict.ok) {
+      log.warn('turn.guard-refused', { slug, phase, kind: 'permission', rule: verdict.rule, exit: verdict.exit, sentence: verdict.sentence, stage: 'ingest' });
+      return false;
+    }
+    return this.raisePermissionItem({
+      slug, runId, phase, ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+      wall: verdict.wall, need: record.declared?.reason ?? null,
+    }) !== null;
+  }
+
   /** A released lock's phase stops fencing its scope — `ServiceRuns.noteFenceReleased`. */
   protected abstract noteFenceReleased(slug: string, phase: number): void;
 
@@ -464,12 +499,21 @@ export abstract class ServiceLive extends ServiceBase {
   protected announceErrand(data: unknown): void {
     const event = data as {
       slug?: string; runId?: string; phase?: number;
-      errand?: { at?: string; need?: string; how?: string; tried?: string[]; situation?: string; budget?: BudgetFact; upcoming?: boolean };
+      /** The errand settles an item already proven (control-tower phase 132) — announce it, raise nothing. */
+      settled?: boolean;
+      errand?: {
+        at?: string; need?: string; how?: string; tried?: string[]; situation?: string; budget?: BudgetFact; upcoming?: boolean;
+        stepId?: string;
+      };
     } | undefined;
     const { slug, runId, phase, errand } = event ?? {};
     // An act not due yet summons nobody (control-tower phase 121, #182): its
     // ONE push is the step's own, when its due-when ref lands.
     if (errand?.upcoming) return;
+    // One turn, one announcer (control-tower phase 132, #209): an errand that
+    // IS an item — the step a session declared, a preflight's credential — was
+    // announced by that item's own push, once, under the item's tag.
+    if (errand?.stepId) return;
     // An errand a BUDGET wrote (a ladder cap, a spent wait) is announced as the
     // budget it is (control-tower phase 14, #40), under `budget` and through the
     // one dedupe, never as a second, mismatched needs-you card beside it.
@@ -498,6 +542,28 @@ export abstract class ServiceLive extends ServiceBase {
     }
 
     const title = phase != null ? this.store?.get(slug)?.plan?.phases[phase]?.title : undefined;
+    // A person errand IS an `operator-act` item (§Architecture 19): raised
+    // through the one door, it is announced ONCE — in the errand's own words,
+    // under the item's tag — and answered by *I've done this — check* on it.
+    // A second announcement of the same errand is the same item, unpushed.
+    // A permission errand IS the permission item its lane's recorded wall
+    // raises (control-tower phase 135, #212) — the session's declaration held
+    // to G5 — announced ONCE as that item. Nothing recorded: the errand below.
+    if (runId && phase != null && !event?.settled && errand.situation && wallErrand(errand.situation)
+      && this.raiseDeclaredWall(slug, runId, phase)) return;
+    if (runId && phase != null && !event?.settled && errand.situation && errandIsItem(errand.situation)) {
+      const raised = this.raiseTurn(
+        errandTurnInput({ slug, phase, runId }, { situation: errand.situation, need: errand.need, ...(errand.how ? { how: errand.how } : {}) }),
+        {
+          message: {
+            title: `${slug} · phase ${phase} needs you`,
+            body: errand.need.slice(0, 200),
+            ...(errand.how ? { detail: `${errand.how}${title ? ` — ${title}` : ''}`.slice(0, 400) } : {}),
+          },
+        },
+      );
+      if (raised && !('refused' in raised)) return;
+    }
     // WHICH channel, from the fact map rather than from here. A `gated-manual`
     // errand is a gate: it waits on a decision, nothing is spending while it
     // waits, and the door is one button on the phase page — so it announces on
@@ -1730,6 +1796,16 @@ export abstract class ServiceLive extends ServiceBase {
   }
 
   /**
+   * This console's owner-door mode (control-tower phase 131, #208) —
+   * `unenrolled` until phase 148's owner keys: `local` presses what it could
+   * before. One reader, so the gate's person test, the router's door check and
+   * `/api/state` cannot disagree.
+   */
+  ownerDoorMode(): OwnerDoorMode {
+    return ownerDoorMode();
+  }
+
+  /**
    * Approve (or revoke) a phase's gate — the clearance record every gate kind
    * honours (`gate-approve.sh` → docs/handoffs/<slug>/gate-status.md). The
    * verdict is the POSTCONDITION read back from the engine, not the script's
@@ -1744,12 +1820,16 @@ export abstract class ServiceLive extends ServiceBase {
     opts: {
       approve: boolean; by?: string; note?: string; continueRun?: boolean; actor?: Actor;
       /**
-       * A PERSON's press (control-tower phase 107, #174): the Gate card from a
-       * browser, a phone's signed Approve, a supervisor-chat act a person
-       * confirmed on its card. Only a person's press opens a MANUAL gate, and
-       * only one is written through the console's door — absent is no person.
+       * The door the press came through (control-tower phase 131, #208; a
+       * person's press since phase 107, #174): the Gate card's request, a
+       * phone's signed Approve (`device`), a supervisor-chat act a person
+       * confirmed on its card (that person's door), or the chat on its own
+       * (`supervisor`). Only a PERSON's door (`isPersonDoor`: `owner`,
+       * `device`, and `local` on a console with no owner key) opens a MANUAL
+       * gate, and only one is written through the console's door — absent is
+       * no person.
        */
-      person?: boolean;
+      door?: PressDoor;
     },
   ): Promise<{ ok: boolean; gate: GateStatus | null; detail: string; resumed?: boolean }> {
     if (!this.flags.allowWrites) {
@@ -1757,21 +1837,29 @@ export abstract class ServiceLive extends ServiceBase {
     }
     const record = this.store?.get(slug);
     if (!record || !this.root) return { ok: false, gate: null, detail: `No plan named ${slug}.` };
-    // A manual gate is a person's (#174). A script calling this route, or a
-    // chat act nobody confirmed, is refused here with the sentence that says
-    // where a person approves it — before the script is asked, which refuses
-    // the same act on its own (`gate-approve.sh`'s door).
+    // A manual gate is a person's (#174) — and since phase 131 (#208) the test
+    // is the press's DOOR, not its User-Agent: a session's token, the
+    // supervisor's bearer or a chat act nobody confirmed is refused here with
+    // the sentence that says where a person approves it — before the script is
+    // asked, which refuses the same act on its own (`gate-approve.sh`'s door).
     const gateDetail = record.plan?.phases[phase];
-    if (opts.approve && opts.person !== true
-      && gateKindOf(gateDetail?.gateCheck, gateDetail?.gated ?? false, this.gateVocab) === 'human') {
-      log.warn('gate.approve-refused', { slug, phase, by: opts.by, via: opts.actor?.via ?? null });
+    const mode = this.ownerDoorMode();
+    const person = isPersonDoor(opts.door, mode);
+    const manual = gateKindOf(gateDetail?.gateCheck, gateDetail?.gated ?? false, this.gateVocab) === 'human';
+    if (opts.approve && !person && manual) {
+      log.warn('gate.approve-refused', { slug, phase, by: opts.by, via: opts.actor?.via ?? null, door: opts.door ?? null });
       return {
         ok: false,
         gate: null,
         detail: `Phase ${phase}'s gate is manual — a person's to clear. Approve it on the phase's Gate card in the console `
-          + 'or from a notification on your phone; a script, a session or an unconfirmed chat act cannot.',
+          + 'or from a notification on your phone; a session, the supervisor or an unconfirmed chat act cannot.',
       };
     }
+    // With no owner key a press from this machine is taken as a person's, as it
+    // always was — and the approval says so, so nobody reads more into it.
+    const unenrolled = opts.approve && manual && opts.door === 'local' && mode === 'unenrolled'
+      ? ' It came through the local door: this console has no owner key yet, so a press from this machine counts as a person\'s.'
+      : '';
 
     let outcome;
     try {
@@ -1779,7 +1867,7 @@ export abstract class ServiceLive extends ServiceBase {
         planWrite(
           {
             action: 'gate-approve' as const, slug, phase, by: opts.by, reason: opts.note, revoke: !opts.approve,
-            ...(opts.person === true ? { door: 'console' as const } : {}),
+            ...(person ? { door: 'console' as const } : {}),
           },
           { root: this.root.path, docsDir: this.root.docsDir },
         ),
@@ -1813,7 +1901,7 @@ export abstract class ServiceLive extends ServiceBase {
       ...(resumed ? { resumed } : {}),
       detail: ok
         ? (opts.approve
-          ? `Gate approved for ${slug} phase ${phase}${resumed ? ' — the run is continuing' : ''}.`
+          ? `Gate approved for ${slug} phase ${phase}${resumed ? ' — the run is continuing' : ''}.${unenrolled}`
           : `Gate approval revoked for ${slug} phase ${phase} — the gate is back in force.`)
         : (outcome.stderr || outcome.stdout).trim() || 'The write did not change the gate.',
     };
@@ -2963,23 +3051,51 @@ export abstract class ServiceLive extends ServiceBase {
     reason: string | undefined,
     remember?: { scope: PolicyScope; rule: string },
     actor?: Actor,
+    fresh?: boolean,
   ): { ok: boolean; decision?: string; wrote?: string; scope?: PolicyScope; error?: string } {
     const approval = this.approvals.all().find((entry) => entry.id === id);
-    const answered = this.settleApproval(id, decision, by, reason, remember, approval);
+    // The door the answer came through (phase 131, #208) rides to the card's
+    // waiter: a supervisor-chat act is a person's press only when a person's
+    // door allowed its card. With it, whether that door PROVED a fresh owner
+    // touch (phase 149) — the engine judges a high grant by that, never by
+    // the door's name alone.
+    const answered = this.settleApproval(id, decision, by, reason, remember, approval, actor ? pressDoorOf(actor) : undefined, fresh);
     // A card that outlived its hook call and stood (control-tower phase 97,
     // #140): the session was told no long ago and the run is parked on it. A
     // person's Allow is the answer it was waiting for — the call is granted
     // ONCE, and the phase resumes through the Resume press, so the session
     // asks again and is let through.
-    if (answered.ok && decision === 'allow' && approval?.converted && approval.tool && approval.phase != null) {
-      this.grantOnce(approval);
+    // Granted on its permission item (phase 149): the item's grant covers the
+    // call and its road back resumes the session — nothing to grant again here.
+    if (answered.ok && decision === 'allow' && approval?.converted && approval.tool && approval.phase != null && !grantedByItem(reason)) {
+      this.grantOnce(approval, by, actor ? pressDoorOf(actor) : undefined);
       const instruction = `A person allowed ${approval.title} on its standing approval card after your hook call `
         + 'ended — run that exact call again: it is granted once, then asks as usual.';
       void this.pressResume(approval.slug, approval.phase, 'resume', {
         instruction, actor: pressActor(actor ?? asActor(by, 'Service.decideApproval')),
       }).catch((error: unknown) => log.warn('approval.resume-failed', { id, error: String(error) }));
     }
+    // The permission item whose Grant this card is (control-tower phase 135):
+    // answered on the card itself, the item is answered too — an Allow is the
+    // grant that covers it (withdrawn, its waiters resumed by the card's own
+    // road), a Deny a person's denial. One the ITEM answered is settled already.
+    if (answered.ok && !answeredByItem(reason)) this.settleCardItem(id, decision, by);
     return answered;
+  }
+
+  /** Settle the open permission item a card is the Grant of, once the card is answered on its own. */
+  private settleCardItem(cardId: string, decision: 'allow' | 'deny', by: string): void {
+    try {
+      const ledger = this.humanStepsNow();
+      for (const step of ledger.open()) {
+        const grant = step.kind === 'permission' ? step.permission?.grant : undefined;
+        if (!grant || !('approvalId' in grant) || grant.approvalId !== cardId) continue;
+        if (decision === 'allow') ledger.move(step.id, 'dismissed', { by, verb: 'dismiss', note: `granted on its card — ${grant.label}` });
+        else ledger.move(step.id, 'declined', { by, verb: 'decline', note: 'denied on its card' });
+      }
+    } catch (error) {
+      log.warn('human-steps.ledger-unwritable', { cardId, error: (error as Error)?.message ?? String(error) });
+    }
   }
 
   /**
@@ -2993,29 +3109,34 @@ export abstract class ServiceLive extends ServiceBase {
     return this.approvals.extend(id, minutes, by);
   }
 
-  /** Calls a person allowed on a standing card, each granted once (#140): run|phase|tool|input → the card. */
-  protected oneTimeGrants = new Map<string, string>();
-
-  private grantKey(runId: string, phase: number, tool: string, input: unknown): string {
-    return `${runId}|${phase}|${tool}|${JSON.stringify(input ?? null)}`;
-  }
-
-  private grantOnce(approval: Approval): void {
-    this.oneTimeGrants.set(
-      this.grantKey(approval.runId, approval.phase!, approval.tool!.name, approval.tool!.input), approval.id,
-    );
+  /**
+   * A call a person allowed on a standing card (#140) is a `call` GRANT since
+   * control-tower phase 149: one use, kept in the ledger rather than in this
+   * process's memory — so a restart loses nothing, and the row says who, which
+   * card and when — spent when the session asks again.
+   */
+  private grantOnce(approval: Approval, by: string, door?: PressDoor): void {
+    const tool = approval.tool!.name;
+    const applied = this.grantsNow().apply({
+      scope: 'call', wall: 'ask', tool, rule: approval.suggestedRule ?? tool,
+      command: callSubject(tool, approval.tool!.input) ?? null, input: approval.tool!.input, family: 'any',
+      slug: approval.slug, phase: approval.phase!, runId: approval.runId, card: approval.id, via: 'card',
+      by, door: door ?? null, reason: 'allowed on its standing approval card after the hook call ended',
+    });
+    if (!applied.ok) log.warn('approval.resume-failed', { id: approval.id, error: applied.error });
   }
 
   /**
-   * Spend a one-time grant (#140): true — and gone — when a person allowed
-   * exactly this call of this phase on a standing card; false for anything else.
+   * Spend a one-time grant (#140): the card's id — and the grant spent — when a
+   * person allowed exactly this call of this phase on a standing card; false
+   * for anything else. Read from the grant ledger (phase 149).
    */
   takeOneTimeGrant(runId: string, phase: number, tool: string, input: unknown): string | false {
-    const key = this.grantKey(runId, phase, tool, input);
-    const card = this.oneTimeGrants.get(key);
-    if (!card) return false;
-    this.oneTimeGrants.delete(key);
-    return card;
+    const row = this.grantsNow().live().find((one) => one.scope === 'call' && one.card && one.runId === runId
+      && one.phase === phase && callMatches(one, tool, input));
+    if (!row) return false;
+    this.grantsNow().spend(row);
+    return row.card!;
   }
 
   private settleApproval(
@@ -3025,34 +3146,55 @@ export abstract class ServiceLive extends ServiceBase {
     reason: string | undefined,
     remember: { scope: PolicyScope; rule: string } | undefined,
     approval: Approval | undefined,
+    door?: PressDoor,
+    fresh?: boolean,
   ): { ok: boolean; decision?: string; wrote?: string; scope?: PolicyScope; error?: string } {
     let wrote: string | undefined;
     let failed: string | undefined;
 
+    // Nothing is remembered for a card that is not up (phase 149): the rule
+    // is written only beside an answer that lands.
+    if (remember?.rule && !this.approvals.isPending(id)) return { ok: false, error: 'no such pending approval' };
     if (remember?.rule) {
       const rule = remember.rule.trim();
       if (!parseRule(rule)) {
         failed = `"${rule}" is not a rule this syntax accepts — nothing was written`;
       } else if (remember.scope === 'plan' && !approval?.slug) {
         failed = 'this card is not attached to a plan, so it cannot write a plan-scoped rule';
+      } else if (decision === 'allow') {
+        // An allow with *remember* is a GRANT (control-tower phase 149): the
+        // engine writes the allow rule for this plan or for every plan on this
+        // machine WITH its row — listed, journalled, announced and revocable
+        // like every grant — and refuses a rule on the never list.
+        const tool = approval?.tool?.name ?? parseRule(rule)?.tool ?? 'Bash';
+        const applied = this.grantsNow().apply({
+          scope: remember.scope === 'plan' ? 'plan' : 'always', wall: 'ask', tool, rule,
+          family: ruleFamilyOf({ tool, rule }),
+          slug: approval?.slug ?? null, phase: approval?.phase ?? null, runId: approval?.runId ?? null,
+          card: id, via: 'card', by, door: door ?? null, reason: reason ?? 'remembered on its approval card',
+          // The owner door holds a high remember (every plan on this machine)
+          // on a console with a key — touched inside five minutes, as the
+          // press's own door reading proved it; the engine reads the key itself.
+          ...(typeof fresh === 'boolean' ? { fresh } : {}),
+        });
+        if (applied.ok) wrote = rule;
+        else failed = `${applied.error} — nothing was written`;
       } else {
-        // An allow decision writes an allow rule; a deny writes an ask rule
-        // rather than a deny one. Widening from a card is deliberate and
-        // reversible; *narrowing* to the wall from a card is not offered at
-        // all — `deny` is what holds when this console is dead, and it should
-        // take more than a tap to put something there.
-        const list = decision === 'allow' ? 'allow' : 'ask';
+        // A deny writes an ask rule rather than a deny one: narrowing to the
+        // wall from a card is not offered at all — `deny` is what holds when
+        // this console is dead, and it should take more than a tap to put
+        // something there. A narrowing is no grant: it gives nothing away.
         this.editPolicy({
           scope: remember.scope,
           slug: approval?.slug ?? null,
-          add: { [list]: [rule] },
+          add: { ask: [rule] },
           by,
         });
         wrote = rule;
       }
     }
 
-    const settled = this.approvals.settle(id, decision, by, reason);
+    const settled = this.approvals.settle(id, decision, by, reason, door, fresh);
     if (!settled) return { ok: false, error: 'no such pending approval' };
     return {
       ok: true,
@@ -3116,6 +3258,11 @@ export abstract class ServiceLive extends ServiceBase {
       // because it is what every message and lifecycle verb identifies it by.
       instance: { id: INSTANCE.id, name: INSTANCE.name, pinned: INSTANCE.pinned },
       allowWrites: this.flags.allowWrites,
+      // The owner door's mode (control-tower phase 131, #208): `unenrolled`
+      // until an owner key exists (phase 148) — a browser's press is `local`,
+      // and `local` presses what it could before. A page says so where a
+      // press would need an owner (the manual gate's card).
+      ownerDoor: this.ownerDoorMode(),
       // Present only on a server that has the run endpoints at all. The client
       // is read from disk per request but the server is whatever Node loaded at
       // startup, so upgrading the skill under a running console leaves a new UI

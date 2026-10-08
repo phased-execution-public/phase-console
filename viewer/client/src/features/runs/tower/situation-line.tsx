@@ -20,7 +20,7 @@ import type { RunState, SpendView } from '@/lib/api';
 import { money, plural } from '@/lib/format';
 import { useSpend } from '@/lib/queries';
 import { cn } from '@/lib/cn';
-import { insightsHref, runsBayHref } from '@/app/routes';
+import { insightsHref, runsBayHref, turnHref } from '@/app/routes';
 import { runFocusWords } from '@/features/runs/check-words';
 import type { TowerModel } from './tower-model';
 
@@ -50,15 +50,16 @@ export function situationParts(input: {
       href: runsBayHref('needs-you'),
     });
   // A person's turn is named on its own (control-tower phase 42): of the
-  // things that need you, these are the ones only you can do, and each waits
-  // on the act itself — a sign-in, a code, a look — not on a decision.
-  const turns = tower.steps?.length ?? 0;
+  // things that need you, these are the ones only you can do. It counts ITEMS
+  // — an errand and its step are one — and opens the page they are on
+  // (control-tower phase 139).
+  const turns = tower.items?.length ?? 0;
   if (turns)
     parts.push({
       key: 'your-turn',
       text: `Your turn (${turns})`,
       loud: true,
-      href: runsBayHref('needs-you'),
+      href: turnHref(),
     });
 
   const live = tower.bays.live;

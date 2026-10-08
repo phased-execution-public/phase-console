@@ -144,7 +144,7 @@ import { REFUSAL_CAUSES, SITUATIONS, parseSituationKey } from '../shared/situati
 import { RUNG_DRIVERS, RUNG_FAILURE_CAUSES, RUNG_VEHICLES } from '../shared/ladder-model.js';
 import { HALT_HOLDER_KINDS, HALT_HOLDER_VERBS } from '../shared/recovery-model.js';
 import { HALT_CATEGORIES } from '../shared/halt-categories.js';
-import { AUTHORITY_VERBS } from '../shared/door-model.js';
+import { AUTHORITY_PRESSES, AUTHORITY_VERBS, DOOR_VERDICTS, OWNER_DOOR_MODES, OWNER_DOOR_STATES, PRESS_DOORS } from '../shared/door-model.js';
 import { POLICY_CLASSES, POLICY_SOURCES } from '../shared/policy-model.js';
 import { RELAY_MODES } from '../shared/run-settings.js';
 import {
@@ -197,6 +197,10 @@ import {
 import {
   HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_BULLET_KEYS, SECRET_QUERY_KEYS,
 } from '../shared/human-step-model.js';
+import {
+  GRANT_SCOPES, GRANT_STATES, HANDLED_LINK_KINDS, HANDLED_SOURCES, PROOF_TYPES, RISK_TIERS, RULE_FAMILIES, TURN_GROUPS, VERDICT_BY, VERDICTS,
+  WALLS, WHY_PERSON,
+} from '../shared/turn-model.js';
 
 import {
   FAILURE_CAUSES,
@@ -796,9 +800,19 @@ const VOCABULARIES: {
    * the family through the owner — a second list would be a second opinion. */
   { name: 'halt categories', members: HALT_CATEGORIES, owner: 'shared/halt-categories.js' },
   /* The owner door's presses (control-tower phase 129, #218): the hook guard
-   * `console-forge` and its test read ONE table, `AUTHORITY_ROUTES`; the verbs
+   * `console-forge` and its test read ONE table, `AUTHORITY_ROUTES`; the words
    * a denial journals are its rows' names. */
+  { name: 'authority presses', members: AUTHORITY_PRESSES, owner: 'shared/door-model.js' },
+  /* …and the door itself (control-tower phase 131, #208): the doors a press
+   * can come through, the twelve authority words, the table's two modes and
+   * its three answers — read by the router's door check, the gate's person
+   * test, the supervisor chat and `owner-door.test.ts`, all through the owner. */
+  { name: 'press doors', members: PRESS_DOORS, owner: 'shared/door-model.js' },
   { name: 'authority verbs', members: AUTHORITY_VERBS, owner: 'shared/door-model.js' },
+  { name: 'owner door modes', members: OWNER_DOOR_MODES, owner: 'shared/door-model.js' },
+  { name: 'door verdicts', members: DOOR_VERDICTS, owner: 'shared/door-model.js' },
+  // The owner key (control-tower phase 148): what a console says about its owner door.
+  { name: 'owner door states', members: OWNER_DOOR_STATES, owner: 'shared/door-model.js' },
 
   /* The wait axis's reasons. `run-lifecycle.js` compares against each member
    * in turn (`recorded === 'external' || …`) because `status-vocab.js`, the
@@ -925,6 +939,27 @@ const VOCABULARIES: {
   { name: 'human-step states', members: HUMAN_STEP_STATES, owner: 'shared/human-step-model.js' },
   { name: 'human-step bullet keys', members: HUMAN_STEP_BULLET_KEYS, owner: 'shared/human-step-model.js' },
   { name: 'secret query keys', members: SECRET_QUERY_KEYS, owner: 'shared/human-step-model.js' },
+  /* Your turn (control-tower phase 130): why a person, how it is proven, how a
+   * check comes back, a grant's scope, tier and life, the page's groups, who
+   * handled something instead of asking, and which wall stopped the AI. */
+  { name: 'why-a-person reasons', members: WHY_PERSON, owner: 'shared/turn-model.js' },
+  { name: 'proof types', members: PROOF_TYPES, owner: 'shared/turn-model.js' },
+  { name: 'turn verdicts', members: VERDICTS, owner: 'shared/turn-model.js' },
+  { name: 'verdict writers', members: VERDICT_BY, owner: 'shared/turn-model.js' },
+  { name: 'grant scopes', members: GRANT_SCOPES, owner: 'shared/turn-model.js' },
+  { name: 'risk tiers', members: RISK_TIERS, owner: 'shared/turn-model.js' },
+  { name: 'grant states', members: GRANT_STATES, owner: 'shared/turn-model.js' },
+  { name: 'turn groups', members: TURN_GROUPS, owner: 'shared/turn-model.js' },
+  { name: 'handled sources', members: HANDLED_SOURCES, owner: 'shared/turn-model.js' },
+  /* What a handled row may link to (control-tower phase 136, #213). */
+  { name: 'handled link kinds', members: HANDLED_LINK_KINDS, owner: 'shared/turn-model.js' },
+  { name: 'walls', members: WALLS, owner: 'shared/turn-model.js' },
+  /* Permission asks (control-tower phase 135): the rule families the risk
+   * table tells apart. (`HOST_COMMANDS` is no vocabulary a page paints — it is
+   * the never list's reading of `DEFAULT_DENY`, held to it by
+   * `permission-item.test.ts` — and `runner/verify.ts` names the same five
+   * words in a refusal list of its own.) */
+  { name: 'rule families', members: RULE_FAMILIES, owner: 'shared/turn-model.js' },
   { name: 'isolation directives', members: ISOLATION_DIRECTIVES, owner: 'shared/worktree-model.js' },
   { name: 'worktree retention', members: WORKTREE_RETENTION, owner: 'shared/worktree-model.js' },
   /* Status model v2 (control-tower phase 16): the three questions a status now
@@ -1125,9 +1160,12 @@ test('START_DOORS is the census — fifteen doors, owned once — and the actor 
   // Fourteen from chapter 02 of the sep-review audit, and `trigger` since
   // control-tower phase 98 (#137): a stored trigger's act is automatic.
   // Pro adds Solve with autopilot's door (control-tower phase 120) after the
-  // nine `startRun` doors, so the census is sixteen in the free tree.
+  // nine `startRun` doors, so the census is seventeen in the free tree — the
+  // checking session's door (`turn-checker`, control-tower phase 134) is the
+  // seventeenth, a spawn the ceiling counts with no `startRun` site.
   const proDoors: string[] = [];
-  assert.equal(START_DOORS.length, 16 + proDoors.length, 'the audit counted fourteen automatic-start doors; phase 98 added the trigger, phase 101 the supervisor');
+  assert.equal(START_DOORS.length, 17 + proDoors.length, 'the audit counted fourteen automatic-start doors; phase 98 added the trigger, phase 101 the supervisor, phase 134 the checker');
+  assert.ok((START_DOORS as readonly string[]).includes('turn-checker'), 'the checking session names its door');
   assert.deepEqual(START_DOORS.slice(9, 9 + proDoors.length), proDoors, 'a Pro startRun door follows the nine');
   assert.deepEqual(START_DOORS.slice(-2), ['trigger', 'supervisor'], 'the trigger and the supervisor ride their verb\'s own door, so they follow the five that are not startRun sites');
   assert.equal(new Set(START_DOORS).size, START_DOORS.length, 'no door may be listed twice');
@@ -1146,7 +1184,7 @@ test('START_DOORS is the census — fifteen doors, owned once — and the actor 
   assert.deepEqual([...CLASSIFIED_BY], ['drive', 'outcome', 'closed', 'heal']);
   assert.equal(OPERATOR_DOOR, 'operator');
   assert.ok(!(START_DOORS as readonly string[]).includes(OPERATOR_DOOR), 'the press is not an automatic door');
-  assert.deepEqual([...ACTOR_FIELDS], ['by', 'via', 'origin', 'remoteUser', 'door', 'trigger', 'guard', 'counter', 'reason']);
+  assert.deepEqual([...ACTOR_FIELDS], ['by', 'via', 'origin', 'remoteUser', 'door', 'trigger', 'guard', 'counter', 'reason', 'pressDoor']);
   // The `run:progress` wire. Both ends read it — the server builds the frame
   // from it and the client's patch writes each field — so a name added here
   // without a reader is a field nothing paints.

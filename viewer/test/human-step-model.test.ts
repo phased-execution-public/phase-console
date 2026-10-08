@@ -63,28 +63,49 @@ const ORDINARY = [
   'v6.0.0',
 ];
 
-test('seventeen kinds and nine states, frozen, each word once', () => {
-  assert.equal(HUMAN_STEP_KINDS.length, 17);
-  assert.equal(new Set(HUMAN_STEP_KINDS).size, 17);
+test('eighteen kinds and eleven states, frozen, each word once', () => {
+  assert.equal(HUMAN_STEP_KINDS.length, 18);
+  assert.equal(new Set(HUMAN_STEP_KINDS).size, 18);
   // The seventeenth (control-tower phase 121, #182): an act only the operator
   // does — a command or a click path — with a moment it becomes due.
   assert.equal(HUMAN_STEP_KINDS[16], 'operator-act');
-  // The ninth state comes FIRST: `upcoming` is a step born before it is due.
-  assert.deepEqual([...HUMAN_STEP_STATES], ['upcoming', 'declared', 'notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']);
+  // The eighteenth (control-tower phase 130, #207): a wall the AI met, ended by
+  // a grant or a denial.
+  assert.equal(HUMAN_STEP_KINDS[17], 'permission');
+  // `upcoming` comes FIRST (phase 121); `returned` closes the open states and
+  // `declined` is the person's own settle (phase 130).
+  assert.deepEqual([...HUMAN_STEP_STATES], [
+    'upcoming', 'declared', 'notified', 'opened', 'checking', 'returned',
+    'proven', 'declined', 'expired', 'cannot', 'dismissed',
+  ]);
   for (const list of [HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_WHERE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BIRTHS, HUMAN_STEP_BULLET_KEYS]) {
     assert.ok(Object.isFrozen(list), 'a vocabulary is frozen');
   }
   assert.deepEqual([...HUMAN_STEP_WHERE], ['host', 'any']);
   assert.deepEqual([...HUMAN_STEP_AUTO_OPEN], ['host']);
-  assert.deepEqual([...HUMAN_STEP_BIRTHS], ['plan', 'session', 'console']);
+  // The fourth birth (control-tower phase 136, #213): an item the supervisor
+  // raises — its escalation, or one a chat asks for.
+  assert.deepEqual([...HUMAN_STEP_BIRTHS], ['plan', 'session', 'console', 'supervisor']);
 });
 
-test('the open and settled states partition the nine', () => {
+test('the open and settled states partition the eleven', () => {
   assert.deepEqual([...HUMAN_STEP_OPEN_STATES, ...HUMAN_STEP_SETTLED_STATES], [...HUMAN_STEP_STATES]);
-  assert.deepEqual([...HUMAN_STEP_OPEN_STATES], ['upcoming', 'declared', 'notified', 'opened', 'checking']);
+  assert.deepEqual([...HUMAN_STEP_OPEN_STATES], ['upcoming', 'declared', 'notified', 'opened', 'checking', 'returned']);
 });
 
-test('KIND_META is total over the seventeen kinds — icon, label, default where, proof hint', () => {
+test('the plan bullet gains why, effort, unblocks and guide; returned and declined move as phase 130 says', () => {
+  assert.deepEqual(HUMAN_STEP_BULLET_KEYS.slice(-4), ['why', 'effort', 'unblocks', 'guide']);
+  assert.ok(canTransition('checking', 'returned'), 'a check sends a step back');
+  assert.ok(!canTransition('notified', 'returned'), 'only a check does');
+  for (const from of ['upcoming', 'declared', 'notified', 'opened', 'checking', 'returned']) {
+    assert.ok(canTransition(from, 'declined'), `a person may decline from ${from}`);
+  }
+  assert.ok(canTransition('returned', 'checking'), 'a returned step is worked again');
+  assert.deepEqual([...HUMAN_STEP_TRANSITIONS.declined], [], 'declined settles');
+  assert.equal(KIND_META.permission.where, 'any');
+});
+
+test('KIND_META is total over the eighteen kinds — icon, label, default where, proof hint', () => {
   assert.deepEqual(Object.keys(KIND_META).sort(), [...HUMAN_STEP_KINDS].sort());
   const labels = new Set<string>();
   for (const kind of HUMAN_STEP_KINDS) {

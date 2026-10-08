@@ -1,34 +1,30 @@
 /**
- * Reminders for a person's turn (control-tower phase 42).
+ * Reminders for a person's turn (control-tower phase 42; ONE quiet-hours
+ * setting since phase 138, #215).
  *
  * A human step that waits on somebody is said again — +15 m, +1 h, +6 h, then
  * daily — until it is proven, handed back or its window closes (phase 43's
  * clock, `REMINDER_SERIES_MS`). The series is the console's own and not a
- * setting; what a person sets is when it may NOT speak: the quiet hours, the
- * server preference `reminderQuiet {start, end}` (`POST /api/prefs`). A
- * reminder due inside them waits for them to end — it is deferred, never
- * dropped — which is why they are a different thing from a device's own quiet
- * hours on the Devices card, which drop what arrives.
+ * setting.
  *
- * The server drops a malformed window silently (it answers 200), so this
- * form refuses one before it is sent: two `HH:MM` times, and not the same one.
+ * Neither are the quiet hours, any more. This card used to hold a window of
+ * its own (`reminderQuiet`), beside every device's on the Devices card — two
+ * answers to "may it buzz now?" that could disagree. There is one setting now,
+ * each device's, edited on the Devices card below: a reminder that falls due
+ * while every device that hears a person's turn is inside its window waits for
+ * the first one to wake (deferred, never dropped), and a reminder is never
+ * urgent, so it never breaks through one. This card says which devices those
+ * are and what each one's window is — read off the push register, never a
+ * copy of it. The old window was moved onto the devices once, by the server.
  */
 
-import { useEffect, useState } from 'react';
 import { REMINDER_SERIES_MS } from '@shared/human-step-model.js';
-import { api, type ReminderQuiet } from '@/lib/api';
-import { keys, useApiMutation, useConsoleState } from '@/lib/queries';
-import { Button, Card, CardBody, CardHeader, CardTitle, Input, Label } from '@/components/ui';
+import type { PushDevice, PushQuietHours } from '@/lib/api';
+import { usePush } from '@/lib/queries';
+import { Card, CardBody, CardHeader, CardTitle } from '@/components/ui';
 
-/** The window a person is offered first — the night. */
-export const DEFAULT_REMINDER_QUIET: ReminderQuiet = { start: '22:00', end: '08:00' };
-
-const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
-
-/** Is this a window the server keeps — two `HH:MM` times that differ? */
-export function validQuiet(quiet: ReminderQuiet): boolean {
-  return HHMM.test(quiet.start) && HHMM.test(quiet.end) && quiet.start !== quiet.end;
-}
+/** The category a person's turn — and every reminder of it — is pushed under. */
+const TURN_CATEGORY = 'needs-you';
 
 /** One gap of the series, in words. */
 export function gapWords(ms: number): string {
@@ -39,21 +35,32 @@ export function gapWords(ms: number): string {
   return hours === 24 ? 'a day' : `${hours / 24} days`;
 }
 
-export function RemindersCard() {
-  const { data: state } = useConsoleState();
-  const held = ((state?.prefs ?? {}) as { reminderQuiet?: ReminderQuiet | null }).reminderQuiet ?? null;
-  const [quiet, setQuiet] = useState<ReminderQuiet>(held ?? DEFAULT_REMINDER_QUIET);
-  useEffect(() => {
-    if (held) setQuiet(held);
-  }, [held?.start, held?.end]); // eslint-disable-line react-hooks/exhaustive-deps
+/** A device that hears a person's turn, and the quiet window it keeps — null when it keeps none. */
+export type ReminderDevice = { id: string; label: string; quiet: PushQuietHours | null };
 
-  const save = useApiMutation<ReminderQuiet | null, unknown>({
-    fn: (value) => api.savePrefs({ reminderQuiet: value }),
-    invalidates: keys.afterPrefs(),
-    say: (_result, value) =>
-      value ? `Quiet ${value.start} to ${value.end} — reminders wait for it to end.` : 'Quiet hours off.',
-  });
-  const valid = validQuiet(quiet);
+/** The devices a reminder is pushed to: every one that takes the turn's category. */
+export function reminderDevices(devices: readonly PushDevice[] | undefined): ReminderDevice[] {
+  return (devices ?? [])
+    .filter((device) => device.categories?.[TURN_CATEGORY] !== false)
+    .map((device) => ({ id: device.id, label: device.label, quiet: device.quiet ?? null }));
+}
+
+/** What the devices' windows mean for the next reminder, in one sentence. */
+export function quietSentence(devices: readonly ReminderDevice[]): string {
+  if (!devices.length) {
+    return 'No device hears a person’s turn, so a reminder goes to the inbox when it is due — there is nothing to be quiet on.';
+  }
+  const awake = devices.filter((device) => !device.quiet);
+  if (awake.length) {
+    const names = awake.map((device) => device.label).join(', ');
+    return `${names} ${awake.length === 1 ? 'keeps' : 'keep'} no quiet hours, so a reminder goes out when it is due.`;
+  }
+  return 'A reminder that falls due while every one of them is quiet waits for the first to wake — deferred, never dropped.';
+}
+
+export function RemindersCard() {
+  const { data: push } = usePush();
+  const devices = reminderDevices(push?.devices);
   const last = REMINDER_SERIES_MS[REMINDER_SERIES_MS.length - 1]!;
 
   return (
@@ -77,56 +84,28 @@ export function RemindersCard() {
           ))}
         </ol>
 
-        <fieldset className="flex flex-col gap-2" data-testid="reminder-quiet">
-          <legend className="text-sm font-medium text-ink">Quiet hours</legend>
+        <section className="flex flex-col gap-2" data-testid="reminder-quiet" aria-label="Quiet hours">
+          <h3 className="text-sm font-medium text-ink">Quiet hours</h3>
           <p className="max-w-prose text-ink-muted">
-            {held
-              ? `Reminders wait from ${held.start} to ${held.end}, and go out when it ends. None is dropped.`
-              : 'Off — a reminder goes out whenever it is due.'}
+            Reminders keep each device&rsquo;s own quiet hours &mdash; the one quiet-hours setting there is,
+            set per device under <strong className="text-ink">Devices</strong> below. A reminder is never
+            urgent, so it never breaks through a quiet window.
           </p>
-          <div className="flex flex-wrap items-end gap-2">
-            <Label className="flex flex-col gap-1 text-2xs text-ink-muted">
-              From
-              <Input
-                type="time"
-                data-testid="quiet-start"
-                value={quiet.start}
-                onChange={(event) => setQuiet({ ...quiet, start: event.target.value })}
-                className="w-32"
-              />
-            </Label>
-            <Label className="flex flex-col gap-1 text-2xs text-ink-muted">
-              Until
-              <Input
-                type="time"
-                data-testid="quiet-end"
-                value={quiet.end}
-                onChange={(event) => setQuiet({ ...quiet, end: event.target.value })}
-                className="w-32"
-              />
-            </Label>
-            <Button
-              size="sm"
-              variant="action"
-              data-testid="quiet-save"
-              disabled={!valid || save.isPending}
-              onClick={() => save.mutate(quiet)}
-            >
-              {held ? 'Save quiet hours' : 'Turn quiet hours on'}
-            </Button>
-            {held && (
-              <Button size="sm" variant="ghost" disabled={save.isPending} onClick={() => save.mutate(null)}>
-                Turn them off
-              </Button>
-            )}
-          </div>
-          {!valid && (
-            <p className="text-2xs text-failed" data-testid="quiet-invalid">
-              Two different times, each as hours and minutes — a window that starts where it ends is no
-              window.
-            </p>
+          {devices.length > 0 && (
+            <ul data-testid="reminder-devices" className="flex flex-col gap-0.5 text-ink">
+              {devices.map((device) => (
+                <li key={device.id} data-testid="reminder-device">
+                  <span className="font-medium">{device.label}</span>
+                  {' — '}
+                  {device.quiet ? `quiet ${device.quiet.start} to ${device.quiet.end}` : 'no quiet hours'}
+                </li>
+              ))}
+            </ul>
           )}
-        </fieldset>
+          <p className="max-w-prose text-ink-muted" data-testid="reminder-quiet-rule">
+            {quietSentence(devices)}
+          </p>
+        </section>
       </CardBody>
     </Card>
   );

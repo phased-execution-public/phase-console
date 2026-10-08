@@ -8,9 +8,10 @@
  * its bay was computed with, so the strip and the bay cannot disagree; the
  * one action on each is the strip's, chosen by that bay.
  *
- * - **Needs you** also carries the inbox rows no strip draws — an ask about a
- *   plan, a gate, a sign-in — with the inbox's own verbs (`InboxRow`) — and,
- *   last and uncounted, *Coming up*: the acts not due yet (phase 121).
+ * - **Needs you** is runs (control-tower phase 139, #216): a strip is a run, and
+ *   each strip's ONE action is its oldest item's primary. The asks no strip
+ *   draws — a plan's gate, a sign-in, the acts coming up — are items of Your
+ *   turn, and the bay links to the page with the page's own counts.
  * - **Waiting** and **Queued** say what each run waits on, on the strip
  *   itself (`waits.ts`): a hold, a scope fence and its refs, a folded errand,
  *   the queue's holder — a sibling run's branch included.
@@ -29,8 +30,8 @@ import { cn } from '@/lib/cn';
 import { plural } from '@/lib/format';
 import { usePrefs } from '@/lib/prefs';
 import { useFocusBand } from './focus-band';
-import { InboxRow, useInboxActions } from '@/components/inbox-row';
-import type { ConvergeStatusView, InboxItem } from '@/lib/api';
+import { turnHref } from '@/app/routes';
+import type { ConvergeStatusView } from '@/lib/api';
 import { nextSweepText } from '../sweep-text';
 import { ReadyBay } from './ready-bay';
 import { Strip } from './strip';
@@ -47,7 +48,7 @@ export const BAY_LABELS: Record<Bay, string> = {
 
 /** What an empty bay says — a fact about the console, not a mood. */
 const EMPTY: Record<Bay, string> = {
-  'needs-you': 'Nothing is waiting on you.',
+  'needs-you': 'No run is waiting on you.',
   live: 'No session is working right now.',
   waiting: 'Nothing is parked on a clock, a wall or a hold.',
   queued: 'Nothing is waiting for a scope or a slot.',
@@ -131,22 +132,14 @@ export function TowerBays({
     if (bay === 'settled')
       return <SettledBody runs={model.bays.settled} allowRun={allowRun} focused={focus === bay} />;
     const runs = model.bays[bay];
-    const loose = bay === 'needs-you' ? model.loose : [];
-    const upcoming = bay === 'needs-you' ? model.upcoming : [];
-    if (!runs.length && !loose.length && !upcoming.length && !(bay === 'queued' && queuedHead)) return null;
+    const turn = bay === 'needs-you' ? { now: model.items.length, upcoming: model.upcoming.length } : null;
+    const asks = Boolean(turn && (turn.now || turn.upcoming));
+    if (!runs.length && !asks && !(bay === 'queued' && queuedHead)) return null;
     return (
       <>
         {bay === 'queued' && queuedHead}
         {runs.length > 0 && <Strips runs={runs} allowRun={allowRun} />}
-        {loose.length > 0 && <LooseRows items={loose} />}
-        {/* The acts not due yet (control-tower phase 121, #182): last, uncounted, each the
-            card's row with what it waits on and the command to copy. */}
-        {upcoming.length > 0 && (
-          <section data-testid="coming-up">
-            <h3 className="mb-1.5 text-xs text-ink-muted">Coming up</h3>
-            <LooseRows items={upcoming} />
-          </section>
-        )}
+        {turn && asks && <TurnLine now={turn.now} upcoming={turn.upcoming} />}
       </>
     );
   }
@@ -218,15 +211,24 @@ function Strips({ runs, allowRun }: { runs: readonly TowerRun[]; allowRun: boole
   );
 }
 
-/** The asks no strip draws, with the inbox's own verbs — Now's inbox, in the Tower. */
-function LooseRows({ items }: { items: readonly InboxItem[] }) {
-  const { perform, ack, busy } = useInboxActions();
+/**
+ * Where the asks went (control-tower phase 139): ONE line, the page's own
+ * counts, one press to the page — every item there, whichever run it is of,
+ * the ones of no run and the ones coming up included.
+ */
+function TurnLine({ now, upcoming }: { now: number; upcoming: number }) {
+  const parts = [
+    now ? `${now} need${now === 1 ? 's' : ''} you` : null,
+    upcoming ? `${upcoming} coming up` : null,
+  ].filter(Boolean);
   return (
-    <ul className="flex min-w-0 flex-col gap-1.5" aria-label="Other asks" data-testid="bay-inbox">
-      {items.map((item) => {
-        return <InboxRow key={item.id} item={item} perform={perform} ack={ack} {...(busy ? { busy } : {})} />;
-      })}
-    </ul>
+    <a
+      href={turnHref()}
+      data-testid="bay-turn"
+      className="tap-line self-start text-xs text-ink underline decoration-rule-strong underline-offset-2 hover:decoration-ink"
+    >
+      Your turn: {parts.join(', ')} — open the page
+    </a>
   );
 }
 

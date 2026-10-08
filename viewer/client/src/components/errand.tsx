@@ -13,7 +13,11 @@
  *   · `ErrandCard` — the card a person is asked with, once. `need` leads,
  *     `how` follows, and what the autopilot already tried is listed so nobody
  *     repeats it by hand. No buttons of its own: the surface that shows it
- *     puts its Ways forward beside it.
+ *     puts its Ways forward beside it. A person's errand IS an item of Your
+ *     turn (control-tower phase 139, #216) — the step the console raised for
+ *     it — so where the inbox holds that item, the card draws the item's row
+ *     (its ONE primary, and a link to its place on the page) in place of the
+ *     how sentence: the page carries the how, as a guide.
  *
  * Neither renders anything for a resolved run — `ladderView()` is empty there,
  * because a settled question is not relitigated, errand included.
@@ -25,6 +29,10 @@ import { Badge, RelativeTime, type BadgeTone } from '@/components/ui';
 import { money, relativeTime } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { Errand } from '@/lib/api';
+import { useAttentionInbox } from '@/lib/queries';
+import { useInboxActions } from '@/components/inbox-row';
+import { LazyItemRow } from '@/features/turn/lazy-item-row';
+import { errandRow } from '@/features/turn/surfaces';
 import type { LadderSituation, LadderView, TriedRung } from '@/lib/ladder';
 import { capArithmetic, SituationCategoryMark } from '@/components/halt-mark';
 
@@ -146,12 +154,20 @@ export function ErrandCard({
   situationLabel,
   compact = false,
   className,
+  scope,
 }: {
   errand: Errand;
   situationLabel?: string | undefined;
   compact?: boolean;
   className?: string;
+  /** The run the errand belongs to — where its item is looked up. */
+  scope?: { slug: string; runId?: string | undefined } | undefined;
 }) {
+  const { data: inbox } = useAttentionInbox(false, Boolean(scope));
+  const { perform, busy } = useInboxActions();
+  const item = scope
+    ? errandRow(inbox?.items ?? [], { slug: scope.slug, runId: scope.runId, phase: errand.phase })
+    : undefined;
   return (
     <div
       role="note"
@@ -175,9 +191,13 @@ export function ErrandCard({
         {errand.at && <RelativeTime at={errand.at} className="ml-auto text-2xs text-ink-faint" />}
       </div>
       <p className="mt-1 max-w-prose text-sm text-ink">{errand.need}</p>
-      <p className="mt-0.5 max-w-prose text-2xs text-ink-muted">
-        <strong className="font-medium text-ink-muted">How:</strong> {errand.how}
-      </p>
+      {item ? (
+        <LazyItemRow row={item} perform={perform} className="mt-1.5" {...(busy ? { busy } : {})} />
+      ) : (
+        <p className="mt-0.5 max-w-prose text-2xs text-ink-muted">
+          <strong className="font-medium text-ink-muted">How:</strong> {errand.how}
+        </p>
+      )}
       {/* A cap's arithmetic and the setting that raises it (#14) — "the
           ladder's sessions did not carry it" with nothing tried told nobody
           what was spent, or where. */}

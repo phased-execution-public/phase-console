@@ -242,6 +242,15 @@ export const keys = {
    * ended up counting the wrong one.
    */
   inbox: (all?: boolean) => (all == null ? (['inbox'] as const) : (['inbox', all] as const)),
+  /**
+   * Your turn (`GET /api/turn`, control-tower phase 137) — a PROJECTION of the
+   * inbox, so its key sits under the inbox prefix: every write and every event
+   * that re-reads the inbox re-reads the turn with it, and no bundle had to
+   * learn a second name. `seen` (the person's last look, which the handled
+   * count is taken from) is the third part; without it the prefix is every
+   * look at once.
+   */
+  turn: (seen?: string | null) => (seen ? (['inbox', 'turn', seen] as const) : (['inbox', 'turn'] as const)),
   /** The human-step ledger (`GET /api/human-steps`) — every step with its moves. */
   humanSteps: () => ['human-steps'] as const,
   auth: () => ['auth'] as const,
@@ -430,6 +439,40 @@ export function patchHumanStep(client: QueryClient, raw: unknown): void {
         }
       : prev,
   );
+  patchTurnStep(client, step);
+}
+
+/**
+ * The same step, written into its item on Your turn (control-tower phase 137)
+ * — every look the cache holds — so the item's badge and its attempt move in
+ * the tick a press answers. Only the item's own record moves: which GROUP it
+ * now belongs to is the server's to say (`groupOf`, which first paint does not
+ * carry), so a look that was patched is asked again — writing data marks a
+ * query fresh, and the re-read the event asked for would otherwise be lost.
+ * A look that does not hold the step is not written at all.
+ */
+function patchTurnStep(client: QueryClient, step: HumanStepRecord): void {
+  type Turnish = { groups?: Record<string, { item: string; step?: Record<string, unknown> }[]> };
+  let patched = false;
+  client.setQueriesData({ queryKey: keys.turn() }, (prev: unknown) => {
+    const turn = prev as Turnish | undefined;
+    if (!turn?.groups) return undefined;
+    let moved = false;
+    const groups = Object.fromEntries(
+      Object.entries(turn.groups).map(([group, items]) => [
+        group,
+        items.map((item) => {
+          if (item.item !== step.id || !item.step) return item;
+          moved = true;
+          return { ...item, step: { ...item.step, ...step } };
+        }),
+      ]),
+    );
+    if (!moved) return undefined;
+    patched = true;
+    return { ...turn, groups };
+  });
+  if (patched) void client.invalidateQueries({ queryKey: keys.turn() });
 }
 
 /** The unread badge travels on the event itself; refetching /api/state to learn
@@ -823,6 +866,12 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
      with it the run's summons, which is what moves its strip out of Needs
      you with no reload. */
   'human-step': { invalidate: [keys.inbox()], patch: (client, data) => patchHumanStep(client, data.step) },
+
+  /* ---- a round changed the turn (control-tower phase 136) ----
+     Only a round that CHANGED something sends it, so it is rare: the inbox —
+     which the turn is projected from — is read again, and with it every look
+     at Your turn (`keys.turn()` sits under the inbox prefix, phase 137). */
+  turn: { invalidate: [keys.inbox()] },
 
   /* ---- the lint, arriving after the page ----
      A cache WRITE and no invalidation: the plan detail the browser is holding

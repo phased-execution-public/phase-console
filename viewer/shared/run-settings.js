@@ -166,6 +166,11 @@ export const RUN_START_FIELDS = Object.freeze([
   // control-tower phase 11 (#18): the launch's answer to the prelude's
   // git-strategy rows — `honour` or `override`. A launch decision, so start-only.
   'gitStrategyAck',
+  // control-tower phase 139: the links the launch form showed in full and sends
+  // back — the launch door opens a plan's `auto-open: host` step on the machine
+  // for one of these, exactly as spelled, and for nothing else. A launch
+  // decision, so start-only: a run already running has passed its door.
+  'autoOpen',
   'gitMode',
   'openPr',
   'isolation',
@@ -340,7 +345,8 @@ export function versionAtLeast(version, floor) {
  * settings patch cannot mint a run, move a run's account (that one is its own
  * verb, `switch-account` — `SETTING_VERBS`) or retroactively unstart a run
  * that has already begun — and so are the prelude's waiver acknowledgements,
- * its override, its git answer and its verification answers. `by`, `reason`
+ * its override, its git answer, its verification answers and the links its
+ * launch form showed (`autoOpen`). `by`, `reason`
  * and `confirm` are not settings: the first two are the audit attribution the
  * route derives, the third a person's acknowledgement (`QA_CONFIRM`).
  */

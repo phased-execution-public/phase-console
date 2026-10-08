@@ -276,7 +276,11 @@ export function RecoveryActions({
           forward should know what was already tried before pressing anything
           — and when the ladder is spent, the ONE errand is the headline. */}
         {!bare && ladder.errand && (
-          <ErrandCard errand={ladder.errand} situationLabel={ladder.situation?.label} />
+          <ErrandCard
+            errand={ladder.errand}
+            situationLabel={ladder.situation?.label}
+            scope={{ slug: target.slug, runId: target.runId }}
+          />
         )}
         {!bare && <LadderStrip view={ladder} />}
         <div className="flex flex-wrap items-center gap-2">

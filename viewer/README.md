@@ -89,12 +89,12 @@ still means something (`#/now` → `#/runs`, `#/now?focus=inbox` → `#/runs?bay
 | Destination | Answers |
 |---|---|
 | **Plans** | *Where is each plan on its route?* The list with progress, ready phases, locks, QA regime and health, filterable by status, ready, locked or repo. A plan opens on six tabs: **Route** (the transit map — phases are stations, dependencies are track, each suggested session batch is a train — plus the health panel and the verify-preflight prediction of how a phase will halt), **Phases** (state-grouped, with a drawer per phase carrying its goal, files, steps, verification, gate, lock, QA verdict and evidence), **Run**, **QA** (the gate for the plan and for each phase — the regime and where it came from, the verdicts and their rounds, what each verdict holds, the report itself, and the on/off switches), **Handoffs** and **Source** (the plan's own markdown, and its **Decisions** card — each `## Decisions` row's key, state, phase, owner, whether it blocks, source, value and evidence). |
-| **Runs** | *Does anything need me, what is running, and what did it cost?* The home since 6.0 (`#/`), and **the Tower**: its bays hold what Now's bands held — Four bands: the needs-you inbox with inline actions (approvals, gates, errands, expired accounts, stalled lanes, a session's question with the seconds left before the console answers it by rule, a correlated lane's **Session ask** answered by steering it — every kind acts in place, and the buttons come from the server's own `{endpoint, method, body}`, so a new kind ships working against a console nobody rebuilt; two kinds carry no button because nothing is owed: **Policy answered**, each answer the policy table gave with nobody asked, and the instance's own health as work — notifications nobody was told about, Tailscale stopped, Serve pointing at another console, a registered console down or its directory gone — each naming the command that fixes it); the operations board — one band per plan, its live lanes with heartbeat, cost, ETA, the branch AND checkout each one rides, and under them that plan's admissions still waiting for a scope (who holds it, what collided, when the lease ends); what is next up across every plan; and the plans in flight. The situation line that counts them rides the shell header on every page, each figure a link to its bay. Beneath the bays: The **orchestration board** — four columns, running · queued · waiting · frozen, a card per live run with its branch chip, spend and phase strip, and every verb that changes what happens next inline on it, Freeze all in the header — over the record of every run there has ever been, with settled-today against the day cap. Per run: the status strip, the ways forward (one renderer — there is no second place a remedy can appear), the Git card for a run on its own branch, the lanes and their session panes, the state-grouped phases with evidence, liveness and rulings, **Why this run started** (every start and refusal from the run's ledger, with the decisions it began under), **What it cost and how long it ran** (each session with who ended it, its cost, turns, time and caps, the rung settlements, and one line reconciling the sessions' own costs against the run's spend — red, naming the gap, when they disagree), the timeline (with a mark for each session, ask, policy answer and start) and the journal. |
+| **Runs** | *Does anything need me, what is running, and what did it cost?* The home since 6.0 (`#/`), and **the Tower**: its bays hold what Now's bands held — Four bands: the needs-you bay — a strip per run that needs a person, its one action the primary of its oldest item, pressed exactly as the server spelled it (`{endpoint, method, body}`, so a new kind ships working against a console nobody rebuilt), and one line with its counts that links to **Your turn** (`#/turn`, below), where since 6.2 the approvals, gates, errands, sign-ins, stalls, a session's question with the seconds left before the console answers it by rule and a correlated lane's **Session ask** are drawn as items; two kinds are no item, because nothing is owed, and stay in the bell beside the lock, ruling and message rows: **Policy answered**, each answer the policy table gave with nobody asked, and the instance's own health as work — notifications nobody was told about, Tailscale stopped, Serve pointing at another console, a registered console down or its directory gone — each naming the command that fixes it); the operations board — one band per plan, its live lanes with heartbeat, cost, ETA, the branch AND checkout each one rides, and under them that plan's admissions still waiting for a scope (who holds it, what collided, when the lease ends); what is next up across every plan; and the plans in flight. The situation line that counts them rides the shell header on every page, each figure a link to its bay. Beneath the bays: The **orchestration board** — four columns, running · queued · waiting · frozen, a card per live run with its branch chip, spend and phase strip, and every verb that changes what happens next inline on it, Freeze all in the header — over the record of every run there has ever been, with settled-today against the day cap. Per run: the status strip, the ways forward (one renderer — there is no second place a remedy can appear), the Git card for a run on its own branch, the lanes and their session panes, the state-grouped phases with evidence, liveness and rulings, **Why this run started** (every start and refusal from the run's ledger, with the decisions it began under), **What it cost and how long it ran** (each session with who ended it, its cost, turns, time and caps, the rung settlements, and one line reconciling the sessions' own costs against the run's spend — red, naming the gap, when they disagree), the timeline (with a mark for each session, ask, policy answer and start) and the journal. |
 | **Sessions** | *What processes exist, and can I get at one?* One list for autopilot lanes, agent sessions, shells and the Claude sessions the presence hook reports — and one pane, the phone-first browser terminal, for the two kinds this console holds a pty for. Agent sessions need `--allow-agent`, shells `--allow-terminal`; the list renders either way and says which flag is missing. A presence the probe saw end reads `ended · inferred`, a run's session shows the door it came through and who ended it at what cost, and the console's own MCP probe sessions are never listed. |
 | **Repo** | *What did the work do to the tree — and which of several trees?* Six sections over the read-only git and issue surfaces: **History** (a commit graph with the run and lane branches decorated), **Branches** (divergence, what claims each one, which working trees hold it), **Working trees** (where the parallel work is, and what no surviving run record claims — the reclaim surface), **Changes** (any range, one file's patch at a time), **Settles** (how each run's work reached the trunk, or why it did not) and **Issues** (the Issues desk: each repository's WHOLE GitHub issue list — up to 2,000, and `truncated` said beyond — in one table, with each issue's category, severity and plan status derived from its labels and the local plans' `Fixes:` lines, every column sortable, seven filters and the sort in the URL, any `owner/name` added beside the estate and marked outside this console, and a multi-select whose one click mints the plan-wizard ticket — freshness per repository is `fresh` · `stale` with its age · `unknown` with the reason, and a probe that cannot answer leaves the last good rows rather than emptying the list). Above them, the glance `/api/state` has always reported: the branch, its tracking counts, and what is uncommitted **under `docs/`** — the only corner that read covers (`repoInfo` scopes its `git status` there), which is why it says so. Every view is addressable and every row opens an inspector carrying the server's record verbatim. |
 | **Insights** | *How long, how much, how fast, on what?* The estimate with the basis under it (`plan`, `portfolio` or `heuristic` — the same "≈ 3 days" means three different things), settled spend against the day cap and each run against its budget, **What each session cost** per plan and per account, **Cards raised** (what reached a person, what auto-grant answered, what waits now), a plan's QA verdicts and report paths, the velocity trend and completions calendar, the state/size mix, the locks and health issues, and the repos, skills and models the work runs on. Portfolio-wide, or one plan with `?plan=`. |
 | **Debug** | *What did the console see?* What this process is running with — and every log this console writes, on one time axis: the run journals, the watch scheduler's decisions, the health record and every refused tool call, filterable by time, run and phase, readable here rather than only in a terminal. Plus `GET /api/debug/bundle`: one redacted JSON snapshot sized for a context window, so diagnosing a run means handing over a bundle rather than describing a screen. |
-| **Settings** | *What may this console do, and as whom?* Eight sections at their own `#/settings/<section>`, ordered minimal → advanced: **Essentials** (the directory, what the console is allowed to do, the start command, the engine, the keys), **Appearance** (theme, density, terminal renderer), **Automation** (the defaults every launch opens on, the ladder's caps and the start ceiling, the stall thresholds, the boarding schedule, **Policy answers** with its **Relay rules**, and the posture read-out), **Notifications** (every kind and where it lands — console, this device, each channel — plus per-device quiet hours), **Accounts**, **MCP servers** (registry and catalog), **Permissions**, **This instance** (what is running, how it is reached, restart, shut down, and the banner of a console whose automation is held). The palette indexes all eight by their CONTENTS, so `⌘K quiet hours` finds the page. `general`, `alerts` and `process` are the pre-4.0 ids and still redirect. |
+| **Settings** | *What may this console do, and as whom?* Eight sections at their own `#/settings/<section>`, ordered minimal → advanced: **Essentials** (the directory, what the console is allowed to do, the start command, the engine, the keys), **Appearance** (theme, density, terminal renderer), **Automation** (the defaults every launch opens on, the ladder's caps and the start ceiling, the stall thresholds, the boarding schedule, **Policy answers** with its **Relay rules**, the check's three controls — whether a judgement proof gets a checking session, what that session runs as and after how many rejections an item goes to the owner — and the posture read-out), **Notifications** (every kind and where it lands — console, this device, each channel — plus per-device quiet hours), **Accounts**, **MCP servers** (registry and catalog), **Permissions** (**Grants** and **Owner keys**, then the rule editor), **This instance** (what is running, how it is reached, restart, shut down, and the banner of a console whose automation is held). The palette indexes all eight by their CONTENTS, so `⌘K quiet hours` finds the page. `general`, `alerts` and `process` are the pre-4.0 ids and still redirect. |
 
 | Overlay | What |
 |---|---|
@@ -300,7 +300,8 @@ phase parks with its errand, whose *how* says so — rather than waiting on a ru
 Each vehicle has a driver (`VEHICLE_DRIVERS`: `console`, `writes` for what needs `--allow-writes`,
 `agent` for a fresh session or pty agent, `never`). A tool call a deny rule refused
 (`blocked-declared:permission`) has one rung, `widen-rule`: a card, *Phase N: widen `<rule>`?*, whose
-**Allow** strikes that deny rule for this plan and resumes the phase's own session, and whose
+**Allow** strikes that deny rule for this plan — a grant at plan scope since 6.2, a row in `grants.ndjson`
+that can be revoked — and resumes the phase's own session, and whose
 **Deny** — or no answer — parks the phase with the errand. The healer reaches
 the same vehicle from outside the loop through `startRun({resumeRunId, reboard: [{phase, situation,
 rung, brief}]})`. Opt-in is the run's own auto-recovery switch; a never-started phase re-boards fresh
@@ -528,17 +529,18 @@ went nowhere is otherwise indistinguishable from one that worked.
 *In this tab* is the Notification API: free, instant, and gone with the tab. *On this device* is a
 push subscription — a service worker and a VAPID keypair, so the notification arrives with the
 console closed and the phone locked. Both are in **Notifications → Settings**, per device, across
-nineteen categories: permission needed, a session waiting on you, a phase needs you, a gate needs a
+twenty categories: permission needed, a session waiting on you, a phase needs you, a gate needs a
 person, a QA verdict owed or failed, run halted, run parked or waiting, nothing is happening, phase
 finished or failed, plan finished, work became ready, plans changed on disk, a session ended, console
 problems, usage limits, usage climbing, budget spent or running low, issue drafted by a session,
-hourly digest. Five are sent urgent: permission needed, a session waiting on
+hourly digest (Your turn first), permission granted. Five are sent urgent: permission needed, a session waiting on
 you, a phase needs you, a QA verdict owed or failed, and run halted. A push names the console it came
 from — its title ends `· <console>` — and a delivery that found no subscribed device, or none taking
 that category, is recorded `no-device` rather than dropped silently.
 A **Send a test** button goes out through the real push service and back, so it proves the chain
 rather than the last hop. An approval notification carries **Allow** and **Deny** as notification
-actions, so answering from a lock screen is one tap.
+actions, so answering from a lock screen is one tap. A push for a Your turn item opens the item
+(`#/turn/<id>`) and carries only the buttons the `device` door may press — `docs/phone.md` has the table.
 
 `PHASE_CONSOLE_NOTIFY=<command>` covers what neither can: a machine with no browser in the picture at
 all. It is run as `cmd "<title>" "<body>"`, and is an environment variable rather than a setting
@@ -618,18 +620,25 @@ now, last raised — from the same counts `/api/state` serves as `approvals` (`r
 
 ### Writing a rule from the card that interrupted you
 
-An approval offers **Always for this plan** and **Always everywhere**, each showing the exact rule
-before it writes it. That rule is derived from the ask rule that actually stopped the call, so
-accepting it cancels precisely what interrupted — and it is written *before* the card is settled, so
-the session's next call is already classified under it.
+A permission item's **Grant** offers **This plan**, **This repository** and **Always** beside the
+narrower **This call** and **This phase** (control-tower phase 149), each saying what it covers and when it
+ends. At plan scope and
+wider a grant IS a policy edit, and the rule is derived from the ask rule that actually stopped the
+call, so accepting it cancels precisely what interrupted — and it is written *before* the item is
+settled, so the session's next call is already classified under it. The grant's row in `grants.ndjson`
+names the file, the list and the rule it changed (`strike`, `remove` or `add`), so a revoke undoes exactly
+that; *Your turn*, below, has the rest.
 
-- Plan-scoped rules live in `~/.config/phase-console/plans/<slug>.json`; global ones in
-  `~/.config/phase-console/autopilot.json`. Both are additive over the shipped defaults.
+- Plan-scoped rules live in `~/.config/phase-console/plans/<instance>/<slug>.json`, repository-scoped
+  ones in `~/.config/phase-console/repositories/<instance>.json` — a layer between the plan's file and
+  the machine's, for every plan of this console — and global ones in
+  `~/.config/phase-console/autopilot.json`. All three are additive over the shipped defaults.
 - Evaluation is **deny → an allow you wrote → ask → allow**, first match winning, specificity
   irrelevant. The one deviation from Claude Code's own order is deliberate: a plain allow rule can
   never cancel an ask rule, so "Always allow this" would otherwise write a rule and change nothing.
-- Every write is journaled as `policy.edited` against the live run, with the author and the scope,
-  and is removable from **Settings → Permissions** with the × on its chip. Shipped defaults are
+- Every write is journaled against the live run — an edit as `policy.edited`, a grant as
+  `policy.grant-applied` and its end as `policy.grant-ended` — with the author and the scope, and is
+  removable from **Settings → Permissions** with the × on its chip. Shipped defaults are
   removable the same way — struck by name at the chosen scope (so an upgrade that ships a new
   default still applies it), listed struck-through beneath the chips with a ↩ to bring one back,
   and each part has a **Restore defaults** button that returns it to stock in one act. That
@@ -731,8 +740,8 @@ what was already tried. The journal records `phase.situation`, `phase.rung` and 
 The rung table itself is `viewer/shared/ladder-model.js` — imported by the server's ladder, the
 client and the tests by identity — so what the autopilot climbs is what every **Ways forward** group
 shows: the situation chip, the rungs tried with how each ended, the rung it tries next, and, once
-the ladder is spent, the one errand card (what is needed, how to give it, what was tried). The
-dashboard's **Waiting on you** lists only errands, permission cards and sign-ins — a halted run
+the ladder is spent, the one errand card (what is needed, how to give it, what was tried). **Your
+turn** lists only the errands, the permission asks and the sign-ins — a halted run
 with no errand is the loop's to climb, not yours to stare at; the run page's banner lists a parked
 run's errands in full; the Pulse carries a **Converge** line per plan with the loop's last pass
 ("re-boarded P12 (Never started → Re-board fresh) · released a stale claim on P3") from
@@ -740,6 +749,158 @@ run's errands in full; the Pulse carries a **Converge** line per plan with the l
 caps, the sweep, the four toggles, the one budget raise and the MCP park clock. The whole
 specification — situations, rungs, convergence triggers, presence, what is still a person's — is
 `docs/loop.md`.
+
+## Your turn — every act only a person can do
+
+Everything a run asks of a person arrives as one **item** on one page: `#/turn`, titled *Your turn* and
+lighting Runs (`client/src/features/turn/`, a lazy chunk `check-dist` finds by `data-turn-page`). The server
+half is `server/turn/`; its words are `shared/turn-model.js` (bash twin `scripts/turn.env`) and
+`shared/guide-grammar.js`, the one guide parser the server and the page share. `references/turn.md` is the
+session's side of it.
+
+**One door in, one list out.** Every source passes `raiseTurn` (`server/turn/index.ts`), the only caller of
+`declareHumanStep`: a plan's `Human step:` bullet, a session's `phase-outcome.sh … needs-human --step`, a
+person errand, a wall a session met (`permission`), a missing credential (`secret-entry`, proven by the watch
+scheme `credential:<id>` — `gh`, `claude`, `env:NAME`, `keychain:SERVICE` or `file:PATH`, read by presence and
+never by value), an MCP server unreachable under `require` (`mcp-login`) and a relayed question no rule
+answers (a `decision` that keeps its options, the `(Recommended)` one marked). `GET /api/turn` answers
+`{round, headline, groups, handled, counts}`: every inbox row that asks a person for an act carries a `turn`
+view (`server/turn/fold.ts`) naming its item and the record that holds it — the human-step ledger, or the
+row's own for an approval card, a gate, a held plan, a QA ask, a live relay question, a person-check, a
+sign-in or a conflict — and the rows of one item fold into one. Health, lock, ruling, policy and message rows
+stay in the bell. `GET /api/turn/:id` explains one item
+(its guide, its attempts, why it is a person's), and `?seen=<ISO>` carries the person's last look.
+
+**An item says why.** One of ten reasons (`WHY_PERSON`: `permission`, `identity`, `secret`, `money`, `legal`,
+`decision`, `physical`, `reach`, `third-party`, `reserved`), held to what its kind allows (`KIND_REASONS`; an
+item that names none is given its kind's default, marked `inferred`); a guide (a why paragraph, `## Steps`,
+`## If it goes wrong`; at most 20 steps and 24 KB, `http(s)` links only, every line through the secret
+screen); and a proof of one type (`PROOF_TYPES`: `probe`, `answer`, `judgement`, `attest`, `grant`). The
+ledger, `human-steps.ndjson`, writes version-2 lines and reads version-1 lines with defaults; the human step
+has eighteen kinds and eleven states, `permission` among the kinds and `returned` and `declined` among the
+states. The guard (G1–G7) runs at the declaration's pre-check and again at ingest: a reason the kind allows; a
+proof, unless the answer is the result (exit 2); a declared `permission` or `reserved` item whose every
+command the run's own policy allows, a `reach` with no `--tried`, and a permission block citing no recorded
+wall are refused with exit 4 (`GUARD_REFUSAL_EXIT`); the same item declared by another lane is one item with
+another waiter, every waiter resumed when it is proven.
+
+**The moves.** Reading is ungated. Every verb is a `POST /api/human-steps/:id/<verb>` with the cross-site
+check, attributed to an actor: `open` (on the machine behind `--allow-terminal` or `--allow-agent`, an
+`http`/`https` link only), `check`, `snooze`, `cannot`, `dismiss`, `answer {option?, note?}`, `decline
+{reason}`, `ask {text}`, `evidence {kind, text | data, mime?, name?}`, `override`, `rewrite`, `deny`, `convert`
+and `grant`. `dismiss`, `answer`, `decline`, `override`, `rewrite`, `deny`, `convert`, `grant` and `check` (an
+`attest` when the person's word is the proof) are rows of `AUTHORITY_ROUTES`, so no session's door can make
+them; `ask` and `evidence` carry no authority, and the route itself refuses an agent's door on them.
+`check` refuses a body that carries a secret and names where the value goes instead — the keychain item
+`phase-console-<id>` on macOS, a 0600 file elsewhere, or the item's own `credential:` place. Each answer
+resumes each waiting session once, with a sentence the console composes ("The operator answered `<option>`:
+<note>", "The operator declined: <reason>. Do not ask again; …") that carries any question the person asked;
+an answer that names a `## Decisions` key is written to the plan's decisions table through `decisions.sh`
+first. Evidence is a note, an image or a file — 160 KB a piece, six an attempt, screened for secrets, kept
+0600 by content hash in `turn-evidence/` (30 days, 64 MB: a retention sink) and never pushed or journalled.
+
+**The check.** *I've done this — check* gets a verdict (`VERDICTS`): `passed`, `rejected` with exactly what to
+redo, or `needs-info`. A probe — a command's proof — is read at once; a proof only words can state is read by
+a short read-only checking session for that one item (`server/turn/checker.ts`: at most 12 turns, $0.50 and
+five minutes; `checkModel` and `checkEffort`, `sonnet` at `low`, and `checkJudgement` — off, the person's word
+is taken and the item marked unverified — all in Settings ▸ Automation), whose verdict is parsed from its last
+fenced block and never invented. Each attempt keeps its evidence and its verdict; a rejection tells the person
+once what to redo and resumes nothing; a pass resumes every waiting session once, saying what was proven.
+After `turnEscalateAfter` rejections (3) the item escalates once, with three ways out: `…/rewrite`, *I can't*,
+or the owner's `…/override` — *Accept anyway*, the one route that writes a verdict, recorded as unverified. A
+judgement passes only on what the person sent for that attempt, and an attest, an override or a rewrite counts
+only through a person's door. `phase_console_turn_checks_total` and `phase_console_turn_check_usd_total` count
+the checks.
+
+**Rounds, and what the AI handled.** A round (`server/turn/round.ts`) is one pass of the human-step clock (a
+minute) and of every run's journal line (debounced two seconds). It ends the grants that ran out, sends the
+reminders that are due, withdraws an item nobody needs and expires a window that closed, withdraws an item a
+live grant now covers and resumes its waiters, escalates an item returned `turnEscalateAfter` times that never
+escalated, brings an upcoming act due with its ONE push, and reads the open proofs the console owns (a
+console's own raise, `credential:<id>` included, on its back-off), proving one that landed. It never runs a
+`cmd:` or `unit:` proof, and what it resumes goes through the console's own door, only where `--allow-run`
+allows it. A round that changed the turn raises `round.n` and sends one server-sent event, `turn`; a
+quiet round changes nothing. The headline (`server/turn/headline.ts`) is composed by rules, never by a model.
+*Handled by the AI* reads `handled.ndjson` (`server/turn/handled.ts`, a retention sink): what the guard refused
+to ask (G4, G5), what the rule table allowed (one row per rule per phase, with a count), relay answers by rule
+and the ladder's recoveries, each linked to the journal line that says it. A session adds its own with
+`phase-outcome.sh <slug> <N> handled --what … [--note …] [--link …]` — never an outcome, its links held to a
+commit, a pull request, an issue or a journal line, the secret screen on every field — into
+`handled-sessions.ndjson`, every line of which reads as the session's, so a session can never speak as the
+guard or the rule table. `phase_console_turn_rounds_total` and `phase_console_turn_handled_total` count them.
+
+**Permission asks, and grants.** Every wall a session meets is recorded on its lane (`server/permissions/walls.ts`):
+a deny rule, each guard of the console's own hook, the CLI's own refusal, and a refused landing push as a
+capability that is off. `blocked --needs permission` citing one raises ONE `permission` item; one citing nothing
+recorded is refused at the door (G5). A grant answers it (`server/permissions/grants.ts`, `POST
+/api/human-steps/:id/grant`) at one of five scopes (`GRANT_SCOPES`): `call`, one use, kept in the ledger and
+spent on use; `phase`, until the phase settles, 24 hours at most; `plan`, the plan's policy file; `repository`,
+`~/.config/phase-console/repositories/<instance>.json`, between the plan's file and the machine's; `always`,
+the machine's file. Below plan scope the console's hook enforces the grant for exactly that lane, rule and (for
+`call`) call, and the run's settings carry the rule lowered for that run only, raised again once it ends — so for
+that long the CLI's own list does not hold it with the console dead. Risk comes from one total table,
+`GRANT_RISK` (wall × rule family × scope): low and medium are one press; high needs the rule typed back, shows
+its blast radius (a 400 `{rule, blast}` carries it) and, on a console with an owner key, a touch of the key
+within five minutes; the never list — a forced or deleting push, the host family (`sudo`, `shutdown`, `reboot`,
+`mkfs`, `dd`), every guard, a protected path, a secret's value, a missing credential, a sandbox or network wall
+and Claude Code's own classifier — offers no grant through any door, and a capability is granted at the machine
+only, never from a phone. The engine fails closed: it reads the owner key itself, so a high grant whose
+press did not prove a fresh touch is refused, a card's Allow included. Under a lifted push wall a push passes
+only by an allow-list, so an abbreviated flag, configuration before the verb, a forcing refspec, an option
+that runs a program or arguments fed by `xargs` read as a forced push. The waiting session resumes by itself
+("The operator granted `<rule>` for <scope> until <end> — run it again"), and an open item a later grant covers
+withdraws itself. `grants.ndjson` is append-only and 0600 (a retention sink that loses no live grant to
+rotation): a `grant` line — who, through which door, the item, the wall, the rule, the scope, the end and
+exactly what it changed — and an `end` line when it is spent, expires or is revoked. A grant is journalled
+(`policy.grant-applied`, `policy.grant-ended`) and announced in the `granted` push category;
+`GET /api/permissions/grants`, `POST /api/permissions/grants/:id/revoke`, `POST
+/api/permissions/grants/revoke-all` and `phase-console grants list|revoke|revoke-all` serve them, and a revoke
+undoes exactly what the row says.
+
+**Who pressed: the doors, and the owner key.** Every request has ONE door, decided by what it can prove and
+never by what its body says (`server/owner/door.ts`, `PRESS_DOORS` in `shared/door-model.js`): `owner` (an owner
+key verified in this browser), `device` (a login the `--remote` proxy verified, or a signed lock-screen action),
+`local` (a loopback request with the console header and nothing more) and `session` (a run token); the console's
+own writes carry two more, `checker` (a checking session, for its own item) and `console` (its own clocks). `by`
+is only a label; every press records `pressDoor` beside it. `DOOR_MAY`, read through `doorMay`, is the door × authority verb × risk
+table in two modes, and `GET /api/state`'s `ownerDoor` says `unenrolled`, `enrolled` or `unlocked`.
+`AUTHORITY_ROUTES` names every authority route and is held both ways: a route that presses an authority method
+without a row fails the suite, naming its line. A request carrying a session's token presses no authority route
+the plan's `permission.destructive` row does not name: with no owner key it is refused 403 before any route runs
+and logged `owner.door-refused`, with one it is recorded as a request like any other door's, and the owner-key
+routes refuse an agent's door either way. A manual gate's person test is a door (`owner` or `device`, and `local` with no
+key), not a User-Agent. The owner key is a passkey, WebAuthn verified by hand with `node:crypto` (attestation
+`none`, ES256 or EdDSA, user verification required, a single-use challenge good for five minutes, the origin
+and relying party taken from the request's own host — `localhost` or an https host the console serves, never
+an IP — and a signature counter that never goes back). Its routes, in both editions and behind no capability
+flag: `GET /api/owner`, `POST /api/owner/enroll/link|begin|finish`, `POST /api/owner/assert/begin|finish`, `POST
+/api/owner/lock`, `DELETE /api/owner/keys/:id` and `POST /api/owner/requests/:id/confirm|refuse`. The first
+key is enrolled at the machine from the link `phase-console owner enroll` prints (good for ten minutes); its
+sign-in opens an owner session that ends after twelve hours with no press (a 256-bit `HttpOnly`, `SameSite=Strict` cookie, `__Host-` on https,
+of which only the hash is kept); a high-risk press needs a touch within five minutes; a later key and a removal
+happen only inside an owner session, and every change is journalled, pushed to every subscribed device and kept
+in the bell for a week. With a key, an authority press through any other door is recorded as a request (202),
+shown on its item as "asked by <label> — confirm?" and pressed through the owner's door only when the owner
+confirms; what the plan's manifest already allows still executes, and a console with no key behaves as before.
+`owner-doors.json`, `owner-sessions.json` and `owner-requests.json` are 0600 and hold no secret. The residual
+risk, in full: a process running as you that deliberately rewrites the console's own files can forge anything
+below the owner key, and can replace the key registry itself; the console walls the paths a session takes and
+makes every grant visible, and it is not a boundary against your own account.
+
+**The page, and the old cards.** Six sections in a fixed order (`TURN_GROUPS`: *Do now*, *Needs one detail from
+you*, *Coming up*, *Being checked*, *Done*, then *Handled by the AI*). Each item is one card — why only you, the
+plan, phase and run, what it unblocks with a countdown, the effort, its guide as stations on a line (each
+step's tick kept in the browser), every command copyable as it is and behind `!` for your own Claude Code
+session and never run by the page, how it will be checked, and ONE primary action chosen by its kind and state.
+Filters and the search live in the address, *Export* downloads the open items as one Markdown document and
+*Print* prints it, and a guide carries its language (a Persian one is drawn right to left, its commands left to
+right). `#/approve` and `#/approve?step=<id>` land on the page in one hop and a push opens `#/turn/<id>`. The
+approval queue, its question card, the gate card and the errand card each draw the same item — one row, the
+kind's mark, the title, the primary pressed exactly as the server spelled it, and *Open on Your turn* — and a
+gate no run is asked about keeps the plan's own Approve (`gate-status.md`). The launch door lists the run's
+items, and a plan step marked `auto-open: host` opens at launch, on the machine, behind `--allow-terminal` or
+`--allow-agent`, an `http`/`https` link only, once the door has shown it whole.
+
 
 ## Sessions, and the two the console starts for you
 
@@ -1258,7 +1419,7 @@ network interface, anyone could send the header themselves. `--remote` deliberat
 A request through the proxy is attributed to its login: the verified `Tailscale-User-Login` becomes
 the actor's `remoteUser`, and its `by` unless the request body names a label of its own — a label is
 only ever that, and `via`, `origin` and `remoteUser` cannot be set from a body — so a press from a
-phone journals as the person who made it.
+phone journals as the person who made it, through the `device` door (`pressDoor`, control-tower phase 131).
 
 `tailscale serve --https=443` is the default console's. Any other console's HTTPS port is its own port
 plus 4000 (`httpsPortFor`), and the Serve command the console composes (`serveCommandFor`) never takes

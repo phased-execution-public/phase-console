@@ -859,6 +859,11 @@ export interface ConsoleState {
     stallLocalJobMs?: number;
     /** May the stall watchdog park a lane by itself? Absent reads as on — see `server/config.ts`. */
     stallAutomaticPark?: boolean;
+    /** The check (control-tower phase 134): judgement on, the checker's model and effort, the escalation count. */
+    checkJudgement?: boolean;
+    checkModel?: string;
+    checkEffort?: string;
+    turnEscalateAfter?: number;
     /**
      * The clock on the ANNOUNCEMENT rather than on a detector: how long before
      * a stall the operator has not acted on is said again.
@@ -919,6 +924,10 @@ export function automationPrefs(state: ConsoleState | undefined): {
   watchCmdRefs: boolean;
   watchMintedCmdRefs: boolean;
   mcpPolicy: McpPolicy;
+  checkJudgement: boolean;
+  checkModel: string;
+  checkEffort: string;
+  turnEscalateAfter: number;
 } {
   const prefs = state?.prefs ?? {};
   return {
@@ -987,6 +996,13 @@ export function automationPrefs(state: ConsoleState | undefined): {
     // A console running an older server has never written the key, and reads
     // as the shipped default rather than as the behaviour it used to have.
     mcpPolicy: prefs.mcpPolicy === 'require' ? 'require' : 'continue',
+    // The check (phase 134), as `server/config.ts` ships it: judgement on
+    // unless the server wrote `false`, the checker on `sonnet` at `low`, and
+    // three rejections escalate.
+    checkJudgement: prefs.checkJudgement !== false,
+    checkModel: prefs.checkModel || 'sonnet',
+    checkEffort: prefs.checkEffort || 'low',
+    turnEscalateAfter: prefs.turnEscalateAfter ?? 3,
   };
 }
 

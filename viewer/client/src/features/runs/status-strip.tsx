@@ -307,6 +307,7 @@ export function runNotes({
                   key={`${errand.phase}-${errand.situation}-${errand.at}`}
                   errand={errand}
                   situationLabel={situationLabelFor(errand.situation)}
+                  scope={{ slug: run.slug, runId: run.id }}
                 />
               ))}
             </span>

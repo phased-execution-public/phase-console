@@ -20,6 +20,373 @@ into a web form at the moment of release.
 
 ## [Unreleased]
 
+## [6.2.0] - 2026-10-08
+
+**Your turn.** 6.2 gives every act only a person can do one page, one shape and one road back to the
+work that waits on it. A sign-in, a code, a secret, a payment, a permission the AI lacks, a decision,
+an errand at the machine: each is an item on Your turn (`#/turn`) that says why only a person fits it,
+carries a guide to follow and a proof the console checks, so *I've done this — check* comes back
+passed, or sent back with exactly what to redo, and no session can pass its own. A permission ask is
+answered by a grant with a scope and an end — this call, this phase, this plan, this repository or
+always — that the server applies, audits and can revoke, beside a never list no door lowers. An owner
+key, a passkey, lets a console tell its owner's press from any other door's. The console keeps the
+page current by itself, and the approval, gate, question and errand cards elsewhere draw the item and
+link to it. The free tree stays MIT. Nothing a 6.1 plan says stops working — what moved under people's
+feet is below.
+
+### Migration
+- **Update the console's scripts and the plugin together.** `PE_API` is 2, and a run refuses to start
+  when the console's and the skill's stamps do not meet, naming the half to update. A 6.1
+  `phase-outcome.sh` takes none of a person's turn's new flags and never exits 4.
+- **A person's turn carries a reason.** A `needs-human --step` declaration says why only a person fits
+  it — `--why`, one of ten reasons, held to what its kind allows — and one that names none is given its
+  kind's default, marked inferred, so an older skill copy and `--act` keep working. A plan's
+  `- **Human step:**` bullet gains `why:`, `effort:`, `unblocks:` and `guide:`; a bullet with no `why:`
+  draws the advisory F40, never a gate.
+- **A step needs a proof.** A step with no `--proof`, no `--proof-words` and no answer for a result is
+  refused (exit 2); name `--proof-type attest` to take the person's word.
+- **Exit 4 is the guard's.** `phase-outcome.sh` exits 4 when a declaration asks a person for what the
+  AI could do itself — a `permission` or `reserved` reason whose every guide command the run's own
+  policy allows, a `reach` with no `--tried` — or a permission block cites no wall the console
+  recorded (G5). Read 4 as "run it yourself", never as a malformed call; `--tried` is the answer when
+  running it failed.
+- **"Done — continue" is *I've done this — check*.** A person errand is an `operator-act` item, and its
+  row's action, like every check button, reads *I've done this — check*. A check now comes back with a
+  verdict — passed, rejected with exactly what to redo, or needs-info — rather than "landed or not",
+  and a probe that misses leaves the item `returned`, where it used to read `notified`.
+- **The `secret-entry` field is gone.** The console never takes a secret: `check` refuses a body that
+  carries one, and the item names where the value goes instead — the keychain item `phase-console-<id>`
+  on macOS, a 0600 file elsewhere, or the item's own `credential:` place.
+- **`#/approve` redirects.** `#/approve` and `#/approve?step=<id>` land on Your turn (`#/turn`,
+  `#/turn/<id>`) in one hop, so a bookmark keeps working; a push opens `#/turn/<id>`.
+- **A grant has a scope and an end.** The approval card's Allow with *remember*, the widen card's Allow
+  and a standing card's one-time allow are grants now — `call` (spent on use), `phase` (until it
+  settles, 24 hours at most), `plan`, `repository` (a new policy layer between the plan's file and the
+  machine's) or `always` — each a row in `grants.ndjson` saying exactly what it changed, and a revoke
+  undoes exactly that. The widen card no longer strikes a rule from the plan for good. A grant below
+  plan scope lowers the rule in that run's settings until it ends, and for that long the CLI's own list
+  does not hold the rule with the console dead.
+- **What an owner key changes for a script that presses the console.** Nothing until a key is enrolled:
+  a console with none behaves as before, and `/api/state.ownerDoor` reads `unenrolled`. Once one is,
+  an authority press from a script, the CLI, a browser with no key, a phone beyond its low and medium
+  answers or a session's token is answered 202 `{requested: true}` — recorded on its item as "asked by
+  <label> — confirm?" and pressed only when the owner confirms — so a script reads 202 as waiting for
+  the owner, never as done. What the plan's manifest already allows still executes through any door.
+  `by` in a body is only a label: the door a request proves is recorded as `pressDoor`, and a request
+  carrying a session's token presses no authority route its plan's `permission.destructive` row does
+  not name (403, `owner.door-refused`).
+- **A turn's push names its buttons by kind**: *Open* and *I did it* for an act, *Allow* and *Deny* for
+  a low or medium permission at its narrowest scope, *Open* and *Deny* for a high or never one, *Open*
+  for a decision. Quiet hours are one setting, the device's: at the first boot a console-wide
+  `reminderQuiet` window moves onto every subscribed device that has none of its own, and is dropped.
+- **For readers of the vocabularies:** a person's turn has an eighteenth kind, `permission`, and eleven
+  states with `returned` and `declined`; `viewer/shared/turn-model.js` (twin `scripts/turn.env`),
+  `viewer/shared/guide-grammar.js` and `viewer/shared/door-model.js` are new owners; the push catalogue
+  has a twentieth category, `granted`.
+- **`git send-pack` and `git http-push` are walled like `git push`** (control-tower phase 141): two
+  default deny rules, the same on every profile. A plan that publishes through either names the rule in
+  its `permission.destructive` row, as it names `git push`.
+- **A guide line may not hold an invisible or direction-changing character** (control-tower phase 141):
+  a control character, a zero-width space, a bidi embedding, override or isolate, a word joiner or a
+  byte-order mark refuses the guide at that line, and a link holding one is not openable. The joiners
+  and the direction marks (U+200C–U+200F) stay, so a Persian guide reads as before.
+
+### Added
+- **The docs say what 6.2 adds, in English and Persian** (control-tower phase 140). The help sheet's
+  *Your turn* guide is rewritten around the page — its six sections, why only you, the guide, the check
+  and its verdicts, your other moves, the phone — and *Permissions* says what a grant is (its five
+  scopes, its risk tiers, its end, the ledger and the revoke), names the never list and the three
+  publishing asks auto-grant never answers (`git push`, `gh pr create`, `gh pr merge`; it said two),
+  and gives the owner key a section that ends with what the key is not: *a process running as you that
+  deliberately rewrites the console's own files can forge anything below the owner key, and can replace
+  the key registry itself; the console walls the paths a session takes and makes every grant visible,
+  and it is not a boundary against your own account.* The tower, mobile, notifications and reference
+  guides, README, USAGE and the console's README follow, each with its Persian twin, section for
+  section. For sessions, `references/turn.md` is new — the reasons with an example each, the guide's
+  grammar and the plan's `**Guide language:**` line, a template per kind, the proof types, the guard's
+  seven rules and how to answer each, a permission block, the answer's road back, `handled` and the
+  doors — and SKILL.md's rule names the five things a session does: give the reason, write the guide
+  in the plan's language, state the proof in words, never ask for what it can do itself, and record
+  what it handled; a denied tool is declared, never routed around, and the console is never pressed.
+  `skill-sync.test.ts` and `guide-coverage.test.ts` hold each against the code it describes.
+- **A decision names its `## Decisions` row** (control-tower phase 140, the deferral phase 133 left).
+  `phase-outcome.sh … needs-human --step decision` takes `--decision-key KEY`: the person's answer is
+  written to the plan's decisions table through `decisions.sh` before the session is resumed with it.
+  Any other kind, or a key outside the manifest, is refused (exit 2).
+- **The old cards move in** (control-tower phase 139, closes #216). Nothing draws a person's ask in a
+  shape of its own any more: the approval queue, its question card, the gate card and the errand card
+  each draw the ITEM — one row, the kind's mark, the title, ONE primary pressed exactly as the server
+  spelled it, and *Open on Your turn* (`#/turn/<id>`), where everything else is one press away. A
+  low or medium permission's row grants in one press; a high or never one, or a choice of options,
+  opens the page. A gate no run is asked about keeps the plan's own Approve (gate-status.md). The
+  Needs-you bay keeps runs: each strip's one action is its oldest item's primary, the loose rows and
+  *Coming up* moved to the page, and one line links there with its counts; *Your turn (n)* in the
+  situation line counts items (an errand and its step are one) and opens the page. The launch door lists the run's items — the
+  pre-cleared shown done, *Do it now* opening an item a launch before this one raised — and a plan
+  step marked `auto-open: host` now OPENS at launch, on the machine, behind `--allow-terminal` or
+  `--allow-agent`, an `http`/`https` link only, once the door has shown it whole (the launch sends
+  back exactly the links it showed); a session's step never does. A `physical` item with a link
+  shows it for the phone. *Not doing this* is a person's no; the dead Dismiss fetcher
+  is gone. A broker card's
+  Allow that a keyed console turns into an owner request is toasted "asked of the owner", never "done".
+- **Grants and owner keys on the screen** (control-tower phase 138, closes #215). A permission item on
+  Your turn is answered in one press on its own card: "Raised because the AI lacks permission to …",
+  the command, why the phase needs it, the wall and its rule, then the scopes the item's wall allows as
+  ONE control — *This call*, *This phase*, *This plan*, *This repository*, *Always* — each saying what
+  it covers and when it ends, with the chosen scope's risk beside *Grant*, *I'll do it myself* and
+  *Deny*. A low or medium grant is one press. A high one shows what it reaches, asks for the rule typed
+  back, and on a console with an owner key waits for a touch of the key inside the last five minutes;
+  with no key the card says so and the typed rule alone grants it. A never item offers no Grant: why,
+  and the manual path as a guide. The server's answer wins — a 400 `{rule, blast}` replaces the card's
+  preview with its own blast radius, and a 202 `{requested}` is said to wait for the owner, never as
+  done. A request another door made on an item reads "asked by … — confirm?", with *Confirm* and
+  *Refuse* for the owner. *Grant every low-risk ask* grants every open low-risk ask, each for this call
+  or this phase, in one press. Settings ▸ Permissions gains **Grants** — every grant with what it
+  allowed, how far, who gave it through which door, when, until when, the item that asked and exactly
+  what it changed, with *Revoke* and *Revoke all* — and **Owner keys**: the first key enrolled through
+  the link `phase-console owner enroll` prints (it now opens `#/settings/permissions?enrol=<token>`),
+  later ones in this browser or through a link for another device, each listed with where and when it
+  was made and last used and removed once asked; sign in, touch again and lock; which presses need the
+  key, read from the door table; and on an IP address, the same page at `localhost`.
+- **Your turn — the page, the card and the guide** (control-tower phase 137, closes #214). `#/turn`,
+  titled *Your turn* and lighting Runs, is where every act only a person can do is listed: the round
+  that read it and its one-sentence headline, then six sections in a fixed order — *Do now*, *Needs
+  one detail from you*, *Coming up*, *Being checked*, *Done* (the day's settled items, the ledger's
+  older ones beneath) and *Handled by the AI* — each item one card that explains the task exactly: why
+  only you can do it, the plan, phase and run it belongs to, what it unblocks with a countdown, the
+  effort, then its guide as stations on a line (each step's tick kept in your browser), every command
+  copyable two ways — as it is, and behind `!` for your own Claude Code session — and never run by the
+  page, a link's whole address shown before it opens, *If it goes wrong*, how it will be checked, and
+  ONE primary action chosen by its kind and state (the kind's own opener, *I've done this — check*,
+  *Send my answer*, or a permission item's Grant), then *Not doing this*, *I can't*, *Snooze*, *Ask*
+  and *Attach*. A check that sends it back says *Back to you*, the attempt and exactly what to redo;
+  after the third miss the item asks how it ends — rewrite the guide, hand it back, or accept it on
+  your word. A decision is answered on its card: its options as cards, the recommended one marked,
+  each consequence, and a note. Every datum is within two presses, the raw record included. Filters
+  (plan, run, kind, reason, risk) and the search live in the address; *Export* downloads the open
+  items as one Markdown document and *Print* prints the same. A guide carries its language — a
+  Persian one is drawn right to left, its commands, refs and numbers left to right — and the Markdown
+  component's code blocks now carry a copy button and `dir="ltr"` everywhere, the help sheet included.
+  `#/approve` and `#/approve?step=<id>` land on it in one hop; a push opens `#/turn/<id>`; the palette
+  opens it. The check button reads *I've done this — check* everywhere. The
+  page is a lazy chunk (`check-dist` finds it by `data-turn-page`); first paint is 189.5 KB of 190.
+- **Rounds, and what the AI handled** (control-tower phase 136, closes #213). Your turn is kept up to
+  date by the console itself: a ROUND — one pass of the human-step clock (a minute) and of every run's
+  journal line, debounced two seconds — ends the grants that ran out, sends the reminders that are
+  due, withdraws an item nobody needs, expires a window that closed, withdraws an item a live grant now
+  covers and resumes its waiters, escalates an item returned `turnEscalateAfter` times that never
+  escalated, brings an upcoming act due with its ONE push, and reads the open proofs the console owns
+  (a console's raise — `credential:<id>` included — on its back-off) and proves one that landed. A
+  round that changed the turn raises `GET /api/turn`'s `round.n` and sends ONE server-sent event,
+  `turn`; a quiet round changes nothing. The headline is composed by RULES — how many need you now,
+  the oldest, how long it has waited and what it holds; how many are being checked; how many are
+  coming up; how many were handled since you last looked (`GET /api/turn?seen=<ISO>`) — never by a
+  model. *Handled by the AI* is a new ledger, `handled.ndjson` (a retention sink): what the guard
+  refused to ask (G4, G5), what the rule table allowed (ONE row per rule per phase, with a count —
+  452 auto-grants are one row), relay answers by rule, the ladder's recoveries, each linked to the
+  journal line that says it, and a session's own `phase-outcome.sh <slug> <N> handled --what …
+  [--note …] [--link …]` — never an outcome, its links held to a commit, a pull request, an issue or a
+  journal line, the secret screen on every field. A session writes a file of its own beside the
+  ledger, `handled-sessions.ndjson`, and every line of it reads as the session's whatever it claims:
+  a session can never speak as the guard or the rule table. The round's proof pass never runs a
+  `cmd:` or `unit:` proof, and what the round resumes goes through the console's own door, never a
+  person's, and only where `--allow-run` allows it.
+  `GET /api/turn/:id` explains one item.
+  `phase_console_turn_rounds_total` and `phase_console_turn_handled_total` count them.
+- **The scoped grant: applied by the server, audited, revocable — and a never list** (control-tower
+  phase 149, closes #212). A permission item is answered with ONE press — a grant for this call, this
+  phase, this plan, this repository or always — that the console applies itself (`server/permissions/
+  grants.ts`). `call` is one use, kept in the ledger and spent on use; `phase` lives until its phase
+  settles, 24 hours at most; `plan` is the plan's policy file; `repository` is a new policy layer between
+  the plan's file and the machine's, for every plan of this console; `always` is the machine's file.
+  Below plan scope the console's hook enforces the grant for exactly that lane, rule and (for `call`)
+  call — never a sibling lane, never after the phase settled, never a neighbouring rule — and the run's
+  settings carry the rule lowered for that run only, raised again once it ends. Risk comes from
+  `GRANT_RISK`: low and medium are one press; high needs the rule typed back, shows its blast radius
+  and, with an owner key, the owner door touched within five minutes; the never list offers no grant
+  through any door; a capability is granted at the machine only, never from another device. The waiting session resumes by itself — "The operator granted
+  `<rule>` for <scope> until <end> — run it again" — a held hook call is answered at no cost, and an
+  open item a later grant covers withdraws itself. Every grant is a row in `grants.ndjson` (a retention
+  sink): who, which door, the item, the wall, the rule, the scope, the end and exactly what it changed,
+  journalled (`policy.grant-applied`, `policy.grant-ended`) and announced in a twentieth push category,
+  `granted`. `GET /api/permissions/grants` lists them; a revoke undoes exactly what the row says
+  (`POST /api/permissions/grants/:id/revoke`, `…/revoke-all`, `phase-console grants list|revoke|revoke-all`).
+  The approval card's Allow with *remember*, the widen card's Allow and a standing card's one-time
+  allow are grants now — nothing else writes a rule on a person's behalf. The engine fails closed: it
+  reads the owner key itself, and a high grant whose press did not prove a fresh owner touch is refused
+  — a card's Allow included, whichever door answered it, and a confirmed request, which is pressed again
+  with the confirmer's own touch and priced by the item it reaches. A `call` grant covers no other item,
+  and under a lifted push wall a push passes only by an allow-list: an abbreviated flag (`--force-w`),
+  configuration before the verb (`-c`), a forcing refspec, an option that runs a program
+  (`--receive-pack`), arguments fed by `xargs`, or a command, verb or option the shell has yet to
+  expand is a forced push. Git is found in any case (`GIT`, `git PUSH`) and as a verb's own program
+  (`git-push`); a here-string a shell runs is read like its `-c`; a line that defines an alias and
+  names a push is refused — and a commit message's here-doc stays data. An escape a program decodes
+  (`\x2d`), a value the line assigns and then runs, and a push glued to an expansion (`"$G"push`)
+  read as forced too, as does a command the line leaves unread beside a push named anywhere on it
+  (`P="git push"; $P --force`).
+- **An owner key: a passkey for what carries risk** (control-tower phase 148, closes #208). A person can
+  now prove a press is theirs. `phase-console owner enroll` prints a one-time link, good for ten
+  minutes, that enrols a passkey at the machine — WebAuthn verified by hand with `node:crypto`, no new
+  dependency: attestation `none`, ES256 or EdDSA, user verification required, a single-use challenge
+  good for five minutes, the origin and relying party taken from the request's own host (`localhost`
+  or an https host the console serves; an IP is refused with the hint to open `localhost`), and a
+  signature counter that never goes back. The key's sign-in opens a twelve-hour owner session (a
+  256-bit `HttpOnly`, `SameSite=Strict` cookie, `__Host-` on https, of which only the hash is kept);
+  a high-risk press needs the key touched within five minutes; `phase-console owner lock` ends every
+  session, and `owner status` says whether the console is `unenrolled`, `enrolled` or `unlocked` (so
+  does `/api/state.ownerDoor`). A later key, and a removal, happen only inside an owner session, and
+  every change is journalled, pushed to every subscribed device and kept in the bell for a week. Once
+  a console has a key, an authority press through any other door — a script, the CLI, a browser with
+  no key, a phone beyond its low and medium answers, a session's token — is recorded as a
+  request (202): shown on its item, or as a decision of its own, as "asked by <label> — confirm?",
+  and pressed through the owner's door only when the owner confirms it. What the plan's manifest
+  already allows still executes. A console with no key behaves exactly as before. The registry
+  (`owner-doors.json`), the sessions and the requests are 0600 and hold no secret.
+- **Permission asks: every wall the AI meets reaches a person** (control-tower phase 135, contributes to
+  #212). Each wall a session meets is recorded on its lane — a deny rule and every guard of this
+  console's own hook, and the CLI's own refusal: a tool outside the allow list, an MCP tool not
+  granted, the CLI's copy of a deny rule — and a refused landing push is a capability that is off. A
+  `blocked --needs permission` declaration that cites one raises ONE `permission` item in Your turn,
+  saying "raised because the AI lacks permission X to do Y" with the command, the phase, why it was
+  needed, the wall and its risk tier; one that cites nothing recorded is refused at the door, exit 4
+  — "nothing refused this — run it" (G5). The widen rung's card and the approval broker's ask ARE this
+  item: its Grant is what exists today, labelled as what it is (the broker's Allow, once or
+  remembered; the widen's permanent plan strike). Every item also offers *Deny* — the session is told
+  "denied — do not retry; find another way inside the plan or say what remains" — and *I'll do it
+  myself*, which turns it into your own act whose guide is the command and whose *I've done this*
+  resumes the session (`POST /api/human-steps/:id/deny`, `…/convert`). The risk table is total over
+  wall × rule family × scope: a forced or deleting push, the host family (`sudo`, `shutdown`,
+  `reboot`, `mkfs`, `dd`), every guard, a protected path and a secret's value are **never** — no grant
+  through any door; the item says why and gives the manual path. An App that is not installed, a
+  sandbox or network wall and a protected path raise their own kinds of item; the classifier's denial
+  is explained with the rule you could add to your own settings, which the console never writes.
+  The scoped grant that answers an item is phase 149's.
+- **The check: probes, a checking session, verdicts, attempts** (control-tower phase 134, #211). A
+  person's *I've done this — check* now gets a verdict — passed, rejected with exactly what to redo, or
+  needs-info — instead of "landed or not". A command's proof is read at once and a miss says what it
+  read; a proof only words can state is read by a short read-only checking session for that one item
+  (at most 12 turns, $0.50 and five minutes; `sonnet` at `low` by default, Settings ▸ Automation),
+  whose verdict is parsed from its last fenced block and never invented. Each attempt keeps its
+  evidence and its verdict; a returned item tells the person once what to redo and resumes nothing;
+  a pass resumes every waiting session once, saying what was proven and what the check read. Three
+  rejections escalate once, with three ways out — rewrite the guide (`…/rewrite`), *I can't*, or the
+  owner's *Accept anyway* (`…/override`, the one route that writes a verdict, recorded as unverified).
+  No session and no agent can mark its own item passed: a judgement passes only on what the person
+  sent for that attempt (a note or a piece of evidence), and an attest, an override or a rewrite counts
+  only through a person's door. New metrics:
+  `phase_console_turn_checks_total`, `phase_console_turn_check_usd_total`.
+- **The owner's moves, and the answer's road back to the session** (control-tower phase 133, #210).
+  Beside *I've done this — check*, *Snooze* and *I can't do this*, a person can now answer a decision
+  (`POST /api/human-steps/:id/answer {option?, note?}` — one of its options, a note, or both), decline
+  an item that allows it with a reason (`…/decline`, the new `declined` ending — *Withdrawn* stays the
+  console's own word), ask a question about it (`…/ask`), and attach evidence (`…/evidence` — a note,
+  an image or a file: 160 KB a piece, six an attempt, screened for secrets, kept 0600 by content hash
+  in `turn-evidence/` and swept by its retention sink, never pushed or journalled). Each answer goes
+  back to the waiting session as ONE resume per waiter that the console composes — "The operator
+  answered `<option>`: <note>", "The operator declined: <reason>. Do not ask again; …" — carrying any
+  question the person asked; an answer that names a `## Decisions` key is written to the plan's
+  decisions table through `decisions.sh` first. `answer` and `decline` are authority presses, so no
+  session's door can make them.
+- **Every source feeds the turn: one list, one done path, one announcer** (control-tower phase 132,
+  #209). Everything that asks a person for an act passes ONE door, `raiseTurn`
+  (`viewer/server/turn/index.ts`, the only caller of `declareHumanStep`), and reads back as ONE list:
+  `GET /api/turn` answers `{round, headline, groups, handled, counts}` — every inbox row that asks a
+  person for an act, folded into one item per thing to do and grouped *Do now* · *Needs one detail
+  from you* · *Coming up* · *Being checked* · *Done*. Every such inbox row carries a `turn` view
+  (`viewer/server/turn/fold.ts`): which item, which record holds it — the human-step ledger, or the
+  row's own for an approval card, a gate, a held plan, a QA ask, a live relay question or a
+  person-check — its kind, reason and proof type. Health, lock, ruling, policy and message rows stay
+  in the bell; issue drafts are one line linking to Repo ▸ Issues.
+- A person errand IS an `operator-act` item: its row's action is *I've done this — check* on that
+  item, and "Done — continue" checks the same item, so a step the person did ends `proven` — the
+  reminder clock no longer withdraws a step its phase resumed past as `dismissed`. One turn is
+  announced once: the item's push, one tag per item, the reminders under that tag.
+- A credential the preflight finds missing raises a `secret-entry` item whose proof is the new watch
+  scheme `credential:<id>` — `gh`, `claude`, `env:NAME`, `keychain:SERVICE`, `file:PATH`, read by
+  presence and never by value — and an MCP server it cannot reach under `require` an `mcp-login` item.
+  A relayed question the console will not answer by rule raises a `decision` item that keeps its
+  options, the one marked `(Recommended)` recommended.
+- **The owner door: who pressed is known** (control-tower phase 131, #208). Every request has ONE
+  door, decided by what it can prove and never by what its body says: a session's run token is
+  `session`; a login the `--remote` proxy verified, or a signed lock-screen action, is `device`;
+  anything else is `local` (`viewer/shared/door-model.js` `PRESS_DOORS`, read by
+  `viewer/server/owner/door.ts`). Every press records it as `pressDoor` beside `by`, which is now only
+  a label — a script that says `by: operator` is recorded `local`. The door × authority verb × risk
+  table (`DOOR_MAY`, `doorMay`) says what each door may do, in two modes: with no owner key — every
+  console until the owner keys arrive — `local` presses what it could before, and `/api/state` says
+  `ownerDoor: 'unenrolled'`.
+- `AUTHORITY_ROUTES` names every authority route — new rows for the relay's answer, a presented plan,
+  *Delegate*, remembering a ruling, the preferences and the lock-screen action — and is held both
+  ways: a route that presses an authority method without a row fails the suite, naming its line. A
+  plan's `permission.destructive` row can name a route-only press as `Console(<press>)`.
+- **Your turn speaks one language** (control-tower phase 130, #207). A person's task now says WHY only
+  a person fits it — one of ten reasons (`permission`, `identity`, `secret`, `money`, `legal`,
+  `decision`, `physical`, `reach`, `third-party`, `reserved`), held to what its kind allows — carries a
+  full guide (a why paragraph, numbered steps each with an optional command, expected result, warning
+  and link, and "If it goes wrong"; 20 steps and 24 KB at most, http(s) links only, every line through
+  the secret screen) and a proof a person can read. `viewer/shared/turn-model.js` (twin
+  `scripts/turn.env`) owns the reasons, the proof types (`probe`, `answer`, `judgement`, `attest`,
+  `grant`), the verdicts, the grant scopes, risk tiers and states, the page's groups, the handled
+  sources and the walls; `viewer/shared/guide-grammar.js` is the one guide parser.
+- **The human step grows to eighteen kinds and eleven states**: the kind `permission` (a wall the AI
+  met, ended by a grant or a denial) and the states `returned` (a check sent it back) and `declined`
+  (the person's own "not doing this"). Each state, verdict, risk tier and grant state has a status row.
+- `phase-outcome.sh … needs-human --step` gains `--why`, `--guide` (with `--lang`), `--effort`, `--due`,
+  `--unblocks`, `--proof-type`, `--proof-words`, `--option` (with `--recommended` and
+  `--allow-decline`), `--window` and `--tried`; the plan bullet gains `why:`, `effort:`, `unblocks:` and
+  `guide:`, and `--human-steps` prints them. `PE_API` is 2.
+- **The guard at the door** (G1–G7), at the declaration's pre-check and again at ingest: a reason the
+  kind allows; a proof unless the answer is the result (`attest` only by name); a declared
+  `permission`, `reserved` or `reach` reason is refused with **exit 4** when the AI could do the act
+  itself — every command its guide asks for is one the run's own policy allows, or a `reach` with no
+  `--tried` — and an act a rule stops becomes a `permission` item naming the wall; the same item
+  declared by another lane is ONE item with another waiter, every waiter resumed when it is proven.
+
+### Changed
+- **A `secret-entry` step no longer takes the secret** (control-tower phase 133). `check` refuses a body
+  that carries one, naming where the value goes instead — the keychain item `phase-console-<id>` on
+  macOS, a 0600 file elsewhere, or the item's own `credential:` place — and the check finds it there by
+  name. The step card's secret field is gone; it says where the value goes.
+- **A step needs a proof** (G2): a `needs-human --step` with no `--proof`, no `--proof-words` and no
+  answer for a result is refused (exit 2) — name `--proof-type attest` to take the person's word. A
+  step that names no `--why` is given its kind's default, marked inferred, so an older skill copy and
+  `--act` keep working. The ledger writes version-2 lines and reads version-1 lines with defaults.
+- An `operator-act` lights the halt family of its reason; with none, a decision.
+- F40 (`human-step-no-why`, advisory): a plan bullet with no `why:`.
+- **A request carrying a session's token presses no authority route** the plan's
+  `permission.destructive` row does not name: it is refused 403 before any route runs, logged
+  `owner.door-refused`.
+- **A manual gate's person test is a door, not a User-Agent**: `owner` or `device`, and `local` on a
+  console with no owner key — where the approval says so. A session's door is refused whatever its
+  User-Agent. (A process outside a session could already clear one with `gate-approve.sh` in a
+  terminal.)
+- `bin/btw` names itself, so its ask is recorded `via: cli`.
+
+### Fixed
+- **"The release phases" in a `permission.destructive` row names them** (#250). A row that allows a
+  publishing act "in the release phases", alone or beside numbered phases, read the numbers alone, so
+  every release phase's `gh pr create` went to a person's card although the plan allowed it. The console
+  now resolves the release phases from the plan's graph — each phase whose title opens with *Release* —
+  and answers that card itself, with a journal line; a qualifier it cannot resolve still narrows the
+  allowance and never widens it.
+- **An approval card's evidence is the asking lane's** (control-tower phase 135, OD-17): the working
+  tree and the verification it shows are read from the lane that asked — its own checkout and its own
+  record — never the console's root or another plan's run.
+- **A word in a pattern is not a deny rule's name** (control-tower phase 135): `matchedDenyRule`, which
+  the relay asks directly, read the raw words of every line and named `Bash(shutdown:*)` for a task
+  subject that said "shutdown"; it now looks inside a wrapper only where the classifier does.
+- **A refused call's journal line never holds a secret the call carried** (control-tower phase 141,
+  #217, found by the tower rehearsal's planted secrets): every `phase.tool-denied` line — the forge
+  guard's, a deny rule's, the gate guard's, the push carve-out's and the poll loop's — keeps its command
+  through the wall's own redacting reader, so an `Authorization: Bearer …` header no longer reached the
+  run's journal; and `redactSecrets` reads a JSON `"password": "…"` as it reads `password=…`.
+- **An answered item no longer leaves its run parked** (control-tower phase 141, found by the tower
+  rehearsal): when a person's answer resumed the session and it finished its phase, the run stayed
+  parked — its next phase never boarded, and converge leaves a run a person pressed. A resume that leaves
+  the run parked with no halt now continues it, as a landed proof's resume always did, under the same
+  guards (`autoContinueRecovery`, `--allow-run`, no live runner, no fleet hold).
+
 ## [6.1.0] - 2026-10-06
 
 **The world outside a run.** 6.1 lets an unattended run wait on what happens outside its own checkout,

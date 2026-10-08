@@ -279,11 +279,13 @@ export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freez
 });
 
 /**
- * The two run fields no VALUE carries, because they are facts about the
- * launch rather than choices in it: which run to resume, and which phases a
- * "run only this" was scoped to. The payload builders add them from context.
+ * The run fields no VALUE carries, because they are facts about the launch
+ * rather than choices in it: which run to resume — the payload builders add it
+ * from context — and which links the launch door showed in full
+ * (`autoOpen`, control-tower phase 139), which the door itself adds as the
+ * launch posts (`door-opens.ts`).
  */
-export const CONTEXT_FIELDS = Object.freeze(['resumeRunId']);
+export const CONTEXT_FIELDS = Object.freeze(['resumeRunId', 'autoOpen']);
 
 /**
  * The resolver's schema.

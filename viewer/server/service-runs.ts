@@ -8,7 +8,8 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `service.ts` holds the concrete class.
  */
-import { parkOnStep, stepJournalFields, type HumanStep } from './human-steps.ts';
+import { parkOnStep, stepJournalFields, type HumanStep, type StepVerbResult } from './human-steps.ts';
+import { itemOfErrand } from './turn/fold.ts';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, relative } from 'node:path';
 import { availableParallelism, homedir, loadavg } from 'node:os';
@@ -88,8 +89,9 @@ import { wantsDefaultCheckout } from '../shared/worktree-model.js';
 import { phaseClocks } from '../shared/phase-clocks.js';
 import { wallReading, withWallWhy } from '../shared/situation-model.js';
 import { mergeDecisions, subKindOfNeed } from '../shared/decisions-model.js';
-import { PreludeRefusal, preludeFor, resolvedManifest, scopedSteps, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
+import { PreludeRefusal, doorOpens, itemOf, preludeFor, resolvedManifest, scopedSteps, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
 import type { PreludeStep, SkillApiFacts } from './prelude.ts';
+import { openUrlOnHost, type HostOpen } from './host-open.ts';
 import { GitStrategyRefusal, type GitStrategyLine } from './prelude.ts';
 import { credentialsHeld } from './credentials-probe.ts';
 import {
@@ -101,6 +103,13 @@ import { probeAccounts, probeCredentials, probeDelivery, probeMcp } from './prel
 import { cliVersion } from './accounts/transcripts.ts';
 import { unitName, unitPath } from '../shared/instances.mjs';
 import { execFile as execFileCb } from 'node:child_process';
+
+/**
+ * What the launch door did about one step it opened on the machine (control-tower
+ * phase 139): the step as the ledger now holds it, the link, who pressed Start, and
+ * whether the machine took it. Told on the run's journal once the run has an id.
+ */
+type DoorOpen = { step: HumanStep; url: string; by: string } & ({ ok: true; n: number } | { ok: false; why: string });
 
 /**
  * Is the phase's own session worth offering as a resume?
@@ -226,7 +235,7 @@ import {
 } from './runner/runner-core.ts';
 import { appendRuling } from './runner/rulings.ts';
 import { resumePolicy, type ResumePolicy } from './runner/usage.ts';
-import { asActor, doorActor, isAutomatic, isPersonsAct, pressActor, stoppedByOf, unattributedActor, type StartActor } from './actor.ts';
+import { asActor, doorActor, isAutomatic, isPersonsAct, pressActor, pressDoorOf, stoppedByOf, unattributedActor, type StartActor } from './actor.ts';
 import { ceilingSentence } from './start-ceiling.ts';
 import {
   consumeOutcome, ignoreOutcome, inboxOutcomePhase, outcomeFileFor, outcomeInboxDir, peekWrittenAt, readOutcome,
@@ -820,7 +829,14 @@ export abstract class ServiceRuns extends ServiceLive {
     // The launch door's asks (control-tower phase 44): every plan-declared step
     // the prelude could not pre-clear is recorded now — born `plan`, one push
     // each — after every refusal the door can still make, before anything spawns.
-    this.askAtTheDoor(slug, doorSteps);
+    // The ones the plan said to open on the machine are opened now too (phase
+    // 139), but only a link the launch form SHOWED in full: `autoOpenShown` is
+    // that form's alone, so converge, a webhook and `bin/` open nothing. Only
+    // strings in a list count: the match is exact, and a string where a list
+    // belongs would match by substring.
+    const shown = Array.isArray(options.autoOpenShown)
+      ? options.autoOpenShown.filter((link): link is string => typeof link === 'string') : [];
+    const opening = this.askAtTheDoor(slug, doorSteps, { shown, by: actor.by });
     const state = await this.runnerFor(slug).start({
       ...options,
       actor,
@@ -837,31 +853,46 @@ export abstract class ServiceRuns extends ServiceLive {
     });
     this.startCeiling.charge(actor, slug);
     this.emit('run:state', { state });
+    // What the door opened on the machine is told on the run's own journal now
+    // the run has an id — never awaited: a launch does not wait on a browser.
+    void opening.then((opened) => this.journalDoorOpens(state, opened));
     return state;
   }
 
   /**
-   * The run-start prelude for a plan (phase 11): the manifest rendered, the
-   * probes run, the blocking list computed — over the console's live
-   * facades. `GET /api/run/:slug/prelude` serves it for the launch form's
-   * draft (the form's answers ride in as `options`); `startRun` runs it again
-   * at the door. Pure in `prelude.ts`; this is the deps builder.
-   */
-  /**
    * Record the plan's owed human steps at the launch door (control-tower phase
    * 44): each one the prelude did not pre-clear becomes a ledger step born
    * `plan`, announced once — unless an open step of this plan already asks
-   * for the same act on the same phase, so a second launch does not ask twice.
-   * A step born here never parks its phase (nothing has spawned yet), so the
-   * reminder clock withdraws it only when that phase closes.
+   * for the same act on the same phase (`itemOf`), so a second launch does not
+   * ask twice. A step born here never parks its phase (nothing has spawned yet),
+   * so the reminder clock withdraws it only when that phase closes.
+   *
+   * And open on the machine the ones the plan said to (`auto-open: host`,
+   * control-tower phase 139, §Architecture 12's safety floor). `doorOpens` holds
+   * the rule — the plan's word, a flag, an http(s) link, nothing due, nothing
+   * pre-cleared, and a link the launch form SHOWED in full (`shown`) — and only a
+   * step recorded NOW is a candidate: one that already stood is not opened again,
+   * whoever asked first. One link opens one tab per launch, however many steps
+   * name it. The opens are fire-and-forget: a launch never waits on a browser and
+   * never fails because one did not open, so the answer is a promise that does not
+   * reject, which `startRun` journals once the run exists.
    */
-  private askAtTheDoor(slug: string, steps: readonly PreludeStep[]): void {
-    let open: HumanStep[] = [];
-    try { open = this.humanStepsNow().open().filter((step) => step.slug === slug && step.birth === 'plan'); } catch { open = []; }
+  private askAtTheDoor(
+    slug: string, steps: readonly PreludeStep[], opts: { shown?: readonly string[]; by?: string } = {},
+  ): Promise<DoorOpen[]> {
+    let held: HumanStep[] = [];
+    try { held = this.humanStepsNow().open(); } catch { held = []; }
+    const gate = {
+      shown: opts.shown ?? [],
+      allowTerminal: Boolean(this.flags.allowTerminal),
+      allowAgent: agentEnabled(this.flags),
+    };
+    const opening: Promise<DoorOpen>[] = [];
+    const tabs = new Set<string>();
     for (const step of steps) {
       if (step.state === 'pre-cleared') continue;
-      if (open.some((held) => held.phase === step.phase && held.kind === step.kind && held.title === step.what.trim())) continue;
-      this.recordHumanStep({
+      if (itemOf(step, held, slug)) continue;
+      const recorded = this.recordHumanStep({
         slug, phase: step.phase, birth: 'plan',
         step: {
           kind: step.kind, title: step.what, where: step.where,
@@ -875,9 +906,81 @@ export abstract class ServiceRuns extends ServiceLive {
           ...(step.due ? { due_when: step.due } : {}),
         },
       });
+      if (!recorded) continue;
+      const [open] = doorOpens([step], gate);
+      if (!open || tabs.has(open.url)) continue;
+      tabs.add(open.url);
+      opening.push(this.openAtTheDoor(recorded, open.url, opts.by ?? 'launch'));
+    }
+    return Promise.all(opening);
+  }
+
+  /**
+   * One step's link, opened on the machine by the launch door (control-tower
+   * phase 139) through the SAME seam *Open on the machine* uses — `hostOpener`,
+   * which hands the desktop an http(s) link and nothing else — and moved to
+   * `opened` as that route moves it (`by: launch`, `where: host`). Never throws:
+   * a machine that would not open it, or a step that settled meanwhile, is an
+   * answer the run's journal carries, not a failed launch.
+   */
+  private async openAtTheDoor(step: HumanStep, url: string, by: string): Promise<DoorOpen> {
+    const told = { step, url, by };
+    try {
+      const opened = await this.hostOpener(url);
+      if (!opened.opened) return { ...told, ok: false, why: String(opened.detail ?? 'the machine did not open it').slice(0, 200) };
+      const moved = this.humanStepsNow().move(step.id, this.openedTo(step.id), { by: 'launch', verb: 'open', where: 'host' });
+      // The link IS open on the machine either way; a step that settled in the
+      // meantime (its proof landed first) is simply not counted by the ledger.
+      return 'refused' in moved ? { ...told, ok: true, n: 0 } : { ...told, step: moved, ok: true, n: moved.opened };
+    } catch (error) {
+      return { ...told, ok: false, why: String((error as Error)?.message ?? error).slice(0, 200) };
     }
   }
 
+  /**
+   * The launch door's opens, told on the run they launched (control-tower phase
+   * 139) — the same `phase.human-step-opened` line a person's *Open* writes,
+   * marked `door: launch`, or `phase.human-step-open-skipped` with why the
+   * machine did not. A step born at the door names no run (`stepJournal` finds
+   * none), so the journal line is written here, where the run has an id. The
+   * ledger is the durable fact: a journal that cannot be written costs nothing.
+   */
+  private journalDoorOpens(state: RunState, opened: readonly DoorOpen[]): void {
+    const root = this.root?.ok ? this.root.path : null;
+    if (!root) return;
+    for (const one of opened) {
+      try {
+        const told = { stepId: one.step.id, kind: one.step.kind, where: 'host', door: 'launch', by: one.by };
+        const phase = one.step.phase > 0 ? one.step.phase : undefined;
+        const journal = Journal.for(root, state.slug, state.id);
+        if (one.ok) journal.append('phase.human-step-opened', { ...told, n: one.n, what: 'url' }, phase);
+        else journal.append('phase.human-step-open-skipped', { ...told, why: one.why }, phase);
+      } catch { /* the ledger is the durable fact */ }
+    }
+  }
+
+  /**
+   * The platform opener, for *Open on the machine* and the launch door's
+   * `auto-open: host` — a seam, so no test opens a browser.
+   */
+  protected hostOpener: (url: string) => Promise<HostOpen> = (url) => openUrlOnHost(url);
+
+  /**
+   * Where an *Open* moves an item: `opened` — or, while a check of it runs,
+   * `checking` still (control-tower phase 134): the person may look at the link
+   * again without taking the item out from under the verdict it is owed.
+   */
+  protected openedTo(id: string): 'opened' | 'checking' {
+    return this.humanStepsNow().get(id)?.state === 'checking' ? 'checking' : 'opened';
+  }
+
+  /**
+   * The run-start prelude for a plan (phase 11): the manifest rendered, the
+   * probes run, the blocking list computed — over the console's live
+   * facades. `GET /api/run/:slug/prelude` serves it for the launch form's
+   * draft (the form's answers ride in as `options`); `startRun` runs it again
+   * at the door. Pure in `prelude.ts`; this is the deps builder.
+   */
   async prelude(slug: string, options: PreludeOptions = {}): Promise<Prelude> {
     const record = this.store?.get(slug);
     const root = this.root?.path;
@@ -1011,6 +1114,9 @@ export abstract class ServiceRuns extends ServiceLive {
         const verdict = await this.watchClock.probeNow(ref);
         return { landed: verdict.state === 'landed', read: `${verdict.state}${verdict.detail ? ` — ${verdict.detail}` : ''}` };
       },
+      // …and the ledger's open steps, so each listed step names the item that
+      // already asks for it (control-tower phase 139) — `itemOf`, the door's own match.
+      openSteps: () => this.humanStepsNow().open(),
       prefs: policyPrefsOf(this.prefs),
     };
     return preludeFor(slug, options, deps);
@@ -1559,6 +1665,9 @@ export abstract class ServiceRuns extends ServiceLive {
       text,
       pinned: input.pinned === true,
       ...(input.phase !== undefined ? { phase: input.phase } : {}),
+      // The door it came through (phase 131, #208): the supervisor's pass
+      // writes `supervisor`, and its notes reach a session as its reading.
+      door: pressDoorOf(actor),
     };
     const run = this.editStoredRun(slug, (state) => {
       state.notes = keepNotes([...(state.notes ?? []), note]);
@@ -4092,6 +4201,63 @@ export abstract class ServiceRuns extends ServiceLive {
     const root = this.root?.path;
     if (!root) return { ok: false, status: 409, error: 'No repository is open.' };
     const target = listRuns(root, slug, this.liveRunIds()).find((run) => run.phases[String(phase)]);
+    const errand = target?.recoveries?.[String(phase)]?.errand;
+    const words = note.trim().slice(0, 4_000);
+    // The errand IS an item (control-tower phase 132, #209): "Done — continue"
+    // is *I've done this — check* on it, so the step ends proven — or says what
+    // its proof still reads — and is never withdrawn later as dismissed.
+    const item = target && !runIsOver(target)
+      ? itemOfErrand(this.humanStepsNow().open(), {
+        slug, runId: target.id, phase, errand, parkedOn: target.phases[String(phase)]?.declared?.step?.id,
+      })
+      : undefined;
+    if (item) {
+      const checked = await this.checkHumanStep(item.id, { by: actor.by, byPerson: true, note: words, actor, resumeVia: 'errand' });
+      if (!checked.ok) return { ok: false, status: checked.status, error: checked.error };
+      const press = (checked as { press?: PressAnswer }).press;
+      if (press) return press;
+      const check = (checked as { check?: { landed: boolean; read: string; state?: string } }).check;
+      // A judgement item (control-tower phase 134): the press asked for a check
+      // and the checking session is reading it — accepted, not refused. The
+      // phase resumes by itself if it passes; the item says what to redo if not.
+      if (check?.state === 'checking') {
+        return {
+          ok: false, status: 202,
+          error: `Being checked — a short read-only session is reading what you sent against the proof. Phase ${phase} `
+            + 'resumes by itself if it passes; if it does not, the item says exactly what to redo.',
+        };
+      }
+      return {
+        ok: false, status: 409,
+        error: check?.landed
+          ? `It is proven, but phase ${phase} of ${slug} could not be resumed — ${String((checked as { resumed?: { why?: string } }).resumed?.why ?? 'Retry it')}.`
+          : `Not yet — its proof reads: ${check?.read ?? 'nothing'}. Phase ${phase} still waits on it.`,
+      };
+    }
+    return this.resumeAnsweredErrand(slug, phase, words, actor);
+  }
+
+  /**
+   * *I've done this — check* on an item (control-tower phase 132) — the
+   * recovery half's verb, declared here so the errand's answer can press it.
+   */
+  abstract checkHumanStep(
+    id: string, opts: { by: string; byPerson?: boolean; note?: string; actor?: StartActor; resumeVia?: 'errand' },
+  ): Promise<StepVerbResult>;
+
+  /**
+   * The answer recorded and the phase re-boarded — "Done — continue"'s body
+   * (control-tower phase 88), and a proven errand item's resume (phase 132,
+   * where `proven` says what was proven instead of the person's word alone).
+   */
+  protected async resumeAnsweredErrand(
+    slug: string, phase: number, words: string, actor: StartActor, proven?: { title: string; read: string; asked?: string },
+    /** The resume's words when the console composed them itself — an answer or a decline (control-tower phase 133). */
+    composed?: string,
+  ): Promise<PressAnswer> {
+    const root = this.root?.path;
+    if (!root) return { ok: false, status: 409, error: 'No repository is open.' };
+    const target = listRuns(root, slug, this.liveRunIds()).find((run) => run.phases[String(phase)]);
     const record = target?.phases[String(phase)];
     const errand = target?.recoveries?.[String(phase)]?.errand;
     const declared = record?.declared;
@@ -4102,7 +4268,6 @@ export abstract class ServiceRuns extends ServiceLive {
         error: `Phase ${phase} of ${slug} has no open errand to answer — Retry or Resume it instead.`,
       };
     }
-    const words = note.trim().slice(0, 4_000);
     const need = errand?.need ?? declared?.reason ?? record.note ?? '';
     const answer = { by: actor.by, note: words, at: new Date().toISOString(), ...(errand ? { situation: errand.situation } : {}) };
     const live = this.liveRunner(slug);
@@ -4111,12 +4276,14 @@ export abstract class ServiceRuns extends ServiceLive {
       this.editStoredRunById(slug, target.id, (stored) => applyErrandAnswer(stored, phase, answer));
       journalOf(target)('phase.errand-answered', { by: answer.by, note: words, situation: answer.situation ?? null }, phase);
     }
-    const instruction = [
+    const instruction = composed ?? [
       `The operator (${actor.by}) has done what this phase asked a person for`
-        + `${need ? ` ("${need.replace(/\s+/g, ' ').slice(0, 400)}")` : ''} and answered it: Done — continue. `
+        + `${need ? ` ("${need.replace(/\s+/g, ' ').slice(0, 400)}")` : ''} and answered it: `
+        + `${proven ? `I've done this — check, and the check proved it (${proven.read}). ` : 'Done — continue. '}`
         + 'Carry on from where the session stopped. Check what the errand was for before relying on it, and do not '
         + 'declare needs-human for the same thing again unless it is still not true.',
       words ? `Their note: ${words}` : '',
+      proven?.asked ?? '',
     ].filter(Boolean).join('\n\n');
     return this.pressResume(slug, phase, 'resume', { instruction, actor });
   }
@@ -4499,8 +4666,13 @@ export abstract class ServiceRuns extends ServiceLive {
    * found the session could not be resumed after all — its transcript would
    * not port, or the policy changed under the press — it left the phase hinted
    * to board fresh with the words, and this continues the run so the loop
-   * boards it. Nothing happens when the recovery resumed the session, when
-   * something else already drives the plan, or when runs are off.
+   * boards it. When the recovery DID resume the session and it carried its
+   * phase on, leaving the run parked with no halt — a person's answer on Your
+   * turn resumes exactly this way — it continues the run as the watch path does
+   * once a landed proof's resume settles (control-tower phase 141, found by the
+   * tower rehearsal: the answered plan's next phase never boarded, and converge
+   * leaves a run a person pressed). Nothing happens when something else already
+   * drives the plan, when runs are off, or under `autoContinueRecovery: false`.
    */
   private continueAfterPress(slug: string, runId: string, phase: number, actor: StartActor): void {
     const runner = this.runners.get(slug);
@@ -4508,8 +4680,12 @@ export abstract class ServiceRuns extends ServiceLive {
     void runner.wait().then(async () => {
       if (!this.flags.allowRun || this.liveRunner(slug) || this.fleetHoldFor(slug)) return;
       const state = runner.current();
-      const hint = state?.id === runId ? state.phases[String(phase)]?.boardingHint : undefined;
-      if (!hint || hint.by !== PERSON_SLOT_BY || state?.phases[String(phase)]?.status !== 'pending') return;
+      if (!state || state.id !== runId) return;
+      const record = state.phases[String(phase)];
+      const hint = record?.boardingHint;
+      const fresh = Boolean(hint && hint.by === PERSON_SLOT_BY && record?.status === 'pending');
+      const healed = state.status === 'parked' && !state.halt && this.prefs.autoContinueRecovery !== false;
+      if (!fresh && !healed) return;
       await this.startRun(slug, {
         // Spelled out, not shorthand: SLF-1 reads the door off `actor: <name>`.
         actor: actor, resumeRunId: runId,

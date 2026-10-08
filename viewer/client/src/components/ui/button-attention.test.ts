@@ -19,10 +19,9 @@ const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const SRC = here('../../');
 
 /** Where a button may be amber. Every entry names the summons it answers. */
-const ALLOW: Readonly<Record<string, string>> = {
-  'features/runs/approvals.tsx':
-    'the permission card — a session is parked until a person allows or denies it',
-};
+// Empty since control-tower phase 139: the permission card it named moved into
+// Your turn, where an item's ONE primary is ink and the summons is its frame.
+const ALLOW: Readonly<Record<string, string>> = {};
 
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];

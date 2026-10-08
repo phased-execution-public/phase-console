@@ -81,12 +81,12 @@ export const ROUTE_HEADS = Object.freeze([
   'settings',
   // pages a destination has not absorbed yet, plus the deep-link heads
   'plan',
-  // The phone surface: exactly what needs a person and can be answered, one
-  // column of thumb-sized cards. A HEAD rather than a destination of its own —
-  // the rail offers the seven above and the phone tab bar four of them —
-  // because it is a deep-link target every push carries, not a place
-  // navigation sends you.
-  'approve',
+  // Your turn (control-tower phase 137, #214): every act only a person can do,
+  // each with its guide, its check and its moves — `#/turn`, and `#/turn/<id>`
+  // for one item, which is where every step push lands. A HEAD that lights
+  // Runs, never an eighth destination (§Architecture 19): "does anything need
+  // me?" already has its home, and the phone's four tab slots are spoken for.
+  'turn',
   // The whole queue of one console (control-tower phase 99, #135): every entry,
   // why it sits where it does, who holds what, and the verbs that move it. A
   // HEAD, not a destination — the Tower's queued bay links to it.
@@ -99,6 +99,10 @@ export const ROUTE_HEADS = Object.freeze([
   'terminal',
   'agent',
   // redirects onto the above
+  // The phone answer page every push linked to until 6.2 — `#/approve` and
+  // `#/approve?step=<id>` are in notifications already on phones, so the head
+  // stays and lands on Your turn (`#/turn`, `#/turn/<id>`) in one hop.
+  'approve',
   'now',
   'dashboard',
   'stats',

@@ -41,7 +41,7 @@ import { SeverityBadge } from '@/components/ui/status/severity-badge';
 import { toHash } from '@/app/routes';
 import { useWindowLeft } from '@/lib/clock';
 import { flagReason, splitActions } from '@/features/runs/lanes-model';
-import { MicField } from '@/features/approve/mic-field';
+import { MicField } from '@/components/mic-field';
 import { LazyHumanStepCard } from '@/components/human-step-lazy';
 
 /* ------------------------------------------------------------------ *
@@ -113,8 +113,11 @@ export function useInboxActions(): {
       // nothing had happened at all. Measured: an operator pressed this three
       // times, was told "done" three times, and the run never moved.
       const stalled = result?.outcome === 'errand' || result?.outcome === 'nothing-to-do';
+      // A 202 `{requested}` on a keyed console (control-tower phases 148, 139)
+      // is a request the OWNER confirms on Your turn — never a done press.
+      const asked = (result as { requested?: unknown } | null | undefined)?.requested === true;
       toast(
-        result?.detail ?? `${action.label} — done.`,
+        result?.detail ?? (asked ? `${action.label} — asked of the owner.` : `${action.label} — done.`),
         stalled ? 'warn' : 'ok',
         // A refusal is a thing to read, not a thing to glimpse.
         stalled ? 8000 : undefined,

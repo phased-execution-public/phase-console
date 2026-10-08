@@ -191,6 +191,26 @@ const VERBS = new Set([
 ]);
 
 /**
+ * The checking session's Bash (control-tower phase 134, #211): the leads of the
+ * table above that only READ, each a whole command prefix its `--settings`
+ * allows as `Bash(<lead>:*)` — nothing else runs, and the session's permission
+ * mode (`dontAsk`) refuses the rest without asking anybody. A deliberately
+ * narrow subset: no `cat`/`head`/`tail`/`diff`/`jq` (Read reads files, under the
+ * deny rules that keep it out of `~/.ssh` and the like), no `find`/`sed`/`awk`/`xargs`
+ * (each can write or run something), no `env` (it prints secrets), no `curl`
+ * (a GET is a `cmd:` probe's job), and only the subcommands of `git`, `gh` and
+ * `docker` that read — not `git log`/`git show` (`--output=<file>` writes) and
+ * not `gh auth status` (`--show-token` prints one). Every lead passes this file's own policy
+ * (`judgeCommand`) — `turn-checker.test.ts` holds it to that.
+ */
+export const READ_ONLY_LEADS: readonly string[] = Object.freeze([
+  'ls', 'wc', 'stat', 'pwd', 'which', 'test',
+  'git status', 'git rev-parse', 'git ls-files',
+  'gh issue view', 'gh pr view', 'gh run view', 'gh release view',
+  'docker inspect', 'docker ps', 'docker images', 'docker version',
+]);
+
+/**
  * Leads a `- **Setup:**` command may use that a §Verification command may not.
  *
  * Setup is bring-up: it exists to CHANGE something — start a stack, install

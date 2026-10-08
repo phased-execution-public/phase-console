@@ -301,6 +301,23 @@ if (args[0] === 'run') {
   process.exit(await runVerb(args.slice(1), { root, preferBuilt, edition: 'free' }));
 }
 
+// ---- the owner key (control-tower phase 148, #208) -------------------------
+// `phase-console owner status | enroll | lock` — the exact module the Pro bin
+// uses (`bin/owner-verb.mjs`): the owner door is in both editions.
+if (args[0] === 'owner') {
+  const { ownerVerb } = await import(pathToFileURL(join(root, 'bin', 'owner-verb.mjs')).href);
+  process.exit(await ownerVerb(args.slice(1), { root }));
+}
+
+// ---- the scoped grants (control-tower phase 149, #212) ---------------------
+// `phase-console grants list | revoke <id> | revoke-all` — every grant a
+// person gave, and taking one back, from a terminal. The verb lives in
+// `bin/grants-verb.mjs`, shared by both editions: a grant is in both.
+if (args[0] === 'grants') {
+  const { grantsVerb } = await import(pathToFileURL(join(root, 'bin', 'grants-verb.mjs')).href);
+  process.exit(await grantsVerb(args.slice(1), { root }));
+}
+
 // ---- the fleet verbs, named rather than mistaken for a directory -----------
 // Without this, a bare `list` reached the block below, which turns a bare first
 // argument into `--root list` — so a verb that manages consoles would BOOT one,

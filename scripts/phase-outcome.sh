@@ -180,13 +180,25 @@ OWN_LOCK_WATCH_REFUSAL="a lock: watch is for somebody else's lock: this one name
 [ -f "$SCRIPT_DIR/decisions.env" ] && . "$SCRIPT_DIR/decisions.env"
 # A person's turn (control-tower phase 41) — the OWNER is
 # viewer/shared/human-step-model.js, twin scripts/human-steps.env.
-HUMAN_STEP_KINDS="browser-login device-code one-time-code secret-entry claude-login mcp-login os-prompt os-permission third-party-approval physical person-check decision protected-path interactive-prompt captcha email-link"
+HUMAN_STEP_KINDS="browser-login device-code one-time-code secret-entry claude-login mcp-login os-prompt os-permission third-party-approval physical person-check decision protected-path interactive-prompt captcha email-link operator-act permission"
 HUMAN_STEP_WHERE="host any"
-HUMAN_STEP_DEFAULT_WHERE="browser-login:host device-code:any one-time-code:host secret-entry:any claude-login:host mcp-login:host os-prompt:host os-permission:host third-party-approval:any physical:host person-check:any decision:any protected-path:host interactive-prompt:host captcha:any email-link:any"
+HUMAN_STEP_DEFAULT_WHERE="browser-login:host device-code:any one-time-code:host secret-entry:any claude-login:host mcp-login:host os-prompt:host os-permission:host third-party-approval:any physical:host person-check:any decision:any protected-path:host interactive-prompt:host captcha:any email-link:any operator-act:host permission:any"
 HUMAN_STEP_SECRET_PATTERNS=''
 HUMAN_STEP_SECRET_QUERY_KEYS=''
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/human-steps.env" ] && . "$SCRIPT_DIR/human-steps.env"
+# Your turn (control-tower phase 130) — the OWNER is viewer/shared/turn-model.js,
+# twin scripts/turn.env: the reasons a person fits, the proof types, the limits.
+WHY_PERSON="permission identity secret money legal decision physical reach third-party reserved"
+G4_REASONS="permission reach reserved"
+KIND_REASONS=""
+PROOF_TYPES="probe answer judgement attest grant"
+PROOF_TYPES_SELF="answer attest grant"
+GUIDE_MAX_STEPS=20
+GUIDE_MAX_BYTES=24576
+GUARD_REFUSAL_EXIT=4
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/turn.env" ] && . "$SCRIPT_DIR/turn.env"
 
 usage() {
   echo 'usage: phase-outcome.sh <slug> <phase> <complete|waiting-external|blocked|needs-human|partial|no-defect>' >&2
@@ -197,6 +209,10 @@ usage() {
   echo '   --step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any] [--proof REF]' >&2
   echo '        [--step-line TEXT]... [--code CODE] [--credential ID] [--due-when REF]: needs-human only — a human step' >&2
   echo '   --act: --step operator-act — the operator'"'"'s own act (a command or a click path), due when --due-when lands' >&2
+  echo '   Your turn: --why REASON · --guide FILE [--lang CODE] · --effort MIN · --due ISO · --unblocks PHASES ·' >&2
+  echo '        --proof-type TYPE · --proof-words TEXT · --option ID=LABEL[::CONSEQUENCE]... · --recommended ID ·' >&2
+  echo '        --allow-decline · --decision-key KEY · --window DURATION · --tried TEXT  (references/turn.md;' >&2
+  echo '        exit 4: the guard refused — the AI can do it itself, or nothing recorded refused it)' >&2
   echo "               ($DECISION_KEYS) or a blocker class as its short form ($NEED_CLASSES)" >&2
   echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>" · unit:<host>/<unit>' >&2
   echo '       unit:<host>/<unit> lands when that systemd unit on that host leaves activating/active (the host is named in the machine profile);' >&2
@@ -215,6 +231,10 @@ usage() {
   echo '   verified: record what your own §Verification proved — the console re-runs only what you did not prove' >&2
   echo '       phase-outcome.sh <slug> <phase> progress --label TEXT --done N --of M' >&2
   echo '   progress: how far the active task'"'"'s long operation has got (journalled as phase.progress)' >&2
+  echo '       phase-outcome.sh <slug> <phase> handled --what TEXT [--note TEXT] [--link REF]...' >&2
+  echo '   handled: what you did INSTEAD of asking a person — a row on Your turn'"'"'s handled log, never an outcome;' >&2
+  echo '            --link (at most 8): commit:<sha> · a GitHub commit, pull or issue URL · pr:[owner/name]#<n> ·' >&2
+  echo '            issue:[owner/name]#<n> · #<n> · journal:<slug>/<runId>#<line>' >&2
   exit 2
 }
 
@@ -236,7 +256,8 @@ case "$status" in
   ruling) mode=ruling ;;
   verified) mode=proof ;;
   progress) mode=progress ;;
-  *) echo "invalid status: $status (want complete|waiting-external|blocked|needs-human|partial|no-defect, or ruling, verified or progress)" >&2; exit 2 ;;
+  handled) mode=handled ;;
+  *) echo "invalid status: $status (want complete|waiting-external|blocked|needs-human|partial|no-defect, or ruling, verified, progress or handled)" >&2; exit 2 ;;
 esac
 
 # JSON string sanitizer, bash 3.2 + BSD sed: control chars (newlines included)
@@ -245,6 +266,36 @@ esac
 # passing around, so the refs are folded as they arrive).
 _json_str() {
   printf '%s' "$1" | tr '\000-\037' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# A multi-line text as one JSON string (a guide): every line kept, joined by \n;
+# a tab is \t and any other control character a space.
+_json_text() {
+  printf '%s\n' "$1" | tr '\000-\010\013-\037' ' ' \
+    | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' \
+    | awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'
+}
+
+# The reasons a kind allows, comma-separated, its default first (turn.env).
+_kind_reasons() {  # _kind_reasons <kind>
+  local pair
+  for pair in $KIND_REASONS; do
+    [ "${pair%%:*}" = "$1" ] && { printf '%s' "${pair#*:}"; return 0; }
+  done
+  return 1
+}
+
+# Minutes from a duration — 90, 90m, 2h, 3d — or nothing when it is not one.
+_minutes_of() {  # _minutes_of <duration>
+  case "$1" in
+    ''|*[!0-9mhd]*) return 1 ;;
+    *m) n="${1%m}" ; m=1 ;;
+    *h) n="${1%h}" ; m=60 ;;
+    *d) n="${1%d}" ; m=1440 ;;
+    *) n="$1" ; m=1 ;;
+  esac
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$((10#$n * m))"
 }
 
 # The redaction floor at the door (control-tower phase 41): is this value
@@ -321,6 +372,12 @@ _watch_problem() {  # _watch_problem <ref>
       # `watch-refs.ts` `UNIT_REF_RE` is the twin.
       printf '%s' "$1" | grep -Eq '^unit:[A-Za-z0-9][A-Za-z0-9._-]{0,62}/[A-Za-z0-9][A-Za-z0-9@._:-]{0,254}$' \
         || printf '%s' 'a unit: ref is unit:<host>/<unit> — a host the machine profile names, a systemd unit name (letters, digits, @ . _ : -), nothing else'
+      ;;
+    credential:*)
+      # A credential read by presence, never its value (control-tower phase
+      # 132) — `watch-refs.ts` `CREDENTIAL_REF_ID_RE` is the twin.
+      printf '%s' "$1" | grep -Eq '^credential:(gh|claude|claude-login|(env|keychain|file):[^[:space:]]+)$' \
+        || printf '%s' 'a credential: ref is credential:gh, credential:claude, credential:env:<NAME>, credential:keychain:<service> or credential:file:<path>'
       ;;
     *)
       printf '%s' 'no watch scheme — the console polls gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>" · unit:<host>/<unit>'
@@ -444,9 +501,14 @@ watch_count=0; watch_json=""
 what=""; why=""; kind=""; cost=""; remember=""; by_word=""; for_whom=""
 exit_code=""; in_dir=""
 label=""; done_n=""; of_n=""; progress_flags=""
+note_text=""; handled_links=""; link_count=0
 step_kind=""; step_title=""; step_open_url=""; step_open_command=""; step_where=""; step_proof=""
 step_lines_json=""; step_line_count=0; step_code=""; step_credential=""; step_flags=""
 step_act=""; step_due_when=""; watch_refs=""
+step_why=""; step_why_source=""; step_guide_file=""; step_effort=""; step_due=""; step_unblocks=""
+step_proof_type=""; step_proof_words=""; step_options_json=""; step_option_ids=" "; step_option_count=0
+step_recommended=""; step_allow_decline=""; step_window=""; step_lang=""; step_tried=""
+step_decision_key=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --label|--done|--of)
@@ -462,6 +524,12 @@ while [ $# -gt 0 ]; do
     --rule)         rule="${2:?--rule needs text}"; shift 2 ;;
     --command)      command_text="${2:?--command needs text}"; shift 2 ;;
     --what)         what="${2:?--what needs text}"; shift 2 ;;
+    --note)         note_text="${2:?--note needs text}"; shift 2 ;;
+    --link)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo '--link needs a reference' >&2; exit 2; }
+      link_count=$((link_count + 1))
+      handled_links="${handled_links}$2
+"; shift 2 ;;
     --why)          why="${2:?--why needs text}"; shift 2 ;;
     --kind)         kind="${2:?--kind needs a word}"; shift 2 ;;
     --cost-if-wrong) cost="${2:?--cost-if-wrong needs text}"; shift 2 ;;
@@ -480,6 +548,36 @@ while [ $# -gt 0 ]; do
     --proof)        step_proof="${2:?--proof needs a ref}"; step_flags=1; shift 2 ;;
     --code)         step_code="${2:?--code needs the code}"; step_flags=1; shift 2 ;;
     --credential)   step_credential="${2:?--credential needs an id}"; step_flags=1; shift 2 ;;
+    --guide)        step_guide_file="${2:?--guide needs a file}"; step_flags=1; shift 2 ;;
+    --effort)       step_effort="${2:?--effort needs minutes}"; step_flags=1; shift 2 ;;
+    --due)          step_due="${2:?--due needs an ISO8601 time}"; step_flags=1; shift 2 ;;
+    --unblocks)     step_unblocks="${2:?--unblocks needs phase numbers}"; step_flags=1; shift 2 ;;
+    --proof-type)   step_proof_type="${2:?--proof-type needs a type}"; step_flags=1; shift 2 ;;
+    --proof-words)  step_proof_words="${2:?--proof-words needs text}"; step_flags=1; shift 2 ;;
+    --recommended)  step_recommended="${2:?--recommended needs an option id}"; step_flags=1; shift 2 ;;
+    --allow-decline) step_allow_decline=1; step_flags=1; shift ;;
+    --decision-key) step_decision_key="${2:?--decision-key needs a key}"; step_flags=1; shift 2 ;;
+    --window)       step_window="${2:?--window needs a duration}"; step_flags=1; shift 2 ;;
+    --lang)         step_lang="${2:?--lang needs a language tag}"; step_flags=1; shift 2 ;;
+    --tried)        step_tried="${2:?--tried needs text}"; step_flags=1; shift 2 ;;
+    --option)
+      # ID=LABEL[::CONSEQUENCE] — a decision's option, and what choosing it does.
+      opt="${2:?--option needs ID=LABEL[::CONSEQUENCE]}"; step_flags=1
+      opt_id="${opt%%=*}"; opt_rest="${opt#*=}"
+      [ "$opt_id" != "$opt" ] && printf '%s' "$opt_id" | grep -qE '^[a-z0-9][a-z0-9-]{0,31}$' \
+        || { echo "--option must be ID=LABEL[::CONSEQUENCE] with an id of a-z, 0-9 and -: $opt_id" >&2; exit 2; }
+      case "$step_option_ids" in *" $opt_id "*) echo "--option $opt_id is named twice" >&2; exit 2 ;; esac
+      opt_label="${opt_rest%%::*}"; opt_cons=""
+      [ "$opt_label" != "$opt_rest" ] && opt_cons="${opt_rest#*::}"
+      [ -n "$opt_label" ] || { echo "--option $opt_id needs a label after =" >&2; exit 2; }
+      _screen_secret --option "$opt_rest"
+      [ "$step_option_count" -lt 8 ] || { echo '--option: a decision offers eight options at most' >&2; exit 2; }
+      step_options_json="${step_options_json:+$step_options_json, }{\"id\": \"$opt_id\", \"label\": \"$(_json_str "$(printf '%s' "$opt_label" | cut -c1-120)")\""
+      [ -n "$opt_cons" ] && step_options_json="$step_options_json, \"consequence\": \"$(_json_str "$(printf '%s' "$opt_cons" | cut -c1-300)")\""
+      step_options_json="$step_options_json}"
+      step_option_ids="$step_option_ids$opt_id "
+      step_option_count=$((step_option_count + 1))
+      shift 2 ;;
     --step-line)
       line_text="${2:?--step-line needs text}"; step_flags=1
       _screen_secret --step-line "$line_text"
@@ -549,6 +647,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# `--why` is two words in one flag: a ruling's reasoning, or — beside --step or
+# --act on a needs-human declaration — the reason only a person fits the act
+# (control-tower phase 130). Claimed by the step here, before the shapes are
+# held apart.
+if [ "$mode" = outcome ] && [ -n "$why" ] && { [ -n "$step_kind" ] || [ -n "$step_flags" ] || [ -n "$step_act" ]; }; then
+  step_why="$why"; why=""
+fi
+
 # The shapes share one option loop and are then held apart, so a flag that
 # belongs to another one is an error rather than a silent no-op.
 if [ "$mode" = progress ]; then
@@ -566,6 +672,39 @@ if [ "$mode" = progress ]; then
   label="$(printf '%s' "$label" | tr '\n\t' '  ' | cut -c1-200)"
 elif [ -n "$progress_flags" ]; then
   echo "--label/--done/--of only make sense with progress, not $status" >&2; exit 2
+fi
+# What a session handled instead of asking (control-tower phase 136, #213): a
+# row on Your turn's handled log — never an outcome — with links held to a
+# commit, a pull request, an issue or a journal line, and the secret screen on
+# every field.
+_handled_link_ok() {  # _handled_link_ok <ref> → 0 when it is one of the four kinds
+  printf '%s' "$1" | grep -Eq '^(commit:([A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}@)?[0-9a-fA-F]{7,40}|[0-9a-fA-F]{7,40}|https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/(commit/[0-9a-fA-F]{7,40}|pull/[0-9]{1,7}|issues/[0-9]{1,7})/?|(pr|issue):([A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100})?#[0-9]{1,7}|([A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100})?#[0-9]{1,7}|journal:[a-z0-9][a-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,64}#[0-9]{1,9})$'
+}
+_handled_screen() {  # _handled_screen <flag> <value> — a secret-shaped value is refused, never echoed
+  if _looks_like_secret "$2"; then
+    echo "$1 refused: its value is shaped like a secret (a token, a password, a one-time code or a URL query secret). A handled row says what was done, never a value. Nothing was written." >&2
+    exit 2
+  fi
+}
+if [ "$mode" = handled ]; then
+  if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
+     || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$needs" ] || [ -n "$why$kind$cost$for_whom$remember$by_word" ] \
+     || [ -n "$exit_code$in_dir" ]; then
+    echo 'handled takes --what, --note and --link only' >&2; exit 2
+  fi
+  [ -n "$what" ] || { echo '--what is required for handled: say what you did instead of asking a person' >&2; exit 2; }
+  [ "$link_count" -le 8 ] || { echo "at most 8 --link, got $link_count" >&2; exit 2; }
+  _handled_screen --what "$what"
+  _handled_screen --note "$note_text"
+  while IFS= read -r _link; do
+    [ -z "$_link" ] && continue
+    _handled_screen --link "$_link"
+    _handled_link_ok "$_link" || { echo "--link refused: $_link is not a commit, a pull request, an issue or a journal line (commit:<sha> · a GitHub commit, pull or issue URL · pr:[owner/name]#<n> · issue:[owner/name]#<n> · #<n> · journal:<slug>/<runId>#<line>)" >&2; exit 2; }
+  done <<EOF_LINKS
+$handled_links
+EOF_LINKS
+elif [ -n "$note_text$handled_links" ]; then
+  echo "--note/--link only make sense with handled, not $status" >&2; exit 2
 fi
 if [ "$mode" = ruling ]; then
   if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
@@ -611,6 +750,8 @@ if [ "$mode" = ruling ]; then
       [ -n "$needs" ] || { echo "--remember $remember needs --needs <key>: a ruling is remembered under the decision key it answers" >&2; exit 2; } ;;
     *) echo "invalid --remember: $remember (want plan|global)" >&2; exit 2 ;;
   esac
+elif [ "$mode" = handled ]; then
+  : # handled reads --what too — held to its own flags above
 elif [ -n "$what" ] || [ -n "$why" ] || [ -n "$kind" ] || [ -n "$cost" ] || [ -n "$remember" ] || [ -n "$by_word" ] || [ -n "$for_whom" ]; then
   echo "--what/--why/--kind/--cost-if-wrong/--for/--remember/--by only make sense with ruling, not $status" >&2; exit 2
 fi
@@ -729,6 +870,142 @@ if [ -n "$step_kind" ] || [ -n "$step_flags" ]; then
   _screen_secret --open-url "$step_open_url"
   _screen_secret --open-command "$step_open_command"
   _screen_secret --proof "$step_proof"
+  _screen_secret --proof-words "$step_proof_words"
+  _screen_secret --tried "$step_tried"
+  # ---- Your turn (control-tower phase 130, #207): the guard's door-side rules ----
+  # G1 — a reason from WHY_PERSON that the kind allows; none named is the
+  # kind's default, marked inferred (an older skill copy and --act keep working).
+  kind_reasons="$(_kind_reasons "$step_kind" || true)"
+  if [ -n "$step_why" ]; then
+    step_why="$(printf '%s' "$step_why" | tr 'A-Z' 'a-z')"
+    case " $WHY_PERSON " in
+      *" $step_why "*) : ;;
+      *) echo "unknown --why $step_why (want one of: $WHY_PERSON)" >&2; exit 2 ;;
+    esac
+    case ",$kind_reasons," in
+      *",$step_why,"*) : ;;
+      *) echo "--why $step_why refused: a $step_kind step is not asked for because of $step_why — its reasons are: $(printf '%s' "$kind_reasons" | tr ',' ' ')" >&2; exit 2 ;;
+    esac
+    step_why_source=declared
+  else
+    step_why="${kind_reasons%%,*}"; step_why_source=inferred
+  fi
+  # G2 — a proof (a ref or words) unless the answer is the result; attest by name.
+  if [ -n "$step_proof_type" ]; then
+    step_proof_type="$(printf '%s' "$step_proof_type" | tr 'A-Z' 'a-z')"
+    case " $PROOF_TYPES " in
+      *" $step_proof_type "*) : ;;
+      *) echo "unknown --proof-type $step_proof_type (want one of: $PROOF_TYPES)" >&2; exit 2 ;;
+    esac
+    case " $PROOF_TYPES_SELF " in
+      *" $step_proof_type "*) : ;;  # the answer, the person's word or a grant ends it — nothing to read
+      *) [ -n "$step_proof$step_proof_words" ] || { echo "--proof-type $step_proof_type needs a proof to read: --proof <ref> or --proof-words" >&2; exit 2; } ;;
+    esac
+    case "$step_proof_type" in
+      probe) [ -n "$step_proof" ] || { echo '--proof-type probe needs --proof <ref>: the console reads a ref to prove it' >&2; exit 2; } ;;
+      judgement) [ -n "$step_proof_words$step_proof" ] || { echo '--proof-type judgement needs --proof-words: what a checker reads the evidence against' >&2; exit 2; } ;;
+      grant) [ "$step_kind" = permission ] || { echo "--proof-type grant belongs to a permission item, not $step_kind" >&2; exit 2; } ;;
+    esac
+  elif [ "$step_kind" != permission ] && [ -z "$step_proof" ] && [ -z "$step_proof_words" ] \
+       && [ "$step_kind" != decision ] && [ "$step_kind" != person-check ]; then
+    echo "a $step_kind step needs a proof: --proof <ref> the console can read, or --proof-words saying what proves it — or --proof-type attest to take the person's word, by name. Nothing was written." >&2
+    exit 2
+  fi
+  # The guide: one file in the grammar of viewer/shared/guide-grammar.js. The
+  # door holds its limits — the size, the steps, http(s) links, and the secret
+  # screen on EVERY line (a refusal names the line, never the value); the
+  # console reads the grammar itself.
+  step_guide_text=""
+  if [ -n "$step_guide_file" ]; then
+    [ -f "$step_guide_file" ] && [ -r "$step_guide_file" ] || { echo "--guide $step_guide_file: no readable file there" >&2; exit 2; }
+    guide_bytes="$(wc -c < "$step_guide_file" | tr -d ' ')"
+    [ "$guide_bytes" -le "$GUIDE_MAX_BYTES" ] || { echo "--guide refused: a guide is $GUIDE_MAX_BYTES bytes at most, and this one is $guide_bytes" >&2; exit 2; }
+    guide_n=0; guide_steps=0; guide_in_steps=""
+    while IFS= read -r guide_line || [ -n "$guide_line" ]; do
+      guide_n=$((guide_n + 1))
+      if _looks_like_secret "$guide_line"; then
+        echo "--guide refused: line $guide_n carries a secret-shaped value — a guide says where the person types a secret, never the secret. Nothing was written." >&2
+        exit 2
+      fi
+      case "$guide_line" in
+        '## '[Ss]'teps'*) guide_in_steps=1 ;;
+        '## '*) guide_in_steps="" ;;
+      esac
+      if [ -n "$guide_in_steps" ] && printf '%s' "$guide_line" | grep -qE '^[0-9]{1,3}[.)][[:space:]]'; then
+        guide_steps=$((guide_steps + 1))
+      fi
+      if printf '%s' "$guide_line" | grep -qiE '\]\([[:space:]]*[a-z][a-z0-9+.-]*:' \
+         && printf '%s' "$guide_line" | grep -oiE '\]\([[:space:]]*[a-z][a-z0-9+.-]*:' | grep -viqE '\([[:space:]]*https?:$'; then
+        echo "--guide refused: line $guide_n links somewhere a guide may not — http and https only" >&2; exit 2
+      fi
+      if printf '%s' "$guide_line" | grep -qiE '^[[:space:]]*link:[[:space:]]*[a-z][a-z0-9+.-]*:' \
+         && ! printf '%s' "$guide_line" | grep -qiE '^[[:space:]]*link:[[:space:]]*(\[[^]]*\]\([[:space:]]*)?https?://'; then
+        echo "--guide refused: line $guide_n links somewhere a guide may not — http and https only" >&2; exit 2
+      fi
+    done < "$step_guide_file"
+    [ "$guide_steps" -le "$GUIDE_MAX_STEPS" ] || { echo "--guide refused: a guide holds $GUIDE_MAX_STEPS steps at most, and this one has $guide_steps" >&2; exit 2; }
+    step_guide_text="$(cat "$step_guide_file")"
+  fi
+  if [ -n "$step_lang" ]; then
+    [ -n "$step_guide_file" ] || { echo '--lang is the language of --guide; it needs one' >&2; exit 2; }
+    printf '%s' "$step_lang" | grep -qE '^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$' \
+      || { echo "--lang must be a language tag like en, fa or pt-BR: $step_lang" >&2; exit 2; }
+  fi
+  if [ -n "$step_effort" ]; then
+    step_effort_min="$(_minutes_of "$step_effort" || true)"
+    [ -n "$step_effort_min" ] && [ "$step_effort_min" -ge 1 ] && [ "$step_effort_min" -le 10080 ] \
+      || { echo "--effort must be minutes (5, 5m, 1h — at most 7d): $step_effort" >&2; exit 2; }
+    step_effort="$step_effort_min"
+  fi
+  if [ -n "$step_window" ]; then
+    step_window_min="$(_minutes_of "$step_window" || true)"
+    [ -n "$step_window_min" ] && [ "$step_window_min" -ge 1 ] && [ "$step_window_min" -le 10080 ] \
+      || { echo "--window must be a duration (90m, 2h, 3d — at most 7d): $step_window" >&2; exit 2; }
+    step_window="$step_window_min"
+  fi
+  if [ -n "$step_due" ]; then
+    # --due ISO is the due-when ref date:ISO — the act is upcoming until then.
+    [ -z "$step_due_when" ] || { echo '--due and --due-when are one or the other: --due ISO is --due-when date:ISO' >&2; exit 2; }
+    case "$step_due" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T\ ][0-9][0-9]:[0-9][0-9]*) : ;;
+      *) echo "--due must be ISO8601 (YYYY-MM-DDTHH:MM...), got: $step_due" >&2; exit 2 ;;
+    esac
+    step_due_when="date:$(printf '%s' "$step_due" | tr ' ' 'T')"
+  fi
+  step_unblocks_json=""
+  if [ -n "$step_unblocks" ]; then
+    for unblock in $(printf '%s' "$step_unblocks" | tr ',' ' '); do
+      printf '%s' "$unblock" | grep -qE '^([A-Za-z0-9][A-Za-z0-9._-]{0,127}/)?0*[1-9][0-9]{0,4}$' \
+        || { echo "--unblocks takes phase numbers (12,13) or slug/N: $unblock" >&2; exit 2; }
+      step_unblocks_json="${step_unblocks_json:+$step_unblocks_json, }\"$unblock\""
+    done
+  fi
+  if [ -n "$step_recommended" ]; then
+    case "$step_option_ids" in
+      *" $step_recommended "*) : ;;
+      *) echo "--recommended $step_recommended names no --option" >&2; exit 2 ;;
+    esac
+  fi
+  # A decision's key (control-tower phase 140, the deferral phase 133 left):
+  # the `## Decisions` row the person's answer is written to, through
+  # decisions.sh, before the session is resumed with it.
+  if [ -n "$step_decision_key" ]; then
+    [ "$step_kind" = decision ] || { echo "--decision-key belongs to a decision, not a $step_kind step: it names the ## Decisions row the answer is written to" >&2; exit 2; }
+    case " $DECISION_KEYS " in
+      *" $step_decision_key "*) : ;;
+      *) echo "unknown --decision-key $step_decision_key (want one of: $DECISION_KEYS)" >&2; exit 2 ;;
+    esac
+  fi
+  # G4, the half a script can judge: a DECLARED `reach` says the AI cannot
+  # reach the system — so it must say what it tried. The other half (a guide
+  # whose every command the run's own policy allows) is the console's, at the
+  # pre-check below and again at ingest.
+  step_g4=""
+  case " $G4_REASONS " in *" $step_why "*) step_g4=1 ;; esac
+  if [ "$step_why_source" = declared ] && [ -n "$step_g4" ] && [ "$step_why" = reach ] && [ -z "$step_tried" ]; then
+    echo "refused (G4): try it, then say what happened — a reach reason says the AI cannot reach the system, so run what you can first and declare again with --tried saying what you ran and how it failed. Nothing was written." >&2
+    exit "$GUARD_REFUSAL_EXIT"
+  fi
   _screen_secret --reason "$reason"
 fi
 rule="$(printf '%s' "$rule" | cut -c1-200)"
@@ -838,6 +1115,43 @@ if [ "$mode" = progress ]; then
     echo "progress recorded: $slug phase $phase — $label $done_n/$of_n"
   else
     echo "note: $target could not be written — printing the progress line only" >&2
+    printf '%s\n' "$line"
+  fi
+  exit 0
+fi
+
+# ---- handled: one appended line on the sessions' handled file, nothing else --
+# The SESSIONS' file beside the console's ledger
+# (`<instance state>/handled-sessions.ndjson`, which $PE_HANDLED_FILE names in a
+# supervised session): the page reads it beside the console's own rows, reads
+# every line of it as a session's whatever it claims, and never mistakes it
+# for an outcome. A session never writes the console's ledger itself.
+if [ "$mode" = handled ]; then
+  what="$(printf '%s' "$what" | tr '\n\t' '  ' | cut -c1-300)"
+  note_text="$(printf '%s' "$note_text" | tr '\n\t' '  ' | cut -c1-600)"
+  links_json=""
+  while IFS= read -r _link; do
+    [ -z "$_link" ] && continue
+    links_json="${links_json:+$links_json,}\"$(_json_str "$_link")\""
+  done <<EOF_LINKS
+$handled_links
+EOF_LINKS
+  handled_id="$(pe_sha256_hex "$slug $phase $now $what" 2>/dev/null | cut -c1-12)"
+  id_json="$( [ -n "$handled_id" ] && printf '"id":"h-%s",' "$handled_id" || true )"
+  note_json="$( [ -n "$note_text" ] && printf ',"note":"%s"' "$(_json_str "$note_text")" || true )"
+  run_json="$( [ -n "${PE_RUN_ID:-}" ] && printf ',"runId":"%s"' "$(_json_str "$PE_RUN_ID")" || true )"
+  session_json="$( [ -n "$session" ] && printf ',"session_id":"%s"' "$session" || true )"
+  line="{\"v\":1,${id_json}\"at\":\"$(_json_str "$now")\",\"first\":\"$(_json_str "$now")\",\"source\":\"session\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase${run_json},\"what\":\"$(_json_str "$what")\"${note_json},\"count\":1,\"links\":[${links_json}]${session_json}}"
+  if [ -n "${PE_HANDLED_FILE:-}" ]; then
+    target="$PE_HANDLED_FILE"
+  else
+    target="$(pe_instance_state_dir "$(pe_instance_root)")/handled-sessions.ndjson"
+    echo "note: PE_HANDLED_FILE is not set (no runner is supervising this session) — recorded for the console at $target" >&2
+  fi
+  if mkdir -p "$(dirname "$target")" 2>/dev/null && (umask 077; printf '%s\n' "$line" >> "$target") 2>/dev/null; then
+    echo "handled recorded: $slug phase $phase — $what  ->  $target"
+  else
+    echo "note: $target could not be written — printing the handled row only" >&2
     printf '%s\n' "$line"
   fi
   exit 0
@@ -1082,6 +1396,19 @@ if [ -n "$step_kind" ]; then
   [ -n "$step_code" ] && step_line="$step_line, \"code\": \"$step_code\""
   [ -n "$step_credential" ] && step_line="$step_line, \"credential\": \"$step_credential\""
   [ -n "$step_due_when" ] && step_line="$step_line, \"due_when\": \"$(_json_str "$step_due_when")\""
+  # Your turn (control-tower phase 130).
+  step_line="$step_line, \"why\": \"$step_why\", \"why_source\": \"$step_why_source\""
+  [ -n "$step_proof_type" ] && step_line="$step_line, \"proof_type\": \"$step_proof_type\""
+  [ -n "$step_proof_words" ] && step_line="$step_line, \"proof_words\": \"$(_json_str "$(printf '%s' "$step_proof_words" | cut -c1-500)")\""
+  [ -n "$step_guide_text" ] && step_line="$step_line, \"guide\": {\"text\": \"$(_json_text "$step_guide_text")\"${step_lang:+, \"lang\": \"$step_lang\"}}"
+  [ -n "$step_effort" ] && step_line="$step_line, \"effort\": $step_effort"
+  [ -n "$step_window" ] && step_line="$step_line, \"window_minutes\": $step_window"
+  [ -n "$step_unblocks_json" ] && step_line="$step_line, \"unblocks\": [$step_unblocks_json]"
+  [ -n "$step_options_json" ] && step_line="$step_line, \"options\": [$step_options_json]"
+  [ -n "$step_recommended" ] && step_line="$step_line, \"recommended\": \"$step_recommended\""
+  [ -n "$step_allow_decline" ] && step_line="$step_line, \"allow_decline\": true"
+  [ -n "$step_decision_key" ] && step_line="$step_line, \"decision_key\": \"$step_decision_key\""
+  [ -n "$step_tried" ] && step_line="$step_line, \"tried\": \"$(_json_str "$(printf '%s' "$step_tried" | cut -c1-600)")\""
   step_line="$step_line},"
 fi
 resume_line="$( [ -n "$resume_after" ] && printf '\n  "resume_after": "%s",' "$(_json_str "$resume_after")" || true )"
@@ -1117,6 +1444,7 @@ json="{
 # the staged file, never from this request. PHASE_OUTCOME_PROBE=0 skips it.
 landed_sentence=""
 refused_sentence=""
+guard_sentence=""; guard_exit=""; guard_rule=""
 # 0 when a ref has already landed, 2 when the console REFUSED one (control-tower
 # phase 88, #125: its policy would never run it, so nothing would ever resume
 # the phase — exit 2 while the session can still fix it), 1 for anything else.
@@ -1124,7 +1452,9 @@ _probe_declaration() {  # _probe_declaration <staged file>
   local url code reply_file reply
   [ "${PHASE_OUTCOME_PROBE:-1}" != 0 ] || return 1
   case "$status" in waiting-external|blocked|needs-human) ;; *) return 1 ;; esac
-  [ -n "$watch_json" ] || return 1
+  # A step is judged by the guard even with no ref to probe (control-tower phase 130),
+  # and so is a permission block: G5 — it cites a wall the console recorded (phase 135).
+  [ -n "$watch_json" ] || [ -n "$step_kind" ] || [ "$status:${needs:-}" = "blocked:permission" ] || return 1
   command -v curl >/dev/null 2>&1 || return 1
   url="$(pe_console_url "$(pe_docs_root)" 2>/dev/null || true)"
   [ -n "$url" ] || return 1
@@ -1137,6 +1467,13 @@ _probe_declaration() {  # _probe_declaration <staged file>
   [ "$code" = 200 ] || return 1
   case "$reply" in
     *'"verdict":"landed"'*) ;;
+    *'"verdict":"guard"'*)
+      guard_sentence="$(printf '%s' "$reply" | sed -n 's/.*"sentence":"\([^"]*\)".*/\1/p' | head -1)"
+      guard_exit="$(printf '%s' "$reply" | sed -n 's/.*"exit":\([0-9]\).*/\1/p' | head -1)"
+      guard_rule="$(printf '%s' "$reply" | sed -n 's/.*"rule":"\(G[0-9]\)".*/\1/p' | head -1)"
+      [ -n "$guard_sentence" ] || guard_sentence="the console's guard refused this person's turn."
+      case "$guard_exit" in 2|4) : ;; *) guard_exit=2 ;; esac
+      return 4 ;;
     *'"verdict":"refused"'*)
       refused_sentence="$(printf '%s' "$reply" | sed -n 's/.*"sentence":"\([^"]*\)".*/\1/p' | head -1)"
       [ -n "$refused_sentence" ] || refused_sentence="refused — the console would never run a watched ref as written, so nothing would ever resume this phase: fix the ref and declare again."
@@ -1152,6 +1489,11 @@ _say_landed() {
   echo "note: exit 3 — nothing was parked and nothing will resume this phase; the wait is over, so carry on (do not stop)" >&2
   exit 3
 }
+_say_guarded() {
+  echo "refused (${guard_rule:-the guard}): $guard_sentence" >&2
+  echo "note: exit $guard_exit — nothing was written and nothing parked" >&2
+  exit "$guard_exit"
+}
 _say_refused() {
   echo "--watch $refused_sentence" >&2
   echo "note: exit 2 — nothing was written and nothing parked; fix the ref (or drop it) and declare again" >&2
@@ -1164,6 +1506,7 @@ _probe_or_carry_on() {  # _probe_or_carry_on <staged file>
   [ "$rc" = 1 ] && return 0
   rm -f "$1" 2>/dev/null || true
   [ "$rc" = 0 ] && _say_landed
+  [ "$rc" = 4 ] && _say_guarded
   _say_refused
 }
 

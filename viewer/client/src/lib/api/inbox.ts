@@ -11,6 +11,7 @@
 
 import type { HaltCategory } from '@shared/halt-categories.js';
 import type { HumanStepView } from '@shared/human-step-model.js';
+import type { TurnView } from './turn';
 import { request, post, q } from './client';
 
 /** What kind of thing is asking. */
@@ -94,6 +95,12 @@ export type InboxItem = {
    * (`components/human-step-card.tsx`). The row's `actions` still answer it.
    */
   humanStep?: HumanStepView;
+  /**
+   * The item of Your turn this row is (control-tower phase 132): which item,
+   * which record holds it, its kind, reason, proof type and group. Absent on a
+   * row nothing waits on, and on an issue draft (`lib/api/turn.ts`).
+   */
+  turn?: TurnView;
   /**
    * A supervisor card's own facts (control-tower phase 102): its situation,
    * detection category, evidence, the verb Accept presses or the command an

@@ -44,6 +44,8 @@ export * from './debug';
 // Types only — the fetchers stay out of `api` (first paint), like the chat's:
 // the card that presses them is lazy and imports `humanStepsApi` itself.
 export type * from './human-steps';
+// Your turn's one read (control-tower phase 132) — its page, phase 137, imports `turnApi` itself.
+export type * from './turn';
 
 export const api = {
   ...stateApi,

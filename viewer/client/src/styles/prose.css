@@ -120,6 +120,36 @@
     overflow-wrap: normal;
   }
 
+  /*
+   * A fenced block's copy button (control-tower phase 137): `markdown.tsx`
+   * `addCopyButtons` wraps each `pre` in `.md-code` and puts ONE button under
+   * it, at the block's end edge — under, never over, so it never covers the
+   * command it copies, and the block keeps scrolling on its own.
+   */
+  .md-code {
+    margin: 0.8em 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.25rem;
+  }
+  .md-code > pre { margin: 0; align-self: stretch; }
+  .md-copy {
+    font-family: var(--font-sans);
+    font-size: var(--text-2xs);
+    color: var(--ink-muted);
+    background: var(--surface);
+    border: 1px solid var(--rule-strong);
+    border-radius: var(--radius-sm);
+    padding: 0.15rem 0.6rem;
+    cursor: pointer;
+  }
+  .md-copy:hover { color: var(--ink); }
+  .md-copy:focus-visible { outline: 2px solid var(--action); outline-offset: 2px; }
+  @media (hover: none) {
+    .md-copy { min-height: var(--tap-min); min-width: var(--tap-min); }
+  }
+
   .md blockquote {
     margin: 0.9em 0;
     padding: 0.15em 0;

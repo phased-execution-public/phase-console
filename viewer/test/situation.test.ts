@@ -1081,7 +1081,8 @@ test('blockerSubKind: a tool the permission policy refused is `permission`, read
   assert.equal(rungsFor('blocked-declared:permission')[0].spends, false);
   const ask = errandFor('blocked-declared:permission', [], 8);
   assert.match(ask.how, /Settings ▸ Permissions/);
-  assert.match(ask.how, /Never strike a deny rule/);
+  assert.match(ask.how, /Your turn holds a permission item for it/);
+  assert.match(ask.how, /never offers no grant/);
 });
 
 /* ------------------------------------------------------------------ *

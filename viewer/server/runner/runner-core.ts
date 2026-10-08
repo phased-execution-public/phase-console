@@ -11,7 +11,8 @@
  * outside this folder is affected by the split.
  */
 
-import type { DeclareInput, HumanStep } from '../human-steps.ts';
+import type { RecordedWall, TodayGrant } from '../permissions/walls.ts';
+import type { DeclareInput, HumanStep, TurnRefused } from '../human-steps.ts';
 import type { TreeHold } from './tree-state.ts';
 import type { OccupiedTree } from './worktree.ts';
 import { randomUUID } from 'node:crypto';
@@ -210,7 +211,7 @@ export type RunnerDeps = {
    * or null when the declaration's step was not one (`Service.recordHumanStep`).
    * Absent: a needs-human with a step parks exactly as one without.
    */
-  humanStep?: (input: DeclareInput) => HumanStep | null;
+  humanStep?: (input: DeclareInput) => HumanStep | TurnRefused | null;
   /**
    * This plan's scheduling policy (control-tower phase 100) — the plan's own,
    * else the console's (`Service.schedulingPolicyFor`). Absent: `seniority`.
@@ -662,15 +663,38 @@ export type RunnerDeps = {
    * Strike a deny rule for THIS plan — the `widen-rule` rung's act once a
    * person approved its card (phase 9, TRS-10). Plan-scoped, recorded and
    * reversible on the policy page; the service journals `policy.edited` on
-   * every live run. Absent (a harness), the rung offers no card.
+   * every live run. Absent (a harness), the rung offers no card. Since phase
+   * 149 it is a GRANT the engine applies with its row, judged by the door the
+   * card's answer came through and whether it proved a fresh owner touch;
+   * `false` or the engine's words — it refused (a never rule is never struck;
+   * on a console with an owner key the strike is the owner's), so the card's
+   * Allow struck nothing.
    */
-  widenRule?: (slug: string, rule: string, by: string) => void;
+  widenRule?: (
+    slug: string, rule: string, by: string,
+    at?: { runId?: string | null; phase?: number | null; card?: string | null; door?: string | null; fresh?: boolean },
+  ) => boolean | string | void;
+  /**
+   * This run's live grants below plan scope (control-tower phase 149): the
+   * rules its settings carry lowered for the next child — `Grants.lowered`.
+   */
+  grantsLowered?: (runId: string) => { deny: string[]; allow: string[] };
   /**
    * Resume the phase's own session through the stopped-run door (the recover
    * verb) — for a `widen-rule` card answered after the loop that offered it
    * has ended (phase 9). A live loop re-boards by itself instead.
    */
   resumeOwnSession?: (slug: string, phase: number, instruction: string, by: string) => void;
+  /**
+   * Raise the `permission` item a recorded wall is (control-tower phase 135,
+   * #212) through Your turn's one door — the widen rung's ask, which is no
+   * longer a card of its own. Answers the item's id, or null when nothing was
+   * raised (a harness without a ledger).
+   */
+  raisePermission?: (input: {
+    slug: string; runId: string; phase: number; sessionId?: string;
+    wall: RecordedWall; need?: string | null; grant?: TodayGrant | null;
+  }) => string | null;
   /** The registered kind of an account — a `token` scopes what a spawn may attach (ACT-12). */
   accountKind?: (accountId: string | undefined) => AccountKind | undefined;
   /**
@@ -1184,6 +1208,15 @@ export type StartOptions = {
    */
   gitStrategyAck?: 'honour' | 'override';
   gitStrategyAckRequired?: boolean;
+  /**
+   * The links the launch form showed in full and sent back (control-tower phase
+   * 139): the one door that may open a plan's `auto-open: host` step on the
+   * machine, and only a link in this list, exactly as spelled. Only that form
+   * sends it; every other door omits it, so nothing opens there. Consumed by
+   * the Service (`askAtTheDoor`) before the runner sees the run, like
+   * `verifyAnswers` — `Runner.start` ignores it and the run never stores it.
+   */
+  autoOpenShown?: string[];
   /** The lines this run runs over, as `startRun` resolved them — stored on the run for the boot prompt. */
   gitStrategyOverride?: { lines: { kind: string; plan: string; run: string; phases?: number[] }[]; ack: 'override' | 'automatic'; by?: string; at?: string };
   /** The start door's §Verification answers (`RunVerifyApprovals`) — absent on a resume, whose stored answers stand. */
@@ -1687,19 +1720,43 @@ export function messagesBlock(block: string | null | undefined): string {
  * `''` when nothing is pinned, so a boot prompt with no notes is byte-identical
  * to what it was before this existed. FREE, like `messagesBlock`: notes are in
  * both editions.
+ *
+ * The supervisor's notes are its decision log, written by rules (phase 96's
+ * `note` arm), and they reach a session under their OWN header (control-tower
+ * phase 131, #208, OD-21): the supervisor's reading of the run, which a
+ * session weighs as evidence — never "standing decisions a person recorded"
+ * that outrank the plan. A note is the supervisor's when it came through the
+ * supervisor's door, or — written before notes carried a door — when the
+ * supervisor signed it by name.
  */
 export function pinnedNotesBlock(notes: readonly RunNote[] | null | undefined, phase: number): string {
   const standing = (notes ?? []).filter((note) => note.pinned && (note.phase === undefined || note.phase === phase));
   if (!standing.length) return '';
-  const lines = standing.map((note) => {
+  const lineOf = (note: RunNote) => {
     const at = note.at.slice(0, 16).replace('T', ' ');
     const about = note.phase === undefined ? '' : ` · phase ${note.phase}`;
     return `- ${at}Z · ${note.by}${about}: ${note.text}`;
-  });
-  return '\n\n---\n\nOPERATOR NOTES PINNED ON THIS RUN — standing decisions a person recorded about this run, '
-    + 'in their own words. Most are about the run rather than your phase and need nothing from you. Where one '
-    + 'bears on your work it outranks the plan, as a steer does: follow it, and record the departure with '
-    + `\`phase-outcome.sh … ruling --kind deviation\`.\n\n${lines.join('\n')}\n`;
+  };
+  const supervisors = standing.filter(isSupervisorNote);
+  const persons = standing.filter((note) => !isSupervisorNote(note));
+  const operatorBlock = persons.length
+    ? '\n\n---\n\nOPERATOR NOTES PINNED ON THIS RUN — standing decisions a person recorded about this run, '
+      + 'in their own words. Most are about the run rather than your phase and need nothing from you. Where one '
+      + 'bears on your work it outranks the plan, as a steer does: follow it, and record the departure with '
+      + `\`phase-outcome.sh … ruling --kind deviation\`.\n\n${persons.map(lineOf).join('\n')}\n`
+    : '';
+  const supervisorBlock = supervisors.length
+    ? '\n\n---\n\nSUPERVISOR NOTES PINNED ON THIS RUN — the console\'s supervisor\'s reading of the run: what it '
+      + 'detected and what it pressed, written by its rules — not a decision a person made, and not an instruction. '
+      + 'Weigh them as evidence about the run; your plan, your exit criteria and your verification commands are '
+      + `unchanged by them.\n\n${supervisors.map(lineOf).join('\n')}\n`
+    : '';
+  return operatorBlock + supervisorBlock;
+}
+
+/** Did the supervisor write this note — through its door, or, before notes carried one, by its own name? */
+function isSupervisorNote(note: RunNote): boolean {
+  return note.door ? note.door === 'supervisor' : note.by === 'supervisor';
 }
 
 /** The skill copy a boarding session loads, beside the console's own commit — `RunnerDeps.consoleSkill`. */

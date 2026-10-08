@@ -217,3 +217,25 @@ test('EA-4: a person-errand\'s holder verb is errand-answered, and the Ways forw
   assert.equal(actions[0]?.group, 'primary');
   assert.equal(actions[0]?.label, 'Done — continue');
 });
+
+test('EA-5 (phase 132): an errand an item stands behind is answered on that item; a permission wall keeps Done — continue until phase 135', async () => {
+  const { buildInbox } = await import('../server/inbox.ts');
+  const at = '2026-10-07T10:00:00.000Z';
+  const step = {
+    id: 'step-ea5', kind: 'operator-act', title: 'Run the two applies', where: 'any', slug: 'alpha', phase: 2, runId: 'r5',
+    birth: 'console', state: 'notified', declaredAt: at, at, opened: 0, attempts: 0, why: 'reserved', whySource: 'declared',
+    proofType: 'attest', waiters: [], source: { kind: 'errand', ref: 'blocked-declared:human-acts' },
+  };
+  const run = (situation: string) => ({
+    id: 'r5', slug: 'alpha', status: 'parked', updatedAt: at, phases: { 2: { phase: 2, status: 'parked' } },
+    recoveries: { 2: { errand: { phase: 2, situation, tried: [], need: NEED, how: 'Run them.', at } } },
+  });
+  const rowOf = (situation: string) => buildInbox({ plans: [], flags: { allowRun: true }, humanSteps: [step], runs: [run(situation)] } as never)
+    .items.find((item) => item.kind === 'errand')!;
+  const item = rowOf('blocked-declared:human-acts');
+  assert.equal(item.actions[0]?.endpoint, '/api/human-steps/step-ea5/check');
+  assert.equal(item.actions[0]?.label, 'I\'ve done this — check');
+  assert.equal(item.turn?.item, 'step-ea5');
+  const wall = rowOf('blocked-declared:permission');
+  assert.equal(wall.actions[0]?.verb, 'errand-answered', 'a permission wall is not an operator act — phase 135 makes it a permission item');
+});

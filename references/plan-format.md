@@ -303,30 +303,41 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    **A person's turn, declared by the plan (control-tower phase 41).** A phase names each act only a
    person can do on its own bullet, so the launch door can ask for it before anything spawns:
    `- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any ·
-   window: <duration> [· auto-open: host] [· credential: <id>] [· due: <ref>]`. The kind and what to do are
+   window: <duration> [· auto-open: host] [· credential: <id>] [· due: <ref>] [· why: <reason>]
+   [· effort: <duration>] [· unblocks: <phases>] [· guide: <file>]`. The kind and what to do are
    positional; every later field is `key: value`, in any order, a value in one pair of backticks read
-   without them. The kind is one of seventeen (`scripts/human-steps.env`, owner
+   without them. The kind is one of eighteen (`scripts/human-steps.env`, owner
    `viewer/shared/human-step-model.js`): `browser-login`, `device-code`, `one-time-code`,
    `secret-entry`, `claude-login`, `mcp-login`, `os-prompt`, `os-permission`, `third-party-approval`,
    `physical`, `person-check`, `decision`, `protected-path`, `interactive-prompt`, `captcha`,
-   `email-link`, `operator-act` — the last the general act only the operator does, a command to run or
-   a click path to follow (control-tower phase 121, #182). `where` defaults to the kind's; `open:` is an http(s) link or a command for the
+   `email-link`, `operator-act` — the general act only the operator does, a command to run or a click
+   path to follow (control-tower phase 121, #182) — and `permission`, a wall the AI met, ended by a
+   grant or a denial (phase 130, #207). `where` defaults to the kind's; `open:` is an http(s) link or a command for the
    terminal; `proof:` is a watch ref (`cmd:`, `gh:`, …); `window:` a duration; `auto-open: host` lets
    the step open by itself on the machine — a PLAN's step only, never a session's; `credential:` is
    the registry id a `secret-entry` stores under; `due:` is a watch ref the step waits on before it is
    due — until it lands the step is `upcoming`, listed under *Coming up*, unannounced and its window
    not started, and when it lands the step is due with ONE push, `NOW: <command>` (a `due:` that fits no
-   scheme's shape — a date with no time, a `phase:` with no number — fails F37 by name). A phase may carry
-   several. The same bullet under a top-level `## Operator errands` heading is the PLAN's own act —
+   scheme's shape — a date with no time, a `phase:` with no number — fails F37 by name). Your turn's four
+   (control-tower phase 130, #207): `why:` — why only a person fits it, a reason from
+   `scripts/turn.env`'s `WHY_PERSON` that the kind allows (`KIND_REASONS`, owner
+   `viewer/shared/turn-model.js`; one the kind does not allow fails F37), `effort:` — how long it takes
+   the person, `unblocks:` — the phases it unblocks (`12,13`), and `guide:` — a guide file under the
+   docs root in the grammar of `viewer/shared/guide-grammar.js` (a why paragraph, `## Steps` with
+   numbered steps and their commands, `## If it goes wrong`; 20 steps and 24 KB at most). A phase may
+   carry several. The same bullet under a top-level `## Operator errands` heading is the PLAN's own act —
    phase `0`, asked at every launch and listed with the rest, e.g.
    `- **Human step:** operator-act · Publish the release · open: npm publish · proof: cmd:"npm view my-package version" · due: unit:build-box/nightly-build.service`.
    Read back with `phase-graph.sh <slug> --human-steps [N]` (`0` for the plan's own; a ninth field, the
-   `due:` ref, when the bullet names one). **The 5.1.0 spelling `- **Human step:** <who, what,
+   `due:` ref, when the bullet names one, and four more — why, effort in minutes, unblocks, guide —
+   when it names one of those). **The 5.1.0 spelling `- **Human step:** <who, what,
    proof ref>` is superseded** — nothing ever parsed it — and fails the lint by name, with the new
    grammar in the sentence (**F37** `human-step-superseded`); so do a kind that is not one of the
-   seventeen (`human-step-kind-unknown`) and a field the grammar does not have
+   eighteen (`human-step-kind-unknown`) and a field the grammar does not have
    (`human-step-field-invalid`). A step with no `proof:` is advised about (**F38**
-   `human-step-no-proof`): only a person's word can close it.
+   `human-step-no-proof`): only a person's word can close it. A step with no `why:` is advised about
+   too (**F40** `human-step-no-why`) — never a gate: the item is given its kind's default reason,
+   marked inferred.
    **Spelling the model.** The `**Target model:**` value may be an alias (`opus`), a full id
    (`claude-opus-5`), or either carrying the `[1m]` window suffix (`opus[1m]`, `claude-opus-5[1m]`) — all
    parse the same. The suffix, not the alias, is what claims the ~200K budget (`references/sizing.md`;
@@ -335,6 +346,13 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    > **Target model:** `claude-opus-5` (1M window) · **Budget:** ~200K weight/session (≈60% of the window) · **Branch:** current branch (no new branch).
    > **Skills (every session):** `design-system`, `some-plugin:test-first`
    > Hard-reasoning phases → Opus/Fable; mechanical phases → Haiku if run in their own sessions.
+
+   **`**Guide language:** <tag>`** (control-tower phase 140) names the language a person's-turn guide
+   is written in — `fa`, `en`, `pt-BR` — for a plan whose operator reads one other than English. It is
+   read by the SESSION, not the engine: SKILL.md tells a session declaring a step to write its `--guide`
+   in that language and pass the tag as `--lang`, and Your turn draws a right-to-left guide right to
+   left with its commands left to right. Silence means English. A plan bullet's `guide:` file is written
+   in it too (`references/turn.md` §The guide).
 5. **`## Decisions`** — the **decision manifest**: every decision a run can need, answered BEFORE the
    run starts, so nothing has to ask a person mid-run (the sep-review audit measured 494 mid-run asks
    and found every one had an answer before the money was spent). **Machine-read by both engines** —
@@ -354,7 +372,10 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    `permission.policy` (this plan's ask/deny/allow overlay,
    `autoApprove`) · `permission.destructive` (publishing and destructive verbs — `deny`, with named
    exceptions: a clause beginning `allow` naming backticked rules, the only thing that lets
-   auto-grant answer `git push` / `gh pr create`) · `issues` (what a session may write OUTWARD to
+   auto-grant answer the three publishing asks — `git push`, `gh pr create`, `gh pr merge` — and the
+   one door through a session's console guard: a press named `Bash(phase-console <verb>:*)`, or
+   `Console(<press>)` for a route no CLI verb presses, e.g. `Console(edit-policy)`; it never hands
+   anyone a grant, an override or the owner keys) · `issues` (what a session may write OUTWARD to
    the repository's issue tracker — `off`, `draft` or `file`, the `**Issues:**` line's word) · `credentials` (backticked ids + the credential policy) · `accounts` (accounts in
    order, minimum headroom each, `onLimit`) · `mcp` (the servers and the MCP policy) · `gates`
    (`Gate-check` on every gated heading; `delegated` or `operator`) · `verification.person-check`
@@ -642,7 +663,7 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      is for a duration. They are mutually exclusive, and both work with `blocked` and `needs-human` as
      well as `waiting-external` — the clock only decides when the console next brings the phase up, and
      never replaces the ask. Better still where it applies: a `--watch` ref, which the console polls on
-     a clock of its own and which resumes the phase the moment it lands — the same eight schemes a
+     a clock of its own and which resumes the phase the moment it lands — the same nine schemes a
      session's `phase-outcome.sh --watch` takes and a `- **Waits on:**` bullet names:
 
      | Ref | Lands when | Use it for |
@@ -655,6 +676,7 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      | `phase:<slug>/<N>` | the console's record of sibling phase N reads done, after its §Verification; un-lands if that phase is reopened | waiting on a sibling — never a `cmd:` grep of its handoff |
      | `verify:<slug>/<N>` | your own red §Verification lines all pass on one branch head, re-run whenever the head moves | your OWN phase, when its blocker is a sibling's red |
      | `cmd:"<command>"` | the command exits 0 — it is run, not read, under the §Verification policy | anything else, self-contained: absolute paths, no shell variables, no `cd`, at most 1,000 characters |
+     | `credential:<id>` | the credential is present, read by NAME and never its value — `credential:gh`, `credential:claude`, `credential:env:<NAME>`, `credential:keychain:<service>`, `credential:file:<path>` | the proof of a `secret-entry` step: storing the secret proves it with nothing read back (control-tower phase 132) |
 
      A ref the console cannot run as written is refused where it is declared — `phase-outcome.sh` exits
      2 and cuts nothing — and a ref the console mints for a refused in-turn wait obeys the same rules.

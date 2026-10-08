@@ -113,6 +113,10 @@ export const SSE_EVENTS = [
   // event, so the card's status line and the strip's summons are a cache
   // write — a proof landing on the phone moves the desk's strip in the tick.
   'human-step',
+  // A round of the console's own clock changed Your turn (control-tower phase
+  // 136): something came due, was proven, expired, was withdrawn or escalated.
+  // The round's counter rides the event; the turn and the inbox are read again.
+  'turn',
   // A plan's structural lint finished. `/api/plans/<slug>` no longer awaits it:
   // `validate.sh` walks every handoff, and on the 22-handoff plan somebody was
   // actually working on that was 11.27 s the page paid before it could paint a

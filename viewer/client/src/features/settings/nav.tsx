@@ -85,7 +85,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = Object.freeze([
   {
     id: 'permissions',
     title: 'Permissions',
-    blurb: 'What a session may run without being asked — one vocabulary, per profile.',
+    blurb: 'Every grant and what it changed, the owner keys, and what a session may run without being asked.',
   },
   {
     id: 'instance',
@@ -127,7 +127,7 @@ export const SECTION_SEARCH_TERMS: Readonly<Record<string, string>> = Object.fre
   accounts: 'claude account login usage meter limit wall switch register rename remove sign in',
   mcp: 'mcp servers registry catalog tools credentials add remove unreachable policy require',
   permissions:
-    'permissions policy allow ask deny wall rules strike shipped defaults restore profile guarded trusted bypass auto approve',
+    'permissions policy allow ask deny wall rules strike shipped defaults restore profile guarded trusted bypass auto approve grants granted revoke scope owner key passkey enrol lock sign in',
   instance: [
     'process restart stop shutdown update interface service worker build revision tailscale remote reach port serving dist',
     'logs retention disk space prune sweep keep delete transcripts journals rulings git trace size bytes',

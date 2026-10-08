@@ -52,7 +52,6 @@ import { api, type PlanDetail } from '@/lib/api';
 import {
   useAccounts,
   useApiMutation,
-  useApprovals,
   useAuth,
   useConsoleState,
   useJournal,
@@ -71,7 +70,7 @@ import { useNow } from '@/lib/clock';
 import type { LabelledClock } from '@/lib/format';
 import { PHASE_CLOCK_LABELS } from '@shared/phase-clocks.js';
 import { isLive } from './defaults';
-import { ApprovalQueue, type Answer, type Decide } from './approvals';
+import { ApprovalQueue } from './approvals';
 import { Controls } from './lane-setup';
 import { LiveConsole } from './console';
 import { RunHeader, RunTiles } from './tiles';
@@ -129,7 +128,6 @@ export function RunView({ detail }: { detail: PlanDetail }) {
   const enabled = !stale;
 
   const { data: detailRun, isPending } = useRun(slug, enabled);
-  const { data: queue } = useApprovals(enabled);
   const { data: auth } = useAuth(enabled);
 
   const run = detailRun?.run ?? null;
@@ -155,8 +153,6 @@ export function RunView({ detail }: { detail: PlanDetail }) {
   // is the only thing that opens it, and only for a phase with two boardings.
   const [comparePhase, setComparePhase] = useState<number | null>(null);
   const { data: ledger } = useRulings(slug, enabled);
-
-  const approvals = (queue ?? []).filter((a) => a.status === 'pending');
 
   // The strip's lanes, from the same fold the Tower draws (`nowLanes`), so the
   // header of this page and this run's strip in the Tower are one reading.
@@ -227,42 +223,6 @@ export function RunView({ detail }: { detail: PlanDetail }) {
     [mutateAsync],
   );
 
-  const decide: Decide = useCallback(
-    (id, decision, reason, remember, rule) => {
-      void act('decide', async () => {
-        const result = await api.decide(id, decision, reason, remember, rule);
-        // The rule is reported back rather than assumed: a card can be answered and
-        // the remembering still refused (an unparseable rule), and saying
-        // "Approved" to both would hide the half that failed.
-        if (result?.error) toast(result.error, 'warn');
-        else if (result?.wrote) {
-          toast(
-            `${decision === 'allow' ? 'Approved' : 'Denied'} · wrote ${result.wrote} (${result.scope})`,
-            'ok',
-          );
-        } else {
-          toast(decision === 'allow' ? 'Approved' : 'Denied', decision === 'allow' ? 'ok' : 'warn');
-        }
-      });
-    },
-    [act],
-  );
-
-  const answerQuestion: Answer = useCallback(
-    (approval, key, label) => {
-      void act('answer', async () => {
-        const result = await api.answerQuestion(approval.slug, approval.id, [{ key, label }]);
-        if (!result?.ok) toast(result?.error ?? 'the question could not be answered', 'warn');
-        else
-          toast(
-            result.remaining ? `Answered “${label}” · ${result.remaining} left` : `Answered “${label}”`,
-            'ok',
-          );
-      });
-    },
-    [act],
-  );
-
   if (stale) return <StaleServerNote />;
   if (isPending && !detailRun) return <Spinner label="Reading run state" />;
 
@@ -295,8 +255,8 @@ export function RunView({ detail }: { detail: PlanDetail }) {
       )}
 
       {/* First, always: a session parked with its hand up is the only thing on
-          this page that is waiting on a person. */}
-      <ApprovalQueue approvals={approvals} allowRun={allowRun} onDecide={decide} onAnswer={answerQuestion} />
+          this page that is waiting on a person — each ask drawn as its item. */}
+      <ApprovalQueue runId={run?.id} slug={slug} />
 
       {authFailure && (
         <AuthCard

@@ -12,6 +12,10 @@
  * functions; `client/src/sw.ts` is what is left, which is listeners and awaits.
  */
 
+// The catalogue's `routeFor` is read below (control-tower phase 138) — a
+// server import, so the sandbox comes first, as every such file's does.
+import './state-sandbox.ts';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -21,6 +25,7 @@ const {
   MAX_NOTIFICATION_ACTIONS,
   NOTIFICATION_BADGE,
   NOTIFICATION_ICON,
+  STEP_OPEN_ACTION,
   actionOf,
   actionRequest,
   answeredNotification,
@@ -34,7 +39,10 @@ const {
   parsePayload,
   readRequest,
   resubscribeRequest,
+  stepOf,
+  stepTarget,
 } = await import('../shared/sw-push.js');
+const { routeFor } = await import('../server/push/catalogue.ts');
 
 const ORIGIN = 'http://127.0.0.1:4123';
 
@@ -167,6 +175,20 @@ test('a click can never leave this origin', () => {
   assert.equal(clickTarget({ url: 'javascript:alert(1)' }, ORIGIN), `${ORIGIN}/`);
 });
 
+test('a person’s turn opens its own item on Your turn — under the payload’s mount, never another origin', () => {
+  // Control-tower phase 137 (#214): a step's push lands on `#/turn/<id>`, the
+  // item expanded — one tap from the lock screen to the whole guide.
+  // `#/approve?step=` still resolves (a redirect), but nothing mints it now.
+  const step = { url: '/#/plan/alpha/run', step: { id: 'human-step-1', kind: 'browser-login' } };
+  assert.equal(stepTarget(step, ORIGIN), `${ORIGIN}/#/turn/human-step-1`);
+  assert.equal(stepTarget({ ...step, url: '/c/abc-hub/#/plan/alpha/run' }, ORIGIN), `${ORIGIN}/c/abc-hub/#/turn/human-step-1`);
+  assert.equal(stepTarget({ ...step, url: 'https://evil.test/#/x' }, ORIGIN), `${ORIGIN}/#/turn/human-step-1`);
+  // An id that needs encoding stays one segment.
+  assert.equal(stepTarget({ ...step, step: { id: 'a/b c' } }, ORIGIN), `${ORIGIN}/#/turn/a%2Fb%20c`);
+  // No step: the payload's own address.
+  assert.equal(stepTarget({ url: '/#/ready' }, ORIGIN), `${ORIGIN}/#/ready`);
+});
+
 /* ---------------- the requests ---------------- */
 
 test('every mutation carries the header the server refuses to work without', () => {
@@ -291,8 +313,102 @@ test('the callback request carries the token and nothing routable', () => {
   assert.doesNotMatch(String(init.body), /https?:|\/api\/(?!push\/action)/);
 });
 
+/* ------------------------------------------------------------------ *
+ * Where a push opens, and the lock screen held to the `device` door
+ * (control-tower phase 138, #215)
+ * ------------------------------------------------------------------ */
+
+test('LS-1: the granted push opens Settings ▸ Permissions ▸ Grants AT that grant — the url routeFor builds, through the worker', () => {
+  const url = routeFor('granted', { grantId: 'g-1a2b 3/4' });
+  assert.equal(url, '/#/settings/permissions?grant=g-1a2b%203%2F4', 'the grant id is one query value, encoded');
+  assert.equal(routeFor('granted'), '/#/settings/permissions', 'with no id, the list itself');
+  const data = parsePayload(JSON.stringify({
+    title: 'Granted: Bash(npm test:*)', body: 'you granted it for this one call', tag: 'granted:g-1a2b 3/4', url, category: 'granted',
+  }));
+  const info = notificationOptions(data).data as { url: string };
+  assert.equal(clickTarget(info, ORIGIN), `${ORIGIN}/#/settings/permissions?grant=g-1a2b%203%2F4`);
+  // A record of authority given asks nothing of anyone: no button.
+  assert.equal(notificationActions(data), undefined);
+});
+
+test('LS-2: an item’s push opens #/turn/<id> — the url routeFor builds and the step block name ONE page', () => {
+  const url = routeFor('needs-you', { slug: 'alpha', phase: 3, stepId: 'step a/1' });
+  assert.equal(url, '/#/turn/step%20a%2F1');
+  const info = notificationOptions({ url, step: { id: 'step a/1', kind: 'browser-login' } }).data as never;
+  assert.equal(stepTarget(info, ORIGIN), `${ORIGIN}/#/turn/step%20a%2F1`);
+  assert.equal(stepTarget(info, ORIGIN), clickTarget(info, ORIGIN), 'the body’s tap and Open land on the same item');
+  // A step of a kind this worker does not know is a plain link — and the link
+  // is the item too, so an older worker still lands on the page.
+  const odd = notificationOptions({ url, step: { id: 'step a/1', kind: 'teleport' } }).data as never;
+  assert.equal(clickTarget(odd, ORIGIN), `${ORIGIN}/#/turn/step%20a%2F1`);
+});
+
+/** A permission item's push, as `announceHumanStep` sends it: the step's named list, the signed buttons, the token. */
+function permissionPush(named: { action: string; title: string }[], signed: { action: string; title: string }[] | null) {
+  return parsePayload(JSON.stringify({
+    title: 'Your turn: permission — alpha phase 3',
+    body: 'Bash(npm test:*) — the session needs it to run the suite.',
+    tag: 'turn-step-p1',
+    url: '/#/turn/step-p1',
+    category: 'needs-you',
+    ...(signed ? { actions: signed, callback: 'tok.sig' } : {}),
+    step: { id: 'step-p1', kind: 'permission', where: 'any', actions: named },
+  }));
+}
+
+const ALLOW = { action: 'grant', title: 'Allow' };
+const DENY = { action: 'deny', title: 'Deny' };
+const OPEN = { action: 'open', title: 'Open' };
+
+test('LS-3: a permission item a paired device may grant carries Allow and Deny — the signed pair, Allow on the left', () => {
+  const data = permissionPush([ALLOW, DENY], [ALLOW, DENY]);
+  const options = notificationOptions(data);
+  assert.deepEqual((options as { actions?: unknown }).actions, [ALLOW, DENY]);
+  const info = options.data as never;
+  // Each press is an answer posted through the one route — never an Open first.
+  assert.equal(actionOf('grant', info), 'grant');
+  assert.equal(actionOf('deny', info), 'deny');
+  assert.deepEqual(JSON.parse(String(actionRequest('tok.sig', 'grant').init.body)), { token: 'tok.sig', action: 'grant', by: 'notification' });
+  // The named list survives onto the notification: the click, hours later,
+  // must still find the buttons it drew.
+  assert.deepEqual((stepOf(info) as { actions?: unknown }).actions, [ALLOW, DENY]);
+  assert.match(ANSWER_RECEIPTS.grant, /narrowest/, 'the receipt says what a lock-screen grant reaches');
+});
+
+test('LS-4: a high-risk item’s button OPENS the item instead of granting; Deny is still a decline', () => {
+  const data = permissionPush([OPEN, DENY], [DENY]);
+  const options = notificationOptions(data);
+  assert.deepEqual((options as { actions?: unknown }).actions, [OPEN, DENY]);
+  const info = options.data as never;
+  assert.equal(actionOf(STEP_OPEN_ACTION, info), null, 'Open is never posted as an answer');
+  assert.equal(actionOf('grant', info), null, 'a grant this notification never offered is not a press');
+  assert.equal(actionOf('deny', info), 'deny');
+  assert.equal(stepTarget(info, ORIGIN), `${ORIGIN}/#/turn/step-p1`, 'Open lands on the item, where the rule is typed');
+});
+
+test('LS-5: a button the server named but did not SIGN is never drawn — a grant without its token is not a grant', () => {
+  // Named Allow, signed only Deny: the worker draws what the token carries.
+  assert.deepEqual(notificationActions(permissionPush([ALLOW, DENY], [DENY])), [DENY]);
+  // No token at all (a fan-in that dropped it, a payload from a stripped
+  // path): nothing is pressable, so the one button left is the item itself.
+  assert.deepEqual(notificationActions(permissionPush([ALLOW, DENY], null)), [OPEN]);
+  // A third named button is cut at the platform's cap, never a partial row of junk.
+  const many = notificationActions(permissionPush([OPEN, ALLOW, DENY], [ALLOW, DENY])) as unknown[];
+  assert.equal(many.length, MAX_NOTIFICATION_ACTIONS);
+  // A named entry that is not a button is skipped, never drawn half-made.
+  assert.deepEqual(notificationActions(permissionPush([{ action: '', title: 'x' }, DENY], [DENY])), [DENY]);
+});
+
+test('LS-6: an older step payload — no named list — still draws Open and its signed I did it', () => {
+  const data = parsePayload(JSON.stringify({
+    url: '/#/turn/s-1', actions: [{ action: 'check', title: 'I did it' }], callback: 'tok',
+    step: { id: 's-1', kind: 'device-code', where: 'any' },
+  }));
+  assert.deepEqual(notificationActions(data), [OPEN, { action: 'check', title: 'I did it' }]);
+});
+
 test('every answerable verb has a receipt, and an unknown one still gets words', () => {
-  for (const verb of ['allow', 'deny', 'approve']) {
+  for (const verb of ['allow', 'grant', 'deny', 'approve']) {
     assert.ok(ANSWER_RECEIPTS[verb], `${verb} has no receipt`);
     assert.match(String(answeredNotification(verb, { approvalId: null })[1].body), /\w/);
   }

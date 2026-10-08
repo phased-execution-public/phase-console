@@ -251,3 +251,18 @@ esac
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('the checking session is an automatic start through its own door — counted, and refused at the ceiling (phase 134)', () => {
+  let now = T0;
+  const ceiling = new StartCeiling(() => ({ startsPerHour: 2, usdPerHour: 0 }), () => now);
+  const checker = doorActor('turn-checker', { by: 'console', via: 'event', origin: 'checkHumanStep' });
+  for (let i = 0; i < 2; i += 1) {
+    assert.equal(ceiling.admit(checker).ok, true);
+    ceiling.charge(checker, 'alpha');
+    now += 1_000;
+  }
+  assert.deepEqual(ceiling.snapshot().doors, { 'turn-checker': 2 });
+  const third = ceiling.admit(checker);
+  assert.equal(third.ok, false, 'a person asked for a CHECK, not a session — the session is the console\'s');
+  if (!third.ok) assert.match(ceilingSentence(third), /refused the turn-checker door/);
+});

@@ -45,7 +45,7 @@ import type { LifecycleVerb } from '@/lib/run-lifecycle';
 import type { RecoveryCtx } from '@/components/recovery-actions';
 import { laneSilent, type NowLane } from '@/features/runs/lanes-model';
 import type { InboxItem, PhaseRecord, QueueEntry, RunState, VerifyingLane } from '@/lib/api';
-import { stepItemsOf } from './tower-model';
+import { runItems } from '@/features/turn/surfaces';
 import { toRows, type RunRow } from '../model';
 import { stripClock } from './clocks';
 import { waitLines, type WaitLine } from './waits';
@@ -226,13 +226,22 @@ export function stripAction(
   facts: { frozen: boolean; held: boolean },
 ): StripAction {
   const { run, lanes, allowRun } = input;
-  // 0. A person's turn: the step's act IS the one thing to press — it needs
-  // no flag, and nothing else the run could be told moves it on.
-  const step = stepItemsOf(input.ctx?.inbox as readonly InboxItem[] | undefined, run)[0];
-  // Its label is the card's own (`human-step-words.ts`), drawn by the lazy
-  // button — kept off the first paint, which reads only that it is a step.
-  if (step?.humanStep)
-    return { kind: 'step', label: 'Your turn', title: `Your turn — ${step.humanStep.title}`, item: step };
+  // 0. A person's turn: the run's OLDEST item's primary IS the one thing to
+  // press (control-tower phases 42, 139) — a step's act, a card's Allow, a
+  // gate's Approve — and nothing else the run could be told moves it on.
+  // Only for a run a person's turn summoned: a plan-wide row names no run, and
+  // must not take a Live strip's Pause or a Settled one's Open run.
+  const item =
+    bay === 'needs-you' ? runItems(input.ctx?.inbox as readonly InboxItem[] | undefined, run)[0] : undefined;
+  // Its label is the item row's own, drawn by the lazy button — kept off the
+  // first paint, which reads only that it is a person's turn.
+  if (item)
+    return {
+      kind: 'step',
+      label: 'Your turn',
+      title: `Your turn — ${item.humanStep?.title ?? item.title}`,
+      item,
+    };
   if (!allowRun) return openAction(run, 'This console cannot drive runs — open the run page to read it');
   if (facts.frozen) return lifecycleAction('thaw');
   if (run.status === 'pausing')

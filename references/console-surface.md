@@ -269,11 +269,12 @@ allowed to depend on it alone.
 reason, not as an unexplained failure — read it. It is not a bug and not something to route around:
 do the part of the work that does not need the denied tool, and record what you could not do under
 **Outstanding** in the handoff as an operator errand. Never try to defeat the wall; a person runs
-those commands themselves, deliberately — or widens the wall for this plan, which the console offers
-them. A deny-list denial is stamped on your phase record (`toolDenied`: the tool, the rule, the
-command), a phase stopped on it reads `blocked-declared:permission`, and that situation's one rung is
-`widen-rule`: a standing approval card naming the rule, whose Allow strikes it for this plan and
-resumes your own session. If the phase cannot proceed without the tool, declare it by key with the
+those commands themselves, deliberately — or grants it, with a scope and an end, on the permission
+item the console raises for them. A deny-list denial is stamped on your phase record (`toolDenied`:
+the tool, the rule, the command), a phase stopped on it reads `blocked-declared:permission`, and that
+situation's one rung is `widen-rule`, which raises the permission item naming the rule: its Grant, at
+the scope the person picks, is applied by the grant engine and resumes your own session
+(`references/turn.md` §A permission block). If the phase cannot proceed without the tool, declare it by key with the
 rule and the command as fields —
 `phase-outcome.sh <slug> <N> blocked --needs permission --rule "<the rule>" --command "<the command>"`
 — and stop. The card is driven only from the console's own recorded denial: a wall described in prose,
@@ -298,6 +299,21 @@ the same way; your run's own checkout and your memory can live there, and stay w
 `phase.tool-denied {rule: 'console-forge', verb}`; nothing about it is a person's to widen from a card.
 The one door through is the plan's own `permission.destructive` row naming the press for your phase
 (`` `phase-console run approve` `` names the card's route too), read as the auto-grant reads it.
+
+**Every wall you meet is recorded, and a permission block must cite one** (control-tower phase 135,
+#212). The console keeps the walls your lane met on its record — each refusal of its own hook (a
+deny rule, every guard above) and each refusal of the CLI's own permission system (a tool outside
+the allow list, an MCP tool this run was not granted, the CLI's copy of a deny rule). When you are
+truly stopped, declare `blocked --needs permission --rule "<the rule>" --command "<the command>"`
+naming the wall you met: the console raises ONE permission item for a person — the command, your
+phase, why (your `--reason`), the wall and its risk tier — and resumes you with their answer. A
+declaration that cites no recorded wall is refused at the door, exit 4: *nothing refused this — run
+it* — so run the command first; if it is refused, that refusal is the wall you cite. The person may
+Grant it at a scope — this call, this phase, this plan, this repository or always (phase 149's grant
+engine) — *Deny* — you are told "Denied — do not retry; find another way inside the plan or say
+what remains" — or take it over (*I'll do it myself*), and you are resumed once they have run it. A
+guard, a forced or deleting push, the host family (`sudo`, `shutdown`, `reboot`, `mkfs`, `dd`), a
+protected path and a secret's value are never granted through any door: plan around them.
 
 ## Never wait on somebody else's clock inside a turn — and never poll
 
@@ -662,7 +678,9 @@ plausible in your situation, re-check the lock before a long unattended stretch 
 
 ## Talking to a running phase — btw, ask and steer
 
-A supervised phase holds its stdin open, so it is a session you can speak to without stopping it. Two
+A supervised phase keeps its stdin open until its first completed turn — the runner closes it at the
+first result (`viewer/server/runner/spawn.ts`) — so while that turn runs it is a session you can speak
+to without stopping it; after it, the lane reads as unreachable and the verbs refuse by name. Two
 verbs, deliberately separate (`viewer/server/runner/runner-control.ts`):
 
 - **ask** — a question. The console frames it so the model answers and then **carries on where it left
@@ -695,11 +713,39 @@ hook reports your session stopped on a prompt, the inbox's `session-ask` row for
 **Answer it**, and a person's words arrive as a *steer* — an instruction for the rest of the phase. (A
 lane with a pending approval card for the same phase gets the card instead of the row.) And **every
 verb says who sent it**: a route derives the actor from the request (`actorOfRequest`,
-`viewer/server/api/actor.ts`) — `via` is `cli` for `phase-console` and `btw` and `api` otherwise,
-`origin` is `local` or the calling host, `remoteUser` is the proxy's login and is read only under
-`--remote`, and `by` is the request body's label (at most 64 characters), else that login, else
-`operator` for a browser or the CLI and `script` for anything else. A message a script sent is
-recorded as the script's, never as the operator's.
+`viewer/server/api/actor.ts`) — `via` is `cli` for `phase-console` and `btw`, which name themselves
+in their User-Agent, and `api` otherwise; `origin` is `local` or the calling host; `remoteUser` is
+the login somebody verified — the proxy's, read only under `--remote`; and `by` is the request
+body's LABEL (at most 64 characters), else that login, else `operator` for a browser or the CLI and
+`script` for anything else. A label is never who pressed: `pressDoor` is (control-tower phase 131),
+decided from what the request can prove — `session` for a run token, `device` for a login the proxy
+verified or a signed lock-screen action, else `local`. A script that says `by: operator` is recorded
+`local`, with its label; and a request carrying your own token is refused at the door of every
+authority route your plan's `permission.destructive` row does not name (`viewer/shared/door-model.js`).
+
+**The owner key** (control-tower phase 148, #208). A console can have an owner: a passkey, enrolled
+at the machine through `phase-console owner enroll`'s one-time link, makes a browser the `owner` door
+for twelve hours idle, and a high-risk press through it needs the key touched within five minutes.
+Once a console has a key, an authority press through any other door — a script, the CLI, a browser
+with no key, your own token — is not applied and not dropped: it is recorded as a REQUEST
+(`202 {requested: true}`), shown on its item as "asked by <label> — confirm?", and pressed only when
+the owner confirms it. So a 202 from a console route is not a done press: it is a person's to answer,
+and your phase declares what it needs rather than waiting on it. What the plan's
+`permission.destructive` row names for your phase still executes. The key routes (`/api/owner/…`) and
+`phase-console owner enroll|lock` are in `AUTHORITY_ROUTES`, so your hook denies them; `owner status`
+reads. A console with no key says `ownerDoor: unenrolled` and behaves as before.
+
+**A grant** (control-tower phase 149, #212). A permission item you raised is answered with one
+press at a scope a person chooses — this call, this phase, this plan, this repository or always — and
+the console applies it; you are resumed with "The operator granted `<rule>` for <scope> until <end> —
+run it again", so run the call again rather than declaring blocked on that rule a second time. Below
+plan scope the grant covers exactly your lane: your phase, the rule it names, and for `call` the one
+call — a sibling lane, a neighbouring rule or the same call after your phase settled is refused as
+before. A grant may also arrive with no item of yours (a person granted the same rule wider); the item
+withdraws itself with "the AI can do this itself now". The never list — forced and deleting pushes,
+`sudo`/`shutdown`/`reboot`/`mkfs`/`dd`, every guard, a protected path, a secret's value — is never
+granted, so do not declare blocked on one expecting a grant: say what remains. `POST
+/api/human-steps/:id/grant` and the revokes are in `AUTHORITY_ROUTES`; your hook denies them.
 
 ## What happens around your phase — landing, notes, issues, the trace id
 
@@ -739,11 +785,13 @@ fourth time, the detector is right and the plan is not going to change under you
 
 ## A person's turn — what the console does with a human step
 
-A `needs-human --step <kind> …` declaration (`references/conventions.md` §A person's turn) is
+A `needs-human --step <kind> …` declaration (`references/conventions.md` §A person's turn; how to
+write one, `references/turn.md`) is
 recorded before anything else: the console writes the step to `human-steps.ndjson` in its own state
 directory, sends ONE `needs-you` push — its title names the kind and the phase, its payload's `step`
-block carries the step's id, kind, where, the actions *Open* and *I did it*, and a `device-code`
-step's code — moves the step to `notified`, and derives ONE `human-step` inbox row from the ledger
+block carries the step's id, kind, where, the lock-screen actions its kind allows (*Open* and *I did
+it* for an act; *Allow* and *Deny*, *Open* and *Deny*, or *Open* alone for a permission item or a
+decision, control-tower phase 138), and a `device-code` step's code — moves the step to `notified`, and derives ONE `human-step` inbox row from the ledger
 for as long as the step is open. The phase parks with its errand written in the step's own words
 (what, where, what proves it) under situation `blocked-declared:human-acts`, whose ladder is empty,
 and its wait history gains an entry of kind `person` that is UNBUDGETED: a person's time is never
@@ -751,6 +799,20 @@ charged to the external-wait budget a phase has for somebody else's clock, and n
 ends it. The journal says `phase.human-step`. The same happens whichever door the declaration came
 through — the lane's own outcome file, a live run's inbox, or a hand-run session's inbox with no run
 live.
+
+**One door, one list** (control-tower phase 132, #209). Every source of a person's turn passes ONE
+door, `raiseTurn` (`viewer/server/turn/index.ts`): a plan's bullet, a session's step, a person
+errand — which IS an `operator-act` item, raised when it is announced — a credential the preflight
+finds missing (a `secret-entry` item whose proof is `credential:<id>`, read by presence, never the
+value), an MCP server it cannot reach under `require` (an `mcp-login` item), a converted stall and a
+relayed question the console will not answer by rule (a `decision` item that keeps its options). A
+second raise of the same source while its item is open is that item. Every inbox row that asks a
+person for an act carries a `turn` view — which item, held by the ledger or by the row's own record
+(the approval card, a gate, a held plan, a QA ask, a live relay question, a person-check) — and
+`GET /api/turn` folds them into one item per thing to do: `{round, headline, groups, handled,
+counts}`. The errand that IS an item announces nothing of its own, and its row's action is *I've done
+this — check* on that item — "Done — continue" checks it too — so a step the person did ends
+`proven`; the clock never withdraws a step whose phase resumed past it.
 
 **The verbs** (control-tower phase 43) are six routes, each attributed and each a ledger move:
 `GET /api/human-steps[?open=1]` lists the steps with their window, next reminder and every move;
@@ -761,6 +823,55 @@ command and runs it on the person's Enter — any number of times, in any state 
 open counted and journalled; `…/check` runs the proof NOW; `…/snooze`, `…/cannot {reason}` and
 `…/dismiss`. Anything but an `http(s)` link is refused, and nothing a person types in the terminal
 reaches the ledger, a journal or the ticket.
+
+**The owner's moves** (control-tower phase 133, #210) join them: `…/answer {option?, note?}` answers a
+decision — one of its options, a note, or both — and proves it; `…/decline {reason}` settles an item
+that allows it (`allowDecline`) as `declined`, the person's own *Not doing this* (`dismissed` stays
+the console's withdrawal); `…/ask {text}` records a question about the item; `…/evidence` attaches a
+note, an image or a file — at most 160 KB a piece and six an attempt, text screened for secrets,
+stored 0600 by content hash under the instance's `turn-evidence/` (a retention sink), never pushed
+and never journalled beyond its kind and size. An answer and a decline carry the owner's authority:
+both are `AUTHORITY_ROUTES` rows, so a session's or the supervisor's door is refused at the router
+and a supervised session's call at the hook; a question and evidence are refused to an agent's door
+by their route. **Each answer travels back as ONE resume per waiter, composed by the console** —
+through `pressResume` (or, for a lane whose errand is the item, the errand's answer): "The operator
+answered `<option>`: <note>" · "The operator declined: <reason>. Do not ask again; find another way
+inside the plan or say what remains" · and a pass's "the person's turn this phase declared is done".
+Every question the person asked rides that resume ("The person asked: …"); a snooze, a question and
+an attachment resume nothing. An item that names a `## Decisions` key (`decision_key` on the step)
+has its answer written to the plan's twin through `decisions.sh` — the phase's own row — FIRST,
+behind `--allow-writes`. **No secret is typed into the console**: `check` refuses a body carrying one
+(a `secret` field, or any value shaped like one) with a sentence naming where the value goes, and a
+`secret-entry` item is proven there by name — its own `credential:` proof, else the keychain item
+`phase-console-<id>` (a 0600 file under `secrets/` off macOS).
+
+**The check** (control-tower phase 134, #211): every *I've done this — check* gets a VERDICT —
+`passed`, `rejected` with exactly what to redo, or `needs-info` with exactly what to send —
+`{state, note, redo[], read[], at, by, attempt}`, kept on the item one per attempt beside that
+attempt's evidence. By proof type: a `probe` (a watch ref, or `credential:<id>` — presence by name)
+is read at once and a miss is a rejection quoting what it read; an `answer` passes on its answer; an
+`attest` passes only through a person's door and is marked unverified; a `judgement` is read by a
+**checking session** — one short read-only `claude -p` for that ONE item (`PE_SESSION_KIND=check`,
+no lock, no outcome file; Read, Grep, Glob and `Bash` held to the verify table's read-only leads,
+a search reaching only what Read's rules allow — its scratch and the docs root, never a secret path;
+the item and the submission framed as data; at most 12 turns, $0.50 and five minutes; model and
+effort from Settings ▸ Automation, `sonnet` at `low` shipped), whose verdict is the LAST fenced
+`verdict` block it writes and is never fabricated — none means the check could not run, and the item
+says so. The checker is an automatic start the ceiling counts (door `turn-checker`) and a freeze
+skips; with judgement switched off such a proof is an `attest`. A rejection or a needs-info moves the
+item to `returned` and tells the person ONCE; nothing is resumed. A pass moves it to `proven` and
+resumes every waiter once, saying what was proven, by whom and what the check read. The
+`turnEscalateAfter`-th rejection (3) escalates ONCE — a push, and on the item every attempt side by
+side with three ways out: `…/rewrite` (the item withdrawn; its raiser resumed with the rejection
+history and told to raise a new version), `…/cannot`, or `…/override` — the owner's *Accept anyway*.
+**No agent marks its own item passed**: a verdict is written in-process by a probe or by the checker
+spawned for THAT item, and over HTTP by one route only, `override`, which the door table opens to the
+owner alone (a `local` press on a console with no key) and the hook's forge guard denies to a
+supervised session; `check` only asks for a check. A judgement passes only on what the PERSON sent
+for the attempt — a note or a piece of evidence — because the item's words are its raiser's: they
+cannot lower the bar, and a checker's pass with nothing sent comes back as `needs-info`. An `attest`,
+an `override` and a `rewrite` count only through a person's door; a call that names no door proves,
+writes and withdraws nothing.
 
 **The proof is a watch.** The declaration carries the step's proof and its window's end, so the watch
 clock polls it off the record on phase 6's `cmd:` back-off (5 m, 15 m, 1 h, then 6 h), bounded by the

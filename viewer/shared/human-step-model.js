@@ -29,11 +29,13 @@
 
 /**
  * Every scenario gets the same workflow — the catalogue of §Architecture 12,
- * in its own order. Seventeen kinds, and closed: a scenario that fits none is a
+ * in its own order. Eighteen kinds, and closed: a scenario that fits none is a
  * kind nobody has designed the proof for yet, and the lint refuses the word.
- * The last, `operator-act` (control-tower phase 121, #182), is the general act
- * only the operator does — a command to run or a click path to follow — and
- * the one kind that is usually born BEFORE it is due (`upcoming`, below).
+ * `operator-act` (control-tower phase 121, #182) is the general act only the
+ * operator does — a command to run or a click path to follow — and the one
+ * kind that is usually born BEFORE it is due (`upcoming`, below). The last,
+ * `permission` (phase 130, #207), is a wall the AI met: it ends by a grant or
+ * a denial, never by a proof.
  * @typedef {(typeof HUMAN_STEP_KINDS)[number]} HumanStepKind
  */
 export const HUMAN_STEP_KINDS = Object.freeze(
@@ -55,11 +57,12 @@ export const HUMAN_STEP_KINDS = Object.freeze(
     'captcha',
     'email-link',
     'operator-act',
+    'permission',
   ]),
 );
 
 /**
- * Where a step has got to. Nine states, a PATH, not flags: `declared` →
+ * Where a step has got to. Eleven states, a PATH, not flags: `declared` →
  * `notified` → `opened` (as often as the person needs) → `checking` →
  * `proven` is the ordinary road. The last four settle a step; nothing moves
  * out of them. A step declared with a due-when ref starts one stop earlier.
@@ -73,10 +76,14 @@ export const HUMAN_STEP_KINDS = Object.freeze(
  *                re-notifies)
  *   opened     — the person opened it (again); the ledger counts how often
  *   checking   — the proof is being run (*I did it — check now*, or the watch)
+ *   returned   — checked and sent back, saying exactly what to redo (phase
+ *                130's word; phase 134's check writes it)
  *   proven     — the proof held; the session resumes saying so
+ *   declined   — the person's own "not doing this", with a reason (phase 130)
  *   expired    — the window closed with nothing proven
  *   cannot     — the person said *I can't do this*: an errand, never a loop
- *   dismissed  — withdrawn: the phase closed, or a person cleared it
+ *   dismissed  — withdrawn: what the CONSOLE does to a step nobody needs any
+ *                more (a person declines, or says they can't)
  * @typedef {(typeof HUMAN_STEP_STATES)[number]} HumanStepState
  */
 export const HUMAN_STEP_STATES = Object.freeze(
@@ -86,7 +93,9 @@ export const HUMAN_STEP_STATES = Object.freeze(
     'notified',
     'opened',
     'checking',
+    'returned',
     'proven',
+    'declined',
     'expired',
     'cannot',
     'dismissed',
@@ -95,12 +104,12 @@ export const HUMAN_STEP_STATES = Object.freeze(
 
 /** The states a step is still OPEN in — an inbox row stands for each (an `upcoming` one is *Coming up*). */
 export const HUMAN_STEP_OPEN_STATES = Object.freeze(
-  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(0, 5))),
+  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(0, 6))),
 );
 
 /** The states that settle a step. */
 export const HUMAN_STEP_SETTLED_STATES = Object.freeze(
-  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(5))),
+  /** @type {const} */ (/** @type {HumanStepState[]} */ (HUMAN_STEP_STATES.slice(6))),
 );
 
 /**
@@ -109,15 +118,65 @@ export const HUMAN_STEP_SETTLED_STATES = Object.freeze(
  * state: a proven step that "un-proves" is a new step. An `upcoming` step
  * becomes due (`declared`), or settles — its proof landed early, a person
  * cannot do it, or it was withdrawn — and is never opened or reminded first.
+ * Only a check sends a step back (`checking` → `returned`), and a returned
+ * step is worked again like any open one; a person may decline any open step.
  * @type {Readonly<Record<HumanStepState, readonly HumanStepState[]>>}
  */
 export const HUMAN_STEP_TRANSITIONS = Object.freeze({
-  upcoming: Object.freeze(['declared', 'proven', 'expired', 'cannot', 'dismissed']),
-  declared: Object.freeze(['notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']),
-  notified: Object.freeze(['notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']),
-  opened: Object.freeze(['notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']),
-  checking: Object.freeze(['notified', 'opened', 'checking', 'proven', 'expired', 'cannot', 'dismissed']),
+  upcoming: Object.freeze(['declared', 'proven', 'declined', 'expired', 'cannot', 'dismissed']),
+  declared: Object.freeze([
+    'notified',
+    'opened',
+    'checking',
+    'proven',
+    'declined',
+    'expired',
+    'cannot',
+    'dismissed',
+  ]),
+  notified: Object.freeze([
+    'notified',
+    'opened',
+    'checking',
+    'proven',
+    'declined',
+    'expired',
+    'cannot',
+    'dismissed',
+  ]),
+  opened: Object.freeze([
+    'notified',
+    'opened',
+    'checking',
+    'proven',
+    'declined',
+    'expired',
+    'cannot',
+    'dismissed',
+  ]),
+  checking: Object.freeze([
+    'notified',
+    'opened',
+    'checking',
+    'returned',
+    'proven',
+    'declined',
+    'expired',
+    'cannot',
+    'dismissed',
+  ]),
+  returned: Object.freeze([
+    'notified',
+    'opened',
+    'checking',
+    'proven',
+    'declined',
+    'expired',
+    'cannot',
+    'dismissed',
+  ]),
   proven: Object.freeze([]),
+  declined: Object.freeze([]),
   expired: Object.freeze([]),
   cannot: Object.freeze([]),
   dismissed: Object.freeze([]),
@@ -149,12 +208,15 @@ export const HUMAN_STEP_WHERE = Object.freeze(/** @type {const} */ (['host', 'an
 export const HUMAN_STEP_AUTO_OPEN = Object.freeze(/** @type {const} */ (['host']));
 
 /**
- * The three ways a step is born: the plan says so (a `- **Human step:**`
+ * The four ways a step is born: the plan says so (a `- **Human step:**`
  * bullet), a session says so (`phase-outcome.sh … needs-human --step`), the
- * console notices (phase 44's guard and stall reading).
+ * console notices (phase 44's guard and stall reading), the supervisor raises
+ * it (phase 136: its escalation, or an item a chat asks for).
  * @typedef {(typeof HUMAN_STEP_BIRTHS)[number]} HumanStepBirth
  */
-export const HUMAN_STEP_BIRTHS = Object.freeze(/** @type {const} */ (['plan', 'session', 'console']));
+export const HUMAN_STEP_BIRTHS = Object.freeze(
+  /** @type {const} */ (['plan', 'session', 'console', 'supervisor']),
+);
 
 /**
  * The keyed fields of the plan bullet, after its two positional ones (the
@@ -168,9 +230,28 @@ export const HUMAN_STEP_BIRTHS = Object.freeze(/** @type {const} */ (['plan', 's
  * is stored under. `due:` (control-tower phase 121) is a watch ref: the step
  * is `upcoming` until it lands, then due — the bullet is legal under the
  * plan's `## Operator errands` too, where it is the plan's own (phase 0).
+ *
+ * Phase 130 (#207) adds four: `why:` — a `WHY_PERSON` reason the kind allows
+ * (`shared/turn-model.js` `KIND_REASONS`; a bullet with none is given its
+ * kind's default, an advisory, never a red), `effort:` — the minutes it takes
+ * (`5m`, `1h`, or bare minutes), `unblocks:` — the phases it unblocks, comma
+ * separated, and `guide:` — a guide file under the docs root, in the grammar
+ * of `shared/guide-grammar.js`.
  */
 export const HUMAN_STEP_BULLET_KEYS = Object.freeze(
-  /** @type {const} */ (['open', 'proof', 'where', 'window', 'auto-open', 'credential', 'due']),
+  /** @type {const} */ ([
+    'open',
+    'proof',
+    'where',
+    'window',
+    'auto-open',
+    'credential',
+    'due',
+    'why',
+    'effort',
+    'unblocks',
+    'guide',
+  ]),
 );
 
 /**
@@ -210,13 +291,32 @@ export const REMINDER_SERIES_MS = Object.freeze([
 
 /**
  * The verbs a person presses on a step (control-tower phase 43), one route
- * each — `POST /api/human-steps/:id/<verb>`. *Open* and *Open again* are one
- * verb: the ledger counts every open, and a step may be opened again in any
- * state short of settled. Not registered in `vocab-owners` for the reason
- * `HUMAN_STEP_WHERE` is not: common words match prose everywhere.
+ * each — `POST /api/human-steps/:id/<verb>`, except `attach`, whose route is
+ * `…/evidence`. *Open* and *Open again* are one verb: the ledger counts every
+ * open, and a step may be opened again in any state short of settled. Phase
+ * 133 (#210) adds the owner's other moves: `answer` (a decision's option, a
+ * note, or both), `decline` (with a reason, where the item allows it), `ask`
+ * (a question about the task) and `attach` (evidence). Phase 134 (#211) adds
+ * `override` — the owner's *Accept anyway*, the ONE route that writes a
+ * verdict — and `rewrite`, the escalation's *Rewrite the guide*, which
+ * withdraws the item (a `dismiss` move) and resumes its raiser. `answer`, `decline` and `override` carry the owner's authority
+ * (`door-model.js` `AUTHORITY_ROUTES`); the rest do not. Not registered in `vocab-owners` for the reason `HUMAN_STEP_WHERE`
+ * is not: common words match prose everywhere.
  */
 export const HUMAN_STEP_VERBS = Object.freeze(
-  /** @type {const} */ (['open', 'check', 'snooze', 'cannot', 'dismiss']),
+  /** @type {const} */ ([
+    'open',
+    'check',
+    'snooze',
+    'cannot',
+    'dismiss',
+    'answer',
+    'decline',
+    'ask',
+    'attach',
+    'override',
+    'rewrite',
+  ]),
 );
 
 /**
@@ -224,7 +324,14 @@ export const HUMAN_STEP_VERBS = Object.freeze(
  * console's own moves — the `due` an upcoming step's landed due-when ref makes
  * (control-tower phase 121), the first `notify`, each `remind`, the `prove` a
  * landed proof makes, and the `expire` a closed window makes. A move written
- * before phase 43 carries none, and reads by its state.
+ * before phase 43 carries none, and reads by its state. Phase 130 adds three:
+ * `wait` — the same wall met again, ONE step with another waiter (G7), which
+ * moves no state; `return` — a check sent the step back; `decline` — a
+ * person's "not doing this". Phase 133 adds three more: `answer` — a decision
+ * answered, which proves it; `ask` and `attach` — a question and a piece of
+ * evidence, which move no state (`HUMAN_STEP_STILL_MOVES`). Phase 134 adds
+ * `override` — the owner accepted an item anyway, recorded as the owner's and
+ * unverified.
  * @typedef {(typeof HUMAN_STEP_MOVES)[number]} HumanStepMove
  */
 export const HUMAN_STEP_MOVES = Object.freeze(
@@ -239,7 +346,28 @@ export const HUMAN_STEP_MOVES = Object.freeze(
     'cannot',
     'dismiss',
     'expire',
+    'wait',
+    'return',
+    'decline',
+    'answer',
+    'ask',
+    'attach',
+    'override',
+    'rewrite',
   ]),
+);
+
+/**
+ * The moves that leave a step in the state it was in: another waiter (G7), a
+ * question, a piece of evidence. Each is a line of the step's history, never
+ * a step along its path — the ledger reader accepts one only at the state it
+ * names.
+ * @type {readonly HumanStepMove[]}
+ */
+export const HUMAN_STEP_STILL_MOVES = Object.freeze(
+  /** @type {HumanStepMove[]} */ (
+    HUMAN_STEP_MOVES.filter((verb) => verb === 'wait' || verb === 'ask' || verb === 'attach')
+  ),
 );
 
 /**
@@ -373,6 +501,12 @@ export const KIND_META = Object.freeze({
     where: 'host',
     proof: 'a cmd: ref that reads what the task changed',
   }),
+  permission: Object.freeze({
+    icon: 'shield-off',
+    label: 'Grant a permission',
+    where: 'any',
+    proof: 'a grant or a denial — the item ends there',
+  }),
 });
 
 /**
@@ -422,7 +556,7 @@ export const SECRET_PATTERNS = Object.freeze([
   'bearer[[:space:]]+[[:alnum:]._~+/=-]{20,}',
   '-----begin[^-]{0,40}private[[:space:]]key',
   '(password|passwd|passphrase|pwd|secret|api[_-]?key|access[_-]?key|client[_-]?secret)=[^&[:space:]]{4,}',
-  '(password|passwd|passphrase)[[:space:]]*:[[:space:]]*[^[:space:]]{4,}',
+  '(password|passwd|passphrase)"?[[:space:]]*:[[:space:]]*"?[^[:space:]"]{4,}',
   '--(password|passwd|token|secret|api-key)[[:space:]]+[^-[:space:]][^[:space:]]{3,}',
   '(^|[^[:alnum:]#./:-])[0-9]{6,8}([^[:alnum:]./-]|$)',
 ]);
@@ -566,8 +700,25 @@ export function redactSecrets(value, opts = {}) {
  * @returns {boolean}
  */
 export function isOpenableUrl(url) {
-  return /^https?:\/\/[^\s/?#]+[^\s]*$/i.test(String(url ?? '').trim());
+  // The screen reads the value as given: `trim()` would drop a BOM or a
+  // vertical tab at either end before anything looked for one.
+  const raw = String(url ?? '');
+  return !HIDDEN_CHARS_RE.test(raw) && /^https?:\/\/[^\s/?#]+[^\s]*$/i.test(raw.trim());
 }
+
+/**
+ * A character a reader cannot see, or one that changes the direction the rest
+ * of a line is drawn in (control-tower phase 141, #217): the C0 and C1 controls
+ * but a tab, the zero-width space, the bidi embeddings, overrides and isolates,
+ * the word joiner and invisible operators, and a byte-order mark. A link or a
+ * guide line holding one shows a person something other than what opens or
+ * runs, so neither may carry one. The joiners and the direction MARKS
+ * (U+200C–U+200F) stay: Persian is written with the non-joiner, and a mark
+ * reorders nothing a reader cannot see.
+ */
+export const HIDDEN_CHARS_RE =
+  // eslint-disable-next-line no-control-regex -- the controls are exactly what it refuses
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
 
 /**
  * A device code's shape: short, upper-case letters and digits, one optional
@@ -740,6 +891,12 @@ export const SUSPECT_OPEN_WORDS = Object.freeze([
  * own actions stay what answers it. `person-check` is the verification card (a
  * §Verification only eyes can do), `plan-approval` the plan a plan-mode phase
  * presented (#34), `protected-path` phase 39's wall on `.claude/**`.
+ *
+ * Widened by control-tower phase 132 (#209) to every row Your turn folds: a
+ * person `errand` is an `operator-act`, the approval broker's ask a
+ * `permission`, a branch `conflict` a `decision`, the `supervisor`'s
+ * escalation an `operator-act`, and the `stall` reading an `operator-act`
+ * until its suspected kind is known (`server/turn/fold.ts`).
  * @type {Readonly<Record<string, HumanStepKind>>}
  */
 export const HUMAN_STEP_FOLDS = Object.freeze({
@@ -751,6 +908,11 @@ export const HUMAN_STEP_FOLDS = Object.freeze({
   question: 'decision',
   qa: 'decision',
   'protected-path': 'protected-path',
+  errand: 'operator-act',
+  approval: 'permission',
+  conflict: 'decision',
+  supervisor: 'operator-act',
+  stall: 'operator-act',
 });
 
 /** @typedef {keyof typeof HUMAN_STEP_FOLDS} HumanStepFold */

@@ -1008,6 +1008,27 @@ proof_superproject() {
   [ -z "$(ls "$BATS_TEST_TMPDIR" | grep '\.tmp\.' || true)" ]
 }
 
+@test "outcome: the guard at the door — a step is judged with no ref to probe, and G4's refusal exits 4 with nothing written (control-tower phase 130)" {
+  fake_console 200 '{"status":200,"verdict":"guard","rule":"G4","exit":4,"sentence":"the AI can do this itself: this run'"'"'s own policy allows every command the guide asks for (`npm test`) — run them, then carry on.","commands":["npm test"],"refs":[]}'
+  run pe_outcome demo 5 needs-human --needs human-acts --act --title "Run the tests" --why reserved --proof-type attest
+  [ "$status" -eq 4 ]
+  assert_contains "$output" "refused (G4): the AI can do this itself"
+  assert_contains "$output" "exit 4"
+  [ ! -f "$PE_OUTCOME_FILE" ]
+  [ -z "$(ls "$BATS_TEST_TMPDIR" | grep '\.tmp\.' || true)" ]
+  grep -q '"file":"[^"]*/outcome\.json\.tmp\.[0-9][0-9]*"' "$FAKE_CURL_LOG"
+  # A G1 refusal from the console carries its own exit, 2.
+  fake_console 200 '{"status":200,"verdict":"guard","rule":"G1","exit":2,"sentence":"a decision step is not asked for because of identity","refs":[]}'
+  run pe_outcome demo 5 needs-human --needs human-acts --step decision --title "Pick"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "refused (G1)"
+  # A pass is pending: the step is written as before.
+  fake_console 200 '{"status":200,"verdict":"pending","refs":[]}'
+  run pe_outcome demo 5 needs-human --needs human-acts --step decision --title "Pick"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_OUTCOME_FILE")" '"kind": "decision"'
+}
+
 @test "outcome: a cmd: ref wrapping gh run list … --commit is offered a gh: ref in its place (WF-4, #87)" {
   run pe_outcome demo 14 waiting-external --wait-minutes 60 \
     --watch "cmd:\"gh run list -R acme/app --workflow deploy.yml --commit cb590f0e --json status -q '.[0].status' | grep -qx completed\""
@@ -1073,3 +1094,49 @@ proof_superproject() {
   [ "$status" -eq 0 ]
   [[ "$output" != *'backstop'* ]]
 }
+
+# ---- handled (control-tower phase 136, #213): what a session did instead of asking ----
+
+@test "outcome: handled appends ONE row to the sessions' handled file — never an outcome, links held to their kinds" {
+  export PE_HANDLED_FILE="$BATS_TEST_TMPDIR/handled-sessions.ndjson"
+  run pe_outcome demo 3 handled --what "Ran the migration myself" --note "the policy allows it" \
+    --link commit:abc1234 --link '#12' --link https://github.com/o/r/pull/5 --link journal:demo/r1#40
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"handled recorded: demo phase 3"* ]]
+  [ ! -e "$PE_OUTCOME_FILE" ]
+  [ "$(wc -l < "$PE_HANDLED_FILE" | tr -d ' ')" = 1 ]
+  line="$(cat "$PE_HANDLED_FILE")"
+  [[ "$line" == *'"source":"session","slug":"demo","phase":3'* ]]
+  [[ "$line" == *'"what":"Ran the migration myself","note":"the policy allows it","count":1'* ]]
+  [[ "$line" == *'"links":["commit:abc1234","#12","https://github.com/o/r/pull/5","journal:demo/r1#40"]'* ]]
+  [[ "$line" == *'"at":"2026-08-10T21:10:03Z"'* ]]
+  [ "$(stat -f '%Lp' "$PE_HANDLED_FILE" 2>/dev/null || stat -c '%a' "$PE_HANDLED_FILE")" = 600 ]
+}
+
+@test "outcome: handled refuses a link of another shape, a secret in any field, and another shape's flags — nothing written" {
+  export PE_HANDLED_FILE="$BATS_TEST_TMPDIR/handled-sessions.ndjson"
+  run pe_outcome demo 3 handled --what "x" --link https://evil.example/a
+  [ "$status" -eq 2 ]; [[ "$output" == *"not a commit, a pull request, an issue or a journal line"* ]]
+  run pe_outcome demo 3 handled --what "used ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+  [ "$status" -eq 2 ]; [[ "$output" != *"ghp_"* ]]
+  run pe_outcome demo 3 handled --what "x" --note "password=hunter2hunter2"
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 3 handled --what "x" --reason "y"
+  [ "$status" -eq 2 ]; [[ "$output" == *"handled takes --what, --note and --link only"* ]]
+  run pe_outcome demo 3 handled --note "no what"
+  [ "$status" -eq 2 ]; [[ "$output" == *"--what is required for handled"* ]]
+  run pe_outcome demo 3 ruling --what "x" --link '#3'
+  [ "$status" -eq 2 ]; [[ "$output" == *"only make sense with handled"* ]]
+  [ ! -e "$PE_HANDLED_FILE" ]
+}
+
+@test "outcome: handled with no runner writes the sessions' handled file under the instance state — never the console's own log" {
+  run pe_outcome demo 3 handled --what "Rebased the branch"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PE_HANDLED_FILE is not set"* ]]
+  found="$(find "$XDG_STATE_HOME" -name handled-sessions.ndjson | head -1)"
+  [ -n "$found" ]
+  grep -q '"what":"Rebased the branch"' "$found"
+  [ -z "$(find "$XDG_STATE_HOME" -name handled.ndjson | head -1)" ]
+}
+

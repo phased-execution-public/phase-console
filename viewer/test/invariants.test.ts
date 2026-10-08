@@ -1413,3 +1413,35 @@ test('DL-4: a declarer and a lock\'s session are asked about in one place — de
   assert.ok(hits(/lockPresence:\s*\(lock\)\s*=>\s*this\.lockPresenceFor\(/).length >= 1, 'the boarding belt-check asks lockPresenceFor');
 });
 
+
+/* ------------------------------------------------------------------ *
+ * CK-INV — the checking session holds ONE process (control-tower phase 134)
+ * ------------------------------------------------------------------ */
+
+test('CK-INV: turn/checker.ts runs ONE process — the host\'s spawn, once — and is no SESSION_MODES member', () => {
+  // A checking session belongs to no run, so clause 1's census of run sessions
+  // never sees it; this is the clause that does. It spawns through the host's
+  // seam (the service wires `spawnClaude`), exactly once, signals nothing
+  // itself (its clock ABORTS, and spawn.ts turns that into signals.ts's
+  // ladder), starts no run, and declares itself a check — outside `runner/`
+  // and outside `pro/supervisor/`.
+  const dir = fileURLToPath(new URL('../server/turn/', import.meta.url));
+  const strip = (text: string): string => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const checker = strip(readFileSync(join(dir, 'checker.ts'), 'utf8'));
+  assert.equal((checker.match(/\bspawn\(/g) ?? []).length, 1, 'checker.ts spawns one process');
+  assert.match(checker, /this\.host\.spawn\(request\)/, 'through the host\'s spawnClaude');
+  assert.ok(!/child_process|\bexec(File)?(Sync)?\(|\bshell\(|\.kill\(|process\.kill|spawnSession\(|spawnClaude|startRun\(/.test(checker),
+    'and no process, signal, run session or run of its own');
+  assert.match(checker, /PE_SESSION_KIND: CHECK_SESSION_KIND/, 'presence counts it as the check it is');
+  assert.match(checker, /controller\.abort\(\)/, 'its clock aborts — the ladder ends it');
+  assert.ok(!(SESSION_MODES as readonly string[]).includes('check'), 'a checking session is not a run session');
+  assert.ok((START_DOORS as readonly string[]).includes('turn-checker'), 'its start names its door');
+  for (const file of readdirSync(dir).filter((name) => name.endsWith('.ts') && name !== 'checker.ts')) {
+    const text = strip(readFileSync(join(dir, file), 'utf8'));
+    assert.ok(!/\bspawn\(|spawnClaude|spawnSession\(/.test(text), `turn/${file} spawns no session`);
+  }
+  // The service wires the seam ONCE, beside the freeze gate and the ceiling's door.
+  const recovery = strip(readFileSync(fileURLToPath(new URL('../server/service-recovery.ts', import.meta.url)), 'utf8'));
+  assert.equal((recovery.match(/new TurnChecker\(/g) ?? []).length, 1);
+  assert.match(recovery, /doorActor\('turn-checker'/);
+});

@@ -91,6 +91,9 @@
  * so that landing their detector changed no type, no route and no stored ack.
  */
 
+import { brokerPermission, type PermissionDetail } from './permissions/walls.ts';
+import { grantRuleOf } from './permissions/grants.ts';
+import { GRANT_SCOPE_WORDS, riskOf } from '../shared/turn-model.js';
 import type { HumanStep } from './human-steps.ts';
 import { HUMAN_STEP_FOLDS, KIND_META, humanStepView, type HumanStepView } from '../shared/human-step-model.js';
 import { HALT_CATEGORY_LABELS, HUMAN_STEP_CATEGORY, categoryOfSituation, type HaltCategory } from '../shared/halt-categories.js';
@@ -109,6 +112,7 @@ import { phaseHref, planHref, toHash } from '../shared/routes.js';
 import { OPERATOR_ISSUE_SCOPE } from '../shared/issues-model.js';
 import { parseSituationKey, situationLabel } from '../shared/situation-model.js';
 import { isPersonErrand } from '../shared/recovery-model.js';
+import { itemOfErrand, ledgerTurn, turnOf, type TurnView } from './turn/fold.ts';
 import { isLiveStatus } from '../shared/status-vocab.js';
 import { ISOLATED, pairKey } from '../shared/worktree-model.js';
 import { INSTANCE_STATE_DIR } from './config.ts';
@@ -227,6 +231,16 @@ export type InboxItem = {
    */
   humanStep?: HumanStepView;
   /**
+   * The item of Your turn this row is (control-tower phase 132, #209 —
+   * `turn/fold.ts`): which item, which record holds it (the ledger, or this
+   * row's own — projected), its kind, reason, proof type and group. Every row
+   * that asks a person for an act carries one, and two rows naming the same
+   * item (an errand and the step it describes) are ONE item in `GET
+   * /api/turn`. Absent on a row nothing waits on (health, lock, ruling, policy,
+   * message) and on an issue draft, whose home is Repo ▸ Issues.
+   */
+  turn?: TurnView;
+  /**
    * A supervisor card's own facts (control-tower phase 102, #145 E), so the
    * Tower draws the card — its situation, its evidence, its ONE action — and
    * the annunciator counts it under its detection category, rather than
@@ -272,6 +286,8 @@ export type InboxErrand = {
   at: string;
   /** The human step the errand is (`Errand.step`, control-tower phase 44) — a protected edit's act and path. */
   step?: { kind: string; act?: string; path?: string };
+  /** The ledger item the errand IS (`Errand.stepId`, control-tower phase 132). */
+  stepId?: string;
 };
 
 /**
@@ -319,6 +335,8 @@ export type InboxRunPhase = {
   planApproval?: { state?: string; sha?: string; bytes?: number; path?: string };
   /** `PhaseRecord.errandTree` — the stable checkout a person's errand runs in (control-tower phase 90, #123). */
   errandTree?: { dir: string; mounts?: readonly { rel: string; sha: string; pushed: boolean }[] };
+  /** `PhaseRecord.declared` — only the step a phase is parked on (control-tower phase 132): its errand IS that item. */
+  declared?: { step?: { id: string } } | null;
   /** `PhaseRecord.undriven`, read only through `undrivenPhases`. */
   undriven?: {
     since: string; board: string; situation: string | null; why: string;
@@ -410,6 +428,9 @@ export type InboxApproval = {
   kind?: string;
   /** A card no session holds a hook open for — the ladder's `widen-rule` offer (phase 9). */
   standing?: true;
+  /** The call a tool card holds, and the rule its Always… would write — a permission item's record (phase 135). */
+  tool?: { name?: string; input?: unknown } | null;
+  suggestedRule?: string | null;
   /** What the card's timeout will do, and whether it outlived its hook call (control-tower phase 97, #140). */
   onTimeout?: string;
   converted?: { at: string };
@@ -583,6 +604,8 @@ export type InboxFacts = {
   mcp?: readonly InboxMcpServer[];
   /** `state().environment.issues` — each carries its own `fix` sentence. */
   environment?: readonly { kind: string; detail: string; fix: string }[];
+  /** The owner keys enrolled and removed (control-tower phase 148) — told in the bell for a week. */
+  ownerKeys?: readonly { change: 'enrolled' | 'removed'; keyId: string; label: string; at: string; by: string }[];
   /**
    * This console's reach, and the other consoles of the machine (zero-touch
    * phase 17, FLT-1 iv / FLT-6) — `ServiceBase.inboxFleetFacts()`. A console
@@ -748,6 +771,8 @@ export type InboxSupervisorCard = {
   then?: string | null;
   /** The cap that turned an act into this card (phase 102). */
   cap?: { ok?: false; cap: string; limit: number; count: number };
+  /** The item an escalation was raised as (control-tower phase 136) — its row is the item's own. */
+  item?: string;
 };
 
 /** One issue draft, narrowed to what its row is decided from — `pro/issues/drafts.ts`'s `IssueDraft` is one. */
@@ -1080,6 +1105,9 @@ function errandDrafts(facts: InboxFacts): Draft[] {
       // and its first action opens a merge errand tree for the last phase.
       const unlanded = phase == null && !live && run.halt?.kind === 'unlanded';
       const landingPhase = unlanded ? positivePhase(run.unlanded?.phase ?? undefined) : null;
+      // The ledger item this errand IS (control-tower phase 132, #209): its
+      // row presses that item — one item, one done path.
+      const item = planPending ? undefined : errandItemOf(facts, run, errand, phase ?? null);
       out.push({
         kind: 'errand',
         severity: 'needs-you',
@@ -1098,6 +1126,7 @@ function errandDrafts(facts: InboxFacts): Draft[] {
           : liveErrandHow(errand, (phase != null ? run.phases?.[String(phase)] : null) as Parameters<typeof liveErrandHow>[1]),
         ...(errand.tried?.length ? { tried: [...errand.tried] } : {}),
         humanStep: errandStep(errand, phase, planPending),
+        ...(item ? { turn: ledgerTurn(item) } : {}),
         since: stableSince(errand.at, run.halt?.at, run.updatedAt),
         href: planHref(run.slug, 'run'),
         actions: [
@@ -1159,7 +1188,12 @@ function errandDrafts(facts: InboxFacts): Draft[] {
                 },
               ]
             // A person's ask is answered by the person (control-tower phase
-            // 88, #124): "Done — continue" records the answer and its note and
+            // 88, #124). When an item stands behind it (phase 132, #209) the
+            // answer is *I've done this — check* on that item: the step ends
+            // proven and resumes the session, never withdrawn as dismissed.
+            : phase != null && isPersonErrand(errand.situation) && item
+              ? (item.kind === 'permission' ? permissionItemActions(item.id, item) : errandItemActions(item.id))
+            // With none, "Done — continue" records the answer and its note and
             // re-boards the phase. Recover re-derived the same ask from the
             // session's stale declaration and read as broken.
             : phase != null && isPersonErrand(errand.situation)
@@ -1327,10 +1361,14 @@ function approvalDrafts(facts: InboxFacts): Draft[] {
         },
         ...gatedBy('run', flags.allowRun),
       });
+      // A tool card IS a permission item, projected (control-tower phase 135):
+      // the call, the rule, the wall and its risk ride the row to Your turn.
+      const permission = approval.kind === 'tool' ? brokerPermission(approval) : null;
       return {
         kind: 'approval' as const,
         severity: 'urgent' as const,
         subject: approval.id,
+        ...(permission ? { permission } : {}),
         ...(approval.slug ? { slug: approval.slug } : {}),
         ...(phase != null ? { phase } : {}),
         ...(approval.runId ? { runId: approval.runId } : {}),
@@ -2725,6 +2763,9 @@ const ENV_TITLES: Record<string, string> = {
   'push-broken': 'Push notifications cannot be delivered',
 };
 
+/** How long a change to the owner keys stays in the bell. */
+const OWNER_KEY_BELL_MS = 7 * 24 * 60 * 60_000;
+
 function healthDrafts(facts: InboxFacts): Draft[] {
   const out: Draft[] = [];
   const settings = toHash(routeFor('health'));
@@ -2740,6 +2781,27 @@ function healthDrafts(facts: InboxFacts): Draft[] {
       // here would be a second copy of an instruction that is version-specific.
       how: issue.fix,
       since: '',
+      href: settings,
+      actions: [],
+    });
+  }
+
+  // A change to the owner keys (control-tower phase 148, EC2): every one is in
+  // the bell for a week, because a key nobody meant to enrol is the one thing
+  // a person must be able to see — fyi, since the console already acted.
+  for (const change of facts.ownerKeys ?? []) {
+    const at = Date.parse(change.at);
+    if (!Number.isFinite(at) || Date.now() - at > OWNER_KEY_BELL_MS) continue;
+    out.push({
+      kind: 'health',
+      severity: 'fyi',
+      subject: `owner-key:${change.change}:${change.keyId.slice(0, 16)}:${change.at}`,
+      title: change.change === 'enrolled' ? `An owner key was enrolled — ${change.label}` : `An owner key was removed — ${change.label}`,
+      need: change.change === 'enrolled'
+        ? `${change.label} can press as this console's owner (enrolled by ${change.by}).`
+        : `${change.label} no longer presses as this console's owner (removed by ${change.by}).`,
+      how: 'If you did not make this change, remove the key and lock every owner session: `phase-console owner lock`.',
+      since: new Date(at).toISOString(),
       href: settings,
       actions: [],
     });
@@ -3422,7 +3484,7 @@ function messageDrafts(facts: InboxFacts): Draft[] {
 export type InboxHumanStep = Pick<
   HumanStep, 'id' | 'kind' | 'title' | 'where' | 'slug' | 'phase' | 'runId' | 'declaredAt' | 'until'
   | 'openUrl' | 'openCommand' | 'proof' | 'code' | 'lines'
-> & Partial<Pick<HumanStep, 'state' | 'birth' | 'dueWhen' | 'dueAt'>>;
+> & Partial<Pick<HumanStep, 'state' | 'birth' | 'dueWhen' | 'dueAt' | 'why' | 'proofType' | 'proofWords' | 'source' | 'permission'>>;
 
 /**
  * A person's turn (control-tower phase 41): one `needs-you` row per open
@@ -3431,7 +3493,7 @@ export type InboxHumanStep = Pick<
  * named). A device code is in the words, on purpose; nothing else a step
  * holds is a secret, because nothing secret reaches the ledger. The row
  * carries the verbs a card can press verbatim (control-tower phase 43) —
- * *I did it — check*, *Snooze* and *I can't do this*, the last with the
+ * *I've done this — check*, *Snooze* and *I can't do this*, the last with the
  * person's reason as its words; *Open* needs the person's own browser, so it
  * is the step card's (phase 42), and the row's `href` is the phase.
  *
@@ -3442,13 +3504,67 @@ export type InboxHumanStep = Pick<
 function humanStepActions(id: string): InboxAction[] {
   const at = (verb: string): string => `/api/human-steps/${encodeURIComponent(id)}/${verb}`;
   return [
-    { verb: 'check', label: 'I did it — check', endpoint: at('check'), method: 'POST' },
+    { verb: 'check', label: "I've done this — check", endpoint: at('check'), method: 'POST' },
     { verb: 'snooze', label: 'Snooze an hour', endpoint: at('snooze'), method: 'POST', body: { minutes: 60 } },
     {
       verb: 'cannot', label: "I can't do this", endpoint: at('cannot'), method: 'POST',
       says: { field: 'reason', label: 'Why not?', placeholder: 'Who can do it, or what is in the way' },
     },
   ];
+}
+
+/**
+ * A permission item's verbs (control-tower phase 135, #212): its Grant — what
+ * exists today, labelled as what it is (the broker's Allow or the widen rung's
+ * plan strike) and pressed on the card that holds it; none for a `never` item —
+ * then *Deny* (the session is told to find another way) and *I'll do it
+ * myself* (the item becomes the person's own act, its guide the command).
+ */
+export function permissionItemActions(id: string, step: Pick<InboxHumanStep, 'permission' | 'openCommand'>): InboxAction[] {
+  const at = (verb: string): string => `/api/human-steps/${encodeURIComponent(id)}/${verb}`;
+  const permission = step.permission;
+  // The scoped grant (control-tower phase 149): one press at the NARROWEST
+  // scope the item offers — the wider ones are the page's to offer — and a
+  // high one asks for the rule typed back. A never item offers no Grant.
+  const scope = permission && !permission.never ? permission.scopes?.[0] : undefined;
+  const high = scope ? riskOf({ wall: permission!.wall, family: permission!.family ?? 'any', scope }) === 'high' : false;
+  const rule = permission ? grantRuleOf(permission) : '';
+  return [
+    ...(scope ? [{
+      verb: 'grant', label: `Grant — ${GRANT_SCOPE_WORDS[scope]}`,
+      endpoint: at('grant'), method: 'POST' as const, body: { scope },
+      says: high
+        ? { field: 'rule', label: 'Type the rule to grant it', placeholder: rule.slice(0, 200) }
+        : { field: 'reason', label: 'Why (optional)', placeholder: (permission!.grant?.label ?? rule).slice(0, 200) },
+    }] : []),
+    {
+      verb: 'deny', label: 'Deny', endpoint: at('deny'), method: 'POST',
+      says: { field: 'reason', label: 'Why (optional)', placeholder: 'What the session should do instead' },
+    },
+    ...(step.permission?.command ?? step.openCommand
+      ? [{ verb: 'convert', label: "I'll do it myself", endpoint: at('convert'), method: 'POST' as const }] : []),
+  ];
+}
+
+/**
+ * A person errand's row when an item stands behind it (control-tower phase
+ * 132): the item's own verbs — since phase 137 every check carries the one
+ * wording, so the errand's row and the step's are the same three.
+ */
+function errandItemActions(id: string): InboxAction[] {
+  return humanStepActions(id);
+}
+
+/**
+ * The open ledger item a person errand IS (control-tower phase 132, #209):
+ * the one it names (`stepId`), the step its phase is parked on, or the
+ * `operator-act` item the console raised for it — one item, one done path.
+ */
+function errandItemOf(facts: InboxFacts, run: InboxRun, errand: InboxErrand, phase: number | null): InboxHumanStep | undefined {
+  if (phase == null) return undefined;
+  return itemOfErrand(facts.humanSteps ?? [], {
+    slug: run.slug, runId: run.id, phase, errand, parkedOn: run.phases?.[String(phase)]?.declared?.step?.id,
+  });
 }
 
 function humanStepDrafts(facts: InboxFacts): Draft[] {
@@ -3500,7 +3616,7 @@ function humanStepDrafts(facts: InboxFacts): Draft[] {
       since: !upcoming && step.dueAt ? step.dueAt : step.declaredAt,
       ...(step.until ? { expiresAt: step.until } : {}),
       href: phase != null ? phaseHref(step.slug, phase) : planHref(step.slug),
-      actions: humanStepActions(step.id),
+      actions: step.kind === 'permission' ? permissionItemActions(step.id, step) : humanStepActions(step.id),
     });
   }
   return out;
@@ -3550,9 +3666,19 @@ export function buildInbox(facts: InboxFacts = {}, now: number = Date.now(), opt
   // ack silencing two rows and the operator seeing the same ask twice.
   const seen = new Set<string>();
   const items: InboxItem[] = [];
+  // Every row that asks a person for an act is an item of Your turn (phase 132).
+  const steps = new Map((facts.humanSteps ?? []).map((step) => [step.id, step]));
+  // A card a permission item's Grant presses (control-tower phase 135) is that
+  // ITEM's row — the widen card is no longer a card of its own.
+  const cards = new Map((facts.humanSteps ?? []).flatMap((step) => {
+    const grant = step.kind === 'permission' ? step.permission?.grant : undefined;
+    return grant && 'approvalId' in grant ? [[grant.approvalId, step] as const] : [];
+  }));
   for (const draft of drafts) {
     const item = mint(draft);
     if (seen.has(item.id)) continue;
+    const turn = turnOf(draft, item.id, (id) => steps.get(id), (cardId) => cards.get(cardId));
+    if (turn) item.turn = turn;
     seen.add(item.id);
     const ack = ackFor(facts.acks, item.id, item.since);
     if (ack) {

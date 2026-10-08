@@ -52,8 +52,10 @@ import {
 } from '../../shared/human-step-model.js';
 import {
   AUTHORITY_ROUTES, CONSOLE_FILES_VERB, authorityCliOf, authorityRouteOf, cliFormOf, type AuthorityRoute,
+  type PressDoor,
 } from '../../shared/door-model.js';
 import { DEFAULT_PORT, PORT_RANGE_SIZE, PORT_RANGE_START, readRegistry } from '../../shared/instances.mjs';
+import { HOST_COMMANDS } from '../../shared/turn-model.js';
 import { splitStatements, type Statement } from './liveness.ts';
 import { executedTexts, readShell, type ShellReading } from './shell-reading.ts';
 
@@ -72,6 +74,10 @@ import { executedTexts, readShell, type ShellReading } from './shell-reading.ts'
  */
 export const DEFAULT_DENY = [
   'Bash(git push:*)',
+  // The push's plumbing (control-tower phase 141, #217): the same write to a
+  // remote, which the `git push` prefix never saw.
+  'Bash(git send-pack:*)',
+  'Bash(git http-push:*)',
   'Bash(git reset --hard:*)',
   'Bash(git clean:*)',
   'Bash(sudo:*)',
@@ -982,7 +988,9 @@ export function signInRefusal(call: SignInCall, outcome: string): string {
     `--title ${shellQuote(call.step.title)}`,
     `--open-command ${shellQuote(call.step.openCommand)}`,
     `--where ${call.step.where}`,
-    ...(call.step.proof ? [`--proof ${shellQuote(call.step.proof)}`] : []),
+    // No status verb to read: the person's word, asked for by name (G2,
+    // control-tower phase 130 — a step with no proof is refused at the door).
+    ...(call.step.proof ? [`--proof ${shellQuote(call.step.proof)}`] : ['--proof-type attest']),
     '--reason',
     shellQuote(`${call.shape} needs a person`),
   ].join(' ');
@@ -992,8 +1000,8 @@ export function signInRefusal(call: SignInCall, outcome: string): string {
     + `human step and stop:\n  ${declare}\n`
     + (call.step.proof
       ? ''
-      : 'It names no --proof: the console\'s command judge does not run this tool\'s status verb, so a person\'s '
-        + '*I did it* proves it — a --proof the watch refuses could never land.\n')
+      : 'It names no --proof but `--proof-type attest`: the console\'s command judge does not run this tool\'s status '
+        + 'verb, so a person\'s *I did it* proves it — a --proof the watch refuses could never land.\n')
     + 'The console asks a person (the inbox and a push, with the command ready in its terminal), watches the '
     + 'proof, and resumes THIS session saying what was proven. If the tool can sign in without a person, run it '
     + `with its non-interactive flag instead (${SIGN_IN_UNATTENDED.slice(0, 3).join(', ')}, …) and a credential `
@@ -1580,6 +1588,17 @@ function runsInlineText(lead: readonly string[]): boolean {
 }
 
 /**
+ * The line's own half of `runsHiddenText`, before any lead is read: a reading
+ * that names what it could not see, a socket written by hand (`/dev/tcp`), a
+ * here-string, a process substitution, an alias the line defines. The never
+ * list's push reading (`forcedPush`, `permissions/grants.ts`) reads the raw line
+ * on exactly this test.
+ */
+export function hidesText(command: string, reading: ShellReading): boolean {
+  return reading.opaque.length > 0 || /\/dev\/(?:tcp|udp)\/|<<<|[<>]\(|\balias\s+[\w.-]+=/.test(command);
+}
+
+/**
  * Does the line run text a reader of its words cannot see into? A line the
  * reader could not resolve; a request written onto a socket by hand (`nc`,
  * `/dev/tcp`); a here-string or a process substitution; an alias the line
@@ -1589,7 +1608,7 @@ function runsInlineText(lead: readonly string[]): boolean {
  * what is judged.
  */
 function runsHiddenText(command: string, reading: ShellReading, leads: readonly Lead[], ports: ReadonlySet<number>): boolean {
-  if (reading.opaque.length || /\/dev\/(?:tcp|udp)\/|<<<|[<>]\(|\balias\s+[\w.-]+=/.test(command)) return true;
+  if (hidesText(command, reading)) return true;
   return leads.some(({ lead, expands }) => {
     const program = basename(lead[0] ?? '');
     if (RAW_SOCKETS.test(program) || runsInlineText(lead)) return true;
@@ -1737,13 +1756,16 @@ export function consoleForgeCall(
  * or null (control-tower phase 129). `rules` are the row's exceptions for the
  * running phase (`destructiveExceptions(value, {phase})`, as phase 107's
  * auto-grant reads them). A press is named by its CLI form, whichever door it
- * took (`phase-console run approve` names the card's route too) — never by a
- * rule that happens to match the line it rides on. The console's own files are
- * no row's to hand out.
+ * took (`phase-console run approve` names the card's route too) — or, since
+ * phase 131 (#208), by `Console(<press>)`, the spelling a route no CLI verb
+ * presses can be named by (`Console(edit-policy)`). Never by a rule that
+ * happens to match the line it rides on. The console's own files are no row's
+ * to hand out. The server's door check reads the row the same way
+ * (`Service.manifestNamesPress`).
  */
-export function consoleForgeException(rules: readonly string[], forge: ConsoleForge): string | null {
+export function consoleForgeException(rules: readonly string[], forge: Pick<ConsoleForge, 'verb' | 'names'>): string | null {
   if (forge.verb === CONSOLE_FILES_VERB) return null;
-  const named = new Set(forge.names.map((form) => `Bash(phase-console ${form}:*)`));
+  const named = new Set([...forge.names.map((form) => `Bash(phase-console ${form}:*)`), `Console(${forge.verb})`]);
   return rules.find((rule) => named.has(rule)) ?? null;
 }
 
@@ -1877,8 +1899,12 @@ export function matchedDenyRule(
   if (direct) return direct;
   // A deny reached by looking inside a wrapper still has to be able to name
   // itself, or the reply says "blocked by the deny list" and cannot say which
-  // line — the one thing the operator will ask next.
-  if (typeof command !== 'string') return null;
+  // line — the one thing the operator will ask next. Only where the CLASSIFIER
+  // looks inside one (`neverAutoApproves`, then `hitsHidden`): the raw words of
+  // any other line are data, and naming a rule for them answered a task
+  // subject that said "shutdown" with `Bash(shutdown:*)` — for the relay, which
+  // asks this directly (control-tower phase 135, #212, the audit's three shapes).
+  if (typeof command !== 'string' || !neverAutoApproves(command)) return null;
   const payloads = wrappedPayloads(command);
   return policy.deny.find(
     (rule) => payloads.some((c) => ruleMatches(rule, toolName, { command: c })),
@@ -2052,6 +2078,17 @@ export function legacyPlanPolicyPath(slug: string, dir = POLICY_DIR): string {
 }
 
 /**
+ * The repository layer (control-tower phase 149, §Architecture 19): one file
+ * per console — so per root — merged between the machine's file and a plan's,
+ * for every plan of this console's repository. Only a grant at `repository`
+ * scope writes it (`permissions/grants.ts`); it holds the same shape as the
+ * other two, so the same merge, strike and editor read it.
+ */
+export function repositoryPolicyPath(dir = POLICY_DIR, instance = INSTANCE.id): string {
+  return join(dir, 'repositories', `${pathSafe(instance)}.json`);
+}
+
+/**
  * A slug or an instance id as one path segment, and nothing else.
  *
  * Both reach this from a URL or a registry file, so each decides a filename and
@@ -2135,15 +2172,21 @@ export function loadPolicy(file = POLICY_FILE): AutopilotPolicy {
 }
 
 /**
- * The rules one plan runs under: the defaults, the operator's global file, then
- * the plan's own — the later ones only ever adding.
+ * The rules one plan runs under: the defaults, the operator's global file, the
+ * repository layer (phase 149), then the plan's own — the later ones only ever
+ * adding.
  */
 export function loadPolicyFor(
   slug: string | null, globalFile = POLICY_FILE, dir = POLICY_DIR,
 ): AutopilotPolicy {
-  const extras = [policyExtras(globalFile)];
+  return mergePolicy(layersFor(slug, globalFile, dir));
+}
+
+/** The files `loadPolicyFor` merges, in order: the machine's, the repository's, the plan's. */
+function layersFor(slug: string | null, globalFile: string, dir: string): PolicyFileExtras[] {
+  const extras = [policyExtras(globalFile), policyExtras(repositoryPolicyPath(dir))];
   if (slug) extras.push(policyExtras(effectivePlanPolicyPath(slug, dir)));
-  return mergePolicy(extras);
+  return extras;
 }
 
 /**
@@ -2161,8 +2204,7 @@ export function loadPolicyFor(
 export function struckFor(
   slug: string | null, globalFile = POLICY_FILE, dir = POLICY_DIR,
 ): { deny: string[]; ask: string[]; allow: string[] } {
-  const extras = [policyExtras(globalFile)];
-  if (slug) extras.push(policyExtras(effectivePlanPolicyPath(slug, dir)));
+  const extras = layersFor(slug, globalFile, dir);
   const flat = (pick: (e: PolicyFileExtras) => string[]) => [...new Set(extras.flatMap(pick))];
   return {
     deny: flat((e) => e.removed.deny),
@@ -2608,6 +2650,13 @@ export type Approval = {
   status: 'pending' | CardDecision | 'unanswerable';
   decidedAt?: string;
   decidedBy?: string;
+  /**
+   * The door the answer came through (control-tower phase 131, #208) — what the
+   * answering request PROVED, where `decidedBy` is its label. A chat act is a
+   * person's press only when a person's door allowed its card. Absent on a card
+   * answered before, and on one the console settled by itself.
+   */
+  decidedDoor?: PressDoor;
   reason?: string;
   /** Set on a card the console restarted under and kept answerable: when it was restored, and when it was first raised. */
   recovered?: { at: string; from: string };
@@ -2645,11 +2694,12 @@ export type Approval = {
   question?: ApprovalQuestion;
 };
 
-type Settled = { decision: CardDecision; by: string; reason?: string };
+/** A card's answer — and, for the owner's door, whether its press proved a touch inside five minutes (phase 149). */
+type Settled = { decision: CardDecision; by: string; reason?: string; door?: PressDoor; fresh?: boolean };
 
 type Waiting = {
   approval: Approval;
-  settle: (decision: CardDecision, by: string, reason?: string) => void;
+  settle: (decision: CardDecision, by: string, reason?: string, door?: PressDoor, fresh?: boolean) => void;
   /** What the deadline does: settle `deny` by `timeout`, or turn a hook's card into a standing one (#140). */
   expire: () => void;
   timer: NodeJS.Timeout | null;
@@ -3316,12 +3366,14 @@ export class Approvals {
       hookAnswered = true;
       after?.(settled);
     };
-    const settle = (asked: CardDecision, askedBy: string, askedReason?: string) => {
+    const settle = (asked: CardDecision, askedBy: string, askedReason?: string, askedDoor?: PressDoor, askedFresh?: boolean) => {
       const entry = this.waiting.get(approval.id);
       if (!entry) return;
       let decision = asked;
       let by = askedBy;
       let reason = askedReason;
+      let door = askedDoor;
+      let fresh = askedDoor === 'owner' ? askedFresh : undefined;
       // #112: an automatic actor never denies what the plan permits in writing.
       // Re-read now, not at raise time — the row may have been amended while
       // the card waited, and a card restored after a restart carries no check.
@@ -3331,6 +3383,8 @@ export class Approvals {
         decision = 'allow';
         reason = `answered from the plan's permission.destructive row — ${check.why}; ${by} does not overrule the plan`;
         by = 'manifest';
+        door = 'console';
+        fresh = undefined;
       } else if (check?.answer === 'deny') {
         // The row allows the push bare, not in this shape (#186): still a no,
         // but the plan's, naming the form to re-run — never a timeout that
@@ -3338,23 +3392,25 @@ export class Approvals {
         approval.manifest = check;
         reason = reshapeReason(check);
         by = 'manifest';
+        door = 'console';
       }
       clearClocks(entry);
       this.waiting.delete(approval.id);
       approval.status = decision;
       approval.decidedAt = new Date().toISOString();
       approval.decidedBy = by;
+      if (door) approval.decidedDoor = door;
       approval.reason = reason;
       this.remember(approval);
       this.flush();
       log.info('approval.decided', {
-        id: approval.id, decision, by, runId: approval.runId, phase: approval.phase, kind: approval.kind,
+        id: approval.id, decision, by, ...(door ? { door } : {}), runId: approval.runId, phase: approval.phase, kind: approval.kind,
         waitedMs: Math.max(0, Date.parse(approval.decidedAt) - Date.parse(approval.createdAt)),
         ...(approval.recovered ? { recovered: true } : {}),
       });
       this.fire('decided', approval);
       try { this.resolved(approval); } catch { /* a listener must never block a decision */ }
-      answerHook({ decision, by, reason });
+      answerHook({ decision, by, reason, ...(door ? { door } : {}), ...(door === 'owner' && typeof fresh === 'boolean' ? { fresh } : {}) });
     };
     const expire = () => {
       if (!this.waiting.has(approval.id)) return;
@@ -3507,10 +3563,10 @@ export class Approvals {
     return { approval, decided };
   }
 
-  settle(id: string, decision: CardDecision, by: string, reason?: string): boolean {
+  settle(id: string, decision: CardDecision, by: string, reason?: string, door?: PressDoor, fresh?: boolean): boolean {
     const entry = this.waiting.get(id);
     if (!entry) return false;
-    entry.settle(decision, by, reason);
+    entry.settle(decision, by, reason, door, fresh);
     return true;
   }
 
@@ -3755,7 +3811,22 @@ export type SettingsOptions = {
    * is what makes the door safe, and it is why the two shipped together.
    */
   messaging?: boolean;
+  /**
+   * This run's grants below plan scope (control-tower phase 149): deny rules
+   * LOWERED and allow rules added for this run only, while a grant lives —
+   * `Grants.lowered(runId)`. The hook enforces the grant's exact scope (its
+   * phase, its lane, its call); the CLI's own list only stops refusing what a
+   * grant covers, and for that long it does not hold "with the console dead" —
+   * the grant says so. Raised again the next time the file is written after
+   * the grant ends. A never rule is never lowered, whatever is asked.
+   */
+  lowered?: { deny: readonly string[]; allow: readonly string[] };
 };
+
+/** The deny rules no grant lowers — the forced and deleting pushes, the host family. */
+export function neverLowered(rule: string): boolean {
+  return PUSH_DENY_CARVED.includes(rule) || HOST_COMMANDS.some((word) => rule === `Bash(${word}:*)`);
+}
 
 /**
  * The tools the `PreToolUse` hook is asked about. `AskUserQuestion` since
@@ -3770,6 +3841,10 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
     opts.policy ?? loadPolicy(), opts.profile ?? 'guarded', opts.openPrCarveOut ?? false,
     opts.publishCarveOut ?? false,
   );
+  const lowered = new Set((opts.lowered?.deny ?? []).filter((rule) => !neverLowered(rule)));
+  // The push wall lowered for a run never opens a forced or deleting push:
+  // the carved rules stand in its place, as the PR carve-out's do.
+  const carved = lowered.has(PUSH_DENY) ? PUSH_DENY_CARVED.filter((rule) => !policy.deny.includes(rule)) : [];
   return {
     // The one settings key that is not about permissions: whether a PEER may
     // put a message into this session's inbox. See `SettingsOptions.messaging`
@@ -3780,8 +3855,9 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
     permissions: {
       // `allow` rides along because permission rules merge across scopes: it
       // adds to what the repository already permits and cannot take anything
-      // away. Only `deny` and `allow` go to the CLI.
-      allow: policy.allow,
+      // away. Only `deny` and `allow` go to the CLI. A live grant below plan
+      // scope adds its allow rule for this run only (phase 149).
+      allow: opts.lowered?.allow.length ? [...new Set([...policy.allow, ...opts.lowered.allow])] : policy.allow,
       // Only `deny` goes to the CLI. It is the layer that holds with the console
       // dead — verified, not assumed.
       //
@@ -3790,8 +3866,9 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
       // past. A real run stalled exactly there — `notes/one.md` written, commit
       // refused, the session politely waiting for a prompt that would never
       // appear. Asking a human is the hook's job, because the hook is the only
-      // part of this that can actually reach one.
-      deny: policy.deny,
+      // part of this that can actually reach one. A live grant below plan
+      // scope lowers its deny rule for this run only (phase 149).
+      deny: lowered.size ? [...policy.deny.filter((rule) => !lowered.has(rule)), ...carved] : policy.deny,
     },
     hooks: {
       PreToolUse: [

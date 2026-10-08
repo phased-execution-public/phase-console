@@ -58,6 +58,12 @@ const CHANNELS: Array<[RegExp, string]> = [
  */
 const ALLOWED: string[] = [];
 
+/**
+ * A channel's words a file holds for a reason other than publishing: the file
+ * and that ONE channel, never the whole file.
+ */
+const WALLED: Array<[string, string]> = [];
+
 /** Every file under `scripts/` and `.github/scripts/`, all the way down, plus both package.json files. */
 const surface = (root = REPO): string[] => {
   const out: string[] = [];
@@ -84,6 +90,7 @@ const channelsIn = (root = REPO, allowed = ALLOWED): string[] => {
     if (allowed.includes(rel)) continue;
     const body = readFileSync(join(root, rel), 'utf8');
     for (const [pattern, channel] of CHANNELS) {
+      if (WALLED.some(([file, words]) => file === rel && words === channel)) continue;
       const m = body.match(pattern);
       if (!m) continue;
       const line = body.slice(0, m.index ?? 0).split('\n').length;

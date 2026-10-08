@@ -53,8 +53,13 @@ import {
 } from '../shared/issues-model.js';
 import {
   HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_OPEN_STATES, HUMAN_STEP_WHERE, HUMAN_STEP_AUTO_OPEN,
-  HUMAN_STEP_BIRTHS, HUMAN_STEP_BULLET_KEYS, KIND_META, SECRET_PATTERNS, SECRET_QUERY_KEYS, SIGN_IN_SHAPES,
+  HUMAN_STEP_BIRTHS, HUMAN_STEP_BULLET_KEYS, HUMAN_STEP_MOVES, HUMAN_STEP_VERBS, KIND_META, SECRET_PATTERNS, SECRET_QUERY_KEYS,
+  SIGN_IN_SHAPES,
 } from '../shared/human-step-model.js';
+import {
+  G4_REASONS, GUARD_REFUSAL_EXIT, HANDLED_LINK_KINDS, HANDLED_SOURCES, KIND_REASONS, PROOF_TYPES, PROOF_TYPES_SELF, WHY_PERSON,
+} from '../shared/turn-model.js';
+import { GUIDE_MAX_BYTES, GUIDE_MAX_STEPS } from '../shared/guide-grammar.js';
 import {
   ISOLATION_DIRECTIVES, WORKTREE_RETENTION, DEFAULT_RETENTION, WORKTREE_LOCK_PREFIXES,
   DEFAULT_ISOLATION_FOR_NEW_BRANCH, retentionOf, retentionTtlHours,
@@ -308,6 +313,9 @@ test('scripts/human-steps.env is human-step-model.js, word for word (control-tow
     ['HUMAN_STEP_AUTO_OPEN', HUMAN_STEP_AUTO_OPEN],
     ['HUMAN_STEP_BIRTHS', HUMAN_STEP_BIRTHS],
     ['HUMAN_STEP_BULLET_KEYS', HUMAN_STEP_BULLET_KEYS],
+    // The owner's moves (control-tower phase 133, #210): the verbs a person presses and the words a move records.
+    ['HUMAN_STEP_VERBS', HUMAN_STEP_VERBS],
+    ['HUMAN_STEP_MOVES', HUMAN_STEP_MOVES],
     ['HUMAN_STEP_SECRET_PATTERNS', SECRET_PATTERNS],
     ['HUMAN_STEP_SECRET_QUERY_KEYS', SECRET_QUERY_KEYS],
   ];
@@ -324,6 +332,36 @@ test('scripts/human-steps.env is human-step-model.js, word for word (control-tow
     HUMAN_STEP_KINDS.map((kind) => `${kind}:${KIND_META[kind].where}`).join(' '),
     'HUMAN_STEP_DEFAULT_WHERE drifted from KIND_META',
   );
+});
+
+test('scripts/turn.env is turn-model.js and guide-grammar.js, word for word (control-tower phase 130)', () => {
+  for (const [name, list] of [
+    ['WHY_PERSON', WHY_PERSON],
+    ['G4_REASONS', G4_REASONS],
+    ['PROOF_TYPES', PROOF_TYPES],
+    ['PROOF_TYPES_SELF', PROOF_TYPES_SELF],
+    // Control-tower phase 136: the handled log's sources and its link kinds.
+    ['HANDLED_SOURCES', HANDLED_SOURCES],
+    ['HANDLED_LINK_KINDS', HANDLED_LINK_KINDS],
+  ] as const) {
+    const bash = fromBash('turn.env', name);
+    assert.ok(bash.length > 0, `${name}: bash read an empty list — a typo in turn.env`);
+    assert.equal(bash, list.join(' '), `${name} drifted between turn.env and turn-model.js`);
+  }
+  assert.equal(
+    fromBash('turn.env', 'KIND_REASONS'),
+    HUMAN_STEP_KINDS.map((kind) => `${kind}:${KIND_REASONS[kind].join(',')}`).join(' '),
+    'KIND_REASONS drifted from turn-model.js',
+  );
+  assert.equal(fromBash('turn.env', 'GUIDE_MAX_STEPS'), String(GUIDE_MAX_STEPS));
+  assert.equal(fromBash('turn.env', 'GUIDE_MAX_BYTES'), String(GUIDE_MAX_BYTES));
+  assert.equal(fromBash('turn.env', 'GUARD_REFUSAL_EXIT'), String(GUARD_REFUSAL_EXIT));
+  // The fallbacks the two scripts carry before they source the twin.
+  for (const script of ['phase-outcome.sh', 'phase-graph.sh']) {
+    const text = readFileSync(join(SCRIPTS, script), 'utf8');
+    assert.match(text, new RegExp(`^WHY_PERSON="${WHY_PERSON.join(' ')}"$`, 'm'), `${script}: its WHY_PERSON fallback`);
+    assert.match(text, /^\[ -f "\$SCRIPT_DIR\/turn\.env" \] && \. "\$SCRIPT_DIR\/turn\.env"$/m, `${script} sources turn.env`);
+  }
 });
 
 test('every key the readers look for is present in each new .env', () => {
@@ -344,10 +382,14 @@ test('every key the readers look for is present in each new .env', () => {
       'ISSUE_LABELS', 'ISSUE_SEVERITY_LABEL_PREFIX', 'SUGGESTION_TYPE', 'ISSUE_SUGGEST_WORDS', 'DEFAULT_ISSUE_SUGGEST',
       'ISSUE_BUDGET_SUGGESTION', 'ISSUE_REPO_AUTO', 'ROOT_REPO_KEY', 'CONSOLE_REPO_KEY',
     ],
+    'turn.env': [
+      'WHY_PERSON', 'G4_REASONS', 'KIND_REASONS', 'PROOF_TYPES', 'PROOF_TYPES_SELF', 'GUIDE_MAX_STEPS', 'GUIDE_MAX_BYTES',
+      'GUARD_REFUSAL_EXIT', 'HANDLED_SOURCES', 'HANDLED_LINK_KINDS',
+    ],
     'human-steps.env': [
       'HUMAN_STEP_KINDS', 'HUMAN_STEP_STATES', 'HUMAN_STEP_OPEN_STATES', 'HUMAN_STEP_WHERE', 'HUMAN_STEP_AUTO_OPEN',
       'HUMAN_STEP_BIRTHS', 'HUMAN_STEP_BULLET_KEYS', 'HUMAN_STEP_DEFAULT_WHERE', 'HUMAN_STEP_SECRET_PATTERNS',
-      'HUMAN_STEP_SECRET_QUERY_KEYS', 'SIGN_IN_SHAPES',
+      'HUMAN_STEP_SECRET_QUERY_KEYS', 'SIGN_IN_SHAPES', 'HUMAN_STEP_VERBS', 'HUMAN_STEP_MOVES',
     ],
   };
   for (const [file, keys] of Object.entries(wanted)) {

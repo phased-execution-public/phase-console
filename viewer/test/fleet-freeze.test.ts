@@ -278,6 +278,18 @@ const MECHANISMS: {
     // armed so the thaw restores it with no rewind.
     guard: "log.info('run.freeze-escalate-frozen'",
   },
+  {
+    // Control-tower phase 134 (#211): a `judgement` item's checking session —
+    // one short read-only `claude -p` a person's *check* asks for. Nobody
+    // pressed the SESSION, so the start ceiling counts it (`turn-checker`) and
+    // a freeze skips it IN PLACE: the host's `admit` answers no, the item says
+    // the check could not run, and nothing is lost. `turn-checker.test.ts`
+    // CK-5 is its behavioural proof.
+    id: 'service:turn-checker',
+    what: "the checking session a person's check of a judgement item starts",
+    where: 'server/service-recovery.ts',
+    guard: "log.info('turn.check-frozen'",
+  },
 ];
 
 /**
@@ -301,11 +313,12 @@ const MECHANISMS: {
  * wants a behavioural test beside it — see `watchdog: a frozen lane is never
  * nudged…` below, which is the one for the row Phase 20 added.
  */
-// 26 in both trees, plus the rows that ride a Pro region above — one, the
+// 27 in both trees (the checking session, control-tower phase 134, is the
+// twenty-seventh), plus the rows that ride a Pro region above — one, the
 // landing session — read as the marked list's length, so the number is true
 // in the free tree too (where that row is absent by marker).
 const PRO_MECHANISMS: string[] = [];
-const AUTO_START_MECHANISM_COUNT = 26 + PRO_MECHANISMS.length;
+const AUTO_START_MECHANISM_COUNT = 27 + PRO_MECHANISMS.length;
 
 test('inventory: every auto-start mechanism is declared, and the count cannot silently move', () => {
   assert.equal(

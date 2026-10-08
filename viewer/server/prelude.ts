@@ -95,6 +95,14 @@ export type PreludeStep = {
   credential?: string;
   /** The watch ref it is `upcoming` until (control-tower phase 121); phase 0 is the plan's own. */
   due?: string;
+  /**
+   * The ledger item that already asks for this act (control-tower phase 139): the
+   * id of an OPEN human step of this plan, born `plan`, with the same phase, kind
+   * and title — `itemOf`, the very match the launch door skips a second ask on.
+   * Absent for a step nobody has asked yet, and for a pre-cleared one, which is
+   * never asked.
+   */
+  item?: string;
 };
 
 export type Prelude = {
@@ -231,6 +239,12 @@ export type PreludeDeps = {
    */
   humanSteps?: () => Promise<readonly { phase: number; step: HumanStepDirective }[]>;
   probeStep?: (ref: string) => Promise<{ landed: boolean; read: string }>;
+  /**
+   * The ledger's open steps (control-tower phase 139) — what each listed step's
+   * `item` is matched against. Optional, like probe 9's own: absent decorates
+   * nothing, and a read that throws is the same silence, never a refused start.
+   */
+  openSteps?: () => readonly HeldStep[];
   prefs: PolicyPrefs;
   now?: () => string;
 };
@@ -281,6 +295,77 @@ export async function doorSteps(
       return { ...base, read: `the proof could not run: ${String((error as Error)?.message ?? error).slice(0, 200)}` };
     }
   }));
+}
+
+/**
+ * An open ledger step, as far as the launch door has to know one (control-tower
+ * phase 139) — `HumanStep`'s own fields, spelled here so this file stays a leaf
+ * (the offline doctor imports it) and the door's match needs no ledger of its own.
+ */
+export type HeldStep = { id: string; slug: string; birth: string; phase: number; kind: string; title: string };
+
+/**
+ * The ledger item that already asks for a listed step's act, or undefined — THE
+ * match of "asked once". It is an OPEN step of this plan, born `plan`: a session's
+ * or the console's step of the same words was raised for another reason and never
+ * stands in for the plan's own ask. Same phase, same kind, same title. The service
+ * skips a second ask on it (`askAtTheDoor`) and the prelude names it as the step's
+ * `item`, so the launch form and the door cannot disagree about "already asked".
+ */
+export function itemOf(
+  step: Pick<PreludeStep, 'phase' | 'kind' | 'what'>, held: readonly HeldStep[], slug: string,
+): string | undefined {
+  const title = step.what.trim();
+  return held.find((open) => open.slug === slug && open.birth === 'plan'
+    && open.phase === step.phase && open.kind === step.kind && open.title === title)?.id;
+}
+
+/** The listed steps, each naming the item that already asks for it — a pre-cleared step is never asked, so it names none. */
+export function withItems(steps: readonly PreludeStep[], held: readonly HeldStep[], slug: string): PreludeStep[] {
+  return steps.map((step) => {
+    const item = step.state === 'pre-cleared' ? undefined : itemOf(step, held, slug);
+    return item ? { ...step, item } : step;
+  });
+}
+
+/**
+ * The steps the launch door opens ON THE MACHINE (control-tower phase 139,
+ * §Architecture 12's safety floor: `auto-open: host` opens at the launch door and
+ * nowhere else). Each clause is one way for a step NOT to open — a step opens
+ * only when none of them holds:
+ *
+ *   - the PLAN said so (`autoOpen: 'host'`). The ledger drops the word from every
+ *     other birth (`sanitiseStep`), so a session's step never carries it here;
+ *   - somebody is still owed the act. A pre-cleared step needs nobody, and a link
+ *     opened for it would be noise at the door;
+ *   - it is asked NOW. An `upcoming` step (`due`) is refused an open by the ledger
+ *     until its ref lands, so the door opens nothing for an act not asked yet;
+ *   - what it opens is a LINK — `http` or `https`, `isOpenableUrl` — never a command
+ *     (the terminal's, on a person's Enter) and never a `file:` or custom scheme;
+ *   - the console may open anything on the machine at all: `--allow-terminal` or
+ *     `--allow-agent`, the very gate of *Open on the machine*;
+ *   - the person was SHOWN the link in full first. The launch form lists it and
+ *     sends it back (`gate.shown`) the way that route's `confirm` does, and the
+ *     match is EXACT: a trailing slash, another case or a space is another link and
+ *     is not opened. Every other door — converge, a webhook, `bin/` — shows nothing,
+ *     so it opens nothing.
+ *
+ * Pure over the steps and the gate: the rule is a function a test can state in
+ * full, and the one place the service asks it.
+ */
+export function doorOpens(
+  steps: readonly PreludeStep[],
+  gate: { shown: readonly string[]; allowTerminal: boolean; allowAgent: boolean },
+): { phase: number; kind: HumanStepKind; what: string; url: string }[] {
+  if (!(gate.allowTerminal || gate.allowAgent)) return [];
+  const opens: { phase: number; kind: HumanStepKind; what: string; url: string }[] = [];
+  for (const step of steps) {
+    if (step.autoOpen !== 'host' || step.state === 'pre-cleared' || step.due) continue;
+    const url = step.open && 'url' in step.open ? step.open.url : undefined;
+    if (!url || !isOpenableUrl(url) || !gate.shown.includes(url)) continue;
+    opens.push({ phase: step.phase, kind: step.kind, what: step.what, url });
+  }
+  return opens;
 }
 
 /**
@@ -996,6 +1081,11 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
   if (deps.humanSteps) {
     try {
       humanSteps = await doorSteps(await deps.humanSteps(), deps.probeStep);
+      // Each step names the ledger item that already asks for it (phase 139). A
+      // ledger that cannot be read names none: the steps are still listed.
+      let held: readonly HeldStep[] = [];
+      try { held = deps.openSteps?.() ?? []; } catch { held = []; }
+      humanSteps = withItems(humanSteps, held, slug);
       stepsVerdict = probeHumanSteps(humanSteps);
     } catch (error) {
       stepsVerdict = { status: 'skip', ok: true, reason: `the plan's human steps could not be read: ${String((error as Error)?.message ?? error)}` };

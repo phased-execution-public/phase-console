@@ -22,7 +22,7 @@ import { PROBE_STATUSES } from '../shared/ops-vocab.js';
 import { SITUATIONS, SUB_KINDS, situationKey } from '../shared/situation-model.js';
 import {
   DECISION_ANSWERS, MANIFEST_BLOCKING, OWNER_KEYS, POLICY_CLASSES, POLICY_DEFAULTS, POLICY_SOURCES, POLICY_TABLE,
-  TRUNK_BRANCHES, answerOf, decisionKeyOfSituation, destructiveCommandExceptions, destructiveExceptions, destructivePushBranches, isAnswerWord, isAutomaticAnswer, policyRowOf, resolvePolicy,
+  TRUNK_BRANCHES, answerOf, decisionKeyOfSituation, destructiveCommandExceptions, destructiveExceptions, destructivePushBranches, exceptionPhases, isAnswerWord, isAutomaticAnswer, policyRowOf, releasePhasesOf, resolvePolicy, unresolvedPhaseSets,
   sanitisePolicyPrefs,
 } from '../shared/policy-model.js';
 import { keyedAsks } from '../server/runner/ladder.ts';
@@ -245,4 +245,39 @@ test('#205 (control-tower phase 107): a row\'s exceptions are read PER PHASE —
     .map((e) => e.verb.join(' ')), ['gh pr create']);
   // The classic opener keeps TRS-4's reading: `git push` there IS the whole rule.
   assert.deepEqual(destructiveExceptions('deny; allow `git push`'), ['Bash(git push:*)']);
+});
+
+test('issues-sweep-hub-tb-hz Phase 30 (2026-10-06): a row that allows a command "in the release phases" names those phases once the plan resolves them — and nothing more until it does', () => {
+  // The sweep plan's row, verbatim, and a phase graph with two release phases (titles opening with `Release`).
+  const row = 'deny; allow `git push` of `pe/issues-sweep-hub-tb-hz`, of an annotated `archive/*` tag and (Phase 21) of the SDK tag and the release-please branch, always as `git -C <absolute repo path> push origin <branch>` alone in its call; allow `gh pr create`, `gh pr merge --squash --delete-branch` and `gh pr close --delete-branch` in the release phases and in Phases 13, 15, 16, 21, 33, 40 and 41; allow `gh issue edit`, `gh issue comment`, `gh issue close` and `gh label create` on the ten repos; never force-push, never move a tag';
+  const graph = [
+    { phase: 24, title: 'Hetzner wave B — register-lint, pre-push, pin-bot cadence' },
+    { phase: 30, title: 'Release B1 — aws → hetzner (box #1)' },
+    { phase: 31, title: 'Release B2 — backend → frontend → root (box #2)' },
+    { phase: 33, title: 'Owner sitting: aws #253 #262' },
+  ];
+  const releasePhases = releasePhasesOf(graph);
+  assert.deepEqual(releasePhases, [30, 31]);
+  const publishing = ['Bash(gh pr create:*)', 'Bash(gh pr merge --squash --delete-branch:*)', 'Bash(gh pr close --delete-branch:*)'];
+  const named = (phase: number, ctx: { releasePhases?: number[] } = {}) =>
+    publishing.filter((rule) => destructiveExceptions(row, { phase, ...ctx }).includes(rule));
+  assert.deepEqual(named(30, { releasePhases }), publishing, 'Phase 30 is a release phase');
+  assert.deepEqual(named(33, { releasePhases }), publishing, 'Phase 33 is named by number');
+  assert.deepEqual(named(30), [], 'unresolved, the words name nothing — narrower, never wider');
+  assert.deepEqual(named(24, { releasePhases }), [], 'a build phase is neither');
+  const entry = destructiveCommandExceptions(row).find((e) => e.rule === 'Bash(gh pr create:*)')!;
+  assert.deepEqual(entry.phases, [13, 15, 16, 21, 33, 40, 41], 'the numbers, as the old reader had them');
+  assert.deepEqual(entry.sets, ['release'], 'and the set it also wrote');
+  assert.deepEqual(exceptionPhases(entry, { releasePhases }), [13, 15, 16, 21, 30, 31, 33, 40, 41]);
+  assert.deepEqual(unresolvedPhaseSets(row, { releasePhases: [] }), ['release'], 'what a lint names: a set the plan resolves to nothing');
+  assert.deepEqual(unresolvedPhaseSets(row, { releasePhases }), []);
+  assert.ok(destructiveExceptions(row, { phase: 24 }).includes('Bash(git push:*)'), 'the classic push rule is every phase\'s, as before');
+  // The leading form, `every release phase`, two lists in one clause (the union, where the first alone was read), a qualified push.
+  assert.deepEqual(destructiveCommandExceptions('deny, with these allow rows: the release phases — `gh pr merge --squash`; Phase 2 — `gh issue close`')
+    .map((e) => [e.rule, e.phases, e.sets]), [['Bash(gh pr merge --squash:*)', [], ['release']], ['Bash(gh issue close:*)', [2], []]]);
+  assert.deepEqual(destructiveExceptions('deny; allow `gh pr create` in every release phase', { phase: 7, releasePhases: [7] }), ['Bash(gh pr create:*)']);
+  assert.deepEqual(destructiveExceptions('deny; allow `gh pr create` in every release phase', { phase: 7, releasePhases: [8] }), []);
+  assert.deepEqual(destructiveCommandExceptions('deny; allow `gh pr create` in phases 4 and 5 and in phases 7 and 8')[0]?.phases, [4, 5, 7, 8]);
+  assert.deepEqual(destructivePushBranches('deny; in the release phases push to `rel/x`', { phase: 30, releasePhases: [30] }), ['rel/x']);
+  assert.deepEqual(destructivePushBranches('deny; in the release phases push to `rel/x`', { phase: 30 }), []);
 });

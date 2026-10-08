@@ -92,6 +92,55 @@ test('AP-6: nothing waiting and nothing lost is no digest at all — silence is 
   assert.equal(composeDigest({ now: NOW, ...nothing }), null);
 });
 
+/* ------------------------------------------------------------------ *
+ * Your turn in the digest, and where a grant's and an item's push open
+ * (control-tower phase 138, #215)
+ * ------------------------------------------------------------------ */
+
+test('TD-1: the digest carries Your turn — how many need you, how many came back, how many were handled', () => {
+  const digest = composeDigest({
+    now: NOW, ...nothing, turn: { needYou: 3, cameBack: 1, handled: 4, handledSince: 'digest' },
+  });
+  assert.ok(digest, 'items waiting on the person are worth a digest');
+  assert.equal(digest.title, 'Your turn: 3 things need you');
+  assert.equal(digest.body, 'Your turn: 3 need you — 1 came back from a check · 4 handled by the AI since the last digest');
+  // The first digest has no last one to count from: the last hour.
+  const first = composeDigest({ now: NOW, ...nothing, turn: { needYou: 1, cameBack: 0, handled: 2, handledSince: 'hour' } });
+  assert.equal(first?.title, 'Your turn: 1 thing needs you');
+  assert.equal(first?.body, 'Your turn: 1 needs you · 2 handled by the AI in the last hour');
+});
+
+test('TD-2: what the AI handled is not news on its own — nothing waiting still sends nothing', () => {
+  assert.equal(composeDigest({ now: NOW, ...nothing, turn: { needYou: 0, cameBack: 0, handled: 7, handledSince: 'hour' } }), null);
+  assert.equal(composeDigest({ now: NOW, ...nothing, turn: { needYou: 0, cameBack: 0, handled: 0, handledSince: 'hour' } }), null);
+});
+
+test('TD-3: beside the itemised lines, the Your turn line leads and the title still counts what waits', () => {
+  const digest = composeDigest({
+    now: NOW,
+    approvals: [{ slug: 'vca', phase: 22, title: 'Bash: git push origin main', createdAt: '2026-09-27T19:20:00.000Z', expiresAt: '2026-09-27T21:09:00.000Z' }],
+    parks: [], detections: [], undelivered: [],
+    turn: { needYou: 2, cameBack: 0, handled: 0, handledSince: 'digest' },
+  });
+  assert.ok(digest);
+  assert.equal(digest.title, '1 thing waits on you', 'the itemised count is unchanged by the summary line');
+  const lines = digest.body.split('\n');
+  assert.equal(lines[0], 'Your turn: 2 need you');
+  assert.equal(lines[1], 'vca phase 22 — Bash: git push origin main (waiting 40 min; expires 21:09Z)');
+});
+
+test('TD-4: a grant’s push opens Settings ▸ Permissions ▸ Grants at that grant; an item’s opens the item', () => {
+  assert.equal(routeFor('granted', { slug: 'alpha', phase: 3, grantId: 'g-0f9e' }), '/#/settings/permissions?grant=g-0f9e');
+  assert.equal(routeFor('granted', { slug: 'alpha', phase: 3 }), '/#/settings/permissions');
+  assert.equal(routeFor('needs-you', { slug: 'alpha', phase: 3, stepId: 'hs-7' }), '/#/turn/hs-7');
+  assert.equal(routeFor('needs-you', { slug: 'alpha', phase: 3 }), '/#/plan/alpha/run', 'a phase that needs you with no item is the run');
+  // `granted` is the twentieth category, on by default and never urgent.
+  assert.equal(CATEGORIES.length, 20);
+  assert.equal(CATEGORIES.at(-1)?.id, 'granted');
+  assert.equal(categoryOf('granted').byDefault, true);
+  assert.equal(categoryOf('granted').urgent, false);
+});
+
 test('AP-7: pushes the channel failed to deliver are summarised, newest first, the count honest past what is kept', () => {
   const undelivered = Array.from({ length: UNDELIVERED_KEEP + 3 }, (_, i) => ({
     category: 'halted', title: `Run halted #${i + 1}`, at: new Date(NOW - (60 - i) * 60_000).toISOString(),
@@ -159,21 +208,55 @@ const card = {
   tool: { name: 'Bash', input: { command: 'git push origin main' } },
 };
 
-test('AP-6: the hourly tick announces through Service.announce only when the category is on', () => {
+test('AP-6: the hourly tick announces through Service.announce only when the category is on', async () => {
   const { svc, pushed, prefs, cleanup } = service();
   try {
     const { approval } = svc.approvals.request(card, 60 * 60_000);
     prefs.notify.digest = false;
-    assert.equal(svc.digestTick(), null, 'off: nothing composed, nothing sent');
+    assert.equal(await svc.digestTick(), null, 'off: nothing composed, nothing sent');
     assert.equal(pushed.filter((p) => p.category === 'digest').length, 0);
     prefs.notify.digest = true;
-    const record = svc.digestTick();
+    const record = await svc.digestTick();
     assert.ok(record, 'on: one digest');
     const sent = pushed.filter((p) => p.category === 'digest');
     assert.equal(sent.length, 1);
     assert.equal(sent[0].title, '1 thing waits on you');
-    assert.ok(sent[0].body.startsWith(`alpha phase 1 — ${approval.title} (waiting 0 min; expires `));
+    // Your turn leads (control-tower phase 138): the waiting card is an item on the page too.
+    const [turnLine, ...rest] = sent[0].body.split('\n');
+    assert.match(turnLine, /^Your turn: 1 needs you/);
+    assert.ok(rest.join('\n').startsWith(`alpha phase 1 — ${approval.title} (waiting 0 min; expires `));
     assert.equal(svc.notifications.list().items.filter((row) => row.category === 'digest').length, 1, 'and the notification inbox has it');
+  } finally { cleanup(); }
+});
+
+test('TD-5: the hourly tick reads Your turn from the page’s own answer — open items, the ones a check sent back, the handled log', async () => {
+  const { svc, pushed, prefs, cleanup } = service();
+  try {
+    prefs.notify.digest = true;
+    const declare = (title: string) => svc.recordHumanStep({
+      slug: 'alpha', phase: 1, birth: 'session', runId: 'run-td5',
+      step: { kind: 'third-party-approval', title, open_url: 'https://github.com/organizations/acme/settings', proof: 'cmd:"gh api orgs/acme"' },
+    })!;
+    const one = declare('Ask the org owner to approve the app');
+    declare('Ask the billing owner to raise the cap');
+    assert.ok(one, 'the item was raised');
+    // A check sent the first one back: it is still the person's, and it came back.
+    const ledger = svc.humanStepsNow();
+    ledger.move(one.id, 'checking', { by: 'operator', verb: 'check' });
+    ledger.move(one.id, 'returned', { by: 'probe', verb: 'return', note: 'the proof did not hold' });
+    // Three things the AI handled instead of asking, since the last digest.
+    for (const what of ['ran npm ci itself', 'answered a question by rule', 'retried the flaky suite']) {
+      svc.handledNow().record({ source: 'session', what, slug: 'alpha', phase: 1 });
+    }
+    const record = await svc.digestTick();
+    assert.ok(record, 'two items need the person: a digest');
+    const sent = pushed.filter((p) => p.category === 'digest').at(-1)!;
+    assert.equal(sent.title, 'Your turn: 2 things need you');
+    assert.equal(sent.body.split('\n')[0], 'Your turn: 2 need you — 1 came back from a check · 3 handled by the AI in the last hour');
+    // The next digest counts what was handled since THIS one.
+    svc.handledNow().record({ source: 'session', what: 'pinned the node version itself', slug: 'alpha', phase: 1 });
+    await svc.digestTick();
+    assert.match(pushed.filter((p) => p.category === 'digest').at(-1)!.body, /· 1 handled by the AI since the last digest$/m);
   } finally { cleanup(); }
 });
 

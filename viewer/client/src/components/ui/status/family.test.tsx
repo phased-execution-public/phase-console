@@ -101,6 +101,16 @@ describe('every member renders icon, word and the three data-* attributes', () =
   it('McpBadge', () => {
     expectComplete(badge(render(<McpBadge status="needs-auth" />).container));
   });
+  it('OpsBadge draws Your turn’s four vocabularies — step, verdict, risk, grant (control-tower phase 130)', () => {
+    for (const vocab of ['step', 'verdict', 'risk', 'grant'] as const) {
+      expect(STATUS_VOCABS).toContain(vocab);
+    }
+    const { container, unmount } = render(<OpsBadge vocab="step" word="returned" />);
+    const el = badge(container);
+    expectComplete(el);
+    expect(el.textContent).toContain('Sent back');
+    unmount();
+  });
   it('OpsBadge, every ops vocabulary and every one of its words', () => {
     const own = new Set([
       'run',

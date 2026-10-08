@@ -103,6 +103,10 @@ test('RET-1 — the shipped defaults are the table the docs promise', () => {
     crashRetainDays: 14,
     locksRotateBytes: 4 * 1024 * 1024,
     humanStepsRotateBytes: 4 * 1024 * 1024,
+    grantsRotateBytes: 4 * 1024 * 1024,
+    handledRotateBytes: 4 * 1024 * 1024,
+    turnEvidenceRetainDays: 30,
+    turnEvidenceMaxBytes: 64 * 1024 * 1024,
     runWorktreeRetainDays: 14,
     runWorktreesMaxBytes: 2 * 1024 * 1024 * 1024,
   });
@@ -439,6 +443,9 @@ test('RET-17 — every sink the policy names is one the inventory can report', (
   plant(join(plan, 'messages.ndjson'), 1);
   plant(join(instance, 'locks.ndjson'), 1);
   plant(join(instance, 'human-steps.ndjson'), 1);
+  plant(join(instance, 'grants.ndjson'), 1);
+  plant(join(instance, 'handled.ndjson'), 1);
+  plant(join(instance, 'turn-evidence', 'a'.repeat(64)), 1);
   plant(join(plan, 'run-aaaaaaaa.jsonl'), 1);
   writeFileSync(join(plan, 'run-aaaaaaaa.json'), '{"id":"aaaaaaaa","status":"finished"}');
 
@@ -455,9 +462,31 @@ test('RET-17 — every sink the policy names is one the inventory can report', (
     'run-records',
     'locks',
     'human-steps',
+    'grants',
+    'handled',
+    'turn-evidence',
   ]) {
     assert.ok(seen.has(sink as never), `the inventory never reported ${sink} — its policy row is unreachable`);
   }
+});
+
+test('RET-EV — what a person attached is a sink: aged out, capped oldest first, a stray name never collected, the report counts it', () => {
+  const dir = fixture();
+  const instance = join(dir, 'state');
+  plant(join(instance, 'turn-evidence', 'a'.repeat(64)), 400, 40 * DAY);
+  plant(join(instance, 'turn-evidence', 'b'.repeat(64)), 300, 2 * DAY);
+  plant(join(instance, 'turn-evidence', 'c'.repeat(64)), 300, 1 * DAY);
+  plant(join(instance, 'turn-evidence', 'not-a-hash.txt'), 10, 90 * DAY);
+  const inventory = collectRetention({ instanceDir: instance, runsDir: null });
+  const files = inventory.files.filter((one) => one.sink === 'turn-evidence').map((one) => basename(one.path)).sort();
+  assert.deepEqual(files, ['a'.repeat(64), 'b'.repeat(64), 'c'.repeat(64)], 'only content-hash names are the sink\'s');
+  assert.deepEqual(actionsFor(planRetention(inventory, sanitiseRetention({}), NOW), 'turn-evidence').map((a) => basename(a.path)),
+    ['a'.repeat(64)], 'past thirty days');
+  const capped = actionsFor(planRetention(inventory, sanitiseRetention({ turnEvidenceMaxBytes: 350 } as never), NOW), 'turn-evidence');
+  assert.deepEqual(capped.map((a) => basename(a.path)), ['a'.repeat(64), 'b'.repeat(64)], 'then the cap, oldest first');
+  assert.equal(sanitiseRetention({ turnEvidenceRetainDays: 0 } as never).turnEvidenceRetainDays, 30, 'a zero is no policy');
+  const report = retentionReport(inventory, sanitiseRetention({}), NOW);
+  assert.equal(report.sinks.find((one) => one.sink === 'turn-evidence')?.files, 3);
 });
 
 test('RET-18 — a transcript, a task ledger and a folded git trace age with their run record', () => {
@@ -725,4 +754,40 @@ test('RET-WT — a kept tree is measured off the loop, once per mtime, and read 
   assert.equal(measured, 1, 'a live tree is never measured');
   rmSync(tree, { recursive: true, force: true });
   assert.equal(keptTreeBytes(tree, measure), undefined, 'a tree that has gone has no size');
+});
+
+test('RET-GR — the grant ledger is a sink (control-tower phase 149): rotated past its cap, its rotated copy left for the engine to carry forward', () => {
+  const dir = fixture();
+  const instance = join(dir, 'state');
+  plant(join(instance, 'grants.ndjson'), 500, 0);
+  plant(join(instance, 'grants.ndjson.1'), 500, 0);
+  const inventory = collectRetention({ instanceDir: instance, runsDir: join(dir, 'runs') });
+  assert.deepEqual(
+    inventory.files.filter((one) => one.sink === 'grants').map((one) => one.path.slice(instance.length + 1)).sort(),
+    ['grants.ndjson', 'grants.ndjson.1'],
+  );
+  const rows = actionsFor(planRetention(inventory, sanitiseRetention({ grantsRotateBytes: 100 } as never), NOW), 'grants');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, 'rotate');
+  assert.ok(rows[0].path.endsWith('grants.ndjson'));
+  assert.equal(actionsFor(planRetention(inventory, sanitiseRetention({}), NOW), 'grants').length, 0);
+});
+
+test('RET-HD — the handled log is a sink (control-tower phase 136): rotated past its cap, its rotated copy kept for the reader', () => {
+  const dir = fixture();
+  const instance = join(dir, 'state');
+  plant(join(instance, 'handled.ndjson'), 500, 0);
+  plant(join(instance, 'handled.ndjson.1'), 500, 0);
+  // The sessions' own file beside it is the same sink.
+  plant(join(instance, 'handled-sessions.ndjson'), 500, 0);
+  const inventory = collectRetention({ instanceDir: instance, runsDir: join(dir, 'runs') });
+  assert.deepEqual(
+    inventory.files.filter((one) => one.sink === 'handled').map((one) => one.path.slice(instance.length + 1)).sort(),
+    ['handled-sessions.ndjson', 'handled.ndjson', 'handled.ndjson.1'],
+  );
+  const rows = actionsFor(planRetention(inventory, sanitiseRetention({ handledRotateBytes: 100 } as never), NOW), 'handled');
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every((row) => row.kind === 'rotate'));
+  assert.deepEqual(rows.map((row) => row.path.slice(instance.length + 1)).sort(), ['handled-sessions.ndjson', 'handled.ndjson']);
+  assert.equal(actionsFor(planRetention(inventory, sanitiseRetention({}), NOW), 'handled').length, 0);
 });

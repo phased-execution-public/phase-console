@@ -13,13 +13,32 @@
  * the self-resolving form for callers that hold a slug and a phase number and
  * nothing else — the run page, its phase drawer, the halt card. One mutation,
  * one set of invalidations, one piece of copy per gate kind.
+ *
+ * A gate that is a person's ask TODAY — a manual gate on a phase the board
+ * calls ready — is an item of Your turn (control-tower phase 139, #216): the
+ * inbox row the server raises for it. Then the card draws that item's row,
+ * its Approve and a link to its place on the page, instead of a form of its
+ * own; one ask, one shape. A gate nobody is asked about (an ai or auto gate, a
+ * phase not ready yet) keeps the plan's own door to gate-status.md — approving
+ * ahead, or revoking — which the engine reads and §Architecture 19 keeps.
  */
 
 import { useState } from 'react';
 import { Banner, Button, Checkbox, Badge, ConfirmButton, field } from '@/components/ui';
 import { Markdown } from '@/components/markdown';
+import { useInboxActions } from '@/components/inbox-row';
+import { LazyItemRow } from '@/features/turn/lazy-item-row';
+import { gateRow } from '@/features/turn/surfaces';
 import { api } from '@/lib/api';
-import { keys, useApiMutation, useConsoleState, useGateStatus, usePlan, useRun } from '@/lib/queries';
+import {
+  keys,
+  useApiMutation,
+  useAttentionInbox,
+  useConsoleState,
+  useGateStatus,
+  usePlan,
+  useRun,
+} from '@/lib/queries';
 import { cn } from '@/lib/cn';
 import type { GateStatus, PhaseView } from '@/lib/api';
 
@@ -66,6 +85,9 @@ export function GateCard({
   const kind = view.gateKind && view.gateKind !== 'none' ? view.gateKind : 'human';
   const copy = GATE_KIND_COPY[kind];
   const approved = Boolean(gate?.clear && /^approved by /.test(gate.detail));
+  const { data: inbox } = useAttentionInbox();
+  const { perform, busy } = useInboxActions();
+  const item = approved ? undefined : gateRow(inbox?.items ?? [], slug, view.phase);
 
   // The continue-the-run offer appears only when this plan's run actually
   // holds the phase as gated — approving must not silently resume a run the
@@ -115,7 +137,9 @@ export function GateCard({
           </p>
         )}
 
-        {allowWrites ? (
+        {item ? (
+          <LazyItemRow row={item} perform={perform} className="mt-2" {...(busy ? { busy } : {})} />
+        ) : allowWrites ? (
           <div className="mt-2 flex flex-wrap items-center gap-2">
             {!approved && (
               <>

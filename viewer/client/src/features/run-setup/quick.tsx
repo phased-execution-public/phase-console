@@ -14,10 +14,13 @@
  * `RunSetup`'s, exactly as before; this file is arrangement.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ChevronLeft } from 'lucide-react';
 import { Button, ButtonGroup, CopyButton, Disclosure, StatusStack, type StatusNote } from '@/components/ui';
 import { KindMark, WHERE_LABEL } from '@/components/human-step-card';
+import { isOpenableUrl } from '@shared/human-step-model.js';
+import { turnHref } from '@/app/routes';
+import { useConsoleState } from '@/lib/queries';
 import type { Prelude, PreludeStep, TreesDetail } from '@/lib/api';
 import { usePhone } from '@/lib/media';
 import { plural } from '@/lib/format';
@@ -37,6 +40,8 @@ import { CategoryTile } from './category-tile';
 import { useDraftPrelude } from './decisions';
 import { useLaunchFacts } from './facts';
 import { useSetupForm } from './form-context';
+import { showAtDoor } from './door-opens';
+import { resumeTarget } from './modes';
 import { gitLinesOf } from './git-reconcile';
 import { MoneyAndStops } from './money-and-stops';
 import { BoardingNotes, useDeparture, ValuesDiffer } from './review';
@@ -198,14 +203,39 @@ function Tiles() {
 /**
  * "This run will need you N times" (control-tower phase 42): the plan's own
  * human steps for the phases this run drives, each proof already run at the
- * door (phase 44). A step whose proof holds is shown done; each of the rest
- * offers *Do it now* — its link opened in a new tab, its command copied for a
- * terminal of the person's own — BEFORE anything spawns, rather than at three
- * in the morning. *Check again* re-reads the door, which re-runs every proof.
+ * door (phase 44), each drawn as the ITEM it becomes at launch (phase 139,
+ * #216) — the kind's mark, where, what, and ONE primary. A step whose proof
+ * holds is shown done. *Do it now* opens the item on Your turn when a launch
+ * before this one already raised it; before that, its link in a new tab or its
+ * command to copy — BEFORE anything spawns, rather than at three in the
+ * morning. A plan step marked `auto-open: host` shows its link IN FULL and
+ * opens on this machine when you launch — behind --allow-terminal or
+ * --allow-agent, never a session's step (`door-opens.ts`). *Check again*
+ * re-reads the door, which re-runs every proof.
  */
 export function YourTurns() {
+  const f = useSetupForm();
   const { data: prelude, refetch, isFetching } = useDraftPrelude();
+  const { data: state } = useConsoleState();
   const steps = prelude?.humanSteps ?? [];
+  // A resume asks nothing at the door (the server re-reads none of it), and a
+  // launch of ONE phase asks only that phase's steps — so only those promise to open.
+  const resuming = resumeTarget(f.mode, f.context.run ?? null) !== undefined;
+  const canOpen = Boolean(state?.allowTerminal || state?.allowAgent) && !resuming;
+  const launched = (step: PreludeStep) =>
+    f.mode !== 'phase' || f.context.phase == null || step.phase === f.context.phase;
+  const opens = canOpen
+    ? steps
+        .filter(launched)
+        .map(autoOpenOf)
+        .filter((url): url is string => Boolean(url))
+    : [];
+  const slug = f.context.slug ?? '';
+  const shownKey = opens.join('\n');
+  // Recorded while the door shows it; the launch form forgets it as it closes (`run-setup.tsx`).
+  useEffect(() => {
+    if (slug) showAtDoor(slug, shownKey ? shownKey.split('\n') : []);
+  }, [slug, shownKey]);
   if (!steps.length) return null;
   const done = steps.filter((step) => step.state === 'pre-cleared').length;
   return (
@@ -227,20 +257,42 @@ export function YourTurns() {
       </div>
       <ul className="flex min-w-0 flex-col gap-2">
         {steps.map((step, index) => (
-          <DoorStep key={`${step.phase}-${step.kind}-${index}`} step={step} />
+          <DoorStep
+            key={`${step.phase}-${step.kind}-${index}`}
+            step={step}
+            canOpen={canOpen}
+            opens={launched(step) && !resuming}
+          />
         ))}
       </ul>
     </section>
   );
 }
 
-function DoorStep({ step }: { step: PreludeStep }) {
+/**
+ * The link a step asks the machine to open at launch — an owed plan step, due
+ * now, with an http(s) link, and not one a launch before this one already
+ * raised (that item is asked once; Do it now opens it on Your turn).
+ */
+export function autoOpenOf(step: PreludeStep): string | undefined {
+  if (step.autoOpen !== 'host' || step.state === 'pre-cleared' || step.due || step.item) return undefined;
+  const url = step.open && 'url' in step.open ? step.open.url : undefined;
+  return url && isOpenableUrl(url) ? url : undefined;
+}
+
+function DoorStep({ step, canOpen, opens }: { step: PreludeStep; canOpen: boolean; opens: boolean }) {
   const [opened, setOpened] = useState(0);
   const done = step.state === 'pre-cleared';
   const url = step.open && 'url' in step.open ? step.open.url : undefined;
   const command = step.open && 'command' in step.open ? step.open.command : undefined;
+  const auto = opens ? autoOpenOf(step) : undefined;
   return (
-    <li data-testid="door-step" data-state={step.state} className="flex min-w-0 flex-col gap-1">
+    <li
+      data-testid="door-step"
+      data-state={step.state}
+      {...(step.item ? { 'data-item': step.item } : {})}
+      className="flex min-w-0 flex-col gap-1"
+    >
       <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
         <KindMark kind={step.kind} />
         <span className="text-2xs text-ink-muted">{WHERE_LABEL[step.where]}</span>
@@ -256,28 +308,54 @@ function DoorStep({ step }: { step: PreludeStep }) {
               ? `Needed${step.read ? ` — the proof read: ${step.read}` : '.'}`
               : 'Not checked — its proof could not be run here.'}
         </span>
-        {!done && url && (
-          <Button
-            size="sm"
-            variant="action"
-            data-testid="door-step-do"
-            onClick={() => {
-              window.open(url, '_blank', 'noopener,noreferrer');
-              setOpened((n) => n + 1);
-            }}
-          >
-            {opened ? 'Open again' : 'Do it now'}
+        {!done && step.item ? (
+          <Button size="sm" variant="action" asChild>
+            <a href={turnHref(step.item)} data-testid="door-step-do" data-move="item">
+              Do it now
+            </a>
           </Button>
-        )}
-        {!done && command && (
+        ) : (
           <>
-            <code className="min-w-0 truncate font-mono text-2xs text-ink" title={command}>
-              {command}
-            </code>
-            <CopyButton text={command} label="Do it now — copy the command" size="sm" />
+            {!done && url && (
+              <Button
+                size="sm"
+                variant="action"
+                data-testid="door-step-do"
+                onClick={() => {
+                  window.open(url, '_blank', 'noopener,noreferrer');
+                  setOpened((n) => n + 1);
+                }}
+              >
+                {opened ? 'Open again' : 'Do it now'}
+              </Button>
+            )}
+            {!done && command && (
+              <>
+                <code className="min-w-0 truncate font-mono text-2xs text-ink" title={command}>
+                  {command}
+                </code>
+                <CopyButton text={command} label="Do it now — copy the command" size="sm" />
+              </>
+            )}
           </>
         )}
       </div>
+      {auto && (
+        <p data-testid="door-step-auto" className="max-w-prose text-2xs text-ink">
+          {canOpen ? (
+            <>
+              Opens on this machine when you launch: <code className="font-mono break-all">{auto}</code>
+            </>
+          ) : (
+            <>
+              The plan asks to open <code className="font-mono break-all">{auto}</code> on this machine at
+              launch; this console was started without{' '}
+              <code className="font-mono whitespace-nowrap">--allow-terminal</code> or{' '}
+              <code className="font-mono whitespace-nowrap">--allow-agent</code>, so open it yourself.
+            </>
+          )}
+        </p>
+      )}
     </li>
   );
 }

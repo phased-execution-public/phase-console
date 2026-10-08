@@ -447,3 +447,23 @@ test('AJ-6 (#205): the row answers the publishing act ALONE — a command beside
   assert.deepEqual(manifestVerdict('gh pr create --fill && npm install left-pad', AB7_ROW, { phase: 4 }).companions, ['npm install left-pad']);
   assert.equal(manifestVerdict('gh pr create --title "x y"', AB7_ROW, { phase: 4 }).companions, undefined, 'nothing beside it');
 });
+
+test('AJ-7 (issues-sweep-hub-tb-hz Phase 30, 2026-10-06): `gh pr create` in a release phase is answered from the row once the plan\'s release phases are known — unresolved, the card names the numbered phases alone', () => {
+  const row = 'deny; allow `git push` of `pe/issues-sweep-hub-tb-hz`, of an annotated `archive/*` tag and (Phase 21) of the SDK tag and the release-please branch, always as `git -C <absolute repo path> push origin <branch>` alone in its call; allow `gh pr create`, `gh pr merge --squash --delete-branch` and `gh pr close --delete-branch` in the release phases and in Phases 13, 15, 16, 21, 33, 40 and 41; allow `gh issue edit`, `gh issue comment`, `gh issue close` and `gh label create` on the ten repos; never force-push, never move a tag';
+  // Phase 30's own call (card muw61u0u-13, 04:16Z), and the merge the same row names.
+  const create = 'gh pr create -R example-org/infra --head pe/issues-sweep-hub-tb-hz --base main --title "fix: sweep release b1 - aws pin 90623843, register-lint at the pin, pin-bot cadence" --body-file /tmp/p30/hz-pr-body.md';
+  const merge = 'gh pr merge 256 -R example-org/infra --squash --delete-branch --subject "fix: sweep release b1"';
+  const releasePhases = [19, 20, 23, 30, 31, 32, 38, 39];
+  const resolved = manifestVerdict(create, row, { phase: 30, releasePhases });
+  assert.equal(resolved.answer, 'allow', resolved.why);
+  assert.match(resolved.why, /for phase 30 \(a release phase\)/, 'the journal line says how the phase qualified');
+  assert.equal(manifestVerdict(merge, row, { phase: 31, releasePhases }).answer, 'allow');
+  assert.equal(manifestVerdict(merge, row, { phase: 33, releasePhases }).answer, 'allow', 'a numbered phase, as before');
+  assert.equal(manifestVerdict(create, row, { phase: 5, releasePhases }).answer, null, 'a build phase is a person\'s card');
+  const unresolved = manifestVerdict(create, row, { phase: 30 });
+  assert.equal(unresolved.answer, null, 'the plan not in hand: a person\'s card, which says why');
+  assert.match(unresolved.why, /phases 13, 15, 16, 21, 33, 40, 41 — not phase 30/);
+  const none = manifestVerdict(create, 'deny; allow `gh pr create` in the release phases', { phase: 30, releasePhases: [] });
+  assert.equal(none.answer, null);
+  assert.match(none.why, /the release phases, which this plan resolves to no phase number — not phase 30/);
+});

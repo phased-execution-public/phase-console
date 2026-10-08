@@ -234,6 +234,22 @@ describe('the commands', () => {
     expect(within(go).queryByText('Sessions')).toBeNull();
   });
 
+  it('opens Your turn — the head every act only a person can do lives on (phase 137)', async () => {
+    // A head, not a destination: it is offered beside the destinations, by its
+    // own name and by the words a person reaching for it would type.
+    const { onNavigate } = open('');
+    const row = await rowNamed('Your turn');
+    expect(within(screen.getByRole('group', { name: 'Go to' })).getByText('Your turn')).toBeTruthy();
+    fireEvent.click(row);
+    expect(onNavigate).toHaveBeenCalledWith('#/turn');
+  });
+
+  it('finds Your turn by what is on it, not only by its name', async () => {
+    const { onNavigate } = open('needs me');
+    fireEvent.click(await rowNamed('Your turn'));
+    expect(onNavigate).toHaveBeenCalledWith('#/turn');
+  });
+
   it('offers a verb only where the flag that governs it is on', async () => {
     open('', { allowTerminal: true, allowAgent: true, allowWrites: true });
     expect(await rowNamed('Open a terminal')).toBeTruthy();

@@ -230,8 +230,14 @@ test('OA-3 — the pass makes due what has landed and only that; a plan act whos
     assert.equal(svc.open(root).ok, true);
     const past = new Date(Date.now() - 60_000).toISOString();
     const ahead = new Date(Date.now() + 24 * 3_600_000).toISOString();
+    // Two acts, so two commands: since phase 130's G7, two lanes of one plan
+    // declaring the SAME command are one item with two waiters.
     const dueNow = svc.recordHumanStep({ slug: 'demo', phase: 3, birth: 'session', step: { ...ACT, due_when: `date:${past}` } })!;
-    const notYet = svc.recordHumanStep({ slug: 'demo', phase: 4, birth: 'session', step: { ...ACT, due_when: `date:${ahead}` } })!;
+    const notYet = svc.recordHumanStep({
+      slug: 'demo', phase: 4, birth: 'session',
+      step: { ...ACT, title: 'Restart the pe-hub console', open_command: 'phase-console update pe-hub --when-idle', due_when: `date:${ahead}` },
+    })!;
+    assert.notEqual(notYet.id, dueNow.id, 'two acts, two items');
     const planAct = svc.recordHumanStep({
       slug: 'other', phase: 0, birth: 'plan',
       step: { kind: 'operator-act', title: 'Rotate the deploy key', open_command: 'vercel env add KEY', proof: `date:${past}` },
@@ -275,11 +281,18 @@ test('OA-3 — a frozen console asks nothing; a due-when the clock refuses makes
   try {
     assert.equal(svc.open(root).ok, true);
     const past = new Date(Date.now() - 60_000).toISOString();
-    const dated = svc.recordHumanStep({ slug: 'demo', phase: 3, birth: 'session', step: { ...ACT, due_when: `date:${past}` } })!;
+    // Commands of their own: the ledger is this file's, and an open act of the
+    // test above with the same command would take these as waiters (G7).
+    const dated = svc.recordHumanStep({
+      slug: 'demo', phase: 3, birth: 'session',
+      step: { ...ACT, title: 'Restart the site console', open_command: 'phase-console update site --when-idle', due_when: `date:${past}` },
+    })!;
     // A host the machine profile does not name: the clock refuses the ref, for good.
     const nowhere = svc.recordHumanStep({
-      slug: 'demo', phase: 4, birth: 'session', step: { ...ACT, due_when: 'unit:no-such-host/nightly-build.service' },
+      slug: 'demo', phase: 4, birth: 'session',
+      step: { ...ACT, title: 'Restart the docs console', open_command: 'phase-console update docs --when-idle', due_when: 'unit:no-such-host/nightly-build.service' },
     })!;
+    assert.notEqual(nowhere.id, dated.id, 'two acts, two items');
     assert.equal(nowhere.state, 'upcoming');
     const own = svc as unknown as { fleetHold: () => unknown };
     const realHold = own.fleetHold;

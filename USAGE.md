@@ -72,8 +72,8 @@ or live foreign claim, a manual gate…) and its situation's ladder is climbed b
 at boot, on a docs change, every few minutes, a minute after any stop, and on Recover & continue —
 within caps in rungs **and** dollars you set in Settings ▸ Automation; when the ladder is spent it
 leaves **one errand** (what is needed, how to give it, what it tried) and drives everything else.
-Every Ways forward shows the situation, the rungs tried and the next one; the dashboard's *Waiting on
-you* lists only errands, permission cards and sign-ins; the Pulse shows each plan's last convergence
+Every Ways forward shows the situation, the rungs tried and the next one; *Your turn* lists only
+errands, permission asks and sign-ins; the Pulse shows each plan's last convergence
 pass. Install the session-presence hook (Settings ▸ Automation ▸ Session presence or `phase-console
 install-hooks`) and a hand-run `claude` in the repository is seen too — queued behind for ten minutes
 after it starts or resumes (for as long as it lives once it works that very phase), its lock released
@@ -165,9 +165,97 @@ asking you.
 **The acts only you do, queued.** An `operator-act` is a step only you carry out — a command to run, a
 click path to follow — declared by a session (`phase-outcome.sh … needs-human --act --due-when <ref>`)
 or written into the plan (`due: <ref>` on a `Human step:` bullet, in a phase or under
-`## Operator errands`). Until its ref lands it waits, silent, under *Coming up* on the Tower and the approve page;
+`## Operator errands`). Until its ref lands it waits, silent, under *Coming up* on Your turn;
 then it is due, with one notification — `NOW:` and its command, or its title for a click path — and
 its proof clears it and resumes the phase that needed it.
+
+**Your turn: every act only a person can do, on one page.** `#/turn`, titled *Your turn* and lighting Runs,
+lists them in six sections, always in this order: *Do now*, *Needs one detail from you*, *Coming up*,
+*Being checked*, *Done* and *Handled by the AI*. Each item is one card: why only you can do it (one of ten
+reasons — `permission`, `identity`, `secret`, `money`, `legal`, `decision`, `physical`, `reach`,
+`third-party` or `reserved`), the plan, phase and run it belongs to, what it unblocks, the effort, its guide as
+steps, how it will be checked, and one primary action. A guide's commands are copyable — *Copy* as
+written, *Copy for Claude Code* behind a `!` — and are never run by the page; a link shows its whole address
+before it opens; a guide written in Persian is drawn right to left, its commands left to right. The plan, run,
+kind, reason and risk filters and the search live in the address; *Export* downloads the open items as one
+Markdown document and *Print* prints the same. `#/approve` and `#/approve?step=<id>` land on the page and a
+push opens `#/turn/<id>`. The approval queue, a question, a gate and an errand all draw the same item with
+*Open on Your turn*; the Tower's Needs-you bay keeps runs and one line linking here, and *Your turn (n)* in the
+situation line counts items.
+
+**Every source feeds the one list.** A person errand is an item, so its *Done — continue* checks the same item
+and a step you did ends `proven`. A credential the preflight finds missing raises a `secret-entry` item,
+proven by a `credential:<id>` watch (`gh`, `claude`, `env:NAME`, `keychain:SERVICE` or `file:PATH`, read by
+presence and never by value); an MCP server the console cannot reach under `require` raises an `mcp-login`
+item; a relayed question the console will not answer by rule raises a `decision` item that keeps its
+options. A session raises its own with `phase-outcome.sh … needs-human --step`, and the console holds the
+declaration to a reason its kind allows (`--why`), a guide (`--guide`: a why paragraph, `## Steps` and `## If it
+goes wrong`; at most 20 steps and 24 KB) and a proof a person can read. It refuses what the AI could do itself
+with exit 4, and a step with no proof with exit 2; `references/turn.md` is the session's reference.
+
+**The check.** *I've done this — check* gets a verdict: passed; rejected, with exactly what to redo (the
+item says *Back to you*, the attempt and the miss); or needs-info. A command's proof is read at once and a
+miss says what it read. A proof only words can state is read by a short read-only checking session for that
+one item — at most 12 turns, $0.50 and five minutes, `sonnet` at `low` unless Settings ▸ Automation says
+otherwise (*Check what a command cannot*; switched off, the item is accepted on your word and marked
+unverified). A pass resumes every waiting session once, saying what was proven. After the third rejection
+(Settings ▸ Automation ▸ *Send to the owner after*) the item asks how it ends: rewrite the guide, *I can't*, or
+the owner's *Accept anyway*, recorded as unverified. No session and no agent can mark its own item passed.
+
+**Your moves.** Beside the check you can answer a decision — one of its options, a note, or both (*Send my
+answer*) — decline an item that allows it, with a reason (*Not doing this*, which ends `declined`), ask a
+question about it (*Ask*) and attach evidence (*Attach*): a note, an image or a file, 160 KB a piece and six an
+attempt, screened for secrets and kept 0600 in `turn-evidence/`, never pushed. Each answer goes back to every
+waiting session once, in a sentence the console composes. The console never takes a secret: a `secret-entry`
+item says where the value goes — the keychain item `phase-console-<id>` on macOS, a 0600 file elsewhere, or
+its own `credential:<id>` place — and the check finds it there.
+
+**Permission items, and grants.** Every wall a session meets is recorded, and a session that declares
+`blocked --needs permission` citing one raises ONE `permission` item, "raised because the AI lacks permission
+…", with the command, the phase, why it was needed, the wall and its risk. Answer it on its card: *Grant* —
+*This call*, *This phase* (until it settles, 24 hours at most), *This plan*, *This repository* (every plan of
+this console) or *Always* (every plan on this machine) — or *I'll do it myself*, which turns it into your own
+act, or *Deny*, after which the session finds another way. A low or medium grant is one press; a high one
+shows what it reaches, asks for the rule typed back, and on a console with an owner key waits for a touch of
+the key within the last five minutes. The **never list** offers no grant through any door: a forced or
+deleting push, `sudo`, `shutdown`, `reboot`, `mkfs` and `dd`, a protected path, a secret's value, the console's
+own guard, a missing credential, a sandbox or network wall, and Claude Code's own classifier — the item says
+why and gives the manual path. The console applies a grant itself: below plan scope its hook lets exactly
+that lane and rule through, and the run's settings carry the rule lowered for that run only until the grant
+ends — for that long the CLI's own list does not hold it with the console dead. The waiting session resumes
+by itself. Every grant is a row in `grants.ndjson` — who granted it through which door, the item, the wall,
+the rule, the scope, the end and exactly what it changed. `phase-console grants list` shows them (so does
+Settings ▸ Permissions ▸ **Grants**), `phase-console grants revoke <id>` undoes exactly what its row says,
+`phase-console grants revoke-all` ends every live one, and a *Permission granted* push announces each.
+
+**The owner key.** A passkey proves a press is yours. Every request has one door, decided by what it can
+prove — `owner`, `device`, `local` or `session` — and the `by` label is only a label.
+`phase-console owner enroll` prints a one-time link, good for ten minutes: open it in a browser on this
+machine, at `localhost` (an IP address is refused), and enrol a passkey (Touch ID, Windows Hello, a security
+key — the console requires user verification); later keys are added in an owner session from Settings ▸
+Permissions ▸ **Owner keys**. From then on the console has an owner: a browser signed in with the key is the
+owner's for twelve idle hours, and a high-risk press — a profile raise, a capability, a key, trust — needs the
+key touched again within five minutes. A press through any other door (a script, the CLI, a browser with no
+key, a phone beyond its low and medium answers, a session's token) is neither applied nor dropped: it
+waits as "asked by … — confirm?" for the owner to confirm or refuse in one press, and what the plan's manifest
+already allows still runs. `phase-console owner status` says whether the console is `unenrolled` or `enrolled`,
+with the keys and the requests waiting (`unlocked` is what a browser inside an owner session reads in
+`/api/state.ownerDoor`), and `phase-console owner lock` ends every owner session. A console with no key behaves as before
+and says so. The residual risk, in full: a process running as you that deliberately rewrites the console's own
+files can forge anything below the owner key, and can replace the key registry itself; the console walls the
+paths a session takes and makes every grant visible, and it is not a boundary against your own account.
+
+**Kept up to date, and what the AI handled.** A round ends the grants that ran out, sends the reminders that
+are due, withdraws an item nobody needs any more or a live grant now covers, brings an upcoming act due with its
+one push, and reads the proofs the console owns. It runs every minute and two seconds after any run's journal
+line, changes the page only when something changed, and announces itself with one server-sent event, `turn`.
+The sentence above the sections is composed by rules — how many need you now and for how long the oldest has
+waited, how many are being checked, how many are coming up, how many were handled since you last looked —
+never by a model. *Handled by the AI* is the other half of the record: what the guard refused to raise, the
+auto-grants the rule table gave (one row per rule per phase, with a count), relay answers by rule, the ladder's
+recoveries, and anything a session records with `phase-outcome.sh <slug> <N> handled --what …`, each linked
+to the journal line that says it. `phase_console_turn_rounds_total`, `phase_console_turn_handled_total`,
+`phase_console_turn_checks_total` and `phase_console_turn_check_usd_total` count them.
 
 
 **Reading a run from a shell.** `phase-console run status <slug>` prints the latest run in a small

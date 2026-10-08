@@ -19,42 +19,32 @@
  *
  * ## Now's bands, absorbed rather than copied
  *
- * Its INBOX is the Needs-you bay's loose rows — every item that wants a person
- * and that no strip in the bay already draws (the approval queue keeps its own
- * cards); its LANES ride on the Live bay's strips; its NEXT UP is the Ready bay
- * — `toDepartures`, the same set, handed in.
+ * Its INBOX is Your turn now (control-tower phase 139, #216): the Needs-you bay
+ * keeps runs — a strip is a run, and Runs must answer "which run?" — each
+ * strip's ONE action its oldest item's primary, and the asks no strip draws
+ * moved to the page, which the bay and the situation line link to. Its LANES
+ * ride on the Live bay's strips; its NEXT UP is the Ready bay —
+ * `toDepartures`, the same set, handed in.
  *
  * ## The annunciator
  *
  * One lamp per halt family (`HALT_CATEGORIES`): each unsettled halted run
- * counts under `haltView(run).category` (phase 17), each loose inbox row under
- * the family the server already put on it (`item.category`, the same table).
+ * counts under `haltView(run).category` (phase 17), and a run a person's turn
+ * summons under its oldest item's family (`item.category`, the same table).
  * A settled run's old halt lights nothing — settled things go quiet.
  */
 
 import { BAYS, bayOf, describeRun, type RunCtx } from '@shared/status-model.js';
 import { HALT_CATEGORIES, isHaltCategory, type HaltCategory } from '@shared/halt-categories.js';
 import { haltView } from '@shared/halt-view.js';
-import { countsTowardAttention } from '@shared/attention-model.js';
 import { ciRefusalsOf, type CiRefusal } from '@shared/ci-refusal.js';
 import type { InboxItem, QueueEntry, RunState, VerifyingLane } from '@/lib/api';
-import { isUpcomingItem } from '@/components/human-step-words';
+import { itemRows, itemsNow, runItems } from '@/features/turn/surfaces';
 import type { Departure, NowLane } from '@/features/runs/lanes-model';
 import { queueEntryFor } from '../queue-words';
 import { verifyingLanes } from '../verifying-lane';
 
 export type Bay = (typeof BAYS)[number];
-
-/** Inbox kinds the approval queue draws as cards of its own — never a loose row as well. */
-const CARDED: ReadonlySet<string> = new Set(['approval', 'question']);
-
-/**
- * Inbox kinds that stand in Needs you as rows of their own even when their
- * run's strip is there: a supervisor's card (control-tower phase 102) is a
- * second ask about the run — its evidence and its ONE action — not the stop
- * the strip already draws.
- */
-const OWN_ROW: ReadonlySet<string> = new Set(['supervisor']);
 
 /** One run, placed. */
 export interface TowerRun {
@@ -95,16 +85,17 @@ export interface TowerModel {
   bays: Record<Bay, TowerRun[]>;
   /** The Ready bay: plans' ready phases, not runs. */
   ready: Departure[];
-  /** Inbox rows in Needs you that no strip draws. */
-  loose: InboxItem[];
   annunciator: Record<HaltCategory, number>;
-  /** How many things each bay holds — Needs you counts its loose rows, Ready its departures. */
+  /** How many things each bay holds — runs, and Ready its departures. */
   counts: Record<Bay, number>;
-  /** The open human steps — a person's turn each (control-tower phase 42): *Your turn (n)*. */
-  steps: InboxItem[];
   /**
-   * The acts not due yet, in the inbox's own order — *Coming up* (control-tower
-   * phase 121, #182): drawn after what is due, counted in no bay, lighting no lamp.
+   * The items a person owes now — one row each, oldest first, an errand and its
+   * step one item (control-tower phase 139): *Your turn (n)*, and the page.
+   */
+  items: InboxItem[];
+  /**
+   * The items not due yet — *Coming up* (control-tower phase 121, #182): on the
+   * page, counted in no bay, lighting no lamp.
    */
   upcoming: InboxItem[];
   /** The Settled bay's two numbers, and the local midnight "today" starts at. */
@@ -154,16 +145,6 @@ function newestBySlug(runs: readonly RunState[]): Map<string, RunState> {
 }
 
 /**
- * Is this inbox row a person's turn on a ledger step — the summons a step
- * puts on its run (control-tower phase 42)? A folded card (a gate, a
- * question) is drawn by the same card but summons through its own kind, and
- * an act not due yet summons nobody: it is *Coming up* (phase 121).
- */
-export function isStepItem(item: Pick<InboxItem, 'kind' | 'humanStep' | 'ack'>): boolean {
-  return item.kind === 'human-step' && Boolean(item.humanStep?.stepId) && !item.ack && !isUpcomingItem(item);
-}
-
-/**
  * The family a row lights — the server's word, which it puts on a person's
  * turn too (its kind's family, `HUMAN_STEP_CATEGORY`, control-tower phase 42).
  */
@@ -172,47 +153,20 @@ export function categoryOfItem(item: Pick<InboxItem, 'category'>): HaltCategory 
   return isHaltCategory(word) ? word : null;
 }
 
-/** This run's open step rows, oldest first — the first is the strip's ONE action. */
-export function stepItemsOf(
-  inbox: readonly InboxItem[] | undefined,
-  run: Pick<RunState, 'id' | 'slug'>,
-): InboxItem[] {
-  return (inbox ?? [])
-    .filter((item) => isStepItem(item) && itemOfRun(item, run))
-    .sort((a, b) => Date.parse(a.since) - Date.parse(b.since));
-}
-
-/** Does this inbox item belong to this run? `describeRun`'s own matching rule. */
-export function itemOfRun(
-  item: Pick<InboxItem, 'runId' | 'slug'>,
-  run: Pick<RunState, 'id' | 'slug'>,
-): boolean {
-  return item.runId ? item.runId === run.id : Boolean(run.slug) && item.slug === run.slug;
-}
-
 /** Urgent first, then the oldest ask — the one you do not already know about. */
 function needsYouOrder(a: TowerRun, b: TowerRun): number {
   const loud = (t: TowerRun) => (describeRun(t.run as never, t.ctx).attention === 'urgent' ? 0 : 1);
   return loud(a) - loud(b) || a.touched - b.touched;
 }
 
-function lampsOf(runs: readonly TowerRun[], loose: readonly InboxItem[]): Record<HaltCategory, number> {
+function lampsOf(runs: readonly TowerRun[]): Record<HaltCategory, number> {
   const lamps = zeroLamps();
   for (const t of runs) if (t.category) lamps[t.category] += 1;
-  for (const item of loose) {
-    const word = categoryOfItem(item);
-    if (word) lamps[word] += 1;
-  }
   return lamps;
 }
 
-function countsOf(
-  bays: Record<Bay, TowerRun[]>,
-  loose: readonly InboxItem[],
-  ready: readonly Departure[],
-): Record<Bay, number> {
+function countsOf(bays: Record<Bay, TowerRun[]>, ready: readonly Departure[]): Record<Bay, number> {
   const counts = Object.fromEntries(BAYS.map((bay) => [bay, bays[bay].length])) as Record<Bay, number>;
-  counts['needs-you'] += loose.length;
   counts.ready = ready.length;
   return counts;
 }
@@ -244,9 +198,9 @@ export function towerModel(input: TowerInput): TowerModel {
     const bay = bayOf(view);
     const queued = mine.find((lane) => lane.status === 'queued');
     const entry = queued ? queueEntryFor(entries, run.slug, queued.phase) : undefined;
-    // A run summoned by a person's turn lights the step's family when no halt
-    // names one — the step IS why it waits (control-tower phase 42).
-    const step = bay === 'needs-you' ? stepItemsOf(inbox, run)[0] : undefined;
+    // A run summoned by a person's turn lights its oldest item's family when no
+    // halt names one — the item IS why it waits (control-tower phases 42, 139).
+    const step = bay === 'needs-you' ? runItems(inbox, run)[0] : undefined;
     const halted =
       bay !== 'settled' && run.halt
         ? (haltView(run as Parameters<typeof haltView>[0])?.category ?? null)
@@ -271,14 +225,6 @@ export function towerModel(input: TowerInput): TowerModel {
   bays['needs-you'].sort(needsYouOrder);
   for (const bay of BAYS) if (bay !== 'needs-you') bays[bay].sort((a, b) => b.touched - a.touched);
 
-  const summoned = bays['needs-you'].map((t) => t.run);
-  const loose = inbox.filter(
-    (item) =>
-      countsTowardAttention(item.severity) &&
-      !CARDED.has(item.kind) &&
-      (OWN_ROW.has(item.kind) || !summoned.some((run) => itemOfRun(item, run))),
-  );
-
   const midnight = new Date(now).setHours(0, 0, 0, 0);
   const settledBay = bays.settled;
 
@@ -286,11 +232,10 @@ export function towerModel(input: TowerInput): TowerModel {
     runs: placed,
     bays,
     ready: [...departures],
-    loose,
-    annunciator: lampsOf(placed, loose),
-    counts: countsOf(bays, loose, departures),
-    steps: inbox.filter(isStepItem),
-    upcoming: inbox.filter(isUpcomingItem),
+    annunciator: lampsOf(placed),
+    counts: countsOf(bays, departures),
+    items: itemsNow(inbox),
+    upcoming: itemRows(inbox.filter((row) => row.turn?.group === 'upcoming')),
     settled: {
       today: settledBay.filter((t) => !t.dormant && t.touched >= midnight).length,
       dormant: settledBay.filter((t) => t.dormant).length,
@@ -314,20 +259,16 @@ export function filterTower(model: TowerModel, filter: TowerFilter): TowerModel 
 
   const bySlug = (slug: string | undefined) => !query || (slug ?? '').toLowerCase().includes(query);
   const runs = model.runs.filter((t) => bySlug(t.run.slug));
-  const loose = model.loose.filter((item) => bySlug(item.slug ?? item.title));
-  const annunciator = lampsOf(runs, loose);
+  const annunciator = lampsOf(runs);
 
   const inFamily = (t: TowerRun) =>
     (!category || t.category === category) && (!keep || keep.runIds.has(t.run.id));
   const bays = emptyBays();
   for (const bay of BAYS) bays[bay] = model.bays[bay].filter((t) => bySlug(t.run.slug) && inFamily(t));
-  const looseShown = loose.filter(
-    (item) => (!category || categoryOfItem(item) === category) && (!keep || keep.itemIds.has(item.id)),
-  );
   // A plan's ready phase has stopped for nothing, so no family holds it.
   const ready = category || keep ? [] : model.ready.filter((d) => bySlug(d.slug));
-  // A person's turn, due or coming up, narrows as its family's rows do.
-  const stepShown = (item: InboxItem) =>
+  // A person's turn, due or coming up, narrows as its family's runs do.
+  const itemShown = (item: InboxItem) =>
     bySlug(item.slug ?? item.title) &&
     (!category || categoryOfItem(item) === category) &&
     (!keep || keep.itemIds.has(item.id));
@@ -336,11 +277,10 @@ export function filterTower(model: TowerModel, filter: TowerFilter): TowerModel 
     runs: model.runs.filter((t) => bySlug(t.run.slug) && inFamily(t)),
     bays,
     ready,
-    loose: looseShown,
     annunciator,
-    counts: countsOf(bays, looseShown, ready),
-    steps: model.steps.filter(stepShown),
-    upcoming: model.upcoming.filter(stepShown),
+    counts: countsOf(bays, ready),
+    items: model.items.filter(itemShown),
+    upcoming: model.upcoming.filter(itemShown),
     settled: {
       today: bays.settled.filter((t) => !t.dormant && t.touched >= model.settled.since).length,
       dormant: bays.settled.filter((t) => t.dormant).length,

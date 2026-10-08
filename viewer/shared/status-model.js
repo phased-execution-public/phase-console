@@ -108,6 +108,14 @@ export const PERSON_WORDS = Object.freeze({
   'decision:outstanding': 'a decision the plan asks for is owed by a person, and the run cannot guess it',
   'verification:human': 'a verification line only a person can check is waiting for that person',
   'landing:conflict': 'a landing git could not merge stays put until a person resolves the conflict',
+  // Your turn (control-tower phase 130): an item only a person can do, waiting
+  // on that person, and a check that sent it back.
+  'step:declared': 'an act only a person can do has been asked for, and nothing else moves it',
+  'step:notified': 'an act only a person can do is waiting on that person',
+  'step:opened': 'the person opened the act and has not finished it — only they can',
+  'step:returned': 'a check sent the act back with what to redo, and only the person can redo it',
+  'verdict:rejected': 'the check rejected what the person sent, and only the person can send it again',
+  'verdict:needs-info': 'the check needs one more thing from the person before it can pass',
 });
 
 /* ------------------------------------------------------------------ *
@@ -405,6 +413,40 @@ export const WORD_ROWS = Object.freeze({
     none: row('No plan', 'circle-dashed', 'skipped', 'standing'),
   }),
   note: NOTE_ROWS,
+  // Your turn (control-tower phase 130, #207) — owners `HUMAN_STEP_STATES`
+  // (`shared/human-step-model.js`) and `VERDICTS`, `RISK_TIERS`,
+  // `GRANT_STATES` (`shared/turn-model.js`). The phases that draw an item, a
+  // check, a risk or a grant add no vocabulary of their own.
+  step: Object.freeze({
+    upcoming: row('Coming up', 'clock', 'queued', 'standing'),
+    declared: row('Your turn', 'hand', 'needs-you', 'standing', PERSON),
+    notified: row('Waiting on you', 'user-round', 'needs-you', 'standing', PERSON),
+    opened: row('Opened', 'eye', 'needs-you', 'standing', PERSON),
+    checking: row('Being checked', 'search-check', 'verifying', 'live'),
+    returned: row('Sent back', 'undo-2', 'needs-you', 'standing', PERSON),
+    proven: row('Proven', 'badge-check', 'done', 'settled', OK),
+    declined: row('Declined', 'circle-slash', 'skipped', 'settled', STOPPED),
+    expired: row('Expired', 'timer-off', 'skipped', 'settled', STOPPED),
+    cannot: row('Can’t be done', 'ban', 'skipped', 'settled', STOPPED),
+    dismissed: row('Withdrawn', 'archive-x', 'skipped', 'settled', SUPERSEDED),
+  }),
+  verdict: Object.freeze({
+    passed: row('Passed', 'circle-check', 'done', 'settled', OK),
+    rejected: row('Rejected', 'circle-x', 'needs-you', 'standing', PERSON),
+    'needs-info': row('Needs more', 'message-circle-question', 'needs-you', 'standing', PERSON),
+  }),
+  risk: Object.freeze({
+    low: row('Low risk', 'shield-check', 'skipped', 'standing'),
+    medium: row('Medium risk', 'shield-minus', 'waiting', 'standing'),
+    high: row('High risk', 'triangle-alert', 'failed', 'standing'),
+    never: row('Never granted', 'shield-x', 'failed', 'standing'),
+  }),
+  grant: Object.freeze({
+    live: row('Live', 'key-round', 'running', 'live'),
+    spent: row('Spent', 'check-check', 'done', 'settled', OK),
+    expired: row('Expired', 'timer-off', 'skipped', 'settled', STOPPED),
+    revoked: row('Revoked', 'ban', 'skipped', 'settled', STOPPED),
+  }),
 });
 
 /** The vocabularies, in the order the Guide lists them. */

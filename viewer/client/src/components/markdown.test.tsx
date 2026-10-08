@@ -13,8 +13,9 @@
  */
 
 import { marked } from 'marked';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import { StatusProse } from '@/app/help/prose';
 import { Markdown, MarkdownInline, inlineCacheSize, plainText, sweep, toFragment } from './markdown';
 
 /** Render markdown the way the component does and hand back the resulting HTML. */
@@ -215,6 +216,87 @@ describe('markdown rendering', () => {
     const { rerender, container } = render(<Markdown text="stable content" />);
     rerender(<Markdown text="stable content" />);
     expect(container.textContent).toContain('stable content');
+  });
+});
+
+/* ---------------- a copy button, and a direction (control-tower phase 137) ---------------- */
+
+/**
+ * The one Markdown component gains what a guide needs (#214, §Architecture 19
+ * "Language"): a copy button on every fenced block — added by THIS module after
+ * the sweep, so content can still bring no button of its own — and a direction
+ * taken from the content's language. Commands read left-to-right in any
+ * language; a right-to-left text isolates its refs and numbers so the bidi
+ * algorithm cannot reorder them.
+ */
+describe('a code block can be copied, and a text carries its direction', () => {
+  it('puts one copy button on each fenced block — and content still brings none', () => {
+    const { container } = render(
+      <Markdown text={'```sh\ngh auth status\n```\n\n<button>evil</button>\n\n```\nnpm test\n```'} />,
+    );
+    const buttons = container.querySelectorAll('button');
+    expect(buttons).toHaveLength(2);
+    for (const button of buttons) {
+      expect(button.getAttribute('data-md-copy')).toBe('');
+      expect(button.getAttribute('type')).toBe('button');
+      expect(button.textContent).toBe('Copy');
+    }
+    expect(container.textContent).not.toContain('evil');
+  });
+
+  it('copies the block’s own text, and says so on the button', async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const { container } = render(<Markdown text={'```sh\ngh auth login --web\n```'} />);
+    const button = container.querySelector('button[data-md-copy]') as HTMLButtonElement;
+    fireEvent.click(button);
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('gh auth login --web'));
+    await waitFor(() => expect(button.textContent).toBe('Copied'));
+  });
+
+  it('reads every command left-to-right, whatever the language around it', () => {
+    const { container } = render(<Markdown text={'run `gh auth status` now\n\n```sh\nnpm test\n```'} />);
+    for (const el of container.querySelectorAll('code, pre')) expect(el.getAttribute('dir')).toBe('ltr');
+    // No language named: the block inherits the page's, and says nothing.
+    expect(container.querySelector('.md')?.getAttribute('dir')).toBeNull();
+  });
+
+  it('draws a right-to-left text right-to-left, its refs and numbers isolated', () => {
+    // The content carries its language and the direction the grammar took from
+    // it (`shared/guide-grammar.js` `guideDirection`); this component draws them.
+    const { container } = render(
+      <Markdown text={'صفحهٔ github.com/login/device را باز کنید و 3 بار بررسی کنید.'} lang="fa" dir="rtl" />,
+    );
+    const md = container.querySelector('.md')!;
+    expect(md.getAttribute('dir')).toBe('rtl');
+    expect(md.getAttribute('lang')).toBe('fa');
+    const isolated = [...md.querySelectorAll('bdi[dir="ltr"]')].map((el) => el.textContent);
+    expect(isolated).toEqual(['github.com/login/device', '3']);
+    // A run of words stays ONE run, or right-to-left would reverse their order.
+    const { container: words } = render(
+      <Markdown text={'دستور gh auth status را اجرا کنید'} lang="fa" dir="rtl" />,
+    );
+    expect([...words.querySelectorAll('bdi')].map((el) => el.textContent)).toEqual(['gh auth status']);
+    // A left-to-right text isolates nothing.
+    const { container: en } = render(<Markdown text={'open github.com/login/device'} lang="en" dir="ltr" />);
+    expect(en.querySelector('.md')?.getAttribute('dir')).toBe('ltr');
+    expect(en.querySelectorAll('bdi')).toHaveLength(0);
+  });
+
+  it('inline markdown takes the direction too, and is cached per direction', () => {
+    const text = 'نسخهٔ v6.2.0 را نصب کنید';
+    const { container } = render(<MarkdownInline text={text} lang="fa" dir="rtl" />);
+    const span = container.querySelector('.md-inline')!;
+    expect(span.getAttribute('dir')).toBe('rtl');
+    expect(span.querySelector('bdi')?.textContent).toBe('v6.2.0');
+    const { container: plain } = render(<MarkdownInline text={text} />);
+    expect(plain.querySelector('bdi')).toBeNull();
+  });
+
+  it('the help sheet draws through it: a guide’s code block there has its copy button', () => {
+    const { container } = render(<StatusProse text={'Run it:\n\n```sh\nphase-console doctor\n```'} />);
+    expect(container.querySelector('pre')?.getAttribute('dir')).toBe('ltr');
+    expect(container.querySelectorAll('button[data-md-copy]')).toHaveLength(1);
   });
 });
 

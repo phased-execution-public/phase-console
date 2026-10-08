@@ -23,8 +23,8 @@ import { shell } from './shell.ts';
 
 export type WriteAction =
   | 'new-plan' | 'new-handoff' | 'qa-record' | 'gate-approve' | 'lock-claim' | 'lock-release'
-  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode' | 'decisions-promote' | 'landing-record'
-  | 'wait-budget';
+  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode' | 'decisions-promote' | 'decisions-answer'
+  | 'landing-record' | 'wait-budget';
 
 export type WriteRequest = {
   action: WriteAction;
@@ -91,6 +91,9 @@ export type WriteRequest = {
   rulingId?: string;
   key?: string;
   ledger?: string;
+  /** `decisions-answer` (control-tower phase 133): the answer's words, and what backs it. */
+  value?: string;
+  evidence?: string;
   /**
    * The landing ledger row to record (`landing-record`): the state — one of
    * `LANDING_STATES` — and the cells `phase-landing.sh` takes. `reason` is the
@@ -414,6 +417,35 @@ export function planWrite(request: WriteRequest, opts: { root: string; docsDir?:
         args: [slug, 'promote', '--from-ruling', rulingId, '--key', key, '--by', by],
         description: `Remember ruling ${rulingId} as the ${slug} answer to ${key}`,
         env: { PE_RULINGS_FILE: ledger },
+      };
+    }
+
+    case 'decisions-answer': {
+      // A person's answer to a decision item that names a `## Decisions` key
+      // (control-tower phase 133, #210) — written to the plan's twin BEFORE the
+      // waiting session hears it, so the run and the plan say one thing. The
+      // row is the phase's own (`--phase`), or the plan's for phase 0: one
+      // item's answer must not silently re-answer the key for every phase.
+      const slug = requireSlug(request.slug);
+      const key = (request.key ?? '').trim();
+      if (!(DECISION_KEYS as readonly string[]).includes(key)) {
+        throw new WriteError(`The decision key must be one of the manifest's (${DECISION_KEYS.join(', ')}).`);
+      }
+      const value = (request.value ?? '').replace(/\s+/g, ' ').trim();
+      if (!value) throw new WriteError('An answer needs its words.');
+      if (/[|\u0060]/.test(value) || value.length > 400) {
+        throw new WriteError('An answer written to the decisions table is one line of at most 400 characters, with no pipe or backtick.');
+      }
+      const by = (request.by ?? '').trim();
+      if (!by || !GATE_BY.test(by)) {
+        throw new WriteError('Who answered must be 1-64 characters: letters, digits, spaces, dots, @, + or dashes.');
+      }
+      const evidence = (request.evidence ?? '').replace(/[|\r\n\u0060]+/g, ' ').trim().slice(0, 120);
+      const scope = request.phase ? ['--phase', String(requirePhase(request.phase))] : [];
+      return {
+        script: 'decisions.sh',
+        args: [slug, ...scope, 'answer', key, '--value', value, '--by', by, ...(evidence ? ['--evidence', evidence] : [])],
+        description: `Answer ${key} for ${slug}${request.phase ? ` phase ${request.phase}` : ''}`,
       };
     }
 

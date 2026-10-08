@@ -138,8 +138,26 @@ export type JournalOptions = {
  */
 const journals = new Map<string, Journal>();
 
+/**
+ * Who hears every line a run's journal writes (control-tower phase 136, #213):
+ * the console's turn — its handled log reads a thing the AI handled off the
+ * line that says it, and a line wakes a round. A listener that throws is
+ * dropped from that line, never from the run.
+ */
+export type JournalAppendListener = (line: { slug: string; runId: string; entry: JournalEntry }) => void;
+const appendListeners = new Set<JournalAppendListener>();
+
+/** Hear every line any run's journal writes in this process; the answer stops it. */
+export function onJournalAppend(listener: JournalAppendListener): () => void {
+  appendListeners.add(listener);
+  return () => { appendListeners.delete(listener); };
+}
+
 export class Journal {
   readonly path: string;
+  /** The run this journal is — what an append listener is told. */
+  private readonly slug: string;
+  private readonly runId: string;
   /** The run's trace — derived, so a restart recomputes it rather than losing it. */
   readonly traceId: string;
   private seq = 0;
@@ -168,6 +186,8 @@ export class Journal {
 
   constructor(root: string, slug: string, id: string, options: JournalOptions = {}) {
     this.path = journalFile(root, slug, id);
+    this.slug = slug;
+    this.runId = id;
     this.traceId = runTraceId(options.instanceId ?? INSTANCE.id, slug, id);
     this.maxBytes = options.maxBytes ?? MAX_BYTES;
     this.reserveBytes = Math.min(options.reserveBytes ?? RESERVE_BYTES, this.maxBytes);
@@ -351,6 +371,9 @@ export class Journal {
     // honest record that something happened and was not written down.
     if (this.overflowed && !RESERVE_EVENTS.has(event)) return entry;
     this.writeLine(entry);
+    for (const listener of appendListeners) {
+      try { listener({ slug: this.slug, runId: this.runId, entry }); } catch { /* a listener never costs the run */ }
+    }
     return entry;
   }
 

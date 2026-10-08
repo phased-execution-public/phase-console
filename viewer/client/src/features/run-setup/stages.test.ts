@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest';
 import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS } from '@shared/run-settings.js';
 import { CATEGORY_OF, categoryById } from './categories';
 import { MODES, buildRunPayload, shows, type RunSetupMode } from './modes';
-import { EMPTY, WIRE, type RunSetupField, type RunSetupValues } from './schema';
+import { CONTEXT_FIELDS, EMPTY, WIRE, type RunSetupField, type RunSetupValues } from './schema';
 import {
   FIELD_LABELS,
   HEADINGS,
@@ -64,7 +64,7 @@ describe('every field has a stage', () => {
     const canonical = [...new Set<string>([...RUN_START_FIELDS, ...RUN_SETTINGS_FIELDS])];
     const staged = MODE_NAMES.filter((mode) => LAUNCH_SURFACE[mode] === 'staged');
     for (const name of canonical) {
-      if (name === 'resumeRunId') continue; // context, never a control
+      if ((CONTEXT_FIELDS as readonly string[]).includes(name)) continue; // context, never a control
       const field = (Object.keys(WIRE) as RunSetupField[]).find((key) => WIRE[key] === name);
       expect(field, `${name} maps onto no form field`).toBeTruthy();
       // `openPr` is owned by `settle` (reachability.test.tsx OWNED_BY); it is

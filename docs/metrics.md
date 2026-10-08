@@ -10,7 +10,7 @@ Everything the cost and progress pages show is on this endpoint too, so a figure
 rather than watched. It is a plain read like every other GET: no flag turns it on, no token guards
 it, and the console binds to loopback.
 
-**50 families** ship in both tiers. The list below comes from `viewer/server/analysis/metrics.ts`
+**54 families** ship in both tiers. The list below comes from `viewer/server/analysis/metrics.ts`
 `METRIC_FAMILIES`, and `viewer/test/docs-parity.test.ts` holds this document to it — a family added
 to one and not the other fails the suite, as does calling a counter a gauge.
 
@@ -88,6 +88,10 @@ which kind of scrape you got.
 | `phase_console_http_requests_total` | counter | HTTP requests answered, by status class. |
 | `phase_console_shell_commands_total` | counter | Other child processes run through the seam, by binary and whether they exited 0. |
 | `phase_console_retention_removed_total` | counter | Files retention deleted, by sink. |
+| `phase_console_turn_checks_total` | counter | Checks of a person's items, by who wrote the verdict and what it was. |
+| `phase_console_turn_check_usd_total` | counter | USD the checking sessions cost, by model. |
+| `phase_console_turn_rounds_total` | counter | Rounds that changed Your turn, by what woke them (the clock or a journal line). |
+| `phase_console_turn_handled_total` | counter | Things the AI handled instead of asking a person, by source. |
 
 **Labels.** `slug` on everything per-plan; `state` on `phase_console_phases`
 (`done` · `ready` · `in-progress` · `waiting` · `stuck`); `status` and `closed` on

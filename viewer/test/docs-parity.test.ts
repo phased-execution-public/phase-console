@@ -1641,3 +1641,14 @@ test('design.md records the figures-and-marks decision: every chart, every visx 
   }
 });
 
+
+test('control-tower phase 140: USAGE names every part of Your turn a person meets, and README names the page — both languages by parity', () => {
+  const usage = read('USAGE.md').replace(/[*_]/g, '').replace(/\s+/g, ' ');
+  const check = /CHECK_LABEL = "([^"]+)"/.exec(read('viewer/client/src/components/human-step-words.ts'))?.[1];
+  assert.ok(check, 'the check has one label');
+  for (const needle of ['`#/turn`', check, 'Handled by the AI', 'owner key', 'never list', 'phase-console grants', 'phase-console owner']) {
+    assert.ok(usage.includes(needle), `USAGE.md never names ${needle}`);
+  }
+  assert.ok(read('USAGE.fa.md').includes('#/turn'), 'USAGE.fa.md names the page by its address');
+  for (const readme of ['README.md', 'README.fa.md']) assert.ok(read(readme).includes('#/turn'), `${readme} names Your turn's address`);
+});

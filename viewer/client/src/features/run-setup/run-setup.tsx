@@ -40,7 +40,7 @@
  * the payload is byte-identical to the one the old dialog sent.
  */
 
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Bot, Play, ShieldCheck } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertDialog, AlertDialogContent, Button, toast } from '@/components/ui';
@@ -70,6 +70,7 @@ import { startSession } from '@/lib/start-session';
 import { cn } from '@/lib/cn';
 import { DEFAULTS, EFFORTS, EFFORT_NOTE, MODEL_NOTE, MODELS } from '@/features/runs/defaults';
 import { PressField, ToggleField, sourceOf, type FieldEffect, type Source } from './fields';
+import { showAtDoor, shownAtDoor } from './door-opens';
 import { SetupFormProvider, type SetupForm } from './form-context';
 import { LaunchShell } from './launch-shell';
 import { recallLaunch, rememberLaunch } from './launch-memory';
@@ -224,6 +225,15 @@ export function RunSetup({
       (mode === 'start' || mode === 'phase') && !run && context.slug ? recallLaunch(context.slug) : null,
     [mode, run, context.slug],
   );
+
+  // The links the launch door showed live as long as this form does — a phone's
+  // sub-view hides the door without forgetting what it showed — and go with it.
+  useEffect(() => {
+    const slug = context.slug;
+    return () => {
+      if (slug) showAtDoor(slug, []);
+    };
+  }, [context.slug]);
 
   // `prefs`, `rawPrefs`, `context` and `defaultSkills` are fresh objects each
   // render; their CONTENT is what matters, so the identity used below is the
@@ -471,7 +481,12 @@ export function RunSetup({
         //   `run: null` no run was created and no reason was given.
         //   `run`       it started — and `preflight` may still carry warnings
         //               worth saying now rather than an hour into the run.
-        const answer = await api.runStart(slug, payload as never);
+        // The links the door showed in full — the only ones this launch may open on the machine.
+        const autoOpen = shownAtDoor(slug);
+        const answer = await api.runStart(
+          slug,
+          (autoOpen.length ? { ...payload, autoOpen } : payload) as never,
+        );
         if (answer?.error) {
           toast(answer.error, 'error');
           return;

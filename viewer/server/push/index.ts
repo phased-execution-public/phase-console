@@ -22,7 +22,13 @@ import {
 } from './catalogue.ts';
 import { deliver, origin, type PushMessage, type Subscription } from './send.ts';
 import { loadVapid, vapidSubject, PUSH_DIR, type Vapid, type VapidRefusal } from './vapid.ts';
+import { inQuietHours, parseQuietHours, type QuietHours } from './quiet.ts';
 import type { DeliveryOutcome } from '../notifications.ts';
+
+// The quiet-hours parser and clock live in `./quiet.ts` (control-tower phase
+// 138), import-free so `config.ts` can migrate a window with the register's
+// own parser; every importer of this module keeps its path.
+export { inQuietHours, parseQuietHours, type QuietHours } from './quiet.ts';
 
 // `defaultCategories`/`sanitiseCategories` are re-exported because the catalogue
 // is no longer only push's business: the console's own global notification
@@ -57,15 +63,6 @@ const FILE = join(PUSH_DIR, 'subscriptions.json');
  */
 const MAX_FAILURES = 15;
 
-/**
- * A daily do-not-disturb window for one device. `start`/`end` are 'HH:MM' on a
- * 24-hour clock; a window may cross midnight (23:00–08:00 is the normal case).
- * `allowUrgent` keeps the "nothing proceeds without you" categories — and the
- * one escalated stall — breaking through. It defaults ON, because an approval
- * suppressed at 3am still stops the fleet dead until morning.
- */
-export type QuietHours = { start: string; end: string; allowUrgent: boolean };
-
 export type Device = {
   id: string;
   endpoint: string;
@@ -86,6 +83,11 @@ export type Device = {
    * record-first choke point already wrote the inbox record, so the morning
    * finds the night in the bell, and the delivery ledger reads `quiet` for
    * the device instead of reading as a failure. Additive JSON.
+   *
+   * The ONE quiet-hours setting (control-tower phase 138, #215): a person's
+   * turn's reminders obey it too — the reminder clock waits while every device
+   * that hears them is inside its window (`reminderWindows`), and a reminder
+   * is announced not-urgent, so it never breaks through one.
    */
   quiet?: QuietHours;
   /**
@@ -280,6 +282,20 @@ export class Push {
     device.categories = sanitiseCategories(categories);
     this.persist();
     return this.publicOf(device);
+  }
+
+  /**
+   * The windows a REMINDER of `category` waits out (control-tower phase 138,
+   * #215) — the quiet hours of every device that takes it. Empty when any of
+   * them has none (a device always awake hears it at once), when none takes
+   * it, or when this register cannot send at all: a reminder waits for the
+   * first device to wake, never for a device that would not hear it anyway.
+   */
+  reminderWindows(category: CategoryId): QuietHours[] {
+    if (!this.vapid) return [];
+    const takers = this.devices.filter((device) => device.categories[category]);
+    if (!takers.length || takers.some((device) => !device.quiet)) return [];
+    return takers.map((device) => ({ ...device.quiet! }));
   }
 
   /** Set or clear one device's quiet hours. `null` clears; a bad shape refuses. */
@@ -641,47 +657,6 @@ export function endpointRefusal(endpoint: string): string | null {
 
   if (!host.includes('.')) return 'endpoint must be a push service, not a bare host name';
   return null;
-}
-
-const QUIET_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
-
-/**
- * A client may send anything. `null` clears the window; a malformed shape is
- * refused rather than coerced, because quiet hours the operator did not ask
- * for is the one misconfiguration this feature must never produce.
- */
-export function parseQuietHours(value: unknown): QuietHours | null | { error: string } {
-  if (value == null) return null;
-  if (typeof value !== 'object') return { error: 'quiet hours must be an object or null' };
-  const raw = value as { start?: unknown; end?: unknown; allowUrgent?: unknown };
-  const start = String(raw.start ?? '');
-  const end = String(raw.end ?? '');
-  if (!QUIET_TIME_RE.test(start) || !QUIET_TIME_RE.test(end)) {
-    return { error: 'quiet hours need start and end as HH:MM' };
-  }
-  if (start === end) return { error: 'quiet hours cannot start and end at the same minute' };
-  return { start, end, allowUrgent: raw.allowUrgent !== false };
-}
-
-/**
- * Is `at` inside the window, on this process's local clock? Half-open
- * [start, end) so a window ending 08:00 hands over cleanly to one starting
- * 08:00 — and a window that crosses midnight is the union of [start, 24:00)
- * and [00:00, end).
- */
-export function inQuietHours(quiet: QuietHours | undefined, at: number): boolean {
-  if (!quiet) return false;
-  const startM = quietMinutes(quiet.start);
-  const endM = quietMinutes(quiet.end);
-  if (startM == null || endM == null || startM === endM) return false;
-  const t = new Date(at);
-  const nowM = t.getHours() * 60 + t.getMinutes();
-  return startM < endM ? nowM >= startM && nowM < endM : nowM >= startM || nowM < endM;
-}
-
-function quietMinutes(text: string): number | null {
-  const m = QUIET_TIME_RE.exec(text);
-  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
 }
 
 function parseSubscription(input: unknown): (Subscription & { endpoint: string }) | { error: string } {

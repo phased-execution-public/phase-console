@@ -1,7 +1,8 @@
 /**
  * The tower rehearsal, in a browser (control-tower phase 33, exit criterion 3):
  * the Runs page and quick start at 360 and at 1280, against a console of this
- * tree whose `claude` is a stub.
+ * tree whose `claude` is a stub — and, since phase 141, Your turn's page and
+ * its returned, decision and high-risk permission items with zero findings.
  *
  * The tower rehearsal drives its consoles over the API. This drives the
  * fixture console the way a person does — the Tower's Ready bay, its Start, the
@@ -21,8 +22,8 @@ import { join } from 'node:path';
 
 import { expect, test, type Page } from '@playwright/test';
 
-import { still } from './lib/probes.ts';
-import { CONSOLE_PORT, fixture } from './lib/shots.ts';
+import { axeFindings, focusFindings, layoutFindings, still } from './lib/probes.ts';
+import { CONSOLE_PORT, fixture, shoot, visit } from './lib/shots.ts';
 
 type Run = {
   id?: string;
@@ -208,4 +209,49 @@ test('on a phone, a run started through quick start stops, and the button its ca
 
   const stopped = await consoleApi(`/api/run/${slug}/stop`, 'POST', {});
   expect(stopped.status).toBe(200);
+});
+
+/**
+ * Your turn rehearsed in a browser (control-tower phase 141, #217, exit
+ * criterion 4): the page, a returned item, a decision and a high-risk
+ * permission item — the fixture's own (`seedTurn`) — each at its own address,
+ * at 360 and at 1280, with zero findings: every layout class, axe in light and
+ * dark, and on the desk the focus walk.
+ */
+const TURN_STOPS = [
+  { name: 'turn-rehearsed', hash: '#/turn', item: null, says: null },
+  {
+    name: 'turn-returned',
+    hash: '#/turn/turn-now-secret',
+    item: 'turn-now-secret',
+    says: /no item by that name/,
+  },
+  { name: 'turn-decision', hash: '#/turn/turn-decide', item: 'turn-decide', says: /Ship it on Monday/ },
+  { name: 'turn-permission', hash: '#/turn/turn-permit', item: 'turn-permit', says: null },
+] as const;
+
+test('Your turn: the page, a returned item, a decision and a high-risk permission item hold with zero findings', async ({
+  page,
+}, info) => {
+  test.skip(!/^rehearsal-(phone-360|desk-1280)$/.test(info.project.name), 'asked at 360 and at 1280');
+  const touch = info.project.name === 'rehearsal-phone-360';
+  const fx = await fixture();
+  for (const stop of TURN_STOPS) {
+    await visit(page, { name: stop.name, hash: stop.hash }, fx.anchor);
+    if (stop.item) {
+      const card = page.locator(`[data-testid="turn-item"][data-item="${stop.item}"]`);
+      await expect(card, `${stop.item} is on the page`).toBeVisible();
+      if (stop.says) await expect(card, `${stop.item} says what it is`).toContainText(stop.says);
+      // The high-risk grant asks for its rule typed: the scopes and the field are there.
+      if (stop.item === 'turn-permit') await expect(card.getByTestId('grant-typed')).toBeVisible();
+      await card.scrollIntoViewIfNeeded();
+      await still(page);
+    }
+    expect(await layoutFindings(page, { touch }), `${stop.name}: layout`).toEqual([]);
+    expect(await axeFindings(page, 'light'), `${stop.name}: axe, light`).toEqual([]);
+    expect(await axeFindings(page, 'dark'), `${stop.name}: axe, dark`).toEqual([]);
+    await page.emulateMedia({ colorScheme: 'light' });
+    if (!touch) expect(await focusFindings(page, 40), `${stop.name}: the focus walk`).toEqual([]);
+    await shoot(page, info.project.name, stop.name);
+  }
 });

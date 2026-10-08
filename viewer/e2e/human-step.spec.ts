@@ -1,18 +1,20 @@
 /**
  * A person's turn, in a real browser (control-tower phase 42, criteria 3 and 7).
  *
- * The fixture console seeds no human step, and seeding one would move every
- * register stop that draws the inbox. So this spec stages its own, on its own
- * pages only: `page.route` adds ONE running run (`ship`) to `/api/runs`, ONE
- * `human-step` row for it to `/api/inbox`, and answers the step's own routes —
- * the ledger's list, *Open*, and *Check now*, whose proof lands. Everything
- * else is the fixture console, unchanged.
+ * The fixture console's own items (control-tower phase 137's `seedTurn`) hang
+ * off `tower`'s last phases, which no run is on. This spec stages one more, on
+ * its own pages only: `page.route` adds ONE running run (`ship`) to
+ * `/api/runs`, ONE `human-step` row for it to `/api/inbox` and the item it is
+ * to `/api/turn`, and answers the step's own routes — the ledger's list,
+ * *Open*, and *Check now*, whose proof lands. Everything else is the fixture
+ * console, unchanged.
  *
  *   3. the step summons its running run into Needs you, with the step's act
  *      as the strip's ONE action; it lights its family's lamp and counts in
  *      *Your turn (n)*; on `proven` the strip leaves Needs you with no reload;
- *   7. on a phone, the push's one tap (`#/approve?step=<id>`) lands on the
- *      whole card: the primary wins `elementFromPoint`, the code is
+ *   7. on a phone, the push's one tap (`#/approve?step=<id>`, the address an
+ *      older push carries) lands on the item on Your turn (`#/turn/<id>`, phase
+ *      137) in one hop, whole: the primary wins `elementFromPoint`, the code is
  *      selectable, nothing overflows.
  */
 
@@ -74,7 +76,7 @@ function row(anchor: number) {
     actions: [
       {
         verb: 'check',
-        label: 'I did it — check',
+        label: "I've done this — check",
         endpoint: `/api/human-steps/${STEP}/check`,
         method: 'POST',
       },
@@ -95,6 +97,47 @@ function row(anchor: number) {
       stepId: STEP,
       openUrl: LINK,
       code: 'WDJB-MJHT',
+    },
+    // The item this row is — what the server folds onto every person-facing row
+    // (`server/turn/fold.ts`); the strip's one action is its run's oldest item's.
+    turn: {
+      item: STEP,
+      record: 'ledger',
+      source: 'declared',
+      kind: 'device-code',
+      why: 'identity',
+      proofType: 'probe',
+      group: 'now',
+    },
+  };
+}
+
+/** The same step as Your turn holds it (`GET /api/turn`'s item). */
+function turnItem(anchor: number) {
+  const r = row(anchor);
+  return {
+    ...r,
+    item: STEP,
+    record: 'ledger',
+    source: 'declared',
+    kind: 'device-code',
+    why: 'identity',
+    proofType: 'probe',
+    group: 'now',
+    rows: [r.id],
+    step: {
+      id: STEP,
+      kind: 'device-code',
+      title: 'Pair the deploy CLI',
+      state: 'notified',
+      why: 'identity',
+      whySource: 'inferred',
+      proofType: 'probe',
+      attempts: 0,
+      waiters: [{ slug: 'ship', phase: 2, runId: RUN }],
+      declaredAt: r.since,
+      birth: 'session',
+      proof: 'cmd:"deploy whoami"',
     },
   };
 }
@@ -161,6 +204,26 @@ async function stage(page: Page, anchor: number, root: string): Promise<Staged> 
     },
   );
   await page.route(
+    (url) => url.pathname === '/api/turn',
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const response = await route.fetch();
+      const turn = (await response.json()) as {
+        groups: { now: unknown[] };
+        counts: { now: number; total: number };
+      };
+      if (staged.proven) return route.fulfill({ response, json: turn });
+      await route.fulfill({
+        response,
+        json: {
+          ...turn,
+          groups: { ...turn.groups, now: [turnItem(anchor), ...turn.groups.now] },
+          counts: { ...turn.counts, now: turn.counts.now + 1, total: turn.counts.total + 1 },
+        },
+      });
+    },
+  );
+  await page.route(
     (url) => url.pathname.startsWith('/api/human-steps'),
     async (route) => {
       const request = route.request();
@@ -219,7 +282,9 @@ test('a step is a summons: Needs you, its act on the strip, its lamp, Your turn 
   const before = await lit();
   expect(before).toBeGreaterThanOrEqual(1);
   if (info.project.name === DESK)
-    await expect(page.getByTestId('situation-line').first()).toContainText('Your turn (1)');
+    // The fixture's own items count too (phase 137's seed), so the number is
+    // read, not written down; the lamp below proves the one this step adds.
+    await expect(page.getByTestId('situation-line').first()).toContainText(/Your turn \(\d+\)/);
 
   // A marker a reload would wipe.
   await page.evaluate(() => void ((window as unknown as { __stayed: boolean }).__stayed = true));
@@ -246,21 +311,23 @@ test('a step is a summons: Needs you, its act on the strip, its lamp, Your turn 
   await expect.poll(lit).toBe(before - 1);
 });
 
-test('on a phone the push’s one tap lands on the whole card: the action wins the thumb, the code selects, nothing overflows', async ({
+test('on a phone the push’s one tap lands on the item on Your turn: the action wins the thumb, the code selects, nothing overflows', async ({
   page,
 }, info) => {
   test.skip(info.project.name !== PHONE, 'the lock screen is a phone’s');
   const fx = await fixture();
   await stage(page, fx.anchor, fx.root);
-  // What the worker opens for the step (`shared/sw-push.js` `stepTarget`).
-  await visit(page, { name: 'human-step-approve', hash: `#/approve?step=${STEP}` }, fx.anchor);
+  // What an older push opens for the step (`#/approve?step=`); the worker now
+  // opens `#/turn/<id>` itself (`shared/sw-push.js` `stepTarget`). One hop.
+  await visit(page, { name: 'human-step-turn', hash: `#/approve?step=${STEP}` }, fx.anchor);
+  await expect(page).toHaveURL(new RegExp(`#/turn/${STEP}$`));
 
-  const focused = page.locator('[data-step-focus]');
-  await expect(focused).toBeVisible();
-  const card = focused.getByTestId('human-step-card');
-  await expect(card.getByTestId('step-title')).toHaveText('Pair the deploy CLI');
+  const card = page.locator(`[data-testid="turn-item"][data-item="${STEP}"]`);
+  await expect(card).toHaveAttribute('aria-current', 'true');
+  await expect(card.getByTestId('turn-title')).toHaveText('Pair the deploy CLI');
 
-  const primary = card.getByTestId('step-primary');
+  const primary = card.getByTestId('turn-primary');
+  await expect(primary).toHaveText('Open sign-in');
   await primary.scrollIntoViewIfNeeded();
   await still(page);
   const wins = await primary.evaluate((el) => {
@@ -283,5 +350,5 @@ test('on a phone the push’s one tap lands on the whole card: the action wins t
     (f) => f.cls === 'overflow' || f.cls === 'escape',
   );
   expect(findings).toEqual([]);
-  await shoot(page, info.project.name, 'human-step-approve');
+  await shoot(page, info.project.name, 'human-step-turn');
 });

@@ -158,10 +158,45 @@ export const HUMAN_STEP_CATEGORY = Object.freeze({
   'interactive-prompt': 'environment',
   captcha: 'external',
   'email-link': 'external',
-  // A command or a click path only the operator runs (control-tower phase 121):
-  // an act at the machine, like an interactive prompt or a cable.
-  'operator-act': 'environment',
+  // A command or a click path only the operator runs (control-tower phase 121).
+  // Its family is its REASON's (phase 130, `humanStepCategory`); this row is
+  // the default reason's — `reserved`, a decision only a person may make.
+  'operator-act': 'decision',
+  // A wall the AI met (control-tower phase 130): granting it is a decision.
+  permission: 'decision',
 });
+
+/**
+ * The family an item's REASON names (control-tower phase 130, §Architecture
+ * 19): a sign-in or a secret is a credential, hands at a device the
+ * environment, an unreachable system or somebody else's approval an external
+ * wait, and every other reason a decision. Keyed by exactly `WHY_PERSON`.
+ * @type {Readonly<Record<string, HaltCategory>>}
+ */
+export const REASON_CATEGORY = Object.freeze({
+  permission: 'decision',
+  identity: 'credentials',
+  secret: 'credentials',
+  money: 'decision',
+  legal: 'decision',
+  decision: 'decision',
+  physical: 'environment',
+  reach: 'external',
+  'third-party': 'external',
+  reserved: 'decision',
+});
+
+/**
+ * The family an item lights: an `operator-act` — the general act on the
+ * person's side — by its reason; every other kind by its kind.
+ * @param {string} kind
+ * @param {string} [why]
+ * @returns {HaltCategory}
+ */
+export function humanStepCategory(kind, why) {
+  const byReason = kind === 'operator-act' && why ? REASON_CATEGORY[why] : undefined;
+  return byReason ?? HUMAN_STEP_CATEGORY[kind] ?? 'decision';
+}
 
 /**
  * The kinds whose situation is too coarse to name the family: the crash-shaped

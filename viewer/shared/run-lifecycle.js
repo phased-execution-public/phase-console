@@ -895,8 +895,9 @@ export const WAIT_AUTHORS = Object.freeze(
 
 /**
  * Every code path that starts a `claude` process with no person in the loop —
- * the sep-review audit's chapter 02 census (SLF-1). Sixteen doors: nine are
- * `startRun` callers, five spawn a session some other way and two — a stored
+ * the sep-review audit's chapter 02 census (SLF-1). Seventeen doors: nine are
+ * `startRun` callers, six spawn a session some other way (the checking
+ * session among them, control-tower phase 134) and two — a stored
  * trigger (control-tower phase 98) and the supervisor (phase 101) — ride their
  * verb's own door, and until this
  * list existed no record named which one had opened — 324 of 326 `run.start`
@@ -907,7 +908,7 @@ export const WAIT_AUTHORS = Object.freeze(
  * says its word: `run.start` carries an `Actor` with a `door` always, a lint
  * in `test/invariants.test.ts` fails any `startRun(` site naming none, and
  * `test/vocab-owners.test.ts` holds the members to this one owner. Order is
- * the census's: the nine `startRun` doors first, then the seven that are not.
+ * the census's: the nine `startRun` doors first, then the eight that are not.
  * A verb several doors share (`retryPhase`, `recoverPhase`) carries its
  * CALLER's actor through rather than naming a door of its own — the door is
  * where the decision to start was made, not where the start happens.
@@ -931,6 +932,13 @@ export const WAIT_AUTHORS = Object.freeze(
  *   - `auto-reviewer` — the automatic reviewer session over a finished phase.
  *   - `ultrareview` — the cloud `ultrareview` child.
  *   - `ladder-pty-agent` — the ladder's interactive pty agent.
+ *   - `turn-checker` — the checking session a `judgement` proof gets
+ *     (control-tower phase 134, #211): one short read-only `claude -p` for ONE
+ *     item, spawned by the console after a person said *I've done this —
+ *     check*. Nobody pressed the SESSION — the press only asked for a check —
+ *     so it is an automatic start the ceiling counts, and a freeze skips it.
+ *     Like the probes it opens no `startRun` site: `server/turn/checker.ts`
+ *     runs its one process through the host's `spawnClaude`.
  *   - `trigger` — a stored trigger firing its verb (control-tower phase 98,
  *     #137): a person armed it, nobody pressed it. It opens no `startRun` site
  *     of its own — its actor rides the verb's own door (`resumeRun`,
@@ -959,6 +967,7 @@ export const START_DOORS = Object.freeze(
     'auto-reviewer',
     'ultrareview',
     'ladder-pty-agent',
+    'turn-checker',
     'trigger',
     'supervisor',
   ]),
@@ -1051,6 +1060,13 @@ export const CLASSIFIED_BY = Object.freeze(/** @type {const} */ (['drive', 'outc
  *     capped by `actorOfRequest`. It rides the actor rather than each verb's
  *     own payload because every line that spreads the actor then carries it —
  *     a verb cannot drop the why its caller gave without dropping the who.
+ *   - `pressDoor` — the door the press came through, from `shared/door-model.js`
+ *     `PRESS_DOORS` (control-tower phase 131, #208): decided from what the
+ *     request PROVED — a paired device, a session's token, the supervisor's
+ *     bearer — never from `by`, which is the body's label. Stamped on every
+ *     request-derived actor by `actorOfRequest`; an in-process actor's is read
+ *     off its transport (`server/owner/door.ts` `pressDoorOf`). Not `door`,
+ *     which on the same line is the START door a run went through.
  *
  * The field names are ALSO an array, not only a typedef, because a typedef in
  * a `.js` file is invisible to a source scan and this shape is a vocabulary
@@ -1058,7 +1074,7 @@ export const CLASSIFIED_BY = Object.freeze(/** @type {const} */ (['drive', 'outc
  *
  * @typedef {{ by: string, via: ActorVia, origin: string, remoteUser: string|null,
  *             door?: AnyDoor, trigger?: string, guard?: string, counter?: string,
- *             reason?: string }} Actor
+ *             reason?: string, pressDoor?: import('./door-model.js').PressDoor }} Actor
  */
 /**
  * What a `run:progress` frame carries, and therefore what a surface may move on
@@ -1116,6 +1132,7 @@ export const ACTOR_FIELDS = Object.freeze(
     'guard',
     'counter',
     'reason',
+    'pressDoor',
   ]),
 );
 
@@ -1224,6 +1241,8 @@ export const SESSION_MODES = Object.freeze(
  *   - `spawn-default` — nothing was handed in, so `spawn.ts` applied its own
  *     floor; no runner spawn writes it either.
  *   - `chat` — the supervisor chat's own caps (Pro, control-tower phase 27).
+ *   - `check` — the checking session's caps (control-tower phase 134, #211):
+ *     12 turns and $0.50 for one item's check, never raised.
  */
 export const CAP_SOURCES = Object.freeze(
   /** @type {const} */ ([
@@ -1237,6 +1256,9 @@ export const CAP_SOURCES = Object.freeze(
     'raise',
     'caller',
     'spawn-default',
+    // The checking session's own caps (control-tower phase 134): a judgement
+    // of ONE item — 12 turns, $0.50 — never raised, never a run's.
+    'check',
   ]),
 );
 

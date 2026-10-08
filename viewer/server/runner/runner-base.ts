@@ -13,6 +13,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
+import { HANDLED_SESSION_FILE } from '../turn/handled.ts';
+import { INSTANCE_STATE_DIR } from '../config.ts';
 import { log } from '../log.ts';
 import { holdBinds } from '../fleet-hold.ts';
 import { onShutdown, offShutdown, type ShutdownContext } from '../lifecycle.ts';
@@ -487,6 +489,10 @@ export abstract class RunnerBase {
       PE_PROOFS_FILE: proofsFile(this.state!.root, this.state!.slug),
       PE_VERIFY_DIR: dir,
       PE_RUN_ROOT: root,
+      // What the session handled instead of asking (control-tower phase 136):
+      // `phase-outcome.sh … handled` appends to the SESSIONS' file — never the
+      // console's own ledger, whose sources a session must not be able to claim.
+      PE_HANDLED_FILE: join(INSTANCE_STATE_DIR, HANDLED_SESSION_FILE),
     };
   }
 

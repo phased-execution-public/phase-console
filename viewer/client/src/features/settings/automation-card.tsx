@@ -27,6 +27,8 @@ import { settingsHref } from '@/app/routes';
 import { Button, Card, CardBody, CardHeader, CardTitle, CardSkeleton } from '@/components/ui';
 import { RunSetup } from '@/features/run-setup/run-setup';
 import { NumberField } from '@/features/settings/ladder';
+import { modelOptions } from '@/features/settings/appearance';
+import { EFFORTS } from '@/features/runs/defaults';
 import { FleetFreezeControl } from '@/components/fleet-freeze';
 import { ISOLATED, WORKTREE_DEFAULTS } from '@shared/worktree-model.js';
 
@@ -150,6 +152,76 @@ export function AutomationCard() {
           </span>
           {onOff(prefs.watchMintedCmdRefs, 'watchMintedCmdRefs')}
         </div>
+
+        {/* The check (control-tower phase 134): what reads a person's
+            "I've done this" when no command can — one short read-only session
+            per item — and when a third "not yet" goes to the owner. */}
+        <div className={row}>
+          <span className="min-w-0">
+            <span className="text-sm text-ink">Check what a command cannot</span>
+            <span className="mt-0.5 block text-2xs text-ink-muted">
+              When a person says they have done something only words can prove, a short read-only session
+              reads what they sent against the proof and answers passed, rejected with what to redo, or needs
+              more. At most 12 turns, $0.50 and five minutes. Off: such an item is accepted on the
+              person&apos;s word and marked unverified.
+            </span>
+          </span>
+          {onOff(prefs.checkJudgement, 'checkJudgement')}
+        </div>
+
+        <div className={row}>
+          <span className="min-w-0">
+            <span className="text-sm text-ink">Checking model and effort</span>
+            <span className="mt-0.5 block text-2xs text-ink-muted">
+              What the checking session runs as (shipped: sonnet, low). It only reads, so a small model is
+              usually enough.
+            </span>
+          </span>
+          <span className="flex gap-2">
+            <select
+              data-pref="checkModel"
+              aria-label="Checking model"
+              value={prefs.checkModel}
+              disabled={busy}
+              onChange={(event) => save.mutate({ checkModel: event.target.value })}
+              className="min-h-(--tap-min) w-full max-w-40 rounded border border-rule bg-ground px-2 text-sm text-ink disabled:opacity-50"
+            >
+              {modelOptions(state?.models, prefs.checkModel)
+                .filter(Boolean)
+                .map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+            </select>
+            <select
+              data-pref="checkEffort"
+              aria-label="Checking effort"
+              value={prefs.checkEffort}
+              disabled={busy}
+              onChange={(event) => save.mutate({ checkEffort: event.target.value })}
+              className="min-h-(--tap-min) w-full max-w-28 rounded border border-rule bg-ground px-2 text-sm text-ink disabled:opacity-50"
+            >
+              {EFFORTS.filter(Boolean).map((effort) => (
+                <option key={effort} value={effort}>
+                  {effort}
+                </option>
+              ))}
+            </select>
+          </span>
+        </div>
+
+        <NumberField
+          pref="turnEscalateAfter"
+          id="turn-escalate-after"
+          label="Send to the owner after"
+          value={prefs.turnEscalateAfter}
+          unit="rejections"
+          min={1}
+          hint="When one item is sent back this many times, the owner is told once and shown every attempt side by side, with three ways out: rewrite the guide, I can't, or accept it anyway (shipped: 3)."
+          disabled={busy}
+          onSave={(next) => save.mutate({ turnEscalateAfter: next })}
+        />
 
         <div className={row}>
           <span className="min-w-0">

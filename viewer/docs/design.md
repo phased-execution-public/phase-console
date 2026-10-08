@@ -375,6 +375,11 @@ holds wherever progress or structure is drawn (`route-map.css`, `SegmentBar`, `M
   `clockWords`), the cost with the session in flight counted, and ONE action chosen by bay
   (`strip-model.ts`). Everything else expands in place. The badge breathes only over an OBSERVED
   live lane, never a `running` word alone; settled strips lose their colour with their paint.
+- **A guide is a route** (control-tower phase 137) — the track at the size of a task
+  (`features/turn/guide.tsx`, `turn.css`): each step a station on one neutral line, and the station IS
+  the step's tick; ticked, it fills with the settled paint and the line below it paints done. No amber
+  on it — the item's badge already said "your turn" once — and every side is logical, so a
+  right-to-left guide mirrors.
 
 ## 8. Components — the kit contract
 
@@ -407,6 +412,16 @@ list (`@/components/ui/data-list`), the typed status family (`@/components/ui/st
   · numbered steps · a device code large, mono and selectable · ONE primary action by kind
   (`PRIMARY_ACT`) · then *Open again*, *Check now*, *Snooze*, *I can't do this* · every datum one
   press in, the raw record one more. A link opens in a new tab; a secret leaves the page once sent.
+  **Your turn's item card joins it too** (`features/turn/item-card.tsx`, control-tower phase 137):
+  the state through `OpsBadge` over `step`, `verdict` and `risk`, never a word of its own · the kind's
+  mark · the title · "Only you:" and the reason's sentence · the plan, phase and run as links, what it
+  unblocks, its countdown, its effort · the verdict when a check sent it back, read BEFORE the guide
+  (*Back to you*, the attempt, what to redo) · the guide, drawn as §7's track at the size of a task ·
+  how it is checked, in words · ONE primary chosen by kind and state (`primaryMoveOf`) · *Not doing
+  this*, *I can't*, *Snooze*, *Ask*, *Attach* · the history one press in, the raw record one more. A
+  command is copied two ways and never run; a decision's options are cards, the recommended one marked
+  in words. The page is a lazy chunk off first paint (`check-dist`: `data-turn-page`), and its print
+  sheet prints every item open.
 - **`Badge`** — tones are the vocabulary's families (`neutral`, `ok`, `live`, `wait`, `bad`,
   `accent`) plus `state` (the indirection) and `solid`; a toneless badge is grey on purpose (visibly
   wrong beats invisibly wrong). The 2.x `Chip` alias is gone: every former chip is the `Badge` it

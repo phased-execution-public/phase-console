@@ -77,8 +77,8 @@ pe_close()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TOD
 # and red from inside a run, which is the one place it is most likely to be run.
 # TRACEPARENT rides with them: it is the W3C spelling of the same context.
 scrub_pe_env() {
-  unset PE_SCOPE PE_OWNER PE_SESSION_ID PE_OUTCOME_FILE PE_RULINGS_FILE PE_TASKS_FILE PE_MCP_SERVERS PE_ISSUES_SUGGEST PE_ISSUE_REPOS \
-    PE_MESSAGES_FILE PE_MSG_TOKEN PE_ISSUES_FILE PE_ISSUES_MODE PE_TRACE_ID PE_SPAN_ID TRACEPARENT PE_PROOFS_FILE \
+  unset PE_SCOPE PE_OWNER PE_SESSION_ID PE_OUTCOME_FILE PE_RULINGS_FILE PE_TASKS_FILE PE_MCP_SERVERS PE_ISSUES_SUGGEST PE_ISSUE_REPOS PE_ISSUES_SOURCE \
+    PE_MESSAGES_FILE PE_MSG_TOKEN PE_ISSUES_FILE PE_ISSUES_MODE PE_TRACE_ID PE_SPAN_ID TRACEPARENT PE_PROOFS_FILE PE_HANDLED_FILE PE_RUN_ID \
     PE_LOCK_MIRROR
   # A declaration never asks a real console (phase-outcome.sh's ingest probe, control-tower
   # phase 50): an unregistered root resolves to port 4123, the operator's own console.

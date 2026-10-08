@@ -243,6 +243,19 @@ export function collectRetention(scan: RetentionScan): RetentionInventory {
   // its last rotation left, which its reader still folds in.
   push(files, plain('human-steps', join(scan.instanceDir, 'human-steps.ndjson')));
   push(files, plain('human-steps', join(scan.instanceDir, 'human-steps.ndjson.1')));
+  push(files, plain('grants', join(scan.instanceDir, 'grants.ndjson')));
+  push(files, plain('grants', join(scan.instanceDir, 'grants.ndjson.1')));
+  push(files, plain('handled', join(scan.instanceDir, 'handled.ndjson')));
+  push(files, plain('handled', join(scan.instanceDir, 'handled.ndjson.1')));
+  // …and the sessions' own file beside it, rotated the same way.
+  push(files, plain('handled', join(scan.instanceDir, 'handled-sessions.ndjson')));
+  push(files, plain('handled', join(scan.instanceDir, 'handled-sessions.ndjson.1')));
+  // What a person attached to an item (control-tower phase 133), one file per
+  // content hash.
+  const evidenceDir = join(scan.instanceDir, 'turn-evidence');
+  for (const name of listDir(evidenceDir)) {
+    if (/^[0-9a-f]{64}$/.test(name)) push(files, plain('turn-evidence', join(evidenceDir, name)));
+  }
   push(files, plain('crashes', join(scan.instanceDir, 'crashes.json')));
   const diagDir = join(scan.instanceDir, 'diag');
   for (const name of listDir(diagDir)) {
@@ -665,6 +678,64 @@ export function planRetention(
     });
   }
 
+  // ---- the grant ledger (control-tower phase 149): rotated past its cap like
+  // the human-step ledger. Nothing live is lost: the engine's next read carries
+  // a live grant the rotated copy alone holds into the current file.
+  for (const file of of('grants')) {
+    if (file.path.endsWith('.1') || file.bytes <= policy.grantsRotateBytes) continue;
+    actions.push({
+      kind: 'rotate',
+      sink: 'grants',
+      path: file.path,
+      bytes: file.bytes,
+      why: `past ${policy.grantsRotateBytes} bytes`,
+    });
+  }
+
+  // ---- what the AI handled (control-tower phase 136): rotated past its cap
+  // like the grant ledger; the reader folds `.1` and the live file, so a row
+  // written before a rotation still reads after it.
+  for (const file of of('handled')) {
+    if (file.path.endsWith('.1') || file.bytes <= policy.handledRotateBytes) continue;
+    actions.push({
+      kind: 'rotate',
+      sink: 'handled',
+      path: file.path,
+      bytes: file.bytes,
+      why: `past ${policy.handledRotateBytes} bytes`,
+    });
+  }
+
+  // ---- what a person attached (control-tower phase 133): age, then the
+  // directory's cap, oldest first. A ledger line naming a swept piece still
+  // reads — its record says what it was; only the bytes are gone.
+  const evidence = of('turn-evidence');
+  const agedEvidence = new Set<string>();
+  for (const file of evidence) {
+    if (!olderThan(file, now, policy.turnEvidenceRetainDays * DAY)) continue;
+    agedEvidence.add(file.path);
+    actions.push({
+      kind: 'delete',
+      sink: 'turn-evidence',
+      path: file.path,
+      bytes: file.bytes,
+      why: `older than ${policy.turnEvidenceRetainDays} days`,
+    });
+  }
+  const kept = evidence.filter((file) => !agedEvidence.has(file.path));
+  let held = kept.reduce((sum, one) => sum + one.bytes, 0);
+  for (const file of [...kept].sort((a, b) => a.at - b.at)) {
+    if (held <= policy.turnEvidenceMaxBytes) break;
+    held -= file.bytes;
+    actions.push({
+      kind: 'delete',
+      sink: 'turn-evidence',
+      path: file.path,
+      bytes: file.bytes,
+      why: `the evidence directory is past ${policy.turnEvidenceMaxBytes} bytes`,
+    });
+  }
+
   // ---- runs: the GLOBAL byte cap. Age and count are `pruneRuns`'s, per plan,
   // because only it knows how to settle a record; this is the floor under it.
   const runs = of('run-records');
@@ -821,6 +892,7 @@ const SINKS: readonly RetentionSink[] = [
   'crashes',
   'locks',
   'run-worktrees',
+  'turn-evidence',
 ];
 
 /** What `GET /api/debug/retention` answers: every sink's bytes, its policy, and what is due. */

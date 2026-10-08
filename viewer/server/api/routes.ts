@@ -18,12 +18,23 @@ import { withWallReadings } from '../../shared/situation-model.js';
 import { parseLockFilter } from '../locks.ts';
 import { DECISION_KEYS } from '../../shared/decisions-model.js';
 import type { AccountRequirement, PressAnswer } from '../runner/state.ts';
-import { classify as classifyAccess } from './access.ts';
-import { actorOfRequest, agentClassOf } from './actor.ts';
+import { classify as classifyAccess, hostnameOf, isLoopbackHost } from './access.ts';
+import { actorOfRequest } from './actor.ts';
 import { createSseWriter } from './sse.ts';
 import { PolicyRuleError } from '../runner/approvals.ts';
 import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
-import { pressActor } from '../actor.ts';
+import { isAgentDoor, pressActor, pressDoorOf } from '../actor.ts';
+import {
+  authorityRefusal, markReplay, ownerDoorMode, ownerDoorState, ownerState, stampDoor, stampedDoor, transportDoor,
+  type DoorReading,
+} from '../owner/door.ts';
+import {
+  OWNER_DOOR_MODES, authorityRouteOf, doorMay, pressRiskOf, type AuthorityRoute,
+} from '../../shared/door-model.js';
+import { RISK_TIERS } from '../../shared/turn-model.js';
+import { requestView } from '../owner/requests.ts';
+import { Readable } from 'node:stream';
+import { bodyCarriesSecret } from '../human-steps.ts';
 import { RUN_SWITCH_WORDS } from '../../shared/verb-model.js';
 import { liveVerifying, slimRun } from '../runs-projection.ts';
 import { agentEnabled, checkRoot, gitDoorRefusal, listDirs } from '../config.ts';
@@ -190,7 +201,22 @@ function sendFile(res: ServerResponse, file: string, name: string): void {
   res.end(body);
 }
 
-async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+/**
+ * One read of a request's body, shared: the door check (control-tower phase
+ * 148) may need what a press says before its route runs, and the route then
+ * reads the same parse — a stream cannot be read twice.
+ */
+const BODIES = new WeakMap<object, Promise<Record<string, unknown>>>();
+
+function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const held = BODIES.get(req);
+  if (held) return held;
+  const pending = readBodyOnce(req);
+  BODIES.set(req, pending);
+  return pending;
+}
+
+async function readBodyOnce(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
@@ -321,16 +347,6 @@ function guardWebhooks(req: IncomingMessage, service: Service): string | null {
  */
 function guardCsrf(req: IncomingMessage): string | null {
   return guardMutation(req, null);
-}
-
-/**
- * Is this request a PERSON's press (control-tower phase 107, #174)? The Gate
- * card in a browser, or a person the remote proxy vouched for. A script — curl
- * from a session, a fetch from a tool — is not one, whatever `by` its body
- * offers. The one test both doors that approve a gate ask (phase 129, #218).
- */
-function personsPress(req: IncomingMessage, actor: { remoteUser?: string | null }): boolean {
-  return agentClassOf(req.headers['user-agent']) === 'browser' || actor.remoteUser != null;
 }
 
 function guardMutation(req: IncomingMessage, disabled: string | null): string | null {
@@ -556,6 +572,28 @@ function intProblem(value: unknown, field: string, min: number, max: number): st
   return null;
 }
 
+/** The most links a launch sends back as shown (control-tower phase 139), and the longest one. */
+const AUTO_OPEN_LINKS_MAX = 20;
+const AUTO_OPEN_LINK_MAX = 2048;
+
+/**
+ * The launch form's `autoOpen`, or the reason it is not one (control-tower phase
+ * 139): the links it showed in full and sends back, so the launch door may open a
+ * plan's `auto-open: host` step on the machine. Refused whole and never trimmed
+ * to fit — a list the door cannot read in full is a list nobody was shown in
+ * full, and opening anything off it would break "shown in full first". Silence
+ * (absent, or `null`) is a launch that opens nothing.
+ */
+function autoOpenProblem(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) return 'autoOpen must be an array of the links the launch form showed in full.';
+  if (value.length > AUTO_OPEN_LINKS_MAX) return `autoOpen may name at most ${AUTO_OPEN_LINKS_MAX} links.`;
+  if (value.some((link) => typeof link !== 'string' || link.length > AUTO_OPEN_LINK_MAX)) {
+    return `every autoOpen link must be a string of at most ${AUTO_OPEN_LINK_MAX} characters.`;
+  }
+  return null;
+}
+
 /**
  * A retention word the vocabulary knows — a `WORKTREE_RETENTION` member or a
  * readable `ttl:<h>` — lower-cased; anything else is `undefined`, "you did
@@ -682,6 +720,139 @@ function ultraReviewMode(value: unknown): UltraReviewMode | undefined {
   return typeof value === 'string' && (ULTRA_REVIEW_MODES as readonly string[]).includes(value)
     ? value as UltraReviewMode
     : undefined;
+}
+
+/** The tier whose press, through the owner's door, needs the key touched inside five minutes. */
+const HIGH_RISK = RISK_TIERS[2];
+
+/**
+ * The one door check (control-tower phase 131, #208; made real by 148), read
+ * before any route runs, so a route can neither forget it nor answer first.
+ * True when it answered the request itself.
+ *
+ *   - an owner-key route (`self`) decides its own door: only an agent's is
+ *     refused here;
+ *   - on a console with no owner key a person's press is what it always was,
+ *     and an agent's presses only what the plan's manifest already allows;
+ *   - on a console with a key the door table decides. A press the door may
+ *     make goes ahead — the owner's HIGH-risk press only with the key touched
+ *     inside five minutes (401, `reassert`). One it may not make is written
+ *     down as a REQUEST for the owner (202): never applied, never dropped.
+ */
+async function doorCheck(
+  service: Service, req: IncomingMessage, res: ServerResponse, reading: DoorReading, pressed: AuthorityRoute, path: string,
+): Promise<boolean> {
+  const agent = isAgentDoor(reading.door);
+  const refuse = (error: string): true => {
+    service.noteDoorRefused?.(reading, pressed, path);
+    json(res, 403, { error, door: reading.door, press: pressed.verb, authority: pressed.authority });
+    return true;
+  };
+  if (pressed.self) {
+    return agent ? refuse(authorityRefusal(reading, pressed, { mode: OWNER_DOOR_MODES[0], manifest: false }) ?? pressed.summary) : false;
+  }
+  const mode = ownerDoorMode();
+  if (mode === OWNER_DOOR_MODES[0]) {
+    if (!agent) return false;
+    const refusal = authorityRefusal(reading, pressed, { mode, manifest: service.manifestNamesPress?.(reading, pressed, path) === true });
+    return refusal ? refuse(refusal) : false;
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = await readBody(req);
+  } catch {
+    json(res, 413, { error: 'That body is over 256 KB.' });
+    return true;
+  }
+  const authority = agent || typeof service.pressAuthorityOf !== 'function'
+    ? pressed.authority
+    : service.pressAuthorityOf(pressed, path, body);
+  if (authority === null) return false;
+  // A grant's press is priced by its OWN cell — wall × family × scope —
+  // rather than the verb's flat tier (control-tower phase 149), and a never
+  // cell or a capability through a paired device is refused here, with why.
+  const priced = typeof service.pressRiskFor === 'function' ? service.pressRiskFor(reading, pressed, path, body) : null;
+  if (priced?.refusal) return refuse(priced.refusal);
+  const risk = priced?.risk ?? pressRiskOf(authority);
+  const manifest = service.manifestNamesPress?.(reading, pressed, path) === true;
+  const verdict = doorMay(reading.door, authority, { risk, mode, manifest });
+  if (verdict === 'refuse') {
+    return refuse(authorityRefusal(reading, pressed, { mode, manifest }) ?? `the ${reading.door} door presses nothing`);
+  }
+  if (verdict === 'press') {
+    if (reading.door === 'owner' && risk === HIGH_RISK && reading.fresh !== true) {
+      json(res, 401, {
+        error: `${pressed.summary.split(' — ')[0]} carries high risk: touch your owner key again — the last touch was over five minutes ago.`,
+        reassert: true, press: pressed.verb, authority,
+      });
+      return true;
+    }
+    return false;
+  }
+  // A request is written for the owner to confirm, so it must come from this
+  // app as any press must — the console's header and the same origin — or a
+  // page on another site could plant one for the owner to confirm.
+  const forged = guardMutation(req, null);
+  if (forged) { json(res, 403, { error: forged }); return true; }
+  const outcome = typeof service.requestAuthority === 'function'
+    ? service.requestAuthority(reading, pressed, {
+      method: req.method ?? 'POST', path, body, authority, risk,
+      label: reading.label ?? actorOfRequest(req, service.flags, body).by,
+    })
+    : { status: 403, answer: { error: `${pressed.summary.split(' — ')[0]} is the owner's to press, and this console records no requests.` } };
+  json(res, outcome.status, outcome.answer);
+  return true;
+}
+
+/**
+ * Press a CONFIRMED request again, as the owner (control-tower phase 148): the
+ * same method, path and body the asker sent, through this router, with the
+ * door marked the owner's (`owner-confirm`) — so every check a route makes
+ * reads the owner, and nothing the asker's door could not do is done twice.
+ */
+async function pressConfirmed(
+  ctx: ApiContext, request: { method: string; path: string; body: Record<string, unknown> }, owner: DoorReading, host: string,
+): Promise<{ status: number; answer: unknown }> {
+  const encoded = Buffer.from(JSON.stringify(request.body ?? {}), 'utf8');
+  const fake = Object.assign(Readable.from([encoded]), {
+    method: request.method,
+    url: request.path,
+    headers: { 'x-phase-console': '1', host, 'content-type': 'application/json', 'content-length': String(encoded.length) },
+    socket: { remoteAddress: '127.0.0.1' },
+  });
+  markReplay(fake, owner);
+  let status = 0;
+  const chunks: Buffer[] = [];
+  const res = {
+    req: fake,
+    statusCode: 200,
+    headersSent: false,
+    writeHead(code: number) { status = code; this.statusCode = code; this.headersSent = true; return this; },
+    setHeader() { return this; },
+    getHeader() { return undefined; },
+    removeHeader() {},
+    write(chunk: string | Buffer) { chunks.push(Buffer.from(chunk)); return true; },
+    end(chunk?: string | Buffer) { if (chunk) chunks.push(Buffer.from(chunk)); this.writableEnded = true; return this; },
+    writableEnded: false,
+    on() { return this; },
+    once() { return this; },
+    off() { return this; },
+  };
+  await handleApi(ctx, fake as unknown as IncomingMessage, res as unknown as ServerResponse, new URL(`http://${host}${request.path}`));
+  const raw = Buffer.concat(chunks).toString('utf8');
+  let answer: unknown = raw;
+  try { answer = raw ? JSON.parse(raw) : null; } catch { answer = raw; }
+  return { status: status || res.statusCode, answer };
+}
+
+/**
+ * The first key is enrolled AT THE MACHINE: a loopback socket, a loopback
+ * Host, and nothing a proxy or the fleet vouched for — a door of `local`.
+ */
+function atTheMachine(req: IncomingMessage, reading: DoorReading): boolean {
+  const address = req.socket?.remoteAddress ?? '';
+  const loopback = address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+  return loopback && reading.door === 'local' && isLoopbackHost(hostnameOf(req.headers.host));
 }
 
 /**
@@ -929,14 +1100,77 @@ async function routeApi(
     return true;
   }
 
+  // The door (control-tower phase 131, #208): read ONCE, from what the request
+  // proves — a session's token, the supervisor's bearer, a device somebody
+  // verified, else `local` — and stamped, so every actor this request's route
+  // builds carries it whatever its body says. Then the one door check: an
+  // agent's door on a route `AUTHORITY_ROUTES` names presses only what the
+  // plan's manifest already allows. Before any route runs, so a route can
+  // neither forget the check nor answer first.
+  // (A harness that stands the router up with no Service behind it gets the
+  // transport's reading alone: no token is anybody's there.)
+  const reading = stampDoor(req, typeof service.doorOf === 'function' ? service.doorOf(req) : transportDoor(req, service.flags ?? {}));
+  const pressed = req.method && req.method !== 'GET' && req.method !== 'HEAD' ? authorityRouteOf(req.method, path) : null;
+  if (pressed && await doorCheck(service, req, res, reading, pressed, path)) return true;
+
   const segments = path.replace(/^\/api\//, '').split('/').filter(Boolean).map(decodeURIComponent);
   const [head, ...rest] = segments;
 
   try {
 
     /* ---------------- session + source directory ---------------- */
+    /* ---------------- the owner key (control-tower phase 148, #208) ---------------- */
+    // A passkey proves a press is the owner's. Ten routes, every one in both
+    // editions and behind no capability flag — proving who you are is not a
+    // capability — and every press among them in `AUTHORITY_ROUTES` as a
+    // `self` row: the hook guard fences them from a session, and each holds
+    // its own rule below.
+    if (head === 'owner') {
+      const owner = ownerState();
+      const rp = service.ownerRelyingParty(req);
+      const ownSession = reading.door === 'owner' && reading.proof === 'owner-session' && reading.sessionId
+        ? (owner.sessions.live().find((session) => session.id === reading.sessionId) ?? null)
+        : null;
+      // GET /api/owner — the door's state here, the keys (no key material), this
+      // browser's session, the requests waiting and the relying party this host names.
+      if ((req.method === 'GET' || req.method === 'HEAD') && rest.length === 0) {
+        json(res, 200, {
+          state: ownerDoorState(reading),
+          mode: ownerDoorMode(),
+          keys: owner.registry.list(),
+          session: ownSession,
+          requests: owner.requests.open().map(requestView),
+          relyingParty: rp.ok ? { id: rp.rpId, origin: rp.origin } : { refused: rp.reason },
+        });
+        return true;
+      }
+      if (req.method !== 'POST' && req.method !== 'DELETE') { json(res, 405, { error: 'GET /api/owner; the rest are POST, and a key is removed with DELETE' }); return true; }
+      const refusal = guardCsrf(req);
+      if (refusal) { json(res, 403, { error: refusal }); return true; }
+      let body: Record<string, unknown> = {};
+      try { body = await readBody(req); } catch { json(res, 413, { error: 'That body is over 256 KB.' }); return true; }
+      const by = actorOfRequest(req, service.flags, body).by;
+      // The owner's one press on a request: confirmed, it is pressed again as
+      // asked, through the owner's door (`pressConfirmed`); refused, by nobody.
+      if (req.method === 'POST' && rest[0] === 'requests' && rest.length === 3 && (rest[2] === 'confirm' || rest[2] === 'refuse')) {
+        const answered = await service.answerOwnerRequest({ id: rest[1]!, answer: rest[2], reading, by },
+          (request) => pressConfirmed(ctx, request, reading, req.headers.host ?? `127.0.0.1:${service.flags.port}`));
+        json(res, answered.status, answered.body);
+        return true;
+      }
+      const pressed = service.ownerPress(req, {
+        method: req.method ?? 'POST', rest, reading, body, by, atTheMachine: atTheMachine(req, reading),
+      });
+      if (pressed?.cookie) res.setHeader('set-cookie', pressed.cookie);
+      json(res, pressed?.status ?? 500, pressed?.body);
+      return true;
+    }
+
     if (head === 'state' && req.method === 'GET') {
-      json(res, 200, service.state(parseInclude(url.searchParams.get('include'), STATE_INCLUDES)));
+      // The owner door as THIS request sees it (phase 148): `unlocked` when it
+      // carries a live owner session.
+      const state = service.state(parseInclude(url.searchParams.get('include'), STATE_INCLUDES));
+      json(res, 200, state && typeof state === 'object' ? { ...state, ownerDoor: ownerDoorState(reading) } : state);
       return true;
     }
     // `GET /api/engine`: the engine pool now — reads running, reads queued behind
@@ -1275,13 +1509,51 @@ async function routeApi(
      *
      *   GET  /api/human-steps[?open=1]
      *   POST /api/human-steps/:id/open     {where?: 'here'|'host', what?: 'url'|'command', confirm?: <the url>}
-     *   POST /api/human-steps/:id/check    {secret?} — a secret-entry step's form, behind --allow-accounts
+     *   POST /api/human-steps/:id/check    {note?} — never a secret: a body carrying one is refused (phase 133)
      *   POST /api/human-steps/:id/snooze   {minutes?}
      *   POST /api/human-steps/:id/cannot   {reason}
      *   POST /api/human-steps/:id/dismiss  {note?}
+     *
+     * The owner's moves (control-tower phase 133, #210) — `answer` and
+     * `decline` are `AUTHORITY_ROUTES` rows, so an agent's door is refused
+     * before any route runs; `ask` and `evidence` carry no authority, and an
+     * agent's door is refused here instead (a session raises, a supervisor
+     * reads — neither asks or attaches in a person's name):
+     *   POST /api/human-steps/:id/answer   {option?, note?} — one of them at least
+     *   POST /api/human-steps/:id/decline  {reason} — where the item allows it
+     *   POST /api/human-steps/:id/ask      {text}
+     *   POST /api/human-steps/:id/evidence {kind: note|image|file, text? | data (base64), mime?, name?}
+     *
+     * The check (control-tower phase 134, #211) — `check` only ASKS for one;
+     * `override` is the ONE route that writes a verdict, the owner's, and
+     * `rewrite` is the escalation's first way out. Both are `AUTHORITY_ROUTES`
+     * rows:
+     *   POST /api/human-steps/:id/override {note?} — Accept anyway: passed, the owner's, unverified
+     *   POST /api/human-steps/:id/rewrite  {note?} — withdraw it; its raiser is resumed to send a new version
      *   POST /api/human-steps/suspected    {slug, phase} — phase 44: a silent lane's suspected
      *        person's turn made a step on a person's request (the inbox's silent row posts it)
      */
+    // Your turn's one read (control-tower phase 132, #209): every inbox row
+    // that asks a person for an act, as ONE item per thing to do, grouped,
+    // with the ledger's detail. A read — unguarded like the rest.
+    // `?seen=<ISO>` (control-tower phase 136): the person's last look, which
+    // the headline's handled count is taken from. `GET /api/turn/:id` explains
+    // one item — what it asks, its guide, its attempts, why it is a person's.
+    if (head === 'turn') {
+      if (req.method === 'GET' && rest.length === 0) {
+        json(res, 200, await service.turnAnswer({ seen: url.searchParams.get('seen') }));
+        return true;
+      }
+      if (req.method === 'GET' && rest.length === 1) {
+        const answer = service.turnExplain(rest[0]!);
+        if (answer.ok) json(res, 200, answer);
+        else json(res, answer.status, { error: answer.error });
+        return true;
+      }
+      json(res, 405, { error: 'GET /api/turn · GET /api/turn/:id' });
+      return true;
+    }
+
     if (head === 'human-steps') {
       if (req.method === 'GET' && rest.length === 0) {
         json(res, 200, service.humanStepsView({ open: url.searchParams.get('open') === '1' }));
@@ -1300,21 +1572,83 @@ async function routeApi(
       if (req.method === 'POST' && rest.length === 2) {
         const refusal = guardCsrf(req);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
-        const body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
         const [id, verb] = rest;
-        const by = actorOfRequest(req, service.flags, body).by;
+        // A person's question and a person's evidence: never an agent's door.
+        const reading = stampedDoor(req) ?? transportDoor(req, service.flags ?? {});
+        if ((verb === 'ask' || verb === 'evidence') && isAgentDoor(reading.door)) {
+          json(res, 403, {
+            error: `${verb === 'ask' ? 'A question' : 'Evidence'} is a person's to give — this request proves it is a `
+              + `${reading.door === 'session' ? "session's" : "supervisor's"}, which raises an item and is resumed with its answer.`,
+            door: reading.door,
+          });
+          return true;
+        }
+        let body: Record<string, unknown>;
+        try {
+          body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+        } catch {
+          json(res, 413, { error: 'That body is over 256 KB — one piece of evidence is at most 160 KB.' });
+          return true;
+        }
+        const actor = actorOfRequest(req, service.flags, body);
+        const by = actor.by;
+        const moves = { by, actor: pressActor(actor) };
         const result = verb === 'open' ? await service.openHumanStep(id, body, { by })
-          : verb === 'check' ? await service.checkHumanStep(id, { by, ...('secret' in body ? { secret: body.secret } : {}) })
+          : verb === 'check' ? await service.checkHumanStep(id, {
+            ...moves, body, ...(typeof body.note === 'string' && body.note.trim() ? { note: body.note.trim().slice(0, 2_000) } : {}),
+          })
             : verb === 'snooze' ? service.snoozeHumanStep(id, body, { by })
               : verb === 'cannot' ? service.cannotHumanStep(id, body, { by })
                 : verb === 'dismiss' ? service.dismissHumanStep(id, body, { by })
-                  : { ok: false as const, status: 404, error: `a step has no verb ${verb}` };
+                  : verb === 'answer' ? await service.answerHumanStep(id, body, moves)
+                    : verb === 'decline' ? await service.declineHumanStep(id, body, moves)
+                      : verb === 'ask' ? service.askHumanStep(id, body, moves)
+                        : verb === 'evidence' ? service.attachHumanStepEvidence(id, body, moves)
+                          : verb === 'override' ? await service.overrideHumanStep(id, body, moves)
+                            : verb === 'rewrite' ? await service.rewriteHumanStep(id, body, moves)
+                              : verb === 'deny' ? await service.denyHumanStep(id, body, moves)
+                                : verb === 'convert' ? await service.convertHumanStep(id, body, moves)
+                                  // The scoped grant (control-tower phase 149): the door
+                                  // and its freshness ride to the engine, which judges
+                                  // the grant's own risk again.
+                                  : verb === 'grant' ? await service.grantHumanStep(id, body, {
+                                    ...moves, door: reading.door, ...(typeof reading.fresh === 'boolean' ? { fresh: reading.fresh } : {}),
+                                  })
+                                    : { ok: false as const, status: 404, error: `a step has no verb ${verb}` };
         if (result.ok) { json(res, 200, result); return true; }
         const { status, ...rest2 } = result;
         json(res, status, rest2);
         return true;
       }
-      json(res, 405, { error: 'GET /api/human-steps, POST /api/human-steps/suspected, or POST /api/human-steps/:id/<open|check|snooze|cannot|dismiss>' });
+      json(res, 405, { error: 'GET /api/human-steps, POST /api/human-steps/suspected, or POST /api/human-steps/:id/<open|check|snooze|cannot|dismiss|answer|decline|ask|evidence|override|rewrite|deny|convert|grant>' });
+      return true;
+    }
+
+    /* ---------------- the scoped grants (control-tower phase 149) ---------------- */
+    // Every grant is a row: who, which door, the item, the wall, the rule, the
+    // scope, the end and exactly what it changed. A revoke takes authority
+    // away, so it needs no owner door — the door table lets `local`, `device`
+    // and the owner decline — and it undoes exactly what the row says.
+    if (head === 'permissions' && rest[0] === 'grants') {
+      if (req.method === 'GET' && rest.length === 1) {
+        json(res, 200, service.grantsView());
+        return true;
+      }
+      if (req.method === 'POST' && (rest.length === 2 && rest[1] === 'revoke-all' || rest.length === 3 && rest[2] === 'revoke')) {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+        if (bodyCarriesSecret(body)) { json(res, 400, { error: 'A reason never carries a token, a password or a code — nothing was revoked.' }); return true; }
+        const by = actorOfRequest(req, service.flags, body).by;
+        const result = rest[1] === 'revoke-all'
+          ? service.revokeAllGrants(body, { by })
+          : service.revokeGrant(decodeURIComponent(rest[1]!), body, { by });
+        if (result.ok) { json(res, 200, result); return true; }
+        const { status, ...answer } = result;
+        json(res, status, answer);
+        return true;
+      }
+      json(res, 405, { error: 'GET /api/permissions/grants, POST /api/permissions/grants/:id/revoke, or POST /api/permissions/grants/revoke-all' });
       return true;
     }
 
@@ -1402,6 +1736,9 @@ async function routeApi(
             return true;
           }
 
+          // A signed lock-screen action is the `device` door (phase 131,
+          // #208): the token was minted for the push a person's device received.
+          stampDoor(req, { door: 'device', label: 'notification', proof: 'push-token' });
           const outcome = await service.performInboxAction(
             grant.item, verb, 'notification', actorOfRequest(req, service.flags, { by: 'notification' }),
           );
@@ -2938,7 +3275,7 @@ async function routeApi(
             note: typeof body.note === 'string' ? body.note : undefined,
             continueRun: body.continueRun === true,
             actor,
-            person: personsPress(req, actor),
+            door: pressDoorOf(actor),
           });
           // On refusal, `error` carries the detail so ApiError.message says
           // WHY rather than "Request failed (409)".
@@ -3307,6 +3644,8 @@ async function routeApi(
         const scope = body.remember === 'plan' ? 'plan'
           : body.remember === 'global' ? 'global' : null;
         const actor = actorOfRequest(req, service.flags, body);
+        // Whether the owner door's touch was inside five minutes rides with the
+        // answer (phase 149): a high grant the card makes is judged by it.
         const answered = service.decideApproval(
           rest[0], decision,
           actor.by,
@@ -3314,6 +3653,7 @@ async function routeApi(
           scope && typeof body.rule === 'string' && body.rule
             ? { scope, rule: body.rule.slice(0, 200) } : undefined,
           actor,
+          stampedDoor(req)?.fresh === true,
         );
         json(res, answered.ok ? 200 : 404, answered);
         return true;
@@ -3563,6 +3903,8 @@ async function routeApi(
               ?? (body.gitStrategyAck === undefined || body.gitStrategyAck === null || body.gitStrategyAck === ''
                 || (GIT_STRATEGY_ACKS as readonly unknown[]).includes(body.gitStrategyAck)
                 ? null : `gitStrategyAck must be one of: ${GIT_STRATEGY_ACKS.join(', ')}.`)
+              // The links the form showed in full (phase 139) — refused, not trimmed.
+              ?? autoOpenProblem(body.autoOpen)
               // QA's own tier is judged exactly as hard as the builder's, and
               // for the same reason: an unknown model would go straight to argv
               // and an unknown effort would be dropped, so the reviewing would
@@ -3643,6 +3985,11 @@ async function routeApi(
               gitStrategyAck: (GIT_STRATEGY_ACKS as readonly unknown[]).includes(body.gitStrategyAck)
                 ? body.gitStrategyAck as (typeof GIT_STRATEGY_ACKS)[number] : undefined,
               gitStrategyAckRequired: true,
+              // The links the form showed in full (control-tower phase 139) — the
+              // launch door opens a plan's `auto-open: host` step only for one of
+              // these, exactly as spelled. This is the one door that sends it:
+              // converge, a webhook and `bin/` send nothing, so nothing opens there.
+              autoOpenShown: Array.isArray(body.autoOpen) ? body.autoOpen as string[] : undefined,
               // Lanes this run may hold at once. Clamped to the console's own
               // ceiling as well as validated, because `--max-sessions` is a
               // machine-level promise about this host and a run may not
@@ -4638,7 +4985,7 @@ async function routeApi(
           by: body.by,
           note: body.reason,
           actor,
-          person: personsPress(req, actor),
+          door: pressDoorOf(actor),
         });
         json(res, outcome.ok ? 200 : 409, {
           ...outcome, ...(outcome.ok ? {} : { error: outcome.detail }), description: plan.description,

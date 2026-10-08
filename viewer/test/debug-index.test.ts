@@ -1190,7 +1190,25 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // branch moved onto what landed (`run.branch-reseated`). Free; both info.
   // +1 from control-tower phase 121 (#182): an upcoming human step's due-when
   // ref landing (`phase.human-step-due`). Free; info.
-  assert.equal(kinds.length, 456 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
+  // +1 from control-tower phase 130 (#207): the guard at the door of Your turn
+  // refusing a declared step (`phase.turn-refused`). Free.
+  // +4 from control-tower phase 133 (#210): the owner's moves — a decision
+  // answered, an item declined, a question asked, evidence attached
+  // (`phase.human-step-answered`, `-declined`, `-asked`, `-evidence`). Free.
+  // +6 from control-tower phase 134 (#211): the check — a judgement begun and
+  // one that could not run, an item returned, escalated, overridden and sent
+  // back for a rewrite (`phase.human-step-check-started`, `-check-skipped`,
+  // `-returned`, `-escalated`, `-overridden`, `-rewrite`). Free.
+  // +5 from control-tower phase 148 (#208): the owner key — a key enrolled and
+  // removed (`policy.owner-key-enrolled`, `-removed`), and a press asked of the
+  // owner, confirmed or refused (`policy.authority-requested`, `-confirmed`,
+  // `-declined`). Free.
+  // +2 from control-tower phase 149 (#212): a grant applied and ended
+  // (`policy.grant-applied`, `-ended`). Free.
+  // +1 from control-tower phase 139: the launch door's open that the machine
+  // would not take (`phase.human-step-open-skipped`). Free; it reads as warn
+  // through `skipped`.
+  assert.equal(kinds.length, 475 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]
@@ -1276,7 +1294,10 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // 63 since control-tower phase 91, which documented phase 90's
   // `run.isolation-switch-refused` — a refusal, and so error through `refused`.
   // (Exclusive bound, so it moves to 64.)
-  assert.ok(tally.error > 0 && tally.error < 64, `${tally.error} kinds read as error — check the vocabulary`);
+  // 64 since control-tower phase 130 (#207): `phase.turn-refused` — the guard
+  // at the door of Your turn refusing a declared step — a refusal, and so
+  // error through `refused`. (Exclusive bound, so it moves to 65.)
+  assert.ok(tally.error > 0 && tally.error < 65, `${tally.error} kinds read as error — check the vocabulary`);
   assert.ok(tally.warn > 0 && tally.warn < 80, `${tally.warn} kinds read as warn — check the vocabulary`);
 });
 

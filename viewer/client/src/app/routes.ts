@@ -100,6 +100,11 @@ export {
  */
 const DESTINATION_OF: Record<string, string> = {
   plan: 'plans',
+  // Your turn is a head under Runs (control-tower phase 137): the Runs badge
+  // and the situation line are how a person gets there, so it is what stays
+  // lit — and the old answer page's address keeps it lit while it redirects.
+  turn: 'runs',
+  approve: 'runs',
   // Everything Now answered is the Tower's since 6.0 (control-tower phase 21),
   // Now included: its head keeps Runs lit for the instant its redirect runs.
   now: 'runs',
@@ -138,6 +143,15 @@ const enc = encodeURIComponent;
  * Every one of these is a head whose destination EXISTS today. See the header.
  */
 export const REDIRECTS: Record<string, (route: Route) => string> = {
+  // 6.2 (control-tower phase 137): the phone answer page is Your turn. A push
+  // minted before it says `#/approve?step=<id>` — that is the item, so it lands
+  // on `#/turn/<id>`, in one hop, with whatever else rode on the address.
+  approve: (route) => {
+    const query = { ...route.query };
+    delete query.step;
+    const search = new URLSearchParams(query).toString();
+    return `${turnHref(route.query.step)}${search ? `?${search}` : ''}`;
+  },
   // 6.0 (control-tower phase 21): the Tower on `#/runs` absorbed Now's bands in
   // phase 20, so Now's address is the Tower's — each `?focus=` becomes the bay
   // that holds the same things, and whatever else rode on the address (an
@@ -450,6 +464,8 @@ export const runsHref = (view?: RunsView): string => (view ? `#/runs?view=${enc(
 export const plansHref = (): string => '#/plans';
 /** The whole queue of this console (control-tower phase 99, #135). */
 export const queueHref = (): string => '#/queue';
+/** Your turn (control-tower phase 137) — the page, or one item on it, expanded. */
+export const turnHref = (item?: string | null): string => (item ? `#/turn/${enc(item)}` : '#/turn');
 export const insightsHref = (plan?: string): string => (plan ? `#/insights?plan=${enc(plan)}` : '#/insights');
 export const settingsHref = (section?: string): string =>
   section ? `#/settings/${enc(section)}` : '#/settings';

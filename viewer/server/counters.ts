@@ -39,6 +39,10 @@ export type CounterFamily =
   | 'http_requests_total'
   | 'shell_commands_total'
   | 'retention_removed_total'
+  | 'turn_checks_total'
+  | 'turn_check_usd_total'
+  | 'turn_rounds_total'
+  | 'turn_handled_total'
   ;
 
 type Bucket = Map<string, number>;

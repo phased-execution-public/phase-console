@@ -44,7 +44,8 @@ export type Stop = { name: string; hash: string; overlay?: Overlay };
 export const STOPS: readonly Stop[] = [
   ...DESTINATIONS.map((d) => ({ name: d, hash: `#/${d}` })),
   ...PLAN_TABS.map((t) => ({ name: `plan-${t}`, hash: `#/plan/${TOUR_PLAN}/${t}` })),
-  { name: 'approve', hash: '#/approve' },
+  // Your turn (control-tower phase 137) — the head that replaced `#/approve`, an item in every group
+  { name: 'turn', hash: '#/turn' },
   // The Issues desk (control-tower phase 118): the fixture's added repository, every state and reading
   { name: 'repo-issues', hash: '#/repo/issues?state=all' },
   // `?k=` `?help=` `?bell=` — `client/src/app/routes.ts` OVERLAY_KEYS.
@@ -61,6 +62,8 @@ export type Fixture = {
   tourPlan: string;
   plans: string[];
   runs: { slug: string; id: string; status: string; halt: string | null }[];
+  /** Your turn's seeded items and their groups (`seedTurn`). */
+  turn: { id: string; group: string; kind: string }[];
   stateDir: string;
   ready: boolean;
   live?: boolean;

@@ -147,3 +147,102 @@ test('on a desk the quick view is one screen of tiles, one open at a time, under
   });
   expect(solid).toBe(1);
 });
+
+/*
+ * The launch door lists ITEMS (control-tower phase 139, #216, exit criteria 3,
+ * 4 and 6). No fixture plan declares a `- **Human step:**`, so the prelude's
+ * answer is staged with three: one its proof already holds (shown done), one a
+ * launch before this one raised (its *Do it now* opens the item on Your turn —
+ * a seeded item, so the page has it), and one the plan marks `auto-open: host`,
+ * whose long link is shown WHOLE and wraps rather than widening a phone.
+ *
+ * Only a FRESH launch promises an open: a resume asks nothing at the door, so
+ * nothing in it opens (`YourTurns`). Every fixture plan's run is unfinished,
+ * so `quiet`'s run is staged as finished, and its door is a fresh start's.
+ */
+test('the launch door lists the run’s items — done, Do it now opening the item, an auto-open link whole', async ({
+  page,
+}, info) => {
+  test.skip(info.project.name !== PHONE && info.project.name !== 'desk-1280', 'a phone and a desk');
+  const fx = await fixture();
+  const item = fx.turn.find((entry) => entry.group === 'now')!.id;
+  const link =
+    'https://registry.example.com/login?next=%2Fcli%2Fpublish%2Fa-path-long-enough-to-wrap-on-a-phone';
+  await page.route(
+    (url) => url.pathname.endsWith('/prelude'),
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const response = await route.fetch();
+      const body = (await response.json()) as { prelude?: Record<string, unknown> } & Record<string, unknown>;
+      const prelude = body.prelude ?? body;
+      prelude.humanSteps = [
+        {
+          phase: 1,
+          kind: 'browser-login',
+          what: 'Sign the gh CLI in',
+          where: 'host',
+          state: 'pre-cleared',
+          open: { url: 'https://github.com/login' },
+          proof: 'cmd:"gh auth status"',
+          read: 'landed — exit 0',
+        },
+        {
+          phase: 1,
+          kind: 'browser-login',
+          what: 'Sign the registry in',
+          where: 'host',
+          state: 'needed',
+          open: { url: 'https://example.com/device' },
+          item,
+        },
+        {
+          phase: 2,
+          kind: 'browser-login',
+          what: 'Approve the publish token',
+          where: 'host',
+          state: 'needed',
+          open: { url: link },
+          autoOpen: 'host',
+        },
+      ];
+      await route.fulfill({ response, json: body });
+    },
+  );
+  await page.route(
+    (url) => url.pathname.endsWith('/api/run/quiet'),
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const response = await route.fetch();
+      const body = (await response.json()) as { run?: Record<string, unknown> | null };
+      if (body.run) body.run.status = 'finished';
+      await route.fulfill({ response, json: body });
+    },
+  );
+  await visit(page, { name: 'launch-door-items', hash: '#/plan/quiet/run' }, fx.anchor);
+  await page
+    .getByRole('button', { name: /^(Continue this run|Start a run)$/ })
+    .first()
+    .click();
+  const dialog = page.getByRole('dialog');
+  const door = dialog.getByTestId('door-steps');
+  await expect(door).toBeVisible();
+  const rows = door.getByTestId('door-step');
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(0).getByTestId('door-step-state')).toHaveText('Done — its proof already holds.');
+  await expect(rows.nth(0).getByTestId('door-step-do')).toHaveCount(0);
+  await expect(rows.nth(2).getByTestId('door-step-auto')).toContainText(link);
+  // Nothing in the door is wider than the dialog — the long link wraps.
+  const widest = await door.evaluate((root) => {
+    const edge = root.getBoundingClientRect().right;
+    return [...root.querySelectorAll('*')].filter((el) => el.getBoundingClientRect().right > edge + 1).length;
+  });
+  expect(widest, 'no element of the door overflows it').toBe(0);
+  await door.scrollIntoViewIfNeeded();
+  await still(page);
+  await page.screenshot({ path: shotPath(info.project.name, 'launch-door-items') });
+  // Do it now opens the item on Your turn.
+  const doIt = rows.nth(1).getByTestId('door-step-do');
+  await expect(doIt).toHaveAttribute('href', `#/turn/${item}`);
+  await doIt.click();
+  await expect(page.locator(`[data-testid="turn-item"][data-item="${item}"]`)).toBeVisible();
+});

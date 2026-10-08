@@ -28,8 +28,15 @@
  *    gets `operator` for a browser or the CLI and `script` for anything else.
  *    That half lives in `api/actor.ts`, beside the access layer it reads; this
  *    file is the pure part the runner imports.
+ *
+ *  - **The press door is proved, never claimed** (control-tower phase 131,
+ *    #208). `by` is a label; `pressDoor` is what the request could prove — a
+ *    session's token, the supervisor's bearer, a device somebody verified, or
+ *    nothing (`local`). An in-process actor's door is read off its transport
+ *    (`pressDoorOf`), so the supervisor's pass is never a person's press.
  */
 
+import { AGENT_DOORS, type PressDoor } from '../shared/door-model.js';
 import { OPERATOR_DOOR, START_DOORS } from '../shared/run-lifecycle.js';
 import type { Actor, ActorVia, AnyDoor, StartDoor } from './runner/state.ts';
 
@@ -124,7 +131,37 @@ export function stoppedByOf(actor: Actor): 'operator' | 'system' {
  */
 export function isPersonsAct(actor: Actor): boolean {
   const door = (actor as { door?: string }).door;
-  return stoppedByOf(actor) === 'operator' && (!door || door === OPERATOR_DOOR);
+  return stoppedByOf(actor) === 'operator' && (!door || door === OPERATOR_DOOR) && !isAgentDoor(pressDoorOf(actor));
+}
+
+/**
+ * The door an actor pressed through (control-tower phase 131, #208). A
+ * request-derived actor carries its own (`actorOfRequest` stamps it); an
+ * in-process one is read off its transport: the supervisor's pass is the
+ * supervisor's, a hook body is a session's, the console's clocks are the
+ * console's, and anything else asked from outside — a signal, an older
+ * caller's bare label — is `local`.
+ */
+export function pressDoorOf(actor: (Pick<Actor, 'via'> & { pressDoor?: PressDoor }) | null | undefined): PressDoor {
+  if (actor?.pressDoor) return actor.pressDoor;
+  // `supervisor-chat` is the chat's own transport (`pro/supervisor/tools.ts`), outside `ACTOR_VIAS`.
+  switch (actor?.via as string | undefined) {
+    case 'supervisor':
+    case 'supervisor-chat':
+      return 'supervisor';
+    case 'hook': return 'session';
+    case 'timer':
+    case 'boot':
+    case 'event':
+      return 'console';
+    default:
+      return 'local';
+  }
+}
+
+/** Did a press come through an agent's door — a session's or the supervisor's — rather than a person's? */
+export function isAgentDoor(door: PressDoor): boolean {
+  return (AGENT_DOORS as readonly string[]).includes(door);
 }
 
 /**

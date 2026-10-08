@@ -678,29 +678,68 @@ report, not a routine ask. Never ask in prose: prose reaches nobody.
 When the work needs an act only a person can do — a sign-in that opens a browser and waits, a device
 code, a token to paste, a password at the machine, an approval on somebody else's dashboard — that is
 not a failure, not a stall and not a free-text errand. It is a **human step**: a typed record with a
-workflow. The console informs (ONE `human-step` inbox row, ONE `needs-you` push naming *Open* and
-*I did it*, and a device code when the kind has one), waits (the phase parks on a PERSON — an
-unbudgeted wait of kind `person`, situation `blocked-declared:human-acts`, no ladder rung ever spent
-on it), and — from phase 43 — lets the person open it again, proves it, and resumes the same session.
+workflow. The console informs (ONE item on **Your turn**, `#/turn`, and ONE `needs-you` push whose
+lock-screen buttons follow the kind — *Open* and *I did it* for an act, *Allow* and *Deny* for a low
+or medium permission, *Open* and *Deny* for a high or never one, *Open* for a decision — with a device
+code when the kind has one), waits (the phase parks on a PERSON — an unbudgeted wait of kind `person`,
+situation `blocked-declared:human-acts`, no ladder rung ever spent on it), checks it when the person
+presses *I've done this — check* (a verdict: `passed`, `rejected` with what to redo, `needs-info`), and
+resumes the same session with what was proven or answered. The session's whole reference — the
+reasons, the guide grammar, a template per kind, the proof types, the guard, a permission block, the
+doors — is `references/turn.md`.
 
 A session declares one with `phase-outcome.sh <slug> <N> needs-human --needs <key> --step <kind>
 --title "<what>" [--open-url <http(s) link> | --open-command "<cmd>"] [--where host|any]
 [--proof <ref>] [--step-line "<step>"]… [--code <device code>] [--credential <id>] [--due-when <ref>]`,
-hands off `in-progress`, and stops. The seventeen kinds are `scripts/human-steps.env`'s; `--act` is
+hands off `in-progress`, and stops. The eighteen kinds are `scripts/human-steps.env`'s; `--act` is
 `--step operator-act`, the operator's own act — a command or a click path — and `--due-when <ref>`
 keeps any step `upcoming` (shown under *Coming up*, announced once, when the ref lands) until it is
-due (control-tower phase 121). Three rules:
+due (control-tower phase 121). Since control-tower phase 130 (#207) the step also says **why only a
+person fits it** (`--why <reason>` — `scripts/turn.env`'s `WHY_PERSON`, held to what the kind allows,
+`KIND_REASONS`; absent, the kind's default is recorded and marked inferred), carries **a full guide**
+(`--guide <file>`, the grammar of `viewer/shared/guide-grammar.js`: a why paragraph, `## Steps` with
+numbered steps — each with an optional command, `Expect:`, `Warning:` and `Link:` — and `## If it goes
+wrong`; 20 steps and 24 KB at most, `--lang` its language) and **a proof a person can read** (a
+`--proof` ref, or `--proof-words`, or `--proof-type attest` for the person's bare word — named, never
+assumed), plus `--effort`, `--due ISO`, `--unblocks`, `--window`, a decision's `--option`s with
+`--recommended` and `--allow-decline`, and `--tried`. Four rules:
+
+- **Never hand a person what you can do yourself.** The console's guard (G1–G7) runs at the
+  declaration's pre-check and again at ingest. A declared `permission`, `reserved` or `reach` reason
+  claims the AI cannot: a guide whose every command this run's own policy would allow is refused with
+  **exit 4**, the commands named — run them; a command a rule stops turns the item into a `permission`
+  item naming the wall; a `reach` with no `--tried` is refused — try it, then say what happened. Raised
+  again with `--tried`, it is accepted and marked. A sign-in (`identity`) is never judged this way: it
+  is the person's even when policy would let its command run. Another lane declaring the same item
+  joins it as a waiter — ONE item, one push, every waiter resumed when it is proven.
 
 - **Never run the sign-in yourself.** In a `-p` session it hangs on a browser or a prompt nobody sees.
 - **Never put a secret in a flag.** A value shaped like a token, a password, a one-time code or a URL
-  query secret is refused (exit 2, nothing written, the value never echoed); the person types it where
-  the step opens. A `secret-entry` step names only the registry id its secret is stored under.
+  query secret is refused (exit 2, nothing written, the value never echoed). The console never takes a
+  secret either (control-tower phase 133): a `secret-entry` step names only the registry id it is
+  stored under, and the item tells the person where the value goes — the keychain item
+  `phase-console-<id>` on macOS, a 0600 file elsewhere, or the item's own `credential:` place — where
+  the check finds it by name.
 - **A session's step never opens by itself.** Only a plan's bullet may carry `auto-open: host`.
+
+Three more habits complete it (control-tower phases 133–136). **A wall is a permission block, not a
+step**: `phase-outcome.sh <slug> <N> blocked --needs permission --rule "<rule>" --command "<command>"`
+raises ONE `permission` item when it cites a wall the console recorded for your lane (else exit 4,
+G5: nothing refused this — run it); a person answers it with a grant at a scope (`call`, `phase`,
+`plan`, `repository`, `always`), *Deny* or *I'll do it myself*, and the never list has no grant.
+**The answer comes back as the console's sentence**, once per waiting session — "The operator answered
+`<option>`: <note>", "The operator declined: <reason>. Do not ask again; …", a grant's "run it again"
+— and a decision declared with `--decision-key <key>` has its answer written to the plan's
+`## Decisions` table first. **What you handled is recorded**: `phase-outcome.sh <slug> <N> handled
+--what "<what>" [--note …] [--link …]` puts one row under *Handled by the AI* — what you did instead of
+asking — and is never an outcome.
 
 What the console keeps is the ledger `<instance state>/human-steps.ndjson` — append-only, one line per
 move, last state wins, a torn last line dropped, rotated past 4 MB with the rotated copy still read —
-in eight states: `declared` → `notified` → `opened` → `checking` → `proven`, or `expired`, `cannot`,
-`dismissed`. No code, token, password or URL query secret reaches it, a journal line, a push payload,
+in eleven states: `upcoming` → `declared` → `notified` → `opened` → `checking` → `proven`, a check's
+`returned` (redo it), or the settles `declined` (the person's "not doing this"), `expired`, `cannot`,
+`dismissed` (withdrawn by the console). A line written before phase 130 reads as a version-2 item
+with defaults. No code, token, password or URL query secret reaches it, a journal line, a push payload,
 the log or a transcript: each of the five is redacted.
 
 **The console notices one, too (phase 44).** Run `gh auth login` (or any `SIGN_IN_SHAPES` member)

@@ -359,3 +359,23 @@ test('the guard has teeth: a fixture route no caller reaches and no row excuses 
   });
   assert.deepEqual(silent, ['NON_UI_ROUTES `orphan` names bin/elsewhere.mjs, which never mentions it']);
 });
+
+test('every verb a person presses on a step has a lib/api caller — a permission item\'s deny and convert among them (control-tower phase 135)', () => {
+  // The step verbs are read off a destructured `verb` (`const [id, verb] = rest`),
+  // which the head/verb parse above does not follow — so they are held here.
+  const head = DISPATCHER.slice(DISPATCHER.indexOf("if (head === 'human-steps')"));
+  const branch = head.slice(0, head.indexOf("json(res, 405, { error: 'GET /api/human-steps"));
+  const verbs = [...branch.matchAll(/verb === '([a-z-]+)'/g)].map((m) => m[1]!);
+  for (const verb of ['deny', 'convert']) assert.ok(verbs.includes(verb), `the dispatcher answers ${verb}`);
+  const callers = readFileSync(join(VIEWER, 'client', 'src', 'lib', 'api', 'human-steps.ts'), 'utf8');
+  // `dismiss` is the CONSOLE's withdrawal — "Withdrawn", what it does to an item
+  // nobody needs any more (§Architecture 19); a person declines or says they
+  // can't, so no page presses it. Control-tower phase 139 retired its dead fetcher.
+  const CONSOLE_ONLY: ReadonlySet<string> = new Set(['dismiss']);
+  for (const verb of CONSOLE_ONLY) assert.ok(verbs.includes(verb), `the dispatcher still answers ${verb}`);
+  const missing = [...new Set(verbs)].filter(
+    (verb) => !CONSOLE_ONLY.has(verb) && !callers.includes(`at(id, '${verb}')`),
+  );
+  assert.deepEqual(missing, [], 'a step verb no page can press');
+  assert.ok(!callers.includes("at(id, 'dismiss')"), 'a person never dismisses a step — they decline it');
+});

@@ -27,8 +27,10 @@ process.env.XDG_STATE_HOME = STATE_HOME;
 process.env.XDG_CONFIG_HOME = join(STATE_HOME, 'config');
 process.env.PHASE_CONSOLE_LOG = '';
 
-const { SKILL_DIR } = await import('../server/config.ts');
+const { SKILL_DIR, INSTANCE_STATE_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
+const { HUMAN_STEPS_FILE } = await import('../server/human-steps.ts');
+const { journalFile } = await import('../server/runner/run-paths.ts');
 import type { StartOptions } from '../server/runner/runner.ts';
 
 const SCRIPTS = join(SKILL_DIR, 'scripts');
@@ -84,11 +86,11 @@ It did the thing.
 
 const OPEN = new Map<string, Array<{ close: () => void }>>();
 
-function scratch(opts: { handoffs?: number[] } = {}): { root: string; cleanup: () => void } {
+function scratch(opts: { handoffs?: number[]; plan?: string } = {}): { root: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), 'pc-launch-'));
   mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
   mkdirSync(join(root, 'docs', 'handoffs', 'alpha'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'alpha.md'), PLAN, 'utf8');
+  writeFileSync(join(root, 'docs', 'plans', 'alpha.md'), opts.plan ?? PLAN, 'utf8');
   for (const phase of opts.handoffs ?? []) {
     writeFileSync(
       join(root, 'docs', 'handoffs', 'alpha', `phase-0${phase}-phase-${phase}.md`),
@@ -329,5 +331,232 @@ test('retry of a claimed phase is refused too', async () => {
       () => svc.retryPhase('alpha', 2),
       (error: Error) => error.name === 'PhaseClaimedError',
     );
+  } finally { cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * The launch door opens a plan's `auto-open: host` step (control-tower phase 139)
+ *
+ * §Architecture 12's safety floor, promised since phase 41: a step the PLAN
+ * marked `auto-open: host` opens on the machine at the launch door — behind a
+ * capability flag, for a link the launch form SHOWED in full and sent back, and
+ * nowhere else. The runner is still a recorder and the opener is a recorder
+ * too: nothing here opens a browser or spawns a session.
+ * ------------------------------------------------------------------ */
+
+const LINK = 'https://vercel.com/login?next=/cli';
+const APPROVAL = 'https://github.com/apps/acme';
+const PRESS = { by: 'mobin', via: 'api', origin: 'test', remoteUser: null, door: 'operator' } as never;
+
+/** `PLAN`, with the three bullets a launch door meets: a link to open, a command to run, a link to read. */
+const DOOR_PLAN = PLAN
+  .replace('- **Goal:** the tables.\n', `- **Goal:** the tables.\n- **Human step:** browser-login · Sign in to Vercel · open: ${LINK} · where: host · auto-open: host\n`)
+  .replace('- **Goal:** A cart endpoint that survives a reload.\n',
+    '- **Goal:** A cart endpoint that survives a reload.\n- **Human step:** browser-login · Sign the gh CLI in · open: `gh auth login --web` · where: host · auto-open: host\n')
+  .replace('### Phase 3 — checkout\n- **Size:** S\n',
+    `### Phase 3 — checkout\n- **Size:** S\n- **Human step:** third-party-approval · The org owner approves the app · open: ${APPROVAL} · where: any\n`);
+
+type HostOpened = { opened: boolean; opener?: string; detail?: string };
+
+/** A service whose host opener is a recorder, on a ledger that starts empty (this file's state home is shared by every test). */
+function doorService(root: string, over: Record<string, unknown> = {}, open?: (url: string) => Promise<HostOpened>) {
+  rmSync(join(INSTANCE_STATE_DIR, HUMAN_STEPS_FILE), { force: true });
+  const made = service(root, over);
+  const opened: string[] = [];
+  (made.svc as unknown as { hostOpener: (url: string) => Promise<HostOpened> }).hostOpener = open
+    ? (url) => { opened.push(url); return open(url); }
+    : async (url) => { opened.push(url); return { opened: true, opener: 'open' }; };
+  return { ...made, opened };
+}
+
+type Svc = ReturnType<typeof service>['svc'];
+const stepTitled = (svc: Svc, title: string) => svc.humanStepsNow().all().find((step) => step.title === title);
+const runJournal = (root: string): { event: string; phase?: number; data: Record<string, unknown> }[] => {
+  const file = journalFile(root, 'alpha', 'run-1');
+  return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
+};
+
+/** The door's opens are fire-and-forget: a launch has returned while they finish, so a test waits for what they leave. */
+async function until(check: () => boolean, what: string, ms = 5_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) assert.fail(`never happened: ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test('LD-1 — a launch that showed the link opens a plan\'s auto-open step ONCE, through the seam: the step reads opened on the host, and the run says so', async () => {
+  const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+  try {
+    const { svc, captured, opened } = doorService(root, { allowTerminal: true });
+    // Everything is "shown" — the command and the link with no auto-open word too.
+    await svc.startRun('alpha', {
+      acknowledgedWaivers: ['announce'], actor: PRESS, autoOpenShown: [LINK, 'gh auth login --web', APPROVAL],
+    });
+    const vercel = () => stepTitled(svc, 'Sign in to Vercel');
+    await until(() => vercel()?.state === 'opened', 'the step reads opened');
+    assert.deepEqual(opened, [LINK], 'one open of the shown link — not the command, not the link the plan did not mark');
+    assert.equal(captured.length, 1, 'and the run started');
+
+    const step = vercel()!;
+    assert.equal(step.birth, 'plan');
+    assert.equal(step.opened, 1);
+    const last = svc.humanStepsNow().history(step.id).at(-1)!;
+    assert.deepEqual([last.state, last.verb, last.where, last.by], ['opened', 'open', 'host', 'launch']);
+
+    // The other two bullets were ASKED all the same — recorded, announced — and left shut.
+    for (const title of ['Sign the gh CLI in', 'The org owner approves the app']) {
+      assert.equal(stepTitled(svc, title)?.state, 'notified', title);
+      assert.equal(stepTitled(svc, title)?.opened, 0, title);
+    }
+
+    // The step was born before the run, so the line is written on the run the launch made.
+    await until(() => runJournal(root).some((line) => line.event === 'phase.human-step-opened'), 'the run\'s journal line');
+    const line = runJournal(root).find((entry) => entry.event === 'phase.human-step-opened')!;
+    assert.equal(line.phase, 1);
+    assert.deepEqual(
+      { stepId: line.data.stepId, kind: line.data.kind, where: line.data.where, door: line.data.door, by: line.data.by, n: line.data.n, what: line.data.what },
+      { stepId: step.id, kind: 'browser-login', where: 'host', door: 'launch', by: 'mobin', n: 1, what: 'url' },
+    );
+  } finally { cleanup(); }
+});
+
+test('LD-2 — the same launch WITHOUT the link shown opens nothing: not shown, shown spelled another way, nothing sent, a resume — the step is still asked', async () => {
+  for (const shown of [undefined, [], [`${LINK}/`], [LINK.replace('https', 'http')], ['https://example.com/']]) {
+    const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+    try {
+      const { svc, opened } = doorService(root, { allowTerminal: true });
+      await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, ...(shown ? { autoOpenShown: shown } : {}) });
+      assert.equal(stepTitled(svc, 'Sign in to Vercel')?.state, 'notified', `${JSON.stringify(shown)}: asked, and left for a person`);
+      // The opens are fire-and-forget, so give one that should not exist its chance to happen.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.deepEqual(opened, [], JSON.stringify(shown));
+      assert.equal(stepTitled(svc, 'Sign in to Vercel')?.opened, 0);
+      assert.ok(!runJournal(root).some((line) => line.event.startsWith('phase.human-step-open')), 'and the run has nothing to say about it');
+    } finally { cleanup(); }
+  }
+  // A resume asks nothing at its door, so it opens nothing either.
+  const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+  try {
+    const { svc, opened } = doorService(root, { allowTerminal: true });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, resumeRunId: 'run-1', autoOpenShown: [LINK] });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.deepEqual(opened, []);
+    assert.equal(svc.humanStepsNow().all().length, 0, 'a resume records no step of the plan');
+  } finally { cleanup(); }
+});
+
+test('LD-3 — opening on the machine is behind --allow-terminal or --allow-agent: with neither, a shown link opens nothing; either one alone is enough', async () => {
+  for (const [flags, expected] of [
+    [{}, []], [{ allowTerminal: false, allowAgent: false }, []], [{ allowTerminal: true }, [LINK]], [{ allowAgent: true }, [LINK]],
+  ] as const) {
+    const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+    try {
+      const { svc, opened } = doorService(root, { ...flags });
+      await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, autoOpenShown: [LINK] });
+      const want = expected.length ? 'opened' : 'notified';
+      await until(() => stepTitled(svc, 'Sign in to Vercel')?.state === want, `${JSON.stringify(flags)}: the step reads ${want}`);
+      // Give an open that should not exist its chance to happen.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.deepEqual(opened, [...expected], JSON.stringify(flags));
+      assert.equal(stepTitled(svc, 'Sign in to Vercel')?.state, want, `${JSON.stringify(flags)}: asked either way`);
+    } finally { cleanup(); }
+  }
+});
+
+test('LD-4 — a launch never waits on the browser: it returns while the opener is still working, and the step moves when the opener is done', async () => {
+  const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+  try {
+    let release!: (answer: HostOpened) => void;
+    const slow = new Promise<HostOpened>((resolve) => { release = resolve; });
+    const { svc, captured, opened } = doorService(root, { allowTerminal: true }, () => slow);
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, autoOpenShown: [LINK] });
+    assert.equal(captured.length, 1, 'the run started with the opener still out');
+    assert.deepEqual(opened, [LINK], 'the opener WAS asked, before the runner started');
+    assert.equal(stepTitled(svc, 'Sign in to Vercel')?.state, 'notified', 'and nothing moved yet');
+    release({ opened: true, opener: 'open' });
+    await until(() => stepTitled(svc, 'Sign in to Vercel')?.state === 'opened', 'the step reads opened once the opener is done');
+  } finally { cleanup(); }
+});
+
+test('LD-5 — a second launch finds the step already asked: it records nothing again and opens nothing again', async () => {
+  const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+  try {
+    const { svc, captured, opened } = doorService(root, { allowTerminal: true });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, autoOpenShown: [LINK] });
+    await until(() => stepTitled(svc, 'Sign in to Vercel')?.state === 'opened', 'the first open');
+    const first = stepTitled(svc, 'Sign in to Vercel')!;
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, autoOpenShown: [LINK] });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(captured.length, 2, 'both launches started');
+    assert.deepEqual(opened, [LINK], 'the link opened once, not once per launch');
+    assert.deepEqual(
+      svc.humanStepsNow().all().filter((step) => step.title === 'Sign in to Vercel').map((step) => [step.id, step.opened]),
+      [[first.id, 1]], 'one step, opened once',
+    );
+  } finally { cleanup(); }
+});
+
+test('LD-6 — a machine that would not open it, or an opener that throws, fails nothing: the launch goes on, the step stands for a person, the run says why', async () => {
+  for (const [name, open, why] of [
+    ['an opener that says no', async () => ({ opened: false, opener: 'open', detail: 'this machine has no desktop opener — open the link yourself' }), /no desktop opener/],
+    ['an opener that throws', async (): Promise<HostOpened> => { throw new Error('the desktop is locked'); }, /the desktop is locked/],
+  ] as const) {
+    const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+    try {
+      const { svc, captured, opened } = doorService(root, { allowTerminal: true }, open);
+      const run = await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, autoOpenShown: [LINK] });
+      assert.equal(run.id, 'run-1', `${name}: the launch still answered with its run`);
+      assert.equal(captured.length, 1);
+      await until(() => runJournal(root).some((line) => line.event === 'phase.human-step-open-skipped'), `${name}: the run's journal line`);
+      assert.deepEqual(opened, [LINK], name);
+      const step = stepTitled(svc, 'Sign in to Vercel')!;
+      assert.equal(step.state, 'notified', `${name}: not opened, so still waiting for a person`);
+      assert.equal(step.opened, 0);
+      const line = runJournal(root).find((entry) => entry.event === 'phase.human-step-open-skipped')!;
+      assert.equal(line.data.door, 'launch');
+      assert.equal(line.data.where, 'host');
+      assert.equal(line.data.stepId, step.id);
+      assert.match(String(line.data.why), why);
+      assert.ok(!runJournal(root).some((entry) => entry.event === 'phase.human-step-opened'), `${name}: nothing claims it opened`);
+    } finally { cleanup(); }
+  }
+});
+
+test('LD-7 — one link opens one tab per launch, however many steps name it; each step is still asked', async () => {
+  const twice = DOOR_PLAN.replace(
+    '- **Human step:** browser-login · Sign the gh CLI in · open: `gh auth login --web` · where: host · auto-open: host',
+    `- **Human step:** browser-login · Sign in to Vercel for the preview · open: ${LINK} · where: host · auto-open: host`,
+  );
+  const { root, cleanup } = scratch({ plan: twice });
+  try {
+    const { svc, opened } = doorService(root, { allowTerminal: true });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS, autoOpenShown: [LINK] });
+    await until(() => stepTitled(svc, 'Sign in to Vercel')?.state === 'opened', 'the first step reads opened');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.deepEqual(opened, [LINK], 'two bullets, one link, one tab');
+    assert.equal(stepTitled(svc, 'Sign in to Vercel for the preview')?.state, 'notified', 'the second is asked all the same, and left for a person');
+  } finally { cleanup(); }
+});
+
+test('LD-8 — the prelude names the item a launch already raised for each step, so the form and the door agree on "already asked" — a session\'s of the same words is not it', async () => {
+  const { root, cleanup } = scratch({ plan: DOOR_PLAN });
+  try {
+    const { svc } = doorService(root, { allowTerminal: true });
+    const titles = ['Sign in to Vercel', 'Sign the gh CLI in', 'The org owner approves the app'];
+    // A session declared the first step's words on its own: another ask, never the plan's.
+    const session = svc.recordHumanStep({
+      slug: 'alpha', phase: 1, birth: 'session', step: { kind: 'browser-login', title: 'Sign in to Vercel', open_url: LINK },
+    })!;
+    const before = await svc.prelude('alpha', { acknowledgedWaivers: ['announce'] });
+    assert.deepEqual(before.humanSteps.map((step) => step.what), titles);
+    assert.deepEqual(before.humanSteps.map((step) => step.item), [undefined, undefined, undefined], 'the plan has asked nothing yet');
+
+    // A launch with no link shown asks all three and opens none.
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], actor: PRESS });
+    const asked = titles.map((title) => svc.humanStepsNow().all().find((step) => step.title === title && step.birth === 'plan')!.id);
+    assert.ok(!asked.includes(session.id));
+    const after = await svc.prelude('alpha', { acknowledgedWaivers: ['announce'] });
+    assert.deepEqual(after.humanSteps.map((step) => step.item), asked, 'each step names the plan\'s own item');
   } finally { cleanup(); }
 });

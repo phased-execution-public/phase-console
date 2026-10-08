@@ -256,6 +256,30 @@ test('every category resolves to a route the client actually matches', () => {
   }
 });
 
+test('an item and a grant land on pages the client actually matches (control-tower phase 138, #215)', () => {
+  const routes = appRoutes();
+  // A push for an item opens the item: Your turn's own head, one segment of id.
+  const item = router.parseHash(catalogue.routeFor('needs-you', { slug: 'demo', phase: 4, stepId: 'hs/1 a' }).replace(/^\//, ''));
+  assert.ok(routes.includes(item.segments[0]!), `the shell has no "${item.segments[0]}" route`);
+  assert.deepEqual(item.segments, ['turn', 'hs/1 a']);
+  // The granted push opens Settings ▸ Permissions ▸ Grants AT that grant.
+  const grant = router.parseHash(catalogue.routeFor('granted', { slug: 'demo', phase: 4, grantId: 'g-9f' }).replace(/^\//, ''));
+  assert.ok(routes.includes(grant.segments[0]!));
+  assert.deepEqual(grant.segments, ['settings', 'permissions']);
+  assert.deepEqual(grant.query, { grant: 'g-9f' });
+});
+
+test('the twentieth category — `granted` — has its own switch, on out of the box, gated on every leg like the rest', () => {
+  assert.equal(catalogue.CATEGORIES.length, 20, 'twenty kinds, so the matrix draws twenty switches');
+  const granted = catalogue.categoryOf('granted');
+  assert.equal(granted.label, 'Permission granted');
+  assert.equal(granted.byDefault, true, 'a record of authority given is on until a person turns it off');
+  assert.equal(granted.urgent, false, 'it asks nothing of anyone: never a wrist buzz');
+  assert.equal(catalogue.defaultCategories().granted, true);
+  assert.equal(catalogue.sanitiseCategories({ granted: false }).granted, false, 'its switch holds');
+  assert.equal(catalogue.sanitiseCategories({}).granted, true, 'an older client never turns it off by omission');
+});
+
 test('the categories that mean "a run needs you" land on the run itself', () => {
   for (const id of ['approval', 'needs-you', 'halted', 'parked', 'finished'] as const) {
     assert.equal(catalogue.routeFor(id, { slug: 'demo' }), '/#/plan/demo/run',
@@ -677,6 +701,52 @@ test('a toggle survives a restart, with no push device in the picture', async ()
   const reloaded = loadPrefs();
   assert.equal(reloaded.notify.changed, true, 'preferences live in config.json, not in a device record');
   assert.equal(reloaded.notify.approval, false);
+});
+
+/* ------------------------------------------------------------------ *
+ * ONE quiet-hours setting — the device's (control-tower phase 138, #215)
+ * ------------------------------------------------------------------ */
+
+test('ONE quiet-hours setting: reminders wait out the devices’ own windows, and have no preference of their own', async () => {
+  const { Service } = await import('../server/service.ts');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { generateKeyPairSync, randomBytes } = await import('node:crypto');
+  const browser = () => {
+    const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = publicKey.export({ format: 'jwk' }) as { x: string; y: string };
+    const point = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]);
+    return {
+      endpoint: `https://push.example.com/sub/one-quiet-${randomBytes(4).toString('hex')}`,
+      keys: { p256dh: point.toString('base64url'), auth: randomBytes(16).toString('base64url') },
+    };
+  };
+  const service = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  try {
+    for (const device of service.push.list()) service.push.unsubscribe(device.id);
+    const reminders = () => service.humanStepsView().reminders as { quiet: unknown; windows: unknown };
+    assert.deepEqual(reminders().windows, [], 'no device, nothing to be quiet on: a reminder goes out when it is due');
+
+    const phone = service.push.subscribe(browser(), undefined, 'phone') as { id: string };
+    service.push.setQuiet(phone.id, { start: '22:00', end: '07:00', allowUrgent: true });
+    assert.deepEqual(reminders().windows, [{ start: '22:00', end: '07:00' }], 'the phone’s own window is the one reminders wait out');
+    assert.deepEqual(reminders().quiet, { start: '22:00', end: '07:00' });
+
+    // A second device that is never quiet hears a reminder at once: nothing waits.
+    const laptop = service.push.subscribe(browser(), undefined, 'laptop') as { id: string };
+    assert.deepEqual(reminders().windows, []);
+    // …unless it does not take the category reminders ride.
+    service.push.setCategories(laptop.id, { 'needs-you': false });
+    assert.deepEqual(reminders().windows, [{ start: '22:00', end: '07:00' }]);
+
+    // The console holds no window of its own: the preference is gone.
+    assert.ok(!('reminderQuiet' in service.state().prefs), 'one setting, and it is the device’s');
+    for (const device of service.push.list()) service.push.unsubscribe(device.id);
+  } finally {
+    service.close();
+  }
 });
 
 /* ------------------------------------------------------------------ *

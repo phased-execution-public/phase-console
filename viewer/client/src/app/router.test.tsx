@@ -269,6 +269,31 @@ describe('what the navigation lights up', () => {
     expect(redirectTarget(route('#/agent'))).toBe('sessions?new=agent');
   });
 
+  it('Your turn is a lazy head that lights Runs — and the destinations are unchanged (phase 137)', () => {
+    // §Architecture 19: a HEAD, `#/turn` and `#/turn/<id>`, never an eighth
+    // destination — "does anything need me?" already has its home in Runs.
+    expect(resolveEntry('turn').kind).toBe('page');
+    expect(resolveView('turn')).toBeTruthy();
+    expect(destinationFor('turn')).toBe('runs');
+    expect(destinationFor('approve')).toBe('runs');
+    expect(DESTINATIONS as readonly string[]).not.toContain('turn');
+    // The item's address is the head and the id — no redirect, it is the page.
+    expect(redirectTarget(route('#/turn'))).toBeNull();
+    expect(redirectTarget(route('#/turn/human-step-1'))).toBeNull();
+    expect(route('#/turn/human-step-1').segments).toEqual(['turn', 'human-step-1']);
+  });
+
+  it('lands #/approve and a push’s #/approve?step=<id> on Your turn in one hop (phase 137)', () => {
+    // Every step push minted before 6.2 says `#/approve?step=<id>`, and a phone
+    // keeps a notification for days: the old address lands on the item itself.
+    expect(resolveEntry('approve').kind).toBe('redirect');
+    expect(redirectTarget(route('#/approve'))).toBe('#/turn');
+    expect(redirectTarget(route('#/approve?step=human-step-1'))).toBe('#/turn/human-step-1');
+    expect(redirectTarget(route('#/approve?step=a%2Fb'))).toBe('#/turn/a%2Fb');
+    // An overlay that rode on the old address rides on.
+    expect(redirectTarget(route('#/approve?step=s1&k=cart'))).toBe('#/turn/s1?k=cart');
+  });
+
   it('names a destination for every head, and one of the eight', () => {
     for (const head of ROUTE_HEADS as readonly string[]) {
       const destination = destinationFor(head);

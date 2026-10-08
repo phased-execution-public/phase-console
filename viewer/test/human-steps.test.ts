@@ -24,8 +24,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const {
-  HumanStepLedger, declareHumanStep, parkOnStep, phaseWaitKind, readLedger, sanitiseStep, stepKeychainService,
-  storeStepSecret,
+  HumanStepLedger, bodyCarriesSecret, declareHumanStep, parkOnStep, phaseWaitKind, readLedger, sanitiseStep, secretPlace,
+  stepKeychainService,
 } = await import('../server/human-steps.ts');
 const humanStepsModule = await import('../server/human-steps.ts');
 const { buildInbox } = await import('../server/inbox.ts');
@@ -333,60 +333,115 @@ test('HS-4 — a link that is not http(s), a code off a device-code step, a cred
 });
 
 /* ------------------------------------------------------------------ *
- * HS-5 — secret-entry stores, and nothing reads it back
+ * HS-5 — secret-entry stores NOTHING (control-tower phase 133, #210):
+ * the item says where its value goes and is proven there by name
  * ------------------------------------------------------------------ */
 
-test('HS-5 — on macOS the secret goes to the keychain on stdin, never in argv', async () => {
-  const secret = `npm_${'s'.repeat(36)}`;
-  const calls: Array<{ file: string; args: string[]; input?: string }> = [];
-  const exec = (async (file: string, args: string[], opts?: { input?: string }) => {
-    calls.push({ file, args, ...(opts?.input !== undefined ? { input: opts.input } : {}) });
-    return { stdout: '' };
-  }) as never;
-  const stored = await storeStepSecret({ dir: '/nonexistent', exec, platform: 'darwin' }, 'npm-token', secret);
-  assert.deepEqual(stored, { stored: 'keychain', probe: `keychain:${stepKeychainService('npm-token')}` });
+test('HS-5 — a secret-entry item says where its value goes, and names the ref that proves it there by name', () => {
+  const step = { credential: 'npm-token' };
+  const mac = secretPlace(step, { dir: '/state/secrets', platform: 'darwin' });
   assert.equal(stepKeychainService('npm-token'), 'phase-console-npm-token', 'the E5.1 item the plan names');
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].file, 'security');
-  assert.ok(!calls[0].args.some((arg) => arg.includes(secret)), 'never in argv');
-  assert.deepEqual(calls[0].args.slice(0, 4), ['add-generic-password', '-U', '-s', 'phase-console-npm-token']);
-  assert.equal(calls[0].input, `${secret}\n${secret}\n`, 'twice on stdin — security asks and asks again');
+  assert.equal(mac.ref, 'credential:keychain:phase-console-npm-token');
+  assert.match(mac.where, /login keychain, as the item `phase-console-npm-token`/);
+  assert.match(mac.where, /security add-generic-password -U -s phase-console-npm-token -a "\$USER" -w/, 'a command that ASKS for it');
+  const linux = secretPlace(step, { dir: '/state/secrets', platform: 'linux' });
+  assert.equal(linux.ref, 'credential:file:/state/secrets/npm-token');
+  assert.match(linux.where, /mode 0600/);
+  // The item's own credential: proof wins, in its own words.
+  assert.equal(secretPlace({ credential: 'x', proof: 'credential:env:NPM_TOKEN' }, { dir: '/d' }).ref, 'credential:env:NPM_TOKEN');
+  assert.match(secretPlace({ proof: 'credential:env:NPM_TOKEN' }, { dir: '/d' }).where, /environment variable `NPM_TOKEN`/);
+  assert.match(secretPlace({ proof: 'credential:gh' }, { dir: '/d' }).where, /gh auth login/);
+  assert.equal(secretPlace({ openCommand: 'vercel env add KEY' }, { dir: '/d' }).ref, undefined, 'a command is words, never a proof');
+  assert.equal(secretPlace({ credential: '../escape' }, { dir: '/d' }).ref, undefined, 'a bad id names no file');
 });
 
-test('HS-5 — elsewhere the secret is a 0600 file in a 0700 directory, and a bad id or a two-line value is refused', async () => {
-  const s = scratch();
-  try {
-    const dir = join(s.dir, 'secrets');
-    const secret = 'Zq81xk2mP0-the-token';
-    const stored = await storeStepSecret({ dir, platform: 'linux' }, 'license.signing_key', secret);
-    assert.equal(stored.stored, 'file');
-    assert.equal(stored.probe, `file:${join(dir, 'license.signing_key')}`);
-    assert.equal(statSync(join(dir, 'license.signing_key')).mode & 0o777, 0o600);
-    assert.equal(statSync(dir).mode & 0o777, 0o700);
-    assert.equal(readFileSync(join(dir, 'license.signing_key'), 'utf8'), `${secret}\n`);
-    await assert.rejects(storeStepSecret({ dir, platform: 'linux' }, '../escape', secret));
-    await assert.rejects(storeStepSecret({ dir, platform: 'linux' }, 'ok-id', 'two\nlines'));
-    await assert.rejects(storeStepSecret({ dir, platform: 'linux' }, 'ok-id', ''));
-
-    // The ledger records WHERE it went — never what it was.
-    const ledger = new HumanStepLedger(join(s.dir, 'human-steps.ndjson'));
-    const step = declareHumanStep({ ledger, announce: () => true }, {
-      slug: 'demo', phase: 5, birth: 'session', step: { kind: 'secret-entry', title: 'Paste the signing key', credential: 'license.signing_key' },
-    })!;
-    const moved = ledger.move(step.id, 'checking', { by: 'person', stored: stored.stored });
-    assert.ok(!('refused' in moved) && moved.stored === 'file');
-    assert.doesNotMatch(readFileSync(ledger.file, 'utf8'), /Zq81xk2mP0/);
-  } finally { s.cleanup(); }
+test('HS-5 — a body carrying a secret is one a verb refuses: a `secret` field at all, or a value shaped like one', () => {
+  assert.equal(bodyCarriesSecret({ secret: '' }), true, 'the field itself, whatever it holds');
+  assert.equal(bodyCarriesSecret({ note: `use npm_${'s'.repeat(36)}` }), true);
+  assert.equal(bodyCarriesSecret({ note: 'password=hunter2hunter2' }), true);
+  assert.equal(bodyCarriesSecret({ note: 'It is done — the light is green.' }), false);
+  assert.equal(bodyCarriesSecret({}), false);
+  assert.equal(bodyCarriesSecret(undefined), false);
 });
 
-test('HS-5 — nothing in the module reads a stored secret back: no reader is exported, no keychain read is made', () => {
+test('HS-5 — nothing in the module stores or reads a secret: no store, no reader, no keychain call, one file read', () => {
   const exported = Object.keys(humanStepsModule).filter((name) => /secret/i.test(name)).sort();
-  assert.deepEqual(exported, ['stepSecretHeldAsFile', 'storeStepSecret'], 'a store and a yes/no probe — no reader');
+  assert.deepEqual(exported, ['bodyCarriesSecret', 'secretPlace'], 'a place and a screen — no store and no reader');
   const source = readFileSync(join(SKILL_DIR, 'viewer', 'server', 'human-steps.ts'), 'utf8');
   // Compared as booleans and short lists — an assertion that fails over the
   // whole source makes node diff twenty kilobytes, which takes minutes.
   assert.equal(source.includes('find-generic-password'), false, 'no keychain read');
+  assert.equal(source.includes('keychainStore'), false, 'no keychain write');
+  assert.equal(source.includes('writeFileSync'), false, 'no file write but the ledger\'s own append');
   const reads = [...source.matchAll(/readFileSync\(([^,)]*)/g)].map((m) => m[1].trim());
   assert.deepEqual(reads, ['path'], 'the one file read is the ledger\'s own (`linesOf`) — never a stored secret');
   assert.ok(/function linesOf\(path: string\)[\s\S]{0,200}readFileSync\(path, 'utf8'\)/.test(source), 'and it is inside linesOf');
+});
+
+test('control-tower phase 130: the ledger writes version 2 and still reads version 1', async () => {
+  const { HUMAN_STEP_LINE_VERSION, HUMAN_STEP_LINE_VERSIONS, withTurnDefaults } = await import('../server/human-steps.ts');
+  assert.equal(HUMAN_STEP_LINE_VERSION, 2);
+  assert.deepEqual([...HUMAN_STEP_LINE_VERSIONS], [1, 2]);
+  const old = withTurnDefaults({
+    id: 'x', kind: 'person-check', title: 'Look at it', where: 'any', birth: 'plan', slug: 's', phase: 1,
+    state: 'notified', declaredAt: '2026-10-01T00:00:00Z', at: '2026-10-01T00:00:00Z', opened: 0,
+  } as never);
+  assert.deepEqual([old.why, old.whySource, old.proofType, old.attempts], ['decision', 'inferred', 'answer', 0]);
+  assert.deepEqual(old.waiters, [{ slug: 's', phase: 1 }]);
+});
+
+test('phase 132: a console item keeps the source that raised it; a session or a plan cannot name one', async () => {
+  const { sanitiseStep } = await import('../server/human-steps.ts');
+  const console_ = sanitiseStep({ kind: 'operator-act', title: 'Run the applies', source: { kind: 'errand', ref: 'blocked-declared:human-acts' } }, 'console');
+  assert.deepEqual(console_?.step.source, { kind: 'errand', ref: 'blocked-declared:human-acts' });
+  for (const birth of ['session', 'plan'] as const) {
+    const clean = sanitiseStep({ kind: 'operator-act', title: 'Run the applies', proof_type: 'attest', source: { kind: 'errand' } }, birth);
+    assert.equal(clean?.step.source, undefined, `a ${birth} step names no source`);
+    assert.ok(clean?.dropped.includes('source'));
+  }
+  const bad = sanitiseStep({ kind: 'operator-act', title: 'x', source: { kind: 'Not A Word!' } }, 'console');
+  assert.equal(bad?.step.source, undefined);
+});
+
+/* ------------------------------------------------------------------ *
+ * HS-6 — the check's record (control-tower phase 134, #211)
+ * ------------------------------------------------------------------ */
+
+test('HS-6 — a verdict rides its move: the item keeps the last and every one, its attempts, and when it escalated', async () => {
+  const { shapeVerdict } = await import('../server/turn/verdict.ts');
+  const s = scratch();
+  try {
+    const file = join(s.dir, 'human-steps.ndjson');
+    const ledger = new HumanStepLedger(file);
+    const step = ledger.declare({ slug: 'demo', phase: 3, birth: 'session', clean: sanitiseStep(STEP, 'session')!.step });
+    assert.equal(step.attempts, 0);
+    assert.equal(step.verdict, undefined, 'a fresh item has no verdict');
+    const at = '2026-10-07T10:00:00.000Z';
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      assert.ok(!('refused' in ledger.move(step.id, 'checking', { by: 'mobin', verb: 'check' })));
+      const verdict = shapeVerdict({ state: 'rejected', note: `read ${attempt}`, redo: ['do it again'] }, { by: 'probe', attempt, at })!;
+      const back = ledger.move(step.id, 'returned', {
+        by: 'mobin', verb: 'return', note: 'Back to you', verdict, read: `exit ${attempt}`, ...(attempt === 3 ? { escalated: true as const } : {}),
+      });
+      assert.ok(!('refused' in back));
+    }
+    let now = ledger.get(step.id)!;
+    assert.equal(now.state, 'returned');
+    assert.equal(now.attempts, 3);
+    assert.equal(now.read, 'exit 3', 'what the proof read at the last check');
+    assert.deepEqual(now.verdicts?.map((v) => [v.attempt, v.state]), [[1, 'rejected'], [2, 'rejected'], [3, 'rejected']]);
+    assert.ok(now.escalatedAt, 'escalated, once');
+    const owner = shapeVerdict({ state: 'passed', note: 'Accepted anyway by the owner.' }, { by: 'owner', attempt: 3, at, unverified: true })!;
+    assert.ok(!('refused' in ledger.move(step.id, 'proven', { by: 'mobin', verb: 'override', note: 'accepted anyway', verdict: owner })));
+    now = ledger.get(step.id)!;
+    assert.deepEqual([now.state, now.provenBy, now.verdict?.by, now.verdict?.unverified, now.verdicts?.length], ['proven', 'mobin', 'owner', true, 4]);
+    const history = ledger.history(step.id);
+    assert.deepEqual(history.filter((m) => m.verdict).map((m) => m.verb), ['return', 'return', 'return', 'override']);
+    // A line written before phase 134 carries no verdict and reads as it always did.
+    const old = ledger.declare({ slug: 'demo', phase: 4, birth: 'session', clean: sanitiseStep({ ...STEP, title: 'Another' }, 'session')!.step });
+    appendFileSync(file, `${JSON.stringify({ v: 2, id: old.id, state: 'checking', at, verb: 'check' })}\n`);
+    appendFileSync(file, `${JSON.stringify({ v: 2, id: old.id, state: 'notified', at, verb: 'check', note: 'pending' })}\n`);
+    const read = readLedger(file).steps.get(old.id)!;
+    assert.deepEqual([read.state, read.attempts, read.verdict, read.verdicts, read.read], ['notified', 1, undefined, undefined, 'pending']);
+  } finally { s.cleanup(); }
 });

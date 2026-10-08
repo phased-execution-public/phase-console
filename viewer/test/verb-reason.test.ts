@@ -147,7 +147,7 @@ test('RE-1: actorOfRequest carries the body\'s reason — trimmed, capped, and a
   assert.equal(actorOfRequest(BROWSER, {}, { reason: 'x'.repeat(5_000) }).reason?.length, ACTOR_REASON_MAX);
   // The who is unchanged by the why.
   const actor = actorOfRequest(BROWSER, {}, { by: 'mobin', reason: WHY });
-  assert.deepEqual({ ...actor }, { by: 'mobin', via: 'api', origin: 'local', remoteUser: null, reason: WHY });
+  assert.deepEqual({ ...actor }, { by: 'mobin', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local', reason: WHY });
 });
 
 /* ------------------------------------------------------------------ *

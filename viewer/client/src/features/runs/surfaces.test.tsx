@@ -58,6 +58,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
       plans: vi.fn(async () => []),
       stats: vi.fn(async () => null),
       approvals: vi.fn(async () => []),
+      inbox: vi.fn(async () => ({ items: [], generatedAt: new Date().toISOString() })),
       auth: vi.fn(async () => ({ loggedIn: true, checkedAt: '2026-08-03T00:00:00Z' })),
       runTranscript: vi.fn(async () => []),
       policy: vi.fn(async () => {
@@ -588,6 +589,35 @@ describe('the Tower', () => {
         status: 'pending',
       },
     ] as never);
+    // The queue draws the card as its item: the inbox row the server folds it into (phase 139).
+    vi.mocked(api.inbox).mockResolvedValue({
+      generatedAt: new Date().toISOString(),
+      items: [
+        {
+          id: 'approval-a1',
+          kind: 'approval',
+          severity: 'urgent',
+          slug: 'demo',
+          phase: 3,
+          runId: 'r1',
+          title: 'Bash: npm publish',
+          need: 'Phase 3 of demo asks to run npm publish.',
+          how: 'Allow it or deny it.',
+          since: new Date().toISOString(),
+          href: '#/plan/demo/run',
+          actions: [{ verb: 'allow', label: 'Allow', endpoint: '/api/approvals/a1', method: 'POST' }],
+          turn: {
+            item: 'approval-a1',
+            record: 'projected',
+            source: 'approval',
+            kind: 'permission',
+            why: 'permission',
+            proofType: 'grant',
+            group: 'now',
+          },
+        },
+      ],
+    } as never);
     vi.mocked(api.auth).mockResolvedValue({ loggedIn: false, checkedAt: '2026-08-03T00:00:00Z' } as never);
     try {
       const { default: RunsView } = await import('@/features/runs');
@@ -609,6 +639,10 @@ describe('the Tower', () => {
       expect((await screen.findByTestId('situation-line')).textContent).toContain('1 needs you');
     } finally {
       vi.mocked(api.approvals).mockImplementation(async () => []);
+      vi.mocked(api.inbox).mockImplementation(async () => ({
+        items: [],
+        generatedAt: new Date().toISOString(),
+      }));
       vi.mocked(api.auth).mockImplementation(
         async () => ({ loggedIn: true, checkedAt: '2026-08-03T00:00:00Z' }) as never,
       );

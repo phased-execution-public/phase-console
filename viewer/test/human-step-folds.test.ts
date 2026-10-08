@@ -35,8 +35,15 @@ const inbox = (facts: Record<string, unknown>): Item[] => buildInbox({ plans: []
 
 test('the fold map names every hand-built card once, each as a kind of the family', () => {
   assert.deepEqual(Object.keys(HUMAN_STEP_FOLDS).sort(), [
-    'gate', 'mcp-auth', 'person-check', 'plan-approval', 'protected-path', 'qa', 'question', 'sign-in',
+    'approval', 'conflict', 'errand', 'gate', 'mcp-auth', 'person-check', 'plan-approval', 'protected-path', 'qa',
+    'question', 'sign-in', 'stall', 'supervisor',
   ]);
+  // Widened by control-tower phase 132 (#209): every row Your turn folds.
+  assert.equal(HUMAN_STEP_FOLDS.errand, 'operator-act', 'a person errand is an operator act');
+  assert.equal(HUMAN_STEP_FOLDS.approval, 'permission', 'the approval broker\'s ask is a permission item');
+  assert.equal(HUMAN_STEP_FOLDS.conflict, 'decision');
+  assert.equal(HUMAN_STEP_FOLDS.supervisor, 'operator-act');
+  assert.equal(HUMAN_STEP_FOLDS.stall, 'operator-act');
   for (const kind of Object.values(HUMAN_STEP_FOLDS)) assert.ok((HUMAN_STEP_KINDS as readonly string[]).includes(kind));
   // The one view carries the kind's own words — KIND_META is read, never re-spelled.
   const view = humanStepView({ kind: 'mcp-login', title: 'x' });
@@ -269,4 +276,23 @@ test('a silent lane\'s suspected turn is raised at once, with the link it saw an
   });
   assert.equal(after.filter((item) => item.kind === 'stall').length, 0);
   assert.equal(after.filter((item) => item.kind === 'human-step').length, 1);
+});
+
+test('phase 132: every folded row carries a turn view of the fold\'s kind, and the stall reading draws as its suspected kind', () => {
+  const rows = inbox({
+    approvals: [
+      { id: 't9', runId: 'r1', slug: 'demo', phase: 3, kind: 'tool', title: 'Run `rm -rf build`?', createdAt: '2026-09-30T11:00:00.000Z', status: 'pending' },
+    ],
+    runs: [{
+      id: 'r9', slug: 'demo', status: 'parked', updatedAt: '2026-09-30T10:00:00.000Z', phases: {},
+      recoveries: { 3: { errand: { phase: 3, situation: 'verify-red', tried: [], need: 'n', how: 'h', at: '2026-09-30T10:00:00.000Z' } } },
+    }],
+  });
+  const tool = rows.find((row) => row.kind === 'approval');
+  assert.equal(tool?.turn?.kind, HUMAN_STEP_FOLDS.approval);
+  assert.equal(tool?.turn?.record, 'projected');
+  assert.equal(tool?.humanStep, undefined, 'still no person\'s card of its own — that is phase 135\'s');
+  const ladder = rows.find((row) => row.kind === 'errand');
+  assert.equal(ladder?.turn?.kind, HUMAN_STEP_FOLDS.errand, 'the ladder\'s own ask is an operator act for a person to decide');
+  assert.equal(ladder?.turn?.group, 'decide');
 });

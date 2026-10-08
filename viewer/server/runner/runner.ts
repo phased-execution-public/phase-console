@@ -65,6 +65,7 @@ import {
   classifySituation, collectEvidence, situation as situationOf, workEvidence,
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './situation.ts';
+import { answeredByItem, grantedByItem, strikeLabel, wallOfCliDenial, wallOfHookDenial } from '../permissions/walls.ts';
 import {
   accountRung, capErrand, capRefusal, chargeRung, countedRungs, errandFor, errandSaid, widenCard, widenInstruction, nextRung, openRunRungs,
   retryForgives, runCapOverrides, rungKey, rungsFor, switchRungDecision, untriedRungs, DEFAULT_LADDER_CAPS, PERSON_SLOT_BY, type LadderCaps, type Rung,
@@ -1752,6 +1753,19 @@ export class Runner extends RunnerAttempt {
     const denied = record.toolDenied;
     if (!state || !approvals || !this.deps.widenRule || !denied?.rule || denied.rule === 'in-turn-wait') return false;
     const { approval, decided } = approvals.offer(widenCard({ runId: state.id, slug: state.slug, phase: record.phase, denied }));
+    // The widen rung raises the permission ITEM (control-tower phase 135): the
+    // card is its Grant's mechanism — today's permanent plan strike, labelled
+    // so — and Your turn shows one item, never a card of its own.
+    const wall = [...(record.walls ?? [])].reverse().find((kept) => kept.rule === denied.rule) ?? wallOfHookDenial(denied, denied.at);
+    let itemId: string | null = null;
+    try {
+      itemId = this.deps.raisePermission?.({
+        slug: state.slug, runId: state.id, phase: record.phase,
+        ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+        wall, need: record.declared?.reason ?? null,
+        grant: { effect: 'strike', approvalId: approval.id, label: strikeLabel(denied.rule) },
+      }) ?? null;
+    } catch (error) { log.warn('runner.widen-rule.failed', { runId: state.id, phase: record.phase, error }); }
     const climbed = accountRung(slot, {
       situation: situation.key, rung: rung.vehicle, params: rung.params, at: now, note: rung.label,
     });
@@ -1762,6 +1776,7 @@ export class Runner extends RunnerAttempt {
     this.record('phase.rung', {
       situation: situation.key, rung: rung.vehicle, params: rung.params ?? null,
       vehicle: 'card', cardId: approval.id, attempt: slot.attempts, by,
+      ...(itemId ? { item: itemId } : {}),
     }, record.phase);
     this.emit('phase', { phase: record.phase, status: 'parked', note: record.note, situation: situation.key, rung: rung.vehicle });
     this.persist();
@@ -1884,8 +1899,9 @@ export class Runner extends RunnerAttempt {
   /** The card's answer: strike and re-board, or settle the rung and leave the errand. */
   private widenDecided(
     phase: number, cardId: string, denied: { rule: string; command?: string },
-    outcome: { decision: 'allow' | 'deny'; by: string; reason?: string },
+    answered: { decision: 'allow' | 'deny'; by: string; reason?: string; door?: string; fresh?: boolean },
   ): void {
+    let outcome = answered;
     const state = this.state;
     if (!state || !state.phases[String(phase)]) return;
     const record = phaseRecord(state, phase);
@@ -1896,8 +1912,30 @@ export class Runner extends RunnerAttempt {
       decision: outcome.decision, by: outcome.by, rule: denied.rule, cardId,
       ...(outcome.reason ? { reason: outcome.reason } : {}),
     }, phase);
+    // Granted on its permission ITEM (control-tower phase 149): the engine
+    // applied the grant at the scope a person chose — no plan strike here —
+    // and the item's road back resumes the session. The rung is superseded.
+    if (outcome.decision === 'allow' && grantedByItem(outcome.reason)) {
+      this.settleOpenRung(phase, 'superseded', 'granted on its permission item');
+      this.persist();
+      return;
+    }
+    // The card's own Allow is a grant too (phase 149) — refused for a never
+    // rule, and on a console with an owner key unless the owner's fresh touch
+    // came with the answer.
+    const widened = outcome.decision === 'allow'
+      ? this.deps.widenRule?.(state.slug, denied.rule, outcome.by, {
+        runId: state.id, phase, card: cardId, door: outcome.door ?? null,
+        ...(typeof outcome.fresh === 'boolean' ? { fresh: outcome.fresh } : {}),
+      })
+      : undefined;
+    if (widened === false || typeof widened === 'string') {
+      outcome = {
+        decision: 'deny', by: outcome.by,
+        reason: typeof widened === 'string' ? `no grant was made — ${widened}` : 'the rule is on the never list — no grant is offered through any door',
+      };
+    }
     if (outcome.decision === 'allow') {
-      this.deps.widenRule?.(state.slug, denied.rule, outcome.by);
       // The loop that offered the card has ended (the run parked or halted
       // meanwhile): the stopped-run door — the recover verb — resumes the
       // phase's own session, which is the door a person's Resume takes too.
@@ -1922,6 +1960,13 @@ export class Runner extends RunnerAttempt {
       return;
     }
     this.settleOpenRung(phase, 'failed', `the widen card was ${outcome.by === 'timeout' ? 'not answered' : `denied by ${outcome.by}`}`);
+    // Answered on its permission ITEM (control-tower phase 135): Deny and I'll
+    // do it myself resume the session on the item's own road back — an errand
+    // here would ask a person a second time what they have just answered.
+    if (answeredByItem(outcome.reason)) {
+      this.persist();
+      return;
+    }
     const situation: Situation = {
       id: 'blocked-declared', sub: 'permission', key: 'blocked-declared:permission',
       label: 'Declared blocked · permission', blurb: '', actor: 'machine', why: [],
@@ -4132,6 +4177,11 @@ export class Runner extends RunnerAttempt {
         ...(event.reason ? { reason: event.reason } : {}),
         ...(event.reasonType ? { reasonType: event.reasonType } : {}),
       }, phase);
+      // …and the wall it is, on the lane's record (control-tower phase 135):
+      // a tool outside the allow list, an MCP tool not granted, the CLI's copy
+      // of a deny rule — what a permission declaration then cites (G5).
+      const wall = wallOfCliDenial(event, this.now().toISOString());
+      if (wall) this.noteWall(phase, wall);
     }
     if (event.kind === 'tool-result' && event.refused) {
       this.record('phase.tool-refused', {

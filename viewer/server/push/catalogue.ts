@@ -16,10 +16,12 @@
  * laptop rarely want the same ones.
  */
 
+import { GRANT_SCOPE_WORDS } from '../../shared/turn-model.js';
+
 export type CategoryId =
   | 'approval' | 'session-ask' | 'needs-you' | 'gate' | 'qa' | 'halted' | 'parked' | 'stalled'
   | 'phase' | 'finished' | 'ready' | 'changed' | 'session' | 'health' | 'limits' | 'usage-climbing'
-  | 'budget' | 'issue' | 'digest';
+  | 'budget' | 'issue' | 'digest' | 'granted';
 
 export type Category = {
   id: CategoryId;
@@ -210,40 +212,79 @@ export const CATEGORIES: readonly Category[] = [
   {
     id: 'digest',
     label: 'Hourly digest',
-    detail: 'A summary instead of a stream: once an hour, every decision waiting on you with how long it '
+    detail: 'A summary instead of a stream: once an hour, Your turn first — how many items need you, how many '
+      + 'came back from a check, how many the AI handled — then every decision waiting on you with how long it '
       + 'has waited and when it expires, every parked run and every stalled session — and, once the channel '
       + 'answers again, the notifications an outage kept from arriving. Nothing waiting sends nothing. Off by '
       + 'default: the categories above already say each thing as it happens.',
     byDefault: false,
     urgent: false,
   },
+  {
+    id: 'granted',
+    label: 'Permission granted',
+    detail: 'A grant was applied (control-tower phase 149): who granted which rule, for how far — this call, this '
+      + 'phase, this plan, this repository or always — until when, and exactly what it changed. Every grant is a '
+      + 'row you can revoke from Settings ▸ Permissions ▸ Grants, and the push opens there, at that grant. Not '
+      + 'urgent: it is a record of authority given, and the session it answered resumes by itself.',
+    byDefault: true,
+    urgent: false,
+  },
 ];
+
+/**
+ * The `granted` push (control-tower phase 149): one per grant applied — who,
+ * the rule, the reach, the end, and what it changed — tagged by the grant so a
+ * repeat replaces rather than stacks. Never a secret: the rule and the command
+ * on a row were redacted when they were recorded.
+ */
+export function grantedPush(row: {
+  id: string; by: string; rule: string; scope: string; until: string | null; door: string | null;
+  changed: readonly { kind: string }[]; slug: string | null; phase: number | null;
+}): { title: string; body: string; tag: string } {
+  const reach = GRANT_SCOPE_WORDS as Readonly<Record<string, string>>;
+  const end = row.until ? `until ${row.until.slice(0, 16)}Z at the latest` : 'until revoked';
+  const where = row.slug ? `${row.slug}${row.phase != null ? ` · phase ${row.phase}` : ''}` : 'this console';
+  const kinds = [...new Set(row.changed.map((change) => change.kind))];
+  return {
+    title: `Granted: ${row.rule}`.slice(0, 120),
+    body: `${row.by}${row.door ? ` (${row.door})` : ''} granted ${row.rule} for ${reach[row.scope] ?? row.scope}, ${end} — ${where}. `
+      + `Changed: ${kinds.length ? kinds.join(', ') : 'nothing — it was already so'}.`,
+    tag: `granted:${row.id}`,
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * A person's turn — what a human step's push carries (control-tower phase 41)
  * ------------------------------------------------------------------ */
 
 /**
- * The actions a human step's `needs-you` push names: *Open* (the step's link
- * or command, where the person is) and *I did it* (run the proof now). Named
- * as DATA on the payload's `step` — each `action` is the verb's own name,
- * `POST /api/human-steps/:id/<action>` (control-tower phase 43) — and *I did
- * it* is ALSO a signed button (`check` in `PUSH_ACTION_VERBS`), because
- * answering it needs no page: the proof runs on the console. *Open* needs the
- * person's own browser, so it stays the notification's tap. Two, and never
- * more — the platform cap. Phase 42 draws them.
+ * The actions an ACT's `needs-you` push names: *Open* (the item, where the
+ * person is) and *I did it* (run the proof now). Named as DATA on the
+ * payload's `step` — each `action` is the verb's own name, `POST
+ * /api/human-steps/:id/<action>` (control-tower phase 43) — and *I did it* is
+ * ALSO a signed button (`check` in `PUSH_ACTION_VERBS`), because answering it
+ * needs no page: the proof runs on the console. *Open* needs the person's own
+ * browser, so it stays the notification's tap. Two, and never more — the
+ * platform cap. Phase 42 draws them. A permission item and a decision name
+ * their own (`push/actions.ts` `lockScreenOf`, control-tower phase 138): what
+ * the `device` door may press, and nothing else.
  */
 export const HUMAN_STEP_PUSH_ACTIONS = Object.freeze([
   Object.freeze({ action: 'open', title: 'Open' }),
   Object.freeze({ action: 'check', title: 'I did it' }),
 ] as const);
 
+/** One button a step's push names: the worker's own *Open*, or a verb the token signs. */
+export type StepPushAction = { readonly action: string; readonly title: string };
+
 /** The `step` block of a human step's push payload — ids and words, never a secret. */
 export type HumanStepPush = {
   id: string;
   kind: string;
   where: 'host' | 'any';
-  actions: typeof HUMAN_STEP_PUSH_ACTIONS;
+  /** The lock screen's buttons, in order (control-tower phase 138) — at most two. */
+  actions: readonly StepPushAction[];
   /** A `device-code` step's code: the one code a push carries, on purpose. */
   code?: string;
 };
@@ -253,10 +294,11 @@ export type HumanStepPush = {
  * phase, a body saying what to do — with the device code, when the kind has
  * one) and the payload's `step` block. `detail`, which is what a webhook and
  * the out-of-band notice carry off the machine, never holds the code.
+ * `actions` is the lock screen's list (`lockScreenOf`); an act's by default.
  */
 export function humanStepPush(step: {
   id: string; kind: string; label: string; title: string; where: 'host' | 'any'; slug: string; phase: number; code?: string;
-  openCommand?: string; openUrl?: string;
+  openCommand?: string; openUrl?: string; actions?: readonly StepPushAction[];
 }): { message: { title: string; body: string; detail: string }; step: HumanStepPush } {
   const place = step.where === 'host' ? ' — at the machine the console runs on' : '';
   // Phase 0 is the plan itself — its `## Operator errands` (control-tower phase 121).
@@ -276,7 +318,7 @@ export function humanStepPush(step: {
       detail: `${step.title}${place}.`,
     },
     step: {
-      id: step.id, kind: step.kind, where: step.where, actions: HUMAN_STEP_PUSH_ACTIONS,
+      id: step.id, kind: step.kind, where: step.where, actions: step.actions ?? HUMAN_STEP_PUSH_ACTIONS,
       ...(step.code ? { code: step.code } : {}),
     },
   };
@@ -300,6 +342,51 @@ export function humanStepReminderPush(
       detail: `${first.message.detail} Reminder ${n}.`,
     },
     step: first.step,
+  };
+}
+
+/** The words of a check's push — the one tag the item's pushes ride, so it replaces the first. */
+type TurnWords = { title: string; body: string; detail: string };
+
+/** The item's scope in words: a phase of a plan, or the plan itself (phase 0). */
+function scopeOf(step: { slug: string; phase: number }): string {
+  return step.phase > 0 ? `${step.slug} phase ${step.phase}` : `the plan ${step.slug}`;
+}
+
+/**
+ * A check sent the item back (control-tower phase 134, #211) — said ONCE, on
+ * the item's own tag: what came back and exactly what to redo. The verdict's
+ * words were redacted when it was shaped; the push repeats them, nothing more.
+ */
+export function humanStepReturnedPush(
+  step: { title: string; label: string; slug: string; phase: number },
+  verdict: { state: string; note: string; redo: readonly string[]; attempt: number },
+): { message: TurnWords } {
+  const head = verdict.state === 'needs-info' ? 'Needs more from you' : 'Back to you';
+  const redo = verdict.redo.length ? ` ${verdict.state === 'needs-info' ? 'Send' : 'Redo'}: ${verdict.redo.join('; ')}` : '';
+  return {
+    message: {
+      title: `${head}: ${step.label.toLowerCase()} — ${scopeOf(step)}`,
+      body: `${step.title} — attempt ${verdict.attempt}: ${verdict.note}${redo}`,
+      detail: `${step.title} — attempt ${verdict.attempt} came back ${verdict.state}.`,
+    },
+  };
+}
+
+/**
+ * The escalation (control-tower phase 134): the `turnEscalateAfter`-th
+ * rejection of one item, said ONCE — the attempts are side by side on the
+ * item, with its three ways out.
+ */
+export function humanStepEscalationPush(
+  step: { title: string; label: string; slug: string; phase: number }, rejections: number,
+): { message: TurnWords } {
+  return {
+    message: {
+      title: `Stuck after ${rejections} checks: ${step.label.toLowerCase()} — ${scopeOf(step)}`,
+      body: `${step.title} came back ${rejections} times. Rewrite the guide, say you can't, or accept it anyway — every attempt is on the item.`,
+      detail: `${step.title} came back ${rejections} times and needs the owner.`,
+    },
   };
 }
 
@@ -369,6 +456,13 @@ export type RouteContext = {
   sessionKind?: 'shell' | 'claude' | null;
   /** A Tower bay to land on instead of the run — a supervisor's card (phase 102). */
   bay?: 'needs-you' | null;
+  /**
+   * The item a push is about (control-tower phase 138, #215): an item's push —
+   * its first, each reminder, a check's return — opens the item itself.
+   */
+  stepId?: string | null;
+  /** The grant a `granted` push announces (phase 138): it opens Settings ▸ Permissions ▸ Grants at that row. */
+  grantId?: string | null;
 };
 
 /**
@@ -393,6 +487,11 @@ export function routeFor(category: CategoryId, context: RouteContext = {}): stri
   const phase = typeof context.phase === 'number' && Number.isInteger(context.phase) && context.phase > 0
     ? context.phase : null;
 
+  // An item is answered on its own page (control-tower phase 138, #215): Your
+  // turn's `#/turn/<id>`, the item expanded with its guide and its buttons —
+  // the same address the worker's `stepTarget` opens from the step block, so
+  // the body's tap, *Open*, the bell's row and a webhook's link all agree.
+  if (category === 'needs-you' && context.stepId) return `/#/turn/${encodeURIComponent(context.stepId)}`;
   // A supervisor's card is answered where it stands (control-tower phase 102):
   // the Tower's Needs-you bay, where its ONE action is.
   if (category === 'needs-you' && context.bay) return `/#/runs?bay=${encodeURIComponent(context.bay)}`;
@@ -453,6 +552,13 @@ export function routeFor(category: CategoryId, context: RouteContext = {}): stri
     // A summary of everything waiting lands where everything waiting is: Now.
     case 'digest':
       return '/#/now';
+    // A grant is listed, with its cause and its Revoke, on Settings ▸
+    // Permissions ▸ Grants — and the push opens AT the grant it announces
+    // (control-tower phase 138), the row's id one query value.
+    case 'granted':
+      return context.grantId
+        ? `/#/settings/permissions?grant=${encodeURIComponent(context.grantId)}`
+        : '/#/settings/permissions';
     default: {
       // Exhaustiveness: a new category added to CATEGORIES without a route here
       // is a compile error, not a notification that silently opens the

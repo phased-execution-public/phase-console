@@ -144,7 +144,7 @@ outcome_env() {
   "status": "needs-human",
   "reason": "gh is signed out",
   "needs": "credential",
-  "step": {"kind": "browser-login", "title": "Sign the gh CLI in", "open_command": "gh auth login --web", "where": "host", "proof": "cmd:\"gh auth status\"", "lines": ["Run the command","Approve it in the browser"]},
+  "step": {"kind": "browser-login", "title": "Sign the gh CLI in", "open_command": "gh auth login --web", "where": "host", "proof": "cmd:\"gh auth status\"", "lines": ["Run the command","Approve it in the browser"], "why": "identity", "why_source": "inferred"},
   "watch": [],
   "written_at": "2026-09-30T10:00:00Z"
 }'
@@ -154,9 +154,9 @@ outcome_env() {
 @test "outcome: a device-code step carries its code; where defaults to the kind's" {
   outcome_env
   run pe_outcome demo 8 needs-human --needs credential --step device-code --title "Enter the code" \
-    --open-url https://github.com/login/device --code ABCD-1234
+    --open-url https://github.com/login/device --code ABCD-1234 --proof-type attest
   [ "$status" -eq 0 ]
-  grep -q '"step": {"kind": "device-code", "title": "Enter the code", "open_url": "https://github.com/login/device", "where": "any", "code": "ABCD-1234"},' "$PE_OUTCOME_FILE"
+  grep -q '"step": {"kind": "device-code", "title": "Enter the code", "open_url": "https://github.com/login/device", "where": "any", "code": "ABCD-1234", "why": "identity", "why_source": "inferred", "proof_type": "attest"},' "$PE_OUTCOME_FILE"
 }
 
 @test "outcome: --step is refused off needs-human, and its fields are refused without it" {
@@ -239,15 +239,35 @@ outcome_env() {
   # shellcheck source=/dev/null
   . "$PE_DIR/scripts/human-steps.env"
   set -- $HUMAN_STEP_KINDS
-  [ "$#" -eq 17 ]
+  [ "$#" -eq 18 ]
   for kind in $HUMAN_STEP_KINDS; do
-    extra=""
-    [ "$kind" = secret-entry ] && extra="--credential some-id"
+    # A step names how it is proven (G2, control-tower phase 130) — here, the person's word.
+    extra="--proof-type attest"
+    [ "$kind" = secret-entry ] && extra="$extra --credential some-id"
     # shellcheck disable=SC2086
     run pe_outcome demo 8 needs-human --needs credential --step "$kind" --title "do the thing" $extra
     [ "$status" -eq 0 ] || { echo "$kind refused: $output"; return 1; }
     rm -f "$PE_OUTCOME_FILE"
   done
+}
+
+# ---- the owner's moves (control-tower phase 133, #210) -------------------------
+
+@test "vocabulary: the owner's eleven verbs, each one a word a ledger move records" {
+  # shellcheck source=/dev/null
+  . "$PE_DIR/scripts/human-steps.env"
+  set -- $HUMAN_STEP_VERBS
+  [ "$#" -eq 11 ]
+  # Phase 134 adds the owner's Accept anyway (override) and the escalation's rewrite.
+  for verb in answer decline ask attach override rewrite; do
+    case " $HUMAN_STEP_VERBS " in *" $verb "*) ;; *) echo "no verb $verb"; return 1 ;; esac
+  done
+  for verb in $HUMAN_STEP_VERBS; do
+    case " $HUMAN_STEP_MOVES " in *" $verb "*) ;; *) echo "verb $verb records no move"; return 1 ;; esac
+  done
+  # A person's "not doing this" settles a step; the console's withdrawal is another word.
+  case " $HUMAN_STEP_STATES " in *" declined "*) ;; *) echo "no state declined"; return 1 ;; esac
+  case " $HUMAN_STEP_OPEN_STATES " in *" declined "*) echo "declined is open"; return 1 ;; *) ;; esac
 }
 
 # ---- the operator act (control-tower phase 121, #182) --------------------------
@@ -304,12 +324,12 @@ outcome_env() {
   run pe_outcome demo 8 needs-human --needs external --act --title "Push the release tag" \
     --open-command "git push origin v1.0.0" --due-when "gh:acme/app#run/42" --proof "gh:acme/app#pr/7"
   [ "$status" -eq 0 ]
-  grep -q '"step": {"kind": "operator-act", "title": "Push the release tag", "open_command": "git push origin v1.0.0", "where": "host", "proof": "gh:acme/app#pr/7", "due_when": "gh:acme/app#run/42"},' "$PE_OUTCOME_FILE"
+  grep -q '"step": {"kind": "operator-act", "title": "Push the release tag", "open_command": "git push origin v1.0.0", "where": "host", "proof": "gh:acme/app#pr/7", "due_when": "gh:acme/app#run/42", "why": "reserved", "why_source": "inferred"},' "$PE_OUTCOME_FILE"
 }
 
 @test "outcome: --due-when works with any --step; --act with another --step, or a due-when alone, is exit 2" {
   outcome_env
-  run pe_outcome demo 8 needs-human --needs credential --step browser-login --title "Sign in" --due-when "date:2026-10-06T09:00:00Z"
+  run pe_outcome demo 8 needs-human --needs credential --step browser-login --title "Sign in" --due-when "date:2026-10-06T09:00:00Z" --proof-type attest
   [ "$status" -eq 0 ]
   grep -q '"due_when": "date:2026-10-06T09:00:00Z"' "$PE_OUTCOME_FILE"
   rm -f "$PE_OUTCOME_FILE"

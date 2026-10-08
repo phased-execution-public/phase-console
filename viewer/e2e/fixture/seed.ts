@@ -16,7 +16,8 @@
  * adopted as an orphan. Nothing here imports `server/` — its paths are bound to
  * THIS process's environment at import, and this process is not sandboxed.
  * Later phases extend the shapes; the handoff of control-tower phase 15 lists
- * them.
+ * them. Since control-tower phase 137 the human-step ledger holds an item in
+ * every group of Your turn (`seedTurn`), and the handled log one row.
  */
 import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -53,7 +54,16 @@ export type SeedInfo = {
   tourPlan: string;
   plans: string[];
   runs: { slug: string; id: string; status: string; halt: string | null }[];
+  /** The ledger items Your turn draws, by the group each lands in (control-tower phase 137). */
+  turn: TurnSeed;
 };
+
+/** The seeded items: each id, and the group `GET /api/turn` puts it in. */
+export type TurnSeed = {
+  id: string;
+  group: 'now' | 'decide' | 'upcoming' | 'checking' | 'done';
+  kind: string;
+}[];
 
 const TITLES: Record<string, [string, string[]]> = {
   tower: [
@@ -445,10 +455,12 @@ export function seed(box: ConsoleSandbox, anchor: number): SeedInfo {
     writeFileSync(join(dir, `run-${r.id}.json`), `${JSON.stringify(state, null, 2)}\n`);
   }
   seedIssues(box, anchor);
+  const turn = seedTurn(box, anchor);
   return {
     anchor,
     tourPlan: 'tower',
     plans,
+    turn,
     runs: runs.map((r) => ({
       slug: r.slug,
       id: r.id,
@@ -551,4 +563,300 @@ function seedIssues(box: ConsoleSandbox, anchor: number): void {
     join(dir, `${DESK_REPO.replace(/[^A-Za-z0-9._-]+/g, '_')}.json`),
     JSON.stringify({ nameWithOwner: DESK_REPO, fetchedAt: anchor - 4 * 60_000, issues }),
   );
+}
+
+/**
+ * Your turn's items (control-tower phase 137, #214): the human-step ledger,
+ * written as the console writes it — a v2 declaration per item, then its
+ * moves — with an item in every group the page draws:
+ *
+ *   - *Do now*: a sign-in whose guide carries a command too long for a phone
+ *     (it scrolls inside its card), a secret the check sent back once (the
+ *     verdict and what to redo), and an operator act whose guide is Persian —
+ *     right-to-left, its command left-to-right;
+ *   - *Needs one detail*: a decision with three options, one recommended;
+ *   - *Coming up*: an act whose due-when is a date a month away;
+ *   - *Being checked*: a check in flight — its `at` is AHEAD of the anchor, so
+ *     the console's sweep of interrupted checks (six minutes) leaves it alone
+ *     for the whole tour, while its `declaredAt` stays behind;
+ *   - *Done*: a sign-in proven within the day.
+ *
+ * And the handled log one row — a standing grant that answered three times.
+ * They hang off `tower`'s last phases, which no run of the fixture is on.
+ */
+function seedTurn(box: ConsoleSandbox, anchor: number): TurnSeed {
+  const at = (min: number): string => new Date(anchor - min * 60_000).toISOString();
+  const ahead = (min: number): string => new Date(anchor + min * 60_000).toISOString();
+  const guide = (
+    summary: string,
+    steps: {
+      text: string;
+      code?: string;
+      expect?: string;
+      warn?: string;
+      link?: { label: string; url: string };
+    }[],
+    trouble: { symptom: string; fix: string }[] = [],
+    lang = 'en',
+  ) => ({ version: 1, lang, dir: lang === 'fa' ? 'rtl' : 'ltr', summary, steps, trouble });
+  const declare = (id: string, min: number, step: Record<string, unknown>) => ({
+    v: 2,
+    id,
+    where: 'host',
+    birth: 'session',
+    slug: 'tower',
+    phase: 7,
+    state: 'declared',
+    declaredAt: at(min),
+    at: at(min),
+    opened: 0,
+    attempts: 0,
+    whySource: 'declared',
+    waiters: [{ slug: 'tower', phase: 7 }],
+    ...step,
+  });
+  const move = (
+    id: string,
+    state: string,
+    verb: string,
+    when: string,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    v: 2,
+    id,
+    state,
+    verb,
+    at: when,
+    ...extra,
+  });
+
+  const lines: Record<string, unknown>[] = [
+    declare('turn-now-signin', 50, {
+      kind: 'browser-login',
+      title: 'Sign the gh CLI in to the estate',
+      why: 'identity',
+      proofType: 'probe',
+      proof: 'cmd:"gh auth status"',
+      proofWords: 'gh answers with your account, signed in.',
+      openUrl: 'https://github.com/login/device',
+      effortMin: 3,
+      unblocks: [{ slug: 'tower', phase: 8 }],
+      guide: guide(
+        'The phase pushes its branch, and **only you can sign in as yourself** — the session has no browser.',
+        [
+          {
+            text: 'Sign in from a terminal on this machine',
+            code: 'gh auth login --hostname github.com --git-protocol https --web --scopes repo,read:org,workflow,write:packages',
+            expect: 'A one-time code, then a browser page asking you to confirm it.',
+          },
+          {
+            text: 'Confirm the code in the browser',
+            link: { label: 'GitHub device sign-in', url: 'https://github.com/login/device' },
+            warn: 'Sign in as the account that owns the estate, not a personal one.',
+          },
+          { text: 'Come back and check', expect: 'The item moves to Being checked, then Done.' },
+        ],
+        [
+          {
+            symptom: 'The browser never opens',
+            fix: 'Open the link yourself and type the code shown in the terminal.',
+          },
+        ],
+      ),
+    }),
+    move('turn-now-signin', 'notified', 'notify', at(49), { by: 'console', pushed: false }),
+
+    declare('turn-now-secret', 120, {
+      kind: 'secret-entry',
+      title: 'Put the npm token in the keychain',
+      why: 'secret',
+      proofType: 'probe',
+      proof: 'cmd:"security find-generic-password -s phase-console-npm-token"',
+      secretWhere: 'the keychain item `phase-console-npm-token`',
+      effortMin: 5,
+      guide: guide('The release publishes with a token **only you hold**.', [
+        { text: 'Create an automation token on the registry' },
+        {
+          text: 'Store it in the keychain',
+          code: 'security add-generic-password -s phase-console-npm-token -a npm -w',
+          expect: 'The command asks for the token and prints nothing.',
+        },
+      ]),
+    }),
+    move('turn-now-secret', 'notified', 'notify', at(119), { by: 'console' }),
+    move('turn-now-secret', 'opened', 'open', at(100), { where: 'here' }),
+    move('turn-now-secret', 'checking', 'check', at(60)),
+    move('turn-now-secret', 'returned', 'return', at(59), {
+      verdict: {
+        state: 'rejected',
+        note: 'The keychain has no item by that name.',
+        redo: ['Store it under the service name phase-console-npm-token'],
+        read: ['security: The specified item could not be found in the keychain.'],
+        at: at(59),
+        by: 'probe',
+        attempt: 1,
+      },
+    }),
+
+    declare('turn-now-fa', 40, {
+      kind: 'operator-act',
+      title: 'کلید استقرار را روی این دستگاه بچرخانید',
+      why: 'reserved',
+      proofType: 'attest',
+      openCommand: 'phase-console capability pe-hub add --allow-issues',
+      effortMin: 2,
+      guide: guide(
+        'این کار را **فقط شما** انجام می‌دهید: یک قاعده آن را برای یک نفر نگه داشته است.',
+        [
+          {
+            text: 'این فرمان را در ترمینال اجرا کنید',
+            code: 'phase-console capability pe-hub add --allow-issues',
+            expect: 'خروجی `capability added` را چاپ می‌کند، در کمتر از 2 ثانیه.',
+          },
+          { text: 'برگردید و دکمهٔ بررسی را بزنید' },
+        ],
+        [],
+        'fa',
+      ),
+    }),
+    move('turn-now-fa', 'notified', 'notify', at(39), { by: 'console' }),
+
+    declare('turn-decide', 30, {
+      kind: 'decision',
+      title: 'Choose when the release ships',
+      why: 'decision',
+      proofType: 'answer',
+      allowDecline: true,
+      options: [
+        {
+          id: 'monday',
+          label: 'Ship it on Monday',
+          consequence: 'The release waits two days; the notes get a review.',
+          recommended: true,
+        },
+        { id: 'today', label: 'Ship it today', consequence: 'Nobody reviews the notes before they go out.' },
+        { id: 'hold', label: 'Hold it', consequence: 'Phase 8 waits until you choose again.' },
+      ],
+    }),
+    move('turn-decide', 'notified', 'notify', at(29), { by: 'console' }),
+
+    declare('turn-upcoming', 20, {
+      kind: 'operator-act',
+      state: 'upcoming',
+      title: 'Publish the package once the nightly build is green',
+      why: 'reserved',
+      proofType: 'probe',
+      proof: 'cmd:"npm view phase-console-pro version"',
+      openCommand: 'npm publish --access public',
+      dueWhen: `date:${ahead(30 * 24 * 60)}`,
+    }),
+
+    declare('turn-checking', 90, {
+      kind: 'physical',
+      title: 'Plug the hardware key into the build machine',
+      why: 'physical',
+      proofType: 'judgement',
+      proofWords: 'The machine lists the key under USB devices.',
+    }),
+    move('turn-checking', 'notified', 'notify', at(89), { by: 'console' }),
+    move('turn-checking', 'opened', 'open', at(80), { where: 'here' }),
+    move('turn-checking', 'checking', 'check', ahead(180)),
+
+    declare('turn-done', 300, {
+      kind: 'claude-login',
+      title: 'Sign Claude in again on this machine',
+      why: 'identity',
+      proofType: 'probe',
+      proof: 'cmd:"claude auth status"',
+    }),
+    move('turn-done', 'notified', 'notify', at(299), { by: 'console' }),
+    move('turn-done', 'proven', 'prove', at(240), { by: 'a person' }),
+
+    // A permission item the console raised from a recorded deny wall (phase
+    // 138): high at every scope, so the card shows all five, the blast radius
+    // and the typed rule — the phone's hardest shape.
+    declare('turn-permit', 35, {
+      kind: 'permission',
+      birth: 'console',
+      title: 'Allow npm publish for the release phase',
+      why: 'permission',
+      proofType: 'grant',
+      permission: {
+        wall: 'deny',
+        tool: 'Bash',
+        rule: 'Bash(npm publish:*)',
+        command: 'npm publish --access public --tag next ./dist/phase-console-pro-6.2.0.tgz',
+        need: 'The phase publishes the prebuilt package once both Releases exist.',
+        family: 'any',
+        risk: 'high',
+        scopes: ['call', 'phase', 'plan', 'repository', 'always'],
+        source: 'hook',
+        at: at(35),
+      },
+    }),
+    move('turn-permit', 'notified', 'notify', at(34), { by: 'console' }),
+  ];
+  const dir = join(box.stateHome, 'phase-console');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'human-steps.ndjson'), `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  // One live grant, made from this console (phase 138): Settings ▸ Permissions ▸
+  // Grants lists it with its cause, and the `granted` push opens it by its id.
+  writeFileSync(
+    join(dir, 'grants.ndjson'),
+    `${JSON.stringify({
+      type: 'grant',
+      row: {
+        id: 'g-e2e0permit0',
+        at: at(25),
+        by: 'e2e',
+        door: 'local',
+        item: 'turn-permit',
+        wall: 'ask',
+        tool: 'Bash',
+        rule: 'Bash(npm test:*)',
+        family: 'any',
+        risk: 'medium',
+        scope: 'plan',
+        slug: 'tower',
+        phase: 7,
+        runId: null,
+        until: null,
+        changed: [
+          {
+            kind: 'policy',
+            layer: 'plan',
+            file: 'tower.json',
+            slug: 'tower',
+            list: 'allow',
+            rule: 'Bash(npm test:*)',
+            op: 'add',
+          },
+        ],
+        reason: 'The suite runs on every phase of this plan.',
+      },
+    })}\n`,
+  );
+  writeFileSync(
+    join(dir, 'handled.ndjson'),
+    `${JSON.stringify({
+      source: 'auto-grant',
+      what: 'Allowed git push of the run branch pe/tower',
+      at: at(15),
+      first: at(200),
+      count: 3,
+      slug: 'tower',
+      phase: 2,
+      links: [{ kind: 'commit', ref: '41bc1f14d0c0ffee' }],
+    })}\n`,
+  );
+  return [
+    { id: 'turn-now-signin', group: 'now', kind: 'browser-login' },
+    { id: 'turn-now-secret', group: 'now', kind: 'secret-entry' },
+    { id: 'turn-now-fa', group: 'now', kind: 'operator-act' },
+    { id: 'turn-decide', group: 'decide', kind: 'decision' },
+    { id: 'turn-upcoming', group: 'upcoming', kind: 'operator-act' },
+    { id: 'turn-checking', group: 'checking', kind: 'physical' },
+    { id: 'turn-done', group: 'done', kind: 'claude-login' },
+    { id: 'turn-permit', group: 'now', kind: 'permission' },
+  ];
 }

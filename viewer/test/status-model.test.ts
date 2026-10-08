@@ -15,6 +15,8 @@
  *     holding failures that read green — resolve as §Architecture 3 says.
  */
 import './state-sandbox.ts';
+import { HUMAN_STEP_STATES } from '../shared/human-step-model.js';
+import { GRANT_STATES, RISK_TIERS, VERDICTS } from '../shared/turn-model.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -109,6 +111,11 @@ const OWNERS: Record<string, readonly string[]> = {
   'issue-severity': ISSUE_SEVERITY_WORDS,
   'issue-plan': ISSUE_PLAN_STATES,
   note: NOTE_SEVERITIES,
+  // Your turn (control-tower phase 130).
+  step: HUMAN_STEP_STATES,
+  verdict: VERDICTS,
+  risk: RISK_TIERS,
+  grant: GRANT_STATES,
 };
 
 /* ------------------------------------------------------------------ *

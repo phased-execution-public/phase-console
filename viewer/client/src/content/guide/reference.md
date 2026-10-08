@@ -47,6 +47,8 @@ All eight capability switches are off unless named. Flags are read once, at star
 | `phase-console install-hooks` | Add the session-presence hook to `~/.claude/settings.json`, so the console knows which sessions are live. `uninstall-hooks` removes it; `hooks-status` says whether it is there. |
 | `phase-console doctor [instance] [--json]` | Whether this machine is ready to run: the checks a run's start makes, with no plan — accounts, MCP servers, the `claude` login, a delivery channel, the presence hooks, the CLI version against the relay floor, `gh auth status`. Exit 1 names the first blocking row that fails. |
 | `phase-console sessions ingest [instance]` | Apply the presence hook's queued drops while no console is running — the hook runs it itself when its POST finds nobody. It does nothing while the console answers, because that console drains its own inbox. |
+| `phase-console owner status \| enroll \| lock` | The owner key from a terminal. `status` says whether the console is `unenrolled`, `enrolled` or `unlocked` (a key is enrolled and this request is the owner's), and lists the keys and the requests waiting. `enroll` prints the first key's one-time link, good for ten minutes and for one use: open it in a browser on this machine, and it opens `#/settings/permissions?enrol=<token>` to enrol a passkey. A console that already has a key refuses; a later key is enrolled from a browser signed in as the owner. `lock` ends every owner session now, so the next high-risk press asks for the key again. `--console <name\|port>` picks which console to ask, `--json` prints the raw answer. A supervised session cannot run `enroll` or `lock`. |
+| `phase-console grants list \| revoke <id> \| revoke-all` | The scoped grants from a terminal. `list` shows every grant, newest first: its rule and scope, who gave it and through which door, until when, and what it changed. `revoke <id>` ends one live grant and undoes exactly what it changed; `revoke-all` ends every live grant. Revoking takes authority away, so no owner key is needed. `--reason <words>`, `--console <name\|port>` and `--json` are its flags. A supervised session cannot revoke. |
 
 `./start` is the clone's equivalent, and it takes a **repository, not a verb**: its first bare
 argument becomes `--root`.
@@ -70,7 +72,9 @@ themselves.
 
 **Approving** — the phase page's Gate card, or `scripts/gate-approve.sh <slug> <N> --by <who>` —
 clears a gate of **any** kind: the row lands in `docs/handoffs/<slug>/gate-status.md`, and revoking
-it restores the gate. A `*(GATED)*` heading with no Gate-check at all reads as an **ai** gate (the
+it restores the gate. When the gate is a person's ask today, the card draws it as an item of **Your turn**
+and links there, where Approve takes its evidence; any other gate keeps the plan's own **Approve** and
+**Revoke**. A `*(GATED)*` heading with no Gate-check at all reads as an **ai** gate (the
 default since 5.0.0) — and fails the plan's lint until the author says which it is.
 
 ## Review holds
@@ -234,6 +238,50 @@ scripts/qa-record.sh <slug> N pass --report …   # record a QA result
 
 The full set — boot prompts, session batching, gate status, handoff scaffolding — is in
 `docs/controls.md`.
+
+## Your turn: the script and the routes
+
+A session that needs a person declares it with `phase-outcome.sh`. The console raises one item on
+**Your turn**, announces it once, checks it, and answers back to the session. The session's own
+reference is `references/turn.md`; these are the words a person meets.
+
+```bash
+scripts/phase-outcome.sh <slug> <N> needs-human --needs <key> --step <kind> --title "…" --why <reason> --guide <file>
+scripts/phase-outcome.sh <slug> <N> handled --what "…" [--note "…"] [--link <ref>]…
+```
+
+| Flag of `needs-human --step KIND` | Says |
+|---|---|
+| `--why REASON` | Why only a person fits it: one of ten reasons, held to what the kind allows. |
+| `--guide FILE` · `--lang TAG` | The full guide a person follows, and its language. A Persian one is drawn right to left. |
+| `--effort MIN` · `--due ISO` · `--unblocks PHASES` | How long it takes, when it falls due, and the phases it unblocks. |
+| `--proof-type TYPE` · `--proof-words TEXT` | How it is proven: `probe`, `answer`, `judgement` or `attest`, and the words a checking session reads when no command can. |
+| `--option ID=LABEL[::CONSEQUENCE]` · `--recommended ID` · `--allow-decline` | A decision's choices, the one recommended, and whether *Not doing this* is offered. |
+| `--window DURATION` | How long it may wait, at most seven days. |
+| `--tried TEXT` | What the session ran and how it failed — the answer to a refusal. |
+
+The exit says what became of it. `0`: written. `2`: refused for its shape — a reason the kind does not
+allow, no proof, a secret in any value. `3`: the proof already holds, so nothing is raised and the
+session carries on. `4`: the guard refused it, because the AI could do the act itself — every command
+its guide asks for is one the run's own policy allows — or because a permission block cites no wall
+the console recorded (*nothing refused this — run it*). A refusal is a row under *Handled by the AI*.
+
+`handled` is not an outcome. It records what the session did instead of asking a person, as a row under
+*Handled by the AI*: `--what` says what, `--note` adds a line, and up to eight `--link` refs point at a
+commit (`commit:<sha>`), a pull request (`pr:[owner/name]#<n>`), an issue (`issue:[owner/name]#<n>` or
+`#<n>`), a journal line (`journal:<slug>/<runId>#<line>`) or the URL of a GitHub commit, pull request or
+issue. A value shaped like a secret is refused.
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/turn` | Your turn's one read: the round that read it, the headline, the groups with their counts, and what was handled. `?seen=<ISO>` counts the handled rows since then. |
+| `GET /api/turn/:id` | One item explained: what it asks, its guide, its attempts, and why it is a person's. |
+| `POST /api/human-steps/:id/<verb>` | A press on one item: `check`, `snooze`, `cannot`, `ask`, `evidence`, `answer`, `decline`, `grant`, `deny`, `convert`, `rewrite` or `override`. |
+| `GET /api/permissions/grants` | Every grant, newest first. |
+| `POST /api/permissions/grants/:id/revoke` · `POST /api/permissions/grants/revoke-all` | End one live grant, or every one. |
+
+`answer`, `decline`, `deny`, `convert`, `grant`, `rewrite`, `override` and the two revokes are authority
+presses, a person's to make. The Permissions guide covers grants and the owner key.
 
 ## Keyboard
 

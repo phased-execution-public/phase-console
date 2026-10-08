@@ -37,6 +37,7 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
 **Sessions:** <!-- paste `scripts/phase-graph.sh <slug> --session-plan <model>`'s `Weight:` and `Forecast:` lines — generated, in the unit 1 phase ≥ 1 session. -->
 **Skills (every session):** <!-- optional — backtick each skill to use across ALL phases, e.g. `design-system`, `some-plugin:test-first`; the engine re-injects them into every phase's boot prompt + QA brief. Remove this line if none. -->
 **MCP servers (every session):** <!-- optional — backtick each MCP server id this work needs across ALL phases, e.g. `github`, `context7`. Registered in Phase Console → MCP; checked before a phase spends a token, so a wall costs a probe rather than an hour. Keep it to 3-6. Remove this line if none. -->
+**Guide language:** en <!-- optional — the language a person's-turn guide is written in (`fa`, `pt-BR`, …): a session writes its guide in it and passes it as --lang; a right-to-left one is drawn right to left. Read by the session, not the engine (references/turn.md). Remove this line for English. -->
 <!-- **MCP policy:** require   <-- optional. By default a server that cannot connect does NOT stop the
      phase: it runs without that server, is told which are missing, and records the gap as an operator
      errand. Add the line above only when the work genuinely cannot proceed without its servers — a
@@ -178,9 +179,12 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
                                       inherits the RUN, which is a different fact from `shared`.
      - **Issues:** draft          <-- off | draft | file — OVERRIDES the plan-wide Issues
      - **Waits on:** gh:<repo>#run · 45m <-- an expected external wait: the ref, and its maximum
-     - **Human step:** browser-login · <what> · open: <url or command> · proof: <ref> · where: host · window: 2d
-                                  <-- an act only a person can do: one of sixteen kinds (scripts/human-steps.env),
-                                      what proves it, where; `auto-open: host` lets it open by itself. --human-steps N
+     - **Human step:** browser-login · <what> · open: <url or command> · proof: <ref> · where: host · window: 2d · why: identity · effort: 5m · unblocks: 12 · guide: docs/guides/sign-in.md
+                                  <-- an act only a person can do: one of eighteen kinds (scripts/human-steps.env),
+                                      what proves it, where; why only a person fits it (a reason the kind allows,
+                                      scripts/turn.env), how long it takes, what it unblocks, and a guide file in
+                                      the grammar of references/turn.md; `auto-open: host` lets it open by itself;
+                                      `due: <ref>` keeps it Coming up until the ref lands. --human-steps N
      - **Person-check:** halt     <-- allow | halt | <owner> when a §Verification fragment is prose
      Read back with phase-graph.sh --size/--qa-mode/--mcp/--mcp-policy/--credentials/--credential-policy/--decisions <N>. -->
   <!-- Externally gated? mark *(GATED)* in the heading, write the conditions (numbered operator steps

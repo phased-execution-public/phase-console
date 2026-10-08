@@ -2507,3 +2507,37 @@ test('a person\'s turn is ONE family (control-tower phase 44): every row asking 
   }
   for (const row of byKind('approval')) assert.equal(row.humanStep, undefined, 'the fixture\'s approval is a tool card');
 });
+
+/* ------------------------------------------------------------------ *
+ * Your turn (control-tower phase 132, #209): a `turn` view on every row that
+ * asks a person for an act
+ * ------------------------------------------------------------------ */
+
+test('phase 132: every row that asks a person for an act carries a turn view; the bell\'s rows and issue drafts carry none', async () => {
+  const { BELL_KINDS } = await import('../server/turn/index.ts');
+  const at = '2026-08-22T11:00:00.000Z';
+  const items = buildInbox({
+    flags: { allowRun: true },
+    humanSteps: [{
+      id: 'step-i1', kind: 'device-code', title: 'Enter the code', where: 'any', slug: 'alpha', phase: 2, runId: 'r1',
+      birth: 'session', state: 'notified', declaredAt: at, code: 'ABCD-EFGH', why: 'identity', proofType: 'probe',
+      proof: 'cmd:"true"', source: { kind: 'declaration' },
+    }],
+    runs: [{
+      id: 'r1', slug: 'alpha', status: 'parked', updatedAt: at, phases: {},
+      recoveries: { 3: { errand: { phase: 3, situation: 'no-handoff', tried: [], need: 'n', how: 'h', at } } },
+    }],
+    approvals: [{ id: 't1', runId: 'r1', slug: 'alpha', phase: 3, kind: 'tool', title: 'Run `rm -rf build`?', createdAt: at, status: 'pending' }],
+  } as unknown as InboxFacts, NOW).items;
+  assert.ok(items.length >= 3);
+  for (const item of items) {
+    const bell = (BELL_KINDS as readonly string[]).includes(item.kind) || item.kind === 'issue-draft';
+    if (bell) assert.equal(item.turn, undefined, `${item.kind} stays in the bell`);
+    else if (item.severity !== 'fyi') assert.ok(item.turn, `${item.kind} ${item.id} carries a turn view`);
+  }
+  const step = items.find((item) => item.kind === 'human-step')!;
+  assert.deepEqual(
+    { item: step.turn?.item, record: step.turn?.record, source: step.turn?.source, kind: step.turn?.kind, why: step.turn?.why, proofType: step.turn?.proofType },
+    { item: 'step-i1', record: 'ledger', source: 'session', kind: 'device-code', why: 'identity', proofType: 'probe' },
+  );
+});

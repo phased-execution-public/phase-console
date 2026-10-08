@@ -25,7 +25,8 @@
  */
 
 import {
-  TRUNK_BRANCHES, destructiveCommandExceptions, destructivePushBranches, type DestructiveException,
+  TRUNK_BRANCHES, destructiveCommandExceptions, destructivePushBranches, exceptionHolds, exceptionPhases,
+  type DestructiveException,
 } from '../../shared/policy-model.js';
 import { executedTexts, gitCanonical, readShell, type ShellCommand, type ShellReading } from './shell-reading.ts';
 
@@ -48,7 +49,15 @@ export type ManifestVerdict = {
   companions?: string[];
 };
 
-export type ManifestContext = { runBranch?: string | null; phase?: number | null };
+export type ManifestContext = {
+  runBranch?: string | null;
+  phase?: number | null;
+  /**
+   * The plan's release phases (`releasePhasesOf`): what a row's `the release
+   * phases` resolves to. Absent, those words name no phase — narrower, never wider.
+   */
+  releasePhases?: readonly number[] | null;
+};
 
 /**
  * Word lists are written as one string and split: this module only READS
@@ -376,7 +385,9 @@ export function manifestVerdict(command: string, value: string | null | undefine
   const phase = typeof ctx.phase === 'number' ? ctx.phase : null;
   const reading = readShell(typeof command === 'string' ? command : '');
   const entries = destructiveCommandExceptions(row);
-  const mine = entries.filter((e) => e.phases === null || (phase !== null && e.phases.includes(phase)));
+  // Per phase — a row's `the release phases` resolved through `ctx.releasePhases`.
+  const phasesOf = (e: DestructiveException): number[] | null => exceptionPhases(e, ctx);
+  const mine = entries.filter((e) => phasesOf(e) === null || (phase !== null && exceptionHolds(e, phase, ctx)));
 
   const publishing = reading.commands
     .map((c) => ({ command: c, verb: publishingVerbOf(c) }))
@@ -412,12 +423,16 @@ export function manifestVerdict(command: string, value: string | null | undefine
       covered.push(c);
       continue;
     }
-    const elsewhere = entries.filter((e) => covers(e, c) && e.phases !== null);
+    const elsewhere = entries.filter((e) => covers(e, c) && phasesOf(e) !== null);
     if (elsewhere.length) {
-      const phases = [...new Set(elsewhere.flatMap((e) => e.phases ?? []))].sort((a, b) => a - b);
+      const phases = [...new Set(elsewhere.flatMap((e) => phasesOf(e) ?? []))].sort((a, b) => a - b);
+      // A set the plan resolves to nothing — `the release phases` with no phase
+      // titled `Release …` — is named as such, so the card says what to fix.
+      const sets = [...new Set(elsewhere.flatMap((e) => e.sets))];
+      const where = phases.length ? phaseList(phases) : `the ${sets.join(' and ')} phases, which this plan resolves to no phase number`;
       return {
         answer: null, rule: verb.rule,
-        why: `the row allows \`${quote(elsewhere[0]!.verb)}\` for ${phaseList(phases)} — not ${phase === null ? 'this phase' : `phase ${phase}`}`,
+        why: `the row allows \`${quote(elsewhere[0]!.verb)}\` for ${where} — not ${phase === null ? 'this phase' : `phase ${phase}`}`,
       };
     }
     const sameVerb = mine.find((e) => e.options.length && verb.verb.every((w, i) => e.verb[i] === w));
@@ -437,14 +452,18 @@ export function manifestVerdict(command: string, value: string | null | undefine
 
   const rules = [...new Set(publishing.map((p) => p.verb.rule))];
   const named = mine.filter((e) => publishing.some((p) => covers(e, p.command) || (e.rule === p.verb.rule && !e.options.length)));
-  const scope = named.some((e) => e.phases !== null) && phase !== null ? ` for phase ${phase}` : '';
+  // Named per phase: say so — and say when the phase qualified as a release phase rather than by number.
+  const byRelease = phase !== null && named.some((e) => e.sets.includes('release') && !(e.phases ?? []).includes(phase));
+  const scope = named.some((e) => phasesOf(e) !== null) && phase !== null
+    ? ` for phase ${phase}${byRelease ? ' (a release phase)' : ''}`
+    : '';
   const bare = [...new Set(covered.map(bareOf))].join(' && ');
   const refusal = lineRefusal(reading, reading.commands.filter((c) => !covered.includes(c)));
   if (refusal) return { answer: 'deny', rule: rules[0], why: refusal, bareForm: bare };
   const companions = companionsOf(reading, covered);
   return {
     answer: 'allow', rule: rules[0],
-    why: named.length && named.every((e) => e.options.length || e.phases !== null)
+    why: named.length && named.every((e) => e.options.length || phasesOf(e) !== null)
       ? `the row names \`${quote([...named[0]!.verb, ...named[0]!.options])}\`${scope}`
       : `the row allows ${rules.join(', ')}${scope}`,
     ...(companions.length ? { companions, bareForm: bare } : {}),

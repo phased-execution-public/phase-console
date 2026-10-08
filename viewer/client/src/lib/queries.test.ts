@@ -30,7 +30,15 @@ vi.mock('@/components/ui/toast', async (importOriginal) => {
 });
 
 import { SSE_EVENTS } from './sse';
-import { EVENT_EFFECTS, keys, queryClientConfig, shellCounts, toastError, useApiMutation } from './queries';
+import {
+  EVENT_EFFECTS,
+  applyEffect,
+  keys,
+  queryClientConfig,
+  shellCounts,
+  toastError,
+  useApiMutation,
+} from './queries';
 import type { RunState } from './api';
 import { nowLanes } from '@/features/runs/lanes-model';
 import { Strip } from '@/features/runs/tower/strip';
@@ -103,7 +111,10 @@ describe('SSE → Query bridge', () => {
     // `human-step` (control-tower phase 42) is the 30th: a person's turn moved,
     // and the step rides the event.
     expect(SSE_EVENTS).toContain('human-step');
-    expect(SSE_EVENTS).toHaveLength(30 + proNames.length);
+    // `turn` (control-tower phase 136) is the 31st: a round of the console's
+    // own clock changed Your turn.
+    expect(SSE_EVENTS).toContain('turn');
+    expect(SSE_EVENTS).toHaveLength(31 + proNames.length);
     // The runner prefixes its own events (`server/runner/runner.ts` emits
     // `run:` + event). Listening for `phase` instead of `run:phase` is the
     // mistake this pins down.
@@ -460,6 +471,56 @@ describe('useApiMutation', () => {
 /* ------------------------------------------------------------------ *
  * run:progress reaches the strip (control-tower phase 19, #25)
  * ------------------------------------------------------------------ */
+
+describe('Your turn is read with the inbox it is projected from (control-tower phase 137)', () => {
+  const answer = (state: string, attempts = 0) => ({
+    round: { at: '2026-10-07T12:00:00.000Z', n: 3, ranAt: null, changedAt: null },
+    headline: '1 needs you now.',
+    groups: {
+      now: [{ item: 's1', record: 'ledger', group: 'now', rows: [], step: { id: 's1', state, attempts } }],
+      decide: [],
+      upcoming: [],
+      checking: [],
+      done: [],
+    },
+    handled: [],
+    counts: { now: 1, decide: 0, upcoming: 0, checking: 0, done: 0, total: 1, handled: 0 },
+    seen: null,
+    issues: null,
+  });
+
+  it('sits under the inbox prefix, so every inbox re-read re-reads it too', () => {
+    expect(keys.turn().slice(0, 1)).toEqual(keys.inbox());
+    expect(keys.turn()).toEqual(['inbox', 'turn']);
+    expect(keys.turn('2026-10-07T10:00:00.000Z')).toEqual(['inbox', 'turn', '2026-10-07T10:00:00.000Z']);
+    // The widest bundle reaches it, and no bundle had to learn its name.
+    expect(keys.afterInboxAct()).toContainEqual(keys.inbox());
+  });
+
+  it('a round that changed the turn, a step that moved and an inbox change each re-read it', () => {
+    for (const name of ['turn', 'human-step', 'inbox'] as const) {
+      const client = new QueryClient();
+      client.setQueryData(keys.turn(), answer('notified'));
+      client.setQueryData(keys.turn('2026-10-07T10:00:00.000Z'), answer('notified'));
+      applyEffect(client, name, name === 'human-step' ? { step: { id: 's1', state: 'opened' } } : {});
+      expect(client.getQueryState(keys.turn())?.isInvalidated, name).toBe(true);
+      expect(client.getQueryState(keys.turn('2026-10-07T10:00:00.000Z'))?.isInvalidated, name).toBe(true);
+    }
+  });
+
+  it('a step that moved is patched into its item in place, before the re-read lands', () => {
+    const client = new QueryClient();
+    client.setQueryData(keys.turn(), answer('notified'));
+    applyEffect(client, 'human-step', { step: { id: 's1', state: 'checking', attempts: 1 } });
+    const now = (client.getQueryData(keys.turn()) as ReturnType<typeof answer>).groups.now[0]!;
+    expect(now.step).toMatchObject({ id: 's1', state: 'checking', attempts: 1 });
+    // Another item's step is left exactly as it was.
+    applyEffect(client, 'human-step', { step: { id: 'other', state: 'proven' } });
+    expect((client.getQueryData(keys.turn()) as ReturnType<typeof answer>).groups.now[0]!.step.state).toBe(
+      'checking',
+    );
+  });
+});
 
 describe('a run:progress frame patches the strip, with no refetch', () => {
   it('moves the strip’s clock, its word and its in-flight spend from the frame alone', async () => {

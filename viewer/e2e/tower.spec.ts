@@ -114,3 +114,35 @@ test('on a phone the bays stack, and each strip’s one action is at its foot, f
   expect(geometry.wins, `the tap lands on ${geometry.what}`).toBe(true);
   await shoot(page, info.project.name, 'tower-thumb');
 });
+
+/*
+ * The Needs-you bay keeps runs (control-tower phase 139, #216, exit criterion
+ * 2): no loose rows — the asks no strip draws are items of Your turn, which
+ * the bay links to in one line, and the situation line's *Your turn (n)*
+ * counts items and opens the page. The fixture seeds Your turn's items on a
+ * phase no run is on (`seedTurn`), so the line is there; the numbers are read
+ * off the page, never written down.
+ */
+test('the Needs-you bay keeps runs — no loose rows, one line to Your turn, which the situation line opens too', async ({
+  page,
+}, info) => {
+  const fx = await fixture();
+  await visit(page, { name: 'tower-turn', hash: '#/runs?view=board' }, fx.anchor);
+  const needs = page.locator('[data-testid="bay"][data-bay="needs-you"]');
+  await expect(needs).toBeVisible();
+  await expect(needs.getByTestId('bay-inbox')).toHaveCount(0);
+  await expect(needs.getByTestId('coming-up')).toHaveCount(0);
+  // The bay counts runs: its number is its strips.
+  const count = Number(await needs.getAttribute('data-count'));
+  expect(await needs.locator('[data-strip]').count()).toBe(count);
+  const line = needs.getByTestId('bay-turn');
+  await expect(line).toHaveAttribute('href', '#/turn');
+  await expect(line).toContainText(/^Your turn: \d+ needs? you/);
+  // The header line holds every part at a desk's width; narrower, it clips from the end.
+  if (info.project.name === 'desk-1280') {
+    const part = page.getByTestId('situation-line').getByRole('link', { name: /^Your turn \(\d+\)$/ });
+    await expect(part).toHaveAttribute('href', '#/turn');
+  }
+  await line.click();
+  await expect(page.getByTestId('turn-item').first()).toBeVisible();
+});

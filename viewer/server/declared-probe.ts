@@ -38,6 +38,8 @@ import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { outcomeInboxDir, readOutcome, type PhaseOutcome } from './runner/outcome.ts';
 import { runDir } from './runner/state.ts';
 import { pollableRefs, type WatchState } from './watch-refs.ts';
+import { guardWall } from './turn/guard.ts';
+import type { RecordedWall } from './permissions/walls.ts';
 
 /** The whole ingest probe's bound — every ref asked at once, answered within it or `unknown`. */
 export const DECLARED_PROBE_BUDGET_MS = 20_000;
@@ -52,6 +54,9 @@ export const ALREADY_LANDED_EXIT = 3;
 
 /** The journal line a landed ingest probe writes on the run it belongs to. */
 export const ALREADY_LANDED_EVENT = 'phase.watch-already-landed';
+
+/** The journal line a declaration the guard refused at the door writes (control-tower phase 130). */
+export const TURN_REFUSED_EVENT = 'phase.turn-refused';
 
 /** A staged declaration older than this is not the one a live session is waiting on. */
 export const DECLARED_PROBE_MAX_AGE_MS = 5 * 60_000;
@@ -73,6 +78,12 @@ export type DeclaredProbeAnswer =
    */
   | { status: 200; verdict: 'refused'; ref: string; detail: string | null; sentence: string; refs: WatchState[] }
   | { status: 200; verdict: 'pending'; refs: WatchState[] }
+  /**
+   * The guard refused the declared step (control-tower phase 130): a reason
+   * its kind does not allow, no proof, a secret, or — exit 4 — the AI could do
+   * it itself. Nothing parks; the script exits with `exit` and prints `sentence`.
+   */
+  | { status: 200; verdict: 'guard'; rule: string; exit: number; sentence: string; commands?: string[]; refs: WatchState[] }
   | { status: 400 | 404 | 409; error: string };
 
 export type DeclaredProbeDeps = {
@@ -81,8 +92,20 @@ export type DeclaredProbeDeps = {
   now?: number;
   /** Ask the refs — `WatchScheduler.probeDeclared`, the timer's own probe. */
   probe: (slug: string, phase: number, refs: readonly string[]) => Promise<{ landed: WatchState | null; refs: WatchState[] }>;
+  /**
+   * The guard at the door (control-tower phase 130): hold a declared step to
+   * G1, G2, G4 and G6 against the run the file names. Absent, nothing is judged.
+   */
+  guard?: (runId: string | null, step: Record<string, unknown> & { guide?: { text?: string; lang?: string } | string }) =>
+    { ok: true } | { ok: false; rule: string; exit: number; sentence: string; commands?: string[] };
   /** Journal the landing on the run it belongs to (the run id, when the file names one). */
   journal?: (slug: string, runId: string | null, kind: string, data: Record<string, unknown>, phase: number) => void;
+  /**
+   * The walls this console recorded for the declaring lane (control-tower
+   * phase 135, G5) — null when it drives no lane for it (an interactive
+   * session), and then a permission declaration is explained, never refused.
+   */
+  walls?: (slug: string, runId: string | null, phase: number) => readonly RecordedWall[] | null;
 };
 
 function same(a: string, b: string): boolean {
@@ -138,9 +161,49 @@ export async function answerDeclaredProbe(
   if (!Number.isFinite(wrote) || now - wrote > DECLARED_PROBE_MAX_AGE_MS) {
     return { status: 409, error: 'the staged declaration is stale' };
   }
-  if (!pollableRefs(declared.watch).length) return { status: 200, verdict: 'pending', refs: [] };
+  // The guard first (control-tower phase 130): a step it refuses parks nothing,
+  // whatever its refs would say.
+  if (declared.status === 'needs-human' && declared.step && deps.guard) {
+    const verdict = deps.guard(shape[1] ?? null, declared.step as unknown as Record<string, unknown>);
+    if (!verdict.ok) {
+      try {
+        deps.journal?.(slug, shape[1] ?? null, TURN_REFUSED_EVENT, {
+          rule: verdict.rule, exit: verdict.exit, sentence: verdict.sentence,
+          ...(verdict.commands ? { commands: verdict.commands } : {}), stage: 'door',
+        }, phase);
+      } catch { /* the answer is what matters */ }
+      return {
+        status: 200, verdict: 'guard', rule: verdict.rule, exit: verdict.exit,
+        sentence: verdict.sentence.replace(/["\\]/g, "'"), ...(verdict.commands ? { commands: verdict.commands } : {}), refs: [],
+      };
+    }
+  }
+  // G5 (control-tower phase 135): a permission block names a wall this
+  // console recorded for the declaring lane, or nothing refused it — the
+  // session hears "run it" (exit 4) while it is still here to.
+  if (declared.status === 'blocked' && declared.needs === 'permission' && deps.walls) {
+    const walls = deps.walls(slug, shape[1] ?? null, phase);
+    const verdict = walls ? guardWall({ rule: declared.rule ?? null, command: declared.command ?? null }, walls) : null;
+    if (verdict && !verdict.ok) {
+      try {
+        deps.journal?.(slug, shape[1] ?? null, TURN_REFUSED_EVENT, {
+          rule: verdict.rule, exit: verdict.exit, sentence: verdict.sentence, stage: 'door',
+          ...(verdict.commands ? { commands: verdict.commands } : {}),
+        }, phase);
+      } catch { /* the answer is what matters */ }
+      return {
+        status: 200, verdict: 'guard', rule: verdict.rule, exit: verdict.exit,
+        sentence: verdict.sentence.replace(/["\\]/g, "'"), ...(verdict.commands ? { commands: verdict.commands } : {}), refs: [],
+      };
+    }
+  }
+  // G3 — a step whose proof already reads true raises nothing: its proof is
+  // asked with the refs (control-tower phase 130).
+  const stepProof = declared.status === 'needs-human' && typeof declared.step?.proof === 'string' ? declared.step.proof : '';
+  const refs = stepProof && !declared.watch.includes(stepProof) ? [...declared.watch, stepProof] : declared.watch;
+  if (!pollableRefs(refs).length) return { status: 200, verdict: 'pending', refs: [] };
 
-  const answer = await deps.probe(slug, phase, declared.watch);
+  const answer = await deps.probe(slug, phase, refs);
   if (!answer.landed) {
     // Landed first — a wait already over is over whatever else it named. A
     // refusal next: the script exits 2 rather than park on it (#125).

@@ -49,6 +49,7 @@ import type { HolderEta } from './scheduler.ts';
 import type { CiNotRun } from '../watch-refs.ts';
 import { pidAlive, pidHoldsWork, processState, type ProcessState } from '../pid.ts';
 import type { PermissionProfile } from './approvals.ts';
+import type { RecordedWall } from '../permissions/walls.ts';
 import type { PermissionMode } from './spawn.ts';
 // Type-only, so nothing is imported at runtime and the pair that would
 // otherwise be a cycle (`rulings.ts` needs `runDir` from here) never forms one.
@@ -58,6 +59,7 @@ import { CLOCK_MODEL, COST_MODEL, type Cap } from './session-record.ts';
 import type { Ruling } from './rulings.ts';
 import type { TaskItem } from './tasks.ts';
 import type { LadderEnding } from './signals.ts';
+import type { PressDoor } from '../../shared/door-model.js';
 import {
   DECLARATIONS_MAX_PER_PHASE, WAIT_SETTLE_GRACE_MS, closeWaitEntry, parkedMsOf, type WaitAuthor, type WaitEntry,
 } from './wait-budget.ts';
@@ -1446,7 +1448,7 @@ export type PhaseRecord = {
      * the step is expired, refused (*I can't do this*) or dismissed, and ends
      * that watch.
      */
-    step?: { id: string; kind: string; proof?: string; until?: string; settled?: 'proven' | 'expired' | 'cannot' | 'dismissed' };
+    step?: { id: string; kind: string; proof?: string; until?: string; settled?: 'proven' | 'declined' | 'expired' | 'cannot' | 'dismissed' };
     /**
      * Set when this declaration met a SPENT wait budget (control-tower phase
      * 45, #59): the phase parks `waiting` with no clock and a `budgets` errand
@@ -1494,7 +1496,7 @@ export type PhaseRecord = {
     at: string;
     refs: {
       ref: string;
-      scheme: 'gh-run' | 'gh-pr' | 'date' | 'lock' | 'phase' | 'verify' | 'cmd' | 'unit';
+      scheme: 'gh-run' | 'gh-pr' | 'date' | 'lock' | 'phase' | 'verify' | 'cmd' | 'unit' | 'credential';
       state: WatchStateWord;
       detail?: string;
       checkedAt: string;
@@ -1754,6 +1756,14 @@ export type PhaseRecord = {
     matched?: string;
     at: string;
   };
+  /**
+   * Every wall this phase's lane met, newest last (control-tower phase 135,
+   * #212): the console's own hook (a deny rule, every guard) and the CLI's own
+   * refusal (a tool outside the allow list, an MCP tool not granted). The
+   * evidence a `permission` item cites — G5 refuses a declaration that names
+   * none of them. At most `WALLS_KEPT`; cleared with `toolDenied`.
+   */
+  walls?: RecordedWall[];
   /**
    * What this phase's lane looked like when it was last measured
    * (`runner/liveness.ts`) — the last output, the last tool call, the turns
@@ -2399,6 +2409,13 @@ export type Errand = {
    */
   step?: { kind: 'protected-path'; act?: string; path?: string };
   /**
+   * The ledger item this errand IS (control-tower phase 132, #209): the step a
+   * session declared, or the item a preflight raised. Its push was the item's
+   * own, so the errand announces nothing, and its row's action is *I've done
+   * this — check* on that item. Absent on an errand no item stands behind.
+   */
+  stepId?: string;
+  /**
    * Rungs climbed on this phase for a DIFFERENT situation than the one this
    * errand is about.
    *
@@ -2959,6 +2976,12 @@ export type RunNote = {
   pinned: boolean;
   /** The phase it is about; absent means the whole run. */
   phase?: number;
+  /**
+   * The door it was written through (control-tower phase 131, #208) — the
+   * supervisor's notes reach a session under their own header, never as a
+   * person's decision (`pinnedNotesBlock`). Absent on a note written before.
+   */
+  door?: PressDoor;
 };
 
 /** The longest note a run keeps — a paragraph, not a file. */
@@ -4602,6 +4625,7 @@ export function resetForRetry(
     // the top has, by pressing, claimed the world has changed (phase 9).
     delete record.cause;
     delete record.toolDenied;
+    delete record.walls;
     // …and the count of declared waits opens again (control-tower phase 14,
     // #40's 2026-09-28 thread): `WAIT_MAX_PER_PHASE` had no reset path, so a
     // release phase whose four waits were four honest hops could never wait

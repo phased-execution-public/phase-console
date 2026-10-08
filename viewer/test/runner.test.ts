@@ -5132,6 +5132,7 @@ test('under `credential policy: require` a phase naming an unheld credential nev
   const r = repo();
   const seen: number[] = [];
   const asked: string[][] = [];
+  const raised: { slug: string; phase: number; birth: string; step: unknown }[] = [];
   const { instance, events } = runner(r, workingSession(r, seen), '`true`', undefined, {
     planCredentials: () => ({ ids: ['gh', 'env:DEPLOY_KEY'], policy: 'require' }),
     credentialsHeld: async (ids) => {
@@ -5140,6 +5141,8 @@ test('under `credential policy: require` a phase naming an unheld credential nev
         ? { id, status: 'ok', reason: 'gh auth status: signed in' }
         : { id, status: 'fail', reason: '$DEPLOY_KEY is not set in the console\'s environment' });
     },
+    // Your turn's door (control-tower phase 132): the missing credential is an item.
+    humanStep: (input) => { raised.push(input as never); return { id: 'step-cred-1', kind: 'secret-entry' } as never; },
   });
   await instance.start({
     slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1],
@@ -5161,6 +5164,12 @@ test('under `credential policy: require` a phase naming an unheld credential nev
   const errand = state.recoveries?.['1']?.errand;
   assert.equal(errand?.situation, 'blocked-declared:credential');
   assert.equal(errand?.decisionKey, 'credentials');
+  // …and the credential is a secret-entry item proven by presence, which the errand IS (phase 132).
+  assert.equal(raised.length, 1, 'one item, for the one credential not held');
+  assert.equal(raised[0]!.birth, 'console');
+  assert.deepEqual((raised[0]!.step as { kind: string; proof: string }).kind, 'secret-entry');
+  assert.equal((raised[0]!.step as { proof: string }).proof, 'credential:env:DEPLOY_KEY');
+  assert.equal(errand?.stepId, 'step-cred-1');
   assert.match(errand?.need ?? '', /`env:DEPLOY_KEY` \(\$DEPLOY_KEY is not set/);
   assert.equal(state.manifest?.decisions[0].state, 'outstanding');
   assert.match(state.manifest?.decisions[0].value ?? '', /not held on this console \(phase 1\); policy require/);
@@ -5548,9 +5557,9 @@ test('a per-phase stop carries phase and the DERIVED actor through the service, 
   assert.equal(status, 200);
   // The body's label is kept as `by`; the transport is read off the request
   // (SHD-3): a loopback Host with no User-Agent is a `script` over the `api`
-  // from `local`, and no proxy vouched for anyone.
+  // from `local`, no proxy vouched for anyone, and the door it proved is `local` (phase 131).
   assert.deepEqual(calls, [{
-    method: 'stopRun', args: ['demo', 9, { by: 'tester', via: 'api', origin: 'local', remoteUser: null }],
+    method: 'stopRun', args: ['demo', 9, { by: 'tester', via: 'api', origin: 'local', remoteUser: null, pressDoor: 'local' }],
   }]);
 
   const refused = await callWith(

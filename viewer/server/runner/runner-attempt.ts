@@ -9,6 +9,7 @@
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
 import { parkOnStep, stepJournalFields } from '../human-steps.ts';
+import { refusalFields } from '../turn/guard.ts';
 import { KIND_META } from '../../shared/human-step-model.js';
 import { comparedClause, stampTrees, type TreeStamp } from './tree-state.ts';
 import { randomUUID } from 'node:crypto';
@@ -4329,12 +4330,20 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // A HUMAN STEP (control-tower phase 41): the ledger, the one inbox row
         // and the one push are the service's (`deps.humanStep`); the park here
         // waits on a PERSON and charges no external-wait budget (`parkOnStep`).
-        const step = declared.step
+        const raised = declared.step
           ? this.deps.humanStep?.({
             slug: state.slug, phase, birth: 'session', step: declared.step, runId: state.id,
             ...(record.sessionId ? { sessionId: record.sessionId } : {}),
           }) ?? null
           : null;
+        // The guard refused it at ingest (control-tower phase 130): no item is
+        // raised, and the park says why — the AI can do it, or must say what
+        // it tried — so the next session reads the refusal, not a person.
+        const step = raised && !('refused' in raised) ? raised : null;
+        if (raised && 'refused' in raised) {
+          record.note = `${record.note} — the guard refused it (${raised.refused.rule}): ${raised.refused.sentence}`;
+          this.record('phase.turn-refused', { ...refusalFields(raised.refused) }, phase);
+        }
         if (step) {
           parkOnStep(record, step, 'session', record.endedAt);
           this.record('phase.human-step', stepJournalFields(step), phase);
@@ -4420,13 +4429,16 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // A plan the console held for a person (control-tower phase 11, #34):
         // the errand names the plan and the two answers, not a generic gate.
         if (step) {
+          // The errand IS the step (control-tower phase 132, #209): one item,
+          // announced once by the step, answered by checking it.
+          slot.errand.stepId = step.id;
           // The errand names the act in the step's own words — what, where,
           // and what proves it — rather than the generic `human-acts` ask.
           const meta = KIND_META[step.kind];
           slot.errand.need = `Your turn — ${meta.label.toLowerCase()}: ${step.title}`;
           slot.errand.how = `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}`
             + `${step.openUrl ? `, open ${step.openUrl}` : step.openCommand ? `, run \`${step.openCommand}\`` : ''}`
-            + `${step.proof ? `; ${step.proof} proves it` : ''}. When it is done, Retry the phase — the same session resumes.`;
+            + `${step.proof ? `; ${step.proof} proves it` : ''}. When it is done, press I've done this — check: the same session resumes.`;
           // Not due yet (control-tower phase 121): nobody is summoned until its
           // due-when ref lands — then the step's own push says NOW.
           if (step.state === 'upcoming') {

@@ -744,6 +744,17 @@ test('the two engines agree about a phase\'s human steps, per phase and in the b
         assert.equal(norm(line), norm(humanStepsFor(acts, phase).map(humanStepLine).join('\n')), `operator-acts phase ${phase}`);
       }
       assert.deepEqual(humanStepsFor(acts, 0).map((s) => [s.kind, s.where, s.due]), [['operator-act', 'host', 'phase:operator-acts/2']]);
+      // Your turn's four (control-tower phase 130): why, effort, unblocks and a
+      // guide — read alike by both engines, a bullet with none read as before.
+      const turn = store.get('turn')!.plan!;
+      for (const phase of [1, 2]) {
+        const line = await engine(corpus, ['turn', '--human-steps', String(phase)], `turn --human-steps ${phase}`);
+        assert.equal(norm(line), norm(humanStepsFor(turn, phase).map(humanStepLine).join('\n')), `turn phase ${phase}`);
+      }
+      assert.deepEqual(humanStepsFor(turn, 1).map((s) => [s.kind, s.why, s.effortMinutes, s.unblocks, s.guide]), [
+        ['browser-login', 'identity', 5, [2, 3], 'guides/gh-sign-in.md'], ['decision', 'money', 60, undefined, undefined],
+      ]);
+      assert.equal(humanStepsFor(turn, 2)[0]!.why, undefined, 'no why: — the console infers it (F40 advises)');
       assert.deepEqual(humanStepsFor(acts, 2).map((s) => [s.kind, s.where, s.due]), [['operator-act', 'any', 'date:2026-10-06T09:00:00Z']]);
       assert.equal(humanStepsFor(acts, 3)[0]!.due, undefined, 'a step with no due: is due at once');
       assert.deepEqual([waitCountFor(acts), waitCountFor(acts, 1), waitCountFor(acts, 2)],

@@ -80,11 +80,15 @@ if [ -z "$plan" ]; then
 fi
 
 # The console refuses cross-origin writes and requires its own header; both are
-# satisfied here the same way the browser satisfies them.
+# satisfied here the same way the browser satisfies them. It names itself, so
+# the console records the ask `via: cli` rather than as an unnamed script
+# (control-tower phase 131, #208) — a label, never a door: who asked is
+# whatever this request can prove, and from a terminal that is `local`.
 body="$(python3 -c 'import json,sys; print(json.dumps({"question": sys.argv[1], "by": "btw"}))' "$question")"
 
 response="$(curl -sS --max-time 20 \
   -X POST "$url/api/run/$plan/ask" \
+  -A 'btw' \
   -H 'content-type: application/json' \
   -H 'x-phase-console: 1' \
   -d "$body" 2>&1)" || {

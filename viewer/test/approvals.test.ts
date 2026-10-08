@@ -1041,6 +1041,51 @@ test('a card decided without remembering writes no rule at all', async () => {
   assert.equal(policyExtras(POLICY_PATH).allow.length, before);
 });
 
+test('an Allow with remember is a GRANT — a row the engine writes, listed and revocable (control-tower phase 149)', async () => {
+  const { policyExtras, planPolicyPath } = await import('../server/runner/approvals.ts');
+  const svc = await service();
+  const approval = card(svc, 'remember-grant');
+  const rule = approval.suggestedRule!;
+  const result = svc.decideApproval(approval.id, 'allow', 'someone@desk', undefined, { scope: 'plan', rule });
+  assert.equal(result.ok, true);
+  assert.equal(result.wrote, rule);
+  assert.ok(policyExtras(planPolicyPath('remember-grant')).allow.includes(rule), 'the allow rule is written for the plan');
+  const row = svc.grantsNow().list().find((one) => one.card === approval.id);
+  assert.ok(row, 'and its grant row names the card');
+  assert.deepEqual({ scope: row.scope, wall: row.wall, rule: row.rule, by: row.by, state: row.state }, { scope: 'plan', wall: 'ask', rule, by: 'someone@desk', state: 'live' });
+  assert.deepEqual(row.changed.map((change) => `${change.kind}:${(change as { op?: string }).op}`), ['policy:add']);
+  svc.grantsNow().end(row.id, 'revoked', 'someone@desk');
+  assert.ok(!policyExtras(planPolicyPath('remember-grant')).allow.includes(rule), 'revoked, the rule it wrote is gone');
+});
+
+test('nothing but the grant engine writes a rule on a person\'s behalf — a source scan of editPolicy\'s callers (control-tower phase 149)', async () => {
+  const { readdirSync, readFileSync: read, statSync } = await import('node:fs');
+  const serverDir = new URL('../server/', import.meta.url);
+  const files: string[] = [];
+  const walk = (dir: URL) => {
+    for (const entry of readdirSync(dir)) {
+      const url = new URL(entry, dir);
+      if (statSync(url).isDirectory()) walk(new URL(`${entry}/`, dir));
+      else if (entry.endsWith('.ts') && !entry.endsWith('.test.ts')) files.push(url.pathname);
+    }
+  };
+  walk(serverDir);
+  const callers: string[] = [];
+  for (const file of files) {
+    const text = read(file, 'utf8');
+    for (const match of text.matchAll(/(?<![\w.])(?:this\.|service\.)?editPolicy\(\{[\s\S]{0,400}?\}\s*(?:,\s*[\w.]+\s*)?\)/g)) {
+      const rel = file.slice(file.indexOf('/server/') + 1);
+      // A widening — an allow added or a deny removed — names a rule a person is given.
+      if (/add:\s*\{\s*allow|remove:\s*\{\s*deny|\[list\]/.test(match[0])) callers.push(rel);
+    }
+  }
+  assert.deepEqual([...new Set(callers)].sort(), ['server/permissions/grants.ts'],
+    'a widening policy edit outside the engine — route it through grantsNow().apply so it has a row');
+  // Settings ▸ Permissions is the person's own page: its route edits the standing policy directly.
+  const routes = read(new URL('../server/api/routes.ts', import.meta.url), 'utf8');
+  assert.match(routes, /service\.editPolicy\(\{/, 'the policy page keeps its own door');
+});
+
 /* ------------------------------------------------------------------ *
  * Reaching someone who is not looking at a tab
  * ------------------------------------------------------------------ */
@@ -2145,4 +2190,42 @@ test('CF-6: a forged press is excused only by the plan row\'s name for it — ne
   assert.equal(both?.verb, 'edit-policy');
   const files = consoleForgeCall('Write', { file_path: '/c/autopilot.json', content: '' }, ctx)!;
   assert.equal(consoleForgeException(['Bash(phase-console run approve:*)'], files), null);
+});
+
+test('a tool card IS a permission item until phase 149: its Grant is the broker\'s Allow, labelled as what it is, unchanged in effect (control-tower phase 135)', async () => {
+  const { brokerPermission, BROKER_GRANT_LABEL } = await import('../server/permissions/walls.ts');
+  const { buildInbox } = await import('../server/inbox.ts');
+  const svc = await service();
+  try {
+    const approval = card(svc, 'alpha');
+    const permission = brokerPermission(approval as never)!;
+    assert.equal(permission.wall, 'ask', 'an ask nobody else answers');
+    assert.equal(permission.tool, 'Bash');
+    assert.equal(permission.command, 'git commit -m x');
+    assert.equal(permission.rule, 'Bash(git commit:*)');
+    assert.equal(permission.risk, 'low', 'one press — this call');
+    assert.deepEqual(permission.grant, { effect: 'broker', approvalId: approval.id, label: BROKER_GRANT_LABEL });
+    assert.match(BROKER_GRANT_LABEL, /this one call/);
+    assert.match(BROKER_GRANT_LABEL, /this plan or for every plan/);
+    // On the screen: the card's row is the projected permission item, and its
+    // Allow and Deny are the card's own — the same press as before.
+    const inbox = buildInbox({ plans: [], runs: [], flags: { allowRun: true }, approvals: svc.approvals.all() } as never, Date.now());
+    const row = inbox.items.find((item) => item.kind === 'approval')!;
+    assert.equal(row.turn?.kind, 'permission');
+    assert.equal(row.turn?.record, 'projected');
+    assert.equal(row.turn?.permission?.grant?.effect, 'broker');
+    assert.deepEqual(row.actions.map((a) => a.endpoint).filter((e) => e.startsWith('/api/approvals/')).length >= 2, true);
+    // …and its effect is the one it always had: an Allow answers the held call.
+    const answered = svc.decideApproval(approval.id, 'allow', 'me', undefined);
+    assert.equal(answered.ok, true);
+    assert.equal(svc.approvals.all().find((a) => a.id === approval.id)?.status, 'allow');
+    // The widen rung's standing card is the permanent plan strike, labelled so.
+    const standing = brokerPermission({ ...approval, standing: true, suggestedRule: 'Bash(git push:*)' } as never)!;
+    assert.equal(standing.wall, 'deny');
+    assert.equal(standing.grant?.effect, 'strike');
+    assert.match(standing.grant!.label, /revocable from Settings ▸ Permissions/, 'a grant with its row since phase 149');
+  } finally {
+    svc.approvals.disarm();
+    svc.close();
+  }
 });

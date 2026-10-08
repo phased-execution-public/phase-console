@@ -50,6 +50,8 @@ export const PRIMARY_ACT: Readonly<Record<HumanStepKind, PrimaryAct>> = Object.f
   captcha: 'open',
   'email-link': 'open',
   'operator-act': 'terminal',
+  // A wall the AI met (control-tower phase 130): it ends by a grant or a denial.
+  permission: 'approve',
 });
 
 /** The kinds whose link is a sign-in — every other link is just a link. */
@@ -59,6 +61,14 @@ const SIGN_IN_KINDS: ReadonlySet<HumanStepKind> = new Set([
   'claude-login',
   'mcp-login',
 ]);
+
+/**
+ * The check's one wording (control-tower phase 137): the act it records — the
+ * person says they did it, and the console checks. The same words on the
+ * card, the item's row and the page, so the button a guide names is the
+ * button a person finds.
+ */
+export const CHECK_LABEL = "I've done this — check";
 
 /** What the primary button says. */
 export function primaryLabel(act: PrimaryAct, kind: HumanStepKind): string {
@@ -72,7 +82,7 @@ export function primaryLabel(act: PrimaryAct, kind: HumanStepKind): string {
     case 'approve':
       return 'Approve';
     case 'check':
-      return 'I did it — check';
+      return CHECK_LABEL;
   }
 }
 

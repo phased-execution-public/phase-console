@@ -162,8 +162,21 @@ describe('one run, one bay — over the phase-16 corpus', () => {
   });
 });
 
-describe('the Needs-you bay absorbs the inbox', () => {
-  it('draws an item on its run’s strip, and every other ask as a loose row', () => {
+/** An inbox row's turn view — what the server folds every person-facing row into. */
+const turnOf = (id: string, group: 'now' | 'decide', over: Record<string, unknown> = {}) =>
+  ({
+    item: id,
+    record: 'projected',
+    source: 'errand',
+    kind: 'operator-act',
+    why: 'decision',
+    proofType: 'attest',
+    group,
+    ...over,
+  }) as never;
+
+describe('the Needs-you bay is runs (control-tower phase 139, exit criterion 2)', () => {
+  it('keeps strips, counts runs, and hands every ask to Your turn — no loose rows', () => {
     const runs = [
       run({
         id: 'r1',
@@ -173,22 +186,83 @@ describe('the Needs-you bay absorbs the inbox', () => {
       }),
     ];
     const inbox = [
-      item({ id: 'mine', runId: 'r1', slug: 'alpha' }),
+      item({ id: 'mine', runId: 'r1', slug: 'alpha', turn: turnOf('mine', 'now') }),
       item({
         id: 'plan-level',
         slug: 'gamma',
         kind: 'gate',
         category: { word: 'decision', label: 'Needs your decision' },
+        turn: turnOf('plan-level', 'decide', { source: 'gate', kind: 'decision' }),
       }),
-      item({ id: 'card', kind: 'approval', slug: 'alpha' }),
-      item({ id: 'relayed', kind: 'question', slug: 'alpha' }),
+      item({ id: 'card', kind: 'approval', slug: 'alpha', turn: turnOf('card', 'now') }),
+      item({ id: 'relayed', kind: 'question', slug: 'alpha', turn: turnOf('relayed', 'decide') }),
       item({ id: 'fyi', kind: 'ruling', severity: 'fyi', slug: 'delta' }),
     ];
     const model = towerModel({ runs, lanes: [], inbox, now: NOW });
     expect(model.bays['needs-you'].map((t) => t.run.id)).toEqual(['r1']);
-    // The approval queue draws the card and the question; fyi wants nobody.
-    expect(model.loose.map((i) => i.id)).toEqual(['plan-level']);
-    expect(model.counts['needs-you']).toBe(2);
+    // The bay counts runs; the asks are items of Your turn — fyi wants nobody.
+    expect('loose' in model).toBe(false);
+    expect(model.counts['needs-you']).toBe(1);
+    expect(model.items.map((i) => i.id)).toEqual(['mine', 'plan-level', 'card', 'relayed']);
+    // A plan-level gate no strip draws lights no lamp: the Tower is runs.
+    expect(model.annunciator.decision).toBe(0);
+  });
+
+  it('each strip’s ONE action is its OLDEST item’s primary — a broker card before a later step', () => {
+    const busy = run({ id: 'r1', slug: 'alpha', status: 'running', activePhase: 1 });
+    const inbox = [
+      item({
+        id: 'later',
+        kind: 'human-step',
+        runId: 'r1',
+        slug: 'alpha',
+        since: iso(60_000),
+        turn: turnOf('s9', 'now'),
+      }),
+      item({
+        id: 'card',
+        kind: 'approval',
+        runId: 'r1',
+        slug: 'alpha',
+        since: iso(600_000),
+        turn: turnOf('card', 'now'),
+      }),
+    ];
+    const model = towerModel({ runs: [busy], lanes: [], inbox, now: NOW });
+    const placed = model.runs[0]!;
+    const strip = stripModel({ run: busy, lanes: [], now: NOW, allowRun: true, ctx: placed.ctx });
+    expect(strip.action.kind === 'step' && strip.action.item.id).toBe('card');
+  });
+
+  it('a plan-wide row takes no strip’s action outside Needs you — a Live strip keeps Pause', () => {
+    const live = run({ id: 'r1', slug: 'alpha', status: 'running', activePhase: 1 });
+    const strip = stripModel({
+      run: live,
+      lanes: [],
+      now: NOW,
+      allowRun: true,
+      ctx: { inbox: [], now: NOW } as never,
+    });
+    const withPlanRow = stripModel({
+      run: live,
+      lanes: [],
+      now: NOW,
+      allowRun: true,
+      ctx: {
+        inbox: [
+          item({
+            id: 'clash',
+            kind: 'conflict',
+            slug: 'alpha',
+            severity: 'fyi',
+            turn: turnOf('clash', 'decide'),
+          }),
+        ],
+        now: NOW,
+      } as never,
+    });
+    expect(withPlanRow.bay).toBe(strip.bay);
+    expect(withPlanRow.action).toEqual(strip.action);
   });
 });
 
@@ -276,6 +350,13 @@ describe('a person’s turn is a summons (control-tower phase 42, criterion 3)',
         openUrl: 'https://github.com/login/device',
         check: true,
       }),
+      turn: turnOf('s1', 'now', {
+        record: 'ledger',
+        source: 'declared',
+        kind: 'browser-login',
+        why: 'identity',
+        proofType: 'probe',
+      }),
       ...over,
     });
   // A run with another lane still working: a step summons it all the same.
@@ -285,8 +366,8 @@ describe('a person’s turn is a summons (control-tower phase 42, criterion 3)',
     const inbox = [step()];
     const model = towerModel({ runs: [busy], lanes: nowLanes([busy], new Map(), NOW), inbox, now: NOW });
     expect(model.bays['needs-you'].map((t) => t.run.id)).toEqual(['busy']);
-    // The row is drawn by the strip, not again as a loose row.
-    expect(model.loose).toEqual([]);
+    // The row is drawn by the strip; the bay has no loose rows at all.
+    expect('loose' in model).toBe(false);
     const placed = model.bays['needs-you'][0]!;
     const strip = stripModel({ run: busy, lanes: placed.lanes, now: NOW, allowRun: true, ctx: placed.ctx });
     expect(strip.bay).toBe('needs-you');
@@ -303,25 +384,36 @@ describe('a person’s turn is a summons (control-tower phase 42, criterion 3)',
     expect(readOnly.action.kind).toBe('step');
   });
 
-  it('lights its family’s lamp and counts in Your turn — loose or on a strip', () => {
+  it('lights its run’s lamp, and Your turn (n) counts ITEMS and opens the page', () => {
     const onStrip = towerModel({ runs: [busy], lanes: [], inbox: [step()], now: NOW });
     expect(onStrip.annunciator.credentials).toBe(1);
-    expect(onStrip.steps).toHaveLength(1);
+    expect(onStrip.items).toHaveLength(1);
     const parts = situationParts({ tower: onStrip, approvals: 0 });
-    expect(parts.find((part) => part.key === 'your-turn')?.text).toBe('Your turn (1)');
+    const turn = parts.find((part) => part.key === 'your-turn');
+    expect(turn?.text).toBe('Your turn (1)');
+    expect(turn?.href).toBe('#/turn');
 
-    // A step whose run is not on the Tower is a loose row, and lights the same lamp.
-    const loose = towerModel({
+    // An errand row and the step it describes are ONE item.
+    const both = towerModel({
+      runs: [busy],
+      lanes: [],
+      inbox: [step(), item({ id: 'errand', runId: 'busy', slug: 'busy', turn: turnOf('s1', 'now') })],
+      now: NOW,
+    });
+    expect(both.items.map((i) => i.id)).toEqual(['human-step:busy:2:s1']);
+
+    // A step whose run is not on the Tower is an item of the page — and lights no lamp.
+    const away = towerModel({
       runs: [],
       lanes: [],
       inbox: [step({ runId: 'gone', slug: 'gone' })],
       now: NOW,
     });
-    expect(loose.loose).toHaveLength(1);
-    expect(loose.annunciator.credentials).toBe(1);
-    // An acknowledged one is seen, not done — but no longer a summons.
+    expect(away.items).toHaveLength(1);
+    expect(away.annunciator.credentials).toBe(0);
+    // An acknowledged one is seen, never done: the page counts it, so the line does.
     const acked = towerModel({ runs: [], lanes: [], inbox: [step({ ack: { at: iso(1) } })], now: NOW });
-    expect(acked.steps).toHaveLength(0);
+    expect(acked.items).toHaveLength(1);
   });
 
   it('on proven the row leaves, and the strip moves back to Live with no reload', () => {
@@ -352,32 +444,47 @@ describe('the supervisor on the Tower (control-tower phase 102, SF-1..2)', () =>
   const card = (over: Partial<InboxItem>) =>
     item({ kind: 'supervisor', title: 'Supervisor suggests', ...over });
 
-  it('stands a supervisor card in Needs you even when its run’s strip is there too', () => {
+  it('a supervisor card is an item of the page, never a loose row of the bay (phase 139)', () => {
     const inbox = [
       item({ id: 'errand', runId: 'h', slug: 'halted-plan' }),
-      card({ id: 'sv-h', runId: 'h', slug: 'halted-plan' }),
-      card({ id: 'sv-l', runId: 'l', slug: 'live-plan' }),
+      card({
+        id: 'sv-h',
+        runId: 'h',
+        slug: 'halted-plan',
+        turn: turnOf('sv-h', 'now', { source: 'supervisor' }),
+      }),
+      card({
+        id: 'sv-l',
+        runId: 'l',
+        slug: 'live-plan',
+        turn: turnOf('sv-l', 'now', { source: 'supervisor' }),
+      }),
     ];
     const model = towerModel({ runs, lanes: [], inbox, now: NOW });
     expect(model.bays['needs-you'].map((t) => t.run.id)).toEqual(['h']);
-    expect(model.loose.map((i) => i.id)).toEqual(['sv-h', 'sv-l']);
-    expect(model.counts['needs-you']).toBe(3);
+    expect(model.items.map((i) => i.id)).toEqual(['sv-h', 'sv-l']);
+    expect(model.counts['needs-you']).toBe(1);
     // A supervisor card lights no halt lamp: detections count on their own lamps.
     expect(model.annunciator.verification).toBe(1);
   });
 
   it('narrows to exactly the runs and cards a pressed supervisor lamp keeps', () => {
     const inbox = [
-      card({ id: 'sv-l', runId: 'l', slug: 'live-plan' }),
-      item({ id: 'gate', kind: 'gate', slug: 'x' }),
+      card({
+        id: 'sv-l',
+        runId: 'l',
+        slug: 'live-plan',
+        turn: turnOf('sv-l', 'now', { source: 'supervisor' }),
+      }),
+      item({ id: 'gate', kind: 'gate', slug: 'x', turn: turnOf('gate', 'decide') }),
     ];
     const model = towerModel({ runs, lanes: [], inbox, now: NOW });
     const only = filterTower(model, { keep: { runIds: new Set(['l']), itemIds: new Set(['sv-l']) } });
     expect(only.runs.map((t) => t.run.id)).toEqual(['l']);
     expect(only.bays.live.map((t) => t.run.id)).toEqual(['l']);
     expect(only.bays['needs-you']).toEqual([]);
-    expect(only.loose.map((i) => i.id)).toEqual(['sv-l']);
-    expect(only.counts['needs-you']).toBe(1);
+    expect(only.items.map((i) => i.id)).toEqual(['sv-l']);
+    expect(only.counts['needs-you']).toBe(0);
     expect(only.ready).toEqual([]);
   });
 });

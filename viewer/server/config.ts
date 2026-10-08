@@ -43,8 +43,10 @@ import {
   CONFLICT_POLICIES, DEFAULT_BASE_BRANCH, DEFAULT_CONFLICT, DEFAULT_LAND, LAND_POLICIES,
 } from '../shared/landing-model.js';
 import { DEFAULT_MESSAGING, MESSAGING_WORDS } from '../shared/message-model.js';
+import { planEffortOf } from '../shared/run-settings.js';
 import { DEFAULT_ISSUES, ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
 import { sanitiseCategories, type CategoryId } from './push/catalogue.ts';
+import { parseQuietHours, type QuietHours } from './push/quiet.ts';
 // A value import, and it is safe because `retention-policy.ts` imports nothing.
 // The sweeper itself (`retention.ts`) logs, so it reaches `log.ts`, which reads
 // the log path from here — importing the sweeper would close that ring. The
@@ -1337,13 +1339,10 @@ export type Prefs = {
    * every write like `boardingSchedule`, and edited in the policy card.
    */
   relayRules?: RelayRule[];
-  /**
-   * The reminder quiet hours for human steps (control-tower phase 43):
-   * `HH:MM` on this machine's clock, a window that may cross midnight. A
-   * reminder due inside it is deferred to its end, never dropped. Absent means
-   * none. Written through `savePreferences`, read through `parseQuietHours`.
-   */
-  reminderQuiet?: { start: string; end: string };
+  // `reminderQuiet` — the reminders' own quiet hours (control-tower phase 43)
+  // — is no preference since phase 138 (#215): there is ONE quiet-hours
+  // setting, each push device's, and reminders obey it. A config that still
+  // holds the key has it moved onto the devices at boot (`migrateReminderQuiet`).
   /**
    * When a lane that is still alive stops being work (`runner/liveness.ts`).
    *
@@ -1386,6 +1385,18 @@ export type Prefs = {
   stallExternalWaitMs?: number;
   stallLocalJobMs?: number;
   stallLoopRun?: number;
+  /**
+   * The check (control-tower phase 134, #211). `checkJudgement`: may a
+   * `judgement` proof be read by a checking session (default on) — off, such a
+   * proof falls back to `attest`, the owner's word, marked unverified.
+   * `checkModel` / `checkEffort`: what that session runs as (the alias
+   * `sonnet`, resolved by `scripts/models.env`; `low`). `turnEscalateAfter`:
+   * the rejections of one item that escalate it, once (3).
+   */
+  checkJudgement?: boolean;
+  checkModel?: string;
+  checkEffort?: string;
+  turnEscalateAfter?: number;
   /**
    * Whether the stall watchdog may PARK a lane by itself — the automatic park
    * `external-wait` makes (default on). The KNOWN-SINCE off switch (SLF-9): the
@@ -1436,6 +1447,15 @@ export type Prefs = {
 const CONFIG_DIR = configDir();
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
 
+/**
+ * The check's shipped answers (control-tower phase 134, #211): judgement on,
+ * the checking session on the alias `sonnet` at effort `low`, and three
+ * rejections of one item escalate it.
+ */
+export const CHECK_DEFAULTS = Object.freeze({
+  checkJudgement: true, checkModel: 'sonnet', checkEffort: 'low', turnEscalateAfter: 3,
+});
+
 const DEFAULT_PREFS: Prefs = {
   recentRoots: [], theme: 'system', density: 'comfortable', sort: 'activity',
   attachDefaultSkills: false, qaByDefault: false, gitMode: 'default-branch', openPrOnComplete: true, repoGuard: true,
@@ -1456,6 +1476,7 @@ const DEFAULT_PREFS: Prefs = {
   boardingSchedule: sanitiseSchedule(undefined),
   relayRules: [],
   ...STALL_DEFAULTS, stallEscalateMs: STALL_ESCALATE_MS, stallAutomaticPark: true,
+  ...CHECK_DEFAULTS,
   notify: sanitiseCategories(undefined),
   retention: RETENTION_DEFAULTS,
 };
@@ -1486,6 +1507,45 @@ export { AUTOMATION_MAP, AUTOMATION_KEYS, toAutomation, fromAutomation };
  */
 export function migrateAutomation(parsed: Partial<Prefs> & { automation?: unknown }): Partial<Prefs> {
   return { ...parsed, ...fromAutomation(parsed.automation) };
+}
+
+/**
+ * ONE quiet-hours setting (control-tower phase 138, #215).
+ *
+ * The reminders of a person's turn had quiet hours of their own
+ * (`reminderQuiet {start, end}`, phase 43) beside every push device's — two
+ * answers to "may it buzz now?" that could disagree. The device's is the one
+ * that stays: reminders obey it (a reminder waits while every device that
+ * hears it is quiet, and never breaks through one). This is the migration's
+ * decision, pure; the service applies it (`ServiceBase.adoptReminderQuiet`):
+ *
+ *   - no `reminderQuiet` key → `null`, nothing to do — which is what makes it
+ *     idempotent: the key is gone after the first run;
+ *   - a window the device register's own parser accepts → it moves onto every
+ *     device with NO window of its own (`devices`), with `allowUrgent` on, as
+ *     every window a device opens starts; a device with its own keeps it
+ *     (`kept`) — its own choice is the newer, narrower one;
+ *   - a malformed window → nothing moves (quiet hours nobody asked for must
+ *     never exist);
+ *   - either way the key is dropped from the preferences (`prefs`), so it is
+ *     never read again — with no device subscribed there is nothing to be
+ *     quiet on, and the window goes with the key.
+ */
+export function migrateReminderQuiet<P extends { reminderQuiet?: unknown }>(
+  prefs: P,
+  devices: readonly { id: string; quiet?: unknown }[],
+): { quiet: QuietHours | null; devices: string[]; kept: string[]; prefs: Omit<P, 'reminderQuiet'> } | null {
+  if (!Object.prototype.hasOwnProperty.call(prefs, 'reminderQuiet')) return null;
+  const { reminderQuiet, ...rest } = prefs;
+  const parsed = parseQuietHours(reminderQuiet);
+  const quiet = parsed && !('error' in parsed) ? { start: parsed.start, end: parsed.end, allowUrgent: true } : null;
+  if (!quiet) return { quiet: null, devices: [], kept: [], prefs: rest };
+  return {
+    quiet,
+    devices: devices.filter((device) => device.quiet == null).map((device) => device.id),
+    kept: devices.filter((device) => device.quiet != null).map((device) => device.id),
+    prefs: rest,
+  };
 }
 
 /**
@@ -1569,7 +1629,7 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
   | 'budgetAutoRaisePct' | 'mcpRequireTimeoutMs' | 'boardingSchedule' | 'relayRules'
   | 'stallSilentMs' | 'stallSpinTurns' | 'stallStalemateAttempts' | 'stallRetryBurst'
   | 'stallExternalWaitMs' | 'stallLocalJobMs' | 'stallEscalateMs' | 'stallAutomaticPark'
-  | 'stallLoopRun'> {
+  | 'stallLoopRun' | 'checkJudgement' | 'checkModel' | 'checkEffort' | 'turnEscalateAfter'> {
   const bool = (value: unknown, fallback: boolean): boolean => (typeof value === 'boolean' ? value : fallback);
   // A cap is a finite, non-negative number or it is the default — a string,
   // a negative or NaN in config.json must never turn the ladder unbounded
@@ -1711,6 +1771,16 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     // this console did before the escalation existed, and a setting an
     // operator can genuinely want.
     stallEscalateMs: cap(parsed.stallEscalateMs, STALL_ESCALATE_MS),
+    // The check (phase 134): only the exact `false` turns judgement off; a
+    // model is any non-empty name (the console resolves an alias), an effort
+    // one of the CLI's words, and an escalation a whole number of rejections.
+    checkJudgement: bool(parsed.checkJudgement, CHECK_DEFAULTS.checkJudgement),
+    checkModel: typeof parsed.checkModel === 'string' && parsed.checkModel.trim()
+      ? parsed.checkModel.trim().slice(0, 80) : CHECK_DEFAULTS.checkModel,
+    checkEffort: typeof parsed.checkEffort === 'string' && planEffortOf(parsed.checkEffort) === parsed.checkEffort.trim()
+      ? parsed.checkEffort.trim() : CHECK_DEFAULTS.checkEffort,
+    turnEscalateAfter: typeof parsed.turnEscalateAfter === 'number' && Number.isInteger(parsed.turnEscalateAfter)
+      && parsed.turnEscalateAfter >= 1 && parsed.turnEscalateAfter <= 20 ? parsed.turnEscalateAfter : CHECK_DEFAULTS.turnEscalateAfter,
   };
 }
 

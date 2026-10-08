@@ -26,8 +26,8 @@
  *
  * A folded card (no ledger step behind it) keeps the actions its row carries:
  * its primary is the row's recommended verb, performed exactly as the server
- * spelled it. A secret typed into a `secret-entry` form leaves the page the
- * moment it is sent, and is never drawn again.
+ * spelled it. A `secret-entry` card has no field for its value: it says where
+ * the value goes (control-tower phase 133) — the console never takes a secret.
  *
  * `variant="row"` folds the card to a line — kind, title, where and the
  * primary — that expands in place to the full card.
@@ -57,6 +57,7 @@ import {
   HUMAN_STEP_OPEN_STATES,
   KIND_META,
   type HumanStepKind,
+  type HumanStepState,
   type HumanStepView,
 } from '@shared/human-step-model.js';
 import {
@@ -72,6 +73,7 @@ import { keys, patchHumanStep } from '@/lib/queries';
 import { Button, CopyButton, Input, toast } from '@/components/ui';
 import { cn } from '@/lib/cn';
 import { STATUS_ICONS } from '@/components/ui/status/status-icons';
+import { OpsBadge } from '@/components/ui/status/ops-badge';
 import { useRoute } from '@/app/router';
 import { splitActions } from '@/features/runs/lanes-model';
 import { StepTerminalSheet } from './step-terminal-sheet';
@@ -111,20 +113,7 @@ export function kindIcon(name: string): LucideIcon | undefined {
   return ICONS[name];
 }
 
-/** A state's plain word, as the card's status says it. */
-const STATE_WORDS: Readonly<Record<string, string>> = {
-  upcoming: 'coming up',
-  declared: 'waiting on you',
-  notified: 'waiting on you',
-  opened: 'opened',
-  checking: 'checking',
-  proven: 'done — proven',
-  expired: 'expired',
-  cannot: 'handed back',
-  dismissed: 'withdrawn',
-};
-
-const BIRTH_WORDS: Readonly<Record<string, string>> = {
+export const BIRTH_WORDS: Readonly<Record<string, string>> = {
   plan: 'the plan',
   session: 'the phase’s session',
   console: 'the console, on a person’s word',
@@ -152,7 +141,7 @@ export function isOpenState(state: string): boolean {
  * Clocks, in words
  * ------------------------------------------------------------------ */
 
-function span(ms: number): string {
+export function span(ms: number): string {
   const minutes = Math.max(1, Math.round(Math.abs(ms) / 60_000));
   if (minutes < 60) return `${minutes} m`;
   const hours = Math.floor(minutes / 60);
@@ -168,7 +157,7 @@ function clockTime(iso: string): string {
     : iso;
 }
 
-function stamp(iso: string | undefined): string {
+export function stamp(iso: string | undefined): string {
   if (!iso) return '—';
   const at = new Date(iso);
   return Number.isFinite(at.getTime())
@@ -289,9 +278,9 @@ export function useStepVerbs(view: HumanStepView) {
     });
   }
 
-  function check(secret?: string) {
+  function check() {
     if (!id) return;
-    void run('check', () => api.humanStepCheck(id, secret)).then((got) => {
+    void run('check', () => api.humanStepCheck(id)).then((got) => {
       if (got?.check?.landed) toast('Proven — the phase carries on.', 'ok');
     });
   }
@@ -348,7 +337,7 @@ export function KindMark({ kind, className }: { kind: HumanStepKind; className?:
   );
 }
 
-function WhereBadge({ where }: { where: HumanStepView['where'] }) {
+export function WhereBadge({ where }: { where: HumanStepView['where'] }) {
   return (
     <span
       data-testid="step-where"
@@ -361,7 +350,7 @@ function WhereBadge({ where }: { where: HumanStepView['where'] }) {
 }
 
 /** A device code: the one code a step shows on purpose — large, mono, selectable, copyable. */
-function DeviceCode({ code }: { code: string }) {
+export function DeviceCode({ code }: { code: string }) {
   return (
     <div className="flex flex-wrap items-center gap-2" data-testid="step-code-block">
       <output
@@ -391,7 +380,7 @@ function StepCommand({ command }: { command: string }) {
 }
 
 /** Not due yet: what the act waits on before it becomes a person's turn. */
-function DueLine({ dueWhen }: { dueWhen: string | undefined }) {
+export function DueLine({ dueWhen }: { dueWhen: string | undefined }) {
   return (
     <p data-testid="step-due" className="max-w-prose text-2xs text-ink-muted">
       {dueWhen ? (
@@ -405,15 +394,37 @@ function DueLine({ dueWhen }: { dueWhen: string | undefined }) {
   );
 }
 
+/**
+ * A `secret-entry` item's one rule, said where its form used to be: the value
+ * goes somewhere the console names and never into this page (control-tower
+ * phase 133). The server's words carry commands in backticks; each is drawn
+ * as code so it can be read and copied whole.
+ */
+export function SecretWhere({ where }: { where: string | undefined }) {
+  const parts = (where ?? 'the place the steps above name').split('`');
+  return (
+    <p data-testid="step-secret-where" className="max-w-prose text-2xs text-ink-muted">
+      This console never takes the value. It goes in{' '}
+      {parts.map((part, index) =>
+        index % 2 ? (
+          <code key={index} className="font-mono break-all text-ink">
+            {part}
+          </code>
+        ) : (
+          <span key={index}>{part}</span>
+        ),
+      )}
+      . Put it there yourself, then check — the check looks for it by name.
+    </p>
+  );
+}
+
 interface PrimaryProps {
   item: InboxItem;
   view: HumanStepView;
   verbs: ReturnType<typeof useStepVerbs>;
   perform?: Perform | undefined;
   busy?: string | undefined;
-  /** The secret typed into a `secret-entry` form — sent by the check, then gone. */
-  secret?: string;
-  onSecretSent?: () => void;
   size?: 'sm' | 'lg';
   className?: string;
   /** The strip names its one action `strip-action`; the card's is `step-primary`. */
@@ -430,8 +441,6 @@ function PrimaryButton({
   verbs,
   perform,
   busy,
-  secret,
-  onSecretSent,
   size = 'sm',
   className,
   testId = 'step-primary',
@@ -474,10 +483,7 @@ function PrimaryButton({
   const press = () => {
     if (act === 'open') verbs.open('url');
     else if (act === 'terminal' || act === 'machine') verbs.open('command');
-    else if (secret) {
-      verbs.check(secret);
-      onSecretSent?.();
-    } else verbs.check();
+    else verbs.check();
   };
   const working =
     (act === 'open' || act === 'terminal' || act === 'machine' ? 'open' : 'check') === verbs.busy;
@@ -570,7 +576,7 @@ function PrimaryWithVerbs({
  * The datums — one press away, and a raw view one more
  * ------------------------------------------------------------------ */
 
-function MoveLine({ move }: { move: HumanStepMoveView }) {
+export function MoveLine({ move }: { move: HumanStepMoveView }) {
   const where =
     move.where === 'host'
       ? ' on the machine'
@@ -730,7 +736,12 @@ function StepRow({ item, view, perform, busy, className }: HumanStepCardProps & 
       {view.kind === 'operator-act' && view.openCommand && !open && (
         <StepCommand command={view.openCommand} />
       )}
-      <div className="flex flex-wrap items-center gap-1.5">
+      {/* `relative`, as the inbox row's title link is (`components/inbox-row.tsx`):
+          in a row with a pick box, the box's 44px touch overlay (`tap-area`)
+          overhangs its 16px box by 14px — past the row's 10px gap — and this
+          line starts flush under it. Unpositioned, the primary lost its
+          top-left corner to the box: the register's touch-wins, in the bell. */}
+      <div className="relative flex flex-wrap items-center gap-1.5">
         {!open && !upcoming && <PrimaryWithVerbs item={item} view={view} perform={perform} busy={busy} />}
         <button
           type="button"
@@ -766,7 +777,6 @@ function FullCard({
   const [details, setDetails] = useState(false);
   const [asking, setAsking] = useState(false);
   const [reason, setReason] = useState('');
-  const [secret, setSecret] = useState('');
   const state = record?.state ?? view.state;
   const live = isOpenState(state);
   // Coming up (control-tower phase 121): open, but not yet a person's turn —
@@ -802,8 +812,8 @@ function FullCard({
             {item.slug ?? 'no plan named'}
             {item.phase != null ? `, phase ${item.phase}` : ''}
           </span>
-          <span className="text-2xs text-ink-muted" data-testid="step-state">
-            {STATE_WORDS[state] ?? state}
+          <span data-testid="step-state">
+            <OpsBadge vocab="step" word={state as HumanStepState} />
           </span>
         </div>
       )}
@@ -830,19 +840,7 @@ function FullCard({
         </p>
       )}
       {!embedded && view.code && <DeviceCode code={view.code} />}
-      {view.kind === 'secret-entry' && view.stepId && live && (
-        <label className="flex max-w-sm flex-col gap-1 text-2xs text-ink-muted">
-          The secret — stored on the machine, never shown again
-          <Input
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            data-testid="step-secret"
-            value={secret}
-            onChange={(event) => setSecret(event.target.value)}
-          />
-        </label>
-      )}
+      {view.kind === 'secret-entry' && live && <SecretWhere where={record?.secretWhere} />}
       {verbs.confirm && (
         <div
           data-testid="step-confirm"
@@ -869,8 +867,6 @@ function FullCard({
             verbs={verbs}
             perform={perform}
             busy={busy}
-            secret={secret}
-            onSecretSent={() => setSecret('')}
             size="lg"
             className="min-h-(--tap-min)"
           />

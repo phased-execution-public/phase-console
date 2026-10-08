@@ -43,8 +43,10 @@ import { Service } from '../server/service.ts';
 import { handleApi } from '../server/api/routes.ts';
 import { CONSOLE_FORGE_RULE } from '../server/runner/approvals.ts';
 import {
-  AUTHORITY_ROUTES, AUTHORITY_VERBS, CONSOLE_FILES_VERB, authorityCliOf, authorityRouteOf,
+  AUTHORITY_PRESSES, AUTHORITY_ROUTES, AUTHORITY_VERBS, CONSOLE_FILES_VERB, authorityCliOf, authorityRouteOf,
 } from '../shared/door-model.js';
+import { AUTHORITY_METHODS } from '../server/owner/door.ts';
+import { mintActionToken } from '../server/push/actions.ts';
 import { configDir, stateHome } from '../shared/instances.mjs';
 import { OPERATOR_VERBS } from '../shared/verb-model.js';
 
@@ -120,6 +122,27 @@ const ROUTE_PRESSES: [string, string][] = [
   ['console-write', `curl -X POST ${H} http://127.0.0.1:4130/api/write -d '{"action":"gate-approve","slug":"demo","phase":3,"door":"console"}'`],
   ['check-step', 'xh :4130/api/human-steps/s-1/check x-phase-console:1 note=done'],
   ['dismiss-step', `curl --request POST ${H} 'http://[::1]:4130/api/human-steps/s-1/dismiss'`],
+  // The owner's moves (control-tower phase 133, #210): an answer and a decline
+  // are the owner's — a supervised session that tries either is denied here.
+  ['answer-step', `curl -s -X POST ${H} http://127.0.0.1:4130/api/human-steps/s-1/answer -d '{"option":"o1","note":"go"}'`],
+  ['decline-step', 'xh :4130/api/human-steps/s-1/decline x-phase-console:1 reason=no'],
+  // The check (control-tower phase 134, #211): the ONE route that writes a
+  // verdict, and the escalation's rewrite — a supervised session that tries
+  // either is denied here, so no agent marks its own item passed.
+  ['override-step', `curl -s -X POST ${H} http://127.0.0.1:4130/api/human-steps/s-1/override -d '{}'`],
+  ['rewrite-step', 'xh :4130/api/human-steps/s-1/rewrite x-phase-console:1 note=again'],
+  // A permission item's two answers besides its Grant (control-tower phase
+  // 135, #212) — a person's: a session that tries to deny or take over its own
+  // item is denied here.
+  ['deny-step', `curl -s -X POST ${H} http://127.0.0.1:4130/api/human-steps/s-1/deny -d '{"reason":"no"}'`],
+  ['convert-step', 'xh POST :4130/api/human-steps/s-1/convert x-phase-console:1'],
+  // The scoped grant (control-tower phase 149, #212): a session that tries to
+  // grant its own item, or to take a person's grant back, is denied here.
+  ['grant-step', `curl -s -X POST ${H} http://127.0.0.1:4130/api/human-steps/s-1/grant -d '{"scope":"phase"}'`],
+  ['revoke-grant', 'xh POST :4130/api/permissions/grants/g-1/revoke x-phase-console:1'],
+  ['revoke-all-grants', `curl -s -X POST ${H} http://127.0.0.1:4130/api/permissions/grants/revoke-all -d '{}'`],
+  ['revoke-grant', 'phase-console grants revoke g-1 --console pe-hub'],
+  ['revoke-all-grants', 'phase-console grants revoke-all'],
   // Spellings the router reads the same way: a percent-encoded segment, a dot
   // segment kept by --path-as-is, a curl glob, an IPv4 short form.
   ['answer-card', `curl -X POST ${H} http://127.0.0.1:4130/api/%61pprovals/a1b2c3 -d '{}'`],
@@ -399,6 +422,8 @@ test('CF-5 (EC5): AUTHORITY_ROUTES is one table of routes the router serves — 
 });
 
 test('CF-5 (EC5): every CLI form is a verb the CLI dispatches, pressing the row\'s own route', () => {
+  // In the free tree `bin/phase-console.mjs` IS the override, and `free/` does not ship.
+  const bins = ['../../bin/phase-console.mjs'];
   for (const row of AUTHORITY_ROUTES) {
     for (const form of row.cli) {
       const [group, name] = form.split(' ');
@@ -406,6 +431,21 @@ test('CF-5 (EC5): every CLI form is a verb the CLI dispatches, pressing the row\
         const verb = OPERATOR_VERBS.find((v) => v.name === name);
         assert.ok(verb?.cli, `${form}: phase-console run has no such verb`);
         assert.equal(verb!.route, `${row.method} ${row.path}`, `${form} presses another route`);
+      } else if (group === 'owner') {
+        // The owner key's verbs (control-tower phase 148): both bins dispatch `owner` to one module.
+        const ownerVerb = readFileSync(new URL('../../bin/owner-verb.mjs', import.meta.url), 'utf8');
+        assert.match(ownerVerb, new RegExp(`word === '${name}'\\) return \\['${row.method}', '${row.path}`), form);
+        for (const bin of bins) {
+          assert.match(readFileSync(new URL(bin, import.meta.url), 'utf8'), /args\[0\] === 'owner'[\s\S]{0,200}owner-verb\.mjs/, `${bin} dispatches owner`);
+        }
+      } else if (group === 'grants') {
+        // The scoped grants (control-tower phase 149): both bins dispatch `grants` to one module.
+        const grantsVerb = readFileSync(new URL('../../bin/grants-verb.mjs', import.meta.url), 'utf8');
+        assert.match(grantsVerb, new RegExp(`word === '${name}'\\) return \\['${row.method}', [\`']/api/permissions/grants/`), form);
+        assert.ok(grantsVerb.includes(row.path.endsWith('/:id/revoke') ? '/revoke`' : `'${row.path}'`), `${form} presses ${row.path}`);
+        for (const bin of bins) {
+          assert.match(readFileSync(new URL(bin, import.meta.url), 'utf8'), /args\[0\] === 'grants'[\s\S]{0,200}grants-verb\.mjs/, `${bin} dispatches grants`);
+        }
       } else {
         assert.equal(group, 'supervisor', `${form}: no such CLI group`);
         const supervisorVerb = readFileSync(new URL('../../bin/supervisor-verb.mjs', import.meta.url), 'utf8');
@@ -425,7 +465,113 @@ test('CF-5: the reader takes a path the way the router does', () => {
   assert.equal(authorityRouteOf('POST', '/api/approvals'), null, 'the card list is not a card');
   assert.equal(authorityRouteOf('POST', '/api/run/demo/messages'), null);
   assert.equal(authorityRouteOf('POST', '/hooks/declaration'), null);
-  assert.equal(new Set(AUTHORITY_VERBS).size, AUTHORITY_VERBS.length, 'one row per press');
+  assert.equal(new Set(AUTHORITY_PRESSES).size, AUTHORITY_PRESSES.length, 'one row per press');
+  for (const row of AUTHORITY_ROUTES) {
+    assert.ok((AUTHORITY_VERBS as readonly string[]).includes(row.authority), `${row.verb}: ${row.authority} is no authority verb`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * OD-5 (control-tower phase 131, #208) — the table held the other way
+ * ------------------------------------------------------------------ */
+
+test('OD-5: every call of an authority method in the router is reached by an AUTHORITY_ROUTES row — a route born without one fails here', async () => {
+  // Every line of the router that calls a method carrying an authority verb.
+  const source = readFileSync(new URL('../server/api/routes.ts', import.meta.url), 'utf8').split('\n');
+  const methods = Object.keys(AUTHORITY_METHODS);
+  const callOf = new RegExp(`\\bservice\\.(${methods.join('|')})\\(`);
+  const sites = new Map<number, string>();
+  source.forEach((line, i) => {
+    const hit = callOf.exec(line);
+    if (hit) sites.set(i + 1, hit[1]!);
+  });
+  assert.ok(sites.size >= methods.length, `the scan found ${sites.size} call sites for ${methods.length} methods`);
+
+  // A real service whose authority methods record the router line that called them.
+  const service = new Service({ ...flags, allowWrites: true, allowRun: true, allowAccounts: true, remoteHosts: [], remoteUsers: [] } as never);
+  const svc = service as unknown as Record<string, unknown>;
+  svc.root = { ok: true, path: tmpdir() };
+  svc.store = { get: () => undefined, all: () => [] };
+  const hits: { row: string; line: number; method: string }[] = [];
+  let pressing = '';
+  for (const method of methods) {
+    svc[method] = () => {
+      const line = /\/server\/api\/routes\.ts:(\d+):\d+/.exec(new Error().stack ?? '')?.[1];
+      if (line) hits.push({ row: pressing, line: Number(line), method });
+      return { ok: true, status: 200, gate: null, detail: 'probed' };
+    };
+  }
+  const answers = new Map<string, string>();
+  const send = async (method: string, path: string, body: Record<string, unknown>) => {
+    const req = {
+      method,
+      url: path,
+      headers: { 'x-phase-console': '1', host: '127.0.0.1:4130', 'content-type': 'application/json' },
+      socket: { remoteAddress: '127.0.0.1' },
+      on() { return this; },
+      [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body), 'utf8'); },
+    };
+    let said = '';
+    const res = {
+      req, writeHead(code: number) { said = `${code} `; return this; }, setHeader() {},
+      end(chunk?: string | Buffer) { said += chunk ? chunk.toString().slice(0, 300) : ''; }, on() { return this; },
+    };
+    await handleApi({ service } as never, req as never, res as never, new URL(`http://127.0.0.1:4130${path}`));
+    answers.set(pressing, said);
+  };
+  const fill = (path: string) => path.replace(/:([a-z]+)/g, (_, name: string) => (name === 'phase' ? '3' : 'demo'));
+  // What each row's route needs in its body to reach its press — one entry per row, so a new row needs one too.
+  const probes: Record<string, { path?: string; body: Record<string, unknown> }[]> = {
+    'answer-card': [{ body: { decision: 'allow' } }, { path: '/api/approvals/a1/extend', body: { minutes: 5 } }],
+    'edit-policy': [{ body: { add: { allow: ['Bash(ls:*)'] } } }],
+    'edit-prefs': [{ body: { theme: 'dark' } }],
+    'run-settings': [{ body: { maxParallel: 1 } }],
+    'answer-question': [{ body: { approvalId: 'a1', key: 'q', label: 'yes' } }],
+    'approve-plan': [{ body: { phase: 1, decision: 'approve' } }],
+    'delegate-step': [{ body: { phase: 1, instruction: 'do it yourself' } }],
+    'remember-ruling': [{ body: { scope: 'global' } }],
+    'approve-gate': [{ body: { approve: true } }],
+    'console-write': [{ body: { action: 'gate-approve', slug: 'demo', phase: 3 } }],
+    'check-step': [{ body: {} }],
+    'dismiss-step': [{ body: {} }],
+    'answer-step': [{ body: { option: 'o1', note: 'go' } }],
+    'decline-step': [{ body: { reason: 'no' } }],
+    'override-step': [{ body: {} }],
+    'rewrite-step': [{ body: {} }],
+    'deny-step': [{ body: { reason: 'no' } }],
+    'convert-step': [{ body: {} }],
+    'grant-step': [{ body: { scope: 'call' } }],
+    'revoke-grant': [{ body: {} }],
+    'revoke-all-grants': [{ body: {} }],
+    'push-action': [{ body: { token: mintActionToken('approval:demo:a1', ['allow']), action: 'allow' } }],
+    // The owner key's routes (control-tower phase 148): one press each, and the owner's answer to a request.
+    'owner-enrol': ['link', 'begin', 'finish'].map((verb) => ({ path: `/api/owner/enroll/${verb}`, body: {} })),
+    'owner-assert': ['begin', 'finish'].map((verb) => ({ path: `/api/owner/assert/${verb}`, body: {} })),
+    'owner-lock': [{ body: {} }],
+    'owner-key-remove': [{ body: {} }],
+    'owner-request': ['confirm', 'refuse'].map((verb) => ({ path: `/api/owner/requests/r1/${verb}`, body: {} })),
+  };
+  try {
+    assert.deepEqual(Object.keys(probes).sort(), [...AUTHORITY_PRESSES].sort(), 'one probe per row');
+    for (const row of AUTHORITY_ROUTES) {
+      pressing = row.verb;
+      for (const probe of probes[row.verb]!) await send(row.method, probe.path ?? fill(row.path), probe.body);
+    }
+  } finally {
+    service.approvals.disarm();
+    service.close();
+  }
+  const reached = new Set(hits.map((hit) => hit.line));
+  for (const row of AUTHORITY_ROUTES) {
+    const own = hits.filter((hit) => hit.row === row.verb).map((hit) => AUTHORITY_METHODS[hit.method]);
+    assert.ok(own.includes(row.authority),
+      `${row.verb} reaches no ${row.authority} press (it reached: ${own.join(', ') || 'nothing'}; the router said ${answers.get(row.verb)})`);
+  }
+  for (const [line, method] of sites) {
+    assert.ok(reached.has(line),
+      `routes.ts:${line} presses ${method} (${AUTHORITY_METHODS[method]}) through a route no AUTHORITY_ROUTES row reaches — `
+      + 'give it a row in shared/door-model.js, and a probe here');
+  }
 });
 
 /* ------------------------------------------------------------------ *
@@ -467,4 +613,59 @@ test('CF-6: a press the plan\'s permission.destructive row names for the running
     await run(manifest('deny; allow `Bash(git push:*)` — every phase'), `curl -X POST ${H} http://127.0.0.1:4130/api/policy -d '{}'`),
     'deny', 'a row naming no console press opens none',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * EC7 (control-tower phase 148, #208) — the owner key's routes are fenced
+ * ------------------------------------------------------------------ */
+
+test('EC7: a session\'s call to the owner key\'s routes and the request routes is denied at its hook; a read passes', async () => {
+  const base = 'http://127.0.0.1:4130';
+  await fenced(`curl -X POST ${H} ${base}/api/owner/enroll/link`, 'owner-enrol');
+  await fenced(`curl -X POST ${H} -d '{}' ${base}/api/owner/enroll/finish`, 'owner-enrol');
+  await fenced(`curl -X POST ${H} ${base}/api/owner/assert/finish -d '{}'`, 'owner-assert');
+  await fenced(`curl -X POST ${H} ${base}/api/owner/lock`, 'owner-lock');
+  await fenced(`curl -X DELETE ${H} ${base}/api/owner/keys/k1`, 'owner-key-remove');
+  await fenced(`curl -X POST ${H} ${base}/api/owner/requests/r1/confirm`, 'owner-request');
+  await fenced(`curl -X POST ${H} ${base}/api/owner/requests/r1/refuse`, 'owner-request');
+  await fenced('phase-console owner enroll', 'owner-enrol');
+  await fenced('phase-console owner lock --console pe-hub', 'owner-lock');
+  await passes('Bash', { command: 'phase-console owner status' });
+  await passes('Bash', { command: `curl -s ${base}/api/owner` });
+  for (const verb of ['owner-enrol', 'owner-assert', 'owner-lock', 'owner-key-remove', 'owner-request']) {
+    assert.ok(AUTHORITY_PRESSES.includes(verb), `${verb} is a row`);
+  }
+});
+
+// A planted value, built at run time so no literal one sits in the tree.
+const PLANTED_TOKEN = `gh${'p'}_${'K'.repeat(36)}`;
+const PLANTED_PASSWORD = `Hunter2-${'4'.repeat(3)}q`;
+
+test('EC-141 (#217): a refused call\'s journal line keeps its command and never a secret the line held', async () => {
+  // Found by the tower rehearsal's turn group (control-tower phase 141): a
+  // session pressing its own console with a bearer token on the line had the
+  // token written into the run's journal, verbatim, by the forge denial.
+  const lines: [string, string][] = [
+    [CONSOLE_FORGE_RULE, `curl -sS -X POST ${H} -H "Authorization: Bearer ${PLANTED_TOKEN}" http://127.0.0.1:4130/api/human-steps/a1b2c3/answer -d '{"option":"keep"}'`],
+    [CONSOLE_FORGE_RULE, `curl -sS -X POST ${H} http://127.0.0.1:4130/api/human-steps/a1b2c3/grant -d '{"scope":"always","password":"${PLANTED_PASSWORD}"}' -u admin:password=${PLANTED_PASSWORD}`],
+    ['Bash(git push:*)', `git push https://bot:${PLANTED_TOKEN}@github.com/acme/app.git main`],
+  ];
+  for (const [rule, command] of lines) {
+    const { decide, noted, close } = supervised('bypass');
+    try {
+      const answer = await decide('Bash', { command });
+      assert.equal(answer.permissionDecision, 'deny', command);
+      const denied = noted.filter((n) => n.event === 'phase.tool-denied');
+      assert.equal(denied.length, 1, `${rule}: written down once`);
+      assert.equal(denied[0]!.data.rule, rule);
+      const kept = String(denied[0]!.data.command ?? '');
+      assert.ok(kept.length > 0, `${rule}: the command is kept, redacted`);
+      for (const value of [PLANTED_TOKEN, PLANTED_PASSWORD]) {
+        assert.ok(!JSON.stringify(noted).includes(value), `${rule}: a planted secret reached the journal line: ${kept}`);
+      }
+      assert.match(kept, /\[redacted\]/, `${rule}: the secret's place is marked`);
+    } finally {
+      close();
+    }
+  }
 });

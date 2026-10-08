@@ -246,4 +246,53 @@ describe('the launch door lists the run’s turns', () => {
     await waitFor(() => expect(mocks.runPrelude).toHaveBeenCalled());
     expect(screen.queryByTestId('door-steps')).toBeNull();
   });
+
+  // control-tower phase 139 (#216, exit criteria 3 and 4)
+  it('lists items: a step a launch already raised opens its item on Your turn', async () => {
+    mocks.runPrelude.mockResolvedValue({
+      prelude: prelude({ humanSteps: [STEPS[0], { ...STEPS[1], item: 'st-9' }] }),
+    });
+    await mount();
+    const rows = within(await screen.findByTestId('door-steps')).getAllByTestId('door-step');
+    expect(rows[1]).toHaveAttribute('data-item', 'st-9');
+    const doIt = within(rows[1]!).getByTestId('door-step-do');
+    expect(doIt).toHaveAttribute('href', '#/turn/st-9');
+    expect(doIt).toHaveAttribute('data-move', 'item');
+    // The pre-cleared one is still shown done, with nothing to press.
+    expect(within(rows[0]!).queryByTestId('door-step-do')).toBeNull();
+  });
+
+  it('shows a plan’s auto-open link whole, and the launch sends exactly that link back', async () => {
+    const auto = {
+      phase: 1,
+      kind: 'browser-login',
+      what: 'Sign the registry in',
+      where: 'host',
+      state: 'needed',
+      open: { url: 'https://registry.example.com/login?next=%2Fcli' },
+      autoOpen: 'host',
+    };
+    const later = { ...auto, phase: 2, what: 'Approve the release', due: 'phase:alpha/1' };
+    // Raised by a launch before this one: asked once, so it promises no second open.
+    const raised = {
+      ...auto,
+      what: 'Sign the mirror in',
+      open: { url: 'https://mirror.example.com/login' },
+      item: 'st-3',
+    };
+    mocks.runPrelude.mockResolvedValue({ prelude: prelude({ humanSteps: [auto, later, raised] }) });
+    await mount();
+    const rows = within(await screen.findByTestId('door-steps')).getAllByTestId('door-step');
+    expect(within(rows[0]!).getByTestId('door-step-auto').textContent).toBe(
+      'Opens on this machine when you launch: https://registry.example.com/login?next=%2Fcli',
+    );
+    // An act not due yet opens nothing at the door, nor one already raised.
+    expect(within(rows[1]!).queryByTestId('door-step-auto')).toBeNull();
+    expect(within(rows[2]!).queryByTestId('door-step-auto')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
+    expect(mocks.runStart.mock.calls[0]![1]).toMatchObject({
+      autoOpen: ['https://registry.example.com/login?next=%2Fcli'],
+    });
+  });
 });

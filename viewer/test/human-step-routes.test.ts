@@ -25,13 +25,20 @@
  *         its command shown and run on Enter, and NOTHING of a code or secret
  *         is in the ticket, the journal or the ledger; the command's exit is
  *         the proof. Plus snooze, cannot (an errand with the reason), dismiss.
+ *   HR-10 `POST /api/run/:slug/start` reads `autoOpen` — the links the launch
+ *         form showed in full — as an array of at most 20 strings of at most
+ *         2048 characters, or answers a 400 naming the field; what it keeps is
+ *         handed to `startRun` as sent, so the door's exact match is not tidied.
+ *   HR-11 that form is the only door that sends them: no other file under
+ *         `server/` passes `autoOpenShown`, so converge, a webhook and `bin/`
+ *         open nothing on the machine.
  */
 
 import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -261,7 +268,8 @@ test('HR-6 — check on a landed proof: proven, journalled, and the SAME session
     h.svc.watchClock.probeNow = async (ref: string): Promise<WatchState> => ({ ref, state: 'landed', detail: 'exit 0' });
     const checked = await call(h.svc, 'POST', `/api/human-steps/${step.id}/check`);
     assert.equal(checked.status, 200);
-    assert.deepEqual(checked.body.check, { landed: true, read: 'landed — exit 0', ref: 'cmd:"gh auth status"' });
+    // Since phase 134 the check answers its verdict too: passed, by the probe, attempt 1.
+    assert.deepEqual(checked.body.check, { landed: true, read: 'landed — exit 0', state: 'passed', by: 'probe', attempt: 1, ref: 'cmd:"gh auth status"' });
     assert.deepEqual(checked.body.resumed, { launched: true });
     assert.equal(h.svc.humanStepsNow().get(step.id)!.state, 'proven');
     assert.equal(h.resumed.length, 1, 'one resume');
@@ -293,11 +301,12 @@ test('HR-7 — check on an unlanded proof answers what it read, in its own words
     assert.equal(check.landed, false);
     assert.equal(check.read, 'pending — exit 1: You are not logged into any GitHub hosts', 'the proof\'s own words');
     const now = h.svc.humanStepsNow().get(step.id)!;
-    assert.equal(now.state, 'notified', 'the step waits on');
+    assert.equal(now.state, 'returned', 'sent back — a miss is a rejection (phase 134)');
+    assert.equal(now.verdict?.state, 'rejected');
     assert.equal(now.read, check.read, 'and remembers what the check read');
     assert.equal(now.checks, 1);
     assert.equal(h.resumed.length, 0, 'nothing resumed');
-    assert.equal(journal(h.root, state).filter((l) => l.event === 'phase.human-step-checked').length, 1);
+    assert.equal(journal(h.root, state).filter((l) => l.event === 'phase.human-step-returned').length, 1);
   } finally { h.cleanup(); }
 });
 
@@ -452,40 +461,95 @@ test('HR-9 — snooze, cannot and dismiss: the reminder floor, an errand with th
   } finally { h.cleanup(); }
 });
 
-test('HR-9 — a secret-entry step stores its secret in the registry, and nothing else ever holds it', async () => {
+test('HR-9 — a secret-entry step takes no secret (phase 133): refused naming where it goes, nothing stored, proven there by name', async () => {
   const SECRET = 'npm_Zq8vXw2LmN4pR6tY1uI3oP5aS7dF9gH0jK2l';
-  const off = harness();
-  try {
-    const { step } = parked(off, { kind: 'secret-entry', title: 'Paste the npm publish token', credential: 'npm-token' });
-    const refused = await call(off.svc, 'POST', `/api/human-steps/${step.id}/check`, { secret: SECRET });
-    assert.equal(refused.status, 403, 'holding a credential is --allow-accounts');
-    assert.equal(off.svc.humanStepsNow().get(step.id)!.state, 'notified', 'and nothing moved');
-  } finally { off.cleanup(); }
-
   const h = harness({ allowAccounts: true });
   try {
-    const dir = mkdtempSync(join(tmpdir(), 'pc-step-secrets-'));
-    const { storeStepSecret } = await import('../server/human-steps.ts');
-    (h.svc as unknown as { stepSecretStore: unknown }).stepSecretStore = (id: string, secret: string) =>
-      storeStepSecret({ dir, platform: 'linux' }, id, secret);
     const { state, step } = parked(h, { kind: 'secret-entry', title: 'Paste the npm publish token', credential: 'npm-token' });
-    const wrongKind = parked(h, BROWSER, 6).step;
-    const notHere = await call(h.svc, 'POST', `/api/human-steps/${wrongKind.id}/check`, { secret: SECRET });
-    assert.equal(notHere.status, 400, 'only a secret-entry step takes a secret');
-    const answer = await call(h.svc, 'POST', `/api/human-steps/${step.id}/check`, { secret: SECRET });
-    assert.equal(answer.status, 200);
-    assert.equal((answer.body.check as { landed: boolean }).landed, true, 'the registry answered, so the probe is green');
-    const done = h.svc.humanStepsNow().get(step.id)!;
-    assert.equal(done.state, 'proven');
-    assert.equal(done.stored, 'file', 'the ledger records WHERE it went');
-    assert.equal(readFileSync(join(dir, 'npm-token'), 'utf8'), `${SECRET}\n`, 'the registry holds it');
+    const refused = await call(h.svc, 'POST', `/api/human-steps/${step.id}/check`, { secret: SECRET });
+    assert.equal(refused.status, 400, 'even behind --allow-accounts: the console never takes the value');
+    assert.match(String(refused.body.error), /never takes a secret/);
+    assert.match(String(refused.body.where), /npm-token/, 'it says where the value goes');
+    assert.equal(h.svc.humanStepsNow().get(step.id)!.state, 'notified', 'and nothing moved');
     for (const [where, text] of [
-      ['answer', JSON.stringify(answer.body)], ['ledger', ledgerText()],
-      ['journal', readFileSync(journalFile(h.root, SLUG, state.id), 'utf8')],
+      ['answer', JSON.stringify(refused.body)], ['ledger', ledgerText()],
+      ['journal', (() => { try { return readFileSync(journalFile(h.root, SLUG, state.id), 'utf8'); } catch { return ''; } })()],
     ] as const) {
       assert.equal(text.includes(SECRET), false, `${where} never holds the secret`);
     }
+    // Put in place by the person, the check finds it BY NAME and the session resumes.
+    const asked: string[] = [];
+    h.svc.watchClock.probeNow = async (ref: string): Promise<WatchState> => { asked.push(ref); return { ref, state: 'landed', detail: 'held' }; };
+    const proven = await call(h.svc, 'POST', `/api/human-steps/${step.id}/check`, {});
+    assert.equal(proven.status, 200);
+    assert.match(asked[0], /^credential:/);
+    assert.equal(h.svc.humanStepsNow().get(step.id)!.state, 'proven');
+    assert.equal(h.svc.humanStepsNow().get(step.id)!.stored, undefined, 'nothing was stored, so nothing says where');
     assert.equal(h.resumed.length, 1, 'and the session resumes');
-    rmSync(dir, { recursive: true, force: true });
   } finally { h.cleanup(); }
+});
+
+test('HR-10 — POST /start reads `autoOpen` as the links the form showed: at most 20 strings of at most 2048 characters, or a 400 naming the field', async () => {
+  const h = harness();
+  try {
+    const started: Record<string, unknown>[] = [];
+    (h.svc as unknown as Record<string, unknown>).startRun = async (_slug: string, options: Record<string, unknown>) => {
+      started.push(options);
+      return { id: 'run-1', slug: SLUG };
+    };
+    // A resume skips the prelude's required answers, so the body can stay about `autoOpen`.
+    const start = (extra: Record<string, unknown>) => call(h.svc, 'POST', `/api/run/${SLUG}/start`, { resumeRunId: 'run-0', ...extra });
+
+    for (const [bad, pattern] of [
+      ['https://github.com/login/device', /^autoOpen must be an array/],
+      [{ 0: LINK }, /^autoOpen must be an array/],
+      [true, /^autoOpen must be an array/],
+      [Array.from({ length: 21 }, (_, i) => `https://example.com/${i}`), /^autoOpen may name at most 20 links/],
+      [[LINK, 7], /^every autoOpen link must be a string of at most 2048 characters/],
+      [[null], /^every autoOpen link must be a string/],
+      [[`https://example.com/${'a'.repeat(2049)}`], /^every autoOpen link must be a string of at most 2048 characters/],
+    ] as const) {
+      const refused = await start({ autoOpen: bad });
+      assert.equal(refused.status, 400, JSON.stringify(bad).slice(0, 60));
+      assert.match(String(refused.body.error), pattern);
+    }
+    assert.equal(started.length, 0, 'a refused body starts nothing');
+
+    // The edges are legal, and what is kept is handed over AS SENT — a link tidied here
+    // (trimmed, de-duplicated) would be a link the person was never shown.
+    const edge = `https://example.com/${'a'.repeat(2048 - 'https://example.com/'.length)}`;
+    assert.equal(edge.length, 2048);
+    const sent = [LINK, ` ${LINK} `, `${LINK}/`, LINK, edge];
+    const full = Array.from({ length: 20 }, (_, i) => `https://example.com/${i}`);
+    for (const links of [sent, full, []]) {
+      const ok = await start({ autoOpen: links });
+      assert.equal(ok.status, 200, `${links.length} links`);
+      assert.deepEqual(started.at(-1)!.autoOpenShown, links);
+    }
+    // Silence — absent, or null — is a launch that shows, and so opens, nothing.
+    for (const extra of [{}, { autoOpen: null }]) {
+      assert.equal((await start(extra)).status, 200);
+      assert.equal(started.at(-1)!.autoOpenShown, undefined, JSON.stringify(extra));
+    }
+  } finally { h.cleanup(); }
+});
+
+test('HR-11 — the launch form is the only door that sends `autoOpenShown`: converge, a webhook and bin/ open nothing on the machine', () => {
+  const server = join(SKILL_DIR, 'viewer', 'server');
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.ts')) files.push(full);
+    }
+  };
+  walk(server);
+  const naming = files.filter((file) => readFileSync(file, 'utf8').includes('autoOpenShown')).map((file) => file.slice(server.length + 1)).sort();
+  // The sender (the start route), the one consumer (`startRun`) and the options type.
+  assert.deepEqual(naming, ['api/routes.ts', 'runner/runner-core.ts', 'service-runs.ts']);
+  const routes = readFileSync(join(server, 'api', 'routes.ts'), 'utf8');
+  assert.equal(routes.match(/autoOpenShown/g)?.length, 1, 'the route names it once, to send it');
+  const sending = routes.slice(routes.indexOf("case 'start': {"), routes.indexOf("case 'ask':"));
+  assert.match(sending, /autoOpenShown: Array\.isArray\(body\.autoOpen\)/, 'and the one sender is the start case');
 });

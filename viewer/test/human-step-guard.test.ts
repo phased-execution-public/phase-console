@@ -153,7 +153,8 @@ test('HG-1: no spelling hides a sign-in — wrappers, runners, env, sudo, paths,
   const words = signInRefusal(bare, 'bash x/phase-outcome.sh demo 2');
   assert.doesNotMatch(words, /--proof '/, 'no --proof flag in the declaration');
   assert.match(words, /It names no --proof/);
-  assert.match(words, /--step browser-login --title 'Sign in in a browser: az login' --open-command 'az login' --where host --reason/);
+  // No status verb to read, so the person's word, asked for by name (G2, control-tower phase 130).
+  assert.match(words, /--step browser-login --title 'Sign in in a browser: az login' --open-command 'az login' --where host --proof-type attest --reason/);
 });
 
 /* ------------------------------------------------------------------ *

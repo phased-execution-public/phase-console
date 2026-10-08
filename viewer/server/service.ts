@@ -7,8 +7,12 @@
  * bumps whenever one of its files changes.
  */
 
+import { EVIDENCE_GIT, evidenceTreeOf, wallCommand } from './permissions/walls.ts';
+import { forcedPush, grantEndWords, type GrantRow } from './permissions/grants.ts';
+import { GRANT_SCOPE_WORDS } from '../shared/turn-model.js';
+import type { IncomingMessage } from 'node:http';
 import { basename, join, resolve as resolvePath } from 'node:path';
-import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, sanitisePolicyPrefs } from '../shared/policy-model.js';
+import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, releasePhasesOf, sanitisePolicyPrefs } from '../shared/policy-model.js';
 import { DECISION_KEYS, mergeDecisions } from '../shared/decisions-model.js';
 import { policyForKey, policyPrefsOf } from './runner/policy.ts';
 import {
@@ -50,9 +54,10 @@ import {
 } from './lifecycle.ts';
 import { log } from './log.ts';
 import {
-  CATEGORIES, Push, isPlanProgress, parseQuietHours, routeFor, sanitiseCategories, tagFor, type CategoryId,
+  CATEGORIES, Push, isPlanProgress, routeFor, sanitiseCategories, tagFor, type CategoryId,
 } from './push/index.ts';
-import { isPushActionVerb } from './push/actions.ts';
+import { isPushActionVerb, LOCK_SCREEN_DOOR, lockScreenGrant } from './push/actions.ts';
+import type { DigestTurn } from './push/digest.ts';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
 import { repoInfo, lastCommit, commitsTouching, type GitRepoInfo, type GitFileInfo } from './git.ts';
 import { findMemory, memoryIndexLines } from './memory.ts';
@@ -101,7 +106,13 @@ import {
   accountRung, errandFor, ladderCaps, nextRung, rungsFor, settleRung, type Rung,
 } from './runner/ladder.ts';
 import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
-import { asActor, doorActor, pressActor } from './actor.ts';
+import { asActor, doorActor, pressActor, pressDoorOf } from './actor.ts';
+import { doorOfRequest, ownerState, type DoorReading } from './owner/door.ts';
+import { relyingPartyOf, type RelyingParty } from './owner/passkey.ts';
+import { answerRequest, ownerPress, type OwnerAnswer, type OwnerPressInput } from './owner/presses.ts';
+import { REQUEST_BODY_MAX, requestItemOf, requestView, type AuthorityRequest } from './owner/requests.ts';
+import { ownerCookieName, readCookie, type OwnerSessionRow } from './owner/session.ts';
+import { routeSegments, type AuthorityRoute } from '../shared/door-model.js';
 import { sanitiseSchedule } from '../shared/schedule-policy.js';
 import { sanitiseRelayRules, type RelayMechanism } from '../shared/relay-model.js';
 import type { RelayReply } from './relay.ts';
@@ -114,6 +125,8 @@ import {
   KIND_PROFILE, NO_HANDOFF_AUTO_RE, VERIFICATION_AUTO_RE, isRecoveryClass, recoveryActionsFor,
 } from '../shared/recovery-model.js';
 import { environmentReport, type EnvIssue } from './env-doctor.ts';
+// The check's effort (control-tower phase 134) is free; the chat's pair reads it too.
+import { isEffort } from './runner/spawn.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { foldInboxTasks, type TaskItem } from './runner/tasks.ts';
 import { Journal } from './runner/journal.ts';
@@ -139,6 +152,7 @@ import {
   slugsNeedingBoard, runDir, consoleRunsDir, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText,
   type BoardingBrief, type Errand, type McpPolicy, type PreflightWarning, type RungRecord, type RunState, type VerifySummary,
   journalOf,
+  runIsOver,
   setRunState,
 } from './runner/state.ts';
 import {
@@ -179,9 +193,10 @@ import {
   consoleForgeCall, consoleForgeException, consoleForgeRefusal, consolePorts, CONSOLE_FORGE_RULE, type ConsoleForge,
   parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED, EXTEND_CHOICES_MIN,
   PERMISSION_PROFILES, PROFILE_LABELS,
-  DEFAULT_DENY, DEFAULT_ASK, DEFAULT_ALLOW, POLICY_PATH, PUSH_DENY,
+  DEFAULT_DENY, DEFAULT_ASK, DEFAULT_ALLOW, POLICY_PATH, PUSH_DENY, PUSH_DENY_CARVED,
   type Approval, type Evidence, type ManifestCheck, type PolicyScope, type PermissionProfile,
 } from './runner/approvals.ts';
+import type { CommandJudge } from './turn/guard.ts';
 import { manifestVerdict } from './runner/manifest-verdict.ts';
 
 import {
@@ -191,6 +206,7 @@ import { ServiceRecovery } from './service-recovery.ts';
 import { qaAnchorPhase } from './service-runs.ts';
 import { trimOldest, NOTIFIED_CAP } from './service-base.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
+import { SETTLED_WELL } from '../shared/run-lifecycle.js';
 import { managedRoots, stagingHome, stagingNames } from './runner/worktree.ts';
 // The four launch-default vocabularies (phase 15) are read on a FREE line —
 // the settings door stores the words in both trees, and their owners ship in
@@ -200,6 +216,9 @@ import { managedRoots, stagingHome, stagingNames } from './runner/worktree.ts';
 import { CONFLICT_POLICIES, LAND_POLICIES } from '../shared/landing-model.js';
 import { MESSAGING_WORDS } from '../shared/message-model.js';
 import { ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
+import { TURN_DONE_MS, turnView, type TurnAnswer } from './turn/index.ts';
+import type { HandledRow } from './turn/handled.ts';
+import { bodyCarriesSecret, type HumanStep } from './human-steps.ts';
 
 export {
   HOOK_EVENTS_PER_MINUTE,
@@ -315,6 +334,17 @@ function keyRank(key: string): number {
   return at < 0 ? DECISION_KEYS.length : at;
 }
 
+
+/**
+ * A refused call's command as its `phase.tool-denied` line keeps it
+ * (control-tower phase 141, #217): one line, 400 characters, never a secret —
+ * the wall's own reading (`wallCommand`), so a token or a password on the
+ * refused line reaches no journal.
+ */
+function deniedCommandField(command: unknown): { command?: string } {
+  const kept = wallCommand(command);
+  return kept ? { command: kept } : {};
+}
 export class Service extends ServiceRecovery {
   /** The attention inbox, memoised per shape (`all` or not) — see `attention`. */
   private inboxMemo = new Map<boolean, InboxMemo>();
@@ -1882,6 +1912,46 @@ export class Service extends ServiceRecovery {
    * The inbox as an HTTP entity — its body and validator, built once per memo
    * rather than once per request, and its coded forms packed once each.
    */
+  /**
+   * `GET /api/turn` (control-tower phase 132, #209): the inbox's person-facing
+   * rows — acknowledged ones too, since an ack is "seen" and never "done" —
+   * folded into one item per thing to do, with the ledger's detail and the
+   * items settled in the last day.
+   */
+  async turnAnswer(opts: { seen?: string | null } = {}): Promise<TurnAnswer> {
+    const inbox = await this.attention(true);
+    let steps: HumanStep[] = [];
+    try { steps = this.humanStepsNow().all(); } catch { /* an unreadable ledger is an empty one */ }
+    let requests: AuthorityRequest[] = [];
+    try { requests = ownerState().requests.open(); } catch { /* an unreadable store is an empty one */ }
+    // What the AI handled (control-tower phase 136): the newest rows, and how
+    // many since the person's last look — or, with none given, the last day.
+    const now = Date.now();
+    const seen = opts.seen && Number.isFinite(Date.parse(opts.seen)) ? new Date(Date.parse(opts.seen)).toISOString() : null;
+    let handled: { rows: HandledRow[]; since: number; seen: string | null } = { rows: [], since: 0, seen };
+    try {
+      const ledger = this.handledNow();
+      handled = { rows: ledger.recent(), since: ledger.since(seen ?? new Date(now - TURN_DONE_MS).toISOString()), seen };
+    } catch { /* an unreadable log is an empty one */ }
+    return turnView(inbox, { steps, now, requests, handled, ...(this.turnRound ? { round: this.turnRound.state() } : {}) });
+  }
+
+  /**
+   * Your turn, counted for the hourly digest (control-tower phase 138, #215) —
+   * from the page's own answer, so the digest says what the page says: the
+   * items that need the person now (*Do now* and *Decide*), the ones a check
+   * sent back among them, and what the AI handled since `since`.
+   */
+  protected override async digestTurn(since: string): Promise<Omit<DigestTurn, 'handledSince'> | null> {
+    const turn = await this.turnAnswer({ seen: since });
+    const open = [...turn.groups.now, ...turn.groups.decide];
+    return {
+      needYou: open.length,
+      cameBack: open.filter((item) => item.step?.state === 'returned').length,
+      handled: turn.counts.handled,
+    };
+  }
+
   async attentionEntity(all = false): Promise<InboxEntity> {
     const memo = await this.inboxMemoFor(all);
     if (!memo.entity) {
@@ -2102,6 +2172,7 @@ export class Service extends ServiceRecovery {
       queue: this.queueSnapshot(),
       accounts, auth, mcp,
       environment: this.environment.issues,
+      ownerKeys: (() => { try { return ownerState().registry.changes(); } catch { return []; } })(),
       watcher: this.watcher.status(),
       // The skill copy each config dir loads, against this console (#151).
       skillCopy: await ok('skill-copy', () => this.skillCopy(), undefined),
@@ -2325,6 +2396,16 @@ export class Service extends ServiceRecovery {
     switch (verb) {
       case 'allow':
       case 'deny': {
+        // A permission item's *Deny* (control-tower phase 138, #215) is the
+        // item's own decline — the session is told to find another way —
+        // never an approval card's: the token named the item, and the item
+        // says what its deny is. A decline any person's door may press.
+        if (verb === 'deny' && item.kind === 'human-step') {
+          const stepId = parseInboxItemId(itemId)?.subject;
+          if (!stepId) return { ok: false, status: 409, error: 'this card names no item to deny' };
+          const denied = await this.denyHumanStep(stepId, {}, { by, actor: pressActor(actor) });
+          return denied.ok ? { ok: true, verb, item: itemId } : { ok: false, status: denied.status, error: denied.error };
+        }
         const parsed = parseInboxItemId(itemId);
         const approvalId = parsed?.subject;
         if (!approvalId) return { ok: false, status: 409, error: 'this card has no id to answer' };
@@ -2332,6 +2413,30 @@ export class Service extends ServiceRecovery {
         return answered.ok
           ? { ok: true, verb, item: itemId }
           : { ok: false, status: 409, error: answered.error ?? 'the card could not be answered' };
+      }
+      // A permission item's *Allow* from the lock screen (control-tower phase
+      // 138, #215): a grant at the item's NARROWEST offered scope, through the
+      // door the press came through — a signed action is the `device` door.
+      // The token said what was offered when the push went out; the door
+      // table is read again HERE against the live item, so a high or never
+      // item's grant pressed anyway is refused and the worker opens the item.
+      // The grant engine then judges its own risk once more (`grantHumanStep`).
+      case 'grant': {
+        const stepId = item.kind === 'human-step' ? parseInboxItemId(itemId)?.subject : undefined;
+        const step = stepId ? this.humanStepsNow().get(stepId) : null;
+        if (!stepId || !step || step.kind !== 'permission') {
+          return { ok: false, status: 409, error: 'this card names no permission item to grant' };
+        }
+        const door = pressDoorOf(actor);
+        const offer = door === LOCK_SCREEN_DOOR ? lockScreenGrant(step.permission) : null;
+        if (!offer) {
+          return {
+            ok: false, status: 403,
+            error: 'this grant is not a paired device’s to make from a lock screen — open the item to grant it',
+          };
+        }
+        const granted = await this.grantHumanStep(stepId, { scope: offer.scope }, { by, actor: pressActor(actor), door });
+        return granted.ok ? { ok: true, verb, item: itemId } : { ok: false, status: granted.status, error: granted.error };
       }
       // The expiry warning's second button (control-tower phase 97, #140).
       case 'extend': {
@@ -2351,8 +2456,9 @@ export class Service extends ServiceRecovery {
           by,
           actor,
           // A notification's Approve is a person's press (#174): its action
-          // token was minted for the push a person's device received.
-          person: true,
+          // token was minted for the push a person's device received, and the
+          // route stamped that `device` door on the request (phase 131, #208).
+          door: pressDoorOf(actor),
           // The receipt an operator reads six weeks later in gate-status.md has
           // to say HOW it was cleared: a tap on a lock screen is a different
           // act from a person sitting in front of the Gate card with the
@@ -2369,7 +2475,10 @@ export class Service extends ServiceRecovery {
       case 'check': {
         const stepId = parseInboxItemId(itemId)?.subject;
         if (!stepId) return { ok: false, status: 409, error: 'this card names no step to check' };
-        const checked = await this.checkHumanStep(stepId, { by });
+        // The route stamped the `device` door on this press (phase 131, #208),
+        // and the door decides whether it is a person's word (phase 134: a
+        // check with no door proves nothing).
+        const checked = await this.checkHumanStep(stepId, { by, actor: pressActor(actor) });
         return checked.ok
           ? { ok: true, verb, item: itemId }
           : { ok: false, status: checked.status, error: checked.error };
@@ -2839,7 +2948,7 @@ export class Service extends ServiceRecovery {
       const bashCommand = (input as { command?: unknown } | null)?.command;
       this.runnerByRunId(run?.id ?? '')?.note('phase.tool-denied', {
         tool: toolName, rule: guard.rule,
-        ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+        ...deniedCommandField(bashCommand),
       }, phase ?? undefined);
       return {
         hookSpecificOutput: {
@@ -2850,9 +2959,47 @@ export class Service extends ServiceRecovery {
         },
       };
     }
-    const verdict = guard?.verdict === 'allow'
+    const classified = guard?.verdict === 'allow'
       ? classifyTool(toolName, input, { ...policy, ask: policy.ask.filter((rule) => rule !== guard.rule) }, profile)
       : classifyTool(toolName, input, policy, profile);
+    // A live grant below plan scope (control-tower phase 149, #212): one of
+    // THIS run's grants for THIS phase — never a sibling lane's, never once the
+    // phase settled — whose rule the call meets (for `call`, this exact call),
+    // and the call classified again with the granted rules lowered: a
+    // neighbouring deny rule still stops it, a never rule is never lowered.
+    // Read BEFORE the deny reply, and before the guards, which still judge it.
+    const covered = run && typeof phase === 'number' && (classified === 'deny' || classified === 'ask')
+      ? this.grantCover(run, phase, lane, toolName, input, policy, profile) : null;
+    const verdict = covered ? 'allow' : classified;
+
+    // The never list holds whatever a grant lifted (control-tower phase 149):
+    // a forced or deleting push — read anywhere on the line, not only as a
+    // leading flag — is refused when a live grant reaching this lane lifted
+    // the push wall, which would otherwise let it by.
+    if (run && toolName === 'Bash' && verdict !== 'deny') {
+      const bashCommand = (input as { command?: unknown } | null)?.command;
+      let lifted = false;
+      try {
+        lifted = typeof bashCommand === 'string' && forcedPush(bashCommand)
+          && this.grantsNow().liftsPush({ runId: run.id, slug: run.slug, phase });
+      } catch { lifted = false; }
+      if (lifted) {
+        try {
+          this.runnerByRunId(run.id)?.note('phase.tool-denied', {
+            tool: toolName, rule: PUSH_DENY_CARVED[0], ...deniedCommandField(bashCommand),
+          }, phase ?? undefined);
+        } catch { /* the deny stands */ }
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: 'blocked by the console: a forced or deleting push is on the never list — a grant of '
+              + '`Bash(git push:*)` never reaches it. This is standing policy, not a person rejecting your work — push '
+              + 'without force, or note it in your handoff for a person to do by hand.',
+          },
+        };
+      }
+    }
 
     // The sign-in guard (control-tower phase 44, §Architecture 12's third birth
     // channel): an interactive sign-in in a supervised session waits on a
@@ -2902,7 +3049,7 @@ export class Service extends ServiceRecovery {
         try {
           this.runnerByRunId(run.id)?.note('phase.tool-denied', {
             tool: toolName, rule: GATE_FORGE_RULE, why: forged,
-            ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+            ...deniedCommandField(bashCommand),
           }, phase ?? undefined);
         } catch { /* the deny stands */ }
         return {
@@ -2941,7 +3088,7 @@ export class Service extends ServiceRecovery {
           this.runnerByRunId(run.id)?.note('phase.tool-denied', {
             tool: toolName, rule: CONSOLE_FORGE_RULE, verb: forged.verb, why: forged.why,
             ...(forged.path ? { path: forged.path } : {}),
-            ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+            ...deniedCommandField(bashCommand),
           }, phase ?? undefined);
         } catch { /* the deny stands */ }
         return {
@@ -3014,7 +3161,7 @@ export class Service extends ServiceRecovery {
         try {
           runner?.note('phase.tool-denied', {
             tool: toolName, rule: 'poll-loop',
-            ...(typeof command === 'string' ? { command: command.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+            ...deniedCommandField(command),
           }, phase);
           // The episode's first refusal also writes the notice into the session
           // — once per lane, the runner's rule — and says whether it landed.
@@ -3124,6 +3271,28 @@ export class Service extends ServiceRecovery {
       }
     }
 
+    // The call a live grant covers, answered allow — a `call` grant is spent
+    // here, the one use it was given for. A call a person allowed on a
+    // standing card (#140) says so in that card's words.
+    if (covered && verdict === 'allow') {
+      const call = covered.grants.find((row) => row.scope === 'call');
+      if (call) this.grantsNow().spend(call);
+      const first = call ?? covered.grants[0]!;
+      if (call?.card && run) {
+        this.runnerByRunId(run.id)?.note('phase.approval-granted-once', { tool: toolName, approvalId: call.card }, phase ?? undefined);
+      }
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+          permissionDecisionReason: call?.card
+            ? 'approved once by a person on its standing approval card — the next such call asks again'
+            : `granted by ${first.by} for ${GRANT_SCOPE_WORDS[first.scope]} until ${grantEndWords(first)} (grant ${first.id}) — `
+              + 'a person\'s grant, enforced by the console\'s hook for exactly that scope',
+        },
+      };
+    }
+
     if (verdict !== 'ask') {
       // A veto is a decision this console made, and it was the one decision it
       // never wrote down: the deny happened inside a hook reply and left no
@@ -3137,7 +3306,8 @@ export class Service extends ServiceRecovery {
         // say which push. A non-Bash tool's target rides `input` in a shape
         // this hook does not read; the tool name still says what it was.
         const bashCommand = (input as { command?: unknown } | null)?.command;
-        const command = typeof bashCommand === 'string' ? bashCommand.replace(/\s+/g, ' ').slice(0, 400) : undefined;
+        // Never a secret: the wall's own reading, redacted (control-tower phase 141).
+        const command = wallCommand(bashCommand);
         const runner = this.runnerByRunId(run?.id ?? '');
         // The journal of the run that was actually denied, found by token…
         runner?.note('phase.tool-denied', {
@@ -3234,7 +3404,7 @@ export class Service extends ServiceRecovery {
         kind: 'tool',
         title: `${toolName}: ${describeToolInput(input)}`,
         detail: `Phase ${phase ?? '?'} of ${run.slug} wants to use ${toolName}.`,
-        evidence: await this.evidenceFor(phase),
+        evidence: await this.evidenceFor(phase, { run, cwd: typeof body.cwd === 'string' ? body.cwd : null }),
         tool: { name: toolName, input, cwd: typeof body.cwd === 'string' ? body.cwd : undefined },
         suggestedRule: rule,
         matched,
@@ -3295,7 +3465,7 @@ export class Service extends ServiceRecovery {
       this.runnerByRunId(run.id)?.note('phase.approval-reshaped', {
         tool: toolName, rule: manifest.rule, why: manifest.why, bareForm: manifest.bareForm ?? null,
         answeredBy: manifest.key, row: { value: manifest.value, source: manifest.source },
-        ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+        ...deniedCommandField(bashCommand),
       }, phase ?? undefined);
       return {
         hookSpecificOutput: {
@@ -3313,7 +3483,7 @@ export class Service extends ServiceRecovery {
       kind: 'tool',
       title: `${toolName}: ${describeToolInput(input)}`,
       detail: `Phase ${phase ?? '?'} of ${run?.slug ?? 'a run'} wants to use ${toolName}.`,
-      evidence: await this.evidenceFor(phase),
+      evidence: await this.evidenceFor(phase, { run, cwd: typeof body.cwd === 'string' ? body.cwd : null }),
       tool: { name: toolName, input, cwd: typeof body.cwd === 'string' ? body.cwd : undefined },
       suggestedRule: suggestedRule(toolName, input, policy),
       matched,
@@ -3632,7 +3802,7 @@ export class Service extends ServiceRecovery {
     const row = this.destructiveRow(run, phase);
     // Read for THIS phase (control-tower phase 107, #205): a rule the row
     // names for other phases only is no exception here.
-    if (!row || !destructiveExceptions(row.value, { phase }).includes(rule)) return null;
+    if (!row || !destructiveExceptions(row.value, { phase, releasePhases: row.releasePhases }).includes(rule)) return null;
     return { rule, value: row.value.slice(0, 200), source: row.source };
   }
 
@@ -3642,10 +3812,230 @@ export class Service extends ServiceRecovery {
    * auto-grant reads the row (`destructiveExceptions`), by the press's own CLI
    * form; never the console's own files. Every press on a line is asked.
    */
-  private forgeExcepted(run: RunState, phase: number | null, forged: ConsoleForge): boolean {
+  private forgeExcepted(run: RunState, phase: number | null, forged: Pick<ConsoleForge, 'verb' | 'names'>): boolean {
     const row = this.destructiveRow(run, phase);
     if (!row) return false;
-    return consoleForgeException(destructiveExceptions(row.value, { phase }), forged) !== null;
+    return consoleForgeException(destructiveExceptions(row.value, { phase, releasePhases: row.releasePhases }), forged) !== null;
+  }
+
+  /* ---------------- the owner door (control-tower phase 131, #208) ---------------- */
+
+  /**
+   * The door one request PROVED — `owner/door.ts`, with this console's own
+   * checks of what a request can carry: the approval hook's run token, a
+   * session's message token, a live supervisor chat's bearer.
+   */
+  doorOf(req: Pick<IncomingMessage, 'headers'>): DoorReading {
+    return doorOfRequest(req, {
+      flags: this.flags,
+      runToken: (authorization) => this.approvals.runIdFor(authorization),
+      ownerSession: (request) => this.ownerSessionOf(request),
+    });
+  }
+
+  /**
+   * The owner key (control-tower phase 148, #208): the relying party a request
+   * names — `localhost`, or an https host this console serves — and the name
+   * of this console's owner cookie on it.
+   */
+  ownerRelyingParty(req: Pick<IncomingMessage, 'headers'>): RelyingParty {
+    return relyingPartyOf(req.headers.host, this.flags.remoteHosts ?? []);
+  }
+
+  ownerCookieNameFor(req: Pick<IncomingMessage, 'headers'>): string {
+    const rp = this.ownerRelyingParty(req);
+    return ownerCookieName(Number(this.flags.port) || 0, rp.ok && rp.secure);
+  }
+
+  /** The live owner session this request's cookie names, or null. */
+  ownerSessionOf(req: Pick<IncomingMessage, 'headers'>): OwnerSessionRow | null {
+    const value = readCookie(req.headers.cookie, this.ownerCookieNameFor(req));
+    if (!value) return null;
+    try {
+      // A session outlives nothing: its key must still be enrolled.
+      const owner = ownerState();
+      const row = owner.sessions.verify(value);
+      return row && owner.registry.get(row.keyId) ? row : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The authority a press through a person's door really carries, which a few
+   * rows can only tell from what they press (phase 148): `POST /api/write`
+   * carries a gate's approval only when its action is one; *I've done this —
+   * check* is a person's WORD (`attest`) only on an item whose proof is the
+   * person's word — on one whose proof the console reads, it asks for a check
+   * and decides nothing. Null: no authority at all.
+   */
+  pressAuthorityOf(row: AuthorityRoute, path: string, body: Record<string, unknown>): AuthorityRoute['authority'] | null {
+    if (row.verb === 'console-write') return body.action === 'gate-approve' ? row.authority : null;
+    if (row.verb === 'check-step') {
+      const item = requestItemOf(path);
+      let step: HumanStep | undefined;
+      try { step = item?.kind === 'human-step' ? this.humanStepsNow().get(item.id) : undefined; } catch { step = undefined; }
+      return !step || step.proofType === 'attest' || step.proofType === 'grant' ? row.authority : null;
+    }
+    return row.authority;
+  }
+
+  /**
+   * An authority press through a door that may not make it, on a console with
+   * an owner key — written down for the owner (phase 148, #208): never applied
+   * and never dropped. A body carrying a secret is refused whole (nothing is
+   * kept); the same press asked again while it stands is the same request.
+   */
+  requestAuthority(reading: DoorReading, row: AuthorityRoute, input: {
+    method: string; path: string; body: Record<string, unknown>; authority: AuthorityRoute['authority']; risk: string; label: string;
+  }): { status: number; answer: Record<string, unknown> } {
+    if (bodyCarriesSecret(input.body)) {
+      return { status: 400, answer: { error: 'That body carries a secret, so it is not kept to be asked of the owner — nothing was recorded.' } };
+    }
+    if (Buffer.byteLength(JSON.stringify(input.body), 'utf8') > REQUEST_BODY_MAX) {
+      return { status: 413, answer: { error: `A press asked of the owner keeps its body, and this one is over ${REQUEST_BODY_MAX / 1024} KB.` } };
+    }
+    const recorded = ownerState().requests.record({
+      door: reading.door, label: input.label, proof: reading.proof, row, authority: input.authority, risk: input.risk,
+      method: input.method, path: input.path, body: input.body,
+    });
+    if (!recorded.ok) return { status: recorded.status, answer: { error: recorded.error } };
+    const view = requestView(recorded.request);
+    if (recorded.created) {
+      const record = {
+        id: view.id, press: view.press, authority: view.authority, risk: view.risk, door: view.door, proof: view.proof,
+        label: view.label, path: view.path.slice(0, 200), ...(view.item ? { item: view.item } : {}),
+      };
+      log.info('policy.authority-requested', record);
+      for (const runner of this.liveRunners()) runner.note('policy.authority-requested', record);
+      this.emit('inbox', { at: new Date().toISOString() });
+    }
+    return {
+      status: 202,
+      answer: {
+        requested: true,
+        request: view,
+        error: `This console has an owner key, so this press — ${row.summary.split(' — ')[0]} — is the owner's: `
+          + `it was asked of the owner (${view.ask}), and it is pressed when they confirm it.`,
+      },
+    };
+  }
+
+  /**
+   * The owner key's presses (control-tower phase 148, #208) — enrol, sign in,
+   * lock, remove a key — through ONE method the router calls, so the table of
+   * authority routes holds both ways for them (`AUTHORITY_METHODS`).
+   */
+  ownerPress(req: Pick<IncomingMessage, 'headers'>, input: OwnerPressInput): OwnerAnswer {
+    return ownerPress({
+      state: ownerState(), rp: this.ownerRelyingParty(req), cookieName: this.ownerCookieNameFor(req),
+      port: Number(this.flags.port) || 0, remoteHosts: this.flags.remoteHosts ?? [], instanceName: INSTANCE.name,
+      noteKey: (change, key, by, door) => this.noteOwnerKey(change, key, by, door),
+    }, input);
+  }
+
+  /** The owner's one press on a request: confirm (pressed through `press`, the router's replay) or refuse. */
+  answerOwnerRequest(
+    input: { id: string; answer: string; reading: DoorReading; by: string },
+    press: (request: AuthorityRequest) => Promise<{ status: number; answer: unknown }>,
+  ): Promise<OwnerAnswer> {
+    return answerRequest({ state: ownerState(), press, note: (answer, record) => this.noteAuthorityAnswer(answer, record) }, input);
+  }
+
+  /**
+   * The owner's answer to a request, journalled (phase 148): confirmed (and
+   * pressed), failed (pressed, and the route refused it), or refused.
+   */
+  noteAuthorityAnswer(answer: 'confirmed' | 'failed' | 'refused', record: Record<string, unknown>): void {
+    const line = { ...record, answer };
+    if (answer === 'refused') log.info('policy.authority-declined', line);
+    else log.info('policy.authority-confirmed', line);
+    const event = answer === 'refused' ? 'policy.authority-declined' : 'policy.authority-confirmed';
+    for (const runner of this.liveRunners()) runner.note(event, line);
+    this.emit('inbox', { at: new Date().toISOString() });
+  }
+
+  /**
+   * A change to the owner keys, told everywhere (phase 148, EC2): the journal
+   * (`policy.owner-key-enrolled` / `policy.owner-key-removed`), every live run's
+   * journal, the bell (the registry keeps the change) and every subscribed
+   * device. Never the key itself.
+   */
+  noteOwnerKey(change: 'enrolled' | 'removed', key: { id: string; label: string; alg: string; origin: string }, by: string, door: string): void {
+    const record = { keyId: key.id.slice(0, 16), label: key.label, alg: key.alg, origin: key.origin, by, door, keys: ownerState().registry.count() };
+    const event = change === 'enrolled' ? 'policy.owner-key-enrolled' : 'policy.owner-key-removed';
+    if (change === 'enrolled') log.info('policy.owner-key-enrolled', record);
+    else log.info('policy.owner-key-removed', record);
+    for (const runner of this.liveRunners()) runner.note(event, record);
+    this.announce('health', {
+      title: change === 'enrolled' ? `An owner key was enrolled — ${key.label}` : `An owner key was removed — ${key.label}`,
+      body: change === 'enrolled'
+        ? `${key.label} (${key.alg}, at ${key.origin}) can now press as this console's owner. If you did not enrol it, remove it in Settings and lock every owner session.`
+        : `${key.label} no longer presses as this console's owner.${record.keys === 0 ? ' No key is left: the console is back to unenrolled.' : ''}`,
+      tag: `owner-key:${change}:${key.id.slice(0, 16)}`,
+    });
+    this.emit('inbox', { at: new Date().toISOString() });
+  }
+
+  /**
+   * Does the plan's manifest already allow this press for the agent that made
+   * it — the one way an agent's door presses an authority route? A session's
+   * token names its run, and the press passes when that run's
+   * `permission.destructive` row names it for one of the run's live phases:
+   * by its CLI form, as phase 129's hook guard reads the row, or by
+   * `Console(<press>)` for a route no CLI verb presses. The supervisor's
+   * bearer names no run, so no row names its press.
+   */
+  manifestNamesPress(reading: DoorReading, row: AuthorityRoute, path = ''): boolean {
+    if (row.self) return false;
+    const press = { verb: row.verb, names: [...row.cli] };
+    const livePhases = (run: RunState): number[] => {
+      const live = new Set<number>();
+      if (typeof run.activePhase === 'number') live.add(run.activePhase);
+      for (const record of Object.values(run.phases ?? {})) if (record?.status === 'running') live.add(record.phase);
+      return [...live];
+    };
+    if (reading.door === 'session') {
+      if (!reading.label) return false;
+      let run: RunState | null = null;
+      try { run = this.runnerByRunId(reading.label)?.current() ?? null; } catch { run = null; }
+      if (!run) return false;
+      return livePhases(run).some((phase) => this.forgeExcepted(run!, phase, press));
+    }
+    // Any other door but the console's own, a checker's and the owner's (who
+    // needs no excuse) carries out what the manifest already allows (phase
+    // 148) — for the run the press is ABOUT: a step's own run and phase, a
+    // gate's plan and phase, a run route's plan, each while its run is live.
+    if (reading.door !== 'local' && reading.door !== 'device' && reading.door !== 'supervisor') return false;
+    const item = requestItemOf(path);
+    const segments = routeSegments(path);
+    let run: RunState | null = null;
+    let phases: number[] = [];
+    try {
+      if (item?.kind === 'human-step') {
+        const step = this.humanStepsNow().get(item.id);
+        run = step?.runId ? (this.runnerByRunId(step.runId)?.current() ?? null) : null;
+        phases = step ? [step.phase] : [];
+      } else if (item?.kind === 'gate') {
+        run = this.runners.get(item.slug)?.current() ?? null;
+        phases = [item.phase];
+      } else if (segments[0] === 'api' && segments[1] === 'run' && segments[2]) {
+        run = this.runners.get(segments[2])?.current() ?? null;
+        phases = run ? livePhases(run) : [];
+      }
+    } catch {
+      run = null;
+    }
+    if (!run) return false;
+    return phases.some((phase) => this.forgeExcepted(run!, phase, press));
+  }
+
+  /** An agent's refused press, written down once (`owner.door-refused`) — never the token itself. */
+  noteDoorRefused(reading: DoorReading, row: AuthorityRoute, path: string): void {
+    log.warn('owner.door-refused', {
+      press: row.verb, authority: row.authority, door: reading.door, proof: reading.proof,
+      ...(reading.label ? { label: reading.label } : {}), path: path.slice(0, 200),
+    });
   }
 
   /**
@@ -3654,13 +4044,21 @@ export class Service extends ServiceRecovery {
    * plan-wide one), else the run's stored manifest when the plan is not in this
    * console's store.
    */
-  private destructiveRow(run: RunState, phase: number | null): { value: string; source: string } | null {
+  private destructiveRow(
+    run: RunState, phase: number | null,
+  ): { value: string; source: string; releasePhases: number[] | null } | null {
     const record = this.store?.get(run.slug);
     const rows: readonly { key: string; state: string; value: string; source?: string }[] = record
       ? mergeDecisions(record.plan?.decisions ?? [], record.decisionsTwin ?? [], phase)
       : (run.manifest?.decisions ?? []);
     const row = rows.find((r) => r.key === 'permission.destructive' && r.state === 'answered');
-    return row ? { value: row.value, source: row.source ?? (record ? 'plan' : 'run') } : null;
+    if (!row) return null;
+    // What the row's `the release phases` resolves to: the plan's own graph
+    // (titles opening with `Release`) while the plan is in this console's
+    // store; unknown — and so naming no phase — when only the run's manifest
+    // is left. An unresolved set narrows, it never widens.
+    const releasePhases = record?.plan ? releasePhasesOf(record.plan.graph) : null;
+    return { value: row.value, source: row.source ?? (record ? 'plan' : 'run'), releasePhases };
   }
 
   /**
@@ -3683,12 +4081,12 @@ export class Service extends ServiceRecovery {
     const base = { key: 'permission.destructive' as const, rule, value: row.value.slice(0, 200), source: row.source };
     const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
     if (typeof command !== 'string') {
-      return destructiveExceptions(row.value, { phase }).includes(rule)
+      return destructiveExceptions(row.value, { phase, releasePhases: row.releasePhases }).includes(rule)
         ? { ...base, answer: 'allow', why: `the row allows ${rule}` }
         : { ...base, answer: null, why: `the row does not name ${rule} as an exception` };
     }
     const verdict = manifestVerdict(command, row.value, {
-      runBranch: run.gitMode === 'new-branch' ? `pe/${run.slug}` : null, phase,
+      runBranch: run.gitMode === 'new-branch' ? `pe/${run.slug}` : null, phase, releasePhases: row.releasePhases,
     });
     // The row answers the publishing act ALONE. What else the line runs is
     // judged as if it ran on its own: one this run's policy would not simply
@@ -3732,6 +4130,43 @@ export class Service extends ServiceRecovery {
     return { profile, policy };
   }
 
+  /**
+   * The live grants that let one call through, or null (control-tower phase
+   * 149) — `Grants.cover` with the lane's own settled state: a grant ends with
+   * its phase, whatever its clock says.
+   */
+  private grantCover(
+    run: RunState, phase: number, lane: { status?: string } | undefined, toolName: string, input: unknown,
+    policy: ReturnType<typeof carvedPolicy>, profile: PermissionProfile,
+  ): { grants: GrantRow[] } | null {
+    try {
+      const record = lane ?? (run.phases as Record<string, { status?: string }> | undefined)?.[String(phase)];
+      const status = record?.status ?? '';
+      const settled = (typeof run.status === 'string' && runIsOver(run))
+        || (SETTLED_WELL as readonly string[]).includes(status) || status === 'failed';
+      return this.grantsNow().cover({ runId: run.id, phase, tool: toolName, input, policy, profile, phaseSettled: settled });
+    } catch (error) {
+      log.warn('hook.grant-read-failed', { runId: run.id, phase, error: String(error) });
+      return null;
+    }
+  }
+
+  /**
+   * The run's own policy as a command judge for the guard's G4 (control-tower
+   * phase 130): `classifyTool` on a Bash call, and the deny rule that decided.
+   */
+  protected override commandJudgeFor(runId: string | null): CommandJudge | null {
+    const run = runId ? this.runForToken(runId) : null;
+    if (!run) return null;
+    const { profile, policy } = this.policyForRun(run);
+    return (command) => {
+      const said = classifyTool('Bash', { command }, policy, profile);
+      // A deferral leaves the call to the CLI's own rules — not the AI's to assume.
+      const verdict = said === 'defer' ? 'ask' : said;
+      return { verdict, ...(verdict === 'deny' ? { rule: matchedDenyRule('Bash', { command }, policy) } : {}) };
+    };
+  }
+
   /** The broker's re-read at settle time (#112): the run that raised the card, live or stored. */
   protected override manifestAnswerForCard(approval: Approval): ManifestCheck | null {
     if (!approval.tool) return null;
@@ -3743,20 +4178,25 @@ export class Service extends ServiceRecovery {
    * What a person would have gone and looked up before answering. A bare
    * "allow this?" automates the ceremony of approval and deletes its substance.
    */
-  private async evidenceFor(phase: number | null): Promise<Evidence[]> {
+  private async evidenceFor(
+    phase: number | null, at: { run?: { root?: string; workRoot?: string; phases?: RunState['phases'] } | null; cwd?: string | null } = {},
+  ): Promise<Evidence[]> {
     const evidence: Evidence[] = [];
-    const root = this.root?.path;
-    if (!root) return evidence;
+    // The ASKING lane's (control-tower phase 135, OD-17): its own tree and its
+    // own record — never the console's root, which is another lane's tree, and
+    // never "the first run", which is another plan's.
+    const run = at.run ?? null;
+    const record = phase === null || !run ? undefined : run.phases?.[String(phase)];
+    const tree = evidenceTreeOf({ cwd: at.cwd ?? null, workRoot: run?.workRoot ?? null, root: run?.root ?? null });
+    if (!tree) return evidence;
 
     const [status, diff] = await Promise.all([
-      gitRead(root, ['status', '--short']),
-      gitRead(root, ['diff', '--stat']),
+      gitRead(tree, [...EVIDENCE_GIT.status]),
+      gitRead(tree, [...EVIDENCE_GIT.diff]),
     ]);
     if (status) evidence.push({ label: 'Working tree', body: status });
     if (diff) evidence.push({ label: 'Uncommitted changes', body: diff });
 
-    const run = this.runStates()[0] ?? null;
-    const record = phase === null ? undefined : run?.phases[String(phase)];
     if (record?.verification?.ran.length) {
       evidence.push({
         label: 'Verification so far',
@@ -4192,6 +4632,14 @@ export class Service extends ServiceRecovery {
     // The sixth signal's run length (phase 13) — in the loader since it
     // shipped and NOT here until phase 15: the Settings control saved nothing.
     if (positive(patch.stallLoopRun)) picked.stallLoopRun = patch.stallLoopRun;
+    // The check (control-tower phase 134), by `sanitiseAutomation`'s rules: a
+    // boolean, a non-empty model name, one of the CLI's efforts, and a whole
+    // number of rejections from 1 to 20.
+    if (typeof patch.checkJudgement === 'boolean') picked.checkJudgement = patch.checkJudgement;
+    if (typeof patch.checkModel === 'string' && patch.checkModel.trim()) picked.checkModel = patch.checkModel.trim().slice(0, 80);
+    if (isEffort(patch.checkEffort)) picked.checkEffort = patch.checkEffort;
+    if (typeof patch.turnEscalateAfter === 'number' && Number.isInteger(patch.turnEscalateAfter)
+      && patch.turnEscalateAfter >= 1 && patch.turnEscalateAfter <= 20) picked.turnEscalateAfter = patch.turnEscalateAfter;
     // …and the escalation clock takes `cap` on both sides, because 0 means
     // "never re-say it" rather than "every tick". Two lists of the same keys:
     // a key in the loader and not here is a setting that survives a restart
@@ -4230,14 +4678,12 @@ export class Service extends ServiceRecovery {
     // The relay's rules (phase 14): a LIST, replaced wholesale for the reason
     // the schedule is — an operator who deleted a rule meant it gone.
     if (patch.relayRules !== undefined) picked.relayRules = sanitiseRelayRules(patch.relayRules);
-    // The reminder quiet hours (control-tower phase 43): `{start, end}`, or null
-    // to clear — through the push register's own parser, so one bad shape is
-    // refused in one place, and DROPPED here rather than coerced.
-    if ('reminderQuiet' in patch) {
-      const quiet = parseQuietHours(patch.reminderQuiet);
-      if (quiet === null) picked.reminderQuiet = undefined;
-      else if (!('error' in quiet)) picked.reminderQuiet = { start: quiet.start, end: quiet.end };
-    }
+    // The reminders' own quiet hours (control-tower phase 43) are no preference
+    // since phase 138 (#215): ONE quiet-hours setting, each device's. A page
+    // from before the change that still sends `reminderQuiet` has it moved the
+    // way a config's is — onto every device with no window of its own — and it
+    // is never stored; `null` clears nothing, the windows being the devices'.
+    if ('reminderQuiet' in patch) this.adoptReminderQuiet({ reminderQuiet: (patch as { reminderQuiet?: unknown }).reminderQuiet });
     // `notify` is a map inside a patch, so a shallow spread alone would let a
     // client sending one toggle reset every other category to its default.
     // Merged off the *current* map (captured before the spread overwrites it),

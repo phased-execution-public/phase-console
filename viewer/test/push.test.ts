@@ -13,7 +13,7 @@
 import '../e2e/fixture/steady-load.mjs';
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -735,4 +735,236 @@ test('a register over a directory of its own keeps its own key and devices, and 
   await register.announce('halted', { title: 'Its own', body: 'b', tag: 'relay-own', url: '/' });
   assert.deepEqual(JSON.parse(browser.decrypt(bodies[1])).console, { id: 'relay', name: 'relay' },
     'a message naming nobody speaks as the register');
+});
+
+test('phase 132: one tag per item — the first push and every reminder ride it, and two items never share one', async () => {
+  const { turnTagOf } = await import('../server/service-base.ts');
+  const a = { id: 'step-a', slug: 'alpha', phase: 2 };
+  assert.equal(turnTagOf(a), turnTagOf({ ...a }), 'stable for one item');
+  assert.notEqual(turnTagOf(a), turnTagOf({ ...a, id: 'step-b' }), 'distinct per item');
+  const facts = { id: 'step-a', kind: 'browser-login', label: 'Browser sign-in', title: 'Sign in', where: 'host' as const, slug: 'alpha', phase: 2 };
+  const first = catalogue.humanStepPush(facts);
+  const again = catalogue.humanStepReminderPush(facts, 1);
+  assert.equal(first.step.id, again.step.id, 'a reminder is the same item');
+});
+
+/* ------------------------------------------------------------------ *
+ * The lock screen, held to the `device` door (control-tower phase 138, #215)
+ *
+ * A signed lock-screen action is the `device` door (phase 131), and the door
+ * table (`shared/door-model.js`) lets a paired device press low and medium
+ * grants, answers and declines — nothing else on its own. So a permission
+ * item's *Allow* is a grant at its NARROWEST offered scope, offered only when
+ * that grant is the device's to make; a high item's button opens the item
+ * (where the rule is typed and the owner key touched); a never item offers no
+ * grant at all; *Deny* is a decline. An act keeps *Open* and *I did it*.
+ * ------------------------------------------------------------------ */
+
+const LS_PLAN = `---
+slug: alpha
+created: 2026-10-08
+status: active
+phases: 1
+---
+
+# alpha
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | one | — | — | app | it works |
+
+## Phases
+
+### Phase 1 — one
+- **Size:** S
+`;
+
+/** A pressed lock-screen button's actor: what `/api/push/action` derives once it stamped the `device` door. */
+const DEVICE = { by: 'notification', via: 'api' as const, origin: 'test', remoteUser: null, pressDoor: 'device' as const };
+
+type Sent = {
+  category: string;
+  message: {
+    url: string; title: string; tag: string; callback?: string; actions?: { action: string; title: string }[];
+    step?: { id: string; kind: string; actions: { action: string; title: string }[] };
+  };
+  opts?: { urgent?: boolean; replace?: boolean };
+};
+
+async function lockScreen() {
+  const { Service } = await import('../server/service.ts');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const root = mkdtempSync(join(tmpdir(), 'pc-lock-screen-'));
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'alpha.md'), LS_PLAN, 'utf8');
+  const svc = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: true, allowRun: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  const sent: Sent[] = [];
+  svc.push.announce = ((category: string, message: Sent['message'], _now?: number, _onDelivery?: unknown, opts?: Sent['opts']) => {
+    sent.push({ category, message, ...(opts ? { opts } : {}) });
+    return null;
+  }) as never;
+  assert.equal(svc.open(root).ok, true);
+  const raise = (wall: Record<string, unknown> = {}, runId = `run-${Math.random().toString(36).slice(2, 8)}`) => {
+    const id = svc.raisePermissionItem({
+      slug: 'alpha', runId, phase: 1, need: 'to run the suite',
+      wall: { wall: 'ask', tool: 'Bash', rule: 'Bash(npm test:*)', command: 'npm test', at: new Date().toISOString(), source: 'hook', ...wall } as never,
+    });
+    assert.ok(id, 'the item was raised');
+    return { id: id!, runId, item: attention.inboxItemId({ kind: 'human-step', slug: 'alpha', phase: 1, runId, subject: id! }) };
+  };
+  const pushOf = (id: string) => sent.filter((one) => one.message.step?.id === id).at(-1);
+  return {
+    svc, sent, raise, pushOf,
+    cleanup: () => { svc.approvals.disarm(); svc.close(); rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+let attention: typeof import('../shared/attention-model.js');
+let actions: typeof import('../server/push/actions.ts');
+before(async () => {
+  attention = await import('../shared/attention-model.js');
+  actions = await import('../server/push/actions.ts');
+});
+
+const ALLOW = { action: 'grant', title: 'Allow' };
+const DENY = { action: 'deny', title: 'Deny' };
+const OPEN = { action: 'open', title: 'Open' };
+
+test('LS-7: a low-risk permission item’s push opens the item and carries a signed Allow — its narrowest scope — and Deny', async () => {
+  const w = await lockScreen();
+  try {
+    const { id } = w.raise();
+    const push = w.pushOf(id)!;
+    assert.equal(push.category, 'needs-you');
+    assert.equal(push.message.url, `/#/turn/${encodeURIComponent(id)}`, 'a push for an item opens #/turn/<id>');
+    assert.deepEqual(push.message.step?.actions, [ALLOW, DENY], 'the device may press a low grant: Allow, left of Deny');
+    assert.deepEqual(push.message.actions, [ALLOW, DENY], 'both signed');
+    const token = actions.readActionToken(push.message.callback);
+    assert.ok(!('error' in token));
+    assert.deepEqual(token.verbs, ['grant', 'deny']);
+    assert.equal(actions.lockScreenGrant({ wall: 'ask', family: 'any', scopes: ['call', 'phase', 'plan'] })?.scope, 'call');
+  } finally { w.cleanup(); }
+});
+
+test('LS-8: a HIGH-risk item’s lock screen opens the page instead of granting — and a grant pressed anyway is refused at the door', async () => {
+  const w = await lockScreen();
+  try {
+    const { id, item } = w.raise({ wall: 'deny', rule: 'Bash(git push:*)', command: 'git push origin pe/x' });
+    const push = w.pushOf(id)!;
+    assert.deepEqual(push.message.step?.actions, [OPEN, DENY], 'the first button is Open: the item, where the rule is typed');
+    assert.deepEqual(push.message.actions, [DENY], 'only the decline is signed');
+    const token = actions.readActionToken(push.message.callback);
+    assert.ok(!('error' in token));
+    assert.deepEqual(token.verbs, ['deny'], 'no token for a grant the device may not make');
+    // A grant pressed through the lock-screen path anyway (a token an older
+    // console minted, a crafted click): the door is read again at the press.
+    const forced = await w.svc.performInboxAction(item, 'grant', 'notification', DEVICE as never);
+    assert.equal(forced.ok, false);
+    assert.equal((forced as { status: number }).status, 403);
+    assert.match((forced as { error: string }).error, /open the item/i);
+    assert.equal(w.svc.grantsView().grants.filter((row) => row.item === id).length, 0, 'nothing was granted');
+    assert.equal(actions.lockScreenGrant({ wall: 'deny', family: 'any', scopes: ['call', 'phase', 'plan', 'repository', 'always'] }), null);
+  } finally { w.cleanup(); }
+});
+
+test('LS-9: a never item offers no Allow through any door — Open and Deny', async () => {
+  const w = await lockScreen();
+  try {
+    const { id } = w.raise({ wall: 'ask', rule: 'Bash(sudo:*)', command: 'sudo launchctl kickstart system/x' });
+    const push = w.pushOf(id)!;
+    assert.deepEqual(push.message.step?.actions, [OPEN, DENY]);
+    assert.deepEqual(push.message.actions, [DENY]);
+    assert.equal(actions.lockScreenGrant({ wall: 'guard', family: 'any', scopes: [] }), null);
+  } finally { w.cleanup(); }
+});
+
+test('LS-10: an act keeps Open and I did it; a decision has no I did it — its answer is on the page', async () => {
+  const w = await lockScreen();
+  try {
+    const act = w.svc.recordHumanStep({
+      slug: 'alpha', phase: 1, birth: 'session', runId: 'run-act',
+      step: { kind: 'device-code', title: 'Enter the code the CLI printed', open_url: 'https://github.com/login/device', code: 'WDJB-MJHT' },
+    })!;
+    const actPush = w.pushOf(act.id)!;
+    assert.equal(actPush.message.url, `/#/turn/${encodeURIComponent(act.id)}`);
+    assert.deepEqual(actPush.message.step?.actions, [OPEN, { action: 'check', title: 'I did it' }]);
+    assert.deepEqual(actPush.message.actions, [{ action: 'check', title: 'I did it' }]);
+
+    const decision = w.svc.recordHumanStep({
+      slug: 'alpha', phase: 1, birth: 'session', runId: 'run-decision',
+      step: {
+        kind: 'decision', title: 'Which region do we deploy to?',
+        options: [{ id: 'eu', label: 'eu-west-1', recommended: true }, { id: 'us', label: 'us-east-1' }],
+      },
+    })!;
+    assert.ok(decision, 'the decision was raised');
+    const decisionPush = w.pushOf(decision.id)!;
+    assert.deepEqual(decisionPush.message.step?.actions, [OPEN], 'a check of an unanswered decision would only send it back');
+    assert.equal(decisionPush.message.callback, undefined, 'nothing to sign, so no token');
+  } finally { w.cleanup(); }
+});
+
+test('LS-11: Allow from the lock screen grants at the NARROWEST scope through the device door — and the granted push opens that grant', async () => {
+  const w = await lockScreen();
+  try {
+    const { id, item } = w.raise();
+    const out = await w.svc.performInboxAction(item, 'grant', 'notification', DEVICE as never);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const row = w.svc.grantsView().grants.find((one) => one.item === id);
+    assert.ok(row, 'a grant row was written');
+    assert.equal(row.scope, 'call', 'the narrowest scope the item offered');
+    assert.equal(row.door, 'device', 'the door the press came through rode into the engine');
+    assert.equal(row.risk, 'low');
+    assert.equal(w.svc.humanStepsNow().get(id)?.state, 'proven');
+    const granted = w.sent.filter((one) => one.category === 'granted').at(-1);
+    assert.ok(granted, 'the granted push went out');
+    assert.equal(granted.message.url, `/#/settings/permissions?grant=${encodeURIComponent(row.id)}`);
+  } finally { w.cleanup(); }
+});
+
+test('LS-12: Deny from the lock screen declines the permission item — a decline any person’s door may press', async () => {
+  const w = await lockScreen();
+  try {
+    const { id, item } = w.raise({ wall: 'deny', rule: 'Bash(git push:*)', command: 'git push origin pe/x' });
+    const out = await w.svc.performInboxAction(item, 'deny', 'notification', DEVICE as never);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(w.svc.humanStepsNow().get(id)?.state, 'declined');
+  } finally { w.cleanup(); }
+});
+
+test('LS-13: a reminder never breaks through a device’s quiet hours — the item’s first push is still urgent', async () => {
+  const w = await lockScreen();
+  try {
+    const act = w.svc.recordHumanStep({
+      slug: 'alpha', phase: 1, birth: 'session', runId: 'run-remind',
+      step: { kind: 'third-party-approval', title: 'Ask the org owner to approve the app', open_url: 'https://github.com/organizations/acme/settings', proof: 'cmd:"gh api orgs/acme"' },
+    })!;
+    assert.equal(w.pushOf(act.id)!.opts?.urgent, undefined, 'the first push rides the category: urgent');
+    (w.svc as unknown as { announceHumanStep: (step: unknown, n: number) => boolean }).announceHumanStep(act, 2);
+    const reminder = w.pushOf(act.id)!;
+    assert.match(reminder.message.title, /^Still your turn/);
+    assert.equal(reminder.opts?.urgent, false, 'a reminder is a repeat, never news: it waits out quiet hours');
+  } finally { w.cleanup(); }
+
+  // …and the register holds a not-urgent push back from a quiet device even when
+  // that device lets urgent traffic through.
+  const register = registerWith(['phone']);
+  const [phone] = register.list();
+  register.setQuiet(phone!.id, { start: '00:00', end: '23:59', allowUrgent: true });
+  const at = new Date();
+  at.setHours(12, 0, 0, 0);
+  const outcomes: string[] = [];
+  const restore = withFetch(() => new Response(null, { status: 201 }), () => {
+    register.announce('needs-you', { title: 'Your turn', body: 'b', tag: 'ls-13-first', url: '/' }, at.getTime(), (r) => { outcomes.push(`first:${r.outcome}`); });
+    register.announce('needs-you', { title: 'Still your turn', body: 'b', tag: 'ls-13-again', url: '/' }, at.getTime(), (r) => { outcomes.push(`reminder:${r.outcome}`); }, { urgent: false });
+  });
+  await settle();
+  restore();
+  assert.ok(outcomes.includes('reminder:quiet'), `a reminder is held by quiet hours: ${outcomes.join(', ')}`);
+  assert.ok(outcomes.includes('first:sent'), `the urgent first push breaks through: ${outcomes.join(', ')}`);
 });

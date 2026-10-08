@@ -21,6 +21,13 @@
  * MG-3  Ignored when read. `--gate-status` honours a manual row only when a
  *       person's door (`console`, `terminal`) wrote it — so the legacy row
  *       #174's session wrote, or one written by hand, opens nothing.
+ * OD-7  (control-tower phase 131, #208) The console's person test is a DOOR,
+ *       not a User-Agent: `owner` or `device`, and `local` on a console with
+ *       no owner key — where the approval says so. A request that proves it
+ *       is a session's or the supervisor's is refused whatever its User-Agent.
+ *       (A local process outside a session could already clear a manual gate
+ *       through `gate-approve.sh` in a terminal — the `terminal` door — so an
+ *       unenrolled console's `local` opens nothing that was shut.)
  */
 
 import '../e2e/fixture/steady-load.mjs';
@@ -198,23 +205,26 @@ test('MG-2: the console opens a manual gate only to a person\'s press — and wr
   t.after(lib.cleanup);
   const svc = service(t, lib.root);
 
-  // A press nobody vouched for as a person's: refused BEFORE the script runs.
-  const scripted = await svc.approveGate('press', 1, { approve: true, by: 'operator', note: 'looks fine' });
-  assert.equal(scripted.ok, false);
-  assert.match(scripted.detail, /manual — a person's to clear/);
-  assert.match(scripted.detail, /Gate card/);
+  // A press with no door — and one through an agent's door (OD-7): refused BEFORE the script runs.
+  for (const door of [undefined, 'session', 'supervisor', 'console'] as const) {
+    const scripted = await svc.approveGate('press', 1, { approve: true, by: 'operator', note: 'looks fine', ...(door ? { door } : {}) });
+    assert.equal(scripted.ok, false, String(door));
+    assert.match(scripted.detail, /manual — a person's to clear/);
+    assert.match(scripted.detail, /Gate card/);
+  }
   assert.ok(!existsSync(lib.file), 'nothing was written for a press that was not a person\'s');
   assert.equal((await svc.gateStatus('press', 1))?.clear, false);
 
-  // A person's press, but naming an automatic approver: the script refuses it.
-  const named = await svc.approveGate('press', 1, { approve: true, by: 'ai-session-delegated', person: true });
+  // A person's door, but naming an automatic approver: the script refuses it.
+  const named = await svc.approveGate('press', 1, { approve: true, by: 'ai-session-delegated', door: 'device' });
   assert.equal(named.ok, false);
   assert.equal((await svc.gateStatus('press', 1))?.clear, false);
 
-  // The Gate card from a browser: written through the console's door, and clear.
-  const pressed = await svc.approveGate('press', 1, { approve: true, by: 'mobin', note: 'approved the four rows', person: true });
+  // The Gate card from this machine: written through the console's door, clear — and, with no owner key, said so.
+  const pressed = await svc.approveGate('press', 1, { approve: true, by: 'mobin', note: 'approved the four rows', door: 'local' });
   assert.equal(pressed.ok, true, pressed.detail);
   assert.equal(pressed.gate?.clear, true);
+  assert.match(pressed.detail, /through the local door: this console has no owner key yet/);
   assert.match(readFileSync(lib.file, 'utf8'), /^\| 1 \| yes \| mobin \| \d{4}-\d{2}-\d{2} \| approved the four rows \| console \|$/m);
 
   // An AI gate is approvable without a person's press, as it always was.
@@ -233,51 +243,69 @@ test('MG-2: the console\'s door is stated, never inherited — a person\'s press
   assert.deepEqual(other.env, { PE_GATE_DOOR: '' }, 'no door claimed, and none inherited from the console\'s own shell');
 });
 
-test('MG-2: the gate route counts a browser (or a vouched remote person) as a person — a script\'s POST is not one', async () => {
-  const { handleApi } = await import('../server/api/routes.ts');
-  const seen: Array<{ person?: boolean; by?: string }> = [];
-  const service = {
+/** A stub service that reads doors as the real one does: a run token is `r1`'s session. */
+async function doorStub(seen: Array<Record<string, unknown>>, approveGate: (opts: Record<string, unknown>) => unknown) {
+  const { doorOfRequest } = await import('../server/owner/door.ts');
+  const stubFlags = { allowWrites: true, allowRun: false, remoteHosts: [] as string[], remoteUsers: [] as string[], scriptsDir: SCRIPTS };
+  return {
     root: { ok: true, path: '/tmp/nowhere' },
     store: {},
-    flags: { allowWrites: true, allowRun: false, remoteHosts: [] as string[] },
-    approveGate: async (_slug: string, _phase: number, opts: { person?: boolean; by?: string }) => {
+    flags: stubFlags,
+    doorOf: (req: { headers: Record<string, string> }) => doorOfRequest(req, {
+      flags: stubFlags, runToken: (h) => (h === 'Bearer run-token' ? 'r1' : null),
+    }),
+    manifestNamesPress: () => false,
+    noteDoorRefused: () => {},
+    approveGate: async (_slug: string, _phase: number, opts: Record<string, unknown>) => {
       seen.push(opts);
-      return { ok: true, gate: { clear: true, kind: 'clear', detail: 'approved' }, detail: 'ok' };
+      return approveGate(opts);
     },
+    invalidateAll: () => {},
   };
-  const post = async (userAgent: string) => {
+}
+
+test('OD-7: the gate route hands approveGate the request\'s DOOR — never its User-Agent; a session\'s token never reaches it', async () => {
+  const { handleApi } = await import('../server/api/routes.ts');
+  const seen: Array<Record<string, unknown>> = [];
+  const service = await doorStub(seen, () => ({ ok: true, gate: { clear: true, kind: 'clear', detail: 'approved' }, detail: 'ok' }));
+  const post = async (headers: Record<string, string>) => {
+    let status = 0;
     const payload = JSON.stringify({ approve: true, by: 'mobin', continueRun: false });
     const req = {
       method: 'POST',
-      headers: { 'x-phase-console': '1', host: '127.0.0.1:4130', 'user-agent': userAgent },
+      headers: { 'x-phase-console': '1', host: '127.0.0.1:4130', ...headers },
       socket: { remoteAddress: '127.0.0.1' },
       on() { return this; },
       [Symbol.asyncIterator]: async function* () { yield Buffer.from(payload, 'utf8'); },
     };
-    const res = { req, writeHead() { return this; }, end() {}, on() { return this; } };
+    const res = { req, writeHead(code: number) { status = code; return this; }, end() {}, on() { return this; } };
     await handleApi({ service } as never, req as never, res as never, new URL('http://127.0.0.1/api/plans/demo/gate/1'));
+    return status;
   };
-  await post('Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 Safari/605.1.15');
-  await post('curl/8.7.1');
-  await post('node');
-  assert.deepEqual(seen.map((s) => s.person), [true, false, false],
-    'the Gate card in a browser is a person; curl from a session, whatever `by` it sends, is not');
+  await post({ 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 Safari/605.1.15' });
+  await post({ 'user-agent': 'curl/8.7.1' });
+  await post({ 'user-agent': 'node' });
+  assert.deepEqual(seen.map((s) => s.door), ['local', 'local', 'local'],
+    'a browser, curl and node are one door on this machine — the person test reads the door, not the User-Agent');
   assert.ok(seen.every((s) => s.by === 'mobin'), 'the offered name rides along — it is never the witness');
+  // A session's run token, whatever User-Agent it wears, is refused at the door: approveGate is never asked.
+  assert.equal(await post({ 'user-agent': 'Mozilla/5.0 (Macintosh)', authorization: 'Bearer run-token' }), 403);
+  assert.equal(seen.length, 3, 'nothing reached the gate');
 });
 
 /* ------------------------------------------------------------------ *
  * MG-4 — /api/write takes no door from its body (control-tower phase 129, #218)
  * ------------------------------------------------------------------ */
 
-/** A POST to the real router, as a client with this User-Agent sends it. */
-async function postWrite(service: unknown, userAgent: string, body: Record<string, unknown>) {
+/** A POST to the real router, as a client with this User-Agent (and these headers) sends it. */
+async function postWrite(service: unknown, userAgent: string, body: Record<string, unknown>, headers: Record<string, string> = {}) {
   const { handleApi } = await import('../server/api/routes.ts');
   let status = 0;
   let text = '';
   const payload = JSON.stringify(body);
   const req = {
     method: 'POST',
-    headers: { 'x-phase-console': '1', host: '127.0.0.1:4130', 'user-agent': userAgent },
+    headers: { 'x-phase-console': '1', host: '127.0.0.1:4130', 'user-agent': userAgent, ...headers },
     socket: { remoteAddress: '127.0.0.1' },
     on() { return this; },
     [Symbol.asyncIterator]: async function* () { yield Buffer.from(payload, 'utf8'); },
@@ -295,40 +323,40 @@ async function postWrite(service: unknown, userAgent: string, body: Record<strin
 const BROWSER = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 Safari/605.1.15';
 
 test('MG-4: /api/write asks the gate route\'s own person test — the door in its body is never read', async () => {
-  const seen: Array<{ person?: boolean; approve: boolean; by?: string }> = [];
-  const service = {
-    root: { ok: true, path: '/tmp/nowhere' },
-    store: {},
-    flags: { allowWrites: true, allowRun: false, remoteHosts: [] as string[], scriptsDir: SCRIPTS },
-    approveGate: async (_slug: string, _phase: number, opts: { person?: boolean; approve: boolean; by?: string }) => {
-      seen.push(opts);
-      return { ok: false, gate: null, detail: 'refused by the stub' };
-    },
-    invalidateAll: () => {},
-  };
+  const seen: Array<Record<string, unknown>> = [];
+  const service = await doorStub(seen, () => ({ ok: false, gate: null, detail: 'refused by the stub' }));
   const forged = { action: 'gate-approve', slug: 'demo', phase: 1, by: 'mobin', door: 'console' };
   await postWrite(service, 'curl/8.7.1', forged);
   await postWrite(service, 'node', forged);
   await postWrite(service, BROWSER, forged);
   await postWrite(service, BROWSER, { ...forged, revoke: true });
-  assert.deepEqual(seen.map((s) => s.person), [false, false, true, true], 'curl and a script are no person, whatever door the body claims');
+  assert.deepEqual(seen.map((s) => s.door), ['local', 'local', 'local', 'local'],
+    'the request\'s door — whatever door the body claims (OD-7)');
   assert.deepEqual(seen.map((s) => s.approve), [true, true, true, false]);
   assert.ok(seen.every((s) => s.by === 'mobin'), 'the offered name rides along — it is never the witness');
+  const refused = await postWrite(service, BROWSER, forged, { authorization: 'Bearer run-token' });
+  assert.equal(refused.status, 403, 'a session\'s token is refused at the door, its User-Agent notwithstanding');
+  assert.equal(refused.body.door, 'session');
+  assert.equal(seen.length, 4, 'and the gate was never asked');
 });
 
-test('MG-4: a manual gate through /api/write is refused to a script with `door: console` — and opened by a person\'s press', async (t) => {
+test('MG-4 / OD-7: a manual gate through /api/write — a session\'s token is refused, `door: console` in a body is nothing, a local press opens it and says why', async (t) => {
   const lib = library('write-door');
   t.after(lib.cleanup);
   const svc = service(t, lib.root);
+  const token = svc.approvals.arm('r-write');
 
-  const forged = await postWrite(svc, 'curl/8.7.1', { action: 'gate-approve', slug: 'write-door', phase: 1, by: 'mobin', door: 'console' });
-  assert.equal(forged.status, 409);
-  assert.match(String(forged.body.error), /manual — a person's to clear/);
+  const forged = await postWrite(svc, 'curl/8.7.1', { action: 'gate-approve', slug: 'write-door', phase: 1, by: 'mobin', door: 'console' },
+    { authorization: `Bearer ${token}` });
+  assert.equal(forged.status, 403);
+  assert.equal(forged.body.door, 'session');
   assert.ok(!existsSync(lib.file), 'nothing was written');
   assert.equal((await svc.gateStatus('write-door', 1))?.clear, false);
 
-  const pressed = await postWrite(svc, BROWSER, { action: 'gate-approve', slug: 'write-door', phase: 1, by: 'mobin' });
+  // With no owner key a press from this machine is a person's — curl or a browser alike — and the answer says so.
+  const pressed = await postWrite(svc, 'curl/8.7.1', { action: 'gate-approve', slug: 'write-door', phase: 1, by: 'mobin' });
   assert.equal(pressed.status, 200, JSON.stringify(pressed.body));
+  assert.match(String(pressed.body.detail), /through the local door: this console has no owner key yet/);
   assert.match(readFileSync(lib.file, 'utf8'), /^\| 1 \| yes \| mobin \| \d{4}-\d{2}-\d{2} \| - \| console \|$/m, 'written through the console\'s door');
   assert.equal((await svc.gateStatus('write-door', 1))?.clear, true);
 });
@@ -427,5 +455,56 @@ test('MG-2: a session cannot borrow a person\'s door through its own tools — s
   } finally {
     svc.approvals.disarm();
     svc.close();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * EC6 (control-tower phase 148, #208) — with an owner key, a manual gate
+ * is the owner's or a device's; a local press of it is a request
+ * ------------------------------------------------------------------ */
+
+test('EC6: on an enrolled console a manual gate needs the owner or a device — a local press becomes a request, never applied', async () => {
+  const { Browser, REMOTE_HOST, call, enrolFirst, freshOwnerState, newService } = await import('./owner-harness.ts');
+  const { SoftAuthenticator } = await import('./webauthn-authenticator.ts');
+  const { isPersonDoor } = await import('../shared/door-model.js');
+  const { ownerDoorMode } = await import('../server/owner/door.ts');
+  const state = freshOwnerState();
+  const service = newService();
+  (service.flags as { remoteUsers: string[] }).remoteUsers = ['owner@example.com'];
+  const seen: string[] = [];
+  // A project open — the gate route answers nothing without one.
+  (service as unknown as Record<string, unknown>).root = { ok: true, path: '/tmp/nowhere' };
+  (service as unknown as Record<string, unknown>).store = { get: () => undefined, all: () => [], list: () => [] };
+  (service as unknown as { approveGate: (slug: string, phase: number, opts: { door?: string }) => unknown }).approveGate = async (_slug, _phase, opts) => {
+    seen.push(String(opts?.door));
+    return { ok: true, gate: { clear: true, kind: 'clear', detail: 'approved' }, detail: 'ok' };
+  };
+  try {
+    // Before a key: a local press is a person's, as it always was.
+    const before = await call(service, 'POST', '/api/plans/demo/gate/1', { body: { approve: true } });
+    assert.equal(before.status, 200, JSON.stringify(before.answer));
+    assert.deepEqual(seen, ['local']);
+    const owner = new Browser(service);
+    await enrolFirst(service, owner, new SoftAuthenticator('ES256'));
+    assert.equal(ownerDoorMode(), 'enrolled');
+    assert.equal(isPersonDoor('local', 'enrolled'), false, 'with a key, a press from this machine is not a person\'s by itself');
+    const local = await call(service, 'POST', '/api/plans/demo/gate/1', { body: { approve: true } });
+    assert.equal(local.status, 202);
+    assert.deepEqual((local.answer.request as { item: unknown }).item, { kind: 'gate', slug: 'demo', phase: 1 });
+    const viaWrite = await call(service, 'POST', '/api/write', { body: { action: 'gate-approve', slug: 'demo', phase: 1 } });
+    assert.equal(viaWrite.status, 202, 'the console door\'s gate action asks the same');
+    assert.deepEqual(seen, ['local'], 'neither press reached the gate');
+    // A paired device and the owner press it.
+    const device = await call(service, 'POST', '/api/plans/demo/gate/1', { host: REMOTE_HOST, headers: { 'tailscale-user-login': 'owner@example.com' }, body: { approve: true } });
+    assert.equal(device.status, 200, JSON.stringify(device.answer));
+    assert.equal((await owner.call('POST', '/api/plans/demo/gate/1', { approve: true })).status, 200);
+    assert.deepEqual(seen, ['local', 'device', 'owner']);
+    // The request stands until the owner answers it — confirmed, it reaches the gate through the owner's door.
+    const id = (local.answer.request as { id: string }).id;
+    assert.equal((await owner.call('POST', `/api/owner/requests/${id}/confirm`)).status, 200);
+    assert.deepEqual(seen, ['local', 'device', 'owner', 'owner']);
+    assert.equal(state.requests.get(id)?.state, 'confirmed');
+  } finally {
+    service.close();
   }
 });

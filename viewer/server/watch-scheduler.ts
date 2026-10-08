@@ -128,6 +128,8 @@ export type WatchSchedulerDeps = {
   verifyProbe?: WatchProbeDeps['verifyProbe'];
   /** `unit:<host>/<unit>` (control-tower phase 121) — the service's one `UnitProber`. */
   unitProbe?: WatchProbeDeps['unitProbe'];
+  /** `credential:<id>` — presence by name (control-tower phase 132); the service wires `probeCredential`. */
+  credentialProbe?: WatchProbeDeps['credentialProbe'];
   /**
    * The run policy's verdict on a command WITHOUT running it — `verify.ts`
    * `judgeCommand` — asked by the ingest probe, so a `cmd:` ref the console
@@ -781,7 +783,7 @@ export class WatchScheduler {
    */
   async probeNow(ref: string): Promise<WatchState> {
     const [target] = pollableRefs([ref]);
-    if (!target) return { ref, state: 'refused', detail: 'not a ref this console can check (gh:, date:, lock:, phase:, verify: or cmd:)' };
+    if (!target) return { ref, state: 'refused', detail: 'not a ref this console can check (gh:, date:, lock:, phase:, verify:, cmd:, unit: or credential:)' };
     if (target.kind === 'cmd') {
       const problem = cmdRefProblem(target.command) ?? this.deps.judgeCommand?.(target.command) ?? null;
       if (problem) return { ref: target.ref, state: 'refused', detail: problem.slice(0, 240) };
@@ -815,6 +817,7 @@ export class WatchScheduler {
         now: this.clock.now(),
         lockFree: this.deps.lockFree,
         ...(this.deps.unitProbe ? { unitProbe: this.deps.unitProbe } : {}),
+        ...(this.deps.credentialProbe ? { credentialProbe: this.deps.credentialProbe } : {}),
         ...(this.deps.cmdRefsEnabled?.() && this.deps.runCommand
           ? { runCommand: (command: string) => this.deps.runCommand!(command, cmdTimeoutMs) }
           : {}),

@@ -180,7 +180,7 @@ before it opens; a guide written in Persian is drawn right to left, its commands
 kind, reason and risk filters and the search live in the address; *Export* downloads the open items as one
 Markdown document and *Print* prints the same. `#/approve` and `#/approve?step=<id>` land on the page and a
 push opens `#/turn/<id>`. The approval queue, a question, a gate and an errand all draw the same item with
-*Open on Your turn*; the Tower's Needs-you bay keeps runs and one line linking here, and *Your turn (n)* in the
+*Open on Your turn*; the Runs home's Your turn group keeps runs and one line linking here, and *Your turn (n)* in the
 situation line counts items.
 
 **Every source feeds the one list.** A person errand is an item, so its *Done — continue* checks the same item

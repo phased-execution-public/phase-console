@@ -1,0 +1,516 @@
+/**
+ * Your turn, the page (7.0, quiet-console phase 8; control-tower phase 137,
+ * #214, exit criterion 1: the six sections render in order with the same
+ * rows as 6.2).
+ *
+ *   TP-1 the headline is the heading, the round its lead, then the six sections in order;
+ *   TP-2 the filters and the search live in the address — an address narrows
+ *        the page, and a select in the Filter slot writes its word into the address;
+ *   TP-3 *Done* holds the day's settled items and, under them, the ledger's older ones;
+ *   TP-4 *Export* writes ONE Markdown document of the open items with their guides;
+ *   TP-5 `#/turn/<id>` opens that item (aria-current) — even one folded under Coming up;
+ *        an id the turn no longer holds says so;
+ *   TP-6 the handled log is the last section, folded with its count;
+ *   TP-7 Everything unfolds Done and the handled log and opens every folded card;
+ *   TP-8 Inspect hands the panel the item, and its Overview reads `GET /api/turn/:id`;
+ *   TP-9 *Withdraw* posts the console's dismiss through the owner door, and the
+ *        item is HELD on the page until the server's `turn` event (#270).
+ */
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { read, explain, humanSteps, owner, post, listeners, inspected } = vi.hoisted(() => ({
+  read: vi.fn(),
+  explain: vi.fn(),
+  humanSteps: vi.fn(),
+  owner: vi.fn(),
+  post: vi.fn(),
+  listeners: [] as { name: string; fn: (data: unknown, name: string) => void }[],
+  inspected: vi.fn(),
+}));
+
+// Every read and write of the page meets the one http door under `data/`.
+vi.mock('@/data/http', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/data/http')>();
+  return {
+    ...actual,
+    request: (path: string) => {
+      if (/^\/api\/turn\/[^?]+/.test(path)) return explain(path);
+      if (path.startsWith('/api/turn')) return read(path);
+      if (path.startsWith('/api/human-steps')) return humanSteps(path);
+      if (path.startsWith('/api/owner')) return owner(path);
+      return Promise.reject(new actual.ApiError(`unmocked ${path}`, 500, path));
+    },
+    post: (path: string, body?: unknown) => post(path, body),
+  };
+});
+// The server's `turn` event is the one thing that ends a hold (#270).
+vi.mock('@/data/live', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/data/live')>();
+  return {
+    ...actual,
+    onSse: (name: string, fn: (data: unknown, name: string) => void) => {
+      listeners.push({ name, fn });
+      return () => {
+        const at = listeners.findIndex((one) => one.fn === fn);
+        if (at >= 0) listeners.splice(at, 1);
+      };
+    },
+  };
+});
+vi.mock('@/shell/panel/inspector-host', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/shell/panel/inspector-host')>();
+  return { ...actual, inspect: (record: unknown) => inspected(record) };
+});
+
+import { humanStepView, type HumanStepKind, type HumanStepState } from '@shared/human-step-model.js';
+import type { HumanStepRecord, PermissionRecord, TurnAnswer, TurnItem } from '@/data/api';
+import { queryClientConfig } from '@/data/keys';
+import { setPrefs } from '@/lib/prefs';
+import { MemoryRouterProvider } from '@/shell/router';
+import { parseHash, type Route } from '@/shell/routes';
+import { turnMarkdown } from './export';
+import { ExplainOverview } from './inspector';
+import TurnPage from './index';
+import { filtersOf, sectionsOf } from './page-model';
+
+const AT = '2026-10-07T12:00:00.000Z';
+
+function item(
+  id: string,
+  kind: HumanStepKind,
+  state: HumanStepState,
+  group: TurnItem['group'],
+  over: Partial<TurnItem> = {},
+): TurnItem {
+  return {
+    item: id,
+    record: 'ledger',
+    source: 'declared',
+    kind,
+    why: kind === 'decision' ? 'decision' : 'identity',
+    proofType: kind === 'decision' ? 'answer' : 'probe',
+    group,
+    rows: [`human-step:alpha:3:${id}`],
+    title: `Item ${id}`,
+    need: '',
+    how: '',
+    severity: 'needs-you',
+    slug: 'alpha',
+    phase: 3,
+    since: '2026-10-07T10:00:00.000Z',
+    href: '/plan/alpha/phase/3',
+    actions: [],
+    humanStep: humanStepView({ kind, title: `Item ${id}`, state, stepId: id }),
+    step: {
+      id,
+      kind,
+      title: `Item ${id}`,
+      state,
+      why: 'identity',
+      whySource: 'declared',
+      proofType: 'probe',
+      attempts: 0,
+      waiters: [],
+      declaredAt: '2026-10-07T10:00:00.000Z',
+      birth: 'session',
+      guide:
+        id === 'now-1'
+          ? {
+              version: 1,
+              lang: 'en',
+              dir: 'ltr',
+              summary: 'Only you can sign the CLI in.',
+              steps: [{ text: 'Run the sign-in', code: 'gh auth login --web' }],
+              trouble: [],
+            }
+          : undefined,
+    } as TurnItem['step'],
+    ...over,
+  };
+}
+
+const ASK: PermissionRecord = {
+  wall: 'ask',
+  tool: 'Bash',
+  rule: 'Bash(npm test:*)',
+  command: 'npm test --workspace viewer',
+  need: 'The phase runs its own suite before it hands off.',
+  family: 'any',
+  risk: 'low',
+  scopes: ['call', 'phase', 'plan', 'repository', 'always'],
+};
+
+const PERMIT = item('permit-1', 'permission', 'notified', 'now', {
+  why: 'permission',
+  proofType: 'grant',
+  permission: ASK,
+  runId: 'r-1',
+  actions: [
+    {
+      verb: 'grant',
+      label: 'Grant — this one call',
+      endpoint: '/api/human-steps/permit-1/grant',
+      method: 'POST',
+      body: { scope: 'call' },
+    },
+    { verb: 'deny', label: 'Deny', endpoint: '/api/human-steps/permit-1/deny', method: 'POST' },
+  ],
+});
+
+function answer(over: Partial<TurnAnswer['groups']> = {}): TurnAnswer {
+  const groups: TurnAnswer['groups'] = {
+    now: [item('now-1', 'browser-login', 'notified', 'now')],
+    decide: [
+      item('decide-1', 'decision', 'notified', 'decide', {
+        slug: 'beta',
+        phase: 2,
+        rows: ['human-step:beta:2:decide-1'],
+      }),
+    ],
+    upcoming: [item('up-1', 'operator-act', 'upcoming', 'upcoming')],
+    checking: [item('check-1', 'physical', 'checking', 'checking')],
+    done: [item('done-1', 'secret-entry', 'proven', 'done')],
+    ...over,
+  };
+  return {
+    round: { at: AT, n: 14, ranAt: AT, changedAt: '2026-10-07T11:50:00.000Z' },
+    headline: 'Two things wait on you; one unblocks phase 4.',
+    groups,
+    handled: [
+      {
+        id: 'h-1',
+        at: AT,
+        first: '2026-10-07T09:00:00.000Z',
+        source: 'auto-grant',
+        what: 'Allowed git push of the run branch',
+        slug: 'alpha',
+        phase: 3,
+        count: 3,
+        links: [{ kind: 'commit', ref: '41bc1f14abcdef' }],
+      },
+    ],
+    counts: {
+      now: groups.now.length,
+      decide: groups.decide.length,
+      upcoming: groups.upcoming.length,
+      checking: groups.checking.length,
+      done: groups.done.length,
+      total: groups.now.length + groups.decide.length + groups.upcoming.length + groups.checking.length,
+      handled: 1,
+    },
+    seen: null,
+    issues: { count: 2, href: '/repo/issues?state=draft' },
+  };
+}
+
+const ANSWER = answer();
+
+const OLDER: HumanStepRecord = {
+  id: 'old-1',
+  kind: 'claude-login',
+  title: 'Sign Claude in again',
+  where: 'host',
+  birth: 'console',
+  slug: 'alpha',
+  phase: 1,
+  state: 'proven',
+  declaredAt: '2026-10-01T10:00:00.000Z',
+  at: '2026-10-01T11:00:00.000Z',
+  opened: 1,
+};
+
+function mount(hash = '#/turn', onNavigate = vi.fn()) {
+  const client = new QueryClient({
+    ...queryClientConfig,
+    defaultOptions: { queries: { ...queryClientConfig.defaultOptions?.queries, retry: false } },
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouterProvider initial={hash} onNavigate={onNavigate}>
+        <TurnPage route={parseHash(hash) as Route} />
+      </MemoryRouterProvider>
+    </QueryClientProvider>,
+  );
+  return { onNavigate, client };
+}
+
+const section = (id: string) =>
+  screen.getAllByTestId('turn-section').find((el) => el.getAttribute('data-section') === id)!;
+
+/** Open the Filter slot (a desk's popover) and hand back its panel. */
+async function openFilter(): Promise<HTMLElement> {
+  fireEvent.click(document.querySelector<HTMLElement>('[data-slot="filter"]')!);
+  return screen.findByRole('dialog', { name: 'Filter' });
+}
+
+beforeEach(() => {
+  read.mockReset();
+  explain.mockReset();
+  humanSteps.mockReset();
+  owner.mockReset();
+  post.mockReset();
+  inspected.mockReset();
+  listeners.length = 0;
+  read.mockResolvedValue(ANSWER);
+  humanSteps.mockResolvedValue({
+    steps: [OLDER],
+    reminders: { series: [], quiet: null },
+    can: { openHost: false, terminal: false, resume: false },
+  });
+  owner.mockResolvedValue({
+    state: 'unenrolled',
+    mode: 'unenrolled',
+    keys: [],
+    session: null,
+    requests: [],
+    relyingParty: { id: 'localhost', origin: 'http://localhost:4130' },
+  });
+  window.localStorage.clear();
+  setPrefs({ everything: {} });
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
+describe('TP-1 the headline, the round and the six sections', () => {
+  it('draws them in order', async () => {
+    mount();
+    expect((await screen.findByTestId('turn-headline')).textContent).toBe(ANSWER.headline);
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(ANSWER.headline);
+    expect(screen.getByTestId('turn-round').textContent).toContain('Round 14');
+    const sections = screen.getAllByTestId('turn-section').map((s) => s.getAttribute('data-section'));
+    expect(sections).toEqual(['now', 'decide', 'upcoming', 'checking', 'done', 'handled']);
+    const headings = screen
+      .getAllByRole('heading', { level: 2 })
+      .map((h) => h.textContent?.replace(/\d+$/, ''));
+    expect(headings).toEqual([
+      'Do now',
+      'Needs one detail from you',
+      'Coming up',
+      'Being checked',
+      'Done',
+      'Handled by the AI',
+    ]);
+    expect(screen.getByTestId('turn-issues').textContent).toContain('2 issue drafts wait');
+    // The page remembers the look, for the next one's handled count.
+    expect(window.localStorage.getItem('turn:seen')).toBe(AT);
+    // The root carries the mark `check-dist` finds the lazy chunk by.
+    expect(screen.getByTestId('turn-page').hasAttribute('data-turn-page')).toBe(true);
+  });
+});
+
+describe('TP-2 the filters live in the address', () => {
+  it('an address narrows the page, and the note says so', async () => {
+    mount('#/turn?plan=beta');
+    await screen.findByTestId('turn-headline');
+    const items = screen.getAllByTestId('turn-item').map((el) => el.getAttribute('data-item'));
+    expect(items).toEqual(['decide-1']);
+    expect(screen.getAllByText(/hidden by the filters/).length).toBeGreaterThan(0);
+    // Five, because Done's settled item counts too — the note counts rows, the headline counts the open.
+    expect(screen.getByTestId('turn-narrowed').textContent).toMatch(/Showing 1 of 5 items/);
+  });
+
+  it('a select in the Filter slot writes its word into the address, keeping the item it names', async () => {
+    const { onNavigate } = mount('#/turn/now-1');
+    await screen.findByTestId('turn-headline');
+    const panel = await openFilter();
+    fireEvent.change(within(panel).getByTestId('turn-filter-kind'), { target: { value: 'decision' } });
+    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('#/turn/now-1?kind=decision'));
+  });
+
+  it('the search is a filter too', () => {
+    const narrowed = sectionsOf(ANSWER, filtersOf({ q: 'gh auth' }));
+    expect(narrowed.flatMap((s) => s.items.map((i) => i.item))).toEqual(['now-1']);
+  });
+});
+
+describe('TP-3 Done', () => {
+  it('holds the day’s settled items and the ledger’s older ones, folded with its count', async () => {
+    mount();
+    await screen.findByTestId('turn-headline');
+    const done = section('done');
+    expect(within(done).queryByTestId('turn-item')).toBeNull();
+    fireEvent.click(within(done).getByRole('button', { name: /What was settled/ }));
+    expect(within(done).getByTestId('turn-item').getAttribute('data-item')).toBe('done-1');
+    expect(within(done).getByTestId('turn-done-earlier').textContent).toContain('Sign Claude in again');
+  });
+});
+
+describe('TP-4 Export', () => {
+  it('writes one Markdown document of the open items with their guides', () => {
+    const text = turnMarkdown(ANSWER, sectionsOf(ANSWER, {}), new Map());
+    expect(text.startsWith('# Your turn\n')).toBe(true);
+    expect(text).toContain(ANSWER.headline);
+    expect(text).toContain('## Do now');
+    expect(text).toContain('### Item now-1');
+    expect(text).toContain('gh auth login --web');
+    expect(text).toContain('#### Steps');
+    expect(text).toContain('## Coming up');
+    // Settled is not open.
+    expect(text).not.toContain('Item done-1');
+    expect(text.match(/^# /gm)).toHaveLength(1);
+  });
+});
+
+describe('TP-5 an item by its address', () => {
+  it('opens the named item, even one folded under Coming up', async () => {
+    mount('#/turn/up-1');
+    await screen.findByTestId('turn-headline');
+    const named = screen.getAllByTestId('turn-item').find((el) => el.getAttribute('data-item') === 'up-1')!;
+    expect(named.getAttribute('aria-current')).toBe('true');
+    expect(within(named).getByTestId('turn-body').className).toContain('flex');
+  });
+
+  it('says so when the item is no longer waiting', async () => {
+    mount('#/turn/gone-1');
+    expect((await screen.findByTestId('turn-item-gone')).textContent).toContain('no longer waiting');
+  });
+});
+
+describe('TP-6 the handled log', () => {
+  it('is the last section, folded with its count', async () => {
+    mount();
+    await screen.findByTestId('turn-headline');
+    const handled = screen.getAllByTestId('turn-section').at(-1)!;
+    expect(handled.getAttribute('data-section')).toBe('handled');
+    expect(within(handled).queryByTestId('turn-handled')).toBeNull();
+    fireEvent.click(within(handled).getByRole('button', { name: /What the AI handled/ }));
+    const row = within(handled).getByTestId('turn-handled-row');
+    expect(row.textContent).toContain('A standing grant allowed it');
+    expect(row.textContent).toContain('×3');
+    expect(row.textContent).toContain('commit 41bc1f14');
+  });
+});
+
+describe('TP-7 Everything', () => {
+  it('unfolds Done and the handled log, and opens every folded card', async () => {
+    setPrefs({ everything: { turn: true } });
+    mount();
+    await screen.findByTestId('turn-headline');
+    expect(within(section('done')).getByTestId('turn-item').getAttribute('data-item')).toBe('done-1');
+    expect(within(section('handled')).getByTestId('turn-handled-row')).toBeTruthy();
+    const coming = within(section('upcoming')).getByTestId('turn-item');
+    expect(within(coming).queryByTestId('turn-item-toggle')).toBeNull();
+    expect(within(coming).getByTestId('turn-body').className).toContain('flex');
+  });
+});
+
+describe('TP-8 Inspect', () => {
+  it('hands the panel the item, keyed, with its state', async () => {
+    mount();
+    await screen.findByTestId('turn-headline');
+    const card = screen.getAllByTestId('turn-item').find((el) => el.getAttribute('data-item') === 'now-1')!;
+    fireEvent.click(within(card).getByTestId('turn-inspect'));
+    expect(inspected).toHaveBeenCalledTimes(1);
+    const record = inspected.mock.calls[0]![0] as { key: string; title: string; overview: unknown };
+    expect(record.key).toBe('turn:now-1');
+    expect(record.title).toBe('Item now-1');
+    expect(record.overview).toBeTruthy();
+  });
+
+  it('its Overview reads the explain view, GET /api/turn/:id, and says why only a person fits it', async () => {
+    explain.mockResolvedValue({
+      ok: true,
+      item: {
+        id: 'now-1',
+        kind: 'browser-login',
+        title: 'Item now-1',
+        state: 'notified',
+        birth: 'session',
+        slug: 'alpha',
+        phase: 3,
+        why: 'identity',
+        whySource: 'declared',
+        whyPerson: 'Only you can sign in: only you can sign in as yourself.',
+        commands: ['gh auth login --web'],
+        proofType: 'probe',
+        proof: 'cmd:"gh auth status"',
+        attempts: 2,
+        verdicts: [],
+        waiters: [{ slug: 'alpha', phase: 3 }],
+        declaredAt: '2026-10-07T10:00:00.000Z',
+        at: '2026-10-07T10:00:00.000Z',
+      },
+    });
+    const client = new QueryClient({ ...queryClientConfig, defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouterProvider initial="#/turn">
+          <ExplainOverview item={ANSWER.groups.now[0]!} record={undefined} />
+        </MemoryRouterProvider>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(explain).toHaveBeenCalledWith('/api/turn/now-1'));
+    expect((await screen.findByTestId('turn-explain-why')).textContent).toContain(
+      'only you can sign in as yourself',
+    );
+    expect(screen.getByTestId('turn-explain-commands').textContent).toContain('gh auth login --web');
+    expect(screen.getByTestId('turn-explain').textContent).toContain('alpha phase 3');
+  });
+});
+
+describe('TP-9 Withdraw, and the hold (#270)', () => {
+  it('posts the console’s dismiss through the owner door, holds the item until the turn event, then lets it go', async () => {
+    post.mockResolvedValue({ ok: true, step: { ...ANSWER.groups.now[0]!.step, state: 'dismissed' } });
+    const { client } = mount();
+    await screen.findByTestId('turn-headline');
+    const card = screen.getAllByTestId('turn-item').find((el) => el.getAttribute('data-item') === 'now-1')!;
+    fireEvent.click(within(card).getByTestId('turn-withdraw'));
+    // The press has to be meant: the confirm keeps the button's own word.
+    const dialog = await screen.findByRole('alertdialog');
+    expect(dialog.textContent).toContain('Withdraw this item?');
+    // From here the server no longer lists the item …
+    read.mockResolvedValue(answer({ now: [] }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Withdraw' }));
+    await waitFor(() => expect(post).toHaveBeenCalledWith('/api/human-steps/now-1/dismiss', {}));
+    // … and the page re-reads it, yet the item stays where it stood, saying what was pressed.
+    await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(1));
+    const held = await screen.findByTestId('turn-settling');
+    expect(held.textContent).toContain('Withdrawn');
+    const row = held.closest('[data-testid="turn-item"]')!;
+    expect(row.getAttribute('data-item')).toBe('now-1');
+    expect(row.hasAttribute('data-settling')).toBe(true);
+    expect(section('now').contains(row)).toBe(true);
+    // Only the server's `turn` event lets it go.
+    expect(listeners.some((one) => one.name === 'turn')).toBe(true);
+    act(() => {
+      for (const one of listeners.filter((l) => l.name === 'turn')) one.fn({ round: 15 }, 'turn');
+    });
+    await client.invalidateQueries();
+    await waitFor(() =>
+      expect(screen.queryAllByTestId('turn-item').map((el) => el.getAttribute('data-item'))).not.toContain(
+        'now-1',
+      ),
+    );
+  });
+
+  it('a grant that went through is held the same way, and leaves on the event (#270)', async () => {
+    read.mockResolvedValue(answer({ now: [PERMIT] }));
+    post.mockResolvedValue({
+      ok: true,
+      granted: { id: 'g-1', rule: 'Bash(npm test:*)', scope: 'call', state: 'live' },
+      resumes: [],
+    });
+    mount();
+    await screen.findByTestId('turn-headline');
+    const card = screen
+      .getAllByTestId('turn-item')
+      .find((el) => el.getAttribute('data-item') === 'permit-1')!;
+    read.mockResolvedValue(answer({ now: [] }));
+    fireEvent.click(within(card).getByTestId('turn-primary'));
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/human-steps/permit-1/grant', { scope: 'call' }),
+    );
+    const held = await screen.findByTestId('turn-settling');
+    expect(held.textContent).toContain('Granted for this one call');
+    expect(held.closest('[data-testid="turn-item"]')!.getAttribute('data-item')).toBe('permit-1');
+    act(() => {
+      for (const one of listeners.filter((l) => l.name === 'turn')) one.fn({ round: 15 }, 'turn');
+    });
+    await waitFor(() => expect(screen.queryByTestId('turn-settling')).toBeNull());
+    expect(screen.queryAllByTestId('turn-item').map((el) => el.getAttribute('data-item'))).not.toContain(
+      'permit-1',
+    );
+  });
+});

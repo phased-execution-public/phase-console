@@ -1,0 +1,5 @@
+{
+  "about": "Legacy status sites per file under client/src, held by ratchet.test.ts. The count reached zero; the empty snapshot makes any site a regression.",
+  "total": 0,
+  "files": {}
+}

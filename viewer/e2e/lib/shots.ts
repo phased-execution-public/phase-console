@@ -3,9 +3,10 @@
  * leaves of each stop.
  *
  * The stops are DERIVED from `shared/route-meta.js` — every destination, every
- * plan tab — plus `#/approve` and the three overlays, so a destination added
- * there is toured (and measured, and photographed) without anyone remembering
- * to add it here. The pictures go to `e2e/.shots/<project>/<stop>.png`,
+ * plan tab — plus Your turn, a few deeper sections and the three overlays, so a
+ * destination added there is toured (and measured, and photographed) without
+ * anyone remembering to add it here; a head that is not a destination is named
+ * below by hand. The pictures go to `e2e/.shots/<project>/<stop>.png`,
  * gitignored and never pixel-diffed: they are for the session that changed the
  * page to READ, because a clipped row is exactly the defect a test that only
  * asks "did it render" passes.
@@ -48,7 +49,31 @@ export const STOPS: readonly Stop[] = [
   { name: 'turn', hash: '#/turn' },
   // The Issues desk (control-tower phase 118): the fixture's added repository, every state and reading
   { name: 'repo-issues', hash: '#/repo/issues?state=all' },
-  // `?k=` `?help=` `?bell=` — `client/src/app/routes.ts` OVERLAY_KEYS.
+  // Sessions ▸ Locks (#24; 7.0's section, quiet-console phase 15): the live lane's claim on its grid
+  { name: 'sessions-locks', hash: '#/sessions/locks' },
+  // Logs' other sections (7.0's own place, quiet-console phase 20): one run on the run view's Gantt,
+  // the delivery ledger on the grid, health's questions between hairlines, and who was served
+  { name: 'logs-journal', hash: `#/logs/journal?slug=${TOUR_PLAN}` },
+  { name: 'logs-delivery', hash: '#/logs/delivery' },
+  { name: 'logs-health', hash: '#/logs/health' },
+  { name: 'logs-access', hash: '#/logs/access' },
+  // Settings' rebuilt sections (7.0's own place, quiet-console phase 21): what this console reads and
+  // may do, how it looks, what it does by itself, and every key the console stores
+  { name: 'settings-essentials', hash: '#/settings/essentials' },
+  { name: 'settings-appearance', hash: '#/settings/appearance' },
+  { name: 'settings-automation', hash: '#/settings/automation' },
+  // Settings ▸ Notifications and Accounts (quiet-console phase 22): every kind and where it lands, the
+  // devices and the webhooks; every account opened to its windows, the ways in, and who is still remembered
+  { name: 'settings-notifications', hash: '#/settings/notifications' },
+  { name: 'settings-accounts', hash: '#/settings/accounts' },
+  // Settings ▸ MCP servers, Permissions and This instance (quiet-console phase 23): the registry and the
+  // policy for an unreachable server; the grants, the owner keys and the rule editor; the process, the
+  // restart and its forms, the launch unit, reach, every retention key, the machine profile and the off switch
+  { name: 'settings-mcp', hash: '#/settings/mcp' },
+  { name: 'settings-permissions', hash: '#/settings/permissions' },
+  { name: 'settings-instance', hash: '#/settings/instance' },
+  { name: 'settings-everything', hash: '#/settings/everything' },
+  // `?k=` `?help=` `?bell=` — `client/src/shell/routes.ts` OVERLAY_KEYS.
   { name: 'overlay-palette', hash: '#/runs?k=', overlay: 'palette' },
   { name: 'overlay-help', hash: '#/runs?help=', overlay: 'help' },
   { name: 'overlay-bell', hash: '#/runs?bell=1', overlay: 'bell' },

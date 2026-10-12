@@ -13,7 +13,7 @@
  * Shared is the MECHANISM. Not shared is the VOCABULARY: which orders exist,
  * what each one leads with, which rows are pinned, what a filter means. Every
  * one of those is a claim about the domain, and this file must never learn what
- * a plan or a run is — the same split `components/toolbar.tsx` makes for the
+ * a plan or a run is — the same split `ui/toolbar.tsx` makes for the
  * controls that drive these.
  *
  * ## The two things the copies each got right once
@@ -52,7 +52,7 @@ export interface SortSpec<Row> {
   pin?: (row: Row) => boolean;
 }
 
-/** One entry in a sort control, in the shape `components/toolbar.tsx` wants. */
+/** One entry in a sort control: its id, its words, and what it leads with. */
 export interface SortOptionOf<Id extends string> {
   id: Id;
   label: string;

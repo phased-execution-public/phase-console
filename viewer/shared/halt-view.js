@@ -7,7 +7,7 @@
  * `recoveryActionsFor(ctx)[0]` — the recovery model's own first verb, never a
  * second opinion. Kept apart because the vocabulary is on the first-paint
  * path (the runs ledger's sentence) and the recovery model is not
- * (`check-dist`: 190 KB served).
+ * (`check-dist`: 170 KB served).
  */
 
 import { recoveryActionsFor } from './recovery-model.js';
@@ -25,7 +25,7 @@ import {
 /**
  * @typedef {{
  *   status: string,
- *   sessionId?: string | null, resumeSessionId?: string | null,
+ *   sessionId?: string | null, resumeSessionId?: string | null, resumable?: boolean,
  *   situation?: { key: string } | null,
  * }} RecordLike
  * @typedef {{
@@ -87,7 +87,9 @@ export function haltCtx(run, opts = {}) {
       ? {
           record: {
             status: record.status,
-            resumable: Boolean(record.sessionId ?? record.resumeSessionId),
+            // A slim row carries the fact itself, never a session id
+            // (`server/runs-projection.ts`, quiet-console phase 7).
+            resumable: Boolean(record.resumable ?? record.sessionId ?? record.resumeSessionId),
             ...(key ? { situation: { key } } : {}),
           },
         }

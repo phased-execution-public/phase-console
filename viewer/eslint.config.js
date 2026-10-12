@@ -15,8 +15,119 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
-const STATUS_PRIMITIVE_MESSAGE =
-  'Draw a status through the typed family (@/components/ui/status) — StatusBadge and StatusDot are its primitive, imported only inside components/ui/status/**.';
+/* ------------------------------------------------------------------ *
+ * The rules of the client's tree (quiet-console §Architecture 4).
+ *
+ * One navigation door (no hand-written `#/…` address outside
+ * `shell/routes.ts`), one data door (`useQuery`/`useMutation` imported only
+ * inside `data/`), one status renderer (`DotWord` imported only inside
+ * `ui/status/**`), one stream (an `EventSource` opened only by `data/live.ts`
+ * and the Logs tail) and one table engine (TanStack Table reached only through
+ * `ui/grid/engine.ts`, by `import()`). Each holds over the whole of
+ * `client/src`; the blocks after the first carve out exactly the one file or
+ * folder that IS the door. Flat config replaces a rule's options wholesale per
+ * matching block, so each block below spells its whole option set through the
+ * two builders.
+ * ------------------------------------------------------------------ */
+const DOT_WORD_MESSAGE =
+  'Draw a status through the typed family (@/ui/status) — DotWord is its renderer, imported only inside ui/status/**.';
+const DATA_DOOR_MESSAGE =
+  'One data door: useQuery/useMutation are imported only inside client/src/data/ — reach a domain through its data/<domain>.ts hooks.';
+const ADDRESS_MESSAGE =
+  'One navigation door: no hand-written `#/…` address outside shell/routes.ts — build it with the routes module.';
+const ENGINE_MESSAGE =
+  'Only ui/grid/engine.ts imports the table engine — reach the grid through @/ui/grid/grid.';
+const ENGINE_DOOR_MESSAGE =
+  'The table engine is reached only through import() (ui/grid/grid.tsx): a static import puts TanStack Table on the path of ' +
+  'every page that draws a table, and check-dist fails that build. A type import is erased — write `import type`.';
+/** A module whose last segment is `engine` — the table engine's file, by any path. */
+const ENGINE_SOURCE = String.raw`/(^|\/)engine$/`;
+const EVENT_SOURCE_MESSAGE =
+  "One stream: data/live.ts opens the console's one EventSource and shares it across tabs. The one named exception is " +
+  'the Logs tail (screens/logs/tail.ts), a per-query stream its reader turns on and off — subscribe through data/live.ts.';
+/** The two files that may open an `EventSource`: the console's one stream, and the Logs tail. */
+const EVENT_SOURCE_DOORS = ['client/src/data/live.ts', 'client/src/screens/logs/tail.ts'];
+
+/** The whole `no-restricted-imports` option set for a block of the client. */
+function restrictedImports({ dotWord = true, dataDoor = true, engine = true } = {}) {
+  return [
+    'error',
+    {
+      paths: [
+        ...(engine
+          ? [
+              { name: '@tanstack/react-table', message: ENGINE_MESSAGE },
+              { name: '@tanstack/table-core', message: ENGINE_MESSAGE },
+            ]
+          : []),
+        ...(dataDoor
+          ? [
+              {
+                name: '@tanstack/react-query',
+                importNames: [
+                  'useQuery',
+                  'useQueries',
+                  'useInfiniteQuery',
+                  'useSuspenseQuery',
+                  'useMutation',
+                ],
+                message: DATA_DOOR_MESSAGE,
+              },
+            ]
+          : []),
+      ],
+      patterns: [
+        ...(engine
+          ? [{ group: ['@tanstack/react-table/*', '@tanstack/table-core/*'], message: ENGINE_MESSAGE }]
+          : []),
+        ...(dotWord ? [{ group: ['**/dot-word'], message: DOT_WORD_MESSAGE }] : []),
+      ],
+    },
+  ];
+}
+
+/** The whole `no-restricted-syntax` option set: the client's bans, plus the address door. */
+function restrictedSyntax({ addresses = true, eventSource = true } = {}) {
+  return [
+    'error',
+    // The colour system: a literal colour in a component is invisible in
+    // one of the two themes. Tokens only (`var(--status-*)`, `text-done`…).
+    {
+      selector: 'Literal[value=/^#[0-9a-fA-F]{3,8}$/]',
+      message: 'No literal colours in the client — use a token (`var(--…)`, a `text-*`/`bg-*` utility).',
+    },
+    // `scrollIntoView` scrolls every ancestor — including the page — and
+    // made the run page crawl under SSE renders. Move `scrollLeft`/`Top`.
+    {
+      selector: "CallExpression[callee.property.name='scrollIntoView']",
+      message:
+        'scrollIntoView scrolls every ancestor; move scrollLeft/scrollTop on the one scroller instead.',
+    },
+    // The table engine's door is `import()`: a static VALUE import or a
+    // re-export of it, from anywhere, is the engine on some page's first load.
+    {
+      selector: `ImportDeclaration[importKind='value'][source.value=${ENGINE_SOURCE}]`,
+      message: ENGINE_DOOR_MESSAGE,
+    },
+    { selector: `ExportAllDeclaration[source.value=${ENGINE_SOURCE}]`, message: ENGINE_DOOR_MESSAGE },
+    {
+      selector: `ExportNamedDeclaration[exportKind='value'][source.value=${ENGINE_SOURCE}]`,
+      message: ENGINE_DOOR_MESSAGE,
+    },
+    // One stream (quiet-console §Architecture 4): a second `EventSource` is a
+    // second connection per tab, and the server sends `run:stream` only to the
+    // listener that asked for it — `data/live.ts` is that listener.
+    ...(eventSource
+      ? [{ selector: "NewExpression[callee.name='EventSource']", message: EVENT_SOURCE_MESSAGE }]
+      : []),
+    ...(addresses
+      ? [
+          { selector: 'TemplateLiteral[quasis.0.value.raw=/^#\\//]', message: ADDRESS_MESSAGE },
+          { selector: 'Literal[value=/^#\\//]', message: ADDRESS_MESSAGE },
+        ]
+      : []),
+  ];
+}
 
 export default tseslint.config(
   {
@@ -70,7 +181,7 @@ export default tseslint.config(
       // them keeps the runtime graph one-directional (vocab → nothing).
       '@typescript-eslint/consistent-type-imports': [
         'error',
-        // `disallowTypeAnnotations: false`: `importOriginal<typeof import('@/lib/api')>()`
+        // `disallowTypeAnnotations: false`: `importOriginal<typeof import('@/data/api')>()`
         // is Vitest's own documented mock idiom, and the annotation is erased anyway.
         { prefer: 'type-imports', fixStyle: 'inline-type-imports', disallowTypeAnnotations: false },
       ],
@@ -81,85 +192,43 @@ export default tseslint.config(
       '@typescript-eslint/ban-ts-comment': ['error', { 'ts-expect-error': 'allow-with-description' }],
       'no-console': ['warn', { allow: ['warn', 'error'] }],
       eqeqeq: ['error', 'smart'],
-      // The table engine has ONE door (control-tower phase 18). TanStack Table
-      // is the grid's row model and nothing else, loaded on demand through
-      // `components/data-table/engine.ts` so it never reaches first paint;
-      // a second importer would put it back on some page's static path, and
-      // `check-dist` would only notice after a build. The one exception is the
-      // override below.
-      // …and the status primitive has ONE family (control-tower phase 31). A page
-      // draws a status through `@/components/ui/status` — the typed badges read
-      // the status model, so a label, an icon and a paint cannot disagree — and
-      // `StatusBadge` / `StatusDot` are that family's primitive, imported only
-      // inside `components/ui/status/**` (the override below).
-      'no-restricted-imports': [
-        'error',
-        {
-          paths: [
-            {
-              name: '@/components/ui',
-              importNames: ['StatusBadge', 'StatusDot', 'statusBadgeClass'],
-              message: STATUS_PRIMITIVE_MESSAGE,
-            },
-            {
-              name: '@tanstack/react-table',
-              message:
-                'Only components/data-table/engine.ts imports the table engine — reach the grid through @/components/data-table.',
-            },
-            {
-              name: '@tanstack/table-core',
-              message:
-                'Only components/data-table/engine.ts imports the table engine — reach the grid through @/components/data-table.',
-            },
-          ],
-          patterns: [
-            {
-              group: ['@tanstack/react-table/*', '@tanstack/table-core/*'],
-              message: 'Only components/data-table/engine.ts imports the table engine.',
-            },
-            { group: ['**/status-badge'], message: STATUS_PRIMITIVE_MESSAGE },
-          ],
-        },
-      ],
-      'no-restricted-syntax': [
-        'error',
-        // The colour system: a literal colour in a component is invisible in
-        // one of the two themes. Tokens only (`var(--status-*)`, `text-done`…).
-        {
-          selector: 'Literal[value=/^#[0-9a-fA-F]{3,8}$/]',
-          message: 'No literal colours in the client — use a token (`var(--…)`, a `text-*`/`bg-*` utility).',
-        },
-        // `scrollIntoView` scrolls every ancestor — including the page — and
-        // made the run page crawl under SSE renders. Move `scrollLeft`/`Top`.
-        {
-          selector: "CallExpression[callee.property.name='scrollIntoView']",
-          message:
-            'scrollIntoView scrolls every ancestor; move scrollLeft/scrollTop on the one scroller instead.',
-        },
-      ],
+      // The doors of the tree — see the block above the config.
+      'no-restricted-imports': restrictedImports(),
+      'no-restricted-syntax': restrictedSyntax(),
     },
   },
   {
-    // The table engine's one door — see `no-restricted-imports` above.
-    files: ['client/src/components/data-table/engine.ts'],
-    rules: { 'no-restricted-imports': 'off' },
+    // The data layer is the one place the query hooks live.
+    files: ['client/src/data/**'],
+    rules: { 'no-restricted-imports': restrictedImports({ dataDoor: false }) },
   },
   {
-    // The status primitive's one family — see `no-restricted-imports` above: the
-    // family itself, the barrel that re-exports it, and the primitive's own tests.
-    files: [
-      'client/src/components/ui/status/**',
-      'client/src/components/ui/index.ts',
-      'client/src/components/ui/status-badge.test.tsx',
-    ],
-    rules: { 'no-restricted-imports': 'off' },
+    // The status renderer's one family: `DotWord` is imported only here.
+    files: ['client/src/ui/status/**'],
+    rules: { 'no-restricted-imports': restrictedImports({ dotWord: false }) },
+  },
+  {
+    // The one navigation door: the only file that spells `#/`.
+    files: ['client/src/shell/routes.ts'],
+    rules: { 'no-restricted-syntax': restrictedSyntax({ addresses: false }) },
+  },
+  {
+    // The one stream and its one named exception — see `restrictedSyntax`.
+    files: EVENT_SOURCE_DOORS,
+    rules: { 'no-restricted-syntax': restrictedSyntax({ eventSource: false }) },
+  },
+  {
+    // The table engine's one door. The data door and the status renderer's
+    // family hold here as everywhere.
+    files: ['client/src/ui/grid/engine.ts'],
+    rules: { 'no-restricted-imports': restrictedImports({ engine: false }) },
   },
   {
     // The one file where literal colours are CORRECT: the sixteen ANSI slots
     // of the terminal palette are an addressing scheme, not a design decision
     // (its own header says why). Everything that IS a design decision there is
     // still read from the live stylesheet.
-    files: ['client/src/features/sessions/palette.ts'],
+    files: ['client/src/screens/sessions/palette.ts'],
     rules: { 'no-restricted-syntax': 'off' },
   },
   {

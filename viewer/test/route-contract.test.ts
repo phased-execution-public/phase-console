@@ -33,7 +33,7 @@ import assert from 'node:assert/strict';
 import { CATEGORIES, routeFor } from '../server/push/catalogue.ts';
 import type { RouteContext } from '../server/push/catalogue.ts';
 import {
-  DEFAULT_HEAD, DESTINATIONS, ROUTE_HEADS, PLAN_TABS, LEGACY_PLAN_TABS, isRouteHead,
+  DEFAULT_HEAD, DESTINATIONS, ROUTE_HEADS, PLAN_TABS, LEGACY_PLAN_TABS, PLAN_PHASE_VIEWS, PLAN_RUN_VIEWS, isRouteHead,
 } from '../shared/route-meta.js';
 import {
   parseHash, toHash, planHref, phaseHref, handoffHref, laneHref, phaseSessionHref, sessionsHref,
@@ -106,6 +106,18 @@ test('the run tab the server routes every in-flight notification to still exists
   assert.ok(PLAN_TABS.includes('run'), `'run' must stay in PLAN_TABS: ${PLAN_TABS.join(', ')}`);
 });
 
+test('each plan view names its readings, and the live run is the run view with no ?view= at all', () => {
+  // 7.0 (quiet-console phase 10): the Run view gains a history reading beside
+  // the live run. `live` leads, so `#/plan/<slug>/run` — the address every
+  // in-flight push carries — still opens on the run as it is now.
+  assert.deepEqual(PLAN_PHASE_VIEWS, ['table', 'map', 'qa', 'handoffs']);
+  assert.deepEqual(PLAN_RUN_VIEWS, ['live', 'history']);
+  const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
+  for (const [id, to] of Object.entries(legacy)) {
+    if (to.tab === 'phases' && to.view) assert.ok(PLAN_PHASE_VIEWS.includes(to.view), `'${id}' → an unknown view`);
+  }
+});
+
 test('the heads 6.0 retired still resolve, and an address that names nothing lands on a destination', () => {
   // Control-tower phase 21 made `runs` the home and folded Now and the Ready
   // list into it — but the digest push still mints `/#/now` and the ready push
@@ -126,7 +138,7 @@ test('the heads 6.0 retired still resolve, and an address that names nothing lan
   assert.ok(DESTINATIONS.includes(DEFAULT_HEAD), `DEFAULT_HEAD '${DEFAULT_HEAD}' must be a destination`);
 });
 
-test('Your turn is a head, the old answer page still resolves, and the destinations are unchanged', () => {
+test('Your turn is a head, the old answer page still resolves, and the destinations are the seven of 7.0', () => {
   // Control-tower phase 137 (#214, §Architecture 19): the page is a HEAD that
   // lights Runs, never an eighth destination — "does anything need me?" already
   // has a home, and the phone's four tab slots are spoken for. `#/approve` is
@@ -136,9 +148,24 @@ test('Your turn is a head, the old answer page still resolves, and the destinati
   assert.ok(isRouteHead('approve'), "'approve' is in pushes already on phones and must keep resolving");
   assert.ok(!DESTINATIONS.includes('turn'), 'Your turn lights Runs; it is not a destination of its own');
   assert.ok(!DESTINATIONS.includes('approve'), "'approve' was never a destination");
-  const free = ['runs', 'plans', 'sessions', 'repo', 'insights', 'debug', 'settings'];
-  assert.deepEqual(DESTINATIONS.filter((head) => free.includes(head)), free, 'the seven, in their order');
-  assert.deepEqual(DESTINATIONS.filter((head) => !free.includes(head)).sort(), DESTINATIONS.length > 7 ? ['chat', 'fleet'] : []);
+  // 7.0 (quiet-console phase 3): Debug became Logs, and the seven are the SAME
+  // in both editions — Pro adds no destination. The Supervisor is the right
+  // panel's second mode (and `#/chat` on a phone), Fleet opens from the
+  // instance switcher, and `debug` lands on `#/logs`: each stays a head,
+  // because an address that was ever in a bookmark, a push or a handoff keeps
+  // resolving, and none is a place the rail lists.
+  const seven = ['runs', 'plans', 'sessions', 'repo', 'insights', 'logs', 'settings'];
+  assert.deepEqual(DESTINATIONS.filter((head) => seven.includes(head)), seven, 'the seven, in their order');
+  assert.deepEqual(
+    DESTINATIONS.filter((head) => !seven.includes(head)),
+    [],
+    'nothing beside the seven, in either edition',
+  );
+  const heads = ['debug', 'turn', 'approve', 'queue'];
+  for (const head of heads) {
+    assert.ok(isRouteHead(head), `'${head}' must stay a route head`);
+    assert.ok(!DESTINATIONS.includes(head), `'${head}' is a head, not a destination, since 7.0`);
+  }
 });
 
 test('toHash accepts every form this system produces for the same route', () => {
@@ -166,7 +193,7 @@ test('the href builders round-trip a slug that needs encoding, and a phase numbe
 
 test('every retired plan tab still names somewhere real', () => {
   // These ids are in bookmarks, in handoff prose, and in push payloads minted
-  // by servers older than this build. `app/routes.ts` `planTabRedirect` builds
+  // by servers older than this build. `shell/redirects.ts` `planTabRedirect` builds
   // the URL; this asserts the VOCABULARY it reads is not self-contradictory —
   // a `tab` that is not a tab, or an id that is both retired and live, is a
   // redirect into nothing.

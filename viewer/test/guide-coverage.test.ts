@@ -1,7 +1,7 @@
 /**
  * The guide, asserted against the code it describes.
  *
- * `client/src/app/help/sheet.test.tsx` already pins the registry's totality
+ * `client/src/shell/help/help.test.tsx` already pins the registry's totality
  * in both directions — a section with no content, or content with no route.
  * What it cannot see is whether the prose still matches the machine, and that is
  * the failure mode that actually happened: the permissions page said an agent
@@ -31,7 +31,7 @@ const guideDir = fileURLToPath(new URL('../client/src/content/guide/', import.me
 const read = (name: string) => readFileSync(`${guideDir}${name}.md`, 'utf8');
 const viewerFile = (rel: string) => readFileSync(fileURLToPath(new URL(`../${rel}`, import.meta.url)), 'utf8');
 
-/** The `## ` headings of a guide body, fences stripped — the cards `app/help/split.ts` cuts. */
+/** The `## ` headings of a guide body, fences stripped — the cards `shell/help/split.ts` cuts. */
 const cards = (body: string): string[] =>
   body
     .replace(/^```[\s\S]*?^```/gm, '')
@@ -113,40 +113,82 @@ test('no guide file, in either language, is outside the section list', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Every 6.0 destination and overlay has a guide body
+ * Every destination, overlay and piece of the 7.0 shell has a guide body
  * ------------------------------------------------------------------ */
 
-/** The rail's labels, read from the one list the rail, the tab bar and the palette all draw. */
+/** The one list the rail, the tab bar and the palette all draw (7.0, quiet-console phase 3). */
+const NAV_FILE = 'client/src/shell/nav.ts';
+
+/** The rail's labels, read from `NAV_FILE` — `id: 'x',` with `label: 'X',` on the next line. */
 const NAV_LABELS: ReadonlyMap<string, string> = new Map(
-  [...viewerFile('client/src/app/shell/nav.ts').matchAll(/id: '([a-z-]+)',(?:\s*\n\s*\/\/[^\n]*)*\s*\n\s*label: '([^']+)'/g)].map(
+  [...viewerFile(NAV_FILE).matchAll(/id: '([a-z-]+)',(?:\s*\n\s*\/\/[^\n]*)*\s*\n\s*label: '([^']+)'/g)].map(
     (m) => [m[1], m[2]] as const,
   ),
 );
 
-test('every destination has its card in Getting around, headed by its rail label', () => {
-  const headings = cards(read('destinations'));
+/**
+ * Getting around, in both languages. A Persian card keeps the English name at the head of its heading
+ * (`## Runs — …`), so one rule reads both files — and a card the Persian reader lacks fails here, by name.
+ */
+const GETTING_AROUND = ['destinations', 'destinations.fa'] as const;
+
+/** Whether a body's cards include one headed `## <name> — …` (or the bare name). */
+const hasCard = (headings: readonly string[], name: string): boolean =>
+  headings.some((h) => h.startsWith(`${name} `) || h === name);
+
+test('every destination has its card in Getting around, headed by its rail label, in both languages', () => {
   for (const id of DESTINATIONS) {
     const label = NAV_LABELS.get(id);
-    assert.ok(label, `no rail label for destination '${id}' in client/src/app/shell/nav.ts`);
-    assert.ok(
-      headings.some((h) => h.startsWith(`${label} `) || h === label),
-      `destinations.md has no card headed "${label} — …" — a page a person can reach is a page the guide explains`,
-    );
+    assert.ok(label, `no rail label for destination '${id}' in ${NAV_FILE}`);
+    for (const file of GETTING_AROUND) {
+      assert.ok(
+        hasCard(cards(read(file)), label),
+        `${file}.md has no card headed "${label} — …" — a page a person can reach is a page the guide explains`,
+      );
+    }
   }
 });
 
-test('every overlay the real-browser tour opens has its card in Getting around', () => {
+test('every overlay the real-browser tour opens has its card in Getting around, in both languages', () => {
   // The tour's own list (`e2e/lib/shots.ts`) — an overlay added to the tour is an overlay a person meets.
   const tour = [...viewerFile('e2e/lib/shots.ts').matchAll(/overlay: '([a-z-]+)'/g)].map((m) => m[1]);
   assert.ok(tour.length >= 3, `expected the tour's overlays, found [${tour}]`);
   const LABEL: Record<string, string> = { palette: 'Palette', help: 'Help', bell: 'Bell' };
-  const headings = cards(read('destinations'));
   const needles = tour.map((o) => {
     assert.ok(LABEL[o], `overlay '${o}' has no guide label here — name it, and give it a card`);
     return LABEL[o];
   });
-  for (const needle of needles) {
-    assert.ok(headings.some((h) => h.startsWith(needle)), `destinations.md has no card for the ${needle} overlay`);
+  for (const file of GETTING_AROUND) {
+    const headings = cards(read(file));
+    for (const needle of needles) {
+      assert.ok(hasCard(headings, needle), `${file}.md has no card for the ${needle} overlay`);
+    }
+  }
+});
+
+test('the shell has its cards in Getting around too — the switcher and the panel, in both languages', () => {
+  // 7.0 (quiet-console phase 3) put two things on every page that are neither a place nor an overlay:
+  // the instance switcher at the top of the rail (`shell/switcher.tsx`, in a phone's header) and the
+  // panel beside the page (`shell/panel/`) — Details in both editions, the Supervisor its second mode in
+  // Pro. A person meets both on the first screen, so each has a card of its own.
+  for (const file of GETTING_AROUND) {
+    const headings = cards(read(file));
+    for (const name of ['Switcher', 'Panel']) {
+      assert.ok(hasCard(headings, name), `${file}.md has no card headed "${name} — …"`);
+    }
+  }
+  // The panel's modes, by the words its segmented control draws (`MODE_LABEL`, `shell/panel/modes.ts`):
+  // a mode the card never names is a mode the guide never explains.
+  const modes = /export const MODE_LABEL[^=]*=\s*\{([\s\S]*?)\n\};/.exec(viewerFile('client/src/shell/panel/modes.ts'));
+  assert.ok(modes, 'shell/panel/modes.ts declares MODE_LABEL');
+  const labels = [...modes[1].matchAll(/^\s+\w+: '([^']+)',$/gm)].map((m) => m[1]);
+  assert.ok(labels.includes('Details'), `the panel's modes read [${labels}] — Details is the one every edition has`);
+  for (const file of GETTING_AROUND) {
+    const body = read(file);
+    const at = body.search(/^## Panel /m);
+    const next = body.indexOf('\n## ', at + 1);
+    const card = body.slice(at, next < 0 ? undefined : next);
+    for (const label of labels) assert.ok(card.includes(`**${label}**`), `${file}.md's Panel card never names the mode **${label}**`);
   }
 });
 
@@ -175,14 +217,14 @@ test('the Your turn guide names the page, its groups, every reason, and the chec
   const text = flat(body);
   assert.ok(body.includes('`#/turn`'), 'your-turn.md names the page by its address');
   for (const label of Object.values(TURN_GROUP_LABEL)) assert.ok(text.includes(label), `your-turn.md names the group "${label}"`);
-  const handled = /handled: '([^']+)'/.exec(viewerFile('client/src/features/turn/page-model.ts'))?.[1];
+  const handled = /handled: '([^']+)'/.exec(viewerFile('client/src/screens/turn/page-model.ts'))?.[1];
   assert.equal(handled, 'Handled by the AI', "the page's sixth section is the handled log");
   assert.ok(text.includes(handled), 'your-turn.md names the handled log');
   for (const why of WHY_PERSON) {
     const label = REASON_META[why].label;
     assert.ok(text.includes(label), `your-turn.md names the reason "${label}" (${why})`);
   }
-  const check = /CHECK_LABEL = "([^"]+)"/.exec(viewerFile('client/src/components/human-step-words.ts'))?.[1];
+  const check = /CHECK_LABEL = "([^"]+)"/.exec(viewerFile('client/src/cards/human-step-words.ts'))?.[1];
   assert.ok(check, 'the check has one label');
   assert.ok(text.includes(check), `your-turn.md names the check as "${check}"`);
   for (const words of ['Back to you', 'Accept anyway', 'Not doing this']) {
@@ -207,8 +249,8 @@ test('the permissions guide says what a grant is — its scopes, its tiers, the 
   const auto = sectionOf(body, 'Auto-grant approvals');
   for (const command of asks) assert.ok(auto.includes(`\`${command}\``), `§Auto-grant approvals names \`${command}\``);
   assert.match(flat(auto), /three publishing asks/, '§Auto-grant approvals counts the publishing asks');
-  // The scopes, by the labels the permission card draws, and the tiers.
-  const card = viewerFile('client/src/features/turn/permission-card.tsx');
+  // The scopes, by the labels the permission card draws (`SCOPE_LABEL`, `screens/turn/grants.tsx` since 7.0), and the tiers.
+  const card = viewerFile('client/src/screens/turn/grants.tsx');
   const grants = flat(sectionOf(body, 'Grants'));
   for (const scope of GRANT_SCOPES) {
     const label = new RegExp(`\\b${scope}: '([^']+)'`).exec(card)?.[1];

@@ -12,8 +12,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { toastMock } = vi.hoisted(() => ({ toastMock: vi.fn() }));
-vi.mock('@/components/ui', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/components/ui')>()),
+// The reporter toasts through the 7.0 kit (quiet-console phase 3): one store,
+// one tray, mounted by the shell.
+vi.mock('@/ui', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/ui')>()),
   toast: toastMock,
 }));
 

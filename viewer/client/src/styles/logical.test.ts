@@ -1,13 +1,14 @@
 /**
  * The logical-properties guard — RTL is a switch away.
  *
- * WHAT IT HOLDS. The kit (`components/ui/**`) and the shell (`app/shell/**`) say
+ * WHAT IT HOLDS. The client's tree (`ui/**`, `cards/**`, `shell/**`, `screens/**`) says
  * every horizontal margin, padding, inset, border, corner radius and alignment
  * in LOGICAL terms — `ms-`/`me-`, `ps-`/`pe-`, `start-`/`end-`, `border-s`/`border-e`,
  * `rounded-s`/`rounded-e` (and `rounded-ss`/`-se`/`-es`/`-ee`), `text-start`/`text-end`,
- * `float-start`/`float-end` — and the four stylesheets (`theme.css`, `console.css`,
- * `prose.css`, `route-map.css`) declare `margin-inline-*`, `padding-inline-*`,
- * `inset-inline-*`, `border-inline-*` and `text-align: start | end`. Never
+ * `float-start`/`float-end` — and the stylesheets (`theme.css`, `console.css`,
+ * `prose.css`, the track's and the route map's own) declare
+ * `margin-inline-*`, `padding-inline-*`, `inset-inline-*`, `border-inline-*`
+ * and `text-align: start | end`. Never
  * `ml-`/`mr-`/`pl-`/`pr-`/`left-`/`right-`/`border-l`/`border-r`/`rounded-l`/
  * `rounded-r`/`text-left`/`text-right`, and never their CSS or inline-style twins.
  *
@@ -38,7 +39,7 @@
  * honest assertion is about what ships.
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -46,9 +47,20 @@ import { describe, expect, it } from 'vitest';
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const SRC = resolve(here('..'));
 
-/** The two trees the phase names. Everything under them, at any depth. */
-const SCOPES = ['components/ui', 'app/shell'];
-const STYLESHEETS = ['theme.css', 'console.css', 'prose.css', 'route-map.css'];
+/**
+ * The client: the kit, the cards, the shell and the screens. Every horizontal
+ * side in them is logical; `KEPT` below holds no entry for them.
+ */
+const TREE = ['ui', 'cards', 'shell', 'screens'];
+const SCOPES = TREE;
+/** Every stylesheet, by its path under `src/` — the three of `styles/`, the track's own and the route map's. */
+const STYLESHEETS = [
+  'styles/theme.css',
+  'styles/console.css',
+  'styles/prose.css',
+  'ui/track/track.css',
+  'screens/plan/map/route-map.css',
+];
 
 /** Shipped source only — a test may NAME a physical utility in order to reject it. */
 function* walk(dir: string): Generator<string> {
@@ -169,7 +181,9 @@ function sourceHits(): { hits: Hit[]; files: string[] } {
   const files: string[] = [];
   const hits: Hit[] = [];
   for (const scope of SCOPES) {
-    for (const path of walk(join(SRC, ...scope.split('/')))) {
+    const root = join(SRC, ...scope.split('/'));
+    if (!existsSync(root)) continue;
+    for (const path of walk(root)) {
       files.push(rel(path));
       hits.push(...hitsIn(rel(path), code(readFileSync(path, 'utf8')), SOURCE_KINDS, true));
     }
@@ -180,9 +194,7 @@ function sourceHits(): { hits: Hit[]; files: string[] } {
 function styleHits(): Hit[] {
   const hits: Hit[] = [];
   for (const name of STYLESHEETS) {
-    hits.push(
-      ...hitsIn(`styles/${name}`, css(readFileSync(join(SRC, 'styles', name), 'utf8')), CSS_KINDS, false),
-    );
+    hits.push(...hitsIn(name, css(readFileSync(join(SRC, name), 'utf8')), CSS_KINDS, false));
   }
   return hits;
 }
@@ -194,36 +206,6 @@ function styleHits(): Hit[] {
  * stale entry.
  */
 const KEPT: readonly { file: string; token: string; count: number; why: string }[] = [
-  {
-    file: 'components/ui/dialog.tsx',
-    token: 'left-1/2',
-    count: 2,
-    why: 'centring pair with -translate-x-1/2 (Dialog and DialogContent): translate has no logical twin, and left:50% with -50% centres in either direction',
-  },
-  {
-    file: 'components/ui/alert-dialog.tsx',
-    token: 'left-1/2',
-    count: 1,
-    why: 'centring pair with -translate-x-1/2, as Dialog',
-  },
-  {
-    file: 'app/shell/tab-bar.tsx',
-    token: 'left-1/2',
-    count: 2,
-    why: 'the active-tab mark: centring pair with -translate-x-1/2, on a tab and on More',
-  },
-  {
-    file: 'components/ui/sheet.tsx',
-    token: 'right-0',
-    count: 1,
-    why: 'SheetSide "right" names a physical edge, and eight call sites pass it by name (help, the bell drawer, the inspector, the chat dock, the QA report …). Flipping it is a rename to "end" across them, not a respelling',
-  },
-  {
-    file: 'components/ui/sheet.tsx',
-    token: 'border-l',
-    count: 1,
-    why: 'the divider of that same "right" sheet — it goes with the edge it faces',
-  },
   {
     file: 'styles/theme.css',
     token: 'left',
@@ -268,15 +250,23 @@ const show = (hits: readonly Hit[]) => hits.map((h) => `${h.file}:${h.line}  ${h
 describe('the kit and the shell spell their sides logically', () => {
   const { hits, files } = sourceHits();
 
-  it('scans the whole of components/ui and app/shell', () => {
+  it('scans the whole of the kit, the cards, the shell and the screens', () => {
     // A guard that finds nothing because it walked nothing is the failure this
-    // pins: the two trees are large, and both must be in the sweep.
-    expect(files.filter((f) => f.startsWith('components/ui/')).length).toBeGreaterThan(50);
-    expect(files.filter((f) => f.startsWith('app/shell/')).length).toBeGreaterThan(8);
-    expect(files).toContain('components/ui/button.tsx');
-    expect(files).toContain('components/ui/status/status-icons.ts');
-    expect(files).toContain('app/shell/layout.tsx');
+    // pins: the trees are large, and every one must be in the sweep.
+    expect(files.filter((f) => f.startsWith('ui/')).length).toBeGreaterThan(30);
+    expect(files).toContain('ui/index.ts');
+    expect(files).toContain('ui/status/dot-word.tsx');
+    expect(files).toContain('ui/track/track.tsx');
+    expect(files.filter((f) => f.startsWith('shell/')).length).toBeGreaterThan(20);
+    expect(files).toContain('shell/layout.tsx');
+    expect(files).toContain('shell/tab-bar.tsx');
+    expect(files.filter((f) => f.startsWith('cards/')).length).toBeGreaterThan(10);
+    expect(files.filter((f) => f.startsWith('screens/')).length).toBeGreaterThan(200);
     expect(files.filter((f) => /\.test\./.test(f))).toEqual([]);
+  });
+
+  it('holds the tree with no allowance at all', () => {
+    expect(KEPT.filter((k) => TREE.some((dir) => k.file.startsWith(`${dir}/`)))).toEqual([]);
   });
 
   it('holds no ml- mr- pl- pr- left- right- border-l/r rounded-l/r text-left/right … outside the allowance', () => {
@@ -312,13 +302,15 @@ describe('the stylesheets declare their sides logically', () => {
     expect(stale, 'strike it from KEPT — the stylesheet no longer carries it').toEqual([]);
   });
 
-  it('reads route-map.css as the logical stylesheet it already is', () => {
-    // It says `inset-inline-*` and `:dir(rtl)` throughout — the guard must read
-    // them as the logical spelling they are, and not trip over the word "left"
-    // in a gradient (`to right`) or a comment about one.
-    const map = css(readFileSync(join(SRC, 'styles', 'route-map.css'), 'utf8'));
-    expect(map).toMatch(/inset-inline-start/);
-    expect(hitsIn('styles/route-map.css', map, CSS_KINDS, false)).toEqual([]);
+  it('reads track.css and the route map’s sheet as the logical stylesheets they are', () => {
+    // They say `inset-inline-*`, `max-inline-size` and `:dir(rtl)` throughout —
+    // the guard must read them as the logical spelling they are, and not trip
+    // over the word "right" in a gradient (`to right`) or a comment about one.
+    for (const name of ['ui/track/track.css', 'screens/plan/map/route-map.css']) {
+      const sheet = css(readFileSync(join(SRC, name), 'utf8'));
+      expect(sheet, name).toMatch(/inset-inline-start|inline-size/);
+      expect(hitsIn(name, sheet, CSS_KINDS, false), name).toEqual([]);
+    }
   });
 });
 

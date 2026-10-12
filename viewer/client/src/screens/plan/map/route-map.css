@@ -1,0 +1,418 @@
+/* ------------------------------------------------------------------ *
+ * The route map — the plan drawn as a transit network
+ *
+ * Imported by `dag.tsx`, so it rides the map's own lazy chunk: a reader who
+ * never opens a map downloads none of it.
+ *
+ * Why CSS and not utilities: an SVG station is a group whose CHILDREN change
+ * appearance on hover, focus and selection of the group (`.route-station:hover
+ * .halo`) — a descendant relationship no utility can say without a variant per
+ * child. The geometry lives in `dag.tsx`; only the paint is here. Inside
+ * `@layer components`, so a utility on an element still wins.
+ *
+ * Every name is a `route-` one or hangs under one: once loaded, this sheet is
+ * global for the rest of the visit, and the kit's line (`ui/track/`) wears
+ * `ui-track`/`ui-station` — `ui/track/track.test.tsx` holds it to none of these.
+ *
+ * ---- One hue, read in one place ----
+ *
+ * A station's class (`.state-done`, `.state-running`, …) sets `--state` once —
+ * theme.css's bridge — and every rule here that paints by state reads
+ * `var(--state)`, so a state added to the vocabulary paints the map with no
+ * edit here. What the map paints that is NOT a station's state names its token
+ * outright, because it describes ink rather than state: the line (`--track`),
+ * the gate's barrier (`--accent`, the one door to amber — a person must lift
+ * it), and the machine's own marks (`--status-running`: a driver, a live
+ * claim, a session batch).
+ *
+ * ---- And nothing reads by hue alone ----
+ *
+ * Every state carries a drawn glyph and a ring treatment (`StationMark` in
+ * `dag.tsx`), so the map survives greyscale and a projector.
+ * ------------------------------------------------------------------ */
+
+@layer components {
+  /* The frame is a fixed window and the SVG's viewBox is what moves inside it,
+     so zooming in brings the map closer rather than making the page longer.
+     Flat, on ONE paper: the drawing carries the structure (the wave ruling
+     below), and one paper is what lets the trunk's casing hide what it
+     crosses. */
+  .route-frame {
+    background: var(--ground-deep);
+    overflow: hidden;
+    /* The visible viewport: `--app-height` is the token the shell corrects for
+       the iOS software keyboard, which `dvh` ignores. */
+    block-size: clamp(300px, calc(var(--app-height) * 0.56), 640px);
+    /* Locked (the resting state), the map is a picture: every gesture is the
+       page's, because the wheel listener is not attached (`useMapView`) and
+       pointers are ignored. Stations stay tappable. */
+    cursor: default;
+    touch-action: auto;
+  }
+  .route-frame[data-interactive] {
+    cursor: grab;
+    /* `pan-y`, never `none`: on a phone the map is half the screen, and `none`
+       would take every swipe that starts on it, so the page could not be
+       scrolled past. A sideways drag and a pinch's second finger still reach
+       the map. No `overscroll-behavior: contain` either: on a box that never
+       scrolls it cuts the swipe `pan-y` hands back to the page
+       (`e2e/route-map.spec.ts`). The wheel is the map's by `preventDefault`. */
+    touch-action: pan-y;
+  }
+  .route-frame[data-interactive]:active { cursor: grabbing; }
+
+  .route-svg { display: block; user-select: none; width: 100%; height: 100%; }
+
+  /* The station's target, sized in plan units by `dag.tsx` so it lands at 44 CSS
+     px at any zoom. `transparent` and not `none`: `fill: none` takes no pointer,
+     which is the difference between a hit area and a decoration. */
+  .route-station-hit { fill: transparent; }
+
+  /* ---------------------------------------------------------------- *
+   * Platforms — the board, ruled
+   *
+   * The engine lays a phase out by its LONGEST-PATH DEPTH: the earliest wave it
+   * could run in. So the columns are ruled by a hairline and headed by their
+   * wave — the way a departures board is ruled — never filled: a stripe is a
+   * table's device, and a second paper would break the trunk's casing.
+   *
+   * Two rules this layer must never break:
+   *   - `pointer-events: none` on the whole group. The ruling spans the frame;
+   *     if it took a pointer it would take every one meant for a station.
+   *   - It paints in GROUND and RULE tones, never a status hue. This is the
+   *     paper; the vocabulary belongs to the marks.
+   * ---------------------------------------------------------------- */
+
+  .platforms { pointer-events: none; }
+
+  .platform-rule { stroke: var(--rule); stroke-width: 1; }
+
+  /* The meta size, in `--ink-muted`: the ruling stays quiet because a hairline
+     and two small words ARE quiet, never by under-inking them. */
+  .platform-label {
+    font-family: var(--font-sans);
+    font-size: var(--text-meta);
+    font-weight: 600;
+    fill: var(--ink-muted);
+  }
+  /* How many phases stand on the platform. A figure, so the sans with tabular
+     numerals; told from the heading by weight and place, never by being
+     lighter. */
+  .platform-count {
+    font-family: var(--font-sans);
+    font-size: var(--text-meta);
+    font-variant-numeric: tabular-nums;
+    fill: var(--ink-muted);
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Track
+   * ---------------------------------------------------------------- */
+
+  .route-track {
+    fill: none;
+    stroke: var(--track);
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    /* Direction, drawn: an arrowhead is a convention a reader already has,
+       and left-to-right is one they would have to be told. */
+    marker-end: url(#route-track-arrow);
+    transition: opacity var(--duration-fast) var(--ease-transit),
+                stroke var(--duration-fast) var(--ease-transit);
+    /* `pathLength="100"` on every path (`dag.tsx`) normalises the geometry, so
+       one dash length draws every edge in exactly, short or long. */
+    stroke-dasharray: 100;
+    stroke-dashoffset: 0;
+    animation: draw-track var(--duration-draw) var(--ease-transit) backwards;
+    /* `--i` is the column, capped by `dag.tsx`, so a deep plan is never left
+       half-drawn for long. */
+    animation-delay: calc(var(--i, 0) * 70ms);
+  }
+  .route-track-done { stroke: color-mix(in oklab, var(--state) 65%, var(--track)); }
+  /* The longest remaining chain: every day it slips, the plan slips. Thicker,
+     and in the action ink. */
+  .route-track-critical {
+    stroke: color-mix(in oklab, var(--action) 70%, var(--track));
+    stroke-width: 4.5;
+    marker-end: url(#route-track-arrow-critical);
+  }
+
+  /**
+   * The casing — what makes the trunk a LINE rather than a thicker edge.
+   *
+   * A transit map draws its lines with a casing: a wider stroke in the paper's
+   * own colour laid under the colour, so where two lines cross one visibly
+   * passes OVER the other. Without it a junction is a blot the eye cannot
+   * follow a line through.
+   *
+   * SVG paints in document order, so `dag.tsx` draws the ordinary edges first
+   * and the trunk LAST, in a `.trunk` group whose children are every casing and
+   * then every line: the trunk passes over what it crosses, and each casing sits
+   * under its own line. The stroke is THE PAPER — `.route-frame`'s background,
+   * which `dag.test.tsx` pins it to: any other tone paints a channel along the
+   * trunk instead of hiding what it covers.
+   */
+  .route-track-casing {
+    fill: none;
+    stroke: var(--ground-deep);
+    stroke-width: 9;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    /* Drawn in with its own line, on the same stagger: a casing that arrived
+       first would flash a blank channel across the map. */
+    stroke-dasharray: 100;
+    animation: draw-track var(--duration-draw) var(--ease-transit) backwards;
+    animation-delay: calc(var(--i, 0) * 70ms);
+  }
+  .route-track-casing.dim { opacity: 0.25; }
+  .route-track.dim { opacity: 0.25; }
+
+  /* The arrowhead has no dash to hide behind, so it fades in with its edge
+     instead of hovering over paper for the length of the stagger. */
+  @keyframes draw-track {
+    from { stroke-dashoffset: 100; opacity: 0; }
+    12% { opacity: 1; }
+    to { stroke-dashoffset: 0; }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The station mark
+   * ---------------------------------------------------------------- */
+
+  .route-station { cursor: pointer; }
+
+  .route-mark .dot {
+    fill: var(--surface);
+    stroke: var(--state, var(--track));
+    stroke-width: 3;
+    transition: transform var(--duration-fast) var(--ease-transit);
+  }
+  /* Departed: filled solid, and quieter than everything still to come. */
+  .route-mark.state-done .dot { fill: var(--state); stroke: var(--state); }
+  .route-station.state-done { opacity: 0.82; }
+  .route-mark.state-running .dot { fill: color-mix(in oklab, var(--state) 30%, var(--surface)); }
+  .route-mark.state-queued .dot { stroke-width: 4.5; }
+  .route-mark.state-needs-you .dot {
+    fill: color-mix(in oklab, var(--state) 25%, var(--surface));
+    stroke-width: 4.5;
+  }
+  .route-mark.state-waiting .dot { stroke-dasharray: 3 3; opacity: 0.85; }
+
+  /* The emphasis ring, drawn for the two states that are not merely a position
+     in a queue: running is happening, needs-you is stopped on a person. Dashed
+     for the one that is moving, solid and heavy for the one that is not. */
+  .route-mark .state-ring { fill: none; stroke: var(--state); stroke-width: 2; }
+  .route-mark.state-running .state-ring { stroke-dasharray: 6 5; opacity: 0.8; }
+  /* Verifying is running's family, told apart by its line: the same ring, cut
+     short and close — a check being read, not a lap being run. It never
+     pulses; only a live running station does. The plan page joins it from the
+     run's own record (`verifyingPhases` in `map-view.tsx`). */
+  .route-mark.state-verifying .dot { fill: color-mix(in oklab, var(--state) 22%, var(--surface)); }
+  .route-mark.state-verifying .state-ring { stroke-dasharray: 2 3; }
+  /* The summons: solid, heavy, and the one amber on the map. */
+  .route-mark.state-needs-you .state-ring { stroke-width: 2.6; }
+
+  /* The chip: a glyph on its own disc, so it reads over track, hatch and the
+     station's own fill without needing any of them to move. */
+  .mark-chip .chip-disc {
+    fill: var(--surface);
+    stroke: var(--state, var(--track));
+    stroke-width: 1.4;
+  }
+  .mark-glyph {
+    fill: none;
+    stroke: var(--state, var(--ink));
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .mark-glyph.filled { fill: var(--state, var(--ink)); stroke: none; }
+
+  /* A gate is a barrier across the track that a person must lift: amber,
+     through `--accent`. The hatched disc (its pattern is drawn in `dag.tsx`)
+     says it at a glance and the boom-bar chip says it without the key. */
+  .gate-chip .chip-disc { stroke: var(--accent); }
+  .gate-chip .mark-glyph { stroke: var(--accent); }
+
+  /* Who is driving, over an OBSERVED live fact — the sessions page's own icon
+     for the same vehicle, in the running hue. */
+  .actor-chip { color: var(--status-running); }
+  .actor-chip .chip-disc { stroke: var(--status-running); }
+
+  /**
+   * A claimed station wears a cordon.
+   *
+   * Deliberately not the gate's hatched disc: a gate is a barrier across the
+   * track that a person must lift, a claim is somebody already standing on the
+   * platform. Dashed because a claim is temporary — it holds for a lease. Drawn
+   * only where there is NO live process to draw instead: a driver chip is the
+   * stronger fact.
+   */
+  .route-mark .claim-ring {
+    fill: none;
+    stroke-width: 1.5;
+    stroke-dasharray: 2 3.5;
+    stroke-linecap: round;
+  }
+  .route-mark .claim-ring.live { stroke: var(--status-running); }
+  .route-mark .claim-ring.stale { stroke: var(--action); opacity: 0.75; }
+
+  /* The halo, outermost: the station's own hue for a hover and for the station
+     the map is ringing; the focus ring's ink for the keyboard, because a
+     focused station is not a summons, whatever state it is in. */
+  .route-station .halo { fill: none; stroke: transparent; stroke-width: 2; }
+  .route-station:hover .halo,
+  .route-station.selected .halo { stroke: color-mix(in oklab, var(--state, var(--ink)) 55%, transparent); }
+  .route-station.selected .halo { stroke-width: 3; }
+  .route-station:focus-visible .halo { stroke: var(--focus); stroke-width: 2.5; }
+  .route-station.dim { opacity: 0.32; }
+  /* The halo is the focus mark: the browser's own outline would trace the
+     bounding box of a two-line label rather than the station. */
+  .route-station:focus-visible { outline: none; }
+
+  .route-station-number {
+    font-family: var(--font-sans);
+    font-size: var(--text-meta);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    fill: var(--ink);
+    pointer-events: none;
+  }
+  /* A departed station is filled solid with its own hue, so its number inverts
+     — against the darkest form of that hue in either light. */
+  .route-station.state-done .route-station-number {
+    fill: color-mix(in oklab, var(--state) 18%, light-dark(white, black));
+  }
+
+  .route-station-label {
+    font-family: var(--font-sans);
+    font-size: var(--text-meta);
+    fill: var(--ink-muted);
+    pointer-events: none;
+    /* A halo in the paper's own colour keeps a name readable where track
+       passes behind it, and is invisible everywhere else. */
+    stroke: var(--ground-deep);
+    stroke-width: 3px;
+    paint-order: stroke fill;
+  }
+  /* `queued` is the paint a board `ready` wears: what is next up reads first. */
+  .route-station.state-queued .route-station-label { fill: var(--ink); font-weight: 600; }
+
+  /* THE one continuing motion, and only over a live fact: `.live` is set from
+     `PhaseLive` — something observed working the phase. `in-progress` alone is
+     a word out of a markdown file, and a word must not breathe. */
+  .route-station.state-running.live .dot {
+    animation: pulse-soft 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* Stated beside the animations it stops, as well as by theme.css's blanket:
+     a map that draws itself in and breathes over a live phase is exactly what
+     "reduce" means. */
+  @media (prefers-reduced-motion: reduce) {
+    .route-track,
+    .route-track-casing,
+    .route-station.state-running.live .dot {
+      animation: none;
+    }
+    .route-mark .dot,
+    .route-track { transition: none; }
+  }
+
+  /* A train: the stations one session carries, threaded rather than boxed. */
+  .train-line {
+    fill: none;
+    stroke: color-mix(in oklab, var(--status-running) 55%, transparent);
+    stroke-width: 8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.22;
+  }
+  .train-ring {
+    fill: none;
+    stroke: color-mix(in oklab, var(--status-running) 45%, transparent);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 4;
+  }
+  .band-label {
+    font-family: var(--font-sans);
+    font-size: var(--text-meta);
+    font-variant-numeric: tabular-nums;
+    fill: color-mix(in oklab, var(--status-running) 75%, var(--ink-faint));
+    stroke: var(--ground-deep);
+    stroke-width: 3px;
+    paint-order: stroke fill;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The minimap — the whole of a crowded plan, under the frame
+   *
+   * On the map's own paper, so it reads as the same drawing seen from further
+   * away. Its stations paint through `.state-*` like every mark above; the
+   * window is ink, because where you are is not a state. Strokes keep their
+   * pixel width however small the plan is drawn.
+   * ---------------------------------------------------------------- */
+  .route-minimap {
+    display: block;
+    flex: none;
+    max-inline-size: 70%;
+    block-size: auto;
+    background: var(--ground-deep);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    /* A vertical swipe that starts on the strip is the page's, as on the map. */
+    touch-action: pan-y;
+  }
+  .minimap-track {
+    fill: none;
+    stroke: var(--track);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+    opacity: 0.55;
+  }
+  .minimap-dots { fill: var(--state, var(--track)); }
+  .minimap-view {
+    fill: color-mix(in oklab, var(--ink) 7%, transparent);
+    stroke: var(--ink);
+    stroke-width: 1.5;
+    vector-effect: non-scaling-stroke;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The key
+   *
+   * It draws the REAL mark, at the map's own radius scaled by its viewBox, so
+   * the key can never teach a language the map does not speak.
+   * ---------------------------------------------------------------- */
+  .legend-mark { display: inline-block; flex: none; vertical-align: middle; overflow: visible; }
+  .legend-line {
+    display: inline-block;
+    inline-size: 18px;
+    block-size: 3px;
+    border-radius: 2px;
+    background: var(--track);
+  }
+  .legend-line.critical {
+    block-size: 4px;
+    background: color-mix(in oklab, var(--action) 70%, var(--track));
+  }
+  .legend-line.train {
+    block-size: 6px;
+    background: color-mix(in oklab, var(--status-running) 55%, transparent);
+  }
+  /* The ruling, as the map draws it: a hairline standing between two halves of
+     the map's own paper — the rule is what separates two waves, so it is never
+     drawn on the swatch's edge, where it would read as a border. */
+  .legend-band {
+    display: inline-block;
+    inline-size: 18px;
+    block-size: 12px;
+    background: linear-gradient(
+      to right,
+      var(--ground-deep) calc(50% - 0.5px),
+      var(--rule) calc(50% - 0.5px),
+      var(--rule) calc(50% + 0.5px),
+      var(--ground-deep) calc(50% + 0.5px)
+    );
+  }
+}

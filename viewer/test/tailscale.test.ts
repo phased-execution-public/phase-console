@@ -405,7 +405,7 @@ test('the whole table is read — every handler, whatever it points at — and o
 });
 
 test('httpsPortFor: 443 for the default console port, 4000 + the port for every other', () => {
-  // The same rows `client/src/features/settings/tailscale.test.tsx` pins on the
+  // The same rows `client/src/screens/settings/reach.test.tsx` pins on the
   // card's import-free fallback copy — one behaviour, held from both sides.
   assert.equal(httpsPortFor(4123), 443);
   assert.equal(httpsPortFor(4130), 8130);

@@ -11,22 +11,22 @@
   "display_override": ["standalone", "minimal-ui"],
   "launch_handler": { "client_mode": "focus-existing" },
   "orientation": "any",
-  "background_color": "#0e1b22",
-  "theme_color": "#0e1b22",
+  "background_color": "#0c1316",
+  "theme_color": "#0c1316",
   "categories": ["productivity", "developer"],
   "shortcuts": [
     {
-      "name": "Now",
-      "short_name": "Now",
-      "description": "What needs you, what is running and what is next",
-      "url": "/#/now",
+      "name": "Runs",
+      "short_name": "Runs",
+      "description": "What needs you, what is running and what is next, and every run there has been",
+      "url": "/#/runs",
       "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
     },
     {
-      "name": "Runs",
-      "short_name": "Runs",
-      "description": "Every run, its status and what it has spent",
-      "url": "/#/runs",
+      "name": "Your turn",
+      "short_name": "Your turn",
+      "description": "Every act only you can do, each with its guide and its check",
+      "url": "/#/turn",
       "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
     },
     {

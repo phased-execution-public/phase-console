@@ -1,6 +1,6 @@
 ## One switch per category
 
-**Settings ▸ Notifications ▸ What is announced, and where it goes** has a switch per kind — and, under each one, the line saying which legs it actually reaches. It is not a push
+**Settings ▸ Notifications ▸ What is announced** has a switch per kind — and, under each one, the line saying which legs it actually reaches, such as *Goes to the inbox, this device and 2 of 3 webhooks.* It is not a push
 setting. Turning a category off means that category produces:
 
 - no record in the inbox,
@@ -92,21 +92,20 @@ interrupt a focus mode and buzz a wrist.
 
 ## Turning off the usage-limit alerts
 
-If the account meters are announcing more than you want to hear, there are two places with the same
-switch, and either one silences every leg:
+If the account meters are announcing more than you want to hear, one switch silences every leg:
+**Usage limits**, under Settings ▸ Notifications ▸ What is announced, where every other category lives
+too. Two doors lead there:
 
-- **The usage meter** — open it from the rail (or the top bar on a phone) and use **Usage alerts**
-  at the bottom.
-- **Settings ▸ Accounts ▸ Claude accounts** — the same control, under the meters.
-- **Settings ▸ Notifications ▸ Usage limits** — the full list, where every other
-  category lives too.
+- **The usage meter** at the foot of the rail (on a phone, **Usage limits** in **More**) opens
+  Settings ▸ Accounts.
+- Settings ▸ Accounts ends its **Every account** list with **Turn usage alerts off in Notifications**.
 
 The meters keep updating either way; only the announcements stop. Be aware of what goes quiet with
 them: the **Usage limits** category carries **a run that parked waiting for a window to reopen**,
 **an account that could not sign in — including a login that expired and needs signing in again**,
 and **a run refused before it started** because the account was already at its limit. If a run seems
 to have gone silent after you mute these, that is where to look. The *window is filling up* early
-warning is its own category — **Usage climbing**, off unless you turn it on.
+warning is its own category — **Usage climbing**, on unless you turn it off.
 
 ## Devices only ever narrow
 
@@ -122,7 +121,9 @@ Setting push up on a phone is its own walk-through: **Mobile setup**.
 
 ## Quiet hours, reminders and the lock screen
 
-**There is one quiet-hours setting: each device's own**, in **Settings ▸ Notifications ▸ Devices**.
+**There is one quiet-hours setting: each device's own**, in Settings ▸ Notifications ▸ **Devices**,
+under each device's **What it hears, and when it is quiet**: **Quiet hours**, **From**, **Until** and
+**Urgent still gets through**.
 Inside a device's window nothing is pushed to it — the inbox still gets every record — and the urgent
 kinds still get through unless you untick that. The **reminders** of a person's turn obey the same
 windows: a reminder that falls due while every device that would hear it is quiet waits for the first
@@ -150,8 +151,8 @@ Settings ▸ Permissions at that grant, where it can be revoked.
 
 ## The inbox, and getting it back to zero
 
-Every announcement that survives the switches lands on **Notifications**. A record knows what it is
-about — a plan, a run, a phase, a session — so it routes to the thing rather than to a list.
+Every announcement that survives the switches lands in the bell's **Announcements** (`#/notifications`
+opens it there). A record knows what it is about — a plan, a run, a phase, a session — so it routes to the thing rather than to a list.
 
 - **Reading a page reads its notifications.** Sitting on a plan or session page for a moment marks
   that page's records read, scoped to that page. The count falls because you actually looked.
@@ -160,9 +161,9 @@ about — a plan, a run, a phase, a session — so it routes to the thing rather
 - Nothing is deleted by either. The record stays; only its unread state changes.
 
 > If announcements arrive in the inbox and never anywhere else, `PHASE_CONSOLE_NOTIFY` is unset and
-> no device is subscribed — the Notifications page says so at the top rather than leaving you to
-> conclude it. Each record says it too: a delivery that found no device reads `no-device` rather than
-> nothing, and a console with no way to reach you at all raises that as a problem with its delivery,
+> no device is subscribed — **Announcements** opens with *Nothing can reach you out of band yet.* rather
+> than leaving you to conclude it. Each record says it too: a delivery that found no device reads *no
+> device* rather than nothing, and a console with no way to reach you at all raises that as a problem with its delivery,
 > naming the category that reached nobody.
 
 Every push carries the name of the console that sent it, after its title.

@@ -3,8 +3,9 @@
 Most tool calls are answered without troubling you. A few are not.
 
 When a session reaches something on the ask list — a commit, a migration, an install — it pauses and
-a card appears on the Autopilot tab and in **Runs**. The card carries the working tree, the diff, the
-verification so far and the exact command, so you are answering a question rather than a prompt.
+an item appears: a row under **Waiting on you** on the run's page, a line in the **Your turn** group on
+Runs, and its whole card on **Your turn**. The card says what is needed and how, with the exact command
+and the rule it met, so you are answering a question rather than a prompt.
 
 Nobody answers within **about an hour** and the call is denied, with the reason passed back to the
 session so it can adapt or stop rather than hang — and the reason is specific: *nobody answered in
@@ -31,7 +32,8 @@ Plans write verification as prose with commands embedded. `… -m "not slow"` is
 fragment; "targeted pytest + safe set" names two suites in English and no command at all.
 
 The runner executes only what is recognisably a command and demonstrably read-only, and **reports
-every fragment it left behind** against the phase on the Autopilot tab. Those are yours to check. On
+every fragment it left behind** against the phase: its row's details say *N steps a person must
+check*. Those are yours to check. On
 the careful autonomy an incomplete verification stops the run instead of calling it green.
 
 The classifier is **segment-aware**: a `cd …`, an environment prefix or a wrapper does not hide what
@@ -47,18 +49,22 @@ verb that matches what is actually missing.
 
 | Verb | Use it when |
 |---|---|
-| **Recheck** | The work looks done. Re-runs verification, lint and the board without spawning anything. |
-| **Closeout** | The work is done but the phase never closed itself out — one continuation session that commits, writes the handoff and updates the board. |
-| **Resume phase** | The session stopped mid-thought. Continues it with `--resume`, optionally with an instruction. |
-| **Retry** | Start the phase again from scratch. The right answer when the attempt was wrong, not merely incomplete. |
+| **Re-check** | The work looks done. Re-runs verification, lint and the board without spawning anything. |
+| **Finish in its own session** | The work is done but the phase never closed itself out — one continuation session that commits, writes the handoff and updates the board. |
+| **Resume with an instruction** | The session stopped mid-thought. Continues it with `--resume`, with what you type. |
+| **Retry from scratch** | Start the phase again from scratch. The right answer when the attempt was wrong, not merely incomplete. |
 | **Retry with edits…** | The same retry, carrying an instruction and settings for **that attempt only**. |
 | **Skip** | Mark it not-to-be-run. Deliberate, and recorded as such. |
 
-**Recheck**, **Closeout** and **Resume phase** are recoveries, and a phase's recoveries are held to a
+The verbs that need a person less — **Delegate to the session**, **Done — continue**, and the agent
+verbs such as **Fix with a new agent** — fold under **More ways forward**.
+
+**Re-check**, **Finish in its own session** and **Resume with an instruction** are recoveries, and a
+phase's recoveries are held to a
 ledger. Pressed again over the evidence the last one already ran under — the board, the handoff, the
 locks and the gate reading exactly as they did — a recovery is refused as *nothing has changed*,
 because running it again would only rewrite the same halt; and a phase recovered six times in one run
-is refused until **Retry** starts it over, which clears the count. Both refusals are journalled
+is refused until **Retry from scratch** starts it over, which clears the count. Both refusals are journalled
 (`run.recover.refused`).
 
 ### Retrying with edits
@@ -68,8 +74,9 @@ simply unlucky and wrong when you have just read the failure and know something 
 Until now the only ways to say so were to edit the plan — a versioned file — or the run's per-phase
 settings, which would then govern every later attempt too.
 
-**Retry with edits…** opens a box beside the button. Type what this attempt should do differently and,
-if it matters, pick a different model or effort. Then:
+**Retry with edits…** opens **What this attempt should do differently** beside the button. Type it and,
+if it matters, pick a different **Model** or **Effort** (each reads *unchanged* until you pick), then
+press **Retry with these**. Then:
 
 - The instruction is appended to the boot prompt **after the failure evidence**, framed as the
   operator's words for this attempt — so the session reads what went wrong and then what you want done
@@ -81,23 +88,25 @@ if it matters, pick a different model or effort. Then:
 - The override is journalled as `phase.retry-override` before it is spent, so *why did phase 7 run on
   Opus that once* stays answerable from the journal alone.
 
-Pressing **Retry with edits…** and typing nothing does nothing — that is what plain Retry is for.
+**Retry with these** stays dim until something is set — an attempt with nothing new is what **Retry from
+scratch** is for.
 
-Each phase row opens on a **diagnosis**: what the board says, what verification actually returned,
+Each phase row opens onto its details, and **Why is this not done?** there gives the **diagnosis**: what
+the board says, what verification actually returned,
 whether a session is resumable, what is uncommitted, and who holds the lock. A phase that is not done
 always offers a way forward.
 
 ## Every warning carries its remedy
 
-A page that lists problems and offers nothing is a page you stop reading. Each card in the Tower's
-**Needs you** bay carries the verb that answers it, and each verb works out what it needs rather
+A page that lists problems and offers nothing is a page you stop reading. Each row under **Needs you**
+in the bell's **Inbox** carries the verb that answers it, and each verb works out what it needs rather
 than asking you to retype it.
 
 | The card | The verb beside it |
 |---|---|
 | A halted or interrupted run | **Continue**, **Dismiss**, or an AI recovery — and if the phases it stopped for have since gone green, it is resolved for you before you get there. |
-| A stale claim | **Release** — one, or all at once. The owner is read off the lock file, so there is nothing to type. A lease that is still live is refused rather than stolen. |
-| Unread notifications | **Mark all read**. |
+| A stale claim | **Release the lock** — one, or all at once. The owner is read off the lock file, so there is nothing to type. A lease that is still live is refused rather than stolen. |
+| Unread announcements | **Mark all read**, on **Announcements**. |
 | A plan that will not parse | The actual issues, each a link to the line, and **Repair the plan with a new agent**. |
 
 The inbox also shows what the console did **without** asking. A **Policy answered** row has nothing to
@@ -108,8 +117,9 @@ button per option and its window ticking down — *N s to answer*, then *answeri
 
 ## A resolved run is annotated, never deleted
 
-It keeps its status, its halt reason and its place on the Runs page — you can see what happened and
-why it no longer demands anything, and undoing that is a click.
+It keeps its status, its halt reason and its place on Runs — you can see what happened and why it no
+longer demands anything — and undoing it is a click: **All runs** offers **Resolve** and **Put the card
+back** in the row's details.
 
 What you overrode by hand is remembered as an override, so the next read does not quietly re-derive
 it and make the button look broken.
@@ -138,8 +148,8 @@ Each situation has a **ladder** of rungs, climbed in order and never the same ru
 phase: its own session resumed first (cheap — the context is intact), a fresh briefed session next,
 an account or model switch at a wall, one bounded unblock session on a declared blocker, a takeover
 of a stale claim. The ladder is bounded in **rungs and dollars** — per phase, per run, per day —
-and every cap is a knob on Settings ▸ Automation's ladder card. Every **Ways forward** shows the
-situation, the rungs tried with how each ended, and the rung it tries next, so what you press is
+and every cap is a knob under **The ladder** in Settings ▸ Automation. The run's fold **Ways forward**
+shows the situation, the rungs tried with how each ended, and the rung it tries next, so what you press is
 never something the machine already tried.
 
 **Every rung names who drives it**: the console itself, the console only under `--allow-writes`, a
@@ -168,9 +178,9 @@ journalled on the run it would have started (`run.start-refused`) and announced 
 person's Start, Retry or Continue is never refused by it.
 
 When every rung is spent, or the situation was yours from the start, the phase is parked with
-**one errand**: what is needed, how to give it, what was already tried. That card is the only thing
-the Tower's **Needs you** bay shows besides permission cards and sign-ins — a halted run with no
-errand is the loop's to climb, not yours to stare at. Do the errand, then press **Recover &
+**one errand**: what is needed, how to give it, what was already tried. That errand is what reaches
+**Your turn**, beside permission items and sign-ins — a halted run with no errand is the loop's to
+climb, not yours to stare at. Do the errand, then press **Recover &
 continue**: the board is re-read, what the errand settled stands down, and the run carries on.
 
 ## It keeps looking — convergence
@@ -180,9 +190,9 @@ change, every few minutes (the sweep), a minute after any stop, and on *Recover 
 the records the board has overtaken, classifies what is still open, climbs the ladder for runs the
 system stopped (never one you paused or stopped, never a resolved one), releases lock debris left
 by dead runs and ended sessions, and resumes the lanes a console restart killed. Each pass is one
-journal line on the run and one line on the Pulse's **Converge** row — "re-boarded P12 (Never
-started → Re-board fresh) · released a stale claim on P3" — so what it did is readable after the
-fact. `--no-converge` keeps the automatic passes off; a console without `--allow-run` never
+journal line on the run — "re-boarded P12 (Never started → Re-board fresh) · released a stale claim
+on P3" — so what it did is readable after the fact, and an empty **Your turn** group on Runs says when
+the loop looks next. `--no-converge` keeps the automatic passes off; a console without `--allow-run` never
 converges by itself. The convergence LOOP never dispatches a reviewer; the ladder does, as a rung
 inside a run — `qa-pending` and `qa-failed` each resume the phase's own session and ask it to dispatch
 the fresh-context subagent and record the verdict.
@@ -191,7 +201,8 @@ the fresh-context subagent and record the verdict.
 
 Install the **session-presence hook** (Settings ▸ Automation ▸ Session presence, or `phase-console
 install-hooks`) and every Claude session on this machine whose directory a console owns reports
-itself: a hand-run `claude` appears on the Pulse as a lane of its own kind, its phase lock names its
+itself: a hand-run `claude` appears on **Sessions**, under **Other sessions on this machine**, its phase
+lock names its
 session, and the lock is a queue to wait in while the session lives and **debris the moment it
 ends** — released without waiting for the lease. Presence is three-valued: live, ended, unknown;
 nothing is ever released on a guess. A hand session's `phase-outcome.sh` declarations reach the

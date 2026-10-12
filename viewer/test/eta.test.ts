@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
 import {
-  estimateEta, estimateMs, etaFrom, etaSamples, fitShape, heuristicPhaseMs, phaseEtaFor, rateFor,
+  estimateEta, estimateMs, etaFrom, etaSamples, fitShape, heuristicPhaseMs, phaseEtaFor, portfolio, rateFor,
   ETA_MIN_EVIDENCE_MS, HEURISTIC_FLOOR_MS, HEURISTIC_RATE_PER_WEIGHT, HEURISTIC_SLOPE_MS_PER_WEIGHT,
   type EtaSample,
 } from '../server/analysis/stats.ts';
@@ -129,6 +129,17 @@ test("this plan's own phases set the level, however big the pool", () => {
   assert.equal(rate.basis, 'plan');
   assert.equal(rate.samples, 3);
   assert.ok(estimateMs(rate, M) > 100 * MIN, 'the plan runs three times the pool, and the estimate says so');
+});
+
+// quiet-console phase 19: Insights says "an M phase takes about N" — the
+// portfolio carries that figure from the same `estimateMs` every phase, run
+// and lane ETA uses, so the page never multiplies a rate by a weight itself.
+test('the portfolio says what one M phase takes, by the estimate every ETA is drawn from', () => {
+  const rate = rateFor([], [sample('M', 40), sample('M', 44, 1), sample('M', 38, 2)]);
+  const view = portfolio([], SIZING, rate);
+  assert.equal(view.rate?.mediumMs, Math.round(estimateMs(rate, M)));
+  assert.equal(view.rate?.basis, 'portfolio', 'the reading itself is carried whole beside it');
+  assert.equal(portfolio([], SIZING).rate, undefined, 'no reading, no figure');
 });
 
 test('with nothing of its own a plan borrows the pool, and says so', () => {

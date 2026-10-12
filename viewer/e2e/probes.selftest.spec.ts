@@ -209,10 +209,9 @@ test.describe('the probes see the real console', () => {
     await page.emulateMedia({ colorScheme: 'light' });
     await still(page);
     await page.emulateMedia({ colorScheme: 'dark' });
-    await still(page);
-    const running = await page.evaluate(
-      () => document.getAnimations().filter((a) => a.playState === 'running' || a.pending).length,
-    );
-    expect(running).toBe(0);
+    // What `still()` itself found on its last frame: a count read in a second
+    // evaluate raced the live page (a row re-rendered a moment later started its
+    // own transitions — one run in ten), which says nothing about the switch.
+    expect(await still(page)).toBe(0);
   });
 });

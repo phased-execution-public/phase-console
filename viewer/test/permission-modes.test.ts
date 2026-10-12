@@ -43,14 +43,14 @@ import {
 } from '../shared/run-settings.js';
 
 const MODES_SRC = readFileSync(
-  fileURLToPath(new URL('../client/src/features/run-setup/modes.ts', import.meta.url)),
+  fileURLToPath(new URL('../client/src/screens/launch/model/modes.ts', import.meta.url)),
   'utf8',
 );
 
 /** The keys of a `export const NAME: … = Object.freeze({ … })` record. */
 function recordKeys(name: string): string[] {
   const at = MODES_SRC.indexOf(`export const ${name}`);
-  assert.notEqual(at, -1, `${name} is declared in run-setup/modes.ts`);
+  assert.notEqual(at, -1, `${name} is declared in launch/model/modes.ts`);
   const body = MODES_SRC.slice(at, MODES_SRC.indexOf('});', at));
   return [...body.matchAll(/^ {2}([A-Za-z][\w]*):/gm)].map(([, key]) => key);
 }

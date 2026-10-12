@@ -17,7 +17,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   bytes,
   clockWords,
@@ -31,9 +31,10 @@ import {
   holderEtaText,
   homePath,
   plural,
+  relativeTime,
 } from './format';
 import { formatInterval } from '../../../shared/interval-format.js';
-import type { EtaEstimate } from './api';
+import type { EtaEstimate } from '@/data/api';
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
@@ -198,6 +199,53 @@ describe('elapsedWords', () => {
   });
 });
 
+describe('relativeTime — a moment, from now, either way (quiet-console phase 27)', () => {
+  const NOW = Date.UTC(2026, 9, 12, 12);
+  const DAY = 24 * HOUR;
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  const at = (offset: number) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+    return relativeTime(NOW + offset);
+  };
+
+  it('reads a moment past as how long ago', () => {
+    expect(at(-5 * MIN)).toBe('5 minutes ago');
+    expect(at(-MIN)).toBe('1 minute ago');
+    expect(at(-3 * HOUR)).toBe('3 hours ago');
+    expect(at(-2 * DAY)).toBe('2 days ago');
+  });
+
+  it('reads a moment ahead as how long until — never "just now" (a lease’s end, a reset, a start)', () => {
+    expect(at(5 * MIN)).toBe('in 5 minutes');
+    expect(at(MIN)).toBe('in 1 minute');
+    expect(at(3 * HOUR)).toBe('in 3 hours');
+    expect(at(2 * DAY)).toBe('in 2 days');
+    expect(at(3 * 7 * DAY)).toBe('in 3 weeks');
+  });
+
+  it('words the same distance the same way on either side of now', () => {
+    for (const distance of [MIN, 5 * MIN, 59 * MIN, 3 * HOUR, 2 * DAY, 3 * 7 * DAY, 60 * DAY, 800 * DAY]) {
+      const past = at(-distance);
+      expect(past).toMatch(/ ago$/);
+      expect(at(distance)).toBe(`in ${past.replace(/ ago$/, '')}`);
+    }
+  });
+
+  it('keeps "just now" for under a minute, and only that, on both sides', () => {
+    for (const offset of [0, 1, -1, 30_000, -30_000, 59_999, -59_999]) expect(at(offset)).toBe('just now');
+    expect(at(60_000)).toBe('in 1 minute');
+    expect(at(-60_000)).toBe('1 minute ago');
+  });
+
+  it('dashes a moment nobody recorded', () => {
+    expect(relativeTime(undefined)).toBe('—');
+    expect(relativeTime(Number.NaN)).toBe('—');
+  });
+});
+
 describe('plural', () => {
   it('covers the two-argument shape features keep re-declaring locally', () => {
     expect(plural(1, 'phase')).toBe('1 phase');
@@ -308,7 +356,11 @@ describe('the source holds one interval formatter and verb-carrying clocks', () 
   });
 
   it('the strip prints a duration only through clockWords — never a bare figure', () => {
-    const tower = files(join(SRC, 'features/runs/tower'));
+    // 7.0's strip is `screens/runs/` — less the All runs grid, whose Worked and
+    // Updated columns are the kit's datums under their own column heads, not
+    // a strip's clock (quiet-console phase 7). The 6.2 strip
+    // (`features/runs/tower/`) went with the run page (phase 11).
+    const tower = files(join(SRC, 'screens/runs')).filter((path) => !/\/all-runs\.tsx$/.test(path));
     expect(tower.length, 'the scan must see the strip').toBeGreaterThan(2);
     const BARE = [
       /\b(?:elapsed|elapsedWords|duration|toolTime|formatInterval|relativeTime|countdown)\(/,

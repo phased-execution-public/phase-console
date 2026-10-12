@@ -1,13 +1,15 @@
 /**
  * AA is a test, not a promise.
  *
- * The status palette in `theme.css` is authored in OKLCH, once per token, as
+ * The palette in `theme.css` is authored in OKLCH, once per token, as
  * `light-dark(paper, night)`. Nothing in jsdom computes a colour, so this file
  * does the arithmetic itself: OKLCH → OKLab → linear sRGB → relative luminance,
- * then WCAG 2 contrast for every (state, surface) pair in BOTH themes. The
- * thresholds are AA's: 4.5:1 for a status used as text (a badge's label, a
+ * then WCAG 2 contrast for every (state, surface) pair in BOTH lights. The
+ * thresholds are AA's: 4.5:1 for a status used as text (a summons's word, a
  * state-coloured count) on every surface the app paints on, 3:1 for a status
- * used as a mark (a dot, a strip segment, a station) against the track.
+ * used as a mark (a dot, a track segment, a station) against the track. The
+ * three inks are held to the same 4.5:1 on the four text surfaces — tokens 7.0
+ * settled their exact L here (quiet-console phase 1).
  *
  * The converter is the standard one (Björn Ottosson's OKLab matrices); it is
  * checked against the two `--ground` hexes `index.html` and the manifest carry,
@@ -182,9 +184,10 @@ describe('the status palette clears AA in both themes', () => {
 
   it('keeps the ink readable on every surface, both themes', () => {
     // Not a status, but the same promise: every ink is TEXT and clears AA
-    // wherever it lands. Faint ink is metadata, and metadata is set at 12px —
-    // 6.0 holds it to 4.5:1 (it was the large-text 3:1, and the tour's axe
-    // counted 768 places a person read it small).
+    // wherever it lands. Faint ink is metadata, and metadata is set at the
+    // 12.5 px meta size — so it is held to 4.5:1 like the other two. Tokens
+    // 7.0 settled the three at Paper 20 / 42 / 52 % and Night 95 / 77 / 67 %
+    // by this very arithmetic (quiet-console phase 1).
     const ink = pair('--ink')!;
     const muted = pair('--ink-muted')!;
     const faint = pair('--ink-faint')!;
@@ -204,6 +207,33 @@ describe('the status palette clears AA in both themes', () => {
         ).toBeGreaterThanOrEqual(4.5);
       }
     }
+  });
+
+  it('keeps the three inks three — each a step apart, in the right order for its light', () => {
+    // Paper reads dark on light, so ink is the darkest; Night the reverse. A
+    // muted ink that drifted to the faint one's L would leave the page with two
+    // inks wearing three names.
+    const ink = pair('--ink')!;
+    const muted = pair('--ink-muted')!;
+    const faint = pair('--ink-faint')!;
+    expect(ink.paper.L).toBeLessThan(muted.paper.L);
+    expect(muted.paper.L).toBeLessThan(faint.paper.L);
+    expect(ink.night.L).toBeGreaterThan(muted.night.L);
+    expect(muted.night.L).toBeGreaterThan(faint.night.L);
+    for (const [a, b] of [
+      [ink, muted],
+      [muted, faint],
+    ] as const) {
+      expect(Math.abs(a.paper.L - b.paper.L)).toBeGreaterThanOrEqual(0.08);
+      expect(Math.abs(a.night.L - b.night.L)).toBeGreaterThanOrEqual(0.08);
+    }
+  });
+
+  it('keeps every text surface a text surface — the inks clear AA on the raised one too', () => {
+    // The four text surfaces are the four a word may be set on; `--track` is a
+    // mark's bed and never carries text, which is why it is not in this list.
+    expect(TEXT_SURFACES).toEqual(['--ground', '--ground-deep', '--surface', '--surface-raised']);
+    for (const token of TEXT_SURFACES) expect(pair(token), token).toBeTruthy();
   });
 });
 

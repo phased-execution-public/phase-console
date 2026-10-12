@@ -11,7 +11,7 @@
  *
  * - `server/api/routes.ts` is the real door, and these lists describe it.
  *   Nothing here validates anything; the route's own coercion is still the wall.
- * - `client/src/features/run-setup/schema.ts` builds its zod shape from these
+ * - `client/src/screens/launch/model/schema.ts` builds its zod shape from these
  *   names, so a field the server accepts and the form cannot send is a test
  *   failure rather than a silent capability gap.
  * - `test/run-settings-parity.test.ts` reads the route module's source and
@@ -718,6 +718,12 @@ export const ONE_M_WINDOW_NOTE = /^[`\s]*\((?:[^)]*[^\w.])?1\s?m(?:\W[^)]*)?\)/i
 export function withWindowNote(model, after) {
   return /\[1m\]$/i.test(model) || !ONE_M_WINDOW_NOTE.test(after ?? '') ? model : `${model}[1m]`;
 }
+
+/**
+ * The five effort levels the CLI accepts, lowest first — what a form offers
+ * beside a model (the launch form, a retry's edits, the supervisor's pair).
+ */
+export const EFFORT_LEVELS = Object.freeze(/** @type {const} */ (['low', 'medium', 'high', 'xhigh', 'max']));
 
 /**
  * The same, for `**Effort:**` — one of the five levels the CLI accepts, or nothing.

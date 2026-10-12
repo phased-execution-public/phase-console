@@ -87,25 +87,41 @@ const TREE = /^[0-9a-f]{40,64}$/;
  */
 export function readProofs(file: string, slug: string, phase: number): Map<string, Proof> {
   const out = new Map<string, Proof>();
+  for (const row of proofRows(file, slug, phase)) {
+    const proof: Proof & { phase?: number } = { ...row };
+    delete proof.phase;
+    out.set(proof.command, proof);
+  }
+  return out;
+}
+
+/**
+ * The same ledger by phase — the last proof of each command each phase
+ * recorded, in the order the commands were first proven; one phase's alone
+ * when `phase` is given. What `GET /api/run/:slug/proofs` lists.
+ */
+export function proofRows(file: string, slug: string, phase?: number): (Proof & { phase: number })[] {
+  const out = new Map<string, Proof & { phase: number }>();
   let text: string;
-  try { text = readFileSync(file, 'utf8'); } catch { return out; }
+  try { text = readFileSync(file, 'utf8'); } catch { return []; }
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let row: Record<string, unknown>;
     try { row = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
-    if (row?.type !== 'proof' || row.slug !== slug || row.phase !== phase) continue;
+    if (row?.type !== 'proof' || row.slug !== slug || typeof row.phase !== 'number') continue;
+    if (phase !== undefined && row.phase !== phase) continue;
     if (typeof row.command !== 'string' || typeof row.code !== 'number' || typeof row.tree !== 'string') continue;
     if (!TREE.test(row.tree)) continue;
     const command = foldCommand(row.command);
     if (!command) continue;
-    out.set(command, {
-      command, code: row.code, tree: row.tree,
+    out.set(`${row.phase}\u0000${command}`, {
+      phase: row.phase, command, code: row.code, tree: row.tree,
       ...(typeof row.head === 'string' && row.head ? { head: row.head } : {}),
       at: typeof row.at === 'string' ? row.at : '',
       ...(typeof row.session_id === 'string' && row.session_id ? { session: row.session_id } : {}),
     });
   }
-  return out;
+  return [...out.values()];
 }
 
 /**

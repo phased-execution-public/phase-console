@@ -170,7 +170,7 @@ test('on a phone, a run started through quick start stops, and the button its ca
   // Careful: a person is there to decide, so nothing recovers the stop before
   // they do. The shipped preset recovers by itself, and a run its healer had
   // already re-driven reads live — a live run's card offers nothing to press.
-  await launchFromRuns(page, slug, '#/runs?bay=ready', 'Careful');
+  await launchFromRuns(page, slug, '#/runs?group=ready', 'Careful');
   // It stops at the door, before any session is spent: the plan states no
   // verification for its one phase — a stop in the `plan` category.
   await expect
@@ -183,8 +183,15 @@ test('on a phone, a run started through quick start stops, and the button its ca
     )
     .toBe('verification-preflight');
 
-  await page.goto(`/#/plan/${slug}/run`);
-  await expect(page.locator('[data-halt-category="plan"]').first()).toBeVisible();
+  // The halt is a fact the API answered above. Under the full tour's load a
+  // page's first read of the run can fail outright and sit on its error past
+  // the 60 s expect window (#227), so the page is asked again, not waited on:
+  // every attempt is a fresh load with a bounded window of its own.
+  const haltCard = page.locator('[data-halt-category="plan"]').first();
+  await expect(async () => {
+    await page.goto(`/#/plan/${slug}/run`);
+    await expect(haltCard).toBeVisible({ timeout: 20_000 });
+  }).toPass({ timeout: 80_000, intervals: [1_000] });
   const recommended = page.getByTestId('halt-recommended').first();
   await expect(recommended).toBeVisible();
   await expect(recommended).toHaveText(/Retry/);

@@ -139,6 +139,8 @@ export type Portfolio = {
     orphans: number;
     /** Plans an operator has closed — excluded from `ready` and the remaining totals. */
     closed: number;
+    /** The plans still open — `plans` less `closed`, said here so no page subtracts it (quiet-console phase 19). */
+    open: number;
     phases: number;
     done: number;
     ready: number;
@@ -188,8 +190,13 @@ export type Portfolio = {
    * which is the number every other figure on it is implicitly about. Absent
    * only when the caller did not compute it — `basis: 'heuristic'` is how "we
    * have never finished anything" is reported.
+   *
+   * `mediumMs` is the reading at work: one M phase's working time, by the same
+   * `estimateMs` every phase, run and lane ETA is drawn from — the figure
+   * Insights says aloud, so no page multiplies a rate by a weight of its own
+   * (quiet-console phase 19).
    */
-  rate?: RateReading;
+  rate?: RateReading & { mediumMs: number };
 };
 
 const DAY = 86_400_000;
@@ -499,6 +506,7 @@ export function portfolio(
     documents: stats.filter((s) => s.stats.kind === 'document').length,
     orphans: stats.filter((s) => s.stats.kind === 'orphan-handoffs').length,
     closed: plans.length - open.length,
+    open: open.length,
     phases: sum(plans.map((s) => s.stats.phases)),
     done: sum(plans.map((s) => s.stats.done)),
     ready: sum(open.map((s) => s.stats.ready.length)),
@@ -605,7 +613,7 @@ export function portfolio(
       .sort((a, b) => a.phases - b.phases),
     stalled,
     busiest: tally(completions.map((c) => c.slug)).slice(0, 10).map(([slug, completionCount]) => ({ slug, completions: completionCount })),
-    ...(rate ? { rate } : {}),
+    ...(rate ? { rate: { ...rate, mediumMs: Math.round(estimateMs(rate, sizing.M)) } } : {}),
   };
 }
 
@@ -1470,7 +1478,7 @@ export function forecastFrom(
   };
 }
 
-/** What each basis actually claims, for the assumptions list. Matches `client/features/insights/eta.tsx`. */
+/** What each basis actually claims, for the assumptions list. Matches `client/src/screens/insights/model.ts` `basisWords`. */
 const BASIS_CLAIM: Record<EtaBasis, string> = {
   plan: 'this plan’s own measured phases, against the shape of every plan’s',
   portfolio: 'every plan’s newest measured phases — this one has none of its own yet',

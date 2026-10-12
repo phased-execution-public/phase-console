@@ -256,10 +256,37 @@ test('the series is exactly seven buckets, oldest first, with the empty days pre
 
 test('nothing on disk is an empty answer, not a missing one', () => {
   const view = spendSummary({ runs: [], capUsd: 600, tz: TZ }, NOW);
-  assert.deepEqual(view.today, { settledUsd: 0, ladderUsd: 0, capUsd: 600 });
+  assert.deepEqual(view.today, { settledUsd: 0, ladderUsd: 0, capUsd: 600, ladderLeftUsd: 600 });
   assert.deepEqual(view.runs, []);
   assert.equal(view.series.length, 7);
-  assert.ok(view.series.every((d) => d.settledUsd === 0 && d.ladderUsd === 0));
+  assert.ok(view.series.every((d) => d.settledUsd === 0 && d.ladderUsd === 0 && d.usd === 0));
+  assert.deepEqual(view.total, { settledUsd: 0, ladderUsd: 0, usd: 0 });
+});
+
+// quiet-console phase 19: the sums Insights prints are the server's, so a page
+// never adds two money figures of its own beside the cap's arithmetic.
+test('the view carries its own sums: each day, the window, and the ladder left under the cap', () => {
+  const runs: SpendRunView[] = [
+    {
+      id: 'r', slug: 'alpha', spentUsd: 7,
+      phases: {
+        '1': { costUsd: 4, endedAt: '2026-08-16T06:00:00Z' },
+        '2': { costUsd: 3.1, endedAt: JUST_AFTER },
+      },
+      recoveries: { '1': { rungs: [rung(JUST_AFTER, 0.2)] } },
+    },
+  ];
+  const view = spendSummary({ runs, capUsd: 0.5, tz: TZ }, NOW);
+  // Today's bucket is settled plus ladder, in cents — never 3.3000000000000003.
+  assert.equal(view.series.at(-1)!.usd, 3.3);
+  assert.equal(view.series[0].usd, 4);
+  assert.deepEqual(view.total, { settledUsd: 7.1, ladderUsd: 0.2, usd: 7.3 });
+  assert.equal(view.today.ladderLeftUsd, 0.3);
+
+  // Past the cap the room is zero, never negative; with no cap there is no room to state.
+  const over = spendSummary({ runs, capUsd: 0.1, tz: TZ }, NOW);
+  assert.equal(over.today.ladderLeftUsd, 0);
+  assert.equal(spendSummary({ runs, tz: TZ }, NOW).today.ladderLeftUsd, null);
 });
 
 test('float dust is not a spend figure', () => {

@@ -28,13 +28,15 @@
  * worker is auto-applied at page load and on return-to-tab — the two moments
  * nothing on screen is mid-flight — guarded by a sessionStorage one-shot (a
  * worker that cannot take over falls back to the toast instead of looping)
- * and suppressed over live pty surfaces and focused inputs. Mid-session
- * updates keep the toast, and `controllerchange` still reloads only a change
- * we asked for: the first-install reload loop stays dead.
+ * and suppressed over live surfaces (`LIVE_SURFACE`) and focused inputs.
+ * Mid-session updates keep the toast — including the one a restart onto a new
+ * build makes, which the shell reports through `useServiceWorker(serverRev)`
+ * — and `controllerchange` still reloads only a change we asked for: the
+ * first-install reload loop stays dead.
  */
 
-import { useEffect, useSyncExternalStore } from 'react';
-import { dismissToast, toast } from '@/components/ui';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { dismissToast, toast } from '@/ui';
 import { MOUNTED } from './base';
 
 /**
@@ -188,11 +190,46 @@ export async function applyUpdateNow(
 }
 
 /**
- * Registers at boot, and offers an update when one is waiting.
+ * The addresses an auto-apply never reloads: a live pty or stream whose
+ * scrollback a reload would lose — a session's page and the two addresses it
+ * had before 7.0 (a tab restored there is on it for the tick before the router
+ * moves it), the Supervisor's chat (`#/chat`), and a plan's Run view, where
+ * the run's console streams. Read off the hash as it stands.
+ */
+export const LIVE_SURFACE = /^#\/(?:sessions|terminal|agent|chat)(?:[/?]|$)|^#\/plan\/[^/?]+\/run(?:[/?]|$)/;
+
+/**
+ * Ask the server now whether there is a newer worker. Its install is what
+ * offers the update (`useServiceWorker`'s `updatefound`); this only asks.
+ */
+export async function checkForUpdate(): Promise<void> {
+  const reg = await registerServiceWorker();
+  try {
+    await reg?.update();
+  } catch {
+    /* offline, or the server is gone */
+  }
+}
+
+/**
+ * Registers after first paint, and offers an update when one is waiting.
+ *
+ * `serverRev` is the build the server says it serves (`/api/state.distRev`).
+ * When it MOVES under an open tab — a restart landed on a new build — the tab
+ * asks for the new worker at once rather than at the next load or return, and
+ * the install offers the toast: mid-session is never a boundary to reload at.
  *
  * Mounted once, by the shell.
  */
-export function useServiceWorker(): void {
+export function useServiceWorker(serverRev?: string | null): void {
+  const seenRev = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (!serverRev) return;
+    const before = seenRev.current;
+    seenRev.current = serverRev;
+    if (before && before !== serverRev) void checkForUpdate();
+  }, [serverRev]);
+
   useEffect(() => {
     let cancelled = false;
     let offered: number | null = null;
@@ -227,7 +264,7 @@ export function useServiceWorker(): void {
     // and `controllerchange` above still reloads only a change we asked for.
     const AUTO_KEY = 'pc-sw-auto-applied';
     const autoApplySafe = () => {
-      if (/^#\/(sessions|terminal|agent)/.test(window.location.hash)) return false;
+      if (LIVE_SURFACE.test(window.location.hash)) return false;
       const active = document.activeElement;
       if (
         active instanceof HTMLElement &&

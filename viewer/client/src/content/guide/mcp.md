@@ -27,11 +27,13 @@ Both are *registry ids* — what the phase needs, never how to reach it, because
 per-machine. They are **unioned**: phase 4 above runs with `github`, `context7` and `playwright`.
 This is the durable statement; it lives in the repository and every session gets it.
 
-**The run.** The launch dialog and the Autopilot tab both offer the registry. What you tick here is
+**The run.** The launch offers the registry in its **Tools** row, under **MCP servers for this run**. What
+you tick there is
 added to what the plan named — you cannot untick the plan's, because that is a statement about the
 work rather than a preference for one afternoon.
 
-**One phase.** The phase matrix has an MCP column, and a `skip run's` checkbox that drops the *run's*
+**One phase.** The launch's phase matrix has an **MCP** column, with **Extra MCP servers** and a `skip
+run's` checkbox that drops the *run's*
 servers for that phase. The plan's still apply.
 
 ## What happens before a phase starts
@@ -53,8 +55,9 @@ the ceiling lets health go stale rather than probing.
 **By default the phase still runs.** It boards without the servers that would not answer, its prompt
 names them and tells it to do the work that does not depend on them and to record the rest under
 **Outstanding** as an errand for you, and you get one notification per run per server. Change that
-under **Settings ▸ Automation → When an MCP server is unavailable**, for one run in the launch
-dialog, or for one phase in the run's phase matrix. A plan can insist for itself with
+under Settings ▸ MCP servers ▸ **When a server cannot be reached** — *Run without it and record an
+errand*, or *Park the phase until it is signed in* — for one run with the launch's **If one will not
+connect**, or for one phase in its phase matrix. A plan can insist for itself with
 `**MCP policy:** require`, and that outranks the run-level choice.
 
 Why not always park? Because `parked` is a settled status, so a run whose ready phases have all
@@ -73,14 +76,15 @@ of *every* turn, and adds names that can collide with another server's. Connecti
 busts the prompt cache and re-reads the whole context, which is why attachment happens at a phase
 boundary and nowhere else.
 
-The run page shows, per phase, how many times each attached server was actually called. A server
+A run's page shows, per phase, how many times each attached server was actually called. A server
 sitting at zero was paid for on every turn and never used.
 
 ## Credentials
 
 Three kinds, and the console holds only one of them.
 
-- **OAuth** (Sentry, Linear, Notion, Figma, Vercel…) — press Sign in. That runs
+- **OAuth** (Sentry, Linear, Notion, Figma, Vercel…) — open the server's row, choose whom to sign in
+  for — this console, or one of its profile accounts — and press **Sign in**. That runs
   `claude mcp login <id> --no-browser` in a terminal; the token goes to the Claude CLI's own store,
   which this console never reads or writes. A second writer is how two processes corrupt one login.
 - **A token in a header** (GitHub's PAT, for instance) — the console holds this one, in your
@@ -94,8 +98,9 @@ named: put it in a header, where it is kept.
 
 ## When a server changes under you
 
-Every probe records the tool names a server advertised. If they change, the card says so and names
-what was added or removed, and the badge lights until you have looked.
+Every probe records the tool names a server advertised. If they change, a banner says so — *github
+connects, but advertises different tools than it did when it was attached.* — and the server's row names
+what was added and removed, with **I have checked it**.
 
 This is not paranoia about a moving version number. A server whose tool descriptions change is a
 server that can change what your sessions are instructed to do — the descriptions go into the prompt.
@@ -108,7 +113,8 @@ call. An unattended run can never approve one, so a phase that needs it will sta
 ## Permissions
 
 MCP tool calls do not reach the console's approval hook — only the CLI's own `permissions.deny` list
-constrains them. Settings → Permission rules understands `mcp__<server>` (every tool that server
+constrains them. Settings ▸ Permissions ▸ **What a session may run unasked** understands
+`mcp__<server>` (every tool that server
 exposes) and `mcp__<server>__<tool>` (one of them). Those rules go into the settings file each run
 loads, so they hold whether or not this console is running.
 

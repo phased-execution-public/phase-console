@@ -3,7 +3,7 @@
  *
  * This file replaces `viewer/shared/instances.mjs` when
  * `scripts/build-free-tree.mjs` materializes the public repository. It is not
- * a smaller module: it exports the SAME 58 names, with the same signatures and
+ * a smaller module: it exports the SAME 65 names, with the same signatures and
  * the same return shapes, because eleven other modules import from here and a
  * missing export is a crash at load rather than a feature that is absent.
  * `viewer/test/free-tree-shape.test.ts` diffs the two export sets and fails on
@@ -296,6 +296,21 @@ export const OVERRIDABLE_PROFILE_KEYS = Object.freeze([
   'quietHours',
 ]);
 
+/**
+ * Every field `profile-set` writes machine-wide: the six a console may also
+ * override for itself, then the machine's alone — its lane ceiling, the hook
+ * script, the heap a console may hold and whether a near-limit event writes
+ * the snapshot that names what is holding it. The settings schema
+ * (`shared/prefs-model.js` `PROFILE_META`) has a row for each.
+ */
+export const PROFILE_MACHINE_KEYS = Object.freeze([
+  ...OVERRIDABLE_PROFILE_KEYS,
+  'maxSessions',
+  'hookScript',
+  'heapMb',
+  'heapSnapshotOnNearLimit',
+]);
+
 const QUIET_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 /**
@@ -357,7 +372,9 @@ function sanitizeProfileFields(raw) {
   if (Number.isInteger(raw.maxSessions) && raw.maxSessions > 0) out.maxSessions = raw.maxSessions;
   if (typeof raw.hookScript === 'string' && raw.hookScript.startsWith('/')) out.hookScript = raw.hookScript;
   if (Number.isInteger(raw.heapMb) && raw.heapMb > 0) out.heapMb = raw.heapMb;
-  if (raw.heapSnapshotOnNearLimit === true) out.heapSnapshotOnNearLimit = true;
+  // A word either way: `false` is how `profile-set` turns it back off, and
+  // every reader asks `=== true`.
+  if (typeof raw.heapSnapshotOnNearLimit === 'boolean') out.heapSnapshotOnNearLimit = raw.heapSnapshotOnNearLimit;
   return out;
 }
 
@@ -1793,9 +1810,7 @@ export function runCli(argv, env = process.env) {
     case 'profile-set': {
       const [key, raw] = positional;
       const instance = flag('instance');
-      const keys = instance
-        ? OVERRIDABLE_PROFILE_KEYS
-        : [...OVERRIDABLE_PROFILE_KEYS, 'maxSessions', 'hookScript'];
+      const keys = instance ? OVERRIDABLE_PROFILE_KEYS : PROFILE_MACHINE_KEYS;
       if (!key || raw === undefined || !keys.includes(key)) {
         return {
           err: `usage: instances.mjs profile-set <${keys.join('|')}> <json>`,

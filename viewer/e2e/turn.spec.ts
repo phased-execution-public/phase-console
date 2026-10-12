@@ -203,7 +203,8 @@ test('Settings ▸ Permissions opens at the granted push’s grant, and holds on
   );
   const row = page.locator('[data-testid="grant-row"][data-grant="g-e2e0permit0"]');
   await expect(row).toHaveAttribute('aria-current', 'true');
-  await expect(page.getByTestId('owner-keys-card')).toBeVisible();
+  // Owner keys sit beside the grants: a 7.0 group since quiet-console phase 22, named for what it holds.
+  await expect(page.getByRole('region', { name: 'Owner keys' })).toBeVisible();
   await wins(page, row.getByRole('button', { name: 'Revoke' }), viewport.touch, 'Revoke');
   const layout = (await layoutFindings(page, { touch: viewport.touch })).filter(
     (f) => f.cls === 'overflow' || f.cls === 'escape',

@@ -17,12 +17,12 @@
  */
 
 import type { QueryClient } from '@tanstack/react-query';
-import { ApiError, api, type TerminalState } from './api';
+import { ApiError, api, type TerminalState } from '@/data/api';
+import { keys } from '@/data/keys';
+import { navigate } from '@/shell/routes';
+import { toast } from '@/ui/toast';
 import { isPhone } from './media';
-import { keys } from './queries';
 import { estimateTerminalSize } from './terminal';
-import { navigate } from '@/app/router';
-import { toast } from '../components/ui';
 
 /** What a duplicate refusal reads as, per intent — the same fact, the right words. */
 const ALREADY_RUNNING: Record<string, string> = {
@@ -37,7 +37,7 @@ const ALREADY_RUNNING: Record<string, string> = {
  * outcome is already either a navigation or a toast. Returns the session id
  * the browser ended up on, or `undefined` when nothing opened.
  *
- * `body` is the agent ticket as `features/run-setup/modes.ts` built it; the
+ * `body` is the agent ticket as `screens/launch/model/modes.ts` built it; the
  * only thing added here is a size for the pty to be born at, which is a
  * property of the viewport rather than of the launch.
  */

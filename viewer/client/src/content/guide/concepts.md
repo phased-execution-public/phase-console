@@ -41,8 +41,8 @@ slowing down for.
 Most of a plan is prose for whoever reads it next. Two parts are parsed, and have to be exact.
 
 **The phase graph table.** The `Depends on` column decides what is ready. List every prerequisite for
-every phase — a cell takes `4`, `4, 5`, a range `1–7`, or `—` for none. A phase that sits alone on
-the plan's **Route** tab when you expected it to depend on something is a mistyped cell.
+every phase — a cell takes `4`, `4, 5`, a range `1–7`, or `—` for none. A phase that stands alone on
+the plan's map (**Phases**, then **Map**) when you expected it to depend on something is a mistyped cell.
 
 **Each phase's `**Verification:**` line.** The runnable command that proves the phase worked, in
 backticks. This is what the autopilot executes to decide whether a phase actually landed — a session

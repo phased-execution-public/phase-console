@@ -43,7 +43,15 @@ type Dist = {
 function baseline(): Dist {
   return withRepoChunk({
     assets: {
-      'index-aaaa.js': 'navigator.serviceWorker.register("/sw.js");\n',
+      // The entry reaches the command palette (cmdk, quiet-console phase 3) by
+      // a DYNAMIC import only — the shape `App.tsx`'s `lazy()` builds.
+      'index-aaaa.js':
+        'navigator.serviceWorker.register("/sw.js");\nexport const palette = () => import("./palette-yyyy.js");\n',
+      // The palette's own chunk, found by the attribute cmdk renders on its root.
+      'palette-yyyy.js': 'export const Root = { "cmdk-root": "" };\n',
+      // The owner key's ceremony (control-tower phase 148, `data/owner.ts`): a
+      // chunk of its own, found by the one route only the ceremony asks.
+      'owner-oooo.js': 'export const begin = () => fetch("/api/owner/assert/begin");\n',
       'sessions-bbbb.js': 'export const Sessions = 1;\n',
       'settings-cccc.js': 'export const Settings = 1;\n',
       'insights-dddd.js': 'export const Insights = 1;\n',
@@ -53,32 +61,39 @@ function baseline(): Dist {
       // Phase 4's two. A destination chunk missing from the precache is a page
       // absent from the offline shell, so the gate names each one — which means
       // the baseline has to carry each one too.
-      'debug-nnnn.js': 'export const Debug = 1;\n',
+      // Logs (quiet-console phase 20): the place names its section nav, and its
+      // hooks (`data/logs.ts`) are a second `logs-*` the gate must not mistake for it.
+      'logs-nnnn.js': 'export const Logs = { nav: "Logs sections" };\n',
+      'logs-aaaa.js': 'export const useDebugIndex = 1;\n',
+      // The two destinations whose names first paint shares (`data/runs.ts`, `data/plans.ts`).
+      'runs-bbbb.js': 'export const Runs = 1;\n',
+      'plans-cccc.js': 'export const Plans = 1;\n',
       'mcp-eeee.js': 'export const Mcp = 1;\n',
       'permissions-ffff.js': 'export const Permissions = 1;\n',
       // The emulator, in the chunk the worker's globIgnores exclude by name.
       'pane-gggg.js': 'import { Terminal } from "xterm";\nexport { Terminal };\n',
       // The plan route, and one chunk it legitimately imports. The check walks
-      // this graph looking for `run-setup-*`; a baseline with no `detail-*` at
+      // this graph looking for `run-setup-*`; a baseline with no `plan-*` at
       // all could not tell a clean graph from a missing one.
-      'detail-jjjj.js': 'import { x } from "./phase-groups-kkkk.js";\nexport const Plan = x;\n',
+      'plan-jjjj.js': 'import { x } from "./phase-groups-kkkk.js";\nexport const Plan = x;\n',
       'phase-groups-kkkk.js': 'export const x = 1;\n',
+      // The route map, its own chunk: the Phases view's map reading loads it with `lazy()`.
+      'map-view-mmmm.js': 'export const MapView = 1;\n',
+      // A chunk that shares the plan route's prefix and is not it (`shared/plan-vocab.js`).
+      'plan-vocab-aaaa.js': 'export const PLAN_WORDS = 1;\n',
       // The table engine (control-tower phase 18): TanStack Table's row model,
       // reached from the grid's chunk by a DYNAMIC import only, marked by an
       // option name only the library spells.
       'data-table-tttt.js': 'export const load = () => import("./engine-uuuu.js");\n',
       'engine-uuuu.js': 'export const options = { maxLeafRowFilterDepth: 100 };\n',
       // The figures (control-tower phase 29): visx drawings behind
-      // `components/figures/lazy.tsx`, found by the attribute they spell.
+      // `ui/figures/lazy.tsx`, found by the attribute they spell.
       'lazy-ffff.js': 'export const load = () => [import("./bars-gggg.js"), import("./run-chart-hhhh.js")];\n',
       'bars-gggg.js': 'export const Bars = { "data-figure": "Bars" };\n',
       'run-chart-hhhh.js': 'export const RunCost = { "data-figure": "RunCost" };\n',
       // The status model's word tables (control-tower phase 16), in a page's
       // chunk — never the entry, never a preload.
       'status-vvvv.js': 'export const Rows = { cooling: ["Cooling", "thermometer-snowflake"] };\n',
-      // The peek's hover card (control-tower phase 19), in the Runs page's
-      // chunk — never the entry, never a preload.
-      'runs-pppp.js': 'export const Trigger = { displayName: "HoverCardTrigger" };\n',
     },
     html: { preload: [], entry: 'index-aaaa.js', extraHead: '' },
     sw: {
@@ -88,7 +103,9 @@ function baseline(): Dist {
         'settings-cccc.js',
         'insights-dddd.js',
         'repo-mmmm.js',
-        'debug-nnnn.js',
+        'logs-nnnn.js',
+        'runs-bbbb.js',
+        'plans-cccc.js',
       ],
       push: true,
     },
@@ -101,7 +118,7 @@ function baseline(): Dist {
 // carried the dynamic import — so a free baseline puts a plain repo chunk back.
 // In the Pro tree the key already exists and this is a no-op.
 function withRepoChunk(dist: Dist): Dist {
-  dist.assets['repo-mmmm.js'] ??= 'export const Repo = 1;\n';
+  dist.assets['repo-mmmm.js'] ??= 'export const Repo = { nav: "Repo sections" };\n';
   return dist;
 }
 
@@ -200,12 +217,27 @@ test('a RENAMED emulator chunk in the precache still fails — the rename-proof 
 test('run-setup reached from the plan chunk by a STATIC import fails', () => {
   const dist = baseline();
   dist.assets['run-setup-llll.js'] = 'export const Setup = 1;\n';
-  dist.assets['detail-jjjj.js'] =
+  dist.assets['plan-jjjj.js'] =
     'import { x } from "./phase-groups-kkkk.js";\nimport { Setup } from "./run-setup-llll.js";\nexport const Plan = x + Setup;\n';
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
   assert.ok(failures(out).some((l) => l.includes('never statically pulls run-setup')), out);
-  assert.match(out, /lazy-launch-dialog/, 'the detail names the module to import instead');
+  assert.match(out, /screens\/launch\/door/, 'the detail names the door to reach it through instead');
+});
+
+test('the route map reached from the plan chunk by a static import fails, and so does no map chunk at all', () => {
+  const dist = baseline();
+  dist.assets['plan-jjjj.js'] =
+    'import { x } from "./phase-groups-kkkk.js";\nimport { MapView } from "./map-view-mmmm.js";\nexport const Plan = [x, MapView];\n';
+  const pulled = runGate(dist);
+  assert.equal(pulled.ok, false);
+  assert.ok(failures(pulled.out).some((l) => l.includes('leaves the route map to its own chunk')), pulled.out);
+
+  const folded = baseline();
+  delete folded.assets['map-view-mmmm.js'];
+  const missing = runGate(folded);
+  assert.equal(missing.ok, false);
+  assert.ok(failures(missing.out).some((l) => l.includes('the route map is its own chunk')), missing.out);
 });
 
 test('run-setup reached from the plan chunk INDIRECTLY fails too', () => {
@@ -223,8 +255,8 @@ test('run-setup reached from the plan chunk INDIRECTLY fails too', () => {
  * The same rule for the Repo destination's one heavy section.
  *
  * React Flow and d3-dag (~97 KiB gzipped, `test/fixtures/spikes/react-flow-bundle.md`)
- * ride behind the Landscape section, which is reached through
- * `features/repo/pro/lazy-landscape`. Three ways that stops being true, each
+ * ride behind the Landscape section, which `screens/repo/index.tsx` reaches
+ * through `lazy()`. Three ways that stops being true, each
  * named: a static import folds the library into the precached repo chunk;
  * the landscape chunk itself gets precached (the worker's globIgnores name it);
  * the document preloads it. All three are rename-proof — they find whichever
@@ -234,11 +266,40 @@ test('run-setup reached from the plan chunk INDIRECTLY fails too', () => {
 test('React Flow reached from the repo chunk by a STATIC import fails', () => {
   const dist = baseline();
   dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
-  dist.assets['repo-mmmm.js'] = 'import { Map } from "./map-rrrr.js";\nexport const Repo = Map;\n';
+  dist.assets['repo-mmmm.js'] =
+    'import { Map } from "./map-rrrr.js";\nexport const Repo = { nav: "Repo sections", Map };\n';
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
   assert.ok(failures(out).some((l) => l.includes('carries no React Flow')), out);
-  assert.match(out, /lazy-landscape/, 'the detail names the module to import instead');
+  assert.match(out, /screens\/repo\/index\.tsx/, 'the detail names where the lazy door is');
+});
+
+/*
+ * Two chunks are named `repo-*` since 7.0 (quiet-console phase 17): the place
+ * and its data hooks. The gate walks the one that names its section nav, so a
+ * hooks chunk that happens to sort first cannot stand in for the route and
+ * call it clean.
+ */
+test('the repo route is found by what it names, not by which `repo-*` chunk sorts first', () => {
+  const dist = withRepoChunk(baseline());
+  dist.assets['repo-aaaa.js'] = 'export const useRepoGraph = 1;\n';
+  dist.assets['run-setup-llll.js'] = 'export const Setup = 1;\n';
+  dist.assets['repo-mmmm.js'] =
+    'import { Setup } from "./run-setup-llll.js";\nexport const Repo = { nav: "Repo sections", Setup };\n';
+  const pulled = runGate(dist);
+  assert.equal(pulled.ok, false);
+  assert.ok(
+    failures(pulled.out).some((l) => l.includes('repo route never statically pulls run-setup')),
+    pulled.out,
+  );
+
+  // And a build whose only `repo-*` chunk is the hooks has no route chunk at all.
+  const hooksOnly = withRepoChunk(baseline());
+  delete hooksOnly.assets['repo-mmmm.js'];
+  hooksOnly.assets['repo-aaaa.js'] = 'export const useRepoGraph = 1;\n';
+  const missing = runGate(hooksOnly);
+  assert.equal(missing.ok, false);
+  assert.ok(failures(missing.out).some((l) => l.includes('the repo route is its own chunk')), missing.out);
 });
 
 /*
@@ -252,7 +313,7 @@ test('React Flow reached from the repo chunk by a STATIC import fails', () => {
 test('a map library reached from the plan chunk by a STATIC import fails, in either tree', () => {
   const dist = baseline();
   dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
-  dist.assets['detail-jjjj.js'] =
+  dist.assets['plan-jjjj.js'] =
     'import { x } from "./phase-groups-kkkk.js";\nimport { Map } from "./map-rrrr.js";\nexport const Plan = [x, Map];\n';
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
@@ -260,13 +321,13 @@ test('a map library reached from the plan chunk by a STATIC import fails, in eit
     failures(out).some((l) => l.includes("the plan route's static graph carries no map library")),
     out,
   );
-  assert.match(out, /components\/dag\.tsx/, 'the detail names the map the plan route draws');
+  assert.match(out, /screens\/plan\/map\/dag\.tsx/, 'the detail names the map the plan route draws');
 });
 
 test('a map library behind a dynamic import from the plan chunk passes', () => {
   const dist = baseline();
   dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
-  dist.assets['detail-jjjj.js'] =
+  dist.assets['plan-jjjj.js'] =
     'import { x } from "./phase-groups-kkkk.js";\nexport const Plan = x;\nexport const map = () => import("./map-rrrr.js");\n';
   const { out } = runGate(dist);
   assert.ok(failures(out).every((l) => !l.includes('carries no map library')), out);
@@ -297,7 +358,7 @@ test('run-setup reached by a DYNAMIC import is exactly what is wanted', () => {
   // every correct answer as a regression.
   const dist = baseline();
   dist.assets['run-setup-llll.js'] = 'export const Setup = 1;\n';
-  dist.assets['detail-jjjj.js'] =
+  dist.assets['plan-jjjj.js'] =
     'import { x } from "./phase-groups-kkkk.js";\nexport const open = () => import("./run-setup-llll.js");\nexport const Plan = x;\n';
   const { ok, out } = runGate(dist);
   assert.ok(ok, out);
@@ -305,7 +366,7 @@ test('run-setup reached by a DYNAMIC import is exactly what is wanted', () => {
 
 test('the plan route having no chunk of its own fails — nothing to walk is not clean', () => {
   const dist = baseline();
-  delete dist.assets['detail-jjjj.js'];
+  delete dist.assets['plan-jjjj.js'];
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
   assert.ok(failures(out).some((l) => l.includes('the plan route is its own chunk')), out);
@@ -321,7 +382,7 @@ test('modulepreloading the emulator fails — the second way a lazy chunk stops 
 
 test('a SECOND chunk carrying the emulator fails — every terminal shares the one lazy door', () => {
   // control-tower phase 42: a human step's terminal sheet reaches the pane
-  // through the same `import('@/features/sessions/pane')` the sessions page
+  // through the same `import('@/screens/sessions/pane')` the sessions page
   // uses. A static import anywhere would put xterm in a second chunk.
   const dist = baseline();
   dist.assets['step-terminal-iiii.js'] = 'import { Terminal } from "xterm";\nexport const Sheet = 1;\n';
@@ -365,12 +426,12 @@ test('first paint over budget fails even when the ENTRY is comfortably under it'
 /*
  * The table engine (control-tower phase 18): TanStack Table behind the grid's
  * filters, groups and picks, ~17 KB gz that a page with a plain table never
- * needs. `components/data-table/data-table.tsx` reaches it through `import()`;
+ * needs. `ui/grid/grid.tsx` reaches it through `import()`;
  * found by CONTENT (an option name only the library spells), never by name.
  */
 test('the table engine reached by a STATIC import fails, from any chunk', () => {
   const dist = baseline();
-  dist.assets['detail-jjjj.js'] =
+  dist.assets['plan-jjjj.js'] =
     'import { x } from "./phase-groups-kkkk.js";\nimport { options } from "./engine-uuuu.js";\nexport const Plan = [x, options];\n';
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
@@ -394,16 +455,16 @@ test('the table engine folded into the grid chunk fails — it must be a lazy ch
   assert.ok(failures(out).some((l) => l.includes('the table engine is its own lazy chunk')), out);
 });
 
-test('first paint above its figure before the grid left the barrel fails, though under the old 200 KB', () => {
-  // Phase 18 moved the grid and the long list out of the preloaded barrel and
-  // set the gate at first paint as it stood BEFORE that move (189.3 KB served,
-  // rounded up). 195 KB would have passed the old gate and must not pass this.
+test('first paint over 170 KB fails, though under the 6.x 190 KB gate', () => {
+  // 7.0 set the gate at 170 KB: the old client's preloaded kit barrel is gone,
+  // and the room it freed is kept rather than spent. 180 KB would have passed
+  // the 6.x gate and must not pass this one.
   const dist = baseline();
-  dist.assets['big-iiii.js'] = randomBytes(195 * 1024);
+  dist.assets['big-iiii.js'] = randomBytes(180 * 1024);
   dist.html.preload.push('big-iiii.js');
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
-  assert.ok(failures(out).some((l) => l.includes('first paint is') && l.includes('of 190 KB')), out);
+  assert.ok(failures(out).some((l) => l.includes('first paint is') && l.includes('of 170 KB')), out);
 });
 
 test('a dist with no .build-rev fails — the staleness warning reads it', () => {
@@ -437,7 +498,7 @@ test('an empty dist is refused before any check, with the command to fix it', ()
 
 /*
  * The figures (control-tower phase 29): the four figures' drawings and the
- * run's cost strip, visx behind `components/figures/lazy.tsx`, by the table
+ * run's cost strip, visx behind `ui/figures/lazy.tsx`, by the table
  * engine's three rules.
  */
 test('a figure drawing reached by a STATIC import fails, from any chunk', () => {
@@ -497,8 +558,9 @@ test('no chunk spelling the tables fails — the guard would find nothing to gua
 });
 
 /*
- * The peek (control-tower phase 19): `components/peek.tsx` wraps the hover
- * card OUTSIDE the preloaded barrel; a re-export from it would put the library
+ * The hover card (control-tower phase 19): the 6.2 strip's peek wrapped it
+ * OUTSIDE the preloaded barrel, and the peek went with the strip in
+ * quiet-console phase 11. Brought back through a first-paint file, it would be
  * in every visitor's first load. Found by the trigger's display name.
  */
 test('the hover card in a preloaded chunk fails — first paint would carry the peek', () => {
@@ -508,14 +570,6 @@ test('the hover card in a preloaded chunk fails — first paint would carry the 
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
   assert.ok(failures(out).some((l) => l.includes('first paint carries no hover card')), out);
-});
-
-test('no chunk spelling the hover card fails — the guard would find nothing to guard', () => {
-  const dist = baseline();
-  delete dist.assets['runs-pppp.js'];
-  const { ok, out } = runGate(dist);
-  assert.equal(ok, false);
-  assert.ok(failures(out).some((l) => l.includes('the hover card is built')), out);
 });
 
 
@@ -547,4 +601,135 @@ test('modulepreloading Your turn fails — every visitor would fetch it', () => 
   const { ok, out } = runGate(dist);
   assert.equal(ok, false);
   assert.ok(failures(out).some((l) => l.includes('never modulepreloads Your turn')), out);
+});
+
+/*
+ * The owner key's ceremony (control-tower phase 148): `data/owner.ts`, reached
+ * by a dynamic import from the press that asks for it again. Found by the one
+ * route only the ceremony asks.
+ */
+test('the owner key ceremony in a chunk of its own, unpreloaded, is exactly what is wanted', () => {
+  const { ok, out } = runGate(baseline());
+  assert.ok(ok, out);
+  assert.match(out, /✓ the owner key's ceremony is built \(owner-oooo\.js\)/);
+  assert.match(out, /✓ first paint's static graph carries no owner key ceremony/);
+  assert.match(out, /✓ the document never modulepreloads the owner key ceremony/);
+});
+
+test('the owner key ceremony folded into the entry, or preloaded, fails', () => {
+  const folded = baseline();
+  folded.assets['index-aaaa.js'] += 'export const begin = () => fetch("/api/owner/assert/begin");\n';
+  delete folded.assets['owner-oooo.js'];
+  const one = runGate(folded);
+  assert.equal(one.ok, false);
+  assert.ok(failures(one.out).some((l) => l.includes("the owner key's ceremony is built")), one.out);
+
+  const preloaded = baseline();
+  preloaded.html.preload.push('owner-oooo.js');
+  const two = runGate(preloaded);
+  assert.equal(two.ok, false);
+  assert.ok(failures(two.out).some((l) => l.includes('never modulepreloads the owner key ceremony')), two.out);
+});
+
+/*
+ * First paint carries no command palette (quiet-console phase 3). The palette
+ * is `shell/palette/palette.tsx` on cmdk, behind `App.tsx`'s `lazy()`; until
+ * 7.0 the library rode in the preloaded `@/components/ui` barrel chunk. Found
+ * by CONTENT — `cmdk-root`, the attribute cmdk renders — never by name.
+ */
+test('the palette behind a dynamic import, unpreloaded, is exactly what is wanted', () => {
+  const { ok, out } = runGate(baseline());
+  assert.ok(ok, out);
+  assert.match(out, /✓ the command palette is built \(palette-yyyy\.js\)/);
+  assert.match(out, /✓ first paint carries no command palette/);
+  assert.match(out, /✓ the document never modulepreloads the command palette/);
+});
+
+test('the palette folded into the entry fails — first paint would carry cmdk', () => {
+  const dist = baseline();
+  dist.assets['index-aaaa.js'] = 'navigator.serviceWorker.register("/sw.js");\nexport const Root = { "cmdk-root": "" };\n';
+  delete dist.assets['palette-yyyy.js'];
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  const failed = failures(out);
+  assert.ok(failed.some((l) => l.includes('the command palette is built')), out);
+  assert.ok(failed.some((l) => l.includes('first paint carries no command palette')), out);
+});
+
+test('the palette reached from the entry by a STATIC import fails, directly or through another chunk', () => {
+  const direct = baseline();
+  direct.assets['index-aaaa.js'] += 'import { Root } from "./palette-yyyy.js";\nexport { Root };\n';
+  const one = runGate(direct);
+  assert.equal(one.ok, false);
+  assert.ok(failures(one.out).some((l) => l.includes('first paint carries no command palette')), one.out);
+  assert.match(one.out, /shell\/palette\/palette/, 'the detail names the lazy door');
+
+  // The 6.x shape: a barrel first paint imports, which imports the command list.
+  const barrel = baseline();
+  barrel.assets['ui-wwww.js'] = 'import { Root } from "./palette-yyyy.js";\nexport const Button = Root;\n';
+  barrel.assets['index-aaaa.js'] += 'import { Button } from "./ui-wwww.js";\nexport { Button };\n';
+  const two = runGate(barrel);
+  assert.equal(two.ok, false);
+  assert.ok(failures(two.out).some((l) => l.includes('first paint carries no command palette')), two.out);
+});
+
+test('modulepreloading the palette fails — every visitor would fetch cmdk', () => {
+  const dist = baseline();
+  dist.html.preload.push('palette-yyyy.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('never modulepreloads the command palette')), out);
+});
+
+test('no chunk spelling cmdk-root fails — the guard would find nothing to guard', () => {
+  const dist = baseline();
+  delete dist.assets['palette-yyyy.js'];
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('the command palette is built (no chunk spells it)')), out);
+});
+
+/*
+ * Debug became Logs in 7.0, and since phase 20 the place is `screens/logs/`: its
+ * chunk is `logs-*`, and the 6.x `debug-*` no longer passes. Two chunks share
+ * the name (the place and `data/logs.ts`), so the place is found by the nav it
+ * names — and it is the PLACE the offline shell must carry.
+ */
+test('the Logs place is precached by name and by what it names; a debug-* chunk no longer passes', () => {
+  const clean = runGate(baseline());
+  assert.ok(clean.ok, clean.out);
+
+  const old = baseline();
+  delete old.assets['logs-nnnn.js'];
+  old.assets['debug-nnnn.js'] = 'export const Debug = { nav: "Logs sections" };\n';
+  old.sw!.precache = old.sw!.precache.map((name) => (name === 'logs-nnnn.js' ? 'debug-nnnn.js' : name));
+  const one = runGate(old);
+  assert.equal(one.ok, false);
+  assert.ok(failures(one.out).some((l) => l.includes('the logs route is its own chunk')), one.out);
+
+  // The hooks' chunk precached and the place's not: the name check passes, the place check fails.
+  const hooksOnly = baseline();
+  hooksOnly.sw!.precache = [...hooksOnly.sw!.precache.filter((name) => name !== 'logs-nnnn.js'), 'logs-aaaa.js'];
+  const two = runGate(hooksOnly);
+  assert.equal(two.ok, false);
+  assert.ok(failures(two.out).some((l) => l.includes("the precache includes the Logs place's own chunk")), two.out);
+
+  const missing = baseline();
+  missing.sw!.precache = missing.sw!.precache.filter((name) => name !== 'logs-nnnn.js');
+  const three = runGate(missing);
+  assert.equal(three.ok, false);
+  assert.ok(failures(three.out).some((l) => l.includes('the Logs destination chunk')), three.out);
+});
+
+test('the seven destinations are all in the offline shell: Runs and Plans too', () => {
+  for (const name of ['runs-bbbb.js', 'plans-cccc.js']) {
+    const dist = baseline();
+    dist.sw!.precache = dist.sw!.precache.filter((one) => one !== name);
+    const { ok, out } = runGate(dist);
+    assert.equal(ok, false, name);
+    assert.ok(
+      failures(out).some((l) => l.includes(name.startsWith('runs') ? 'the Runs destination' : 'the Plans destination')),
+      out,
+    );
+  }
 });

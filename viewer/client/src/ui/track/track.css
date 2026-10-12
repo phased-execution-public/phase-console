@@ -1,0 +1,261 @@
+/*
+ * The line and its stations — the console's one graphic (design.md §7).
+ *
+ * Descendant rules rather than utilities, because a station paints by the
+ * STATE it carries (`.state-<paint>` sets `--state`) and the line under it is
+ * drawn once, by the list, not by every item. Inside `@layer components`, so a
+ * utility on an element still wins. Every side is logical; a right-to-left
+ * page mirrors the line.
+ *
+ * The three sizes are the track's own custom properties (named `--station-*`,
+ * never `--track-*`: `track` is a colour family and the theme guard reads a
+ * any other name in it as a colour it never declared). A caller may raise
+ * `--station-size` for a map; the dot is 6 px everywhere else.
+ *
+ * The classes are the kit's own `ui-` names. The plan's route map draws its
+ * network with its own `route-` names (`screens/plan/map/route-map.css`, in
+ * the map's lazy chunk), and once loaded that sheet is global for the visit —
+ * so `track.test.tsx` holds the kit to none of its names, and no first-paint
+ * sheet styles a bare `.track` or `.station` at all.
+ */
+
+@layer components {
+  .ui-track {
+    --station-size: 6px;
+    --station-line: 2px;
+    --station-ground: var(--ground);
+    position: relative;
+    display: flex;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .ui-track[data-orientation='horizontal'] {
+    flex-direction: row;
+    align-items: center;
+    min-height: var(--station-size);
+  }
+  .ui-track[data-orientation='vertical'] {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  /* The line: neutral. A centred vertical track draws it once, down through
+     every mark and BESIDE the words; a horizontal track draws it leg by leg
+     (below), because one line under a row of labels strikes each one through. */
+  .ui-track[data-orientation='vertical']::before {
+    content: '';
+    position: absolute;
+    inset-block: calc(var(--station-size) / 2);
+    inset-inline-start: calc(var(--station-size) / 2);
+    width: var(--station-line);
+    translate: -50% 0;
+    background: var(--track);
+    border-radius: 1px;
+  }
+
+  .ui-station {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+    flex: 1 1 0;
+  }
+  /* Stations sit at equal intervals; the last one ends the line. */
+  .ui-track[data-orientation='horizontal'] > .ui-station:last-child {
+    flex: 0 0 auto;
+  }
+  .ui-track[data-orientation='vertical'] > .ui-station {
+    flex: 0 0 auto;
+    padding-block: 0.25rem;
+  }
+
+  /* The dot. Its halo in the ground colour parts the line from the dot, so a
+     hollow dot reads as hollow. */
+  .ui-station-dot {
+    position: relative;
+    z-index: 1;
+    flex: none;
+    width: var(--station-size);
+    height: var(--station-size);
+    border-radius: 999px;
+    background: var(--state);
+    box-shadow: 0 0 0 2px var(--station-ground);
+  }
+  .ui-station-label {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  /* Settled: hollow, and quiet — the hue goes with the tense. A failed station
+     keeps its red: a bad ending is still a signal. */
+  .ui-station[data-settled] > .ui-station-dot {
+    background: transparent;
+    box-shadow:
+      inset 0 0 0 1px var(--ink-faint),
+      0 0 0 2px var(--station-ground);
+  }
+  .ui-station[data-settled].state-failed > .ui-station-dot {
+    box-shadow:
+      inset 0 0 0 1px var(--state),
+      0 0 0 2px var(--station-ground);
+  }
+
+  /* The one continuing motion on a page: a station observed live, and running. */
+  .ui-station[data-live] > .ui-station-dot {
+    animation: pulse-soft 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* The summons ring — solid, heavier, the one amber on the line; never a pulse. */
+  .ui-station[data-summons] > .ui-station-dot {
+    box-shadow:
+      0 0 0 2px var(--station-ground),
+      0 0 0 3.5px var(--accent);
+  }
+
+  /* HORIZONTAL: the line drawn leg by leg, AFTER each label. The leg is the
+     station's last flex item — `[dot] [label] [leg]` — so it starts a gap past
+     the station's words and runs to the next station's dot, wherever those
+     words end and however they wrap; the last station ends the line and draws
+     none. Every leg is a short line at least, so the line never vanishes
+     between two long labels. Never a ground-coloured box behind the words to
+     hide a line under them: on a card or a hovered row that box is a patch. */
+  .ui-track[data-orientation='horizontal'] > .ui-station:not(:last-child)::after {
+    content: '';
+    flex: 1 1 0;
+    min-inline-size: 0.75rem;
+    block-size: var(--station-line);
+    border-radius: 1px;
+    background: var(--track);
+  }
+
+  /* A filled segment: the leg after this station, in the station's own paint
+     (ink-faint once it is settled, like its dot). */
+  .ui-track[data-orientation='horizontal'] > .ui-station[data-fill]:not(:last-child)::after {
+    background: var(--state);
+  }
+  .ui-track[data-orientation='horizontal']
+    > .ui-station[data-fill][data-settled]:not(.state-failed):not(:last-child)::after {
+    background: var(--ink-faint);
+  }
+  .ui-track[data-orientation='vertical'] > .ui-station[data-fill]::after {
+    content: '';
+    position: absolute;
+    inset-block-start: 50%;
+    inset-block-end: calc(-1 * var(--station-size));
+    inset-inline-start: calc(var(--station-size) / 2);
+    width: var(--station-line);
+    translate: -50% 0;
+    background: var(--state);
+  }
+  .ui-track[data-orientation='vertical'] > .ui-station[data-fill][data-settled]:not(.state-failed)::after {
+    background: var(--ink-faint);
+  }
+
+  /* START-ALIGNED (vertical): each mark beside its station's first line, and
+     the line drawn leg by leg — from under a mark to the next station — so a
+     tall last station carries no line past its mark. `--station-lead` lowers
+     the mark onto the first line's middle; `--station-gap` is the leg's
+     length between two stations. */
+  .ui-track[data-orientation='vertical'][data-align='start'] {
+    --station-lead: 0px;
+    --station-gap: 1rem;
+  }
+  .ui-track[data-orientation='vertical'][data-align='start']::before {
+    content: none;
+  }
+  .ui-track[data-orientation='vertical'][data-align='start'] > .ui-station {
+    align-items: flex-start;
+    padding-block: 0 var(--station-gap);
+  }
+  .ui-track[data-orientation='vertical'][data-align='start'] > .ui-station:last-child {
+    padding-block-end: 0;
+  }
+  .ui-track[data-orientation='vertical'][data-align='start'] > .ui-station > :is(.ui-station-dot, .ui-station-tick) {
+    margin-block-start: var(--station-lead);
+  }
+  .ui-track[data-orientation='vertical'][data-align='start'] > .ui-station:not(:last-child)::after {
+    content: '';
+    position: absolute;
+    inset-block: calc(var(--station-lead) + var(--station-size) / 2) 0;
+    inset-inline-start: calc((var(--station-size) - var(--station-line)) / 2);
+    width: var(--station-line);
+    translate: none;
+    background: var(--track);
+  }
+  .ui-track[data-orientation='vertical'][data-align='start'] > .ui-station[data-fill]:not(:last-child)::after {
+    background: var(--state);
+  }
+  .ui-track[data-orientation='vertical'][data-align='start']
+    > .ui-station[data-fill][data-settled]:not(.state-failed):not(:last-child)::after {
+    background: var(--ink-faint);
+  }
+
+  /* THE TICK — a station that is a control: a real checkbox, unseen, over a
+     drawn station that carries its number. Open, it is a ring on the line;
+     ticked, it fills with the station's paint and its number turns to the
+     ground. The checkbox covers the drawn station; on touch the label's
+     `::after` widens the target to a thumb, centred on every side. */
+  .ui-station-tick {
+    position: relative;
+    z-index: 1;
+    display: inline-grid;
+    flex: none;
+    place-items: center;
+    inline-size: var(--station-size);
+    block-size: var(--station-size);
+    border: 1.5px solid var(--rule-strong);
+    border-radius: 999px;
+    background: var(--surface);
+    box-shadow: 0 0 0 2px var(--station-ground);
+    color: var(--ink);
+    cursor: pointer;
+    transition:
+      background-color var(--duration-fast) var(--ease-transit),
+      border-color var(--duration-fast) var(--ease-transit);
+  }
+  .ui-station-tick:hover {
+    border-color: var(--ink-muted);
+  }
+  .ui-station-tick:has(.ui-station-tick-input:focus-visible) {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+  .ui-station-tick-input {
+    position: absolute;
+    z-index: 1;
+    inset: 0;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  .ui-station-tick-face {
+    font-size: var(--text-meta);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    pointer-events: none;
+  }
+  .ui-station[data-ticked='true'] > .ui-station-tick {
+    border-color: var(--state);
+    background: var(--state);
+    color: var(--ground);
+  }
+  @media (hover: none) {
+    .ui-station-tick::after {
+      content: '';
+      position: absolute;
+      inset: calc((100% - var(--tap-min)) / 2);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ui-station[data-live] > .ui-station-dot {
+      animation: none;
+    }
+    .ui-station-tick {
+      transition: none;
+    }
+  }
+}

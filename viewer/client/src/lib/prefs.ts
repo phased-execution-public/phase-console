@@ -8,14 +8,18 @@
  */
 
 import { useSyncExternalStore } from 'react';
+import type { DENSITIES, THEMES } from '@shared/prefs-model.js';
 
 const KEY = 'phase-console.ui';
 
-export type Theme = 'system' | 'dark' | 'light';
+/** The colour schemes, from their owner (`shared/prefs-model.js`), which the server's writer reads too. */
+export type Theme = (typeof THEMES)[number];
+/** How much room a row takes — the owner is the same file. */
+export type Density = (typeof DENSITIES)[number];
 
 /**
  * What an operator made of one grid table, kept by its `tableId`
- * (`components/data-table`). Every field is optional and absent means "the
+ * (`ui/grid/view.ts`). Every field is optional and absent means "the
  * table's own default": a table that has never been touched stores nothing.
  *
  *   - `filters`   column id → the filter's value, by the column's kind: the
@@ -41,9 +45,28 @@ export interface TableState {
 }
 
 
+/**
+ * The shell's right panel (7.0, quiet-console phase 3) — the one surface that
+ * SURVIVES navigation, so its state lives here rather than in the address.
+ * `open` is whether it stands (at 1200 and up a column beside the page; a
+ * sheet below), `width` its column in px, and `mode` which of its modes it
+ * shows: `details` (the inspector) or, in Pro, `supervisor` (the chat —
+ * `shell/panel/modes.ts` owns the words).
+ */
+export interface PanelPref {
+  open: boolean;
+  width: number;
+  mode: string;
+}
+
+/** The panel's column on a desk, in px: wide enough for a card, narrow enough to leave the page a page. */
+export const PANEL_WIDTH = { min: 320, initial: 400, max: 640 } as const;
+
 export interface Prefs {
   theme: Theme;
-  density: 'comfortable' | 'compact';
+  density: Density;
+  /** See `PanelPref`. */
+  panel: PanelPref;
   /** How the plan list is ordered — see `views/plans/model.ts` `SORTS`. */
   sort: string;
   /** Plan list: include the documents and orphan handoffs, not only plans. */
@@ -71,11 +94,14 @@ export interface Prefs {
    */
   plansHiddenBannerOff: boolean;
   model: string;
-  /** Plan list: rich cards, or the dense comparison table. */
-  plansLayout: 'board' | 'table';
+  /**
+   * Plan list: one line per plan (`list`, 7.0's library) or a card per plan.
+   * `board` and `table` are 6.x's words, read as `list` and never written.
+   */
+  plansLayout: 'list' | 'cards' | 'board' | 'table';
   /** Plan list: one flat list, or sectioned by status or by repo. */
   plansGroup: 'none' | 'status' | 'repo';
-  /** How Next up is ordered — see `features/runs/lanes-model.ts` `RANKS`. */
+  /** How Ready to start is ordered — see `data/lanes.ts` `RANKS`. */
   readyRank: string;
   /**
    * Ready board: one flat queue, or grouped under each plan.
@@ -95,7 +121,7 @@ export interface Prefs {
    * one would have to turn them on again after every click.
    */
   nowShowAcked: boolean;
-  /** How the runs ledger is ordered — see `features/runs/model.ts` `SORTS`; its filters, groups and hidden columns are `tables['runs-ledger']`. */
+  /** How the runs ledger is ordered — see `screens/runs/all-runs.tsx` `RUNS_SORTS`; its filters, groups and hidden columns are `tables['runs-ledger']`. */
   runsSort: string;
   /**
    * Fleet: keep runs of CLOSED plans in the table. Off by default — a run of a
@@ -110,15 +136,20 @@ export interface Prefs {
    *
    * One or the other, never both: they are two readings of the same fleet, and
    * drawing them beside each other is how a page comes to say two things about
-   * one run. The board is the default because it is the only one of the two
-   * that can be acted on — the table answers "what has happened", the board
-   * answers "what is happening, and what do I do about it" — and the board's
-   * empty state points at the table when nothing is live.
+   * one run. The groups are the default because they are the only one of the
+   * two that can be acted on — the grid answers "what has happened", the groups
+   * answer "what is happening, and what do I do about it".
+   *
+   * 7.0's words are `groups` and `all` (quiet-console phase 7); `board` and
+   * `table` are the 6.x words a stored preference may still hold, read as
+   * aliases through `runsViewWord` and never written again. The key is reused,
+   * never renamed: the registry row is `browser.runsView`.
    */
-  runsView: 'board' | 'table';
+  runsView: 'groups' | 'all' | 'board' | 'table';
   /**
-   * Which sections of the run page's phase table are collapsed
-   * (`features/runs/phase-table.tsx` `PHASE_GROUPS`).
+   * Which sections of the run page's phase table are collapsed (the 6.2
+   * `features/runs/phase-table.tsx` `PHASE_GROUPS`, gone with the run page in
+   * quiet-console phases 10–11; nothing reads it now).
    *
    * Persisted rather than component state for one reason: the run page
    * remounts on every navigation, and a Done section that re-opens each time
@@ -127,21 +158,22 @@ export interface Prefs {
    */
   runPhasesCollapsed: string[];
   /**
-   * Which run strips are expanded in place (`features/runs/tower/strip.tsx`),
+   * Which run rows are expanded in place (`screens/runs/run-row.tsx`; the 6.2 strip's),
    * by run id, newest first and capped — "expand in place, and remember each
    * expansion per user" (docs/design.md, control-tower phase 19). Stored as the
    * OPEN ids: a strip is folded until somebody opens it.
    */
   stripsOpen: string[];
   /**
-   * Which of the run page's folded sections are open (`features/runs/run-sections.tsx`,
-   * control-tower phase 24), by section id. Stored as the OPEN ids, like
+   * Which of the Run view's folds are open (`screens/plan/run/sections.ts`,
+   * quiet-console phase 11; the run page's since control-tower phase 24), by
+   * section id. Stored as the OPEN ids, like
    * `stripsOpen`: the page opens on a glance, and a section stays folded until
    * somebody opens it — then stays open for them on every run they read.
    */
   runSectionsOpen: string[];
   /**
-   * The Tower's saved filters (`features/runs/tower/`, control-tower phase 20):
+   * The Runs home's saved filters (`screens/runs/`; the Tower's since control-tower phase 20):
    * the annunciator lamp pressed — a `HALT_CATEGORIES` word, empty for none,
    * stored as a plain string so a family the vocabulary later drops reads as
    * "no filter" — and the free text over plan names. Kept, because a filter a
@@ -162,12 +194,12 @@ export interface Prefs {
   planPhasesCollapsed: string[];
   /** Keep the session console open on the runs page while nothing is running. */
   runsConsole: boolean;
-  /** How the sessions list is ordered — see `features/sessions/model.ts` `SORTS`. */
+  /** How the sessions list is ordered — see `screens/sessions/model.ts` `SORTS`. */
   sessionsSort: string;
   /**
    * Which kind the sessions list is filtered to; empty is every kind.
    *
-   * A `SessionGroupKind` (`features/sessions/list.tsx`), stored as a plain
+   * A `SessionGroupKind` (`screens/sessions/model.ts`), stored as a plain
    * string on purpose: a value the vocabulary has
    * since stopped offering must read as "every kind" rather than as an empty
    * list, and a browser carrying a retired word cannot be migrated.
@@ -215,6 +247,13 @@ export interface Prefs {
    * new field here and a retired one leaves a harmless entry behind.
    */
   tables: Record<string, TableState>;
+  /**
+   * Everything, per page (design.md §1, principle 3; `ui/everything.ts`): page
+   * id → on. Absent is off — the essentials. Only `true` is ever stored, so a
+   * page somebody switched back leaves nothing behind. One key for every page,
+   * for `tables`' reason: a page added later needs no new field here.
+   */
+  everything: Record<string, boolean>;
 }
 
 // A key added here is safe for a browser carrying the old client's settings:
@@ -223,12 +262,15 @@ export interface Prefs {
 const DEFAULTS: Prefs = {
   theme: 'system',
   density: 'comfortable',
+  // Closed until something is inspected: a page is one calm column, and an
+  // empty panel beside it is chrome.
+  panel: { open: false, width: PANEL_WIDTH.initial, mode: 'details' },
   sort: 'activity',
   showDocuments: false,
   showClosed: false,
   plansHiddenBannerOff: false,
   model: '',
-  plansLayout: 'board',
+  plansLayout: 'list',
   plansGroup: 'none',
   readyRank: 'leverage',
   // Off: acknowledged is "seen, not cleared", and a list that shows everything
@@ -239,7 +281,7 @@ const DEFAULTS: Prefs = {
   readyGroup: true,
   runsSort: 'updated',
   runsShowClosed: false,
-  runsView: 'board',
+  runsView: 'groups',
   // Only `done` — the one group that is usually the longest and least read.
   runPhasesCollapsed: ['done'],
   stripsOpen: [],
@@ -259,6 +301,7 @@ const DEFAULTS: Prefs = {
   terminalScreenReader: false,
   terminalWebgl: false,
   tables: {},
+  everything: {},
 };
 
 /** Read-only view of the shipped defaults, so a test can pin one without

@@ -273,7 +273,7 @@ function device(node: Record<string, unknown>): TailscaleDevice {
  * machine for the same reason the port is. `serveCommandFor` is what decides
  * the port actually printed, because a sibling can already hold this one.
  *
- * The client keeps an import-free copy (`features/settings/tailscale.tsx`) for
+ * The client keeps an import-free copy (`screens/settings/reach.tsx`) for
  * a server that predates `serve.command`; the two suites pin the same table.
  */
 export function httpsPortFor(port: number): number {

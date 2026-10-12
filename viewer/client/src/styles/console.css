@@ -4,10 +4,9 @@
  * Utilities cannot express this: every rule below paints a *descendant* chosen
  * by the parent's kind (`.live-line.k-tool .live-k`), and the kind arrives from
  * the console model at runtime — there is no set of classes a component could
- * hold. Same reasoning as `prose.css` and `route-map.css`, and the same
- * mechanism: `@import`ed by `theme.css` inside `@layer components`, so layer
- * order (not file order) decides the cascade and a utility on the element still
- * wins.
+ * hold. Same reasoning as `prose.css`, and the same mechanism: `@import`ed by
+ * `theme.css` inside `@layer components`, so layer order (not file order)
+ * decides the cascade and a utility on the element still wins.
  *
  * The colour vocabulary is the board's, unchanged: progress for a tool call,
  * done for verification, blocked for a failure, ready/amber for anything an
@@ -61,18 +60,19 @@
 
 /* The line a `?line=` permalink names. A ruled band rather than a background
    wash, so it stays legible against every kind colour below — and it survives
-   the reader scrolling away and back, because the hash still says so. */
+   the reader scrolling away and back, because the hash still says so. Ink,
+   not amber: a permalink is a place, never a summons (tokens 7.0). */
 .live-line.is-linked {
-  background: color-mix(in oklch, var(--accent) 12%, transparent);
-  box-shadow: inset 2px 0 0 0 var(--accent);
-  border-radius: 2px;
+  background: color-mix(in oklch, var(--ink) 8%, transparent);
+  box-shadow: inset 2px 0 0 0 var(--ink-muted);
+  border-radius: var(--radius-sm);
 }
 /* A shadow's offset has no logical spelling, and the band is the line's LEADING
    edge — the same edge `k-steer` and `k-subagent` rule below — so under RTL the
    offset flips by hand. `:dir()` follows the direction the line inherits, not
    the document's alone. */
 .live-line.is-linked:dir(rtl) {
-  box-shadow: inset -2px 0 0 0 var(--accent);
+  box-shadow: inset -2px 0 0 0 var(--ink-muted);
 }
 
 .live-line.k-tool .live-k,

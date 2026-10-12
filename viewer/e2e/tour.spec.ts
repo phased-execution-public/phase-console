@@ -2,8 +2,9 @@ import { expect, test } from '@playwright/test';
 
 import { STOPS, fixture, shoot, visit } from './lib/shots.ts';
 
-// The tour: every destination `shared/route-meta.js` declares, every plan tab,
-// `#/approve` and the three overlays, in all four viewports — rendered without
+// The tour: every stop `lib/shots.ts` names — every destination
+// `shared/route-meta.js` declares, every plan tab, Your turn and the three
+// overlays among them — in all four viewports, rendered without
 // an uncaught error or a fallen error boundary, and photographed. The pictures
 // (`e2e/.shots/<viewport>/<stop>.png`) are never compared by pixel; they are
 // for the session that changed a page to open and READ.

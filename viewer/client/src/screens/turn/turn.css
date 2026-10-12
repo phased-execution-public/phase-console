@@ -1,0 +1,34 @@
+/*
+ * Your turn's own stylesheet (7.0, quiet-console phase 8; control-tower phase
+ * 137) — loaded with the page's lazy chunk, never on first paint.
+ *
+ * One thing lives here, impossible to say in utilities: PRINT. *Print* hands
+ * the page to the browser: the shell's rail, header, tab bar and panel fold
+ * away, the one scroller (`<main>`) lets its content run its whole length,
+ * and every item prints open — the same document *Export* writes, on paper.
+ * (The guide's track is the cards' own, `cards/guide.css`.)
+ */
+
+@media print {
+  /* The page alone: the shell's chrome folds away … */
+  body:has([data-turn-page]) :is(header, nav, aside, [data-testid='tab-bar'], [data-testid='rail'], [role='dialog']) {
+    display: none !important;
+  }
+  /* … the one scroller lets the page run its whole length … */
+  body:has([data-turn-page]) :is(#root, #main, main) {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  /* … and the page's own controls do not print — every item is printed open. */
+  [data-turn-page] [data-print='hide'],
+  [data-turn-page] [data-toolbar] {
+    display: none !important;
+  }
+  [data-turn-page] [data-print='open'] {
+    display: flex !important;
+  }
+  [data-turn-page] [data-testid='turn-item'] {
+    break-inside: avoid;
+  }
+}

@@ -1,9 +1,9 @@
 
 ## Or copy the one line that starts it
 
-**Settings ▸ Essentials ▸ Start with every capability** composes the exact command from this console's own facts
-— its source directory, its port, and every switch but `--allow-publish`, the one that pushes — and gives you a
-Copy button.
+**Settings ▸ Essentials ▸ Start command** composes the exact command from this console's own facts
+— its source directory, its port, and every switch but `--allow-publish`, the one that pushes — and gives you
+**Copy the command**.
 
 Paths render as `$HOME/…` rather than absolute, so the line works pasted on any account and a
 screenshot of that page carries no username.
@@ -30,7 +30,7 @@ never implied by a narrower one. **All eight are off unless you name them.**
 | Flag | What it opens |
 |---|---|
 | `--allow-writes` | Scaffold plans and handoffs, record QA results, take phase locks, close and reopen plans. It never commits and never pushes. |
-| `--allow-run` | **Spawn Claude sessions that edit your repository**, unattended, for hours. The widest of the eight. Nothing on the Autopilot tab starts, stops or approves anything without it. |
+| `--allow-run` | **Spawn Claude sessions that edit your repository**, unattended, for hours. The widest of the eight. Nothing on a plan's **Run** view starts, stops or approves anything without it. |
 | `--allow-terminal` | A **real shell** in the browser, running as you, with no policy in front of it. |
 | `--allow-agent` | Interactive `claude` sessions in that shell, and the *New plan with AI* wizard. The CLI still asks before it acts; you answer in the terminal itself. |
 | `--allow-accounts` | Register more than one Claude account, choose one per run, and let a run that hits its usage window move to one with headroom. **The usage meters work without it** — only registering accounts is gated. |
@@ -38,8 +38,8 @@ never implied by a narrower one. **All eight are off unless you name them.**
 | `--allow-webhooks` | **POST every announcement somewhere else** — a Slack channel, a Discord server, a Telegram chat, your own relay. The only switch that sends anything off this machine, which is why it is its own. Off means no outbound request at all, even for a URL already registered. **Reading the destination list works without it.** |
 | `--allow-publish` | **Push a finished phase's `pe/*` branch** — never a trunk, never with force, and only where the plan's `permission.destructive` row allows `git push`. Off means the console pushes nothing; a `Land: pr` phase then parks with the reason. The eighth switch, and the second that leaves the machine. |
 
-The startup banner says which are on, and the line at the top of this Guide says what *this* console
-can do right now.
+The startup banner says which are on, Settings ▸ Essentials lists each as **On** or **Off**, and the first
+line of this Help sheet says what *this* console can do right now.
 
 > Flags are read once, at startup, so turning one on means restarting.
 

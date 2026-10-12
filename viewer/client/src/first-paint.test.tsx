@@ -9,27 +9,29 @@
  * is written so that undoing its change turns it red. The comment above each
  * names the undo.
  *
- * ⚠️ Read `features/plans/tabs.test.ts` before adding to this file: it holds
+ * ⚠️ Read `screens/plan/tabs.test.ts` before adding to this file: it holds
  * the render-tree walk and its five documented blind spots. Nothing here
  * replaces it — this file is about timing, that one is about reachability.
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
-import { PlanCards } from '@/features/plans/map-view';
-import { TooltipProvider } from '@/components/ui';
-import { ROUTE_TABLE, preloadView, type PageRoute } from '@/app/router';
-import { EVENT_EFFECTS, applyEffect, keys, queryClientConfig } from '@/lib/queries';
+import { PhasesFoot } from '@/screens/plan/phases/view';
+import { TooltipProvider } from '@/ui/tooltip';
+import { ROUTE_TABLE, preloadView, type PageRoute } from '@/shell/router';
+import { EVENT_EFFECTS, applyEffect } from '@/data/live';
+import { keys, queryClientConfig } from '@/data/keys';
 import { PERSISTED_ROOTS, shouldPersistQuery } from '@/lib/persist';
 import { afterLoadIdle } from '@/lib/pwa';
-import type { ConsoleState, PlanDetail } from '@/lib/api';
+import type { ConsoleState, PlanDetail } from '@/data/api';
 
 const { state, prompt } = vi.hoisted(() => ({ state: vi.fn(), prompt: vi.fn() }));
 
-vi.mock('@/lib/api', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/lib/api')>();
+// The pages' hooks import the barrel itself, so its fetchers are mocked there.
+vi.mock('@/data/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/data/api')>();
   return {
     ...actual,
     api: {
@@ -170,32 +172,38 @@ const DETAIL = {
 
 describe('opening a plan spends no engine invocations', () => {
   /**
-   * UNDO THAT REDS THIS: delete `collapsed` from the ready-phase `PromptCard`s
-   * in `features/plans/map-view.tsx` (`PlanCards`, under every view of the Phases tab).
+   * UNDO THAT REDS THIS: open the foot's "Boot prompts" fold by default, or
+   * make `PromptFold` (`screens/plan/phases/prompt.tsx`) fetch outside its own
+   * fold — the Phases view's foot, under every reading of the grid.
    *
-   * Each boot prompt is a `phase-graph.sh` shell-out SERVER-side, and
-   * `PromptCard` fetches on `enabled: open`. Three ready phases meant three
-   * engine runs on the same page load as everything else — for text nobody had
-   * asked to see. The board above already says which phases are ready.
+   * Each boot prompt is a `phase-graph.sh` shell-out SERVER-side, and a fold
+   * fetches only once it is open. Three ready phases meant three engine runs on
+   * the same page load as everything else — for text nobody had asked to see.
+   * The grid above already says which phases are ready.
    */
-  it('issues no prompt request for a ready phase until its card is opened', async () => {
+  it('issues no prompt request for a ready phase until its own fold is opened', async () => {
     render(
       <QueryClientProvider client={client()}>
         <TooltipProvider>
-          <PlanCards detail={DETAIL} />
+          <PhasesFoot detail={DETAIL} />
         </TooltipProvider>
       </QueryClientProvider>,
     );
 
-    // Three ready phases, three cards, and a Show button on each.
-    const cards = await screen.findAllByText(/Boot prompt — phase/);
-    expect(cards).toHaveLength(3);
+    // Three ready phases behind one fold that says how many.
+    const fold = await screen.findByTestId('foot-prompts');
+    expect(fold).toHaveTextContent('(3)');
 
     // An ABSENCE assertion, so it needs a real window rather than one tick —
-    // a `PromptCard` that fetched on mount would have done so by now.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    });
+    // a fold that fetched on mount would have done so by now.
+    const settle = () => act(async () => void (await new Promise((resolve) => setTimeout(resolve, 20))));
+    await settle();
+    expect(prompt).not.toHaveBeenCalled();
+
+    // Open, it lists one prompt per ready phase — each still behind its own press.
+    fireEvent.click(fold);
+    expect(await screen.findAllByText(/^Boot prompt for phase/)).toHaveLength(3);
+    await settle();
     expect(prompt).not.toHaveBeenCalled();
   });
 });

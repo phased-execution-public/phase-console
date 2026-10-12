@@ -23,8 +23,8 @@
  *     a lazy chunk the entry document never references — in the precache OR
  *     as a `modulepreload`, which is the second way a lazy chunk stops being
  *     lazy and the one nothing checked until Phase 7.
- *   • first paint (entry + every modulepreload) is GATED at 190 KB (200 until
- *     control-tower phase 18, see the note above the constant) — of SERVED
+ *   • first paint (entry + every modulepreload) is GATED at 170 KB (see the
+ *     note above the constant) — of SERVED
  *     bytes, the `.br`/`.gz` sibling the server actually sends. It was advisory
  *     for four phases, drifted 211 → 220 KB, and nobody read the printed line;
  *     the cause turned out to be a one-line barrel import, not a dependency
@@ -33,9 +33,7 @@
  *     above the constant.
  *   • the TABLE ENGINE (TanStack Table, behind the grid's filters, groups and
  *     picks — control-tower phase 18) is a lazy chunk of its own that no chunk
- *     imports statically and the document never preloads; and first paint is
- *     held at its figure from before the grid left the preloaded barrel, so
- *     that move is proven not to have raised it.
+ *     imports statically and the document never preloads.
  *   • `dist/.build-rev` exists — proves the stamp stayed wired into
  *     `npm run build`, which is what `npm start`'s staleness warning reads.
  *
@@ -117,12 +115,12 @@ check('the precache includes index.html (the offline shell)', sw.includes('index
 check(
   'the precache does NOT include the pane chunk (where xterm lives)',
   !sw.includes('pane-'),
-  'the emulator chunk `features/sessions/session-page.tsx` lazy-loads — 89 KB no reader of a route map needs',
+  'the emulator chunk `screens/sessions/session-page.tsx` lazy-loads — 89 KB no reader of a route map needs',
 );
 check(
   'the precache DOES include the Sessions destination chunk',
   /\bsessions-[^"'`\s]*\.js/.test(sw),
-  'Sessions is one of the eight destinations; its chunk belongs in the offline shell like the rest. ' +
+  'Sessions is one of the seven destinations; its chunk belongs in the offline shell like the rest. ' +
     'If this fails while the emulator check passes, the destination chunk was excluded by name — the thing ' +
     'to exclude is the pane, never the page.',
 );
@@ -130,7 +128,7 @@ check(
  * The other two destinations Phase 11 built, by the same rule.
  *
  * A destination is precached; the expensive thing INSIDE it is not. Settings
- * is eight sections and only two of them are heavy (the MCP catalog with its
+ * is nine sections (Pro adds two) and only two of them are heavy (the MCP catalog with its
  * search and add dialog; the permissions rule editor), so both are `lazy()`
  * inside the section chunk — the same shape as Sessions and its pane, for the
  * same reason: nobody who opened Settings to flip a theme should download a
@@ -148,7 +146,20 @@ check('the precache DOES include the Insights destination chunk', /\binsights-[^
  * whatever signal is there) where that matters most.
  */
 check('the precache DOES include the Repo destination chunk', /\brepo-[^"'`\s]*\.js/.test(sw));
-check('the precache DOES include the Debug destination chunk', /\bdebug-[^"'`\s]*\.js/.test(sw));
+/*
+ * Debug became Logs in 7.0 (quiet-console phase 3), and since phase 20 the
+ * place is `screens/logs/index.tsx`, so its chunk is `logs-*` — the 6.x name
+ * no longer satisfies the check. Below, once the assets are listed, the place's
+ * own chunk is found by content, because `data/logs.ts` is a `logs-*` too.
+ */
+check('the precache DOES include the Logs destination chunk', /\blogs-[^"'`\s]*\.js/.test(sw));
+/*
+ * The seven destinations, all of them: Runs and Plans are offline too. Each
+ * also names a `data/` chunk, so these two say only that nothing excluded the
+ * name — the glob takes every chunk the list above does not ignore.
+ */
+check('the precache DOES include the Runs destination chunk', /\bruns-[^"'`\s]*\.js/.test(sw));
+check('the precache DOES include the Plans destination chunk', /\bplans-[^"'`\s]*\.js/.test(sw));
 
 /* The entry — parsed from the document, not guessed from filenames. */
 const entryMatch = /<script[^>]+type="module"[^>]+src="\/assets\/(index-[^"]+\.js)"/.exec(html);
@@ -187,7 +198,7 @@ check(
   "Settings' two heavy sections are chunks of their own",
   assets.some((name) => /^mcp-.*\.js$/.test(name)) &&
     assets.some((name) => /^permissions-.*\.js$/.test(name)),
-  'features/settings/index.tsx reaches the MCP catalog and the permissions editor through `lazy()`. ' +
+  'screens/settings/index.tsx reaches the MCP section and the permissions editor through `lazy()` (its BODIES). ' +
     'A static import folds both into the precached Settings chunk — which every visitor downloads ' +
     'on install, including one who only ever changes the theme.',
 );
@@ -224,7 +235,7 @@ check(
   `the precache excludes the emulator, whatever the chunk is called (${xtermChunks.join(', ') || 'none'})`,
   precachedXterm.length === 0,
   `precached: ${precachedXterm.join(', ')} — add it to globIgnores in vite.config.ts. ` +
-    'A renamed emulator chunk is the usual cause; see the note in features/sessions/pane.tsx.',
+    'A renamed emulator chunk is the usual cause; see the note in screens/sessions/pane.tsx.',
 );
 
 /*
@@ -260,7 +271,7 @@ check(
   'the Sessions destination chunk carries no emulator',
   emulatorInSessions.length === 0,
   `${emulatorInSessions.join(', ')} contains xterm — the pane must stay behind ` +
-    "`lazy(() => import('./pane'))` in features/sessions/session-page.tsx; a static import puts 89 KB gz " +
+    "`lazy(() => import('./pane'))` in screens/sessions/session-page.tsx; a static import puts 89 KB gz " +
     'of emulator into a chunk every visitor precaches.',
 );
 
@@ -273,12 +284,12 @@ check(
  * source of any file anyone would think to open:
  *
  *   - `groupRows`, a ten-line helper, was exported from the 888-line run table,
- *     so importing the helper imported the table (now `features/runs/phase-groups`).
+ *     so importing the helper imported the table (the helper now lives apart from it).
  *   - `LaunchDialog` — the whole run-setup surface, 77.6 KB of skill picker,
  *     MCP picker, per-phase table and zod schema — was a static import in two
  *     components the plan page mounts, both of which render it as
  *     `{open && <LaunchDialog/>}`. Rendered on a press; downloaded by everyone
- *     (now `features/run-setup/lazy-launch-dialog`).
+ *     (now `screens/launch/door`, the one door every launch opens through).
  *
  * So this walks the graph rather than trusting a name. `import("./x.js")` and
  * its backticked twin are deliberately NOT followed: a dynamic import is the
@@ -310,11 +321,12 @@ function chunkClosure(entry) {
   return seen;
 }
 
-const planChunk = assets.find((name) => /^detail-.*\.js$/.test(name));
+// `plan-vocab-*` (shared/plan-vocab.js) shares the prefix; the page's chunk is `plan-<hash>`.
+const planChunk = assets.find((name) => /^plan-(?!vocab-)[\w-]+\.js$/.test(name));
 check(
   'the plan route is its own chunk (nothing to walk otherwise)',
   Boolean(planChunk),
-  'features/plans/detail.tsx is `page(() => import(...))` in app/router.tsx; if it stopped being its ' +
+  'screens/plan/index.tsx is `page(() => import(...))` in shell/router.tsx; if it stopped being its ' +
     'own chunk it was folded into the entry, which is a bigger problem than this check.',
 );
 if (planChunk) {
@@ -324,9 +336,8 @@ if (planChunk) {
     `the plan route never statically pulls run-setup (${planGraph.size} chunks in its graph)`,
     runSetup.length === 0,
     `${runSetup.join(', ')} is reachable from ${planChunk} by static imports. The launch dialog must be ` +
-      "reached through `features/run-setup/lazy-launch-dialog`, and the run table's grouping helpers " +
-      'through `features/runs/phase-groups` — never `phase-table` or `launch-dialog` directly from ' +
-      'anything the plan page mounts.',
+      'reached through `LaunchDoor` (`screens/launch/door.tsx`) — never `launch-dialog` or `run-setup` directly ' +
+      'from anything the plan page mounts.',
   );
 }
 
@@ -339,23 +350,62 @@ if (planChunk) {
  * read a commit graph downloaded 71 KB of skill picker. That is the plan
  * route's own regression, on a different page, which is exactly why the check
  * is a rule rather than a fact about one chunk.
+ *
+ * The route's chunk is found by CONTENT, as the turn chunk is below: since 7.0
+ * two chunks are named `repo-*` — the place (`screens/repo/index.tsx`) and its
+ * data hooks (`data/repo.ts`) — and which of them sorts first is the hashes'
+ * business. Taken by name, the walk below could read the hooks' four imports
+ * and call the route clean (quiet-console phase 17). The place is the one that
+ * names its section nav.
  */
-const repoChunk = assets.find((name) => /^repo-.*\.js$/.test(name));
+const REPO_MARK = 'Repo sections';
+const repoChunk = assets.find(
+  (name) =>
+    /^repo-.*\.js$/.test(name) && readFileSync(join(DIST, 'assets', name), 'utf8').includes(REPO_MARK),
+);
 check(
   'the repo route is its own chunk (nothing to walk otherwise)',
   Boolean(repoChunk),
-  'features/repo/index.tsx is `page(() => import(...))` in app/router.tsx; if it stopped being its ' +
-    'own chunk it was folded into the entry, which is a bigger problem than this check.',
+  'screens/repo/index.tsx is `page(() => import(...))` in shell/router.tsx, and its chunk is the `repo-*` one ' +
+    `that names its section nav ("${REPO_MARK}"). If none does, the place was folded into the entry — a bigger ` +
+    'problem than this check — or the nav was renamed, and this mark goes with it.',
 );
+if (repoChunk) {
+  check(`the precache includes the Repo place's own chunk (${repoChunk})`, sw.includes(repoChunk));
+}
+
+/*
+ * The Logs place's own chunk, by the Repo rule: two chunks are named `logs-*`
+ * since 7.0 — the place (`screens/logs/index.tsx`) and its data hooks
+ * (`data/logs.ts`) — and the place is the one that names its section nav. The
+ * offline shell must carry the PLACE: a phone that opens Logs with no network
+ * is exactly the reader who needs it.
+ */
+const LOGS_MARK = 'Logs sections';
+const logsChunk = assets.find(
+  (name) =>
+    /^logs-.*\.js$/.test(name) && readFileSync(join(DIST, 'assets', name), 'utf8').includes(LOGS_MARK),
+);
+check(
+  'the logs route is its own chunk',
+  Boolean(logsChunk),
+  'screens/logs/index.tsx is `page(() => import(...))` in shell/router.tsx, and its chunk is the `logs-*` one ' +
+    `that names its section nav ("${LOGS_MARK}"). If none does, the place was folded into the entry or the nav ` +
+    'was renamed, and this mark goes with it.',
+);
+if (logsChunk) {
+  check(`the precache includes the Logs place's own chunk (${logsChunk})`, sw.includes(logsChunk));
+}
 if (repoChunk) {
   const repoGraph = chunkClosure(repoChunk);
   const runSetup = [...repoGraph].filter((name) => /^run-setup-.*\.js$/.test(name));
   check(
     `the repo route never statically pulls run-setup (${repoGraph.size} chunks in its graph)`,
     runSetup.length === 0,
-    `${runSetup.join(', ')} is reachable from ${repoChunk} by static imports. The issues board's ` +
-      'launch must be reached through `features/repo/lazy-issues-launch` — never `issues-launch`, ' +
-      'nor anything else that imports `RunSetup`, directly from anything the Repo destination mounts.',
+    `${runSetup.join(', ')} is reachable from ${repoChunk} by static imports. The Issues desk is ` +
+      '`lazy()` in screens/repo/index.tsx, its plan-from-issues dialog `lazy()` in the desk, and every ' +
+      'launch on it goes through `screens/launch/door` — never `run-setup` or `launch-dialog` directly ' +
+      'from anything the Repo destination mounts.',
   );
 }
 
@@ -365,8 +415,8 @@ if (repoChunk) {
  * The Landscape section (many-plans-one-repo phase 14) draws the repository
  * map on React Flow with a d3-dag layout — ~97 KiB gzipped by the phase-1
  * spike (`test/fixtures/spikes/react-flow-bundle.md`), behind a section most
- * readers of `#/repo` never open. `features/repo/index.tsx` reaches it through
- * `features/repo/pro/lazy-landscape`, so the library rides in a chunk of its
+ * readers of `#/repo` never open. `screens/repo/index.tsx` reaches
+ * `screens/repo/pro/landscape-section` through `lazy()`, so the library rides in a chunk of its
  * own: not in the repo chunk's static graph, not in the precache, not
  * preloaded. Each is found by CONTENT — whichever chunk carries React Flow's
  * own class prefix — for the reason the pane check gives: a name is exactly
@@ -386,13 +436,13 @@ if (repoChunk) {
     `the repo route's static graph carries no React Flow (${repoGraph.size} chunks walked)`,
     pulled.length === 0,
     `${pulled.join(', ')} is reachable from ${repoChunk} by static imports. The Landscape section must be ` +
-      'reached through `features/repo/pro/lazy-landscape` — never `landscape-section` or `repo-map` ' +
-      'directly from anything the Repo destination mounts.',
+      'reached through the `lazy()` in screens/repo/index.tsx — never `landscape-section` or `repo-map` ' +
+      'statically from anything the Repo destination mounts.',
   );
 }
 /*
  * And the plan route, in both trees (control-tower phase 30). The route map is
- * hand-rolled — `components/dag.tsx`, kept over React Flow by the phase's
+ * hand-rolled — `screens/plan/map/dag.tsx`, kept over React Flow by the phase's
  * spike, which measured React Flow's pane taking a phone's vertical swipe — so
  * no map library may reach the plan chunk's static graph. Found by content, as
  * above; in the free tree nothing carries the library and the walk is short.
@@ -404,8 +454,28 @@ if (planChunk) {
     `the plan route's static graph carries no map library (${planGraph.size} chunks walked)`,
     pulled.length === 0,
     `${pulled.join(', ')} is reachable from ${planChunk} by static imports. The plan route draws its map ` +
-      'with components/dag.tsx; a map library there would ride into every plan page, and into the free ' +
+      'with screens/plan/map/dag.tsx; a map library there would ride into every plan page, and into the free ' +
       "tree — control-tower phase 30's handoff records why it was not adopted.",
+  );
+}
+/*
+ * The route map is the console's largest drawing and most visits to a plan read
+ * the grid, so the map rides a chunk of its own (`screens/plan/map/map-view.tsx`,
+ * `lazy()` in the Phases view) — quiet-console phase 10.
+ */
+const mapChunk = assets.find((name) => /^map-view-.*\.js$/.test(name));
+check(
+  'the route map is its own chunk',
+  Boolean(mapChunk),
+  'screens/plan/phases/view.tsx loads `../map/map-view` with `lazy()`; a static import folds the map into the plan chunk.',
+);
+if (planChunk && mapChunk) {
+  const planGraph = chunkClosure(planChunk);
+  check(
+    `the plan route's static graph leaves the route map to its own chunk (${planGraph.size} chunks walked)`,
+    !planGraph.has(mapChunk),
+    `${mapChunk} is reachable from ${planChunk} by static imports. Only the Phases view's map reading draws it; ` +
+      'reach it through `lazy()`, never a static import of `screens/plan/map/*`.',
   );
 }
 const precachedReactFlow = reactFlowChunks.filter((name) => sw.includes(name));
@@ -413,7 +483,7 @@ check(
   `the precache excludes React Flow, whatever the chunk is called (${reactFlowChunks.join(', ') || 'none'})`,
   precachedReactFlow.length === 0,
   `precached: ${precachedReactFlow.join(', ')} — add it to globIgnores in vite.config.ts. A renamed landscape ` +
-    'chunk is the usual cause; see the note in features/repo/pro/lazy-landscape.tsx.',
+    'chunk is the usual cause; see the Landscape note in screens/repo/index.tsx.',
 );
 
 const preloaded = [...html.matchAll(/<link[^>]+rel="modulepreload"[^>]+href="\/assets\/([^"]+)"/g)].map(
@@ -424,14 +494,14 @@ check(
   'the document never modulepreloads React Flow, whatever the chunk is called',
   preloadedReactFlow.length === 0,
   `modulepreloaded: ${preloadedReactFlow.join(', ')} — a preloaded chunk is fetched by every visitor on ` +
-    'first paint. Usually a static import that should be a `lazy()`; see features/repo/pro/lazy-landscape.tsx.',
+    'first paint. Usually a static import that should be a `lazy()`; see the Landscape note in screens/repo/index.tsx.',
 );
 /*
  * The same rule for the fleet app's one heavy piece.
  *
  * The pairing QR (many-plans-one-repo phase 23) is drawn by the `qrcode`
  * encoder, which nobody opening the fleet app to read an inbox needs.
- * `features/fleet/reach.tsx` reaches it through `features/fleet/lazy-qr`, so
+ * `screens/fleet/reach.tsx` reaches it through `screens/fleet/lazy-qr`, so
  * the encoder rides in a chunk of its own: not in the Fleet chunk's static
  * graph, not in the precache, not preloaded. Found by CONTENT — the encoder's
  * own error sentence — for the reason the two checks above give. In the free
@@ -442,7 +512,20 @@ const QR_MARK = 'too big to be stored in a QR Code';
 const qrChunks = assets.filter(
   (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(QR_MARK),
 );
-const fleetChunk = assets.find((name) => /^fleet-.*\.js$/.test(name));
+/*
+ * The Fleet place's own chunk, by the Repo rule (quiet-console phase 24): two
+ * chunks are named `fleet-*` since 7.0 — the place (`screens/fleet/index.tsx`)
+ * and its data door (`data/fleet.ts`) — and which sorts first is the hashes'
+ * business. The place is the one that names its page (`fleet-page`); its
+ * sections ride in a chunk it shares with the supervisor's own app, so the
+ * offline shell must carry everything the place imports statically, not only
+ * the place. In the free tree no chunk names it, and the walks below are skipped.
+ */
+const FLEET_MARK = 'fleet-page';
+const fleetChunk = assets.find(
+  (name) =>
+    /^fleet-.*\.js$/.test(name) && readFileSync(join(DIST, 'assets', name), 'utf8').includes(FLEET_MARK),
+);
 if (fleetChunk) {
   const fleetGraph = chunkClosure(fleetChunk);
   const pulled = [...fleetGraph].filter((name) => qrChunks.includes(name));
@@ -450,7 +533,7 @@ if (fleetChunk) {
     `the fleet chunk's static graph carries no QR encoder (${fleetGraph.size} chunks walked)`,
     pulled.length === 0,
     `${pulled.join(', ')} is reachable from ${fleetChunk} by static imports. The pairing QR must be ` +
-      'reached through `features/fleet/lazy-qr` — never `qr-code` directly from anything the fleet app mounts.',
+      'reached through `screens/fleet/lazy-qr` — never `qr-code` directly from anything the fleet app mounts.',
   );
 }
 const precachedQr = qrChunks.filter((name) => sw.includes(name));
@@ -458,23 +541,23 @@ check(
   `the precache excludes the QR encoder, whatever the chunk is called (${qrChunks.join(', ') || 'none'})`,
   precachedQr.length === 0,
   `precached: ${precachedQr.join(', ')} — add it to globIgnores in vite.config.ts. A renamed qr-code chunk ` +
-    'is the usual cause; see the note in features/fleet/lazy-qr.tsx.',
+    'is the usual cause; see the note in screens/fleet/lazy-qr.tsx.',
 );
 const preloadedQr = qrChunks.filter((name) => preloaded.includes(name));
 check(
   'the document never modulepreloads the QR encoder, whatever the chunk is called',
   preloadedQr.length === 0,
   `modulepreloaded: ${preloadedQr.join(', ')} — a preloaded chunk is fetched by every visitor on first paint. ` +
-    'Usually a static import that should be a `lazy()`; see features/fleet/lazy-qr.tsx.',
+    'Usually a static import that should be a `lazy()`; see screens/fleet/lazy-qr.tsx.',
 );
 /*
  * The table engine, by the same three rules — and one stricter.
  *
- * `components/data-table/engine.ts` is the ONE file that imports TanStack
- * Table (ESLint's `no-restricted-imports` holds that in the source), and
- * `components/data-table/data-table.tsx` reaches it through `import()` only
- * when a table asks for a filter, a group, a pick or a window. A table with
- * none of those — most of them — never downloads it. Found by CONTENT: an
+ * `ui/grid/engine.ts` is the ONE file that imports TanStack Table, and the
+ * engine is reached only through `import()` (ESLint holds both in the source),
+ * by `ui/grid/grid.tsx` alone, only when a table asks for a filter, a group, a
+ * pick or a window. A table with none of those — most of them — never
+ * downloads it. The chunk is `engine-*`, by the file's name. Found by CONTENT: an
  * option name only the library itself spells (the client never writes it), for
  * the reason the pane check gives — a chunk name is exactly what a bundler is
  * free to change.
@@ -494,7 +577,7 @@ const engineChunks = assets.filter(
 check(
   `the table engine is its own lazy chunk (engine-*: ${engineChunks.join(', ') || 'none'})`,
   engineChunks.some((name) => /^engine-.*\.js$/.test(name)),
-  "components/data-table/data-table.tsx reaches the engine through `import('./engine')`; if no engine-* chunk " +
+  "ui/grid/grid.tsx reaches the engine through `import('./engine')`; if no engine-* chunk " +
     'carries it, it was folded into its importer — every page with a table would download it.',
 );
 const staticEngineImporters = assets.filter(
@@ -507,8 +590,7 @@ check(
   `no chunk imports the table engine statically (${staticEngineImporters.join(', ') || 'none do'})`,
   staticEngineImporters.length === 0,
   `${staticEngineImporters.join(', ')} import the engine by a static import. Only ` +
-    'components/data-table/engine.ts may import @tanstack/react-table, and only data-table.tsx reaches it, ' +
-    'through `import()`.',
+    'ui/grid/engine.ts may import @tanstack/react-table, and the grid reaches it only through `import()`.',
 );
 const preloadedEngine = engineChunks.filter((name) => preloaded.includes(name));
 check(
@@ -521,15 +603,15 @@ check(
  * The figures, by the table engine's three rules (control-tower phase 29).
  *
  * The four figures' drawings and the run's cost strip draw with visx, in
- * `components/figures/bars.tsx` and `run-chart.tsx`, and
- * `components/figures/lazy.tsx` reaches them only through `import()`.
- * `charts.tsx` is imported by nearly every destination for its MARKS (the
- * Pulse draws one), so a static edge from it — or from anything — to a drawing
- * is visx in first paint. Found by CONTENT: the `data-figure` attribute every
- * drawing spells and nothing else in the client does. Not kept out of the
- * precache, for the engine's reason: the figures are on precached
- * destinations, and an offline Insights page that could not draw would show
- * only its tables.
+ * `ui/figures/bars.tsx` and `ui/figures/run-chart.tsx`, behind ONE door that
+ * reaches each only through `import()`: `ui/figures/lazy.tsx`.
+ * The door is imported by every page that draws a figure and the Gantt sits
+ * on every plan's Run view, so a static edge from either — or from anything —
+ * to a drawing is visx in first paint. Found by CONTENT: the `data-figure`
+ * attribute every drawing spells and nothing else in the client does. Not
+ * kept out of the precache, for the engine's reason: the figures are on
+ * precached destinations, and an offline Insights page that could not draw
+ * would show only its tables.
  */
 const FIGURES_MARK = 'data-figure';
 const figureChunks = assets.filter(
@@ -539,8 +621,9 @@ check(
   `the figures are lazy chunks of their own (bars-*, run-chart-*: ${figureChunks.join(', ') || 'none'})`,
   figureChunks.some((name) => /^bars-.*\.js$/.test(name)) &&
     figureChunks.some((name) => /^run-chart-.*\.js$/.test(name)),
-  "components/figures/lazy.tsx reaches the drawings through `import('./bars')` and `import('./run-chart')`; " +
-    'if either chunk is gone it was folded into an importer — and the page that imports it carries visx.',
+  "ui/figures/lazy.tsx reaches the bars through `import('./bars')` and the cost strip through " +
+    "`import('./run-chart')`; if either chunk is gone it was folded into an importer — and the page that " +
+    'imports it carries visx.',
 );
 const staticFigureImporters = assets.filter(
   (name) =>
@@ -552,7 +635,7 @@ check(
   `no chunk imports a figure drawing statically (${staticFigureImporters.join(', ') || 'none do'})`,
   staticFigureImporters.length === 0,
   `${staticFigureImporters.join(', ')} import a figure drawing by a static import. Only ` +
-    'components/figures/lazy.tsx may reach bars.tsx or run-chart.tsx, and only through `import()`.',
+    'ui/figures/lazy.tsx may reach bars.tsx and run-chart.tsx, each only through `import()`.',
 );
 const preloadedFigures = figureChunks.filter((name) => preloaded.includes(name));
 check(
@@ -588,7 +671,7 @@ check(
     check(
       `first paint's static graph carries no Your turn (${firstPaint.size} chunks walked)`,
       pulled.length === 0,
-      `${pulled.join(', ')} is reachable from the entry by static imports — import features/turn lazily.`,
+      `${pulled.join(', ')} is reachable from the entry by static imports — import screens/turn lazily.`,
     );
   }
   const preloadedTurn = turnChunks.filter((name) => preloaded.includes(name));
@@ -600,13 +683,93 @@ check(
 }
 
 /*
+ * The owner key's ceremony (`data/owner.ts`, control-tower phase 148): the
+ * passkey's begin and finish, and the press that asks for it again
+ * (`data/press.ts`, quiet-console phase 2) reaches it through a dynamic
+ * import. Found by CONTENT — the one route only the ceremony asks — so a press
+ * or a card that imported it statically would put it in what every visitor
+ * downloads, and a console with no key never needs a byte of it.
+ */
+{
+  const ownerChunks = assets.filter(
+    (name) =>
+      name.endsWith('.js') &&
+      readFileSync(join(DIST, 'assets', name), 'utf8').includes('/api/owner/assert/begin'),
+  );
+  check(
+    `the owner key's ceremony is built (${ownerChunks.join(', ') || 'none'})`,
+    ownerChunks.length > 0 && entryMatch !== null && !ownerChunks.includes(entryMatch[1]),
+    'no chunk asks /api/owner/assert/begin, or the entry does — data/owner.ts was folded into first paint or lost.',
+  );
+  if (entryMatch) {
+    const firstPaint = chunkClosure(entryMatch[1]);
+    const pulled = [...firstPaint].filter((name) => ownerChunks.includes(name));
+    check(
+      `first paint's static graph carries no owner key ceremony (${firstPaint.size} chunks walked)`,
+      pulled.length === 0,
+      `${pulled.join(', ')} is reachable from the entry by static imports — reach data/owner lazily.`,
+    );
+  }
+  const preloadedOwner = ownerChunks.filter((name) => preloaded.includes(name));
+  check(
+    'the document never modulepreloads the owner key ceremony',
+    preloadedOwner.length === 0,
+    `modulepreloaded: ${preloadedOwner.join(', ')} — a preloaded chunk is fetched by every visitor on first paint.`,
+  );
+}
+
+/*
+ * First paint carries no command palette (quiet-console phase 3).
+ *
+ * The palette is `shell/palette/palette.tsx`, on cmdk, and `App.tsx` reaches
+ * it only through `lazy(() => import('@/shell/palette/palette'))`: what first
+ * paint holds is the chord that opens it (`shell/palette/shortcut.ts`), never
+ * the dialog. In 6.x the library rode in the kit's modulepreloaded barrel
+ * chunk, so every visitor downloaded the palette's engine before the first
+ * frame whether or not they ever pressed ⌘K. Found by
+ * CONTENT — `cmdk-root`, the attribute cmdk renders on its root and nothing in
+ * the client spells — because a chunk's name is the bundler's to change, and
+ * so the combobox that shares the library is held to the same rule: built,
+ * absent from first paint's static graph, never modulepreloaded.
+ */
+{
+  const CMDK_MARK = 'cmdk-root';
+  const cmdkChunks = assets.filter(
+    (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(CMDK_MARK),
+  );
+  check(
+    `the command palette is built (${cmdkChunks.join(', ') || 'no chunk spells it'})`,
+    cmdkChunks.length > 0 && entryMatch !== null && !cmdkChunks.includes(entryMatch[1]),
+    `no chunk spells \`${CMDK_MARK}\`, or the entry does — shell/palette/palette.tsx was lost or folded into ` +
+      'first paint. If cmdk renamed the attribute, move CMDK_MARK to another word only the library spells.',
+  );
+  if (entryMatch) {
+    const firstPaint = chunkClosure(entryMatch[1]);
+    const pulled = [...firstPaint].filter((name) => cmdkChunks.includes(name));
+    check(
+      `first paint carries no command palette (${firstPaint.size} chunks walked)`,
+      pulled.length === 0,
+      `${pulled.join(', ')} is reachable from the entry by static imports. App.tsx reaches the palette through ` +
+        "`lazy(() => import('@/shell/palette/palette'))` and the shell imports only `shell/palette/shortcut`; a " +
+        'first-paint import of `ui/command`, `ui/combobox` or a barrel that re-exports them carries cmdk.',
+    );
+  }
+  const preloadedCmdk = cmdkChunks.filter((name) => preloaded.includes(name));
+  check(
+    'the document never modulepreloads the command palette',
+    preloadedCmdk.length === 0,
+    `modulepreloaded: ${preloadedCmdk.join(', ')} — a preloaded chunk is fetched by every visitor on first paint.`,
+  );
+}
+
+/*
  * The status model's word tables and its icon map stay out of first paint
  * (control-tower phase 16).
  *
- * `StatusStack` and the toast sit in the preloaded `@/components/ui` barrel and
- * draw four note severities. The typed badge family (`ui/status/`) draws every
- * word of two dozen vocabularies with 98 lucide icons, and only pages import
- * it. Tree-shaking works per MODULE, not per chunk: a module that one
+ * The shell's toast and banner (`ui/toast.tsx`, `ui/banner.tsx`) are on first
+ * paint and draw four note severities. The typed status family (`ui/status/`)
+ * draws every word of two dozen vocabularies with 98 lucide icons, and only
+ * pages import it. Tree-shaking works per MODULE, not per chunk: a module that one
  * first-paint file and one page both import is placed whole in a chunk first
  * paint loads. So the notes live in modules of their own
  * (`shared/status-notes.js`, `ui/status/note-icons.ts`) — and while they did
@@ -639,31 +802,27 @@ check(
 );
 
 /*
- * The peek stays out of first paint (control-tower phase 19).
+ * The hover card stays out of first paint (control-tower phase 19).
  *
- * `components/peek.tsx` wraps `@radix-ui/react-hover-card`, and it sits OUTSIDE
- * the preloaded `@/components/ui` barrel on purpose: the run strip is its only
- * user, and the Runs page is a lazy route. A re-export from the barrel — the
- * one-line mistake that once cost first paint 8 KB — would put the hover card in
- * every visitor's first load. Found by CONTENT: the trigger's display name,
- * which the library spells and nothing else in the client does.
+ * `@radix-ui/react-hover-card` came in with the 6.2 run strip's peek and left
+ * with it in 7.0, uninstalled, so no chunk spells it and this check passes by
+ * having nothing to find. It stays as the rule for the next one: a hover card
+ * brought back through a first-paint file — the one-line barrel re-export
+ * that once cost first paint 8 KB — would put it in every visitor's first
+ * load. Found by
+ * CONTENT: the trigger's display name, which the library spells and nothing
+ * else in the client does.
  */
 const PEEK_MARK = 'HoverCardTrigger';
 const peekChunks = assets.filter(
   (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(PEEK_MARK),
-);
-check(
-  `the hover card is built (${peekChunks.join(', ') || 'no chunk spells it'})`,
-  peekChunks.length > 0,
-  `no chunk spells \`${PEEK_MARK}\`, so the check below could not find the peek it guards. If the ` +
-    'library renamed its trigger, move PEEK_MARK to another word only it spells.',
 );
 const peekInFirstPaint = peekChunks.filter((name) => name === entryMatch?.[1] || preloaded.includes(name));
 check(
   `first paint carries no hover card (${peekInFirstPaint.join(', ') || 'none does'})`,
   peekInFirstPaint.length === 0,
   `${peekInFirstPaint.join(', ')} spell \`${PEEK_MARK}\`: a first-paint file imports ` +
-    '`components/peek.tsx` (or the barrel re-exports it). The peek is for pages, reached through their routes.',
+    'the hover card (or a barrel re-exports it). A hover card is for pages, reached through their routes.',
 );
 
 const preloadedXterm = xtermChunks.filter((name) => preloaded.includes(name));
@@ -699,8 +858,14 @@ check(
  * comfortable 128.6 of 300 KB and says nothing is wrong. Only the total says
  * so. Raise this deliberately if a real dependency needs the room — with the
  * reason, here.
+ *
+ * 170 since 7.0 (quiet-console phase 29). The 7.0 shell imports nothing of the
+ * 6.x kit on its static path — the preloaded barrel that was 37 % of the old
+ * figure is gone with the old client — and first paint measured about 131 KB
+ * at the release. The gate keeps the room the redesign bought and makes
+ * spending it a decision, stated here.
  */
-const FIRST_PAINT_SERVED = 190 * 1024;
+const FIRST_PAINT_SERVED = 170 * 1024;
 
 /*
  * SERVED bytes, not `gzipSync` of the source.
@@ -717,13 +882,10 @@ const FIRST_PAINT_SERVED = 190 * 1024;
  * that step and this check reads the identity size and FAILS, which is the
  * whole point: the gap can no longer open silently.
  *
- * 190, not 200, since control-tower phase 18. That phase took the grid
- * (`DataTable`) and the long list (`DataList`, with its virtualizer) out of
- * the preloaded `@/components/ui` barrel: first paint went from 189.3 KB to
- * 181.3 KB served. The gate is set at the figure from BEFORE that move,
- * rounded up, so "the grid's new engine did not raise first paint" is a check
- * rather than a sentence — and the room the move freed is there to be spent
- * deliberately. Raise it with the reason, here.
+ * The gate was 200, then 190 (control-tower phase 18 took the grid and the
+ * long list out of the 6.x kit's preloaded barrel), and is 170 since 7.0 —
+ * each time set from a measured figure, never raised to make a build pass.
+ * Raise it with the reason, at the constant above.
  */
 function servedBytes(file) {
   if (!existsSync(file)) return 0;

@@ -30,7 +30,7 @@ import type { QueryClient } from '@tanstack/react-query';
 import { createSyncStoragePersister } from '@tanstack/query-sync-storage-persister';
 import { removeOldestQuery } from '@tanstack/react-query-persist-client';
 import type { PersistQueryClientOptions } from '@tanstack/react-query-persist-client';
-import { CACHE_GC_TIME } from './queries';
+import { CACHE_GC_TIME } from '@/data/keys';
 
 /** One entry, so a second console on another port cannot read this one's. */
 const CACHE_KEY = 'pc-query-cache';

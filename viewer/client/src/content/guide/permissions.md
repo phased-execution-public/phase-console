@@ -14,8 +14,8 @@ An approval card cannot get past these at run time, and neither can auto-grant. 
 deny rule only with a **grant**: one press on a permission item, with a scope and an end — a time limit,
 or your revoke (see **Grants**, below). The rules on the never list have no grant at all. Add your own in
 `~/.config/phase-console/autopilot.json`, or from **Settings** — your rules merge on top of the
-defaults, and shipped defaults can be struck by name (each list has ↩ and **Restore defaults** as
-the ways back). Striking a shipped **deny** rule is the one edit Settings confirms first: it widens
+defaults, and shipped defaults can be struck by name (a struck rule waits under *Shipped rules struck*,
+with **Restore**, and each list has **Restore defaults**, as the ways back). Striking a shipped **deny** rule is the one edit Settings confirms first: it widens
 what every future run may do, with this console dead included.
 
 ## The approval hook does not
@@ -100,7 +100,7 @@ with its own the moment it answers. On a console with an owner key, a press from
 it is only recorded: the card says it was asked of the owner, never that it was granted (see **The owner
 key**).
 
-**Grant every low-risk ask**, at the top of Your turn, grants every open low-risk ask in one press, each
+**Grant every low-risk ask (N)**, beside **Do now** on Your turn, grants every open low-risk ask in one press, each
 for this call or this phase and nothing wider. On a phone's lock screen, a low or medium-risk permission
 push offers **Allow** and **Deny**; *Allow* grants at the narrowest scope the item offers. A high-risk or
 never push offers **Open** and **Deny**, because a risky grant is typed on the page.
@@ -120,7 +120,8 @@ covers withdraws itself.
 Every grant is a row in `grants.ndjson`: who gave it, through which door, the item that asked, the wall, the
 rule, the scope, the end, and exactly what it changed. It is journalled (`policy.grant-applied`,
 `policy.grant-ended`) and announced in the push category **Permission granted**, which opens Settings ▸
-Permissions ▸ Grants at that grant. That page lists every grant with **Revoke** and **Revoke all**, and the
+Permissions ▸ Grants at that grant. That page lists every grant with **Revoke** and **Revoke all**, each
+asking why, which is kept on the grant's row and in the journal, and the
 terminal does the same with `phase-console grants list`, `phase-console grants revoke <id>` and
 `phase-console grants revoke-all`. A grant ends one of three ways: spent (a call, once used), expired (its
 phase settled, or its 24 hours passed) or revoked. A revoke undoes exactly what the row says the grant
@@ -188,7 +189,8 @@ low or medium-risk grant, answer a card or a decision, and approve a gate or a p
 person uses (`owner`, `device` and `local`) may **Deny**, say **I can't** and **Revoke**. A press through
 any other door — a script, the CLI, a browser with no key, a phone beyond its low and medium answers, a
 session's token — is not applied and not dropped.
-It is recorded as a request, shown on its item as `asked by <label> — confirm?`, with **Confirm** and
+It is recorded as a request, shown on its item as who asked, through which door and when, then *The
+owner confirms exactly this:* — the method, the path and the body — with **Confirm** and
 **Refuse** for the owner, and it is pressed through the owner's door only when the owner confirms it. What
 the plan's manifest already allows still executes. A lock-screen **Allow** is the `device` door, and it
 never grants a high-risk ask.
@@ -220,9 +222,10 @@ rule for that plan (a row scoped to a phase, for that phase), and every such gra
 *Permission needed* channel. A console setting cannot carve that exception; only the plan's own manifest
 can.
 
-The auto-grant switch has three scopes of its own, and the most specific wins: a **phase** (the launch
-dialog's per-phase "More" panel) beats the **plan** (this page, scope "to one plan only") beats
-**everywhere** (this page, global scope). Turn it off at any scope and those cards wait for a person
+The auto-grant switch has three scopes of its own, and the most specific wins: a **phase** (the launch's
+phase matrix, **More for phase N** ▸ **Auto-grant approvals in phase N only**) beats the **plan**
+(Settings ▸ Permissions, **These rules apply** set to *To one plan only*) beats **everywhere** (the same
+page, *Everywhere*). Turn it off at any scope and those cards wait for a person
 again — the off state is the one worth setting deliberately, since on is the shipped default.
 Verification sign-offs ("a check only you can make") and gates are never auto-granted; they are
 judgments, not permissions.
@@ -243,7 +246,7 @@ the policy can deliver. **No profile silences a question.** A call that is a que
 than a permission — `AskUserQuestion` — is held on all three, right after the deny list. On a run whose
 **relay** is armed (`relay: last-resort`, at a CLI of 2.1.268 or later) it goes on the queue for 60 seconds
 as a question card — pick an option there or on the phone — and, unanswered, the console answers it at 55
-seconds by a relay rule (Settings ▸ Automation ▸ policy answers), else its `(Recommended)` option, else its
+seconds by a relay rule (Settings ▸ Automation ▸ **Policy answers**), else its `(Recommended)` option, else its
 first, and tells the session it did (`phase.question-answered`). A multi-select question, one with a
 destructive option, one the deny list touches, one raised while the run is stopped, or the same question
 twice in a phase is never answered that way: the phase parks for a person. Anywhere else a question is
@@ -267,7 +270,7 @@ ledger. When the console chose, the session is told so in plain terms: the answe
 that it is not a change to the phase, and to declare `blocked --needs ambiguity` rather than ask again.
 
 The ruling it leaves in the inbox offers **Remember as a relay rule**: this question, this answer,
-kept in `relayRules` with the rest of Settings ▸ Automation ▸ policy answers. From then on that rule
+kept in `relayRules` with the rest of Settings ▸ Automation ▸ **Policy answers**. From then on that rule
 is the console's answer to the same question when its window closes — a person inside the window still
 wins. Each phase may put 8 questions through the relay; past that the phase parks for a person
 (`budget-spent`), the same way an excluded question does (`phase.question-unanswerable`).
@@ -297,7 +300,8 @@ back, with the outage counted in its wait.
 
 ## Writing a rule
 
-The builder in **Settings** covers the forms people get wrong from memory.
+The builder, **Add a rule** in Settings ▸ Permissions, covers the forms people get wrong from memory: pick
+a form, a tool and a value, then **Add everywhere** or add it for one plan.
 
 | Form | Builds | Watch out for |
 |---|---|---|
@@ -307,15 +311,15 @@ The builder in **Settings** covers the forms people get wrong from memory.
 | One parameter | `Agent(model:opus)` | One parameter per rule. `Bash(command:…)` looks like this and is **silently ignored**. |
 | A path | `Read(~/.ssh/**)` | Only `Read(…)` and `Edit(…)` paths are consulted. `Write(…)`, `NotebookEdit(…)` and `Glob(…)` paths are ignored. A bare name means anywhere: `Read(.env)` is `Read(**/.env)`. |
 | A web domain | `WebFetch(domain:*.example.com)` | Covers subdomains, not the bare domain. |
-| MCP | `mcp__server` | Covers everything that server exposes; `mcp__server__tool` is one of them. |
+| An MCP server or tool | `mcp__server` | Covers everything that server exposes; `mcp__server__tool` is one of them. |
 | A directory | `Cd(~/code/**)` | `*` is one segment deep; `**` is any depth. |
 
 **Wrappers are seen through** — `timeout time nice nohup stdbuf command builtin noglob` and bare
 `xargs`. Some deliberately are not: `watch`, `setsid`, `flock` and `find -exec` never auto-approve,
 because what they actually run cannot be seen from the outside, so they get a card.
 
-Settings lists any rule you have written that **parses and does nothing**, rather than leaving you to
-discover it at 3am.
+Settings ▸ Permissions lists any rule you have written that **parses and does nothing** — *These parse
+and do nothing.* — rather than leaving you to discover it at 3am.
 
 ## Shells and agent sessions
 

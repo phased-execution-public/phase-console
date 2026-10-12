@@ -9,7 +9,9 @@
 // process THIS console is tracking is alive (`invariants.test.ts` clause 1).
 // A stray scan is a different question — a MACHINE-WIDE census no live
 // console ever needs to ask about itself — so it lives here instead, beside
-// the verb that is its only caller.
+// the verb that stops strays. A console LISTS them for Logs ▸ Health
+// (`GET /api/doctor/strays`, quiet-console phase 25) through
+// `listStrayConsoles` alone; stopping one stays the verb's.
 //
 // Every function below is pure over its inputs (or takes its `ps` read and
 // its `kill` as injectable dependencies), so a test can feed a fake listing

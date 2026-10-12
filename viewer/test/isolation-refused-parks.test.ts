@@ -143,11 +143,11 @@ test('RI-1 — only the refusals a person can fix park; the structural ones keep
 });
 
 test('RI-2 — the run card says the run is parked, with the refusal and its fix', () => {
-  const card = readFileSync(join(CLIENT, 'features/runs/git-card.tsx'), 'utf8');
+  const card = readFileSync(join(CLIENT, 'screens/plan/run/git-card.tsx'), 'utf8');
   assert.match(card, /run\?\.halt\?\.kind === 'isolation-refused'/, 'the card tells a parked refusal from a shared one');
   assert.match(card, /refusalFixes/);
   assert.match(card, /parked/);
-  const state = readFileSync(join(CLIENT, 'lib/api/state.ts'), 'utf8');
+  const state = readFileSync(join(CLIENT, 'data/api/state.ts'), 'utf8');
   assert.match(state, /refusalFixes\?: Record<string, string>/);
-  assert.equal(existsSync(join(CLIENT, 'features/runs/git-card.test.tsx')), true);
+  assert.equal(existsSync(join(CLIENT, 'screens/plan/run/git-card.test.tsx')), true);
 });

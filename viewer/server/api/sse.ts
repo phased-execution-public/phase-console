@@ -23,14 +23,17 @@
  *
  *   **It routes partials by request.** A `run:stream` frame is a fragment of
  *   one session's output. Two views render it; every other listener was paying
- *   for it in buffer. A listener now opts in per run (`/events?stream=<runId>`,
- *   or a `subscribe` frame later), gets those partials coalesced to one frame
+ *   for it in buffer. A listener opts in per run — `/events?stream=` names one
+ *   run or a comma-separated few, and `POST /api/events/subscribe` changes the
+ *   set on a stream already open — gets those partials coalesced to one frame
  *   per lane per tick, and everybody else moves on `run:progress` instead.
  *
  * Deliberately not a stream: the handlers own their own headers, ping and
  * teardown, and a writer that also owned those would have to know which of the
  * two it was.
  */
+
+import { randomUUID } from 'node:crypto';
 
 import { isClientDisconnect, log } from '../log.ts';
 
@@ -53,6 +56,18 @@ export const SSE_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
  * and turns a thousand frames a minute per lane into four.
  */
 export const SSE_STREAM_COALESCE_MS = 250;
+
+/**
+ * How many runs one stream may take partials for, and how long a run id it
+ * names may be.
+ *
+ * One browser's stream serves every tab it has open, so a few runs at once is
+ * normal; thirty-two is more transcripts than any screen paints together. The
+ * length is there only so a list no page would send is never held: a run id is
+ * a dozen characters.
+ */
+export const SSE_MAX_STREAMS = 32;
+export const SSE_MAX_RUN_ID_CHARS = 200;
 
 /** The event whose frames are partial, and therefore opt-in. */
 const STREAM_EVENT = 'run:stream';
@@ -90,6 +105,14 @@ export type SseWriter = {
   event(name: string, data: unknown, id?: number | string): void;
   /** Take this client's partials for one run. `null` takes none. */
   subscribe(runId: string | null): void;
+  /**
+   * Take this client's partials for exactly these runs. One browser's stream
+   * serves every tab it has open, so it may want several at once. Empty takes
+   * none.
+   */
+  subscribeMany(runIds: readonly string[]): void;
+  /** The runs whose partials this client takes now, in the order they were named. */
+  readonly streams: readonly string[];
   /** Send whatever partials are held, now. The tick calls this; a test calls it too. */
   flushStream(): void;
   /** Stop writing and let the socket go. Idempotent. */
@@ -124,7 +147,8 @@ export function createSseWriter(res: SseSink, opts: SseWriterOptions): SseWriter
 
   let dropped = false;
   let closed = false;
-  let stream: string | null = null;
+  /** The runs whose partials this client takes. Empty takes none. */
+  let streams: ReadonlySet<string> = new Set();
   /** The newest partial per lane, waiting for the tick. Insertion order is lane order. */
   const held = new Map<string, { data: unknown; id?: number | string }>();
   let tick: NodeJS.Timeout | null = null;
@@ -187,6 +211,21 @@ export function createSseWriter(res: SseSink, opts: SseWriterOptions): SseWriter
     held.clear();
   }
 
+  /**
+   * Does this client take a partial of this run? One that names no run cannot
+   * be told apart, so it goes to every client taking any.
+   */
+  const wants = (run: string | null): boolean => streams.size > 0 && (run === null || streams.has(run));
+
+  const follow = (runIds: readonly string[]): void => {
+    streams = new Set(runIds.filter((id) => typeof id === 'string' && id !== ''));
+    // A partial already held for a run this client has just let go must not
+    // reach it at the next tick: the page that asked has moved on, and text it
+    // no longer renders is buffer it will not read.
+    for (const [lane, entry] of held) if (!wants(runOf(entry.data))) held.delete(lane);
+    if (!held.size) disarm();
+  };
+
   return {
     send(chunk: string): void {
       writeRaw(chunk);
@@ -194,21 +233,92 @@ export function createSseWriter(res: SseSink, opts: SseWriterOptions): SseWriter
     event(name: string, data: unknown, id?: number | string): void {
       if (dropped || closed) return;
       if (name !== STREAM_EVENT) { writeRaw(frame(name, data, id)); return; }
-      // A partial. Only for the run this client asked for, and only the newest
+      // A partial. Only for the runs this client asked for, and only the newest
       // per lane: a surface rendering a transcript wants the current text, and
       // the ones it skipped were superseded before they could be painted.
-      const run = runOf(data);
-      if (!stream || (run !== null && run !== stream)) return;
+      if (!wants(runOf(data))) return;
       held.set(laneKey(data), { data, id });
       arm();
     },
     subscribe(runId: string | null): void {
-      stream = runId;
-      if (!runId) { disarm(); held.clear(); }
+      follow(runId ? [runId] : []);
     },
+    subscribeMany(runIds: readonly string[]): void {
+      follow(runIds);
+    },
+    get streams(): readonly string[] { return [...streams]; },
     flushStream,
     close,
     get dropped(): boolean { return dropped; },
     get bufferedBytes(): number { return res.writableLength; },
   };
+}
+
+/**
+ * The open `/events` streams, by the name each was greeted with.
+ *
+ * A browser holds ONE event stream however many tabs it has open — a leader
+ * tab shares it with the rest — so the runs whose partials it wants change
+ * while the socket stays open. Reopening to say so would cost a reconnect and
+ * a replay per change. Instead the stream's `hello` carries a name, and
+ * `POST /api/events/subscribe` finds the writer here by it. A name is held
+ * exactly as long as its stream is open — the handler's teardown drops it with
+ * the listener — so a closed stream's name, or one another process minted, is
+ * not found, and the page's answer to that is to reopen with `?stream=` and
+ * `?last=`, which loses nothing.
+ *
+ * The name is a random UUID that only the stream's own first frame carries.
+ * Knowing one lets a caller choose which partials that one socket is sent and
+ * nothing more, and the route that takes it is behind the cross-site check.
+ */
+const connections = new Map<string, SseWriter>();
+
+/** Name an open stream's writer, so a later request can find it. */
+export function registerSseConnection(writer: SseWriter): string {
+  const id = randomUUID();
+  connections.set(id, writer);
+  return id;
+}
+
+/** The writer of the open stream with this name, or undefined — closed, or never this process's. */
+export function sseConnection(id: string): SseWriter | undefined {
+  return connections.get(id);
+}
+
+/** Forget a stream's name. The handler's teardown calls it; a second call is a no-op. */
+export function dropSseConnection(id: string): void {
+  connections.delete(id);
+}
+
+/**
+ * `/events?stream=` as the runs it names: one id, or a comma-separated few.
+ *
+ * Lenient where the subscribe route is strict, because the reader differs: an
+ * `EventSource` cannot read an error body and does not retry a refused open,
+ * so a list it got wrong is cut to what can be honoured — blanks and ids longer
+ * than any run's dropped, the first `SSE_MAX_STREAMS` kept — rather than
+ * refused with a status no page would ever see.
+ */
+export function streamsOfParam(value: string | null): string[] {
+  if (!value) return [];
+  const ids = value.split(',').map((id) => id.trim()).filter((id) => id !== '' && id.length <= SSE_MAX_RUN_ID_CHARS);
+  return [...new Set(ids)].slice(0, SSE_MAX_STREAMS);
+}
+
+/**
+ * The id a stream's replay starts after, or null for no replay.
+ *
+ * `Last-Event-ID` is what a browser resends when its `EventSource` reconnects
+ * by itself. A page that reopens its stream on purpose cannot set that header,
+ * so it names the last id it saw as `?last=` instead. When both arrive the
+ * header wins: `?last=` rides the URL of every reconnect that EventSource later
+ * makes on its own, by which time the header is the newer of the two.
+ *
+ * Absence is asked before any number is read — `Number(null)` is 0, and 0
+ * replays the whole log to a page that asked for none — and anything but a
+ * whole number replays nothing.
+ */
+export function replayCursorOf(header: string | string[] | undefined, last: string | null): number | null {
+  const raw = (Array.isArray(header) ? header[0] : header)?.trim() || last?.trim();
+  return raw && /^\d+$/.test(raw) ? Number(raw) : null;
 }

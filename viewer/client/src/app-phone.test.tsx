@@ -19,13 +19,13 @@ vi.mock('@/lib/media', async (original) => ({
 }));
 
 import { App } from '@/App';
-import type { ConsoleState } from '@/lib/api';
-import { queryClientConfig } from '@/lib/queries';
+import type { ConsoleState } from '@/data/api';
+import { queryClientConfig } from '@/data/keys';
 
 const { state } = vi.hoisted(() => ({ state: vi.fn() }));
 
-vi.mock('@/lib/api', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/lib/api')>();
+vi.mock('@/data/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/data/api')>();
   return {
     ...actual,
     api: {
@@ -68,9 +68,9 @@ function mount() {
 beforeEach(() => {
   vi.clearAllMocks();
   // The home page itself, not a redirect into it: `#/ready` became one in
-  // Phase 8, and a shell test that starts mid-navigation is a shell test with
-  // an extra render nobody asked for.
-  window.location.hash = '#/now';
+  // Phase 8 and `#/now` in 6.0, and a shell test that starts mid-navigation is
+  // a shell test with an extra render nobody asked for.
+  window.location.hash = '#/runs';
   state.mockResolvedValue(READY_STATE);
 });
 
@@ -150,22 +150,26 @@ describe('the phone shell', () => {
 });
 
 describe('full-height routes', () => {
-  it('sessions gets a non-scrolling flex main; plans keeps the one page scroller', async () => {
-    // The pane owns its own height — a page scroller here gives a phone two
-    // scrollbars and no way to reach the prompt. `#/terminal` reaches the same
-    // frame THROUGH the redirect, which is asserted below rather than relied on
-    // here, or this test would pass for a reason it does not name.
-    window.location.hash = '#/sessions';
+  it('an open session gets a non-scrolling flex main; the sessions list, like plans, keeps the one page scroller', async () => {
+    // The pane owns its own height — a page scroller there gives a phone two
+    // scrollbars and no way to reach the prompt. The LIST is a page like any
+    // other since 7.0 (quiet-console phase 15, `ownsHeight`): its grid scrolls
+    // `main`. `#/terminal` reaches the session's frame THROUGH the redirect,
+    // which is asserted below rather than relied on here, or this test would
+    // pass for a reason it does not name.
+    window.location.hash = '#/sessions/abc123';
     mount();
     const main = await screen.findByRole('main');
     expect(main.className).toContain('overflow-hidden');
     expect(main.className).not.toContain('overflow-y-auto');
 
-    await act(async () => {
-      window.location.hash = '#/plans';
-      window.dispatchEvent(new HashChangeEvent('hashchange'));
-    });
-    expect((await screen.findByRole('main')).className).toContain('overflow-y-auto');
+    for (const hash of ['#/sessions', '#/sessions/locks', '#/plans']) {
+      await act(async () => {
+        window.location.hash = hash;
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      });
+      expect((await screen.findByRole('main')).className, hash).toContain('overflow-y-auto');
+    }
   });
 
   it('a legacy #/terminal deep link lands in that same frame', async () => {

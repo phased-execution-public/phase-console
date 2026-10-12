@@ -1,0 +1,7 @@
+{
+  "_note": "How many rows of the surface registry (client/src/data/surface.ts) are still owed a door — `unassigned` — per edition: `free` counts the free rows, which both trees carry; `pro` the rows only the Pro tree has. Phase 26 took both to zero, and viewer/test/surface-parity.test.ts now refuses an `unassigned` row by name: a new row comes with its door, or with the reason no page draws it and the file that reaches it instead.",
+  "unassigned": {
+    "free": 0,
+    "pro": 0
+  }
+}

@@ -202,3 +202,23 @@ export function sanitiseRetention(parsed: Partial<RetentionPolicy> | undefined):
   }
   return out;
 }
+
+/**
+ * The members of a settings patch's `retention` this console may store
+ * (quiet-console phase 23): a key of the table whose value passes the floor
+ * `sanitiseRetention` holds it to — a finite number above zero, or zero and
+ * above for `runRetainMin`. Anything else is left out rather than defaulted,
+ * the settings door's rule: a value it cannot use leaves the stored one as it
+ * was, where the loader's fallback would quietly put the shipped number back.
+ */
+export function retentionPatch(raw: unknown): Partial<RetentionPolicy> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Object.prototype.hasOwnProperty.call(RETENTION_DEFAULTS, key)) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+    if (key === 'runRetainMin' ? value < 0 : value <= 0) continue;
+    out[key] = value;
+  }
+  return out as Partial<RetentionPolicy>;
+}

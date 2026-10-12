@@ -44,6 +44,8 @@ import {
 } from '../shared/landing-model.js';
 import { DEFAULT_MESSAGING, MESSAGING_WORDS } from '../shared/message-model.js';
 import { planEffortOf } from '../shared/run-settings.js';
+import { CAPABILITY_WORDS } from '../shared/capability-model.js';
+import { DENSITIES, PREF_META, THEMES, type PrefSource } from '../shared/prefs-model.js';
 import { DEFAULT_ISSUES, ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
 import { sanitiseCategories, type CategoryId } from './push/catalogue.ts';
 import { parseQuietHours, type QuietHours } from './push/quiet.ts';
@@ -736,26 +738,12 @@ export function isLoopbackHost(host: string): boolean {
 
 /**
  * The capability flags, worst blast radius first — the order a refusal names
- * them in. One list, so a new flag cannot be added without appearing here.
- *
- * `--allow-publish` sits right under the session-spawning flags: it is the one
- * flag that puts this repository's WORK somewhere other people build on (a
- * pushed branch, a filed issue), which is a wider act than an announcement
- * and a narrower one than a session that edits for hours.
- * `--allow-webhooks` sits below it and above writes: it cannot run anything,
- * but unlike a write it leaves the machine, and on a wide bind it is the one
- * that turns an open port into somebody else's outbound request generator.
+ * them in. Built from `shared/capability-model.js`, the one list, so a new flag
+ * cannot be added without appearing here, on the page and in the unit writer.
  */
-const CAPABILITY_FLAGS: ReadonlyArray<readonly [string, (flags: Flags) => boolean]> = [
-  ['--allow-run', (f) => f.allowRun],
-  ['--allow-terminal', (f) => f.allowTerminal],
-  ['--allow-agent', (f) => f.allowAgent],
-  ['--allow-publish', (f) => f.allowPublish],
-  ['--allow-accounts', (f) => f.allowAccounts],
-  ['--allow-mcp', (f) => f.allowMcp],
-  ['--allow-webhooks', (f) => f.allowWebhooks],
-  ['--allow-writes', (f) => f.allowWrites],
-];
+const CAPABILITY_FLAGS: ReadonlyArray<readonly [string, (flags: Flags) => boolean]> = CAPABILITY_WORDS.map(
+  ({ flag, field }) => [flag, (flags: Flags) => flags[field as keyof Flags] === true] as const,
+);
 
 /**
  * Refuse to start rather than start wrong.
@@ -1006,6 +994,12 @@ export function expandHome(input: string): string {
  * Persisted preferences
  * ------------------------------------------------------------------ */
 
+/**
+ * What each key DOES, as a person reads it, is data: `shared/prefs-model.js`
+ * `PREF_META` (group, type, words, unit, description, writable), which
+ * `GET /api/prefs/schema` serves and `prefs-schema.test.ts` holds to this type.
+ * The comments below say why a key is shaped and defaulted as it is.
+ */
 export type Prefs = {
   recentRoots: string[];
   /**
@@ -1016,8 +1010,8 @@ export type Prefs = {
    */
   issueRepos?: string[];
   lastRoot?: string;
-  theme?: 'dark' | 'light' | 'system';
-  density?: 'comfortable' | 'compact';
+  theme?: (typeof THEMES)[number];
+  density?: (typeof DENSITIES)[number];
   model?: string;
   sort?: string;
   /**
@@ -1476,10 +1470,17 @@ const DEFAULT_PREFS: Prefs = {
   boardingSchedule: sanitiseSchedule(undefined),
   relayRules: [],
   ...STALL_DEFAULTS, stallEscalateMs: STALL_ESCALATE_MS, stallAutomaticPark: true,
+  // Its shipped number lived only in the coercer (`sanitiseAutomation`), so a
+  // `null` in a patch — the one way to take an override back — was dropped
+  // like a typo for this one stall clock.
+  stallLocalJobMs: STALL_LOCAL_JOB_MS,
   ...CHECK_DEFAULTS,
   notify: sanitiseCategories(undefined),
   retention: RETENTION_DEFAULTS,
 };
+
+/** Every key with a shipped default — what `null` in a settings patch can return a key to. */
+export const DEFAULT_PREF_KEYS: readonly string[] = Object.freeze(Object.keys(DEFAULT_PREFS));
 
 /**
  * The automation grouping lives in `shared/automation-model.js`, with the rest
@@ -1812,6 +1813,11 @@ export function instancePrefsFile(instance: Instance = INSTANCE): string {
   return instance.default ? CONFIG_FILE : instancePrefsPath(instance.id);
 }
 
+/** The person's file — `config.json`, which the person-wide keys and every adopting console read. */
+export function sharedPrefsFile(): string {
+  return CONFIG_FILE;
+}
+
 function readJson(file: string): Partial<Prefs> {
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown;
@@ -1886,6 +1892,98 @@ function pick<K extends keyof Prefs>(source: Partial<Prefs>, keys: readonly K[])
 }
 
 /**
+ * What one write was asked to change: the keys it set, and the keys it took
+ * back to their shipped default. A dotted key names one member of a map
+ * (`notify.needs-you`).
+ */
+export type PrefsWrite = { set?: readonly string[]; unset?: readonly string[] };
+
+/** The maps whose members are kept one by one: the loader completes each from its shipped table. */
+const MEMBER_MAPS: readonly string[] = ['notify', 'retention'];
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/** One value against another as JSON says them, key order aside. */
+function sameValue(a: unknown, b: unknown): boolean {
+  const stable = (value: unknown): unknown =>
+    Array.isArray(value) ? value.map(stable)
+      : isPlainObject(value) ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]))
+        : value;
+  return JSON.stringify(stable(a)) === JSON.stringify(stable(b));
+}
+
+/**
+ * The part of `prefs` a file keeps (quiet-console phase 25): what the file
+ * already held, what this write set, and whatever differs from its shipped
+ * default — less what this write took back. So a key returned to its default
+ * stays OUT of the file however many saves follow, and the settings schema
+ * reads its source as `default`; and a key the file held keeps its place, so a
+ * write about one setting never drops another an operator stored. A key with
+ * no shipped default is kept whenever it has a value.
+ *
+ * And the shape must READ BACK as `prefs`: a key whose default depends on
+ * another (`isolation` on `gitMode`, `settle` on `openPrOnComplete` —
+ * `sanitiseAutomation`) is not silent merely because it equals the shipped
+ * constant, so any key a reload of the shape would read differently is kept.
+ * Adding one cannot move another's reading: the keys the derivations read are
+ * only ever dropped at the constant that derives nothing.
+ */
+function keptShape(
+  prefs: Partial<Prefs>, stored: Partial<Prefs> & { automation?: unknown }, keys: readonly string[],
+  set: ReadonlySet<string>, unset: ReadonlySet<string>,
+): Record<string, unknown> {
+  const held: Record<string, unknown> = { ...stored, ...fromAutomation(stored.automation) };
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    const value = (prefs as Record<string, unknown>)[key];
+    if (value === undefined || unset.has(key)) continue;
+    const shipped = prefDefault(key);
+    if (MEMBER_MAPS.includes(key) && isPlainObject(value)) {
+      const before = isPlainObject(held[key]) ? held[key] : {};
+      const table = isPlainObject(shipped.value) ? shipped.value : {};
+      const members = Object.fromEntries(Object.entries(value).filter(([member, item]) => {
+        const name = `${key}.${member}`;
+        if (unset.has(name)) return false;
+        return member in before || set.has(name) || !(member in table) || !sameValue(item, table[member]);
+      }));
+      if (Object.keys(members).length) out[key] = members;
+      continue;
+    }
+    if (key in held || set.has(key) || !shipped.known || !sameValue(value, shipped.value)) out[key] = value;
+  }
+  const reread = sanitiseAutomation(migrateAutomation(out as Partial<Prefs>)) as Record<string, unknown>;
+  for (const key of keys) {
+    const value = (prefs as Record<string, unknown>)[key];
+    if (value === undefined || key in out || unset.has(key) || !(key in reread)) continue;
+    if (!sameValue(reread[key], value)) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * What a reload reads for each of `keys` once a file says nothing about it: the
+ * shipped default, or — for a key whose default depends on another
+ * (`isolation` on `gitMode`, `settle` on `openPrOnComplete`) — the one
+ * `sanitiseAutomation` derives from the rest of `prefs`; nothing for a key with
+ * no default. What a `null` in a settings patch takes a key back to, so the
+ * console runs with exactly what its next boot will read.
+ */
+export function silentValues(prefs: Prefs, keys: readonly string[]): Record<string, unknown> {
+  const rest: Record<string, unknown> = { ...prefs };
+  delete rest.automation;
+  for (const key of keys) delete rest[key];
+  const derived = sanitiseAutomation(migrateAutomation(rest as Partial<Prefs>)) as Record<string, unknown>;
+  return Object.fromEntries(keys.map((key) => [key, key in derived ? derived[key] : prefDefault(key).value]));
+}
+
+/** The flat keys and, when any of them is an automation key, the object derived from them. */
+function bothShapes(flat: Record<string, unknown>): Record<string, unknown> {
+  const automation = toAutomation(flat);
+  return Object.keys(automation).length ? { ...flat, automation } : flat;
+}
+
+/**
  * Persist both halves.
  *
  * Two writes for a non-default instance and one for the default, which is the
@@ -1893,9 +1991,15 @@ function pick<K extends keyof Prefs>(source: Partial<Prefs>, keys: readonly K[])
  * the next console will find them, the project's land beside that project's id.
  * The shared file is read-modify-written rather than replaced, so an instance
  * saving its own preferences cannot delete another's.
+ *
+ * Each file keeps only what `keptShape` says it holds, so `write.unset` — the
+ * keys a `null` took back — leaves the file and stays out of it.
  */
-export function savePrefs(prefs: Prefs, instance: Instance = INSTANCE): void {
+export function savePrefs(prefs: Prefs, instance: Instance = INSTANCE, write: PrefsWrite = {}): void {
   const file = instancePrefsFile(instance);
+  const set = new Set(write.set ?? []);
+  const unset = new Set(write.unset ?? []);
+  const keys = Object.keys(prefs).filter((key) => key !== 'automation');
   try {
     mkdirSync(dirname(file), { recursive: true });
     // 3.5.0 writes BOTH shapes for one release: the flat keys so a 3.4 console
@@ -1903,9 +2007,8 @@ export function savePrefs(prefs: Prefs, instance: Instance = INSTANCE): void {
     // the shape everything after 3.6.0 reads. The object is DERIVED from the
     // flat keys rather than carried alongside them, so the two cannot disagree
     // — there is no path by which a caller sets one and forgets the other.
-    const dual: Prefs & { automation: unknown } = { ...prefs, automation: toAutomation(prefs) };
     if (file === CONFIG_FILE) {
-      writeJsonAtomic(CONFIG_FILE, dual);
+      writeJsonAtomic(CONFIG_FILE, bothShapes(keptShape(prefs, readJson(CONFIG_FILE), keys, set, unset)));
       return;
     }
     mkdirSync(CONFIG_DIR, { recursive: true });
@@ -1915,13 +2018,62 @@ export function savePrefs(prefs: Prefs, instance: Instance = INSTANCE): void {
     // write, immediately before the rename, so the window is a rename rather
     // than a whole save — and the rename itself is what makes a torn or
     // half-written config impossible, which a bare `writeFileSync` allowed.
-    writeJsonAtomic(CONFIG_FILE, { ...readJson(CONFIG_FILE), ...pick(prefs, USER_GLOBAL_KEYS) });
-    const own: Partial<Prefs> & { automation?: unknown } = { ...dual };
-    for (const key of USER_GLOBAL_KEYS) delete own[key];
-    writeJsonAtomic(file, own);
+    const shared = readJson(CONFIG_FILE);
+    const person: Record<string, unknown> = { ...shared };
+    // Only a person-wide key this console holds, or took back, is its to
+    // rewrite: a `model` another console stored since this one booted stays.
+    for (const key of USER_GLOBAL_KEYS) {
+      if ((prefs as Record<string, unknown>)[key] !== undefined || unset.has(key)) delete person[key];
+    }
+    writeJsonAtomic(CONFIG_FILE, { ...person, ...keptShape(prefs, shared, USER_GLOBAL_KEYS, set, unset) });
+    const own = keys.filter((key) => !(USER_GLOBAL_KEYS as readonly string[]).includes(key));
+    // Until its first save a console reads `config.json` whole (`loadPrefs`),
+    // so that is the file whose stored choices its own file takes over.
+    const held = existsSync(file) ? readJson(file) : shared;
+    writeJsonAtomic(file, bothShapes(keptShape(prefs, held, own, set, unset)));
   } catch {
     /* preferences are a convenience; a read-only home must not break the app */
   }
+}
+
+/**
+ * Where each preference's value comes from (quiet-console phase 25;
+ * `shared/prefs-model.js` `PREF_SOURCES`), keyed like `PREF_META`: the file
+ * this console reads holds it — `config` for the person's file, `instance` for
+ * the console's own — or the loader derives it from another key or an older
+ * spelling (`migrated`), or nothing holds it (`default`). The same reading
+ * `loadPrefs` makes, so the two cannot describe different files.
+ */
+export function prefSources(instance: Instance = INSTANCE): Record<string, PrefSource> {
+  const shared = readJson(CONFIG_FILE);
+  const file = instancePrefsFile(instance);
+  const own = file !== CONFIG_FILE && existsSync(file);
+  const scope: PrefSource = own ? 'instance' : 'config';
+  const stored = migrateAutomation(own ? readJson(file) : shared) as Record<string, unknown>;
+  const out: Record<string, PrefSource> = {};
+  for (const key of Object.keys(PREF_META)) {
+    const dot = key.indexOf('.');
+    if (dot > 0) {
+      const map = stored[key.slice(0, dot)];
+      out[key] = isPlainObject(map) && map[key.slice(dot + 1)] !== undefined ? scope : 'default';
+    } else if ((USER_GLOBAL_KEYS as readonly string[]).includes(key) && shared[key as keyof Prefs] !== undefined) {
+      out[key] = 'config';
+    } else if (key === 'resumeAtBoot' && typeof stored.resumeAtBoot === 'boolean') {
+      // Stored as a boolean before 3.5.0; `resumeAtBootMode` reads it as a word.
+      out[key] = 'migrated';
+    } else if (stored[key] !== undefined) {
+      out[key] = scope;
+    } else if (key === 'settle' && stored.openPrOnComplete === false) {
+      // `settleOf` folds an old `openPrOnComplete: false` into `keep`.
+      out[key] = 'migrated';
+    } else if (key === 'isolation' && stored.gitMode === 'new-branch' && DEFAULT_ISOLATION_FOR_NEW_BRANCH) {
+      // A console that cuts its own branches isolates when it says nothing.
+      out[key] = 'migrated';
+    } else {
+      out[key] = 'default';
+    }
+  }
+  return out;
 }
 
 /**

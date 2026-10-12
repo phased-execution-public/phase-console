@@ -112,15 +112,15 @@ const proSpans = (body: string): Array<[number, number]> => {
 const insidePro = (spans: Array<[number, number]>, at: number): boolean => spans.some(([a, b]) => at > a && at < b);
 
 /**
- * Lifted from config.ts's own CAPABILITY_FLAGS table — the same source
+ * Lifted from `shared/capability-model.js`, the list config.ts's CAPABILITY_FLAGS is built from — the same source
  * `docs-parity.test.ts` reads, on purpose. That file asks whether the GUIDE is
  * right; this one asks whether the SKILL is, and they must not disagree about
  * where the truth lives. Each row knows whether it sits in a Pro region.
  */
 const capabilityRows = (): Array<{ flag: string; pro: boolean }> => {
-  const src = read('viewer/server/config.ts');
-  const from = src.indexOf('const CAPABILITY_FLAGS');
-  const block = src.slice(from, src.indexOf('];', from));
+  const src = read('viewer/shared/capability-model.js');
+  const from = src.indexOf('export const CAPABILITY_WORDS');
+  const block = src.slice(from, src.indexOf(']);', from));
   const spans = proSpans(block);
   const rows = new Map<string, boolean>();
   for (const m of block.matchAll(/--allow-[a-z-]+/g)) {
@@ -147,7 +147,7 @@ function* statedCounts(body: string, patterns: RegExp[]): Generator<{ word: stri
 
 test('SKILL.md names every capability flag and states the right count', () => {
   const flags = capabilityFlags();
-  assert.ok(flags.length >= 5, 'CAPABILITY_FLAGS did not parse out of config.ts');
+  assert.ok(flags.length >= 5, 'CAPABILITY_WORDS did not parse out of shared/capability-model.js');
 
   const skill = read('SKILL.md');
   for (const flag of flags) {

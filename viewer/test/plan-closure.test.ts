@@ -239,6 +239,8 @@ test('a closed plan is not work: no ready queue, no remaining weight, not stalle
 
   assert.equal(view.totals.plans, 2);
   assert.equal(view.totals.closed, 1);
+  // Said by the server, so Insights never subtracts the two (quiet-console phase 19).
+  assert.equal(view.totals.open, 1);
   assert.equal(view.totals.ready, 1, 'only the open plan offers work');
   assert.deepEqual(view.readyQueue.map((r) => r.slug), ['live-plan']);
   assert.equal(view.totals.ready, view.readyQueue.length,

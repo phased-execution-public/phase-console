@@ -17,8 +17,14 @@
 
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Toaster, useToasts } from '@/components/ui';
-import { registerServiceWorker, resetServiceWorkerForTests, useOnline, useServiceWorker } from './pwa';
+import { Toaster, useToasts } from '@/ui';
+import {
+  LIVE_SURFACE,
+  registerServiceWorker,
+  resetServiceWorkerForTests,
+  useOnline,
+  useServiceWorker,
+} from './pwa';
 
 /** A `ServiceWorker` with only the parts this module touches. */
 function fakeWorker() {
@@ -113,8 +119,8 @@ afterEach(() => {
 });
 
 /** Mounts the hook and exposes whatever the toast store is holding. */
-function Harness() {
-  useServiceWorker();
+function Harness({ rev }: { rev?: string | null }) {
+  useServiceWorker(rev);
   const toasts = useToasts();
   return (
     <>
@@ -289,6 +295,54 @@ describe('the update prompt', () => {
   it('asks the server once per load whether there is anything newer', async () => {
     render(<Harness />);
     await waitFor(() => expect(registration.update).toHaveBeenCalledTimes(1));
+  });
+
+  it('asks again when the server’s build moves under an open tab, and offers what installs as a toast', async () => {
+    const view = render(<Harness rev="aaaa1111" />);
+    await waitFor(() => expect(registration.update).toHaveBeenCalledTimes(1));
+    // The same build, read again: nothing new to ask.
+    view.rerender(<Harness rev="aaaa1111" />);
+    expect(registration.update).toHaveBeenCalledTimes(1);
+
+    // A restart landed on a new build: the tab asks at once…
+    view.rerender(<Harness rev="bbbb2222" />);
+    await waitFor(() => expect(registration.update).toHaveBeenCalledTimes(2));
+    // …and the worker that installs is OFFERED, never applied mid-session.
+    const installing = fakeWorker();
+    registration.installing = installing;
+    act(() => {
+      registration.emit('updatefound');
+    });
+    installing.state = 'installed';
+    act(() => {
+      installing.emit('statechange');
+    });
+    await waitFor(() => expect(screen.getByTestId('count').textContent).toBe('1'));
+    expect(installing.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('knows 7.0’s live surfaces: a session, the chat and a plan’s Run view — never a list or a plan’s phases', () => {
+    for (const live of [
+      '#/sessions/abc',
+      '#/sessions',
+      '#/terminal/x',
+      '#/agent/x',
+      '#/chat',
+      '#/plan/demo/run',
+      '#/plan/demo/run?lane=p3',
+    ]) {
+      expect(LIVE_SURFACE.test(live), live).toBe(true);
+    }
+    for (const calm of [
+      '#/runs',
+      '#/plan/demo/phases',
+      '#/plans',
+      '#/logs',
+      '#/plan/runner/phases',
+      '#/sessionsx',
+    ]) {
+      expect(LIVE_SURFACE.test(calm), calm).toBe(false);
+    }
   });
 });
 

@@ -67,11 +67,11 @@ export function handoffHref(slug, phase) {
 /**
  * A session's own page, or the list.
  *
- * Moved here from `client/src/app/routes.ts` (which re-exports it, so every
- * existing `import { sessionsHref } from '@/app/routes'` is untouched) because
- * `phaseSessionHref` below has to build one and this file is the one place
- * that spells a route. Two spellings of `#/sessions/<id>` is how a deep link
- * survives a rename in one of them and not the other.
+ * Moved here from `client/src/app/routes.ts` (whose successor,
+ * `client/src/shell/routes.ts`, re-exports it) because `phaseSessionHref`
+ * below has to build one and this file is the one place that spells a route.
+ * Two spellings of `#/sessions/<id>` is how a deep link survives a rename in
+ * one of them and not the other.
  */
 export function sessionsHref(id) {
   return id ? `#/sessions/${encodeURIComponent(id)}` : '#/sessions';
@@ -80,9 +80,10 @@ export function sessionsHref(id) {
 /**
  * The autopilot lane working a phase — `#/plan/<slug>/run?lane=p<N>`.
  *
- * A lane is `p<N>` on the run page's tab strip (`features/runs/session-panes.
- * ts:laneId`), which until now was component state and therefore unaddressable:
- * the pane you were told to look at could not be linked to.
+ * A lane is `p<N>` in the Run view's sessions fold
+ * (`client/src/screens/plan/run/session-panes.tsx` `paneIdOf`). The pick was
+ * once component state and therefore unaddressable: the pane you were told to
+ * look at could not be linked to.
  */
 export function laneHref(slug, phase) {
   return `#/plan/${encodeURIComponent(slug)}/run?lane=p${phase}`;

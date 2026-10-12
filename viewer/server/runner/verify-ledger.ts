@@ -134,6 +134,24 @@ export function readLedger(file: string, slug: string): LedgerRow[] {
   return out;
 }
 
+/** How many rows `GET /api/run/:slug/verifications` answers by default, and at most. */
+export const VERIFICATIONS_PAGE = 200;
+export const VERIFICATIONS_PAGE_MAX = 2_000;
+
+/**
+ * One plan's ledger as `GET /api/run/:slug/verifications` lists it
+ * (quiet-console phase 25): newest first, narrowed to one phase and one run
+ * when asked, at most `limit` rows — and how many matched before the cut.
+ */
+export function ledgerPage(
+  rows: readonly LedgerRow[], query: { phase?: number; run?: string; limit?: number } = {},
+): { rows: LedgerRow[]; total: number; limit: number } {
+  const limit = Math.min(VERIFICATIONS_PAGE_MAX, Math.max(1, Math.floor(query.limit ?? VERIFICATIONS_PAGE)));
+  const matched = rows.filter((row) => (query.phase === undefined || row.phase === query.phase)
+    && (!query.run || row.run === query.run));
+  return { rows: matched.slice(-limit).reverse(), total: matched.length, limit };
+}
+
 /**
  * How much of a red line's output the record, the ledger and the session's
  * note keep (control-tower phase 106, #195): the end of it, where a suite

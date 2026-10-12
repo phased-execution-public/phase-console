@@ -85,8 +85,9 @@ yours. At **0.8 ×** the console checkpoints the session
 itself and boards the next attempt FRESH with the resume brief — that session is never `--resume`d,
 because resuming it would re-read all of it. Each line acts once per session, and only on the phase's
 own session: a closeout, a QA round or a repair is never cut off. Every session's counters are journalled
-`phase.tokens` and kept on the record as `tokens[]`; the run view shows a live lane's context now and at
-its peak, its cache rebuilds and its status checks.
+`phase.tokens` and kept on the record as `tokens[]`; a live lane's row in the plan's **Phases** shows its
+context now and at its peak, with its cache rebuilds and its status checks on hover, and the phase's
+panel (**Inspect**) lists every session's peak.
 
 **And a resume is judged before it happens** (autopilot-token-drain phase 4, `resumePolicy` in
 `viewer/server/runner/usage.ts`). A `--resume` re-reads the whole conversation, and a cold one writes all
@@ -476,7 +477,7 @@ answers to the decision manifest: `resumeOnRestart`, `relay`, `accounts` (`[{id,
 
 **The start door refuses before it spawns (since 5.0.0).** A fresh `POST /api/run/:slug/start` that
 omits `resumeOnRestart`, `relay` or `accounts` is answered **400** naming the missing field — the
-launch form's Decisions stage is where they are answered, and a scripted start has to answer them
+launch's **Decisions** row is where they are answered, and a scripted start has to answer them
 too. With them given, the **prelude** (`viewer/server/prelude.ts`) runs the plan's `## Decisions`
 rows and five probes — accounts, MCP, credentials, delivery, verification — and a blocking row still `outstanding`,
 a `waived` row nobody acknowledged, or a failed blocking probe answers **409** `{unanswered: [{key,
@@ -663,16 +664,18 @@ cannot be written is said once (`locks.ledger-failed`) and nothing else changes.
 
 ## Freeze and thaw — a phase held, and a lock released
 
-An operator can **freeze** a lane: the phase's child is held rather than killed, and the console
-renders the promise on the lane card. `viewer/server/runner/freeze.ts` is what keeps that promise
+An operator can **freeze** a lane: the phase's child is held rather than killed, and the lane's line
+in the plan's **Run** view reads *frozen*, saying on hover when the freeze will checkpoint by itself.
+`viewer/server/runner/freeze.ts` is what keeps that promise
 when the console that armed it is gone — past **15 minutes** the freeze escalates by itself
 (wake-then-terminate, then the record is converted into something *Continue* can resume), and a
 freeze that escalated in a live console and one that escalated at boot leave byte-identical records.
 **Thaw** is the operator's release; a frozen phase is simply not scheduled until then.
 
 The same category holds a fact SKILL.md's Mode 2 does not: **an operator can release your phase lock
-out from under you.** `scripts/phase-lock.sh` leases are cooperative, the console's Locks view can
-force one, and the convergence loop releases the locks of sessions it can prove are dead. The lock is
+out from under you.** `scripts/phase-lock.sh` leases are cooperative, the console's Sessions ▸ Locks
+(`#/sessions/locks`) can force one, and the convergence loop releases the locks of sessions it can
+prove are dead. The lock is
 yours until phase-finish *by convention*, not by enforcement. If a `claim --force` by someone else is
 plausible in your situation, re-check the lock before a long unattended stretch rather than assuming.
 
@@ -688,7 +691,8 @@ verbs, deliberately separate (`viewer/server/runner/runner-control.ts`):
 - **steer** — an instruction: do this differently from here.
 
 Either way it becomes one more turn in the same conversation — same context, same warm prompt cache —
-and the answer appears in the console's session window. Both are idempotent under a caller-supplied
+and the answer appears in the lane's console, under the plan's **Run** view's **Sessions and their
+consoles**. Both are idempotent under a caller-supplied
 key, so a double-click is one write and one journal line.
 
 From any terminal, `bin/btw` is the ask verb without the browser:
@@ -810,7 +814,9 @@ second raise of the same source while its item is open is that item. Every inbox
 person for an act carries a `turn` view — which item, held by the ledger or by the row's own record
 (the approval card, a gate, a held plan, a QA ask, a live relay question, a person-check) — and
 `GET /api/turn` folds them into one item per thing to do: `{round, headline, groups, handled,
-counts}`. The errand that IS an item announces nothing of its own, and its row's action is *I've done
+counts}` — the page a person answers on, **Your turn** (`#/turn`; one item at `#/turn/<id>`, where a
+step's push opens it), whose waiting items also lead the Runs home, one line each, in its **Your
+turn** group. The errand that IS an item announces nothing of its own, and its row's action is *I've done
 this — check* on that item — "Done — continue" checks it too — so a step the person did ends
 `proven`; the clock never withdraws a step whose phase resumed past it.
 
@@ -962,10 +968,11 @@ it — the server projects with it, the client asks with it:
 `/api/state` takes `full` or `runs`. Groups compose (`?include=prose,memory`).
 
 Two rules for anyone touching this: **`full` must stay byte-identical** — it is the compatibility
-promise the projection is allowed to exist because of — and **a tab's own source file is not its
+promise the projection is allowed to exist because of — and **a page's own source file is not its
 render tree**. A field is reachable from a page only if some component that page actually mounts asks
-for its group; following the JSX from the tab's entry component is the only way to know, and grepping
-the tab's file is how a field gets projected away silently.
+for its group — a row expanded in place, the record in the panel (**Inspect**) and the page with
+**Everything** on included; following the JSX from the page's entry component is the only way to
+know, and grepping the page's file is how a field gets projected away silently.
 
 ## Where the state lives — the instance rule
 

@@ -127,6 +127,8 @@ for p in \
   "viewer/shared/automation-model.js" \
   "viewer/shared/orchestration-model.js" \
   "viewer/shared/queue-model.js" \
+  "viewer/shared/capability-model.js" \
+  "viewer/shared/prefs-model.js" \
   "viewer/server/inbox.ts" \
   "viewer/server/analysis/spend.ts" \
   "viewer/server/analysis/week-report.ts" \
@@ -181,6 +183,7 @@ for p in \
   "bin/run-verb.mjs" \
   "bin/owner-verb.mjs" \
   "bin/grants-verb.mjs" \
+  "bin/stray-consoles.mjs" \
   "viewer/server/retention.ts" \
   "viewer/server/retention-policy.ts" \
   "viewer/server/debug/bundle.ts" \

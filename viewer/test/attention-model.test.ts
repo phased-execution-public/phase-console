@@ -2,7 +2,7 @@
  * The attention model — the inbox's two invariants, held here because nothing
  * else can hold them.
  *
- *   1. AGREEMENT. `client/src/lib/api/inbox.ts` carries the wire TYPES and
+ *   1. AGREEMENT. `client/src/data/api/inbox.ts` carries the wire TYPES and
  *      `shared/attention-model.js` carries the VALUES. TypeScript unions erase
  *      at runtime, so no import can hold the pair together; this file reads the
  *      contract's source and asserts the same words in the same order. A kind
@@ -67,7 +67,7 @@ function unionWords(source: string, typeName: string): string[] {
   return [...body.matchAll(/'([\w-]+)'/g)].map((m) => m[1]);
 }
 
-const CONTRACT = readFileSync(here('../client/src/lib/api/inbox.ts'), 'utf8');
+const CONTRACT = readFileSync(here('../client/src/data/api/inbox.ts'), 'utf8');
 
 /* ------------------------------------------------------------------ *
  * 1. Agreement with the client contract
@@ -78,7 +78,7 @@ test('INBOX_KINDS is the InboxKind union, same words, same order', () => {
   assert.deepEqual(
     [...INBOX_KINDS],
     union,
-    'shared/attention-model.js and client/src/lib/api/inbox.ts have drifted — the union order is also the inbox sort tie-break, so a reorder is a behaviour change',
+    'shared/attention-model.js and client/src/data/api/inbox.ts have drifted — the union order is also the inbox sort tie-break, so a reorder is a behaviour change',
   );
   // 18 since control-tower phase 41: `human-step`, a person's turn.
   assert.equal(union.length, 18, union.join(','));

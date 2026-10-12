@@ -83,6 +83,20 @@ export type CeilingRefusal = {
 
 export type CeilingVerdict = { ok: true; starts: number; usd: number } | CeilingRefusal;
 
+/** One ceiling's window as a page reads it — `StartCeiling.view`. */
+export type CeilingView = {
+  starts: number;
+  usd: number;
+  limits: CeilingLimits;
+  windowMs: number;
+  /** Starts in the window, by the door that made each. */
+  doors: Record<string, number>;
+  /** The limit the next automatic start would meet; null while there is room under both. */
+  full: CeilingRefusal['ceiling'] | null;
+  /** ISO — when the oldest entry that limit counts leaves the window; null while there is room. */
+  until: string | null;
+};
+
 type StartEntry = { at: number; door: StartDoor; slug: string | null };
 type SpendEntry = { at: number; usd: number };
 
@@ -166,6 +180,21 @@ export class StartCeiling {
       windowMs: CEILING_WINDOW_MS,
       doors,
     };
+  }
+
+  /**
+   * The live counters as `GET /api/ceiling` shows them (quiet-console phase
+   * 25): the snapshot, the limit an automatic start would meet now (`full`,
+   * null while there is room) and when the oldest entry it counts leaves the
+   * window. A read: it charges nothing and announces nothing.
+   */
+  view(at = this.now()): CeilingView {
+    const snap = this.snapshot(at);
+    const full = snap.limits.startsPerHour > 0 && snap.starts >= snap.limits.startsPerHour ? 'startsPerHour'
+      : snap.limits.usdPerHour > 0 && snap.usd >= snap.limits.usdPerHour ? 'usdPerHour'
+        : null;
+    const oldest = full === 'startsPerHour' ? this.starts[0]?.at : full === 'usdPerHour' ? this.spend[0]?.at : undefined;
+    return { ...snap, full, until: oldest === undefined ? null : new Date(oldest + CEILING_WINDOW_MS).toISOString() };
   }
 
   private prune(at: number): void {

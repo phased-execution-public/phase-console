@@ -41,7 +41,9 @@
  */
 
 import type { PhaseSize } from '../parse/plan.ts';
-import { deriveCapTable, type CapSample, type CapTable } from '../runner/session-record.ts';
+import {
+  deriveCapTable, phaseCaps, SHIPPED_CAP_TABLE, type Cap, type CapSample, type CapTable,
+} from '../runner/session-record.ts';
 import { expectedFromEnv, sessionsFor, type Sizing } from './graph.ts';
 import { ETA_CLASS_MIN, fitAffine, median } from './stats.ts';
 
@@ -451,5 +453,36 @@ export function sizingCensus(
     context: fitContextModel(contextSamples, shipped),
     sessions: sessionsPerPhaseOf(finished, shipped),
     derivedAt: new Date(nowMs).toISOString(),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * The view: what a session may spend, as `GET /api/sizing` answers it
+ * ------------------------------------------------------------------ */
+
+/**
+ * The measured session caps beside the shipped ones, the caps a phase session
+ * spawns under, the context model with its boot floor's line, and sessions per
+ * phase (quiet-console phase 25) — the census as a page reads it. `census` is
+ * null until this console's first read of its own sessions lands, and every
+ * answer is then the shipped one, said so by `derivedAt: null` and each row's
+ * own basis.
+ */
+export type SizingView = {
+  derivedAt: string | null;
+  caps: { measured: CapTable | null; shipped: CapTable; phase: { turns: Cap; usd: Cap } };
+  context: ContextModel;
+  bootLine: string;
+  sessions: Record<PhaseSize, SessionsRow>;
+};
+
+export function sizingView(census: SizingCensus | null, shipped: ShippedSizing): SizingView {
+  const context = census?.context ?? shippedContextModel(shipped);
+  return {
+    derivedAt: census?.derivedAt ?? null,
+    caps: { measured: census?.caps ?? null, shipped: SHIPPED_CAP_TABLE, phase: phaseCaps(census?.caps) },
+    context,
+    bootLine: bootFloorLine(context.bootMeasured, shipped.bootFloor),
+    sessions: census?.sessions ?? sessionsPerPhaseOf([], shipped),
   };
 }

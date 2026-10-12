@@ -23,7 +23,7 @@
  *   - `viewer/server/api/routes.ts` — `GET /api/inbox`, `POST /api/inbox/ack`,
  *     `DELETE /api/inbox/ack`. The acks file is keyed by the id minted here,
  *     so the id IS the ack key and the stability rules below are load-bearing;
- *   - `viewer/client/src/lib/api/inbox.ts` — the wire TYPES, agreed in Phase 3
+ *   - `viewer/client/src/data/api/inbox.ts` — the wire TYPES, agreed in Phase 3
  *     (`InboxKind`, `InboxSeverity`, `InboxAction`, `InboxItem`, `InboxView`).
  *     TypeScript types erase at runtime, so that file cannot carry the values
  *     and this one cannot carry the types; `viewer/test/attention-model.test.ts`
@@ -300,8 +300,8 @@ export function attentionCount(items) {
  * Which UI state paints each severity.
  *
  * The console has ONE status vocabulary (`shared/status-vocab.js`): eight
- * states, each with its own hue token, read by `StatusBadge` and `.state-<ui>`
- * and by nothing else. Severity is a new word family, so it maps into that
+ * states, each with its own hue token, read by the status family
+ * (`client/src/ui/status/`) and `.state-<ui>` and by nothing else. Severity is a new word family, so it maps into that
  * vocabulary here rather than growing a ninth colour — and `needs-you` maps to
  * the state of the same name, which is not a coincidence but the point.
  *

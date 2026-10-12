@@ -11,7 +11,7 @@
  * So this suite reads `server/api/routes.ts` as TEXT — the two `case` blocks,
  * every `body.<field>` and `'<field>' in body` inside them — and holds that
  * set equal to `shared/run-settings.js`. The client's zod schema is built from
- * the same module (`features/run-setup/schema.ts`, pinned by
+ * the same module (`screens/launch/model/schema.ts`, pinned by
  * `schema-parity.test.ts` on the vitest side), so all three agree or this
  * fails.
  *

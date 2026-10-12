@@ -17,24 +17,26 @@ import { onlineManager, QueryClient, QueryClientProvider } from '@tanstack/react
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
-import type { ConsoleState } from '@/lib/api';
-import { queryClientConfig } from '@/lib/queries';
+import type { ConsoleState } from '@/data/api';
+import { queryClientConfig } from '@/data/keys';
 
 const { state } = vi.hoisted(() => ({ state: vi.fn() }));
 
 // `vi.hoisted` for the same reason `views.test.tsx` needs it: the factory below
 // is hoisted above every `const` in this file.
-vi.mock('@/lib/api', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/lib/api')>();
+vi.mock('@/data/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/data/api')>();
   return {
     ...actual,
+    // The header's situation words read the SLIM run list (7.0, #234's fix);
+    // the Runs page under it still asks for the whole one.
+    runList: vi.fn(async () => []),
     api: {
       ...actual.api,
       state,
       plans: vi.fn(async () => []),
       stats: vi.fn(async () => null),
       approvals: vi.fn(async () => []),
-      // The palette is shell chrome now and asks for the fleet by name.
       runs: vi.fn(async () => []),
     },
   };
@@ -210,9 +212,9 @@ describe('the network drops while the board is up', () => {
  * The fleet freeze's banner is only useful if it is MOUNTED — and a component
  * that renders correctly in its own test while nothing in the shell renders it
  * is exactly the shape this codebase has been caught by before (an axe harness
- * that shipped and was called by nothing for nine phases). Its behaviour is
- * pinned in `components/fleet-freeze.test.tsx`; what is pinned HERE is that the
- * app puts it on the page, on an ordinary destination, with nothing else wrong.
+ * that shipped and was called by nothing for nine phases). The banner is
+ * `shell/banners.tsx`'s `FrozenBanner`; what is pinned HERE is that the app
+ * puts it on the page, on an ordinary destination, with nothing else wrong.
  */
 describe('the whole console is frozen', () => {
   it('says so on the page you are already looking at', async () => {

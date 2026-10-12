@@ -421,8 +421,8 @@ function connectSources(): string {
  * writes its scrollbar, cell-metric and theme CSS into `<style>` elements it
  * creates (no nonce option exists), react-remove-scroll does the same behind
  * every Radix dialog, and NOT_BUILT_PAGE above is one inline `<style>`. That
- * costs little: `components/markdown.tsx` already deletes `<style>`, `<link>`
- * and every `style=` attribute out of agent-written text.
+ * costs little: `client/src/ui/markdown.tsx` already deletes `<style>`,
+ * `<link>` and every `style=` attribute out of agent-written text.
  * `img-src` keeps `data:` for the SVG favicon in index.html.
  *
  * This rides `/sw.js` as well, which is deliberate: a worker executes under the

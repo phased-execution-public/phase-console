@@ -126,13 +126,13 @@ test('a ws server is refused: `claude mcp add` has no spelling for it', () => {
 });
 
 test('the client\'s SIGNABLE_TRANSPORTS is exactly what the server will bridge', () => {
-  // `client/src/features/settings/mcp.tsx` keeps its own copy so the Sign in
+  // `client/src/screens/settings/mcp.tsx` keeps its own copy so the Sign in
   // button can be ABSENT rather than present-and-refusing, and its comment says
   // this test holds the two together. It has to actually do that: every
   // transport the registry knows is asked of the server, and the answer must
   // match the client's list member-for-member.
   const client = readFileSync(
-    new URL('../client/src/features/settings/mcp.tsx', import.meta.url), 'utf8',
+    new URL('../client/src/screens/settings/mcp.tsx', import.meta.url), 'utf8',
   );
   const declared = client.match(/const SIGNABLE_TRANSPORTS[^=]*=\s*\[([^\]]*)\]/);
   assert.ok(declared, 'SIGNABLE_TRANSPORTS is gone from the card — this test is now a lie');

@@ -7,7 +7,8 @@ import { TOUR_PLAN, shoot } from './lib/shots.ts';
 releaseRoutesAfterEach();
 
 /*
- * The plan page at the size #26 measured (control-tower phase 23): 72 phases.
+ * The plan page at the size #26 measured (control-tower phase 23; 7.0's page,
+ * quiet-console phase 10): 72 phases.
  *
  * The plan #26 measured has 72 phases, and its plan page drew every one of
  * them in four tabs, each row in the DOM twice over. The page has
@@ -25,8 +26,8 @@ releaseRoutesAfterEach();
 const PHASES = 72;
 
 /**
- * Past this many rows the phase table draws a window (`PHASE_VIRTUAL_FROM`,
- * `client/src/features/runs/phase-table.tsx`): the most phase rows the DOM may
+ * Past this many rows the phase grid draws a window (`PHASE_VIRTUAL_FROM`,
+ * `client/src/screens/plan/phases/model.ts`): the most phase rows the DOM may
  * hold at any moment. A table that drew the whole plan — even for one frame,
  * even before its engine had loaded — would hold 72.
  */
@@ -201,12 +202,13 @@ test.describe('the plan page at 72 phases', () => {
     await expect(table).toHaveAttribute('aria-rowcount', String(folded + finished));
 
     // Plan order, chosen the way a person chooses it: one row per phase, no
-    // headings — so the count is the plan's, exactly.
-    await page.getByRole('button', { name: /^View/ }).click();
-    const sheet = page.getByRole('dialog', { name: 'View' });
-    await sheet.getByRole('radio', { name: 'Plan order' }).check();
+    // headings — so the count is the plan's, exactly. On a desk the toolbar's
+    // Group control opens its choices in place.
+    await page.getByRole('button', { name: /^Group/ }).click();
+    const choices = page.getByRole('radiogroup', { name: 'Group by' });
+    await choices.getByRole('radio', { name: 'Plan order' }).check();
     await page.keyboard.press('Escape');
-    await expect(sheet).toHaveCount(0);
+    await expect(choices).toHaveCount(0);
     await expect(table).toHaveAttribute('aria-rowcount', String(PHASES + 1));
     expect(await table.locator('tbody tr[aria-rowindex]').count()).toBeLessThan(WINDOW_FROM);
 
@@ -257,7 +259,7 @@ test.describe('the plan page at 72 phases', () => {
 
     // Keystroke by keystroke, as a person types: every one of them re-filters
     // the plan, and none may cost the plan's worth of rows.
-    const filter = page.getByRole('searchbox', { name: 'Filter phases by phase' });
+    const filter = page.getByRole('searchbox', { name: 'Search the phases by phase' });
     await filter.pressSequentially('radar');
     const waves = PHASES / 8;
     await expect(page.getByText(`${waves} of ${PHASES} shown`)).toBeVisible();
@@ -270,5 +272,30 @@ test.describe('the plan page at 72 phases', () => {
     await expect(table).toHaveAttribute('aria-rowcount', /^\d+$/);
     await expect(page.getByText(`${waves} of ${PHASES} shown`)).toHaveCount(0);
     expect(await rowsHigh(page)).toBeLessThanOrEqual(WINDOW_FROM);
+  });
+
+  test('Inspect puts a phase in the panel: the run record in its sections, the verbs, the raw record', async ({
+    page,
+  }, info) => {
+    await page.goto(`/#/plan/${TOUR_PLAN}/phases`);
+    await expect(page.locator(ROWS).first()).toBeVisible();
+    // By its number, not its place: the run lands when it lands, the phase it
+    // works moves to a group of its own above the rest, and Done folds — so a
+    // phase read off the first row may fold away before its button is pressed.
+    // Read it again from the grid as it stands until the press lands.
+    let phase: string | null = null;
+    await expect(async () => {
+      phase = await page.locator(ROWS).first().getAttribute('data-phase');
+      await page
+        .getByRole('button', { name: `Inspect phase ${phase}`, exact: true })
+        .click({ timeout: 5_000 });
+    }).toPass({ timeout: 60_000 });
+    // The panel's Overview: the record in sections, or the one line that says
+    // the phase has not boarded in this run.
+    const record = page.getByTestId('phase-record-sections').or(page.getByText(/it has not boarded/));
+    await expect(record.first()).toBeVisible();
+    await page.getByRole('tab', { name: 'Raw' }).click();
+    await expect(page.getByText(`"phase": ${phase},`).first()).toBeVisible();
+    await shoot(page, info.project.name, 'plan-inspect');
   });
 });

@@ -1,0 +1,527 @@
+/**
+ * The one recovery renderer: grouping, the live chip, disabled-with-reason,
+ * the touch ⓘ path, and the verbs actually firing their endpoints.
+ */
+
+import { render, screen, act, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@/lib/media', () => ({
+  usePhone: () => false,
+  useNarrow: () => false,
+  useTouch: () => true,
+  isPhone: () => true,
+}));
+
+const { recheck, recover, retry, resumePhase, delegate, toast } = vi.hoisted(() => ({
+  recheck: vi.fn(async () => ({ run: null })),
+  retry: vi.fn(async () => ({ run: null })),
+  // A press answers with what it launched (control-tower phase 53).
+  resumePhase: vi.fn(async (): Promise<Record<string, unknown>> => ({ run: null })),
+  delegate: vi.fn(async (): Promise<Record<string, unknown>> => ({ run: null })),
+  toast: vi.fn(),
+  recover: vi.fn(async () => ({
+    outcome: 'resumed',
+    detail: 'The board had moved past the stop — the run continues from here.',
+    steps: ['the board had moved past phase 2 — stale record closed'],
+    run: null,
+  })),
+}));
+vi.mock('@/data/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/data/api')>();
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      runRecheck: recheck,
+      runRecover: recover,
+      runRetry: retry,
+      runResumePhase: resumePhase,
+      runDelegate: delegate,
+    },
+  };
+});
+vi.mock('@/ui', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/ui')>();
+  return { ...actual, toast };
+});
+// The repair agent opens through the one launch door; the form itself is the launch's own suite.
+const doorRequests = vi.hoisted(() => [] as unknown[]);
+vi.mock('@/screens/launch/door', () => ({
+  LaunchDoor: ({ request }: { request: unknown }) => {
+    doorRequests.push(request);
+    return <p>the launch form</p>;
+  },
+}));
+
+import { RecoveryActions as Actions } from './recovery-actions';
+
+/** As a surface draws it, minus the account row it lends (`screens/settings/account-row.tsx`). */
+const PARTS = {};
+const RecoveryActions = (props: Omit<React.ComponentProps<typeof Actions>, 'parts'>) => (
+  <Actions parts={PARTS} {...props} />
+);
+import { keys } from '@/data/keys';
+import { FLAG_OFF, RECOVERY_BUSY } from '@shared/recovery-model.js';
+
+function mount(
+  node: React.ReactElement,
+  opts: {
+    allowRun?: boolean;
+    allowAgent?: boolean;
+    sessions?: unknown[];
+    /** What the SERVER says it will accept — the retry panel's model list. */
+    models?: string[];
+  } = {},
+) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  client.setQueryData(keys.state(), {
+    allowRun: opts.allowRun ?? true,
+    allowAgent: opts.allowAgent ?? true,
+    allowWrites: false,
+    autopilot: true,
+    root: { ok: true, path: '/repo' },
+    ...(opts.models ? { models: opts.models } : {}),
+  });
+  client.setQueryData(keys.terminal(), {
+    allowed: false,
+    agentAllowed: true,
+    available: 'yes',
+    sessions: opts.sessions ?? [],
+  });
+  return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
+}
+
+const HALTED = {
+  status: 'halted',
+  halt: { reason: 'phase 2 did not verify', kind: 'verify-failed', phase: 2 },
+} as const;
+
+beforeEach(() => vi.clearAllMocks());
+
+describe('<RecoveryActions>', () => {
+  it('groups: own-session leads, agent follows, the rest fold with visible blurbs', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+    );
+    const labels = screen.getAllByRole('button').map((b) => b.textContent ?? '');
+    expect(labels[0]).toContain('Finish in its own session');
+    // The fold unmounts what it hides: nothing past the inline two is drawn
+    // until it is opened, and then each carries its blurb in words.
+    expect(labels.some((l) => l.includes('Fix with a new agent'))).toBe(false);
+    fireEvent.click(screen.getByText(/More ways forward/));
+    expect(screen.getByRole('button', { name: 'Fix with a new agent' })).toBeInTheDocument();
+    expect(screen.getByText(/Discards the stopped session's conversation/)).toBeInTheDocument();
+  });
+
+  it('a new agent opens the launch form through its door, with the recovery it is for — whatever the surface lends', () => {
+    doorRequests.length = 0;
+    mount(
+      <Actions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+    );
+    fireEvent.click(screen.getByText(/More ways forward/));
+    expect(screen.getByRole('button', { name: 'Retry from scratch' })).toBeInTheDocument();
+    expect(screen.queryByText('the launch form')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Fix with a new agent' }));
+    expect(screen.getByText('the launch form')).toBeInTheDocument();
+    expect(doorRequests.at(-1)).toMatchObject({ kind: 'recovery', slug: 'demo', phase: 2 });
+  });
+
+  it('touch renders a tappable ⓘ beside every action — blurbs are never hover-only', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+    );
+    expect(screen.getAllByRole('button', { name: /^About / }).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('a live recovery renders the chip and disables both families with the same sentence', async () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+      {
+        sessions: [
+          {
+            id: 's-live',
+            exited: null,
+            meta: { recovery: { kind: 'halted-verification', slug: 'demo', phase: 2 } },
+          },
+        ],
+      },
+    );
+    expect(screen.getByRole('link', { name: /Fix the failing verification — running/ })).toHaveAttribute(
+      'href',
+      '#/sessions/s-live',
+    );
+    expect(screen.getByRole('button', { name: 'Finish in its own session' })).toBeDisabled();
+    // The reason is reachable through the touch ⓘ.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'About Finish in its own session' }));
+    });
+    expect((await screen.findAllByText(RECOVERY_BUSY)).length).toBeGreaterThan(0);
+  });
+
+  it('flags disable with the exact sentence, never hide', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: false } }}
+      />,
+      { allowRun: false, allowAgent: false },
+    );
+    const recheckButton = screen.getByRole('button', { name: 'Re-check' });
+    expect(recheckButton).toBeDisabled();
+    fireEvent.click(screen.getByText(/More ways forward/));
+    expect(screen.getAllByText(FLAG_OFF.run).length).toBeGreaterThan(0);
+  });
+
+  it('a console without --allow-agent still offers the new agent — disabled, never absent', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+      { allowAgent: false },
+    );
+    expect(screen.getByRole('button', { name: 'Finish in its own session' })).toBeEnabled();
+    fireEvent.click(screen.getByText(/More ways forward/));
+    expect(screen.getByRole('button', { name: 'Fix with a new agent' })).toBeDisabled();
+  });
+
+  it('a verb goes to its endpoint', async () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ record: { status: 'failed', resumable: false } }}
+        max={3}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Re-check' }));
+    await waitFor(() => expect(recheck).toHaveBeenCalledWith('demo', 2));
+  });
+});
+
+describe('the plan-level Recover & continue', () => {
+  it('leads the run-only offers, says exactly what it will do, and reports its steps', async () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', runId: 'r1' }}
+        ctx={{ run: { status: 'halted', halt: { reason: 'x', kind: 'verify-failed', phase: 2 } } }}
+      />,
+    );
+    const first = screen.getAllByRole('button')[0];
+    expect(first.textContent).toContain('Recover & continue');
+    fireEvent.click(first);
+    await waitFor(() => expect(recover).toHaveBeenCalledWith('demo'));
+  });
+
+  it('offers NOTHING for a resolved stop — settled questions are not relitigated', () => {
+    const { container } = mount(
+      <RecoveryActions
+        target={{ slug: 'demo', runId: 'r1' }}
+        ctx={{
+          run: {
+            status: 'halted',
+            halt: null,
+            resolved: { at: 'x', reason: 'superseded — the board shows phase 7 done' },
+          },
+        }}
+      />,
+    );
+    expect(container.querySelector('button')).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The ladder on Ways forward
+ * ------------------------------------------------------------------ */
+
+describe('the ladder on Ways forward', () => {
+  const ERRAND = {
+    phase: 2,
+    situation: 'verify-red',
+    tried: ['resume-own-session (fix-verification) → failed', 'fix-agent → failed'],
+    need: "The phase's §Verification to pass — the ladder's sessions could not make it green.",
+    how: 'Read What failed on the phase page, fix it, then Re-check or Retry.',
+    at: '2026-08-20T10:00:00.000Z',
+  };
+
+  it("shows the situation, what was tried and what the machine tries next — in the table's words", () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{
+          run: {
+            ...HALTED,
+            recoveries: {
+              '2': {
+                attempts: 1,
+                lastAt: '',
+                rungs: [
+                  {
+                    situation: 'verify-red',
+                    rung: 'resume-own-session',
+                    params: { mode: 'fix-verification' },
+                    at: '2026-08-20T09:00:00Z',
+                    outcome: 'failed',
+                  },
+                ],
+              },
+            },
+          },
+          record: { status: 'failed', resumable: true, situation: { key: 'verify-red' } },
+        }}
+      />,
+    );
+    const strip = screen.getByTestId('ladder');
+    expect(strip).toHaveTextContent('Verification red');
+    // The rung climbed, on the line: its name and how it ended, two words apart.
+    expect(screen.getByTestId('ladder-tried')).toHaveTextContent('Resume with the failure');
+    expect(screen.getByTestId('ladder-tried')).toHaveTextContent('did not hold');
+    expect(screen.getByTestId('ladder-next')).toHaveTextContent('Fix with a stronger new agent');
+    // No errand yet — the ladder is still climbing.
+    expect(screen.queryByTestId('errand')).toBeNull();
+    // And the buttons are still there: the strip explains, it does not replace.
+    expect(screen.getAllByRole('button').length).toBeGreaterThan(0);
+  });
+
+  it('shows exactly ONE errand, need and how, once the ladder is exhausted', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{
+          run: { ...HALTED, recoveries: { '2': { attempts: 2, lastAt: '', errand: ERRAND, rungs: [] } } },
+          record: { status: 'failed', resumable: false },
+        }}
+      />,
+    );
+    const errands = screen.getAllByTestId('errand');
+    expect(errands).toHaveLength(1);
+    expect(errands[0]).toHaveTextContent('Needs you — phase 2');
+    expect(errands[0]).toHaveTextContent(ERRAND.need);
+    expect(errands[0]).toHaveTextContent(ERRAND.how);
+    expect(screen.getByTestId('errand-tried')).toHaveTextContent(
+      'resume-own-session (fix-verification) → failed',
+    );
+    // Exhausted: nothing is proposed as next.
+    expect(screen.queryByTestId('ladder-next')).toBeNull();
+  });
+
+  it('reads the run-level errand for a phase-less target (a wall with no phase)', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', runId: 'r1' }}
+        ctx={{
+          run: {
+            status: 'halted',
+            halt: { reason: 'the run budget of $40 is spent', kind: 'budget' },
+            errand: {
+              ...ERRAND,
+              phase: 0,
+              situation: 'resource-wall:budget',
+              tried: ['raise-budget → failed'],
+              need: 'More budget.',
+              how: 'Raise it on the run page and press Continue.',
+            },
+          },
+        }}
+      />,
+    );
+    const errand = screen.getByTestId('errand');
+    expect(errand).toHaveTextContent('More budget.');
+    expect(errand).toHaveTextContent('Resource wall · budget');
+  });
+
+  it('still offers NOTHING for a resolved stop, errand or not — the pin holds', () => {
+    const { container } = mount(
+      <RecoveryActions
+        target={{ slug: 'demo', runId: 'r1' }}
+        ctx={{
+          run: {
+            status: 'halted',
+            halt: null,
+            resolved: { at: 'x', reason: 'superseded — the board shows phase 7 done' },
+            recoveries: { '2': { attempts: 2, lastAt: '', errand: ERRAND } },
+            errand: { ...ERRAND, phase: 0 },
+          },
+        }}
+      />,
+    );
+    expect(container.querySelector('button')).toBeNull();
+    expect(screen.queryByTestId('errand')).toBeNull();
+    expect(screen.queryByTestId('ladder')).toBeNull();
+  });
+
+  /* ---------------------------------------------------------------- *
+   * Retry with edits
+   *
+   * The panel that turns Retry from all-or-nothing into "again, but this
+   * time…". What matters here is that the edits reach the ONE verb that
+   * performs a retry, that an empty panel cannot be submitted, and that the
+   * card says what a person needs to know before typing: this attempt only.
+   * ---------------------------------------------------------------- */
+
+  it('offers Retry with edits beside plain Retry, never instead of it', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+    );
+    fireEvent.click(screen.getByText(/More ways forward/));
+    expect(screen.getByRole('button', { name: 'Retry from scratch' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry with edits…' })).toBeInTheDocument();
+  });
+
+  it('sends the addendum and the model as edits on the retry verb, and says they are one-off', async () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+      { models: ['claude-opus-5', 'claude-sonnet-5'] },
+    );
+    fireEvent.click(screen.getByText(/More ways forward/));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry with edits…' }));
+
+    // The failure is the placeholder, never the value: a prefilled instruction
+    // would be submitted by anyone who pressed the button without reading, and
+    // the halt reason repeated back is not an instruction.
+    const box = screen.getByLabelText(/What this attempt should do differently/) as HTMLTextAreaElement;
+    expect(box.value).toBe('');
+    expect(box.placeholder).toContain('phase 2 did not verify');
+    expect(screen.getByText(/This attempt only/)).toBeInTheDocument();
+
+    fireEvent.change(box, { target: { value: 'The fixture is stale — regenerate it.' } });
+    fireEvent.change(screen.getByLabelText('Model for this attempt'), { target: { value: 'claude-opus-5' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Retry with these' }));
+
+    await waitFor(() => expect(retry).toHaveBeenCalled());
+    expect(retry).toHaveBeenCalledWith('demo', 2, {
+      addendum: 'The fixture is stale — regenerate it.',
+      options: { model: 'claude-opus-5' },
+    });
+  });
+
+  it('an empty panel cannot be submitted — that is what plain Retry is for', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+    );
+    fireEvent.click(screen.getByText(/More ways forward/));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry with edits…' }));
+    const submit = screen.getByRole('button', { name: 'Retry with these' });
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Effort for this attempt'), { target: { value: 'max' } });
+    expect(screen.getByRole('button', { name: 'Retry with these' })).not.toBeDisabled();
+  });
+
+  it('the model list is the SERVER`s, so the console never offers a name the door would refuse', () => {
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ run: HALTED, record: { status: 'failed', resumable: true } }}
+      />,
+      { models: ['only-this-one'] },
+    );
+    fireEvent.click(screen.getByText(/More ways forward/));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry with edits…' }));
+    const options = [...(screen.getByLabelText('Model for this attempt') as HTMLSelectElement).options].map(
+      (o) => o.value,
+    );
+    expect(options).toEqual(['', 'only-this-one']);
+  });
+});
+
+describe('a press says what it launched (control-tower phase 53)', () => {
+  const HUMAN_ACTS = {
+    record: { status: 'parked', resumable: true },
+    run: {
+      status: 'parked',
+      halt: { reason: "phase 2 needs a person: the merge is the owner's", kind: 'needs-human', phase: 2 },
+    },
+    situation: { id: 'blocked-declared', sub: 'human-acts' },
+  } as const;
+
+  it('leads a phase parked on human acts with Delegate, and sends the words to its own endpoint', async () => {
+    mount(<RecoveryActions target={{ slug: 'demo', phase: 2 }} ctx={HUMAN_ACTS} />);
+    const first = screen.getAllByRole('button')[0];
+    expect(first).toHaveAccessibleName('Delegate to the session');
+    fireEvent.click(first);
+    const words = screen.getByRole('textbox', { name: 'Your words to the session' });
+    // The words are optional: Delegate's own instruction already hands the acts over.
+    const submit = screen.getByRole('button', { name: 'Delegate the acts' });
+    expect(submit).toBeEnabled();
+    fireEvent.change(words, { target: { value: 'Merge it; I trust the gate.' } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(delegate).toHaveBeenCalledWith('demo', 2, 'Merge it; I trust the gate.'));
+    expect(resumePhase).not.toHaveBeenCalled();
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    const [message, kind] = toast.mock.calls.at(-1)!;
+    expect(kind).toBe('ok');
+    expect(message).toMatch(/^Delegated — the phase's session resumes/);
+  });
+
+  it('a resume that boarded FRESH says so, and why — not "resuming the session"', async () => {
+    resumePhase.mockResolvedValueOnce({
+      run: null,
+      launched: {
+        runId: 'r1',
+        phase: 2,
+        session: null,
+        brief: 'resume',
+        why: 'it ended at 681k tokens of context',
+      },
+    });
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ record: { status: 'failed', resumable: true }, situation: { id: 'work-in-progress' } }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Resume with an instruction' }));
+    const box = screen.getByRole('textbox', { name: 'Your instruction' });
+    const submit = screen.getByRole('button', { name: 'Resume with this' });
+    expect(submit).toBeDisabled();
+    fireEvent.change(box, { target: { value: 'Finish the parser.' } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(resumePhase).toHaveBeenCalledWith('demo', 2, 'Finish the parser.'));
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    expect(toast.mock.calls.at(-1)![0]).toBe(
+      'Boarded fresh with the resume brief and your instruction — its session was not resumed: it ended at 681k tokens of context.',
+    );
+  });
+
+  it('a delegation the server refuses reads its reason, not a success', async () => {
+    const { ApiError } = await import('@/data/api');
+    delegate.mockRejectedValueOnce(
+      new ApiError(
+        'Phase 2 of demo is not parked on acts kept for a person',
+        409,
+        '/api/run/demo/delegate',
+        {},
+      ),
+    );
+    mount(<RecoveryActions target={{ slug: 'demo', phase: 2 }} ctx={HUMAN_ACTS} />);
+    fireEvent.click(screen.getAllByRole('button')[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Delegate the acts' }));
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    expect(toast.mock.calls.at(-1)).toEqual([
+      'Phase 2 of demo is not parked on acts kept for a person',
+      'error',
+    ]);
+  });
+});

@@ -1,14 +1,14 @@
 /**
- * The theme guard.
+ * The theme guard — tokens 7.0 (quiet-console phase 1).
  *
  * Two things rot silently in a token system: a fourth breakpoint appearing
  * because someone needed "just one" media query, and a token being renamed out
- * from under the components that use it. The old stylesheet had five
- * breakpoints (640, 780, 900, 1180, 1200), no two of which agreed on what a
- * small screen was. This test is what keeps that from happening again — and,
- * since 3.0, what keeps the status palette a closed set of eight, the accent a
- * single amber, the type floor at 12 px and the fonts the vendored files (two
- * variable faces since 4.0, with their width clamps).
+ * from under the components that use it. This test is what keeps that from
+ * happening — and, since 7.0, what keeps the type to ONE sans at ONE width
+ * (the condensed display face is retired, and the test fails the day a width
+ * clamp comes back), the status palette a closed set of eight at one weight,
+ * the accent a single amber, the type floor at 12 px with four sizes to a
+ * page, the radii 3 / 6 / 10, and the shadow one — for overlays.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -34,6 +34,22 @@ const STATUS_TOKENS = [
   '--status-needs-you',
   '--status-failed',
   '--status-skipped',
+];
+
+/** Every colour the room is made of — each declared ONCE, for both lights at once. */
+const COLOUR_TOKENS = [
+  ...STATUS_TOKENS,
+  '--ground',
+  '--ground-deep',
+  '--surface',
+  '--surface-raised',
+  '--rule',
+  '--rule-strong',
+  '--ink',
+  '--ink-muted',
+  '--ink-faint',
+  '--track',
+  '--hatch',
 ];
 
 /**
@@ -66,6 +82,37 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+/** Every `@font-face` a stylesheet declares: its family and its width clamp. */
+function faces(css: string): { family: string; stretch: string | null }[] {
+  return [...css.matchAll(/@font-face\s*\{([^}]*)\}/g)].map(([, body]) => ({
+    family: /font-family:\s*'([^']+)'/.exec(body)?.[1] ?? '',
+    stretch: /font-stretch:\s*([\d.]+%)/.exec(body)?.[1] ?? null,
+  }));
+}
+
+/**
+ * The 7.0 type law, as a function of a stylesheet so it can be shown its own
+ * negative: ONE sans, Instrument Sans, at 100 % of its width; the mono held at
+ * 87.5 %; no second face over the sans file and no condensed clamp anywhere.
+ * Returns what breaks it, so `[]` is the law held.
+ */
+function widthLawBroken(css: string): string[] {
+  const out: string[] = [];
+  const declared = faces(css);
+  const sans = declared.filter((f) => f.family === 'Instrument Sans');
+  if (sans.length !== 1) out.push(`Instrument Sans declared ${sans.length}× (one face, one width)`);
+  for (const f of declared) {
+    if (/display/i.test(f.family)) out.push(`a display face: '${f.family}'`);
+    if (f.family === 'Instrument Sans' && f.stretch !== '100%')
+      out.push(`the sans clamped at ${f.stretch ?? 'no width'}`);
+    if (f.family === 'Martian Mono' && f.stretch !== '87.5%')
+      out.push(`the mono clamped at ${f.stretch ?? 'no width'}`);
+    if (f.stretch && f.stretch !== '100%' && f.stretch !== '87.5%') out.push(`a width clamp of ${f.stretch}`);
+  }
+  if (/--font-display\b/.test(css)) out.push('a --font-display token');
+  return out;
+}
+
 describe('theme tokens', () => {
   it('declares exactly three breakpoints, at 640/900/1200', () => {
     const declared = [...THEME.matchAll(/--breakpoint-([\w-]+):\s*(\d+)px/g)].map(([, name, value]) => ({
@@ -89,26 +136,17 @@ describe('theme tokens', () => {
 
   it('declares every token the components paint with', () => {
     const required = [
-      '--ground',
-      '--ground-deep',
-      '--surface',
-      '--surface-raised',
-      '--rule',
-      '--rule-strong',
-      '--ink',
-      '--ink-muted',
-      '--ink-faint',
-      '--track',
-      '--hatch',
-      ...STATUS_TOKENS,
+      ...COLOUR_TOKENS,
       '--accent',
       '--action',
       '--focus',
-      '--shadow-card',
-      '--glow-action',
+      '--shadow-overlay',
       '--font-sans',
-      '--font-display',
       '--font-mono',
+      '--text-title',
+      '--text-section',
+      '--text-body',
+      '--text-meta',
       '--text-2xs',
       '--text-xs',
       '--text-sm',
@@ -117,9 +155,13 @@ describe('theme tokens', () => {
       '--text-xl',
       '--text-2xl',
       '--text-3xl',
+      '--radius-sm',
+      '--radius',
+      '--radius-lg',
       '--tap-min',
       '--text-input',
       '--app-height',
+      '--measure',
       '--z-base',
       '--z-sticky',
       '--z-shell',
@@ -127,35 +169,29 @@ describe('theme tokens', () => {
       '--z-toast',
       '--rail-width',
       '--content-max',
+      '--pad-x',
+      '--pad-y',
+      '--tile-pad-x',
+      '--tile-pad-y',
     ];
     const missing = required.filter((token) => !new RegExp(`\\${token}:`).test(THEME));
     expect(missing, `undeclared: ${missing.join(', ')}`).toEqual([]);
   });
 
-  it('defines each colour once, for both themes at the same time', () => {
-    // The old file wrote the light palette twice on top of the dark one and the
-    // three copies had already drifted (`--line-waiting` was missing from one).
+  it('defines each colour once, for both lights at the same time', () => {
     // `light-dark()` makes a second definition unnecessary — and a duplicate
-    // here means someone started a fourth copy.
-    for (const token of [
-      ...STATUS_TOKENS,
-      '--ground',
-      '--ground-deep',
-      '--surface',
-      '--surface-raised',
-      '--ink',
-      '--track',
-    ]) {
+    // here means someone started a second copy of the palette.
+    for (const token of COLOUR_TOKENS) {
       const declarations = [...THEME.matchAll(new RegExp(`^\\s*\\${token}:`, 'gm'))];
       expect(declarations.length, `${token} declared ${declarations.length}x`).toBe(1);
       const line = THEME.split('\n').find((l) => l.trim().startsWith(`${token}:`)) ?? '';
-      expect(line, `${token} should carry both themes`).toContain('light-dark(');
+      expect(line, `${token} should carry both lights`).toContain('light-dark(');
     }
   });
 
-  it('holds the status palette at one OKLCH weight per theme', () => {
+  it('holds the status palette at one OKLCH weight per light', () => {
     // Equal weight is the design rule: no state shouts louder than another by
-    // accident. Every chromatic state shares one L/C pair per theme; the two
+    // accident. Every chromatic state shares one L/C pair per light; the two
     // neutrals (queued, skipped) keep the lightness and drop the chroma.
     const weights = new Map<string, { paper: string; night: string }>();
     for (const token of STATUS_TOKENS) {
@@ -175,18 +211,29 @@ describe('theme tokens', () => {
     expect([...nightC], 'one night L/C for every chromatic state').toHaveLength(1);
   });
 
+  it('keeps the room one cool neutral family — every surface and ink at hue 230, low chroma', () => {
+    // One room, two lights: a surface or an ink at another hue is a second
+    // room, and a chroma past 0.02 is a tint rather than paper.
+    for (const token of COLOUR_TOKENS.filter((t) => !STATUS_TOKENS.includes(t) && t !== '--hatch')) {
+      const line = THEME.split('\n').find((l) => l.trim().startsWith(`${token}:`)) ?? '';
+      for (const [, C, h] of line.matchAll(/oklch\([\d.]+% ([\d.]+) ([\d.]+)/g)) {
+        expect(Number(C), `${token} chroma`).toBeLessThanOrEqual(0.02);
+        if (Number(C) > 0) expect(Number(h), `${token} hue`).toBe(230);
+      }
+    }
+  });
+
   it('reserves amber for the thing that needs a person — reached only through --accent', () => {
-    // Tokens 6.0 (control-tower phase 16): amber is a summons and nothing else.
-    // `--accent` is the ONE door to it and it is the needs-you state; the
-    // action colour (a primary button, "do this now") and the focus ring are
-    // high-contrast INK, because neither is a person being summoned.
+    // Amber is a summons and nothing else. `--accent` is the ONE door to it and
+    // it is the needs-you state; the action colour (a primary button) and the
+    // focus ring are high-contrast INK, because neither is a person being
+    // summoned.
     expect(THEME).toMatch(/--accent:\s*var\(--status-needs-you\)/);
     expect(THEME).toMatch(/--action:\s*var\(--ink\)/);
     expect(THEME).toMatch(/--focus:\s*var\(--ink\)/);
     // Follow every custom property to its root: the only tokens whose value
     // reaches the amber hue are the needs-you state itself, the accent, and the
-    // aliases that exist to paint a needs-you state. (The 2.x `--line-*` and
-    // `--color-stuck`/`--color-gated` aliases went in control-tower phase 31.)
+    // aliases that exist to paint a needs-you state.
     expect(tokensReachingAmber()).toEqual(['--accent', '--color-accent', '--color-needs-you']);
     // Only one token may sit at the amber hue: every other hue in the palette
     // is at least 40° away, so no second state can be mistaken for the accent.
@@ -199,15 +246,15 @@ describe('theme tokens', () => {
       if (token === '--status-needs-you') continue;
       expect(Math.abs(hue - amber), `${token} sits too close to the amber hue`).toBeGreaterThanOrEqual(40);
     }
+    // And a selection is not a summons either.
+    expect(THEME).not.toMatch(/::selection\s*\{[^}]*accent/);
   });
 
   it('never draws a focus mark in amber', () => {
     // A focused control is not a person being summoned. The ring is `--focus`
     // (ink), painted by `:focus-visible` in theme.css; a component that narrows
-    // it names `outline-focus`. Two named `outline-accent` instead — the shell's
-    // skip link, the first tab stop of every page, and the grid's row link —
-    // and only a real browser saw it (`e2e/status.spec.ts`). An outline is only
-    // ever a focus mark here; a ring is one under a focus variant.
+    // it names `outline-focus`. An outline is only ever a focus mark here; a
+    // ring is one under a focus variant.
     const amber = new Set(
       ['--status-needs-you', ...tokensReachingAmber()].map((t) => t.replace(/^--(?:color-)?/, '')),
     );
@@ -232,9 +279,7 @@ describe('theme tokens', () => {
   });
 
   it('carries no 2.x alias — the line tokens, their colour names and the board-word classes are gone', () => {
-    // Control-tower phase 31 retired them: every view paints through the eight
-    // UI states, so an alias left behind would only be a second way to say one.
-    expect(THEME).not.toMatch(/--line-[a-z]/);
+    expect(THEME).not.toMatch(/(?<![\w-])--line-[a-z]/);
     expect(THEME).not.toMatch(/--color-(?:ready|progress|blocked|stuck|gated)\b/);
     expect(THEME).not.toMatch(/\.state-(?:ready|in-progress|blocked|stuck|gated)\b/);
   });
@@ -248,7 +293,19 @@ describe('theme tokens', () => {
     }
   });
 
-  it('sets the type floor at 12 px and lifts the reading sizes', () => {
+  it('sets the type floor at 12 px, four sizes to a page, and tabular numerals', () => {
+    // Four sizes make a page (design.md §2): title 22 · section 15 · body 14 ·
+    // meta 12.5 — fixed, never fluid. The body is set in `--text-body`.
+    const roles = Object.fromEntries(
+      [...THEME.matchAll(/--text-(title|section|body|meta):\s*([\d.]+)rem/g)].map(([, k, v]) => [
+        k,
+        Number(v) * 16,
+      ]),
+    );
+    expect(roles).toEqual({ title: 22, section: 15, body: 14, meta: 12.5 });
+    expect(THEME).toMatch(/body\s*\{[^}]*font-size:\s*var\(--text-body\)/s);
+    // The 6.x scale stays while the rendered-markdown sheet (`prose.css`) sizes
+    // from it — no page wears it — and its floor is 12 px.
     const sizes = Object.fromEntries(
       [...THEME.matchAll(/--text-(2xs|xs|sm|md):\s*([\d.]+)rem/g)].map(([, k, v]) => [k, Number(v)]),
     );
@@ -259,38 +316,56 @@ describe('theme tokens', () => {
     // Tabular figures are the body's default, and `.tnum` exists for opt-back-in.
     expect(THEME).toMatch(/body\s*\{[^}]*font-variant-numeric:\s*tabular-nums/s);
     expect(THEME).toMatch(/@utility tnum\s*\{\s*font-variant-numeric:\s*tabular-nums/);
+    // Titles are the UI face at 600 — no second face.
+    expect(THEME).toMatch(/h1,\s*h2,\s*h3,\s*h4\s*\{[^}]*font-family:\s*var\(--font-sans\)/s);
   });
 
-  it('vendors the 4.0 voices as exactly two variable woff2 files and nothing else', () => {
+  it('shapes with three radii — 3, 6, 10 — and casts one shadow, for overlays', () => {
+    expect(THEME).toMatch(/--radius-sm:\s*3px/);
+    expect(THEME).toMatch(/--radius:\s*6px/);
+    expect(THEME).toMatch(/--radius-lg:\s*10px/);
+    // One shadow exists: the overlay's. Surfaces differ by tone, never by
+    // shadow, so a card shadow, a glow or a second elevation is a regression.
+    const shadows = new Set([...THEME.matchAll(/--shadow-([\w-]+)\s*:/g)].map(([, name]) => name));
+    expect([...shadows]).toEqual(['overlay']);
+    expect(THEME).not.toMatch(/--glow-/);
+  });
+
+  it('vendors the voices as exactly two variable woff2 files and nothing else', () => {
     const fonts = readdirSync(here('../assets/fonts'))
       .filter((f) => f.endsWith('.woff2'))
       .sort();
     expect(fonts).toEqual(['instrument-sans-var.woff2', 'martian-mono-var.woff2']);
     // Every @font-face points at one of them, and every one is pointed at.
-    // De-duplicated: the display face deliberately reuses the sans file.
     const referenced = [
       ...new Set([...THEME.matchAll(/url\('\.\.\/assets\/fonts\/([\w.-]+\.woff2)'\)/g)].map(([, f]) => f)),
     ].sort();
     expect(referenced).toEqual(fonts);
     for (const f of fonts) expect(existsSync(here(`../assets/fonts/${f}`))).toBe(true);
-    // The families the tokens name are the families the faces declare.
+    // The families the tokens name are the families the faces declare — two of them.
     expect(THEME).toMatch(/--font-sans:\s*'Instrument Sans'/);
-    expect(THEME).toMatch(/--font-display:\s*'Instrument Sans Display'/);
     expect(THEME).toMatch(/--font-mono:\s*'Martian Mono'/);
+    expect(faces(THEME).map((f) => f.family)).toEqual(['Instrument Sans', 'Martian Mono']);
     // Ligatures are off in the mono utility itself, not only on `code`.
     expect(THEME).toMatch(/--font-mono--font-feature-settings:\s*'liga' 0, 'calt' 0/);
   });
 
-  it('clamps the width axes: UI full, display condensed, mono semi-condensed', () => {
-    // The display face is the SAME file as the UI face with its width axis
-    // clamped by the `font-stretch` descriptor — lose the clamp and the
-    // display voice silently becomes the body voice, which nothing else can
-    // see. The mono clamp is the density the tables were budgeted on.
-    const face = (family: string) =>
-      new RegExp(`font-family:\\s*'${family}';[^}]*`, 's').exec(THEME)?.[0] ?? '';
-    expect(face('Instrument Sans')).toMatch(/font-stretch:\s*100%/);
-    expect(face('Instrument Sans Display')).toMatch(/font-stretch:\s*80%/);
-    expect(face('Martian Mono')).toMatch(/font-stretch:\s*87\.5%/);
+  it('sets ONE sans at 100 % of its width and no display clamp — and would fail on one', () => {
+    // 7.0 retired the condensed display face 4.0 clamped out of the sans file
+    // (`font-stretch: 80%`): titles are the UI face at 600. The law is a
+    // function of the stylesheet, shown its own negative here, so the day a
+    // clamp comes back this test is what says so.
+    expect(widthLawBroken(THEME)).toEqual([]);
+    const reclamped = THEME.replace(/font-stretch:\s*100%/, 'font-stretch: 80%');
+    expect(reclamped).not.toBe(THEME);
+    expect(widthLawBroken(reclamped)).toEqual(expect.arrayContaining([expect.stringMatching(/80%/)]));
+    const secondFace =
+      THEME +
+      "@font-face { font-family: 'Instrument Sans Display'; src: url('../assets/fonts/instrument-sans-var.woff2') format('woff2-variations'); font-stretch: 80%; }";
+    expect(widthLawBroken(secondFace)).toEqual(
+      expect.arrayContaining([expect.stringMatching(/display face/), expect.stringMatching(/80%/)]),
+    );
+    expect(widthLawBroken(`${THEME}\n--font-display: 'x';`)).toContain('a --font-display token');
   });
 
   /**
@@ -298,7 +373,7 @@ describe('theme tokens', () => {
    * 2 is explicit: a bundled or redistributed copy must carry the copyright
    * notice and the licence, as a stand-alone text file or a readable header —
    * one notice PER redistributed family. Prose about a licence is not the
-   * licence (the 3.0 tree learned this the hard way).
+   * licence.
    */
   it('ships the OFL text and both copyright notices beside the fonts they cover', () => {
     const ofl = here('../assets/fonts/OFL.txt');
@@ -313,9 +388,6 @@ describe('theme tokens', () => {
     expect(text).toMatch(/DISCLAIMER/);
 
     // …and it has to be in the TARBALL, which is the thing being redistributed.
-    // `files` ships `viewer/client/dist/` and not `client/src`, so a licence
-    // that only exists in source is a licence that does not travel with the
-    // fonts — the same defect, one directory along.
     const pkg = JSON.parse(readFileSync(here('../../../../package.json'), 'utf8')) as {
       files: string[];
     };
@@ -329,13 +401,7 @@ describe('theme tokens', () => {
    * `@theme inline` block. The palette also declares each state twice — once as
    * the raw `--status-done` and once as the utility `--color-done` — so a
    * className spelled from the RAW namespace (`bg-status-done`) is a perfectly
-   * plausible-looking class that compiles to NOTHING. It typechecks, it lints,
-   * it renders, every one of the client's tests passes over it, and the
-   * affordance it was painting is simply invisible. Three shipped that way.
-   *
-   * So: any colour utility whose base names a custom property the stylesheet
-   * declares, but which the theme never exposed as `--color-<base>`, is a
-   * ghost. That is exactly the raw-namespace mistake and nothing else.
+   * plausible-looking class that compiles to NOTHING. Three shipped that way.
    */
   it('paints only with colour tokens the theme actually exposes', () => {
     const declared = new Set([...THEME.matchAll(/--color-([a-z][a-z0-9-]*)\s*:/g)].map(([, name]) => name));
@@ -359,19 +425,11 @@ describe('theme tokens', () => {
   });
 
   /**
-   * The same guard, widened — and this is the half that was missing.
-   *
-   * The test above catches a base declared as a RAW property but never exposed
-   * as `--color-*`. It cannot catch a base declared NOWHERE AT ALL, because
-   * `raw.has(base)` is false for a name the stylesheet has never heard of. So
-   * `bg-surface-sunken` sailed through: there is no `--surface-sunken` and no
+   * The same guard, widened: a base declared NOWHERE AT ALL. `bg-surface-sunken`
+   * sailed through the test above — there is no `--surface-sunken` and no
    * `--color-surface-sunken`, the class compiled to nothing, and four sites
-   * painted air — the run phase table's group headers, the timeline's bar
-   * track and two gantt hatch fills. Same failure mode, opposite cause.
-   *
-   * A blanket "every colour utility must be a project token" would fail on
-   * `bg-white` and `text-transparent`, so the rule is scoped to the families
-   * this palette owns: inside one of those, the full name must be exposed.
+   * painted air. Scoped to the families this palette owns: inside one of
+   * those, the full name must be exposed.
    */
   it('never paints from a token family with a name the theme never declared', () => {
     const declared = new Set([...THEME.matchAll(/--color-([a-z][a-z0-9-]*)\s*:/g)].map(([, name]) => name));
@@ -391,8 +449,8 @@ describe('theme tokens', () => {
       )) {
         flag(base, hit);
       }
-      // And the same name reached through `var()` — how the two gantt fills
-      // did it, which no scan over utility CLASSES could ever have seen.
+      // And the same name reached through `var()`, which no scan over utility
+      // CLASSES could ever have seen.
       for (const [hit, base] of body.matchAll(/var\(--([a-z][a-z0-9-]*)\)/g)) {
         if (declared.has(base) || THEME.includes(`--${base}:`)) continue;
         flag(base, hit);
@@ -424,11 +482,10 @@ describe('theme tokens', () => {
  * fix is a stylesheet line with nothing else to hold it in place.
  */
 describe('the phone holds together', () => {
-  const ROUTE_MAP = readFileSync(here('./route-map.css'), 'utf8');
+  // The map's own sheet, beside it — it rides the map's lazy chunk.
+  const ROUTE_MAP = readFileSync(here('../screens/plan/map/route-map.css'), 'utf8');
 
   it('lets a long path in a sentence wrap instead of widening the page', () => {
-    // The skill directory printed on Settings is one unbreakable word 91px
-    // wider than the phone, and it took the tab bar sideways with it.
     expect(THEME).toMatch(/:not\(pre\)\s*>\s*code[^{]*\{[^}]*overflow-wrap:\s*anywhere/);
     // …and a block of shell still scrolls inside itself rather than wrapping.
     expect(THEME).not.toMatch(/\bpre\s*\{[^}]*overflow-wrap:\s*anywhere/);
@@ -439,11 +496,6 @@ describe('the phone holds together', () => {
   });
 
   it('leaves the vertical swipe to the page, even over the route map', () => {
-    // `touch-action: none` gave the map every touch that began inside it, and
-    // on a phone the map is half the screen — so the tab could not be scrolled.
-    // The map now opens LOCKED (`auto` — every gesture is the page's) and only
-    // the unlocked `[data-interactive]` state takes the horizontal gestures,
-    // still leaving `pan-y` to the page.
     expect(ROUTE_MAP).toMatch(/\.route-frame\s*\{[^}]*touch-action:\s*auto/s);
     expect(ROUTE_MAP).toMatch(/\.route-frame\[data-interactive\]\s*\{[^}]*touch-action:\s*pan-y/s);
     expect(ROUTE_MAP).not.toMatch(/touch-action:\s*none/s);

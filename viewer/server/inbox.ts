@@ -127,7 +127,7 @@ import { UPDATE_SKILL_COMMAND, copyCommit, type SkillCopyReport } from './skill-
 /* ------------------------------------------------------------------ *
  * The wire shapes
  *
- * These mirror `client/src/lib/api/inbox.ts` field for field — that file was
+ * These mirror `client/src/data/api/inbox.ts` field for field — that file was
  * agreed in Phase 3 and is already exported from the client's api barrel, so
  * it is the frozen contract and this is the implementation of it. TypeScript
  * types erase at runtime and cannot be imported across the client/server
@@ -3118,7 +3118,7 @@ function serializeTarget(pair: { a: string; b: string }, byBranch: Map<string, I
  * arrangement `lockDrafts` uses for a lock with no session.
  *
  * There is no dismiss ACTION here on purpose: every row already carries the
- * generic acknowledge control (`client/src/features/now/inbox-row.tsx`), which
+ * generic acknowledge control (`client/src/cards/inbox-row.tsx`), which
  * posts the same `/api/inbox/ack`. A second button would be the same act
  * spelled twice.
  */

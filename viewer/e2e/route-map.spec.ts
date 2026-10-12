@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 
 import { expect, test, type Page } from '@playwright/test';
 
+import { planViewHref } from '../shared/routes.js';
 import { touch } from './lib/grid.ts';
 import { releaseRoutesAfterEach } from './lib/routes.ts';
 import { TOUR_PLAN, shoot } from './lib/shots.ts';
@@ -9,8 +10,8 @@ import { TOUR_PLAN, shoot } from './lib/shots.ts';
 releaseRoutesAfterEach();
 
 /*
- * The route map at 71 stations, in a real browser (control-tower phase 30, #32
- * gap 3).
+ * The route map at 71 stations, in a real browser — the Phases view's `map`
+ * reading (`screens/plan/map/`), drawn from `map-view.tsx`.
  *
  * The plan is `test/fixtures/route-map/plan-71.json` — a real 71-phase
  * dependency shape, 30 waves by 13 rows, neutral titles — served as the tour
@@ -18,10 +19,13 @@ releaseRoutesAfterEach();
  * ratchet is not moved by a seeded plan. What jsdom cannot answer is held here:
  *
  *   - the zoom floor is 45 %, for the buttons and for a two-finger pinch;
+ *   - the rings, painted: a running station's dashed ring, the halo on the
+ *     station the map opened on and on what a search found, and a keyboard
+ *     focus in the focus ring's ink, never a station's own hue;
  *   - the page scrolls PAST the map on a phone — a vertical swipe that starts
  *     on the map, or on its minimap, is the page's, locked or unlocked;
  *   - every station is keyboard reachable, from one tab stop;
- *   - and the hardening the spike chose: the DOM holds a window of stations,
+ *   - and the hardening at plan scale: the DOM holds a window of stations,
  *     not the plan; a minimap; fit-to-width; a search that moves the window.
  *
  * Both touch gestures go through Chromium's own input pipeline, as
@@ -46,7 +50,7 @@ const PLAN = JSON.parse(
   readFileSync(new URL('../test/fixtures/route-map/plan-71.json', import.meta.url), 'utf8'),
 ) as Fixture;
 const STATIONS = PLAN.route.nodes.length;
-const MAP = `/#/plan/${TOUR_PLAN}/phases?view=map`;
+const MAP = `/${planViewHref(TOUR_PLAN, 'map')}`;
 const TOUR_ONLY = new Set(['live', 'lock', 'handoff']);
 
 /** Serve the tour plan with the fixture's route and phases in place of its own. */
@@ -120,7 +124,7 @@ async function zoom(page: Page): Promise<number> {
   return Number(text!.replace('%', ''));
 }
 
-const stations = (page: Page) => page.locator('.route-svg .station');
+const stations = (page: Page) => page.locator('.route-svg .route-station');
 
 async function openMap(page: Page): Promise<void> {
   await serveFixture(page);
@@ -140,6 +144,36 @@ async function insideFrame(page: Page, selector: string): Promise<boolean> {
   }, selector);
 }
 
+/**
+ * A station's halo, read as paint: whether it draws at all, and whether it is
+ * exactly the focus ring's ink. Colours are compared as the pixels they paint,
+ * never as strings — a `color-mix()` and a token serialize differently.
+ */
+async function halo(page: Page, phase: number): Promise<{ painted: boolean; ink: boolean }> {
+  return page.evaluate((phase) => {
+    const ring = document.querySelector(`.route-svg .route-station[data-phase="${phase}"] .halo`);
+    if (!ring) return { painted: false, ink: false };
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const pixel = (colour: string): number[] => {
+      ctx.clearRect(0, 0, 1, 1);
+      ctx.fillStyle = colour;
+      ctx.fillRect(0, 0, 1, 1);
+      return [...ctx.getImageData(0, 0, 1, 1).data];
+    };
+    // The token resolved in the box the map is drawn in: `light-dark()` asks it.
+    const probe = document.createElement('span');
+    probe.style.cssText = 'transition: none; color: var(--focus)';
+    document.querySelector('.route-frame')!.appendChild(probe);
+    const focus = pixel(getComputedStyle(probe).color);
+    probe.remove();
+    const stroke = getComputedStyle(ring).stroke;
+    const paint = stroke === 'none' ? [0, 0, 0, 0] : pixel(stroke);
+    return { painted: paint[3]! > 0, ink: paint.every((v, i) => Math.abs(v - focus[i]!) <= 3) };
+  }, phase);
+}
+
 /** Bring the map's card to the top of what `<main>` shows, for a shot. */
 async function frameTheMap(page: Page): Promise<void> {
   await page
@@ -155,7 +189,7 @@ test.describe('the route map at 71 stations', () => {
     // this is the dev server, and the spike measured the production build.
     await page.addInitScript(() => {
       new MutationObserver((_, observer) => {
-        if (document.querySelector('.route-svg .station')) {
+        if (document.querySelector('.route-svg .route-station')) {
           observer.disconnect();
           requestAnimationFrame(() => {
             (window as unknown as { firstStation: number }).firstStation = performance.now();
@@ -200,7 +234,7 @@ test.describe('the route map at 71 stations', () => {
     for (let press = 0; press < 12; press++) await out.click();
     expect(await zoom(page)).toBe(45);
     const radius = await page.evaluate(() => {
-      const dot = document.querySelector('.route-svg .station .dot')!;
+      const dot = document.querySelector('.route-svg .route-station .dot')!;
       return dot.getBoundingClientRect().width / 2;
     });
     // 15 plan units at 0.45 is 6.75 px, and the ring's stroke adds half its width.
@@ -237,6 +271,36 @@ test.describe('the route map at 71 stations', () => {
     await pinch(100, 10);
     await pinch(100, 10);
     await expect.poll(() => zoom(page)).toBe(45);
+  });
+
+  test('the rings: running dashed, where the map opened haloed, a keyboard focus in ink', async ({
+    page,
+  }, info) => {
+    await openMap(page);
+    // A running station wears its dashed ring, painted by the map's own sheet —
+    // which rides the map's chunk, so this also proves the sheet arrived.
+    const running = PLAN.route.nodes.find((n) => n.state === 'in-progress')!.phase;
+    const dash = await page.evaluate((phase) => {
+      const ring = document.querySelector(`.route-svg .route-station[data-phase="${phase}"] .state-ring`);
+      return ring ? getComputedStyle(ring).strokeDasharray : 'missing';
+    }, running);
+    expect(dash).not.toBe('missing');
+    expect(dash).not.toBe('none');
+    // The map opened on the plan's blocked handoff, and says why it moved there.
+    const opened = PLAN.route.nodes.find((n) => n.state === 'stuck')!.phase;
+    const station = page.locator(`.route-svg .route-station[data-phase="${opened}"]`);
+    await expect(station).toHaveClass(/\bselected\b/);
+    await expect(station).toHaveAttribute('tabindex', '0');
+    expect((await halo(page, opened)).painted).toBe(true);
+    // A keyboard focus is the focus ring's ink, never the station's own hue.
+    if (!touch(info.project.name)) {
+      await station.focus();
+      await page.keyboard.press('ArrowRight');
+      const focused = await page.evaluate(() => Number(document.activeElement?.getAttribute('data-phase')));
+      expect(focused).toBeGreaterThan(0);
+      expect(focused).not.toBe(opened);
+      await expect.poll(async () => (await halo(page, focused)).ink).toBe(true);
+    }
   });
 
   test('a vertical swipe that starts on the map, or its minimap, scrolls the page past it', async ({
@@ -281,6 +345,12 @@ test.describe('the route map at 71 stations', () => {
     // has left the screen, or the page has ended.
     await page.locator('.route-frame').evaluate((frame) => frame.scrollIntoView({ block: 'start' }));
     const startTop = await scrollTop();
+    // How far the page goes on below that — 7.0's Phases view folds its foot,
+    // so on a tall screen there may be less than a swipe's worth left.
+    const roomAtStart = await page
+      .locator('main')
+      .first()
+      .evaluate((main) => main.scrollHeight - main.clientHeight - main.scrollTop);
     // What `<main>` shows: the shell's header sits above it, and a map under
     // the header has left the page as surely as one above the screen.
     const shown = () =>
@@ -308,7 +378,8 @@ test.describe('the route map at 71 stations', () => {
       });
     }
     const past = await shown();
-    expect((await scrollTop()) - startTop).toBeGreaterThan(100);
+    // Carried at least 100 px — or as far as the page goes, when less is left.
+    expect((await scrollTop()) - startTop).toBeGreaterThanOrEqual(Math.min(100, roomAtStart - 2));
     // Gone from what `<main>` shows (a sliver under 40 px), or the page ended.
     expect(past.bottom - past.top < 40 || past.pageEnded).toBe(true);
   });
@@ -316,19 +387,19 @@ test.describe('the route map at 71 stations', () => {
   test('every station is keyboard reachable, from one tab stop', async ({ page }, info) => {
     test.skip(touch(info.project.name), 'a keyboard');
     await openMap(page);
-    await expect(page.locator('.route-svg .station[tabindex="0"]')).toHaveCount(1);
+    await expect(page.locator('.route-svg .route-station[tabindex="0"]')).toHaveCount(1);
     // Tab from the search, through the toolbar, onto the map's one stop.
     await page.getByRole('searchbox', { name: 'Find a station' }).focus();
     for (let press = 0; press < 12; press++) {
       await page.keyboard.press('Tab');
-      if (await page.evaluate(() => document.activeElement?.classList.contains('station'))) break;
+      if (await page.evaluate(() => document.activeElement?.classList.contains('route-station'))) break;
     }
     const active = () => page.evaluate(() => Number(document.activeElement?.getAttribute('data-phase')));
     expect(await active()).toBeGreaterThan(0);
 
     await page.keyboard.press('End');
     await expect.poll(active).toBe(STATIONS);
-    expect(await insideFrame(page, `.station[data-phase="${STATIONS}"]`)).toBe(true);
+    expect(await insideFrame(page, `.route-station[data-phase="${STATIONS}"]`)).toBe(true);
     await page.keyboard.press('Home');
     await expect.poll(active).toBe(1);
 
@@ -337,10 +408,10 @@ test.describe('the route map at 71 stations', () => {
     for (let wave = 1; wave < PLAN.route.layers; wave++) await page.keyboard.press('ArrowRight');
     const at = await active();
     expect(lastWave).toContain(at);
-    expect(await insideFrame(page, `.station[data-phase="${at}"]`)).toBe(true);
+    expect(await insideFrame(page, `.route-station[data-phase="${at}"]`)).toBe(true);
     await page.keyboard.press('ArrowUp');
     await page.keyboard.press('ArrowDown');
-    expect(await page.locator('.route-svg .station[tabindex="0"]').count()).toBe(1);
+    expect(await page.locator('.route-svg .route-station[tabindex="0"]').count()).toBe(1);
   });
 
   test('a station search moves the window to the station and rings it', async ({ page }, info) => {
@@ -352,9 +423,11 @@ test.describe('the route map at 71 stations', () => {
     await search.press('Enter');
     await expect(page.getByText('1 of 1')).toBeVisible();
     await expect(page.locator('svg.route-svg')).not.toHaveAttribute('viewBox', before!);
-    const found = page.locator(`.route-svg .station[data-phase="${target.phase}"]`);
+    const found = page.locator(`.route-svg .route-station[data-phase="${target.phase}"]`);
     await expect(found).toHaveClass(/\bselected\b/);
-    expect(await insideFrame(page, `.station[data-phase="${target.phase}"]`)).toBe(true);
+    expect(await insideFrame(page, `.route-station[data-phase="${target.phase}"]`)).toBe(true);
+    // The ring a search puts on its answer is painted, not merely a class.
+    expect((await halo(page, target.phase)).painted).toBe(true);
     await frameTheMap(page);
     await shoot(page, info.project.name, 'route-map-found');
   });

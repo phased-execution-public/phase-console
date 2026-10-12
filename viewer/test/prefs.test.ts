@@ -22,7 +22,8 @@ process.env.XDG_STATE_HOME = STATE_HOME;
 process.env.XDG_CONFIG_HOME = CONFIG_HOME;
 process.env.PHASE_CONSOLE_LOG = '';
 
-const { loadPrefs, sanitiseAutomation, SKILL_DIR } = await import('../server/config.ts');
+const { instancePrefsFile, loadPrefs, sanitiseAutomation, savePrefs, SKILL_DIR } = await import('../server/config.ts');
+const { instanceId } = await import('../shared/instances.mjs');
 const { STALL_DEFAULTS } = await import('../shared/attention-model.js');
 const { Service } = await import('../server/service.ts');
 
@@ -589,19 +590,100 @@ test('QH-6 (control-tower phase 138, #215): reminderQuiet is no preference any m
 test('PR-10 (control-tower phase 53, #56): a pref set to null returns to its shipped default, in memory and on disk', () => {
   writeConfig({});
   const service = makeService();
+  const onDisk = (): Record<string, unknown> => JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) as Record<string, unknown>;
   try {
     assert.equal(service.savePreferences({ ladderPerPhaseRungs: 6 }).ladderPerPhaseRungs, 6);
-    assert.equal(JSON.parse(readFileSync(CONFIG_FILE, 'utf8')).ladderPerPhaseRungs, 6);
+    assert.equal(onDisk().ladderPerPhaseRungs, 6);
     // It used to be dropped like a typo: 200, and the raised cap stayed.
     const back = service.savePreferences({ ladderPerPhaseRungs: null } as never);
     assert.equal(back.ladderPerPhaseRungs, 3, 'null is how an override is taken back');
-    assert.equal(JSON.parse(readFileSync(CONFIG_FILE, 'utf8')).ladderPerPhaseRungs, 3);
-    // A null for a key with no shipped default is still dropped, and moves nothing else.
+    // Since quiet-console phase 25 the key LEAVES the file rather than being
+    // written back at 3, so the settings schema reads it as the default and a
+    // later shipped default would reach it.
+    assert.ok(!('ladderPerPhaseRungs' in onDisk()), 'the key left config.json');
+    assert.equal(loadPrefs().ladderPerPhaseRungs, 3, 'and a fresh read is the shipped default');
+    // A null for a key this door does not know is still dropped, and moves nothing else.
     const again = service.savePreferences({ somethingElse: null, mcpPolicy: 'require' } as never);
     assert.ok(!('somethingElse' in again));
     assert.equal(again.mcpPolicy, 'require');
     assert.equal(again.ladderPerPhaseRungs, 3);
+    assert.ok(!('ladderPerPhaseRungs' in onDisk()), 'a later save does not write it back');
+
+    // One notify category, by its dotted key: that member alone goes back.
+    service.savePreferences({ notify: { 'needs-you': false, gate: false } } as never);
+    const notify = service.savePreferences({ 'notify.needs-you': null } as never).notify;
+    assert.equal(notify['needs-you'], true, 'the category is announced again, as shipped');
+    assert.equal(notify.gate, false, 'and its neighbour stays as the operator left it');
+    assert.deepEqual(onDisk().notify, { gate: false });
+
+    // A writable key with no shipped default goes back to unset.
+    service.savePreferences({ model: 'claude-opus-5-5' });
+    assert.equal(onDisk().model, 'claude-opus-5-5');
+    assert.equal(service.savePreferences({ model: null } as never).model, undefined);
+    assert.ok(!('model' in onDisk()));
   } finally {
     service.close();
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * The file keeps only what reads back as what the console runs with
+ * (quiet-console phase 25)
+ * ------------------------------------------------------------------ */
+
+const onDisk = (file = CONFIG_FILE): Record<string, unknown> =>
+  JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+
+test('a key whose default follows another is kept wherever dropping it would change the next boot', () => {
+  // `isolation` defaults to `worktree` beside `gitMode: new-branch` and
+  // `settle` to `keep` beside `openPrOnComplete: false` (sanitiseAutomation),
+  // so equal to the shipped constant is not the same as silent.
+  writeConfig({});
+  const service = makeService();
+  try {
+    const saved = service.savePreferences({ gitMode: 'new-branch' });
+    assert.equal(saved.isolation, 'queue', 'the console goes on running the isolation it had');
+    assert.equal(onDisk().isolation, 'queue', 'so the file says so');
+    assert.equal(loadPrefs().isolation, 'queue', 'and the next boot reads what this one runs');
+    service.savePreferences({ openPrOnComplete: false });
+    assert.equal(loadPrefs().settle, service.prefs.settle);
+  } finally {
+    service.close();
+  }
+});
+
+test('a key taken back is what the next boot reads: `isolation: null` beside a new-branch console is worktree', () => {
+  writeConfig({ gitMode: 'new-branch', isolation: 'queue', openPrOnComplete: false, settle: 'pr' });
+  const service = makeService();
+  try {
+    const back = service.savePreferences({ isolation: null, settle: null } as never);
+    assert.equal(back.isolation, 'worktree', 'derived from gitMode, as a boot derives it');
+    assert.equal(back.settle, 'keep', 'derived from openPrOnComplete: false');
+    assert.ok(!('isolation' in onDisk()) && !('settle' in onDisk()), 'both left the file');
+    assert.equal(loadPrefs().isolation, back.isolation);
+    assert.equal(loadPrefs().settle, back.settle);
+  } finally {
+    service.close();
+  }
+});
+
+test('a console of its own takes over what it read from config.json, and leaves the person-wide keys it never held', (t) => {
+  const root = '/tmp/p25-prefs-adopter';
+  const own = { id: instanceId(root), name: 'p25-adopter', root, default: false, pinned: true };
+  t.after(() => rmSync(instancePrefsFile(own), { force: true }));
+  rmSync(instancePrefsFile(own), { force: true });
+  // A machine that has run one console: a pinned isolation beside new-branch, and no model.
+  writeConfig({ gitMode: 'new-branch', isolation: 'queue', qaByDefault: false, theme: 'dark' });
+  const adopted = loadPrefs(own);
+  assert.equal(adopted.isolation, 'queue');
+  // Another console stores a model after this one read its preferences.
+  writeConfig({ ...onDisk(), model: 'claude-opus-5-5' });
+
+  savePrefs({ ...adopted, repoGuard: false }, own, { set: ['repoGuard'] });
+  const mine = onDisk(instancePrefsFile(own));
+  assert.equal(mine.isolation, 'queue', 'the pin it read is its own now — not dropped as a default');
+  assert.equal(mine.qaByDefault, false, 'and so is every other choice config.json held');
+  assert.equal(loadPrefs(own).isolation, 'queue');
+  assert.equal(onDisk().model, 'claude-opus-5-5', 'a person-wide key this console never held is not erased');
+  assert.equal(onDisk().theme, 'dark');
 });

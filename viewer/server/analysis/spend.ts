@@ -4,7 +4,7 @@
  * argument.
  *
  * Read by `server/service.ts` (`spendSummary`, behind `GET /api/spend`, whose
- * answer the client's `client/src/lib/api/spend.ts` `SpendView` already names
+ * answer the client's `client/src/data/api/spend.ts` `SpendView` already names
  * field for field) and by the two callers of `runner/ladder.ts` `nextRung` —
  * `server/runner/runner.ts` (`Runner.climb`) and `server/service.ts`
  * (`maybeAutoRecover`) — which need `rungsToday` for the `dayHistory` the
@@ -20,8 +20,8 @@
  * ## Days are LOCAL days here, and that is a deliberate break
  *
  * Every other day key in this tree is `toISOString().slice(0, 10)` — a UTC day
- * (`analysis/stats.ts`, `client/src/lib/format.ts`, `client/src/components/
- * charts.tsx`). That is fine for a heat-map of activity and wrong for money:
+ * (`analysis/stats.ts`, `client/src/lib/format.ts`, `client/src/ui/figures/
+ * lazy.tsx`). That is fine for a heat-map of activity and wrong for money:
  * "today's ladder budget is spent" is a sentence about the operator's day, and
  * an operator seven hours west of UTC watches their cap reset in the middle of
  * the afternoon and their evening's spend land on tomorrow. So `dayKey` here
@@ -151,11 +151,22 @@ export type SpendFacts = {
   days?: number;
 };
 
-/** Exactly `client/src/lib/api/spend.ts` `SpendView`. Do not add a field here without changing that file. */
+/**
+ * Exactly `client/src/data/api/spend.ts` `SpendView`. Do not add a field here without changing that file.
+ *
+ * The sums a page prints are made HERE (quiet-console phase 19): `usd` per day,
+ * the window's `total` and the ladder's room left under the cap. A page that
+ * added them itself would be a second arithmetic beside the cap's, free to
+ * round differently from the figure a rung is refused against.
+ */
 export type SpendView = {
-  today: { settledUsd: number; ladderUsd: number; capUsd: number | null };
+  /** `ladderLeftUsd`: the cap less the ladder's spend today, never below zero; null with no cap. */
+  today: { settledUsd: number; ladderUsd: number; capUsd: number | null; ladderLeftUsd: number | null };
   runs: { runId: string; slug: string; spentUsd: number; budgetUsd: number | null }[];
-  series: { day: DayKey; settledUsd: number; ladderUsd: number }[];
+  /** `usd`: that day's settled spend and ladder spend together. */
+  series: { day: DayKey; settledUsd: number; ladderUsd: number; usd: number }[];
+  /** The whole series, summed — what the window cost. */
+  total: { settledUsd: number; ladderUsd: number; usd: number };
 };
 
 const DAY = 86_400_000;
@@ -339,20 +350,29 @@ export function spendSummary(facts: SpendFacts, now: Date | number): SpendView {
     }))
     .sort((a, b) => b.spentUsd - a.spentUsd || a.runId.localeCompare(b.runId));
 
+  // Every day present, empty ones as zeros: a gap in a bar chart reads as
+  // missing data, and "nothing was spent on Sunday" is data.
+  const series = keys.map((day) => {
+    const settledUsd = cents(settled.get(day) ?? 0);
+    const ladderUsd = cents(ladder.get(day) ?? 0);
+    return { day, settledUsd, ladderUsd, usd: cents(settledUsd + ladderUsd) };
+  });
+  const ladderToday = cents(ladder.get(today) ?? 0);
+
   return {
     today: {
       settledUsd: cents(settled.get(today) ?? 0),
-      ladderUsd: cents(ladder.get(today) ?? 0),
+      ladderUsd: ladderToday,
       capUsd,
+      ladderLeftUsd: capUsd === null ? null : cents(Math.max(0, capUsd - ladderToday)),
     },
     runs: rows,
-    // Every day present, empty ones as zeros: a gap in a bar chart reads as
-    // missing data, and "nothing was spent on Sunday" is data.
-    series: keys.map((day) => ({
-      day,
-      settledUsd: cents(settled.get(day) ?? 0),
-      ladderUsd: cents(ladder.get(day) ?? 0),
-    })),
+    series,
+    total: {
+      settledUsd: cents(series.reduce((sum, day) => sum + day.settledUsd, 0)),
+      ladderUsd: cents(series.reduce((sum, day) => sum + day.ladderUsd, 0)),
+      usd: cents(series.reduce((sum, day) => sum + day.usd, 0)),
+    },
   };
 }
 

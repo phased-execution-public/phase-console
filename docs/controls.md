@@ -32,8 +32,8 @@ plain language at plan time, or edit the file yourself afterwards.
 | Give a run its own checkout, so two plans in one repo drive at once | the launch form ▸ *Give this run its own checkout* (needs the work branch) | the console |
 | Say what a finished branch becomes | the launch form ▸ *When the plan completes* — PR · merge queue · integration · keep | the console |
 | Cut this run's branch from a chosen base, cap the runs beside it, say what becomes of its checkouts | the launch form ▸ *Branch and checkout* ▸ **Base branch** · **Runs beside it in the repository** · **When the run settles, its checkouts** — each speaks only where the plan's `**Base branch:**` / `**Repo capacity:**` / `**Worktree retention:**` line is silent, and each opens on the Settings ▸ Automation default; the base is refused (`409`) once the branch exists, the cap is clamped to the console's own | the console · the plan |
-| Read where every lane was cut from | the run page's phase table and the Tower's live strip ▸ the branch chip's title — *Cut from `<ref>` at `<sha>` (which git arm; who declared it)*, from the run record's `base` | the console |
-| See that a lane's tree is locked | the Tower's live strip ▸ **locked** chip — the `git worktree lock` reason the runner fastened, on git's word (`ChildRef.locked`); absent means no lock this console holds | the console |
+| Read where every lane was cut from | a plan's Phases table and its Run view's git fold ▸ the branch's title — *Cut from `<ref>` at `<sha>` (which git arm; who declared it)*, from the run record's `base` | the console |
+| See that a lane's tree is locked | the Run view's git fold ▸ **locked by the console** (or **locked by hand**), its title the `git worktree lock` reason, on git's word (`ChildRef.locked`); absent means no lock | the console |
 | Bring a stack up before a phase can be proved | `- **Setup:**` in that `### Phase N` block (or one `**Setup (every phase):**` line in §Session budget) | the plan |
 | How long a session may sit on its OWN background job before the console parks it — measured on the wait CHAIN (calls of one probe, each within `WAIT_CHAIN_GAP_MS`, 3 min, of the last), so the wait procedure's 10-minute slices add up; silent until then, one push when it passes | Settings ▸ Automation ▸ `stallLocalJobMs` (45 min shipped) | the console |
 | Bound the console's own checkouts (cap, setup command, `.env` copy, branch reclaim) | Settings ▸ Automation (shown only while isolation is on) | the console |
@@ -151,7 +151,7 @@ The console keeps its automation preferences in Settings ▸ Automation (stored 
 `~/.config/phase-console/`). **Ten of them are the opening values a launch surface starts from** —
 `attachDefaultSkills`, `qaByDefault`, `gitMode`, `openPrOnComplete`, `isolation`, `settle`,
 `reviewEachPhaseByDefault`, `reviewerPolicy`, `autoRecoverByDefault`, `mcpPolicy` (the keys of
-`buildPrefs()` in `features/run-setup/modes.ts`). Each launch can override them for itself, and how many
+`buildPrefs()` in `screens/launch/model/modes.ts`). Each launch can override them for itself, and how many
 a given surface even shows depends on its mode — a recovery ticket offers five fields in all, of which
 `attachDefaultSkills` is the only one of these ten. The preferences are where "for all plans" is said
 once. The others in this table — the repository guard, the run-branch and merged-branch policies, and
@@ -372,7 +372,7 @@ stays a claim you can trust.
 Everything a run asks of a person is one **item** on one page: `#/turn`, titled *Your turn* and lighting
 Runs. `#/approve` and `#/approve?step=<id>` land on it in one hop, a push opens `#/turn/<id>`
 (`docs/phone.md` has the buttons a push carries), and the approval queue, a question, a gate and an errand each
-draw the same item with *Open on Your turn*. The Tower's Needs-you bay keeps runs and one line linking here,
+draw the same item with *Open on Your turn*. The Runs home's Your turn group keeps runs and one line linking here,
 and *Your turn (n)* in the situation line counts items. The guide's **Your turn** card is the person's account
 of the page; this is the reference, and `references/turn.md` is the session's.
 
@@ -984,7 +984,7 @@ queued plan — as a suggested order, computed when you ask and never acted on.
 
 
 Nothing on it is a new control: the columns, the lane rows, the holder facts, the branch chip, the
-meters and every lifecycle door are the same primitives the run page and the Tower use, which is why a
+meters and every lifecycle door are the same primitives the Run view and the Runs home use, which is why a
 verb cannot behave one way here and another way there.
 
 ## Steering which plan goes first
@@ -1003,7 +1003,7 @@ starvation is a bug.
 while its running phases finish and write their handoffs. That is the whole difference from Pause:
 a pause waits for the next phase boundary and then *settles* the run, so bringing it back is a
 Start; a hold refuses the next admission and nothing else, so a Release puts it straight back in
-the queue. Held entries name who held them on the queue page, and never age into a reservation —
+the queue. Held entries name who held them on their line, and never age into a reservation —
 standing aside must not turn a plan into an obstacle.
 
 **Bump** moves one phase to the front of its class. It never crosses a class boundary (the
@@ -1013,15 +1013,13 @@ relaunch or a restart re-creates the entry already bumped, and the run's own boa
 the phase first among its siblings; it is spent when the phase boards. Two bumps order by when they
 were given, the most recent first.
 
-**The queue page** (`#/queue`, linked from the Tower's board header) is the whole queue of one
-console: every entry in the order it will board, with why it sits there — a dependency, an aged-out
-reservation, its class, a bump, or first come first served — what it waits on (a lane polling its own
-job is named so), its class, account and clocks; the live lanes and who each holds up; the phases a
-re-board asked for that no entry holds yet (Queue it bumps one); the withdrawn phases (Re-queue);
-and the audit strip — every change, newest first, with who and why. Beside Bump, one phase at a time:
-**Hold** keeps it queued with its age, never admitted, until **Release**; **Defer** is a hold that
-ends by itself at a time; **Withdraw** takes it out — its run boards its other phases and names it
-until you **Re-queue** it. Type the reason once at the top of the page and every press records it.
+**The queue** has no page of its own since 7.0: `#/queue` opens the Runs home's **Queued** group. A
+queued run's line says whom it waits on, and opening it says why it sits there — a dependency, an
+aged-out reservation, its class, a bump, or first come first served — and moves it: **Bump**, **Board
+P<N> first**, **Hold**. One phase's own place in line is in its **Actions**, in the panel: **Hold in
+the queue** keeps it queued with its age, never admitted, until **Release**; **Defer until…** is a hold
+that ends by itself at a time; **Withdraw** takes it out — its run boards its other phases and names it
+until you **Requeue at the front**. Settings ▸ Automation ▸ **The queue** decides how the line is ordered.
 Every one is `POST /api/queue/<verb>` — `bump`, `hold`, `release`, `defer {until}`, `withdraw`,
 `requeue {position?: 'front'}`, `reorder {slug, phases}` (the listed phases first, in that order) —
 naming an entry by `entryId` or a phase by `{slug, phase}`, each journalled on its run with the
@@ -1029,11 +1027,11 @@ actor and the reason.
 
 **Start after `<slug>`** (launch only) chains a run behind another plan: it boards nothing until
 that plan's latest run *ends* — finished, paused, parked, halted or stopped, whichever comes — and
-the chain survives a console restart because it lives on the run's checkpoint. The queue page shows
-it as *waiting for `<slug>` to settle*. The slug is not validated: one that names no plan settles
+the chain survives a console restart because it lives on the run's checkpoint. Its line in the Queued
+group says *Chained behind `<slug>`*. The slug is not validated: one that names no plan settles
 at once, rather than refusing to start a run whose predecessor you are about to create.
 
-`GET /api/queue` carries everything the queue page draws — the widened entries, `lanes`, `hinted`,
+`GET /api/queue` carries everything the Queued group and a phase's queue Actions draw — the widened entries, `lanes`, `hinted`,
 `withdrawn` and `audit` — and **ordering advice** alongside them: remaining plan weight and an ETA
 per queued plan, computed when you ask and never stored. Nothing on the server reads the advice
 back: it is the figure to look at before deciding to use one of the controls above.

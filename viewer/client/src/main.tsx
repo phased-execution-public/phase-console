@@ -7,7 +7,7 @@ import { createRoot } from 'react-dom/client';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client';
 import { App } from './App';
-import { createQueryClient } from './lib/queries';
+import { createQueryClient } from './data/keys';
 import { persistOptions, revalidateRestored } from './lib/persist';
 import { applyDensity, applyTheme, getPrefs } from './lib/prefs';
 import { installErrorReporting } from './lib/report-error';
@@ -21,9 +21,8 @@ applyTheme(getPrefs().theme);
 applyDensity(getPrefs().density);
 
 // Before React renders, so a throw during the very first mount is reported
-// rather than lost. `ErrorBoundary` catches what happens while RENDERING a
-// destination; these two are the classes it structurally cannot see — a throw
-// from an event handler or a timer, and a promise nobody awaited.
+// rather than lost: a throw from an event handler or a timer, and a promise
+// nobody awaited, are the two classes the route boundary cannot see.
 installErrorReporting();
 
 const root = document.getElementById('root');
@@ -42,9 +41,7 @@ const queryClient = createQueryClient();
 // a store to keep one in. `PersistQueryClientProvider` holds fetching for the
 // microtask the restore takes, which is the point: a query that fires BEFORE
 // the restore lands is the double request the persistence exists to remove.
-//
-// `null` — a private window, storage refused — is not a failure mode with a
-// branch of its own. The app runs as it always did, from the network.
+// `null` — a private window, storage refused — runs the app from the network.
 const persistence = persistOptions();
 
 createRoot(root).render(

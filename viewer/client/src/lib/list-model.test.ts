@@ -11,7 +11,7 @@
  *    RESTING value from the NO-OP value (the trap that would turn "hide closed
  *    plans" into "hide nothing"), prepares once per pass rather than once per
  *    row, and lets a predicate read a sibling field;
- *  - and the whole kit reproduces `features/plans/model.ts` exactly, on a
+ *  - and the whole kit reproduces `screens/plans/model.ts` exactly, on a
  *    fixture, for every order it offers and every filter combination that has
  *    a control. That is the assertion that makes migrating the three feature
  *    models a mechanical change rather than a rewrite.
@@ -32,12 +32,12 @@ import {
   SORTS as PLAN_SORTS,
   applyFilters as planApplyFilters,
   isSortId as planIsSortId,
-  matches as planMatches,
+  matchesPlan as planMatches,
   sortRows as planSortRows,
   type Filters as PlanFilters,
   type PlanRow,
   type SortId as PlanSortId,
-} from '@/features/plans/model';
+} from '@/screens/plans/model';
 
 /* ------------------------------------------------------------------ *
  * defineSorts
@@ -222,7 +222,7 @@ describe('defineFilters', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Parity with features/plans/model.ts
+ * Parity with screens/plans/model.ts
  * ------------------------------------------------------------------ */
 
 const plan = (over: Partial<PlanRow> & Pick<PlanRow, 'slug'>): PlanRow => ({
@@ -340,7 +340,7 @@ const planFilterKit = defineFilters<PlanRow, PlanFilterSet>({
   },
 });
 
-describe('parity with features/plans/model.ts', () => {
+describe('parity with screens/plans/model.ts', () => {
   it('offers the same orders, with the same words', () => {
     expect(planKit.SORTS).toEqual(PLAN_SORTS.map((s) => ({ ...s })));
   });

@@ -281,8 +281,8 @@ test('SU-3 (#96): progressReading — the one reading the header and the row dra
   const legacy = progressReading({ phases: 72, done: null, percent: null }, now);
   assert.equal(legacy.known, false, 'a null count is not a reading');
 
-  const client = join(HERE, '..', 'client', 'src', 'features', 'plans');
-  for (const file of ['header.tsx', 'row.tsx']) {
+  const client = join(HERE, '..', 'client', 'src');
+  for (const file of [join('screens', 'plan', 'header.tsx'), join('screens', 'plans', 'row.tsx')]) {
     const source = readFileSync(join(client, file), 'utf8');
     assert.match(source, /progressReading\(/, `${file} draws the shared reading, not its own 0 %`);
   }

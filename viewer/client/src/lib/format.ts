@@ -6,7 +6,7 @@
  * runtime — including a test.
  */
 
-import type { EtaBasis, EtaEstimate, HolderEtaView } from './api';
+import type { EtaBasis, EtaEstimate, HolderEtaView } from '@/data/api';
 import { formatInterval } from '../../../shared/interval-format.js';
 
 /** `310000` → `310K`. A weight is always tokens, and always rounded. */
@@ -146,17 +146,25 @@ const UNITS: [number, string][] = [
   [31_557_600_000, 'year'],
 ];
 
-/** `just now` / `4 minutes ago`, falling back to a date once that stops helping. */
+/**
+ * `just now` / `4 minutes ago` / `in 4 minutes`, falling back to a date once
+ * that stops helping. A moment ahead is worded as the same distance the other
+ * way — a lease's end, a reset, a scheduled start — and "just now" is only
+ * ever within a minute of now, on either side.
+ */
 export function relativeTime(ms: number | undefined): string {
   if (!ms || Number.isNaN(ms)) return '—';
   const delta = Date.now() - ms;
-  if (delta < 60_000) return 'just now';
+  const ahead = delta < 0;
+  const distance = Math.abs(delta);
+  if (distance < 60_000) return 'just now';
   for (let i = 0; i < UNITS.length; i++) {
     const [size, name] = UNITS[i];
     const next = UNITS[i + 1]?.[0] ?? Infinity;
-    if (delta < next) {
-      const value = Math.round(delta / size);
-      return `${value} ${name}${value === 1 ? '' : 's'} ago`;
+    if (distance < next) {
+      const value = Math.round(distance / size);
+      const span = `${value} ${name}${value === 1 ? '' : 's'}`;
+      return ahead ? `in ${span}` : `${span} ago`;
     }
   }
   return new Date(ms).toISOString().slice(0, 10);
@@ -198,7 +206,7 @@ export function bytes(n: number | null | undefined): string | undefined {
  * shell anyway. Anything outside `$HOME` is printed exactly as it is — a
  * `/tmp` or `/Volumes` path shortened would be a lie about where it is.
  *
- * This is the DISPLAY form. `portablePath` in `features/settings/start-command`
+ * This is the DISPLAY form. `portablePath` in `lib/start-command`
  * is the shell form (`"$HOME/…"`, quoted); they are different jobs.
  */
 export function homePath(path: string | undefined, home: string | undefined): string | undefined {
@@ -244,7 +252,7 @@ function coarse(ms: number): string {
  * loud, so this only formats and hedges. A collapsed range (both ends in the
  * same bucket) prints once rather than as `~5 min–5 min`. `of work` names the
  * clock: working time, the remaining phases back to back — never a calendar
- * date, which is `Forecast.label` (`lib/api/plans`) and reads differently.
+ * date, which is `Forecast.label` (`data/api/plans`) and reads differently.
  */
 export function etaLabel(lowMs: number, highMs: number, basis: EtaBasis): string {
   const range = lowMs === highMs ? `~${coarse(highMs)}` : `~${coarse(lowMs)}–${coarse(highMs)}`;

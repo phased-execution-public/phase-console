@@ -47,6 +47,7 @@ import {
 } from '../shared/door-model.js';
 import { AUTHORITY_METHODS } from '../server/owner/door.ts';
 import { mintActionToken } from '../server/push/actions.ts';
+import { fill, probe, unrouted } from './route-probe.ts';
 import { configDir, stateHome } from '../shared/instances.mjs';
 import { OPERATOR_VERBS } from '../shared/verb-model.js';
 
@@ -383,34 +384,6 @@ test('CF-5: reads, the hooks, the session\'s own doors, the skill\'s scripts and
 });
 
 test('CF-5 (EC5): AUTHORITY_ROUTES is one table of routes the router serves — a row it does not answer fails here', async () => {
-  const probe = async (method: string, path: string) => {
-    let status = 0;
-    let body = '';
-    const req = {
-      method,
-      url: path,
-      headers: { 'x-phase-console': '1', host: '127.0.0.1:4130', 'content-type': 'application/json' },
-      socket: { remoteAddress: '127.0.0.1' },
-      on() { return this; },
-      [Symbol.asyncIterator]: async function* () { yield Buffer.from('{}', 'utf8'); },
-    };
-    const res = {
-      req,
-      writeHead(code: number) { status = code; return this; },
-      setHeader() {},
-      end(chunk?: string) { body += chunk ?? ''; },
-      on() { return this; },
-    };
-    // Every capability on and no Service behind it: a served route gets past
-    // its guard and fails on the method it calls; a path no route serves is
-    // the router's own 404 or 405.
-    const service = { root: { ok: true, path: tmpdir() }, store: {}, flags: { allowWrites: true, allowRun: true, allowAccounts: true, remoteHosts: [] as string[] } };
-    await handleApi({ service } as never, req as never, res as never, new URL(`http://127.0.0.1:4130${path}`));
-    return { status, body };
-  };
-  const unrouted = ({ status, body }: { status: number; body: string }) =>
-    status === 405 || (status === 404 && /No API route|No run verb|a step has no verb/.test(body));
-  const fill = (path: string) => path.replace(/:([a-z]+)/g, (_, name: string) => (name === 'phase' ? '3' : 'demo'));
   for (const row of AUTHORITY_ROUTES) {
     const answer = await probe(row.method, fill(row.path));
     assert.ok(!unrouted(answer), `${row.verb} (${row.method} ${row.path}): the router does not serve it — ${answer.status} ${answer.body}`);

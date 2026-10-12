@@ -12,7 +12,7 @@
  */
 
 import { isAuthHalt } from '@shared/halt-categories.js';
-import type { AccountView, AuthStatus, RunState } from './api';
+import type { AccountView, AuthStatus, RunState } from '@/data/api';
 
 /**
  * Does this run's halt look like a sign-in problem?

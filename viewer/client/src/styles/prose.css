@@ -37,6 +37,8 @@
 
   .md p { margin: 0.7em 0; }
 
+  /* Headings are the one sans at 600 (tokens 7.0): no second face, and the
+     small ones are sentence-case words in muted ink, never a tracked-out label. */
   .md h1,
   .md h2,
   .md h3,
@@ -44,7 +46,7 @@
   .md h5,
   .md h6 {
     color: var(--ink);
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-weight: 600;
     line-height: 1.25;
     margin: 1.4em 0 0.5em;
@@ -57,9 +59,7 @@
   .md h5,
   .md h6 {
     font-size: var(--text-sm);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--ink-faint);
+    color: var(--ink-muted);
   }
 
   .md ul,
@@ -187,7 +187,7 @@
   }
   /* No height cap, ever — `overflow-x` computes `overflow-y` to `auto`, and a
      capped box is a second vertical scroller that eats the page's touch flick.
-     The same rule `components/ui/table.tsx` states for `TableWrap`. */
+     The same rule `ui/table.tsx` states for `TableWrap`. */
   .md table {
     width: max-content;
     max-width: none;

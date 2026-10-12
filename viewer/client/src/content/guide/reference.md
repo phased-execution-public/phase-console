@@ -152,9 +152,10 @@ up to half an hour.
 
 ## Run timeline
 
-**Plan → a run → Run timeline** draws the run on one absolute axis: a row per phase, every bar
-held to a journal line. It answers a different question from the *Timeline* card below it — that
-one splits each phase's own clock, this one says *when* each phase held the lane.
+The run's fold **Where the time went** opens on **When each phase held the lane**: the run on one
+absolute axis, a row per phase, every bar held to a journal line. It answers a different question from
+**How each phase's clock was split**, under it — that one splits each phase's own clock, this one says
+*when* each phase held the lane. Logs ▸ **Journal** draws it for any run, a finished one too.
 
 | Bar | What the lane was doing |
 | --- | --- |
@@ -162,7 +163,7 @@ one splits each phase's own clock, this one says *when* each phase held the lane
 | `verifying` | §Verification was running — the automatic proof measured back from `phase.verify`'s own command times, and the person-check path bracketed by `phase.awaiting-verification` → `phase.verify` |
 | `queued` | waiting for a scope somebody else held — a queue episode, `phase.queued` → `phase.queue-closed` |
 | `waiting` | parked on something outside the phase — a wait, an MCP preflight |
-| `down` | the RUN was down with this phase in flight — halted, parked, paused, stopped or shut down — until the next start; the bar's tooltip names the cause (`halted: plan-lint`, `stopped by operator`) |
+| `down` | the RUN was down (the legend says *run down*) with this phase in flight — halted, parked, paused, stopped or shut down — until the next start; the bar's tooltip names the cause (`halted: plan-lint`, `stopped by operator`) |
 | `frozen` | stopped by the operator (a SIGSTOP: no spend, real wall-clock) |
 
 Working means a session and nothing else, so a stretch no line claims is left as a gap: the phase
@@ -179,7 +180,8 @@ reads `pinned` while it is a standing decision. The **critical path** highlighte
 weighted by each phase's MEASURED session and verification time, never by a bar still open — not
 the plan page's estimate, which answers what is left rather than what happened.
 
-A phase boarded twice offers **attempt comparison**: what changed between two boardings —
+A phase boarded twice offers **attempt comparison** — press its `×2` for *Phase N's attempts*: what
+changed between two boardings —
 outcome, model, duration, spend, ladder rung, and every §Verification command whose result moved.
 An attempt is one BOARDING, and its spend is summed from its own `phase.session` lines, so it is
 never the phase's cumulative total. A figure that was never recorded reads *not recorded*, never
@@ -189,12 +191,12 @@ never the phase's cumulative total. A figure that was never recorded reads *not 
 | --- | --- |
 | Endpoint | `GET /api/run/<slug>/timeline` · `GET /api/run/<slug>/attempts/<phase>` |
 | Flag to see it | none — reading is always allowed |
-| If the journal was truncated | the header says so, and the lanes it cut are marked partial |
+| If the journal was truncated | *Journal truncated* beside the heading, and a lane it cut reads *starts mid-flight* |
 
 ## Landing packet
 
-The console never pushes, so a finished plan hands you its work as files. **Route tab → Landing
-packet**, or the API below.
+The console never pushes, so a finished plan hands you its work as files: the **Landing packet**,
+folded at the foot of the plan's **Phases**, or the API below.
 
 | Thing | Value |
 |---|---|
@@ -222,6 +224,7 @@ the card says how much.
 | `~/.local/state/phase-console/accounts/learned.json` | What the machine has learned about each Claude credential — its walls, the entitlement breaker, when its meters were last read, its organisation (hashed), and the tombstone of a removed registration. Every console on the machine reads the same file; the registrations themselves stay per console. |
 | `~/.local/state/phase-console/cli-init.json` | The newest Claude CLI version a session on this console reported — what the relay's floor is judged against. |
 | `~/.local/state/phase-console/relay/state.json` | The relay's memory across a restart: the questions each run has asked, and the answers kept for a session that resumes. |
+| This browser's `phase-console.ui` | What this browser remembers about how you look at things: the theme and density, the panel's width and mode, each page's **Everything**, the rows and folds you left open, a table's columns, the map's lock and the terminal's font size. Nothing in it is a setting of the console. |
 | `.phase-console.json` | Optional, committed at a repository root: `{"name": …, "port": …}` names that project's console for everyone who clones it. |
 
 ## The engine, if you would rather drive it yourself
@@ -285,31 +288,38 @@ presses, a person's to make. The Permissions guide covers grants and the owner k
 
 ## Keyboard
 
-Three keys, not eight. The 2.x list was seven single-letter jumps you had to memorise from a card you
-had to remember to visit. The palette replaced all of them with one chord that shows you its own
-contents — every destination, every plan, every run, every verb — and prints the chord on itself, in
-the header, on every page.
+A handful of chords, and the palette names the rest. The 2.x list was seven single-letter jumps you had
+to memorise from a card you had to remember to visit; the palette replaced them with one chord that shows
+you its own contents — every page, every plan, the ready phases, every verb — and prints the chord on
+itself, in the header, on a desk.
 
 | Key | Does |
 |---|---|
-| `⌘ K` | The command palette — search and every verb |
-| `/` | The same, without a modifier |
-| `Esc` | Close a dialog, a sheet or the palette |
+| `⌘ K` | Opens and closes the palette — go to, find, or do — even while you type (Ctrl+K elsewhere) |
+| `/` | Opens the palette when nothing has your typing |
+| `⌘ I` | Opens and closes the panel's **Details** on a desk (Ctrl+I elsewhere) |
+| `Esc` | Closes a dialog, a sheet, the palette, the bell or this guide |
+| `←` `→` | On the panel's focused edge, widen or narrow it, 16 px a press (×4 with Shift) |
 
-Everything the old letters reached is in the palette by name: type `ready` for what is next up,
-`stats` or `insights` for the numbers, `guide` for this page.
+A Ctrl chord does nothing inside a terminal, where Ctrl+K and Ctrl+I belong to the shell; a ⌘ chord still
+works there. Everything the old letters reached is in the palette by name: type `ready` for the phases
+that are next up, `insights` for the numbers, `help` or `guide` for this sheet.
 
 ## The route map
 
-The Phases tab's **Map** view draws the plan as a route: a station per phase, a line per dependency.
-It opens locked, as a picture the page scrolls past; press **Pan & zoom** to drag and pinch it, and the
-**−**, **+** and **Fit** buttons work either way (double-clicking the map fits it too). A plan too big to
-show whole never draws its stations smaller than they can be read. Instead:
+A plan's **Phases** has a **Map** view beside **Table**, **QA** and **Handoffs**, and it draws the plan as
+a route: a station per phase, a line per dependency. It opens locked, as a picture the page scrolls past;
+press **Pan and zoom** (the lock) to drag and pinch it, and this browser remembers which you chose. The
+zoom readout, **−**, **+** and **Fit** work either way, and double-clicking the map fits it too. A plan too
+big to show whole never draws its stations smaller than they can be read. Instead:
 
 - **Fit rows** fits every row of the plan across the frame, then you pan along its waves.
-- The **minimap** strip under the frame shows the whole plan and where you are; press it to go there.
-- **Find a station** searches by number or title — Enter jumps to the next match.
-- The stations are one tab stop: focus the map, then the **arrow keys** walk from station to station.
+- The **minimap** under the frame shows the whole plan and where you are — *Waves 3–5 of 9* — press it
+  to go there, or drag along it.
+- **Find a station** (on a plan of twenty stations or more) searches by number or title: Enter jumps to
+  the next match, Shift+Enter to the one before, Esc clears it.
+- The stations are one tab stop: focus the map, then the **arrow keys** walk from station to station, and
+  Enter opens the phase. On a touch screen the first tap shows the station's facts with **Open phase**.
 
 A station's paint is its status (the eight states below). A **Stuck** phase is drawn in the waiting
 paint with an alert glyph; only a summons — something a person must do — wears the amber ring.
@@ -329,7 +339,7 @@ onto these eight; the tables further down list every word under the state it rea
 | `needs-you` | **Needs you** | Stopped until a person does something — an approval, a gate, a sign-in, a decision, an errand. The only amber. | phase `awaiting-verification` (**Awaiting sign-off**) · an MCP server or account to sign in · an outstanding decision · a landing conflict · anything with an open inbox item |
 | `failed` | **Failed** | The attempt failed — a red verification, or a session that produced nothing the board accepts. | phase `failed` · QA `fail` |
 | `running` | **Running** | A session is working right now, or the run is on its way to a stop. The only state that may pulse. | run `running` `halting` `pausing` `stopping` · phase `running` · board `in-progress` (**In progress**) · a machine's situation |
-| `verifying` | **Verifying** | The session finished; the console is running the plan's §Verification itself. Running's family, drawn dashed on a map or strip. | phase `verifying` |
+| `verifying` | **Verifying** | The session finished; the console is running the plan's §Verification itself. Running's family, drawn dashed on a map or a track. | phase `verifying` |
 | `waiting` | **Waiting** | Asleep on something that settles by itself or by a press — a dependency, a usage window, an external clock, a pause you asked for, a halt whose errand waits in the inbox. | run `waiting` `paused` `frozen` `halted` `parked` `interrupted` · phase `waiting` `gated` `parked` `interrupted` · board `waiting` `gated` `blocked` `stuck` (**Stuck**, with an alert glyph) · a situation that waits on time or someone else |
 | `queued` | **Queued** | In line — next up, or behind something holding the same repos. A board phase that is `ready` reads **Next up**. | run `queued` · phase `queued` `pending` · board `ready` · QA `pending` |
 | `skipped` | **Skipped** | Taken off this run's list by the operator. Not finished, not failed. Also how a word the console does not know reads: **Unknown**, never a borrowed colour. | phase `skipped` · QA `waived` · an unknown word |
@@ -373,18 +383,18 @@ available, so closing is a cheap, reversible call.
 
 | Word | Reads as | What it means | What to do |
 |---|---|---|---|
-| `running` | Running | The autopilot is driving: sessions spawn, verify and hand off by themselves. | Nothing — watch the phase tabs. Pause, Freeze and Stop all apply. |
+| `running` | Running | The autopilot is driving: sessions spawn, verify and hand off by themselves. | Nothing — watch its lanes. Pause, Freeze and Stop all apply. |
 | `pausing` | Waiting | A pause is armed: whatever is running finishes, and nothing new boards. | Wait for the boundary, or Cancel pause to keep going. |
 | `paused` | Waiting | Stopped between phases at your request; nothing is running. | Press Continue when ready — it picks up exactly where it left off. |
 | `waiting` | Waiting | Asleep on a clock: an account's usage window reopening, an external wait a session declared, or — while a verification or permission card stands — a person, with the run's clock at the soonest card's expiry. A card that runs out its clock unanswered parks its phase as `awaiting-person`. | Nothing, unless it is waiting on you: then answer the card. |
 | `frozen` | Waiting | Every session is stopped where it stands (mid-token), warm and losing nothing. A freeze on ONE session of several is recorded on that session's tab instead, and the run stays `running`. | Continue the frozen session to resume instantly, or Stop it. |
-| `parked` | Needs you | Every remaining phase needs a person first — a gate, an approval, a decision. | Read "Why this is stopped": each blocker is named with its remedy. |
-| `queued` | Queued | In line behind another plan holding the same repos; starts itself when the scope frees. | Nothing — the holder is named on the queued chip. |
+| `parked` | Needs you | Every remaining phase needs a person first — a gate, an approval, a decision. | Read **Ways forward** on its page: each blocker is named with its remedy. |
+| `queued` | Queued | In line behind another plan holding the same repos; starts itself when the scope frees. | Nothing — its line on Runs names the holder. |
 | `halting` | Needs you | A halt was recorded; live sessions are finishing before the run fully stops. | Read the halt card. The run reads halted once the last session settles. |
 | `halted` | Needs you | Stopped on something that must not be automated past — usually a red verification. | 'Finish in its own session' or 'Fix with a new agent' on the halt card, or fix the cause yourself and Retry the phase. |
 | `stopping` | Waiting | A stop was requested; sessions are being wound down. | Wait a moment. |
 | `finished` | Done | Nothing left to run on this plan. | Nothing. |
-| `interrupted` | Needs you | Nothing is driving it and nothing recorded why — a console or session died mid-flight. | Resume with AI, or press Continue — work already on disk is kept. |
+| `interrupted` | Needs you | Nothing is driving it and nothing recorded why — a console or session died mid-flight. | **Pick up with a new agent**, or press Continue — work already on disk is kept. |
 
 ## Phase record
 
@@ -394,17 +404,17 @@ disk.
 | Word | Reads as | What it means | What to do |
 |---|---|---|---|
 | `pending` | Queued | This run has not started the phase yet. | Nothing — the loop reaches it when its dependencies are done. |
-| `gated` | Needs you | Held at the plan's gate — a human or automatic condition the run cannot clear itself (ai gates never park: their session is booted to clear them). | Do the gate's steps and Approve on the phase page's Gate card (it can continue the run in the same action), or Retry to re-check. |
-| `running` | Running | A session is working this phase right now. | Watch its tab; Ask reaches the session mid-flight. |
+| `gated` | Needs you | Held at the plan's gate — a human or automatic condition the run cannot clear itself (ai gates never park: their session is booted to clear them). | Do the gate's steps and press **Approve the gate** on the phase page's Gate card (it can continue the run in the same action), or Retry to re-check. |
+| `running` | Running | A session is working this phase right now. | Watch its pane; **Ask** reaches the session mid-flight. |
 | `verifying` | Verifying | The session finished; the console runs the plan's verification commands itself. | Nothing — green marks it done, red halts with the evidence. |
 | `awaiting-verification` | Needs you | The machine checks passed; steps only a person can confirm remain. | Answer the verification card — it lists exactly what needs your eyes. |
 | `done` | Done | Finished and independently verified in this run. | Nothing. |
-| `failed` | Failed | The attempt failed — a red verification, or a session that produced nothing. | Why? shows the evidence; 'Fix with a new agent' repairs it, or Retry restarts the run here. |
-| `interrupted` | Needs you | The session or console died mid-phase — or the operator stopped this one session from its tab; the working tree is wherever it stopped. | Resume with AI or Retry — the session id is kept, and uncommitted work is preserved, never redone blindly. |
+| `failed` | Failed | The attempt failed — a red verification, or a session that produced nothing. | **Why is this not done?** shows the evidence; **Fix with a new agent** repairs it, or **Retry from scratch** restarts it. |
+| `interrupted` | Needs you | The session or console died mid-phase — or the operator stopped this one session from its pane; the working tree is wherever it stopped. | **Pick up with a new agent** or **Retry from scratch** — the session id is kept, and uncommitted work is preserved, never redone blindly. |
 | `skipped` | Skipped | Taken off this run's list by the operator. | Retry it later if it should still happen. |
 | `parked` | Needs you | Needs a person before the loop will touch it again — the note says exactly why. | Read the note (gate, foreign lock, decision), act on it, then Retry. |
 | `waiting` | Waiting | Parked on an external clock the session declared — a CI build, a PR auto-merge, a deploy window. | Nothing — the runner resumes the phase's own session when the window elapses. |
-| `queued` | Queued | Waiting for repos another phase or plan is holding; starts itself when they free. | Nothing — the queued chip names what it waits on. |
+| `queued` | Queued | Waiting for repos another phase or plan is holding; starts itself when they free. | Nothing — its line names what it waits on. |
 
 A `failed` record under a phase the **board** calls done means: this run's attempt stopped, and the
 work was finished and verified outside it. The row says "nothing to fix — done elsewhere".
@@ -454,7 +464,7 @@ shows the UI state's word (`ready` reads **Next up**).
 | `in-progress` | Running | A session is on this phase right now. | Watch its lane. The board catches up when the handoff lands. |
 | `waiting` | Waiting | An earlier phase it depends on is not done yet. | Nothing here; finish what it waits on. |
 | `stuck` / `blocked` | Stuck · Blocked | Its handoff is marked blocked — the Outstanding section says exactly why. Drawn in the waiting paint with an alert glyph; it turns amber only when an errand asks you for something. | Read the excerpt on the phase page, or use Ways forward on the run page. |
-| `gated` | Gated | The plan gates this phase — on a person (`manual`), a session's own check (`ai`), or an automatic condition. | The phase page's Gate card shows the steps and the Approve button; ai gates clear themselves when their session boots. |
+| `gated` | Gated | The plan gates this phase — on a person (`manual`), a session's own check (`ai`), or an automatic condition. | The phase page's Gate card shows the steps and **Approve the gate**; ai gates clear themselves when their session boots. |
 
 ## The claim
 

@@ -2,15 +2,22 @@
 
 **Sessions** shows every process this console owns or can see, in one place:
 
-- **Autopilot lanes** — the phases a run is driving. The row links to the run page, where that lane's
-  console, approvals, ask box and replay live.
+- **Autopilot lanes** — the phases a run is driving. The row opens the plan's **Run** view, where the
+  lane's console is a pane of **Sessions and their consoles**, with its ask box; while a permission
+  waits, the open row also offers **Answer on Your turn**.
 - **Agent sessions** — interactive Claude sessions you opened here.
 - **Shells** — a plain shell on this machine, from a laptop or a phone.
 - **Other sessions on this machine** — Claude sessions the presence hook reported: your own CLI,
-  another console's lane. The row exists because *that* is what a scope conflict is — and it opens
-  a page of its own, from which the conversation can be **resumed** in a terminal here.
+  another console's lane. The row exists because *that* is what a scope conflict is. A row tied to a
+  phase of a plan opens that phase; any other opens a page of its own, from which the conversation can
+  be **resumed** in a terminal here.
 
-Only the middle two are processes this console holds a terminal for, so only those offer Close. A
+Search the list, narrow it with **Filter** by kind, **Group** it by kind or not at all, **Sort** it by
+activity, start or kind, and **Everything** adds every column. **Locks**, beside **Sessions** at the top,
+is every phase claim and who holds it, at `#/sessions/locks`.
+
+Only the middle two are processes this console holds a terminal for, so only those offer **Freeze** and
+**Stop**, and, in an open session's panel, **Close**. A
 foreign row's own address is `#/sessions/<conversation id>`, which resolves to the pty once one is
 running that conversation — so the link keeps working after you open it, and after a restart.
 
@@ -27,9 +34,8 @@ is where the resume starts. A directory outside the open root and the recent one
 whatever the session's presence, and the confirm names the path.
 
 `#/agent/<id>` and `#/terminal/<id>` still work — they were two pages until 3.0 and both are in
-bookmarks. Each keeps its session id through the redirect; with no id, `#/agent` opens the agent
-launcher
-and `#/terminal` the new-shell state, because that is what each address meant.
+bookmarks. Each keeps its session id through the redirect; with no id, `#/agent` opens **New session**,
+the form that starts one, and `#/terminal` opens **New shell**, because that is what each address meant.
 
 ## A session is a process, not a tab
 
@@ -51,11 +57,13 @@ session.
 
 ## On a phone
 
-Sessions works under a thumb: the list collapses to the open session and a chevron (the sheet behind
-it holds every session, the controls, and the lanes this page cannot open a pane for), then a fixed
-key bar with the keys a phone keyboard lacks, a composer for agent sessions, a pty born at the size
-of your screen, an `A−`/`A+` font stepper, and reconnects that happen by themselves. **Mobile setup ▸
-Driving a session from the phone** walks through it.
+Sessions works under a thumb. An open session keeps one line above its terminal: **‹** back to every
+session, its status and name, **Switch** (**Open another**, **New session**, **New shell**, **Every
+session**) and **Details**, which raises the panel from the bottom with its vitals, its facts and its
+controls; the line steps aside while the keyboard is up. Under the terminal sits a fixed key bar with the
+keys a phone keyboard lacks; a Claude session gets a composer, *Message the session*, with **Send**; the
+pty is born at the size of your screen, with an `A−`/`A+` font stepper; and reconnects happen by
+themselves. **Mobile setup ▸ Driving a session from the phone** walks through it.
 
 ## Ended is not gone
 
@@ -64,20 +72,23 @@ session that record carries the `claude --resume <id>` that picks the work up ag
 why the record outlives the process: discarding it discards the only way back into the conversation.
 Records are dropped 24 hours after death, or when you dismiss them.
 
-Opening `#/sessions/<id>` for a session that has already exited shows that panel — what it was, how
-it ended, how to resume it — rather than an empty terminal pretending to connect.
+Opening `#/sessions/<id>` for a session that has already exited shows its scrollback under one line that
+says how it ended — *This session exited cleanly 2 minutes ago.* — with **Resume here**, **Copy resume
+command** and **Dismiss**, rather than an empty terminal pretending to connect. A record already retired
+says so.
 
 ## Where they all are
 
-**Sessions** is the list; **Runs ▸ Live** is the same lanes ranked by what needs you, and the
-nav badge counts what is live — so a session started from one plan's page is not lost to another.
+**Sessions** is the list; the **Running** group on **Runs** is the same lanes ranked by what needs you,
+and the badge on the rail's **Sessions** counts this console's live shells and agent sessions — so a
+session started from one plan's page is not lost to another.
 
 The **A session ended** notification category covers the case you cannot see: a session that
 finished, detached, while you were elsewhere. Closing one yourself is never announced.
 
 ## The console can start the session that unsticks it
 
-Every "Waiting on you" card a Claude session could act on carries a button that opens one. The prompt
+Every halt card and errand a Claude session could act on carries a button that opens one. The prompt
 is not a text box you fill in: **the server composes it**, reading the board, the run, the phase
 diagnosis, the lock and the health issues itself. The browser names only the target.
 
@@ -86,8 +97,9 @@ session* resumes the phase's OWN session through the runner (`claude -p --resume
 intact and the run's settings, deny rules and hooks all apply; cheap, and the right first move when a
 session stopped one step short. *… with a new agent* opens a FRESH interactive session briefed by the
 console with the evidence — fresh eyes that know the facts, not the conversation; it costs a full
-session, and you watch it in this tab. Every button carries the exact what-will-happen as its
-tooltip (tap the ⓘ on a phone).
+session, and you watch it on **Sessions**, where it is listed as `Recover checkout-rewrite P3` while the
+card reads *— running* and links to it. Every button carries the exact what-will-happen as its tooltip (tap
+the ⓘ on a phone).
 
 | The card says | The button | The session is told to |
 |---|---|---|
@@ -113,12 +125,15 @@ the repository is not on it, or using the run's linked worktree when one exists.
 ## Asking for a review
 
 Recording a QA verdict was always possible; **getting** one is the other half. From a finished phase
-— on its panel, in a run's phase table, or on a Ready row whose QA failed before — **QA this phase**
-opens a session whose brief is the skill's own `--qa-prompt`, embedded verbatim, plus what the engine
+— in the plan's phase table, the phase's details or its panel, and in the **Phases** fold of its run —
+**QA this phase** opens a session whose brief is the skill's own `--qa-prompt`, embedded verbatim, plus
+what the engine
 cannot know: the handoff the phase wrote, its key files, the commits that touched it, and that
 phase's exit criteria and verification quoted rather than summarised.
 
-You choose model, effort, permission profile and skills, exactly as for any agent session.
+You choose model, effort, permission profile and skills, exactly as for any agent session. Once it
+starts, the button reads **QA running** and links to the session, listed as `QA checkout-rewrite P3`,
+whose panel says **What it is reviewing**.
 
 **The session records the verdict; the console only reads it back.** The brief ends with the exact
 `qa-record.sh` line, report path already filled in, and when the session exits `test-status.md` is
@@ -141,7 +156,8 @@ and stall everything downstream of them.
 ## The off switch
 
 **Settings ▸ This instance ▸ Shut down** ends the console and everything it owns, as a graceful
-exit that says what it is taking with it — and what the exit achieves, in the dialog's own sentence.
+exit that says what it is taking with it — and what the exit achieves, in the dialog's own sentence:
+*Shut the console down?*, confirmed with **Shut down**. The palette's *Shut this console down…* goes there.
 
 - **The dialog is an inventory, not a warning.** It lists what the console is holding — the lanes in
   flight, the clocks armed, the runs on disk, the live sessions, the cards still waiting for an
@@ -155,5 +171,5 @@ exit that says what it is taking with it — and what the exit achieves, in the 
 - **It is not behind `--allow-run`**, unlike Restart. A read-only console is the common case, and the
   one thing every console must be able to do is stop.
 
-**Restart** shows the same inventory — but since the pty broker the sessions *survive* it, so both
-dialogs list them under "This keeps running" rather than claiming to stop them.
+**Restart the console** shows the same inventory — but since the pty broker the sessions *survive* it,
+so both dialogs list them under "This keeps running" rather than claiming to stop them.

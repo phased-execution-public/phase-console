@@ -5,7 +5,8 @@ memory of yesterday. It answers three questions in the order they get asked:
 **where is the evidence**, **how do I tie it together**, and **what do I hand a
 model**.
 
-There is a page for all of it — `#/debug` in the console — and the page is a
+There is a page for all of it — `#/logs` in the console (Debug until 7.0, and
+every `#/debug…` address still lands on its section) — and the page is a
 reader of the endpoints below rather than a second source of truth. If you are
 in a terminal, skip to [One bundle, for a model](#one-bundle-for-a-model).
 
@@ -125,8 +126,9 @@ grep -m1 '"event":"run.trace"' ~/.local/state/phase-console/runs/<instance>/<slu
 grep -r "$TRACE" ~/.local/state/phase-console/ ~/work/<repo>/docs/handoffs/
 ```
 
-The Debug page takes the same id: `?trace=<id>` on `GET /api/debug/index`, and
-the trace chip on any row.
+The Logs page takes the same id: `?trace=<id>` on `GET /api/debug/index` and in
+its own address (`#/logs?trace=<id>`), and any row's record, opened in the
+panel, filters by its trace with one press.
 
 Two things it does NOT answer, by design. A line written **outside** any span
 carries no trace — that is "no trace", not "some trace", and the filter will not
@@ -162,7 +164,8 @@ them. This is the walk:
    the richest single payload this console has: the command output, the
    session's closing words, the lint summary, the board-vs-handoff
    disagreement, the lock, the working tree, and what can still be done about
-   it. The Debug page's Journal section renders it beside the run's timeline.
+   it. Logs ▸ Journal (`#/logs/journal?slug=&run=&phase=`) renders it under
+   the run's Gantt.
 
 A worked example — *"phase 7 says stuck and I do not know why"*:
 
@@ -366,7 +369,7 @@ rotated by the writer that owns it.
   as a green tick is the one way this data actively misleads.
 - **Metrics are a snapshot, not a series.** `/api/metrics` renders the current
   facts on every scrape and the console stores no history. The Health section
-  charts one sample; the thing on the Debug destination that genuinely is a
+  charts one sample; the thing on the Logs destination that genuinely is a
   timeline is the run journal.
 - **The console log and the supervisor log are different failures.** A crash
   before the logger opened its file exists only in `console.err.log`, and that

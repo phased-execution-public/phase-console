@@ -97,30 +97,65 @@ tests and the client.
 
 ### The client — seven destinations, and the vocabularies they share
 
-Since 6.0 (control-tower phase 21) the client is seven destinations in three bands — **the work**
-(Runs · Plans · Sessions) · **the record** (Repo · Insights · Debug) · **the console** (Settings) —
-under one shell (`client/src/app/`), with every older address still resolving. The design law is
-`viewer/docs/design.md` ("Control Tower 6.0"): every rule in it names the guard that holds it.
-`#/runs`, the Tower, is the home (`DEFAULT_HEAD`); Now is retired and each of its addresses lands on a Runs bay
-(`#/now?focus=inbox` → `#/runs?bay=needs-you`, `#/ready` → `#/runs?bay=ready`). **Your turn**
-(`#/turn`, `features/turn/`, a lazy chunk; control-tower phases 130–139, 148 and 149) is a head that
-lights Runs: every act only a person can do as one item — why only they fit it, a guide, a proof the
-console checks — in five groups plus *Handled by the AI*, read from `GET /api/turn`, which the
-server's `turn/` folds from every source through one door (`raiseTurn`); `#/approve` lands there,
-and the approval, gate, question and errand cards elsewhere draw the item and link to it. A
-permission item is answered by a scoped grant (`server/permissions/grants.ts`, `grants.ndjson`), and
-an owner key (`server/owner/`, a passkey) is what lets a console tell its owner's press from any
-other door's. The band is the
-rail's grouping — a slim 80 px rail, a glyph over each name — and the situation line rides the shell
-header on every page. The phone tab bar is its own list, `TAB_BAR` in `app/shell/nav.ts` (Runs ·
-Plans · Sessions · Insights), and the rest are the More sheet.
-`Repo` and `Debug` are 4.0's additions, both built: Repo is six sections over the `GET /api/repo/…`
-and `GET /api/issues` surfaces (`features/repo/` — the sixth is the Issues desk: since control-tower
-phase 118 a repository's WHOLE issue list, each issue's category, severity and plan status derived once
-in `shared/issues-model.js`, plus any GitHub `owner/name` an operator adds, read-only), Debug is every
-log this console writes on one time axis plus the redacted bundle (`features/debug/`). `views/` is gone;
-a page lives in `client/src/features/<destination>/`. Overlays (`?k=` palette, `?help=`, `?bell=`)
-are query params, never routes: open ⟺ the URL says so, so navigating anywhere closes them.
+7.0 (the quiet-console plan) rebuilt the client from zero: the 6.x tree under `client/src/` (app/,
+features/, components/, lib/api/) is gone, and every address it ever answered still lands, in one hop,
+with its query (`client/src/shell/redirects.ts`). The design law is `viewer/docs/design.md` ("Quiet"):
+every rule in it names the guard that holds it.
+
+**The map.** Seven destinations in three bands, the same seven in both editions (`DESTINATIONS` in
+`shared/route-meta.js`, `NAV` in `client/src/shell/nav.ts`): **the work** — Runs (`#/runs`, the home,
+`DEFAULT_HEAD`), Plans (`#/plans`; a plan is `#/plan/<slug>`), Sessions (`#/sessions`); **the record** —
+Repo (`#/repo/<section>`), Insights (`#/insights`), Logs (`#/logs/<section>`); **the console** —
+Settings (`#/settings/<section>`). The Runs home's heading is the situation sentence; under it six
+groups — Your turn · Running · Waiting · Queued · Ready to start · Settled today (`?group=`, and 6.x's
+`?bay=` still read) — hold one line per run with exactly ONE action, and All runs (`?view=all`) is the
+same set as a table; `#/now…` lands on Runs (a `?focus=` on its group), `#/queue` on Queued. A plan
+opens on its glance over
+three views, each an address: Phases (Table · Map · QA · Handoffs), Run (`#/plan/<slug>/run`;
+`?view=history` for its earlier runs) and Source. Repo is six sections — History, Branches, Working
+trees, Changes, Settles and the Issues desk (`screens/repo/issues-section.tsx`: a repository's WHOLE
+issue list, each issue's category, severity and plan status derived once in `shared/issues-model.js`,
+plus any GitHub `owner/name` an operator adds, read-only). Logs (Debug until 7.0;
+`#/debug[/<section>]` lands on its section with its query) is five — Logs, Journal, Delivery, Health
+and Access — every log this console writes on one time axis, plus the redacted bundle. Settings is
+nine, Everything last: every key `GET /api/prefs/schema` describes, with its value, where it came from
+and its reset. **Your turn** (`#/turn`, `screens/turn/`; control-tower phases 130–139, 148 and 149) is
+a head that lights Runs: every act only a person can do as one item — why only they fit it, a guide, a
+proof the console checks — in five groups plus *Handled by the AI*, read from `GET /api/turn`, which
+the server's `turn/` folds from every source through one door (`raiseTurn`); `#/approve` lands there,
+and the approval, gate, question and errand cards elsewhere draw the item and link to it. A permission
+item is answered by a scoped grant (`server/permissions/grants.ts`, `grants.ndjson`), and an owner key
+(`server/owner/`, a passkey) is what lets a console tell its owner's press from any other door's.
+
+**The shell** (`client/src/shell/`). From 900 px a slim 80 px rail: the instance switcher at its top,
+the seven places as a glyph over a word, banded by hairlines, and Help and the account meter at its
+foot. The header carries the page title, the situation words (each a link on a desk), search (⌘K) and
+the bell. Below 900 a tab bar — `TAB_BAR` in `shell/nav.ts`: Runs · Plans · Sessions · Insights ·
+More — and the More sheet holds the rest. The palette (`?k=`: go to · find · do), the help sheet
+(`?help=`) and the bell (`?bell=`) are query params, never routes: open ⟺ the URL says so, so
+navigating anywhere closes them. **Three doors to depth, on every page** (design.md §1): **expand** a
+row in place, remembered per person; **inspect** it in the panel, on four tabs — Overview · Actions ·
+History · Raw; and **Everything**, a per-page switch kept in `prefs.everything` that shows every
+column, fact and section. Every list's toolbar is one row in one order — search · Filter · Group ·
+Sort · View · ⋯ · Everything — and below 900 the search and one View sheet. **The panel**
+(`client/src/shell/panel/`) is where Inspect puts a record, its **Details** mode: the shell grid's
+third column at 1200 px and up, a sheet from 900 to 1200, a bottom sheet on a phone. ⌘I opens and
+closes it, and its mode, its width and whether it stands persist in `prefs.panel`, because it
+survives navigation.
+
+**The code** (`viewer/client/src/`): `ui/` the kit, `cards/` what a person acts on as a unit (a turn
+item, a halt, an errand, an inbox row), `shell/`, `screens/<place>/` — each place a lazy chunk the
+router loads — and `data/`, the one way to the server; then `styles/`, `lib/` and `content/guide/`.
+ESLint holds five doors over the whole tree: one navigation door (only `shell/routes.ts` spells `#/`),
+one data door (`useQuery`/`useMutation` only under `data/`), one status renderer (`DotWord` only under
+`ui/status/`), one stream (`data/live.ts` opens the console's one `EventSource`; the Logs tail,
+`screens/logs/tail.ts`, is the one named exception) and one table engine (`ui/grid/engine.ts`, reached
+by `import()`). `data/press.ts` is the one press door: the owner door's 202 (a request the owner
+confirms) and 401 (touch the key, then press once more) are handled there, once. `data/surface.ts` is
+the surface registry — every route, SSE event, settings key and operator verb, each with the door a
+person meets it through or an exemption naming its caller — held to the server both ways by
+`viewer/test/surface-parity.test.ts`, its ratchet at zero. First paint is held at 170 KB served, the
+Free build's included (`viewer/scripts/check-dist.mjs`).
 
 Its rule is the same one-source rule as `sizing.env`, and it is what the whole redesign existed to
 establish — a vocabulary lives in `shared/` and is imported by identity by server, client and tests:
@@ -132,10 +167,11 @@ establish — a vocabulary lives in `shared/` and is imported by identity by ser
 - `shared/status-model.js` — status model v2 (control-tower phase 16), the signal law: every word of
   every vocabulary gets one row (label, icon, paint, tense, attention), and `describeRun` /
   `describePhase` decide by table. A page draws a status through the typed family
-  (`client/src/components/ui/status/`), never a raw `StatusBadge`/`StatusDot` — ESLint refuses that
-  import outside the family, the status ratchet (`status/ratchet.test.ts`) is at ZERO, and its source
-  scan holds the retired 2.x `Chip`/`StateChip`, their tone words and the `--line-*` aliases gone
-  (control-tower phase 31). A hue is chosen only there and in theme.css's `.state-<ui>` classes.
+  (`client/src/ui/status/`) as a dot and a word — its renderer, `DotWord`, is imported nowhere else
+  (ESLint) — and the status ratchet (`client/src/ui/status/ratchet.test.ts` + `status-ratchet.json`)
+  scans the whole of `client/src/`: legacy status sites at ZERO, and the retired names — the 2.x
+  `Chip`/`StateChip`, their tone words, the `--line-*` aliases, the 6.x `StatusBadge`/`StatusDot` —
+  gone by name. A hue is chosen only there and in theme.css's `.state-<ui>` classes.
 - `shared/route-meta.js` — the route heads and the destinations, asserted at module load.
 - `shared/situation-model.js` · `shared/ladder-model.js` · `shared/recovery-model.js` — the
   situation, rung and recovery-class vocabularies.
@@ -257,9 +293,10 @@ XDG `.desktop` whose `Exec` paths are baked absolute (Exec lines expand no varia
 WSL story rather than a shortcut that would break. Everything filesystem-shaped is a parameter, so
 tests never touch a real Desktop. **Bump `LAUNCHER_REV` whenever the template's argv changes** — that
 is what tells an installed copy it is stale instead of letting it start a console whose Settings
-disagrees with it. The Settings start-command card composes the same line from the console's own
-facts and renders every path as `$HOME/…`: the line must paste on any account and a screenshot must
-carry no username, and a scrubbed test keeps the shipped template personal-path-free. `viewer/run`
+disagrees with it. Settings ▸ Essentials ▸ Start command composes the same line from the console's
+own facts (`client/src/lib/start-command.ts`) and renders every path as `$HOME/…`: the line must
+paste on any account and a screenshot must carry no username, and a scrubbed test keeps the shipped
+template personal-path-free. `viewer/run`
 looks past the PATH's `node` when it is below the floor (Homebrew, `/usr/local`, volta, newest nvm)
 rather than refusing.
 

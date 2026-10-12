@@ -14,7 +14,7 @@ import {
   situationLabelFor,
   untriedRungs,
 } from './ladder';
-import type { Errand, RecoverySlot } from './api';
+import type { Errand, RecoverySlot } from '@/data/api';
 
 const slot = (over: Partial<RecoverySlot> = {}): RecoverySlot => ({ attempts: 0, lastAt: '', ...over });
 const errand = (over: Partial<Errand> = {}): Errand => ({

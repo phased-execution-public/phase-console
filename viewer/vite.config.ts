@@ -105,9 +105,9 @@ export default defineConfig({
         // into a chunk it named after whichever one was the boundary, and
         // adding a second shared module renamed it (`pane-*` → `ended-*`),
         // matched nothing here, and precached 346 KB. There is now one
-        // deliberate boundary instead: `features/sessions/session-page.tsx`
-        // reaches the pane through `lazy(() => import('./pane'))` and nothing
-        // else imports it, so the chunk is named after that module by
+        // deliberate boundary instead: `screens/sessions/session-page.tsx`
+        // reaches the pane through `lazy(() => import('./pane'))` (and a human
+        // step's terminal sheet through the same module) and nothing else imports it, so the chunk is named after that module by
         // construction. `sessions-*` — the destination chunk — IS precached
         // like the other five, which is exactly why the emulator must not be
         // in it. scripts/check-dist.mjs asserts both halves, by name and by
@@ -128,12 +128,12 @@ export default defineConfig({
     }),
   ],
   resolve: {
-    alias: {
-      '@': here('client/src'),
+    alias: [
+      { find: '@', replacement: here('client/src') },
       // The Node-importable SSOT modules (routes, route-meta, console-model,
       // phase-model). Same files `node --test` imports — one source of truth.
-      '@shared': here('shared'),
-    },
+      { find: '@shared', replacement: here('shared') },
+    ],
   },
   build: {
     // `client/dist` is the only client the server serves, so a build into it
@@ -158,7 +158,7 @@ export default defineConfig({
     // for the server suite, and for the same measured reason.
     //
     // The FIRST test in a file pays for the lazy module graph its `mount()`
-    // pulls in (the dialog behind `lazy-launch-dialog.tsx`, Radix, the whole
+    // pulls in (the dialog behind `screens/launch/door.tsx`, Radix, the whole
     // run-setup tree), transformed on demand INSIDE that test's own budget.
     // One test file per core is the default, so on a loaded machine the import
     // loses the race: phase 8's verification went red twice at load average 57

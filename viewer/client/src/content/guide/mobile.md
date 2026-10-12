@@ -106,15 +106,19 @@ you a cleaner window.
 
 ## Turn on push, and choose what it sends
 
-**Notifications ▸ Devices** has two switches, and the difference between them is the whole point:
+**Settings ▸ Notifications ▸ This browser** has two switches, and the difference between them is the
+whole point:
 
 | | What it is | When it fires |
 |---|---|---|
-| **In this tab** | The Notification API, raised by the page. | Only while a tab is open somewhere. |
-| **On this device** | A push subscription, delivered by Apple, Google or Mozilla to a service worker. | With the console closed, the phone locked, the laptop asleep. |
+| **In this tab** | The Notification API, raised by the page. **Allow**, then it reads **On**. | Only while a tab is open somewhere. |
+| **On this device** | A push subscription, delivered by Apple, Google or Mozilla to a service worker. **Turn on**, then **Send a test** and **Turn off**. | With the console closed, the phone locked, the laptop asleep. |
 
 Press **Turn on** under *On this device*, then **Send a test** — it goes out through the real push
-service and back, so a notification appearing proves the whole chain rather than the last hop.
+service and back, so a notification appearing proves the whole chain rather than the last hop. On an
+iPhone that has not installed it to the Home Screen, *On this device* reads **Not available here**, and
+the page says how to install it. **Devices**, the next group, lists every device subscribed so far, each
+with its own **Send a test** and what it hears, and when it is quiet.
 
 Do it on the laptop too: `http://127.0.0.1` counts as a secure context, so the same button works
 there with no HTTPS involved, and every browser gets its own subscription and its own choices.
@@ -128,7 +132,8 @@ the push service relays a notification about your plans without being able to re
 
 Some notifications carry buttons. Pressing one answers it and shows a receipt; nothing opens. Android
 and desktop render them, and iOS shows the notification without them. Tapping a push about an item, or
-its **Open** button, opens the item on **Your turn**, at `#/turn/<id>`.
+its **Open** button, opens the item on **Your turn**, at `#/turn/<id>`. The bell's **Announcements**
+rows carry the same buttons, and answer in place: *Allow — answered.*
 
 A turn's buttons depend on what it asks, and a button is offered only if a paired device may press it:
 
@@ -164,10 +169,11 @@ already answered, or since cleared opens the console instead.
 old bookmark or an old notification keeps working. A push about an item opens that item, at
 `#/turn/<id>`, already open. Bookmark `#/turn`.
 
-On a phone the items stack in one column, and the search, **Filters**, **Export** and **Print** share one
-line, with the five filters folded behind **Filters**, so the items rather than the controls are the
-first screen. Everything on an item works from the phone: its guide, a device code, a link, the check
-and **Snooze**. A command is shown with its copy buttons, and the page never runs it. Only an item
+On a phone the items stack in one column, under a bar of two things: the search, and one **View**
+button. Its sheet holds **Filter** — plan, run, kind, reason and risk — **More actions** (**Export as
+Markdown** and **Print**) and **Everything**, so the items rather than the controls are the first
+screen. From the **Runs** tab, the **Your turn** group's **Open Your turn** link leads there. Everything on
+an item works from the phone: its guide, a device code, a link, the check and **Snooze**. A command is shown with its copy buttons, and the page never runs it. Only an item
 marked *At the machine* needs you at the computer.
 
 A permission of low or medium risk is granted with one press on its card, from the phone as from the
@@ -238,8 +244,11 @@ and a plain shell live — is built for a thumb:
   connection that drops — the phone locking, the app in the background — comes back on its own,
   with *Reconnecting… (n)* while it does; the console keeps the session and its scrollback, so
   nothing is lost while the socket is away.
-- **The session list** is the bar above the terminal: the open session and a chevron. Tap it for
-  every session, Freeze / Continue / Stop, the clock, and *New plan with AI*.
+- **The line above the terminal** is the way back and the way across: **‹ Sessions** returns to the
+  list, then come the session's state and name, **Switch** (**Open another**, **New session**, **New
+  shell**, **Every session**) and **Details**, which raises the panel from the bottom with the session's
+  vitals and **Freeze**, **Continue** and **Stop**. *New plan with AI* is on the Sessions list, under
+  **More actions** in its **View** sheet.
 - In portrait the terminal keeps 80 columns and pans sideways under a finger; landscape gives the
   columns outright.
 

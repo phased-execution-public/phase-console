@@ -24,7 +24,7 @@
  * waits for the result.
  */
 
-import { api, type PushDevice, type PushState } from './api';
+import { api, type PushDevice, type PushState } from '@/data/api';
 import { registerServiceWorker } from './pwa';
 import { MOUNTED } from './base';
 

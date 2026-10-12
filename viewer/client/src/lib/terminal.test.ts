@@ -15,12 +15,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { terminalTicket } = vi.hoisted(() => ({ terminalTicket: vi.fn() }));
 
-vi.mock('./api', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./api')>();
+vi.mock('@/data/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/data/api')>();
   return { ...actual, api: { ...actual.api, terminalTicket } };
 });
 
-import { ApiError } from './api';
+import { ApiError } from '@/data/api';
 import {
   RECONNECT_BACKOFF_MS,
   TerminalLink,

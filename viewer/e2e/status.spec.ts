@@ -14,7 +14,11 @@ import { STOPS, VIEWPORTS, fixture, visit } from './lib/shots.ts';
  * wearing its paint — a Radix part's `data-state="open"` is not a status). A
  * badge must SHOW an icon and a word: drawn, not collapsed to nothing, not left
  * to a screen reader alone. A dot is the hue and nothing else by design, so the
- * box that holds it must show the word it colours.
+ * box that holds it must show the word it colours — which is the whole 7.0
+ * family (`ui/status/dot-word.tsx`, design.md §3.1: a dot and a word, the word
+ * always drawn), told from a 6.x badge by its `[data-dot]`. A station on the line
+ * (`[data-station]`, `ui/track`, design.md §7) is that dot with its record's
+ * identity beside it, so it is held to the dot's rule: it must show a word.
  *
  * The focus ring is ink, never amber (tokens 6.0): every ring a keyboard walk
  * paints is the resolved `--ink`, in both themes, and never the resolved
@@ -54,12 +58,20 @@ async function colourOnly(page: Page): Promise<Miss[]> {
     const out: Miss[] = [];
     for (const el of document.querySelectorAll('[data-status][data-paint]')) {
       if (!shown(el)) continue;
+      if (el.querySelector(':scope > [data-dot]')) {
+        if (!words(el)) out.push({ why: 'a family status shows no word beside its dot', what: sketch(el) });
+        continue;
+      }
       if (!icon(el)) out.push({ why: 'a family badge draws no icon', what: sketch(el) });
       if (!words(el)) out.push({ why: 'a family badge draws no word', what: sketch(el) });
     }
     for (const el of document.querySelectorAll('[data-state]')) {
       const state = el.getAttribute('data-state') ?? '';
       if (!states.includes(state) || !el.classList.contains(`state-${state}`) || !shown(el)) continue;
+      if (el.hasAttribute('data-station')) {
+        if (!words(el)) out.push({ why: 'a station shows no word beside its dot', what: sketch(el) });
+        continue;
+      }
       if (el.getAttribute('aria-hidden') === 'true') {
         const box = el.parentElement;
         if (!box || !words(box, el))

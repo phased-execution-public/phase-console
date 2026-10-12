@@ -5,8 +5,8 @@
  * eight UI states, each with a label, a hue, a tone and an icon — lives in
  * `shared/status-vocab.js`, imported here by identity (the node suite's
  * `test/status-vocab.test.ts` holds the two the same object). Hue and icon
- * are read in exactly two places, `components/ui/status-badge.tsx` and the
- * `.state-<ui>` classes in `styles/theme.css`; nothing else names a colour
+ * are read in exactly two places, the typed status family (`ui/status/`) and
+ * the `.state-<ui>` classes in `styles/theme.css`; nothing else names a colour
  * for a status.
  *
  * What is CLIENT-ONLY, and therefore here: the explanations — what each word
@@ -53,7 +53,7 @@ import { type QA_RESULTS } from '../../../shared/plan-vocab.js';
 // Type-only, and straight from the module rather than the barrel: the runtime
 // graph must stay one-directional (component → vocab); a type edge the
 // compiler erases is fine.
-import type { PhaseStatus, RunStatus } from '@/lib/api';
+import type { PhaseStatus, RunStatus } from '@/data/api';
 import {
   BOARD_STATE_UI as _BOARD,
   PHASE_STATUS_UI as _PHASE,
@@ -70,7 +70,7 @@ export type StateMeta = {
   /** The hue token suffix: `--status-<hue>`. */
   hue: UiState;
   tone: 'accent' | 'bad' | 'live' | 'wait' | 'neutral' | 'ok';
-  /** A lucide icon name; `StatusBadge` resolves it. */
+  /** A lucide icon name; `statusIcon` (`ui/status/`) resolves it. */
   icon: string;
 };
 
@@ -402,7 +402,7 @@ export const QA_RESULT_HELP: Record<QaResultWord, StatusHelp> = {
 };
 
 // A verdict's paint, icon and word are `shared/status-model.js`'s `qa-result`
-// rows, drawn by `QaBadge` (`@/components/ui/status`) — this file keeps only
+// rows, drawn by `QaStatus` (`@/ui/status`) — this file keeps only
 // what each verdict MEANS.
 
 export function qaResultTitle(result: string | undefined): string | undefined {

@@ -151,4 +151,11 @@ test('the summary aggregates per plan and per account, most expensive first, unk
   assert.equal(byAccount.backup.costUsd, 0.75);
   assert.equal(byAccount.backup.unknownCost, 1);
   assert.equal(summary.truncatedRuns, 0);
+  // Counted once over every run, so a page never adds the plans' rows itself (quiet-console phase 19).
+  assert.equal(summary.unknownSessions, 1);
+  assert.equal(
+    summary.unknownSessions,
+    summary.plans.reduce((sum, row) => sum + row.unknownCost, 0),
+    'the same sessions the per-plan rows count, never a second reading',
+  );
 });

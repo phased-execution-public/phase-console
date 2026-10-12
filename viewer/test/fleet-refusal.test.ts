@@ -42,10 +42,10 @@ const AGENT_FLAGS = [
 
 /** The capability switches, from the one table that owns them. */
 function capabilityFlags(): string[] {
-  const src = read('viewer/server/config.ts');
-  const from = src.indexOf('const CAPABILITY_FLAGS');
-  assert.ok(from > 0, 'CAPABILITY_FLAGS did not parse out of config.ts');
-  const block = src.slice(from, src.indexOf('];', from));
+  const src = read('viewer/shared/capability-model.js');
+  const from = src.indexOf('export const CAPABILITY_WORDS');
+  assert.ok(from > 0, 'CAPABILITY_WORDS did not parse out of shared/capability-model.js');
+  const block = src.slice(from, src.indexOf(']);', from));
   const flags = [...new Set(block.match(/--allow-[a-z-]+/g) ?? [])];
   assert.ok(flags.length >= 5, `expected the capability table, found ${flags.length} flags`);
   return flags;

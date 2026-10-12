@@ -107,11 +107,12 @@ if (!('ResizeObserver' in globalThis)) {
   Object.defineProperty(globalThis, 'ResizeObserver', { value: FakeResizeObserver, writable: true });
 }
 
-// The figures chunk (control-tower phase 29) is a dynamic import in the app —
-// `components/figures/lazy.tsx`. Loaded once here, every figure draws in its
-// first render, exactly as it does in a browser once the chunk has arrived, so
-// a test reads the drawing rather than its placeholder.
+// The figures' drawings (control-tower phase 29) are dynamic imports in the
+// app — the bars and the run's cost strip, both behind `ui/figures/lazy.tsx`,
+// the one door. Loaded once here, every figure draws in its first render,
+// exactly as it does in a browser once the chunks have arrived, so a test
+// reads the drawing rather than its placeholder.
 beforeAll(async () => {
-  const { loadFigures } = await import('@/components/figures/lazy');
+  const { loadFigures } = await import('@/ui/figures/lazy');
   await loadFigures();
 });

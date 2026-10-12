@@ -1,14 +1,17 @@
 /**
- * The run page and Sessions at a phone's width (control-tower phase 24, exit
- * criterion 6): nothing overflows `main`, folded or unfolded, and every tap
- * target the page opens on — the strip's action, each fold's row, the
- * settings verb — wins its own hit test at the thumb's height.
+ * The plan's Run view and Sessions at every width (7.0, quiet-console phase
+ * 11; control-tower phase 24's criterion carried): nothing overflows `main`,
+ * folded or unfolded, and every tap target the view opens on — the head's one
+ * action and its Inspect, each fold's row, the settings verb — wins its own
+ * hit test at the thumb's height.
  *
- * The run page opens on a glance since phase 24: the run's strip as its header
- * and every other section folded under a row that names it. A fold's row is
- * the thing a thumb presses most on this page, so each one is hit-tested, and
- * the page is read again with every fold open — a section that only overflows
- * once shown is still an overflow.
+ * The view opens on a glance: the run's row as its head (the Runs home's own
+ * line, its `header` variant), the halt card when stopped, the lanes, the
+ * verbs, and every other section folded under a row that names it. A fold's
+ * row is the thing a thumb presses most here, so each one is hit-tested, and
+ * the view is read again with every fold open — a section that only overflows
+ * once shown is still an overflow. The History reading (every run of the
+ * plan) and the run in the panel (Inspect) are read the same way.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test';
@@ -38,7 +41,7 @@ async function wins(target: Locator) {
   });
 }
 
-test('the run page opens on its strip and folds, and stays inside main — folded and unfolded', async ({
+test('the Run view opens on its head and folds, and stays inside main — folded and unfolded', async ({
   page,
 }, info) => {
   const fx = await fixture();
@@ -47,7 +50,9 @@ test('the run page opens on its strip and folds, and stays inside main — folde
 
   await visit(page, { name: 'run-page', hash: '#/plan/tower/run' }, fx.anchor);
   await expect(page.getByTestId('run-head')).toBeVisible();
-  await expect(page.getByTestId('run-head').locator('[data-strip][data-variant="row"]')).toBeVisible();
+  // The head IS the Runs home's row — the same line, as a header.
+  await expect(page.getByTestId('run-head').locator('[data-strip][data-variant="header"]')).toBeVisible();
+  await expect(page.getByTestId('run-head').getByTestId('strip-expand')).toHaveCount(0);
   const toggles = page.getByTestId('run-section-toggle');
   expect(await toggles.count(), 'the page folds its sections under named rows').toBeGreaterThan(5);
   expect(await escapes(page, touch)).toEqual([]);
@@ -67,6 +72,29 @@ test('the run page opens on its strip and folds, and stays inside main — folde
   await still(page);
   await shoot(page, info.project.name, 'run-page-unfolded');
 
+  // The sessions fold names its panes in the address and draws the chosen one's console.
+  const sessions = page.locator('section[data-section="sessions"]');
+  await expect(sessions.getByRole('link', { name: /^Run\b/ })).toBeVisible();
+  await expect(sessions.getByRole('log').first()).toBeAttached();
+  // Each rebuilt fold photographed at its own top, so the pictures read every section.
+  for (const id of [
+    'sessions',
+    'time',
+    'ledger',
+    'notes',
+    'messages',
+    'git',
+    'landing',
+    'ways',
+    'verification',
+  ]) {
+    const fold = page.locator(`section[data-section="${id}"]`);
+    if (!(await fold.count())) continue;
+    await fold.evaluate((el) => el.scrollIntoView({ block: 'start' }));
+    await still(page);
+    await shoot(page, info.project.name, `run-fold-${id}`);
+  }
+
   // Leave the folds as a person found them: the preference is per browser.
   for (let i = 0; i < (await toggles.count()); i += 1) {
     const toggle = toggles.nth(i);
@@ -85,6 +113,7 @@ test('on a phone every tap target the run page opens on wins its tap', async ({ 
   for (let i = 0; i < (await toggles.count()); i += 1) targets.push(toggles.nth(i));
   const action = page.getByTestId('run-head').getByTestId('strip-action');
   if (await action.count()) targets.push(action.first());
+  targets.push(page.getByTestId('run-head').getByTestId('strip-inspect'));
   const verb = page.getByRole('button', { name: /^(Settings|Continue this run|Start a run)$/ });
   if (await verb.count()) targets.push(verb.first());
 
@@ -95,6 +124,54 @@ test('on a phone every tap target the run page opens on wins its tap', async ({ 
     else if (hit.height < 44) lost.push(`${hit.label}: ${hit.height}px, under a thumb's 44`);
   }
   expect(lost).toEqual([]);
+});
+
+test('the History reading lists every run of the plan and opens one, inside main', async ({ page }, info) => {
+  const fx = await fixture();
+  const touch = info.project.name === PHONE || info.project.name.startsWith('tablet');
+  await visit(page, { name: 'run-history', hash: '#/plan/tower/run?view=history' }, fx.anchor);
+  const rows = page.getByTestId('history-row');
+  await expect(rows.first()).toBeVisible();
+  expect(await escapes(page, touch)).toEqual([]);
+  await shoot(page, info.project.name, 'run-history');
+
+  // A run opened: its phases, one line each, inside main.
+  const id = await rows.first().getAttribute('data-run');
+  await visit(
+    page,
+    { name: 'run-history-picked', hash: `#/plan/tower/run?view=history&run=${id}` },
+    fx.anchor,
+  );
+  await expect(page.getByTestId('history-picked')).toBeVisible();
+  await still(page);
+  expect(await escapes(page, touch)).toEqual([]);
+});
+
+test('Inspect puts the run in the panel: its eight sections and its Actions', async ({ page }, info) => {
+  test.skip(info.project.name !== 'desk-1280', 'the panel is the desk’s column; asked once');
+  const fx = await fixture();
+  await visit(page, { name: 'run-inspect', hash: '#/plan/tower/run' }, fx.anchor);
+  await page.getByTestId('run-head').getByTestId('strip-inspect').click();
+  // The eight sections fold under their names, the phase inspector's grammar.
+  await expect(page.getByRole('button', { name: /^Isolation and trees/ }).first()).toBeVisible();
+  await page.getByRole('tab', { name: 'Actions' }).click();
+  await expect(page.getByTestId('run-actions')).toBeVisible();
+  // Five verbs, then Extend once per waiting card of the run — and one row,
+  // disabled, while none waits, as in the seed: six.
+  const actions = page.getByTestId('run-action');
+  for (const id of [
+    'isolate',
+    'isolate-phase',
+    'board-at-boundary',
+    'repair-checkout',
+    'errand-tree',
+    'extend',
+  ]) {
+    await expect(actions.and(page.locator(`[data-action="${id}"]`))).toHaveCount(1);
+  }
+  await expect(actions).toHaveCount(6);
+  await still(page);
+  await shoot(page, info.project.name, 'run-inspect');
 });
 
 test('Sessions stays inside main, and every row’s way in wins its tap on a phone', async ({ page }, info) => {

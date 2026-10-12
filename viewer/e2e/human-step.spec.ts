@@ -9,9 +9,11 @@
  * *Open*, and *Check now*, whose proof lands. Everything else is the fixture
  * console, unchanged.
  *
- *   3. the step summons its running run into Needs you, with the step's act
- *      as the strip's ONE action; it lights its family's lamp and counts in
- *      *Your turn (n)*; on `proven` the strip leaves Needs you with no reload;
+ *   3. the step summons its running run — the row keeps its group, Running,
+ *      and wears the summons (`data-bay="needs-you"`), with the step's act as
+ *      its ONE action; it lights its family's lamp in the toolbar's Filter and
+ *      counts in *Your turn (n)*; on `proven` the summons leaves the row with
+ *      no reload;
  *   7. on a phone, the push's one tap (`#/approve?step=<id>`, the address an
  *      older push carries) lands on the item on Your turn (`#/turn/<id>`, phase
  *      137) in one hop, whole: the primary wins `elementFromPoint`, the code is
@@ -33,6 +35,25 @@ const RUN = 'e2e0000step1';
 const LINK = 'https://example.com/device';
 
 type Staged = { proven: boolean; opens: number };
+
+/**
+ * The lamps are the toolbar's Filter slot (7.0): a popover under the Filter
+ * word on a desk, a section of the one View sheet below 900 px (`ui/toolbar`).
+ * Open it before reading a lamp — it is gone from the DOM while closed, and a
+ * press outside it puts it away again — and put it away before pressing the
+ * page, because the sheet is modal.
+ */
+async function openFilter(page: Page): Promise<void> {
+  const phone = (page.viewportSize()?.width ?? 0) < 900;
+  await page.locator(phone ? '[data-slot="view-sheet"]' : '[data-slot="filter"]').click();
+  await expect(page.getByTestId('annunciator')).toBeVisible();
+}
+
+/** Escape dismisses the popover and the sheet alike. */
+async function closeFilter(page: Page): Promise<void> {
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('annunciator')).toHaveCount(0);
+}
 
 function record(anchor: number, staged: Staged) {
   const at = (min: number) => new Date(anchor - min * 60_000).toISOString();
@@ -273,14 +294,17 @@ test('a step is a summons: Needs you, its act on the strip, its lamp, Your turn 
 
   const strip = page.locator('[data-strip][data-slug="ship"]');
   await expect(strip).toHaveAttribute('data-bay', 'needs-you');
+  await expect(strip).toHaveAttribute('data-group', 'live');
   await expect(strip.getByTestId('strip-action')).toHaveText('Open sign-in');
-  // Its family's lamp is lit, and counts it — the seed's own signed-out run
-  // lights the same lamp, so the step is read as one MORE.
+  // Its family's lamp, in the Filter, is lit and counts it — the seed's own
+  // signed-out run lights the same lamp, so the step is read as one MORE.
+  await openFilter(page);
   const lamp = page.locator('[data-testid="lamp"][data-category="credentials"]');
   await expect(lamp).toHaveAttribute('data-lit', 'true');
   const lit = async () => Number((await lamp.locator('span').last().textContent())?.trim() ?? 'NaN');
   const before = await lit();
   expect(before).toBeGreaterThanOrEqual(1);
+  await closeFilter(page);
   if (info.project.name === DESK)
     // The fixture's own items count too (phase 137's seed), so the number is
     // read, not written down; the lamp below proves the one this step adds.
@@ -289,7 +313,7 @@ test('a step is a summons: Needs you, its act on the strip, its lamp, Your turn 
   // A marker a reload would wipe.
   await page.evaluate(() => void ((window as unknown as { __stayed: boolean }).__stayed = true));
 
-  // The strip's one action opens the step here, in a new tab — the Tower stays.
+  // The row's one action opens the step here, in a new tab — the home stays.
   await strip.getByTestId('strip-action').click();
   await expect
     .poll(() => page.evaluate(() => (window as unknown as { __opened: unknown[] }).__opened.length))
@@ -308,6 +332,8 @@ test('a step is a summons: Needs you, its act on the strip, its lamp, Your turn 
   await expect(page.locator('[data-strip][data-slug="ship"]')).not.toHaveAttribute('data-bay', 'needs-you');
   expect(staged.proven).toBe(true);
   expect(await page.evaluate(() => (window as unknown as { __stayed?: boolean }).__stayed)).toBe(true);
+  // The Filter opened again: the lamp counts one fewer.
+  await openFilter(page);
   await expect.poll(lit).toBe(before - 1);
 });
 

@@ -435,7 +435,7 @@ export function nothingReadySituation(halt) {
  * A word `HALT_KINDS` holds. Read through the fact map, which is total over
  * that list (fact-map.test), so this module never loads the recovery model:
  * it is on the first-paint path (the runs ledger's sentence), and the model
- * is not (`check-dist`, 190 KB served).
+ * is not (`check-dist`, 170 KB served).
  * @param {unknown} value
  */
 export function isHaltKind(value) {

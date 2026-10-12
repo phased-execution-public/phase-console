@@ -143,10 +143,26 @@ function firstLine(text: string): string {
 
 const cache = new Map<string, { at: number; verdict: CredentialVerdict }>();
 
-/** Forget every cached answer — tests, and a Settings ▸ re-check button. */
-export function forgetCredentialProbes(): void {
-  cache.clear();
+/** Forget the cached answers for these ids, or every one — tests, and a Settings ▸ re-check button. */
+export function forgetCredentialProbes(ids?: readonly string[]): void {
+  if (!ids) { cache.clear(); return; }
+  for (const id of ids) cache.delete(id);
 }
+
+/** The ids asked about with no plan at all — the GitHub CLI and the machine `claude` login, as `doctor` asks. */
+export const CLI_PROBE_IDS: readonly string[] = Object.freeze(['gh', 'claude']);
+
+/**
+ * What `GET /api/credentials` answers (quiet-console phase 25): each id's
+ * verdict — a word and a reason, never a value — whether the registry knows
+ * its kind, and which open plans (and phases) name it.
+ */
+export type CredentialsView = {
+  at: string;
+  /** How long a verdict stands before it is asked again. */
+  cacheMs: number;
+  credentials: (CredentialVerdict & { known: boolean; named: { slug: string; phase?: number }[] })[];
+};
 
 /**
  * The verdicts for a list of ids, memoised per id for `PROBE_CACHE_MS`.

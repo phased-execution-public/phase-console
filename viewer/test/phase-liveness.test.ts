@@ -300,17 +300,19 @@ test('every href this builds is encoded, and `sessionsHref` has ONE definition',
   assert.equal(laneHref('a/b', 3), '#/plan/a%2Fb/run?lane=p3');
   assert.equal(sessionsHref('a b'), '#/sessions/a%20b');
   assert.equal(sessionsHref(), '#/sessions');
-  // It moved out of `client/src/app/routes.ts` into the one file that spells a
+  // It moved out of the client's route file (`client/src/app/routes.ts` until
+  // 7.0, `client/src/shell/routes.ts` since) into the one file that spells a
   // route; the client re-exports it, so two spellings cannot drift.
+  assert.match(readClientRoutes(), /\bsessionsHref,/, 'shell/routes.ts re-exports sessionsHref from shared/routes.js');
   assert.equal(
-    readClientRoutes().match(/export const sessionsHref/)?.length ?? 0,
+    readClientRoutes().match(/export (?:const|function) sessionsHref/)?.length ?? 0,
     0,
     'sessionsHref must be re-exported from shared/routes.js, never redefined',
   );
 });
 
 function readClientRoutes(): string {
-  return readFileSync(new URL('../client/src/app/routes.ts', import.meta.url), 'utf8');
+  return readFileSync(new URL('../client/src/shell/routes.ts', import.meta.url), 'utf8');
 }
 
 /* ================================================================== *

@@ -1,6 +1,8 @@
 /**
  * On a phone, the button a halt card recommends is the one a thumb reaches
- * (control-tower phase 17, criterion 7).
+ * (control-tower phase 17, criterion 7) — on 7.0's Run view, where the card is
+ * the view's own (quiet-console phase 11): the plan's trouble section above it
+ * no longer draws the stop a second time.
  *
  * The seed (`e2e/fixture/seed.ts`) stops one plan in each of the nine
  * families of §Architecture 4 — halted, parked or interrupted the way the
@@ -42,9 +44,12 @@ for (const [slug, category] of Object.entries(SEEDED)) {
     expect(HALT_KIND_CATEGORY[seeded!.halt!], `${slug}'s stop is in the ${category} family`).toBe(category);
 
     await visit(page, { name: `halts-${slug}`, hash: `#/plan/${slug}/run` }, fx.anchor);
-    await expect(page.locator(`[data-halt-category="${category}"]`).first()).toBeVisible();
+    const notes = page.getByTestId('run-notes');
+    await expect(notes.locator(`[data-halt-category="${category}"]`).first()).toBeVisible();
+    // Drawn once: the plan's own trouble section leaves the run's stop to the view.
+    await expect(page.getByTestId('trouble-run')).toHaveCount(0);
 
-    const button = page.getByTestId('halt-recommended').first();
+    const button = notes.getByTestId('halt-recommended').first();
     await expect(button).toBeVisible();
     await button.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'center' }));
     await still(page);

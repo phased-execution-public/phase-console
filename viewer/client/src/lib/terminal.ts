@@ -58,7 +58,7 @@
  * because a replay is cheap and a dead pane is not.
  */
 
-import { ApiError, api, type TerminalSession } from './api';
+import { ApiError, api, type TerminalSession } from '@/data/api';
 import { consolePath } from './base';
 
 export type LinkStatus = 'connecting' | 'reconnecting' | 'live' | 'closed' | 'error';

@@ -27,7 +27,7 @@
  * console: the OS replaces by origin+tag, so three tabs raise one card.
  */
 
-import type { NotificationRecord } from './api';
+import type { NotificationRecord } from '@/data/api';
 import { notifyState, type NotifyState } from './notify';
 import { currentEndpoint } from './push';
 import { onSse } from './sse';

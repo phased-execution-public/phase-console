@@ -1,7 +1,7 @@
 /**
  * The errors no boundary can catch.
  *
- * `app/shell/error-boundary.tsx` contains anything thrown while RENDERING a
+ * `shell/error-boundary.tsx` contains anything thrown while RENDERING a
  * destination. Two large classes never reach it: an exception raised from an
  * event handler, a timer or a `requestAnimationFrame`, and a rejected promise
  * nobody awaited. Both are reported by the browser to `window` and, until now,
@@ -14,7 +14,7 @@
  * so they know to look.
  */
 
-import { toast } from '@/components/ui';
+import { toast } from '@/ui';
 
 /** So a storm of identical failures is one line, not a thousand. */
 const seen = new Map<string, number>();

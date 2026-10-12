@@ -8,9 +8,6 @@
 import './state-sandbox.ts';
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import {
@@ -18,10 +15,9 @@ import {
   SUPERVISOR_INVARIANTS, SUPERVISOR_OUTCOMES, SUPERVISOR_POLICIES, SUPERVISOR_SHIPPED_POLICY, SUPERVISOR_SITUATIONS,
   TOOL_CAPABILITIES, commandFor, isSupervisorPolicy, outcomeFor, remedyFor,
 } from '../shared/supervisor-model.js';
+import { CAPABILITY_WORDS } from '../shared/capability-model.js';
 import { VERB_NAMES, verbNamed } from '../shared/verb-model.js';
 import { parseRowArgs } from '../../bin/run-verb.mjs';
-
-const VIEWER = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 test('SV-1: the autonomy words are off · observe · suggest · act, the shipped one is suggest, and they map onto confirm', () => {
   assert.deepEqual([...SUPERVISOR_POLICIES], ['off', 'observe', 'suggest', 'act']);
@@ -97,9 +93,9 @@ test('SV-1: CHAT_TOOLS — name, read or act, destructive, capability, and every
     'human-step-check-now']) {
     assert.ok(names.includes(name), `§Architecture 8 names the ${name} tool`);
   }
-  // The capability flags are the console's own switches.
-  const config = readFileSync(join(VIEWER, 'server', 'config.ts'), 'utf8');
-  for (const flag of TOOL_CAPABILITIES) assert.ok(config.includes(`['${flag}'`), `${flag} is a console switch`);
+  // The capability flags are the console's own switches — the one list `config.ts` builds them from.
+  const switches = CAPABILITY_WORDS.map((word) => word.flag);
+  for (const flag of TOOL_CAPABILITIES) assert.ok(switches.includes(flag), `${flag} is a console switch`);
   // A human step may be listed, reopened and re-checked — never completed by the chat.
   assert.ok(!names.some((name) => /complete/.test(name)));
 });

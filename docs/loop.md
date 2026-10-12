@@ -366,7 +366,8 @@ action: relaunch|heal, why, reboard[], rearm[], launched, phase, situation, rung
 `run.converge-failed`), and the flattened report rides the event stream as **`run:converge`** and
 answers `GET /api/converge` (`{automatic, everyMs, pending[], running[], reports[]}`) — the Pulse's
 **Converge** line ("re-boarded P12 (Never started → Re-board fresh) · released a stale claim on P3")
-is that view, and the Tower's empty *Needs you* bay states whether the loop runs by itself on this console.
+is that view, and the Runs home's empty *Your turn* group states whether the loop runs by itself on this
+console, and when it sweeps.
 `--no-converge` keeps the automatic passes off while Recover & continue still works; a console without
 `--allow-run` never converges (it cannot start anything).
 
@@ -1326,8 +1327,8 @@ the console emits, with its sink and its meaning, is in
 `viewer/server/{converge,service,hooks-install,relay,start-ceiling,prelude,inbox}.ts` ·
 `viewer/server/accounts/{index,learned}.ts` · `viewer/server/sessions/registry.ts` ·
 `scripts/{session-hook,instance,phase-lock,phase-outcome}.sh` · `bin/sessions-verb.mjs` · the client's
-`components/{errand,recovery-actions,pulse}.tsx`, `features/runs/tower/tower.tsx`,
-`features/settings/{automation,ladder,hooks}.tsx` · tests: `viewer/test/{situation,ladder,converge,
+`cards/errand.tsx`, `cards/recovery-actions.tsx`, `screens/plan/run/lanes.tsx`, `screens/runs/{index,groups}.tsx`,
+`screens/settings/{automation,ladder,hooks}.tsx` · tests: `viewer/test/{situation,ladder,converge,
 auto-recovery,sessions-*,hooks-install,liveness,rulings}.test.ts` and
 `tests/unit/{session-hook,lock,outcome}.bats`.
 

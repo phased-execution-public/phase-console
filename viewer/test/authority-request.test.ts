@@ -87,19 +87,29 @@ test('AR-2: local, a session and the supervisor ask — recorded, named, journal
   const info = log.info;
   log.info = ((name: string, data: Record<string, unknown>) => { lines.push({ name, data }); return info.call(log, name as never, data as never); }) as typeof log.info;
   try {
+    // The body's `by` is what the asker CALLS itself — a claim the owner reads
+    // quoted, never the label (#277): the local door's proof names no one, so
+    // the label is the transport's class of asker.
     const body = { add: { deny: ['Bash(ar2-never:*)'] }, by: 'nightly-script' };
     const local = await call(service, 'POST', '/api/policy', { body });
     assert.ok(requested(local), `${local.status} ${JSON.stringify(local.answer)}`);
-    const request = local.answer.request as { id: string; door: string; label: string; press: string; ask: string; state: string };
-    assert.deepEqual([request.door, request.label, request.press, request.state], ['local', 'nightly-script', 'edit-policy', 'open']);
-    assert.match(request.ask, /^asked by nightly-script through the local door .* — confirm\?$/);
+    const request = local.answer.request as { id: string; door: string; label: string; claims?: string; press: string; ask: string; state: string };
+    assert.deepEqual([request.door, request.label, request.claims, request.press, request.state], ['local', 'script', 'nightly-script', 'edit-policy', 'open']);
+    assert.match(request.ask, /^asked by script \(which calls itself “nightly-script”\) through the local door .* — confirm\?$/);
+    // A script that says it is the owner is not drawn as the owner — not even as "the owner asked".
+    const posing = await call(service, 'POST', '/api/policy', { body: { add: { deny: ['Bash(ar2-posing:*)'] }, by: 'the owner' } });
+    assert.ok(requested(posing), `${posing.status} ${JSON.stringify(posing.answer)}`);
+    const posed = posing.answer.request as { label: string; claims?: string; ask: string };
+    assert.deepEqual([posed.label, posed.claims], ['script', 'the owner']);
+    assert.doesNotMatch(posed.ask, /^asked by the owner/);
+    assert.equal(state.requests.open().length, 2);
     assert.match(String(local.answer.error), /asked of the owner/, 'the asker is told what happened to its press');
     assert.equal(holds(service, 'Bash(ar2-never:*)'), false, 'never applied');
     // The same press again: the same request.
     const again = await call(service, 'POST', '/api/policy', { body });
     assert.equal((again.answer.request as { id: string }).id, request.id);
-    assert.equal(state.requests.open().length, 1);
-    assert.equal(state.requests.open()[0]!.repeats, 1);
+    assert.equal(state.requests.open().length, 2);
+    assert.equal(state.requests.open().find((row) => row.id === request.id)!.repeats, 1);
     // A session's token: a request too, named by its run.
     const token = service.approvals.arm('r1');
     const session = await call(service, 'POST', '/api/run/demo/settings', { headers: { authorization: `Bearer ${token}` }, body: { permissionProfile: 'bypass' } });
@@ -112,11 +122,11 @@ test('AR-2: local, a session and the supervisor ask — recorded, named, journal
     service.doorOf = doorOf;
     assert.ok(requested(supervisor), `${supervisor.status} ${JSON.stringify(supervisor.answer)}`);
     assert.deepEqual((supervisor.answer.request as { item: unknown }).item, { kind: 'gate', slug: 'demo', phase: 2 });
-    assert.equal(lines.filter((line) => line.name === 'policy.authority-requested').length, 3, 'each journalled once');
+    assert.equal(lines.filter((line) => line.name === 'policy.authority-requested').length, 4, 'each journalled once');
     // A body carrying a secret is not kept, so it is not asked.
     const secret = await call(service, 'POST', '/api/policy', { body: { add: { deny: ['x'] }, secret: 'hunter2' } });
     assert.equal(secret.status, 400);
-    assert.equal(state.requests.open().length, 3);
+    assert.equal(state.requests.open().length, 4);
   } finally {
     log.info = info;
     close();

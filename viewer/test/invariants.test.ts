@@ -379,7 +379,7 @@ test('clause 1: the agent-flag refusal reads the same in the server and in the p
   assert.ok(readFileSync(new URL('api/routes.ts', SERVER), 'utf8').includes(sentence),
     'the server must still refuse in these words');
   assert.ok(
-    readFileSync(new URL('../client/src/features/sessions/foreign.tsx', SERVER), 'utf8').includes(sentence),
+    readFileSync(new URL('../client/src/screens/sessions/foreign.tsx', SERVER), 'utf8').includes(sentence),
     'and the page that refuses FIRST must say the same words');
 });
 

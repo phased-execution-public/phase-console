@@ -13,7 +13,7 @@
  * a panel gets ignored.
  */
 
-import type { PreflightWarning } from '@/lib/api';
+import type { PreflightWarning } from '@/data/api';
 
 /**
  * The badge tone of each kind: the certainty red, the three predictions the

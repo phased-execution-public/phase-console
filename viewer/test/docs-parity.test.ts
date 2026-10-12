@@ -356,11 +356,11 @@ const proSpans = (body: string): Array<[number, number]> => {
 };
 const insidePro = (spans: Array<[number, number]>, at: number): boolean => spans.some(([a, b]) => at > a && at < b);
 
-/** The capability flags, lifted out of config.ts's own CAPABILITY_FLAGS table — each knowing whether it is Pro. */
+/** The capability flags, lifted out of `shared/capability-model.js` (config.ts's CAPABILITY_FLAGS is built from it) — each knowing whether it is Pro. */
 const capabilityRows = (): Array<{ flag: string; pro: boolean }> => {
-  const src = read('viewer/server/config.ts');
-  const from = src.indexOf('const CAPABILITY_FLAGS');
-  const block = src.slice(from, src.indexOf('];', from));
+  const src = read('viewer/shared/capability-model.js');
+  const from = src.indexOf('export const CAPABILITY_WORDS');
+  const block = src.slice(from, src.indexOf(']);', from));
   const spans = proSpans(block);
   const rows = new Map<string, boolean>();
   for (const m of block.matchAll(/--allow-[a-z-]+/g)) {
@@ -372,7 +372,7 @@ const capabilityFlags = (): string[] => capabilityRows().map((row) => row.flag).
 
 test('the guide documents every capability flag, and states the right count', () => {
   const flags = capabilityFlags();
-  assert.ok(flags.length >= 5, 'CAPABILITY_FLAGS did not parse out of config.ts');
+  assert.ok(flags.length >= 5, 'CAPABILITY_WORDS did not parse out of shared/capability-model.js');
   const proFlags = capabilityRows().filter((row) => row.pro).map((row) => row.flag);
   const freeCount = flags.length - proFlags.length;
 
@@ -392,7 +392,7 @@ test('the guide documents every capability flag, and states the right count', ()
     ['guide/reference.md', reference],
     ['guide/running.md', running],
     ['guide/troubleshooting.md', read('viewer/client/src/content/guide/troubleshooting.md')],
-    ['help/sections.ts', read('viewer/client/src/app/help/sections.ts')],
+    ['help/sections.ts', read('viewer/client/src/shell/help/sections.ts')],
   ] as const;
   // Two shapes, because the guide states the count both ways and only one of
   // them mentions the word "switches": "All six capability switches are off"
@@ -428,14 +428,15 @@ test('the guide documents every capability flag, and states the right count', ()
 });
 
 test('the guide sends readers only to settings sections that exist', () => {
-  const nav = read('viewer/client/src/features/settings/nav.tsx');
+  const nav = read('viewer/client/src/screens/settings/nav.tsx');
   const navSpans = proSpans(nav);
   const declared = [...nav.matchAll(/title: '([^']+)'/g)];
   const titles = declared.map((m) => m[1]);
   const proTitles = declared.filter((m) => insidePro(navSpans, m.index ?? 0)).map((m) => m[1]).sort();
-  // Eight in every tree; Pro adds Issues (control-tower phase 115) and License
-  // (phase 72) inside fences the free tree strips — so ten here and eight there.
-  assert.equal(titles.length - proTitles.length, 8, `expected 8 settings sections in every tree, nav.tsx has ${titles.length - proTitles.length}`);
+  // Nine in every tree since 7.0 added Everything, every key the console stores
+  // (quiet-console phase 21); Pro adds Issues (control-tower phase 115) and
+  // License (phase 72) inside fences the free tree strips — eleven here, nine there.
+  assert.equal(titles.length - proTitles.length, 9, `expected 9 settings sections in every tree, nav.tsx has ${titles.length - proTitles.length}`);
   assert.deepEqual(proTitles, proTitles.length ? ['Issues', 'License'] : [], 'the Pro sections are Issues and License');
 
   const guideDir = `${root}viewer/client/src/content/guide/`;
@@ -483,7 +484,14 @@ const READER_REPO = ['docs/plans/', 'docs/handoffs/'];
  * starting with one of these resolves against any BASE below; if it resolves
  * under none, it is drift.
  */
-const RELATIVE_ROOTS = ['features/', 'components/', 'views/', 'app/', 'lib/', 'content/', 'styles/', 'server/', 'shared/', 'client/', 'runner/'];
+const RELATIVE_ROOTS = [
+  // 7.0's client (quiet-console): the kit, the cards, the shell, the places and the data door.
+  'ui/', 'cards/', 'shell/', 'screens/', 'data/',
+  // The 6.x client's roots stay on the list after its deletion (quiet-console phase 29): a doc
+  // that still cites `components/…` or `features/…` is exactly the drift this exists to catch.
+  'features/', 'components/', 'views/', 'app/',
+  'lib/', 'content/', 'styles/', 'server/', 'shared/', 'client/', 'runner/',
+];
 const BASES = ['', 'viewer/', 'viewer/client/src/', 'viewer/server/'];
 
 /**
@@ -503,7 +511,7 @@ const BASES = ['', 'viewer/', 'viewer/client/src/', 'viewer/server/'];
 const SCRIPT_NAME = /^[a-z0-9][a-z0-9._-]*\.(?:sh|mjs|bats)$/;
 const SCRIPT_PATH = /^(?:[a-z0-9._-]+\/)+[a-z0-9][a-z0-9._-]*\.(?:sh|mjs|bats)$/;
 const SCRIPT_BASES = [
-  'scripts/', '', 'bin/', 'viewer/', 'viewer/deploy/', 'viewer/scripts/',
+  'scripts/', '', 'bin/', 'viewer/', 'viewer/deploy/', 'viewer/scripts/', 'viewer/shared/',
   '.github/scripts/', 'tests/', 'tests/unit/', 'tests/integration/',
 ];
 
@@ -529,7 +537,7 @@ const expandBraces = (spec: string): string[] => {
   return m[2].split(',').flatMap((part) => expandBraces(`${m[1]}${part.trim()}${m[3]}`));
 };
 
-test('every backticked repo path in docs/, references/ and SKILL.md still resolves', () => {
+test('every backticked repo path in docs/, references/, SKILL.md and the guides still resolves', () => {
   const files = [
     ...readdirSync(`${root}docs/`).filter((f) => f.endsWith('.md')).map((f) => `docs/${f}`),
     ...readdirSync(`${root}references/`).filter((f) => f.endsWith('.md')).map((f) => `references/${f}`),
@@ -539,6 +547,15 @@ test('every backticked repo path in docs/, references/ and SKILL.md still resolv
     // every session loads, so a script it names and the repo does not have is
     // the most expensive stale path in the repository.
     'SKILL.md',
+    // And the help sheet's guides, in both languages (quiet-console phase 28): a guide that sends a
+    // reader to a file is held to the file existing, in the tree it ships in.
+    ...GUIDE_SECTIONS.flatMap((id) => [`${GUIDE_DIR}/${id}.md`, `${GUIDE_DIR}/${id}.fa.md`]),
+    // And the console's own documents (quiet-console phase 29): the design law names the guard
+    // behind every rule and the file that holds it, and the READMEs and CLAUDE.md name the code.
+    'viewer/docs/design.md',
+    'viewer/README.md',
+    'viewer/README.fa.md',
+    'CLAUDE.md',
   ];
   const missing: string[] = [];
   for (const rel of files) {
@@ -570,7 +587,8 @@ test('every backticked repo path in docs/, references/ and SKILL.md still resolv
       const absolute = PATH_ROOTS.some((p) => token.startsWith(p));
       const relative = RELATIVE_ROOTS.some((p) => token.startsWith(p));
       if (!absolute && !relative) continue;
-      if (READER_REPO.some((p) => token.startsWith(p))) continue;
+      // The folder itself as well as a file in it: CLAUDE.md names `docs/plans` as where a plan lives.
+      if (READER_REPO.some((p) => token.startsWith(p) || token === p.slice(0, -1))) continue;
       if (NOT_YET_WRITTEN.has(token)) continue;
       if (token.includes('<') || token.includes('$')) continue; // a template, not a path
       const bases = absolute ? [''] : BASES;
@@ -1611,7 +1629,7 @@ test('plan-format.md documents the Permission-mode spellings, the per-lane Workt
 
 // control-tower phase 29 (#32 gap 2): where the chart library line sits is
 // WRITTEN DOWN, and it names every chart and every visx module this tree
-// installs — so a sixth module or an eighth chart cannot arrive unexplained.
+// installs — so a fifth module or a sixth chart cannot arrive unexplained.
 test('design.md records the figures-and-marks decision: every chart, every visx module installed, every one refused', () => {
   const text = read('viewer/docs/design.md');
   const start = text.indexOf('## 8.2 Figures and marks');
@@ -1619,13 +1637,14 @@ test('design.md records the figures-and-marks decision: every chart, every visx 
   const next = text.indexOf('\n## ', start + 1);
   const section = text.slice(start, next < 0 ? undefined : next);
 
-  const charts = read('viewer/client/src/components/charts.tsx');
+  // The split is the figures' door's own (quiet-console phase 19: `components/charts.tsx` retired).
+  const door = read('viewer/client/src/ui/figures/lazy.tsx');
   const members = (list: string) =>
-    [...(new RegExp(`${list} = Object\\.freeze\\(\\[([^\\]]*)\\]`).exec(charts)?.[1] ?? '').matchAll(/'([A-Za-z]+)'/g)].map(
+    [...(new RegExp(`${list} = Object\\.freeze\\(\\[([^\\]]*)\\]`).exec(door)?.[1] ?? '').matchAll(/'([A-Za-z]+)'/g)].map(
       (match) => match[1],
     );
-  const named = [...members('CHART_FIGURES'), ...members('CHART_MARKS')];
-  assert.equal(named.length, 7, 'charts.tsx still declares four figures and three marks');
+  const named = [...members('FIGURES'), ...members('MARKS')];
+  assert.equal(named.length, 5, 'ui/figures/lazy.tsx still declares four figures and one mark');
   for (const name of named) assert.ok(section.includes(`\`${name}\``), `the section names ${name}`);
 
   const pkg = JSON.parse(read('viewer/package.json')) as {
@@ -1644,7 +1663,7 @@ test('design.md records the figures-and-marks decision: every chart, every visx 
 
 test('control-tower phase 140: USAGE names every part of Your turn a person meets, and README names the page — both languages by parity', () => {
   const usage = read('USAGE.md').replace(/[*_]/g, '').replace(/\s+/g, ' ');
-  const check = /CHECK_LABEL = "([^"]+)"/.exec(read('viewer/client/src/components/human-step-words.ts'))?.[1];
+  const check = /CHECK_LABEL = "([^"]+)"/.exec(read('viewer/client/src/cards/human-step-words.ts'))?.[1];
   assert.ok(check, 'the check has one label');
   for (const needle of ['`#/turn`', check, 'Handled by the AI', 'owner key', 'never list', 'phase-console grants', 'phase-console owner']) {
     assert.ok(usage.includes(needle), `USAGE.md never names ${needle}`);

@@ -15,7 +15,7 @@
  *   - `server/service.ts` builds `PhaseDiagnosis.actions` and the unattended
  *     `autoRecoveryClass` from `recoveryActionsFor`/`KIND_PROFILE`;
  *   - `client/src/lib/recovery.ts` re-exports the classifiers and words;
- *   - `client/src/components/recovery-actions.tsx` renders the actions.
+ *   - `client/src/cards/recovery-actions.tsx` renders the actions.
  *
  * Dependency-free ESM (`.js` + JSDoc), the `phase-model.js` precedent: the
  * client imports it as `@shared/recovery-model.js`, the server as

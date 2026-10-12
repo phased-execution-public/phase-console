@@ -4,11 +4,11 @@
  *
  * Nothing draws a person's ask in a shape of its own any more: a permission
  * ask, a question, a gate, an errand, a sign-in or a step is drawn by the
- * family — `client/src/features/turn/` and the one card it grew from
- * (`components/human-step-card.tsx`, its words, its lazy door and its terminal
- * sheet) — and every older surface draws the ITEM through the family's row
- * variant (`features/turn/item-row.tsx`, reached through `lazy-item-row.tsx`),
- * which links to the item on the page. This file reads the client's source and
+ * family — Your turn's page (`client/src/screens/turn/` since 7.0, quiet-console phase 8) and the cards it
+ * draws (`cards/`: the item, its row, the decision, the guide, and the step
+ * card with its words, its lazy door and its terminal sheet) — and every older
+ * surface draws the ITEM through the family's row variant (`cards/item-row.tsx`,
+ * reached through `lazy-item-row.tsx`), which links to the item on the page. This file reads the client's source and
  * fails on a bespoke ask creeping back, with the few that stand by ruling
  * named below, each with its reason — an entry that no longer matches anything
  * fails too, so the list cannot rot.
@@ -37,13 +37,18 @@ const read = (rel: string): string => readFileSync(join(SRC, rel), 'utf8');
 
 /** The family that may draw a person's ask — and the API layer, which draws nothing. */
 const FAMILY = (rel: string): boolean =>
-  rel.startsWith('features/turn/') ||
-  rel.startsWith('lib/api/') ||
+  rel.startsWith('screens/turn/') ||
+  rel.startsWith('data/') ||
   [
-    'components/human-step-card.tsx',
-    'components/human-step-words.ts',
-    'components/human-step-lazy.tsx',
-    'components/step-terminal-sheet.tsx',
+    'cards/item-card.tsx',
+    'cards/item-row.tsx',
+    'cards/lazy-item-row.tsx',
+    'cards/decision-card.tsx',
+    'cards/guide.tsx',
+    'cards/human-step-card.tsx',
+    'cards/human-step-words.ts',
+    'cards/human-step-lazy.tsx',
+    'cards/step-terminal-sheet.tsx',
   ].includes(rel);
 
 /** What a bespoke ask looks like in source — each a shape only the family may draw. */
@@ -56,7 +61,8 @@ const BESPOKE: readonly { what: string; re: RegExp }[] = [
   { what: 'a step pressed outside its card', re: /\bhumanStepsApi\b/ },
   { what: 'a gate approved by a form of its own', re: /\bapi\.approveGate\(/ },
   { what: 'an errand’s ask said in a shape of its own', re: /\berrand\.how\b/ },
-  { what: 'a step dismissed by a person — a person declines; only the console withdraws', re: /humanStepDismiss/ },
+  // A person declines, with a reason the session reads; the OWNER withdraws, on Your turn alone (7.0, phase 8).
+  { what: 'a step withdrawn outside Your turn — Withdraw is the page’s, through data/turn', re: /humanStepWithdraw|\bwithdrawItem\(/ },
 ];
 
 /**
@@ -65,12 +71,12 @@ const BESPOKE: readonly { what: string; re: RegExp }[] = [
  */
 const STANDS: readonly { rel: string; what: string; why: string }[] = [
   {
-    rel: 'features/plans/gate-card.tsx',
+    rel: 'screens/plan/phases/gate-card.tsx',
     what: 'a gate approved by a form of its own',
-    why: 'the plan’s door to gate-status.md for a gate NOBODY is asked about (an ai or auto gate, a phase not ready) — the engine reads it; a gate that IS an ask draws its item',
+    why: 'the plan’s door to gate-status.md for a gate NOBODY is asked about (an ai or auto gate, a phase not ready) — the engine reads it; a gate that asks a person wears the summons and draws its item (quiet-console phase 10)',
   },
   {
-    rel: 'components/errand.tsx',
+    rel: 'cards/errand.tsx',
     what: 'an errand’s ask said in a shape of its own',
     why: 'the ladder’s how, said only where the inbox holds no item for the errand',
   },
@@ -88,57 +94,91 @@ test('TS-1 no component outside the family draws a person’s ask in a bespoke s
       else offenders.push(`${rel}: ${what} (${re})`);
     }
   }
-  assert.deepEqual(offenders, [], 'draw the item through features/turn/lazy-item-row instead');
+  assert.deepEqual(offenders, [], 'draw the item through cards/lazy-item-row instead');
   const stale = STANDS.filter((entry) => !used.has(`${entry.rel} — ${entry.what}`)).map((entry) => entry.rel);
   assert.deepEqual(stale, [], 'a ruling that matches nothing any more is stale — delete it');
 });
 
 test('TS-2 each older surface draws the item through the row variant, which links to the page', () => {
-  for (const rel of [
-    'features/runs/approvals.tsx',
-    'features/plans/gate-card.tsx',
-    'components/errand.tsx',
-  ]) {
-    assert.match(read(rel), /from '@\/features\/turn\/lazy-item-row'/, `${rel} draws its item through LazyItemRow`);
+  // The Run view's asks (quiet-console phase 11, the 6.2 approval queue's place).
+  for (const rel of ['screens/plan/run/halt.tsx']) {
+    assert.match(read(rel), /from '@\/cards\/lazy-item-row'/, `${rel} draws its item through LazyItemRow`);
   }
-  // The strip's ONE action is its run's oldest item's primary, loaded with the row.
-  assert.match(read('features/runs/tower/strip.tsx'), /import\('@\/features\/turn\/item-row'\)/);
-  assert.match(read('features/runs/tower/strip-model.ts'), /\brunItems\(/);
+  // The errand card is a card itself since quiet-console phase 5: it reaches the row beside it.
+  assert.match(read('cards/errand.tsx'), /from '\.\/lazy-item-row'/, 'cards/errand.tsx draws its item through LazyItemRow');
+  // 7.0's run row — its one action, `row-action.tsx` — and its Your turn group
+  // (quiet-console phase 7) reach the same row through the family's lazy door,
+  // and the row's one action is still its run's oldest item's primary.
+  for (const rel of ['screens/runs/row-action.tsx', 'screens/runs/your-turn.tsx']) {
+    assert.match(read(rel), /from '@\/cards\/lazy-item-row'/, `${rel} draws its item through LazyItemRow`);
+  }
+  // So does 7.0's gate card (quiet-console phase 10), for a gate that asks a person now.
+  assert.match(
+    read('screens/plan/phases/gate-card.tsx'),
+    /from '@\/cards\/lazy-item-row'/,
+    'screens/plan/phases/gate-card.tsx draws its item through LazyItemRow',
+  );
+  assert.match(read('screens/runs/model.ts'), /\brunItems\(/);
   // The row links to the item: `#/turn/<id>`.
-  const row = read('features/turn/item-row.tsx');
+  const row = read('cards/item-row.tsx');
   assert.match(row, /data-testid="item-link"/);
-  assert.match(read('features/turn/surfaces.ts'), /turnHref\(itemIdOf\(row\)\)/);
+  assert.match(read('screens/turn/surfaces.ts'), /turnHref\(itemIdOf\(row\)\)/);
   // The row is reached lazily: the step card is no first paint's business.
-  const lazyDoor = read('features/turn/lazy-item-row.tsx');
+  const lazyDoor = read('cards/lazy-item-row.tsx');
   assert.match(lazyDoor, /lazy\(\(\) => import\('\.\/item-row'\)\)/);
   for (const { rel, source } of files) {
-    if (rel.startsWith('features/turn/') || rel === 'features/runs/tower/strip.tsx') continue;
-    assert.doesNotMatch(source, /from '@\/features\/turn\/item-row'/, `${rel} imports the row statically`);
+    assert.doesNotMatch(source, /from '@\/cards\/item-row'/, `${rel} imports the row statically`);
   }
 });
 
-test('TS-3 the Needs-you bay keeps runs: no loose rows, and Your turn (n) counts items and opens the page', () => {
-  const model = read('features/runs/tower/tower-model.ts');
-  assert.doesNotMatch(model, /\bloose\b\s*[:,]/, 'the Tower model carries no loose rows');
-  assert.match(model, /items: itemsNow\(inbox\)/);
-  const bays = read('features/runs/tower/bays.tsx');
-  assert.doesNotMatch(bays, /\bInboxRow\b|\bLooseRows\b|\bSuggestionCard\b/, 'the bay draws strips, not rows');
-  assert.match(bays, /data-testid="bay-turn"/);
-  const line = read('features/runs/tower/situation-line.tsx');
-  assert.match(line, /tower\.items\?\.length/);
+test('TS-3 Your turn is the items: no loose rows, a summoned run keeps its group, and Your turn (n) counts items and opens the page', () => {
+  // The home's groups are decided in ONE fold (7.0, quiet-console phase 7):
+  // Your turn is the items a person owes now, counted as such, and a run a
+  // person's turn summons sits in the group of what it IS — never a loose row
+  // beside the strips, never a run drawn twice.
+  const fold = read('data/run-groups.ts');
+  assert.doesNotMatch(fold, /\bloose\b\s*[:,]/, 'the groups carry no loose rows');
+  assert.match(fold, /const items = itemsNow\(inbox\)/);
+  assert.match(fold, /'needs-you': items\.length/);
+  assert.match(fold, /\brunItems\(/);
+  // The group draws the items through the family's row, in no shape of its own.
+  for (const rel of ['screens/runs/groups.tsx', 'screens/runs/your-turn.tsx']) {
+    assert.doesNotMatch(
+      read(rel),
+      /\bInboxRow\b|\bLooseRows\b|\bSuggestionCard\b/,
+      `${rel} draws the items through the family's row`,
+    );
+  }
+  const yourTurn = read('screens/runs/your-turn.tsx');
+  assert.match(yourTurn, /from '@\/cards\/lazy-item-row'/);
+  assert.match(yourTurn, /data-testid="bay-turn"/);
+  assert.match(yourTurn, /href=\{turnHref\(\)\}/);
+  // The situation words count what a person owes NOW — Do now and Needs one
+  // detail, the two groups the page's own headline counts — and open the page.
+  const line = read('shell/situation-line.tsx');
+  assert.match(line, /turn\.counts\.now \+ turn\.counts\.decide/);
   assert.match(line, /href: turnHref\(\)/);
 });
 
 test('TS-4 the launch door lists items, and a plan’s auto-open link is shown whole and sent back', () => {
-  const door = read('features/run-setup/quick.tsx');
+  // The departure notice is the door (7.0, quiet-console phase 13); the form still records what it showed.
+  const door = read('screens/launch/quick.tsx');
   assert.match(door, /turnHref\(step\.item\)/, 'Do it now opens the item');
   assert.match(door, /data-testid="door-step-auto"/);
   assert.match(door, /showAtDoor\(slug/);
-  assert.match(read('features/run-setup/run-setup.tsx'), /shownAtDoor\(slug\)/);
+  assert.match(read('screens/launch/run-setup.tsx'), /shownAtDoor\(slug\)/);
 });
 
-test('TS-5 Not doing this is the person’s no; the Dismiss fetcher is gone', () => {
-  assert.doesNotMatch(read('lib/api/human-steps.ts'), /humanStepDismiss/);
-  assert.match(read('features/turn/item-card.tsx'), />\s*Not doing this\s*</);
+test('TS-5 Not doing this is the person’s no; Withdraw is the owner’s, on Your turn alone', () => {
+  // A person declines with a reason the session reads (control-tower phase 139);
+  // the dead Dismiss fetcher stays gone. 7.0 (quiet-console phase 8) gives the
+  // OWNER a *Withdraw* — the console's own `dismiss`, through the owner door —
+  // pressed from the page through `data/turn.ts` and from nowhere else (TS-1).
+  const fetchers = read('data/human-steps.ts');
+  assert.doesNotMatch(fetchers, /humanStepDismiss/);
+  assert.match(fetchers, /humanStepWithdraw:[^\n]*\n[^\n]*at\(id, 'dismiss'\)/);
+  assert.match(read('data/turn.ts'), /export function withdrawItem\(/);
+  assert.match(read('screens/turn/index.tsx'), /\bwithdrawItem\(/);
+  assert.match(read('cards/item-card.tsx'), />\s*Not doing this\s*</);
 });
 

@@ -23,7 +23,7 @@
 // heads, which is what let 3.0 turn both into overlays without touching the server.)
 //
 // 3.0 added `now`, `sessions` and `insights` and kept EVERY older head. Some of the
-// old ones are now redirects rather than pages (`app/routes.ts` `REDIRECTS`), but a
+// old ones are now redirects rather than pages (`shell/redirects.ts` `REDIRECTS`), but a
 // head that ever appeared in a bookmark, a push payload or a handoff stays in this
 // list and stays resolvable — which is the whole contract this array exists for.
 //
@@ -35,15 +35,22 @@
 //
 // 6.0 (control-tower phase 21) made `runs` the home and `now` a redirect onto
 // it — the eighth head to become one — and again dropped nothing.
+//
+// 7.0 (quiet-console phase 3) renamed Debug to Logs: `logs` is the head and the
+// destination, `debug` the ninth redirect (`#/debug/health?since=1` lands on
+// `#/logs/health?since=1`, section and query carried). The Pro heads `chat`
+// and `fleet` stay heads and leave DESTINATIONS: the Supervisor is the right
+// panel's second mode (and `#/chat` on a phone), and Fleet opens from the
+// instance switcher at the top of the rail. Nothing was dropped.
 
 /**
  * Top-level route heads — `route.segments[0]`. The empty hash (`#/`) and any
  * unknown head resolve to `DEFAULT_HEAD` below.
  *
- * The first seven are the 6.0 DESTINATIONS — what the rail and the phone tab
- * bar offer. Everything after them is a head that still resolves (a page a
- * later phase has not rebuilt yet, or a redirect onto its new home) but is not a
- * place the navigation sends you.
+ * The first seven are the 7.0 DESTINATIONS — what the rail and the phone tab
+ * bar offer, the same seven in both editions. Everything after them is a head
+ * that still resolves (a page a later phase has not rebuilt yet, or a redirect
+ * onto its new home) but is not a place the navigation sends you.
  *
  * `source` renders outside the app shell (the pre-open directory picker).
  * `terminal` and `agent` became REDIRECTS into `sessions` in Phase 10, when the
@@ -77,7 +84,9 @@ export const ROUTE_HEADS = Object.freeze([
   'sessions',
   'repo',
   'insights',
-  'debug',
+  // Every log this console writes, on one time axis (7.0: Debug's new name;
+  // `debug` below redirects onto it).
+  'logs',
   'settings',
   // pages a destination has not absorbed yet, plus the deep-link heads
   'plan',
@@ -99,6 +108,10 @@ export const ROUTE_HEADS = Object.freeze([
   'terminal',
   'agent',
   // redirects onto the above
+  // Debug became Logs in 7.0 (quiet-console phase 3). The head stays: it is in
+  // bookmarks, in handoff prose and in the e2e specs, and every `#/debug/<section>?…`
+  // lands on `#/logs/<section>?…` in one hop with its query.
+  'debug',
   // The phone answer page every push linked to until 6.2 — `#/approve` and
   // `#/approve?step=<id>` are in notifications already on phones, so the head
   // stays and lands on Your turn (`#/turn`, `#/turn/<id>`) in one hop.
@@ -130,14 +143,21 @@ export const DEFAULT_HEAD = 'runs';
  *
  * Read as three bands, which is what the rail draws a rule between and what the
  * order encodes: **the work** (`runs`, `plans`, `sessions`) is what is moving
- * right now; **the record** (`repo`, `insights`, `debug`) is what it did — the
+ * right now; **the record** (`repo`, `insights`, `logs`) is what it did — the
  * tree it changed, the numbers it made, the trace it left; **`settings`** is
  * the console itself, and stays last because it always has been.
  *
- * `runs` leads since 6.0 (control-tower phase 21): it is the home, the Tower,
- * and `now` — which led from 3.0 — is a redirect onto it. `repo` and `debug`
- * are 4.0's two additions; they sit in the middle band rather than at the end
- * because the band is the meaning: both answer *what happened*.
+ * `runs` leads since 6.0 (control-tower phase 21): it is the home, and `now` —
+ * which led from 3.0 — is a redirect onto it. `repo` and `logs` (Debug until
+ * 7.0) are 4.0's two additions; they sit in the middle band rather than at the
+ * end because the band is the meaning: both answer *what happened*.
+ *
+ * The SAME seven in both editions since 7.0 (quiet-console phase 3). Pro's two
+ * places are reached from the shell rather than listed: the Supervisor is the
+ * right panel's second mode (and the phone tab bar's fourth slot, `#/chat`),
+ * and Fleet opens from the instance switcher at the top of the rail. A list
+ * that differed by edition was a tab bar that differed by edition, and a guide
+ * card that had to exist twice.
  * @type {readonly string[]}
  */
 export const DESTINATIONS = Object.freeze([
@@ -146,7 +166,7 @@ export const DESTINATIONS = Object.freeze([
   'sessions',
   'repo',
   'insights',
-  'debug',
+  'logs',
   'settings',
 ]);
 
@@ -187,6 +207,16 @@ export const PLAN_TABS = Object.freeze(['phases', 'run', 'source']);
 export const PLAN_PHASE_VIEWS = Object.freeze(['table', 'map', 'qa', 'handoffs']);
 
 /**
+ * The views of the `run` tab — the `?view=` of `#/plan/:slug/run` (7.0,
+ * quiet-console phase 10; drawn by phase 11): `live`, the plan's run as it is
+ * now, and `history`, every run of the plan with a past run's activity and
+ * report. `live` is the default, so it is the one whose address carries no
+ * `?view=`.
+ * @type {readonly string[]}
+ */
+export const PLAN_RUN_VIEWS = Object.freeze(['live', 'history']);
+
+/**
  * A retired tab id -> where its address goes now.
  *
  * Shared rather than client-local for the same reason `PLAN_TABS` is: these ids
@@ -197,7 +227,7 @@ export const PLAN_PHASE_VIEWS = Object.freeze(['table', 'map', 'qa', 'handoffs']
  * are tabs of this page.
  *
  * A value naming a head is spelled with no leading `#/`; the caller builds the
- * URL (`app/routes.ts` `planTabRedirect`), because only it knows the slug and
+ * URL (`shell/redirects.ts` `planTabRedirect`), because only it knows the slug and
  * how to encode it. `view` is the half of a tab an address meant — the same
  * device `?focus=` was for Now's bands (`?bay=` on the Tower since 6.0), and
  * the reason `#/plan/x/raw` does not quietly become "the prose reading of x".

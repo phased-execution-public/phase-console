@@ -19,8 +19,11 @@ import { parseLockFilter } from '../locks.ts';
 import { DECISION_KEYS } from '../../shared/decisions-model.js';
 import type { AccountRequirement, PressAnswer } from '../runner/state.ts';
 import { classify as classifyAccess, hostnameOf, isLoopbackHost } from './access.ts';
-import { actorOfRequest } from './actor.ts';
-import { createSseWriter } from './sse.ts';
+import { ACTOR_LABEL_MAX, actorOfRequest } from './actor.ts';
+import {
+  SSE_MAX_RUN_ID_CHARS, SSE_MAX_STREAMS, createSseWriter, dropSseConnection, registerSseConnection, replayCursorOf,
+  sseConnection, streamsOfParam,
+} from './sse.ts';
 import { PolicyRuleError } from '../runner/approvals.ts';
 import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
 import { isAgentDoor, pressActor, pressDoorOf } from '../actor.ts';
@@ -64,6 +67,7 @@ import { METRICS_CONTENT_TYPE } from '../analysis/metrics.ts';
 import { debugFor, runBundleDeps } from '../debug/deps.ts';
 import { parseSince, runBundle } from '../debug/bundle.ts';
 import { isRunId, isSlug, parseDebugQuery } from '../debug/index.ts';
+import { ReportQueryError } from '../analysis/report-view.ts';
 import type { DebugEntry } from '../debug/sources.ts';
 import { compress, etagMatches, sendBody, sendSettled } from '../http/compress.ts';
 import { LANE_VERBS, QUEUE_VERBS, RUN_PRIORITIES, type RunPriority } from '../../shared/orchestration-model.js';
@@ -794,10 +798,16 @@ async function doorCheck(
   // page on another site could plant one for the owner to confirm.
   const forged = guardMutation(req, null);
   if (forged) { json(res, 403, { error: forged }); return true; }
+  // The label is the door's proof alone — the reading's name, else the
+  // transport's class of asker — never the body's own `by` (#277): a script
+  // that says `by: the owner` is recorded as `script`, and what it calls
+  // itself rides beside as a claim the owner reads quoted.
+  const offered = typeof body.by === 'string' ? body.by.trim().slice(0, ACTOR_LABEL_MAX) : '';
   const outcome = typeof service.requestAuthority === 'function'
     ? service.requestAuthority(reading, pressed, {
       method: req.method ?? 'POST', path, body, authority, risk,
-      label: reading.label ?? actorOfRequest(req, service.flags, body).by,
+      label: reading.label ?? actorOfRequest(req, service.flags).by,
+      ...(offered ? { claims: offered } : {}),
     })
     : { status: 403, answer: { error: `${pressed.summary.split(' — ')[0]} is the owner's to press, and this console records no requests.` } };
   json(res, outcome.status, outcome.answer);
@@ -1048,11 +1058,16 @@ async function routeApi(
      * retiring this listener, the second by capping what it may hold first.
      */
     const writer = createSseWriter(res, { label: 'events', onDrop: () => stop() });
+    // The stream's name: its hello carries it, and `POST /api/events/subscribe`
+    // finds this writer by it. Held exactly as long as the stream is open —
+    // `stop` drops it.
+    const connection = registerSseConnection(writer);
     const stop = () => {
       if (closed) return;
       closed = true;
       if (ping) clearInterval(ping);
       writer.close();
+      dropSseConnection(connection);
       off?.();
     };
 
@@ -1063,19 +1078,23 @@ async function routeApi(
 
     // Partial `run:stream` frames are opt-in, per run. A surface that renders a
     // transcript asks for them; every other listener moves on `run:progress`
-    // instead and never buffers a byte of output it will not paint.
-    writer.subscribe(url.searchParams.get('stream'));
+    // instead and never buffers a byte of output it will not paint. One
+    // browser's stream serves all of its tabs, so `?stream=` may name a
+    // comma-separated few, and the subscribe route changes them later.
+    writer.subscribeMany(streamsOfParam(url.searchParams.get('stream')));
 
     // Replay anything the client missed while reconnecting. Browsers resend the
     // last id automatically, so a dropped connection costs no events — which
-    // matters once a run is streaming phase progress through here.
-    const lastSeen = Number(req.headers['last-event-id']);
-    const missed = Number.isFinite(lastSeen) ? service.eventsSince(lastSeen) : [];
+    // matters once a run is streaming phase progress through here. A page that
+    // reopens the stream itself cannot set that header, and says it as `?last=`.
+    const lastSeen = replayCursorOf(req.headers['last-event-id'], url.searchParams.get('last'));
+    const missed = lastSeen === null ? [] : service.eventsSince(lastSeen);
 
     send(`event: hello\ndata: ${JSON.stringify({
       generation: service.generation,
       cursor: service.eventCursor,
       replayed: missed.length,
+      connection,
     })}\n\n`);
     for (const item of missed) {
       writer.event(item.event, item.data, item.id);
@@ -1117,6 +1136,51 @@ async function routeApi(
   const [head, ...rest] = segments;
 
   try {
+
+    /* ---------------- live updates: which runs a stream takes partials for ---------------- */
+    // `POST /api/events/subscribe {connection, streams?: string[], stream?: string | null}`:
+    // the stream whose hello carried `connection` takes `run:stream` partials
+    // for exactly these runs from now on — `streams` when it is a list, else
+    // `stream`; `[]`, `null` or neither takes none. One browser's stream serves
+    // all of its tabs, so the set changes while the socket stays open, and this
+    // changes it without a reopen and its replay. The cross-site check and no
+    // flag: choosing what your own page is sent is display. A name this process
+    // does not hold — the stream closed, or another console greeted it — is a
+    // 404 with `reopen`, and the page opens `/events?stream=…&last=…` again.
+    if (head === 'events') {
+      if (req.method === 'POST' && rest.length === 1 && rest[0] === 'subscribe') {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        let raw: unknown;
+        try { raw = await readBody(req); } catch { json(res, 413, { error: 'That body is over 256 KB.' }); return true; }
+        const body = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+        const connection = body.connection;
+        if (typeof connection !== 'string' || !connection) {
+          json(res, 400, { error: "connection must be the name the stream's hello frame carried" });
+          return true;
+        }
+        const named: unknown = body.streams ?? (body.stream === undefined || body.stream === null ? [] : [body.stream]);
+        if (!Array.isArray(named)) { json(res, 400, { error: 'streams must be a list of run ids' }); return true; }
+        const runIds = named.filter((id): id is string => typeof id === 'string' && id !== '' && id.length <= SSE_MAX_RUN_ID_CHARS);
+        if (runIds.length !== named.length || runIds.length > SSE_MAX_STREAMS) {
+          json(res, 400, { error: `Name at most ${SSE_MAX_STREAMS} runs, each a run id of at most ${SSE_MAX_RUN_ID_CHARS} characters.` });
+          return true;
+        }
+        const writer = sseConnection(connection);
+        if (!writer) {
+          json(res, 404, {
+            error: 'No stream of this console is open under that name — open /events again with ?stream= and ?last=.',
+            reopen: true,
+          });
+          return true;
+        }
+        writer.subscribeMany(runIds);
+        json(res, 200, { ok: true, connection, streams: writer.streams });
+        return true;
+      }
+      json(res, 405, { error: 'POST /api/events/subscribe — the stream itself is GET /events' });
+      return true;
+    }
 
     /* ---------------- session + source directory ---------------- */
     /* ---------------- the owner key (control-tower phase 148, #208) ---------------- */
@@ -1424,7 +1488,18 @@ async function routeApi(
       }
     }
 
-    if (head === 'prefs' && req.method === 'POST') {
+    // `GET /api/prefs/schema` (quiet-console phase 25): every preference and
+    // machine-profile field, described (`shared/prefs-model.js`), with its
+    // shipped default, the value the console runs with, where that came from,
+    // whether a page can write it and the line that changes it. A read.
+    if (head === 'prefs' && rest.length === 1 && rest[0] === 'schema' && req.method === 'GET') {
+      json(res, 200, service.prefsSchema());
+      return true;
+    }
+
+    // A key sent as `null` goes back to its shipped default and leaves the file
+    // (`savePreferences`, `savePrefs`' `unset`).
+    if (head === 'prefs' && rest.length === 0 && req.method === 'POST') {
       const refusal = guardCsrf(req);
       if (refusal) { json(res, 403, { error: refusal }); return true; }
       const body = await readBody(req);
@@ -2632,6 +2707,52 @@ async function routeApi(
       return true;
     }
 
+    /* ---------------- thin reads of the console and the machine (quiet-console phase 25) ---------------- */
+    //
+    // Above the "no source directory" wall for `spend`'s reason: the start
+    // ceiling, the credentials this machine holds and its stray consoles are
+    // the console's and the machine's, open plan directory or not. Reads, so
+    // no capability flag; the one press (a re-probe) takes the console header.
+    //
+    // `GET /api/ceiling`: the start ceiling's live counters — starts and
+    // dollars in the sliding hour, the limits, the doors, the limit the next
+    // automatic start would meet and when it frees — and the MCP probe's own.
+    if (head === 'ceiling' && rest.length === 0 && req.method === 'GET') {
+      json(res, 200, service.startCeilingView());
+      return true;
+    }
+    // `GET /api/credentials`: every credential id this machine is asked about
+    // — the CLI's own two and each an open plan names — held or not, with the
+    // plans that name it; a word and a reason, never a value.
+    // `POST /api/credentials/probe {ids?}` asks them (or those ids) again now
+    // rather than reading the minute-long cache.
+    if (head === 'credentials') {
+      if (req.method === 'GET' && rest.length === 0) {
+        json(res, 200, await service.credentialsView());
+        return true;
+      }
+      if (req.method === 'POST' && rest.length === 1 && rest[0] === 'probe') {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        let raw: unknown;
+        try { raw = await readBody(req); } catch { json(res, 413, { error: 'That body is over 256 KB.' }); return true; }
+        const named = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>).ids : undefined;
+        const ids = Array.isArray(named)
+          ? named.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 200).slice(0, 64)
+          : [];
+        json(res, 200, await service.credentialsView(ids));
+        return true;
+      }
+    }
+    // `GET /api/doctor/strays`: the console processes on this machine whose
+    // code is gone (`bin/stray-consoles.mjs`), listed — stopping them stays
+    // the CLI's (`phase-console doctor --stop-strays`). Before `doctor`, whose
+    // GET answers any path under its head.
+    if (head === 'doctor' && rest.length === 1 && rest[0] === 'strays' && req.method === 'GET') {
+      json(res, 200, await service.strayConsoles());
+      return true;
+    }
+
     /* ---------------- doctor: the prelude's probes with no plan, and the machine ---------------- */
     //
     // Above the "no source directory" wall for the same reason `debug` is: a
@@ -3002,6 +3123,35 @@ async function routeApi(
     }
 
     if (!service.store) { json(res, 409, { error: 'No source directory is open.' }); return true; }
+
+    /* ---------------- thin reads of the plan directory's runs (quiet-console phase 25) ---------------- */
+    // Below the wall: both read the open directory's stored runs.
+    //
+    // `GET /api/sizing`: what a session may spend, measured from this
+    // console's own sessions — the cap table beside the shipped one, the caps a
+    // phase spawns under, the context model and sessions per phase.
+    if (head === 'sizing' && rest.length === 0 && req.method === 'GET') {
+      json(res, 200, service.sessionSizing());
+      return true;
+    }
+    // `GET /api/report?since=&until=&replay=1`: the week in numbers — the
+    // report, its ETA backtest and its holder ETA — over the window (the week
+    // before `until`, now, by default), remembered five minutes per question;
+    // `replay=1` re-derives with today's models, as `phase-console report --replay`.
+    if (head === 'report' && rest.length === 0 && req.method === 'GET') {
+      const q = url.searchParams;
+      try {
+        const answer = service.weekReport({
+          since: q.get('since'), until: q.get('until'), replay: q.get('replay') === '1' || q.get('replay') === 'true',
+        });
+        if (!answer) { json(res, 409, { error: 'No source directory is open.' }); return true; }
+        json(res, 200, answer);
+      } catch (error) {
+        if (!(error instanceof ReportQueryError)) throw error;
+        json(res, 400, { error: error.message });
+      }
+      return true;
+    }
 
     /* ---------------- portfolio ---------------- */
     if (head === 'plans' && rest.length === 0) { json(res, 200, await service.summaries()); return true; }
@@ -3568,8 +3718,8 @@ async function routeApi(
       const result = await service.releaseLock(slug, phase, body.force === true);
       // 409 rather than 400 on a live lease: the request is well formed, the
       // phase is simply still being worked. `error` carries the explanation
-      // because that is the field `lib/api.ts` turns into the thrown message —
-      // without it a refusal reads as "Request failed (409)".
+      // because that is the field `client/src/data/http.ts` turns into the
+      // thrown message — without it a refusal reads as "Request failed (409)".
       json(res, result.ok ? 200 : 409, result.ok ? result : { ...result, error: result.detail });
       return true;
     }
@@ -3817,6 +3967,41 @@ async function routeApi(
         // The plan's stored triggers, armed first (control-tower phase 98, #137).
         if (verb === 'triggers') {
           json(res, 200, { triggers: service.listTriggers(slug) });
+          return true;
+        }
+        // What the plan's sessions proved (`proofs.ndjson`, the last proof of
+        // each command by phase) and every run of its §Verification lines
+        // (`verifications.ndjson`, newest first, `?run=` one run's, `?limit=`
+        // rows) — from the FILES, like the rulings, so a finished run's answer
+        // too (quiet-console phase 25). `?phase=` narrows either to one phase.
+        // Both return file CONTENTS through the path's slug, which reaches
+        // `runDir()`'s bare `join`, so a slug that is not one is refused (the
+        // debug routes' rule) rather than read one directory up.
+        if (verb === 'proofs' || verb === 'verifications') {
+          if (!isSlug(slug)) {
+            json(res, 400, { error: 'slug must be a plan slug: letters, digits, dot, dash, underscore' });
+            return true;
+          }
+          const q = url.searchParams;
+          const phase = q.get('phase');
+          if (phase !== null && phase !== '' && !/^[1-9]\d{0,5}$/.test(phase)) {
+            json(res, 400, { error: '?phase= is a phase number' });
+            return true;
+          }
+          const which = phase ? Number(phase) : undefined;
+          if (verb === 'proofs') {
+            json(res, 200, service.runProofs(slug, which));
+            return true;
+          }
+          const limit = q.get('limit');
+          if (limit !== null && limit !== '' && !/^\d{1,6}$/.test(limit)) {
+            json(res, 400, { error: '?limit= is a whole number of rows' });
+            return true;
+          }
+          const run = (q.get('run') ?? '').slice(0, 200);
+          json(res, 200, service.runVerifications(slug, {
+            ...(which !== undefined ? { phase: which } : {}), ...(run ? { run } : {}), ...(limit ? { limit: Number(limit) } : {}),
+          }));
           return true;
         }
         // `eta` rides along rather than getting an endpoint of its own: it is

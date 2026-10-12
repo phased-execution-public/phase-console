@@ -463,9 +463,14 @@ export async function axeFindings(page: Page, theme: 'light' | 'dark', within?: 
  * style is read. On the plan page that cascade runs for up to 12 frames.
  * Contrast read mid-transition is a colour halfway between two tokens, or the
  * old theme's ink on the new ground — a different finding on every run.
+ *
+ * Answers what was still running when it stopped: 0 is a frame on which nothing
+ * moved, so the switch had landed. A count read in a LATER evaluate races the
+ * live page instead — a row the console re-renders a moment after starts its
+ * own 0.01 ms transitions (quiet-console phase 27 caught one in ten).
  */
-export async function still(page: Page): Promise<void> {
-  await page.evaluate(async () => {
+export async function still(page: Page): Promise<number> {
+  return page.evaluate(async () => {
     const frame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
     const finish = (animations: Animation[]): void => {
       for (const a of animations) {
@@ -482,12 +487,15 @@ export async function still(page: Page): Promise<void> {
     // getAnimations() brings style up to date first, so it sees what the last
     // round of finishing started. Bounded: a page that animates for ever is
     // measured as it stands.
+    let left = 0;
     for (let round = 0; round < 60; round++) {
       await frame();
       const running = document.getAnimations().filter((a) => a.playState === 'running' || a.pending);
-      if (!running.length) break;
+      left = running.length;
+      if (!left) break;
       finish(running);
     }
+    return left;
   });
 }
 

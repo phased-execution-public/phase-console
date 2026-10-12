@@ -40,6 +40,12 @@ export type AuthorityRequest = {
   door: PressDoor;
   label: string;
   proof: string;
+  /**
+   * What the asker CALLS itself — a body's `by` — kept only as a claim, never as
+   * the label (#277): a local script that says `by: the owner` is `script`,
+   * which calls itself "the owner".
+   */
+  claims?: string;
   /** The press: its `AUTHORITY_ROUTES` row, the authority it carries and its tier. */
   press: string;
   authority: AuthorityVerb;
@@ -74,9 +80,10 @@ const DOOR_NAMES: Readonly<Record<string, string>> = Object.freeze({
   supervisor: "the supervisor's bearer",
 });
 
-/** The sentence a person reads on the item: who asked, how, and the question. */
-export function askSentence(request: Pick<AuthorityRequest, 'label' | 'door' | 'summary'>): string {
-  return `asked by ${request.label} through ${DOOR_NAMES[request.door] ?? `the ${request.door} door`} — ${request.summary.split(' — ')[0]} — confirm?`;
+/** The sentence a person reads on the item: who asked (and what it calls itself), how, and the question. */
+export function askSentence(request: Pick<AuthorityRequest, 'label' | 'door' | 'summary' | 'claims'>): string {
+  const claims = request.claims && request.claims !== request.label ? ` (which calls itself “${request.claims}”)` : '';
+  return `asked by ${request.label}${claims} through ${DOOR_NAMES[request.door] ?? `the ${request.door} door`} — ${request.summary.split(' — ')[0]} — confirm?`;
 }
 
 export function requestView(request: AuthorityRequest): AuthorityRequestView {
@@ -115,6 +122,8 @@ export type RequestInput = {
   door: PressDoor;
   label: string;
   proof: string;
+  /** The asker's own name for itself, when its body offered one — quoted, never trusted. */
+  claims?: string | undefined;
   row: Pick<AuthorityRoute, 'verb' | 'summary'>;
   authority: AuthorityVerb;
   risk: string;
@@ -166,6 +175,7 @@ export class AuthorityRequests {
       door: input.door,
       label: input.label.slice(0, 120),
       proof: input.proof,
+      ...(input.claims ? { claims: input.claims.slice(0, 64) } : {}),
       press: input.row.verb,
       authority: input.authority,
       risk: input.risk,

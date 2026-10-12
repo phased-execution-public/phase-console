@@ -1,72 +1,55 @@
 /* ------------------------------------------------------------------ *
  * Phase Console — design tokens (Tailwind v4)
  *
- * The instrument-panel system — 4.0 “Departures”. Status is a SYSTEM, not a colour: every
- * state the console can show is one of eight UI states, each with a hue, an
- * icon and a plain label, read from one module (`shared/status-vocab.js`).
- * This file holds the hues. Amber — the one accent — is reserved for the one
- * thing that needs a person (`--status-needs-you` = `--accent`, and nothing
- * else: since 6.0 the action colour and the focus ring are ink); nothing in the
- * interface may reach for it by literal, because the literal cannot say *why*
- * it is amber.
+ * Tokens 7.0 — "Quiet" (quiet-console phase 1). One sans at one width, mono
+ * for machine values only, one room in two lights, status as a dot and a
+ * word, amber only as a summons. The data is the hero; the chrome is silent.
  *
  * ---- What this file promises (and styles/*.test.ts hold) ----
  *
- * 1. ONE palette definition. Each token is declared ONCE with
+ * 1. ONE palette definition. Each colour is declared ONCE with
  *    `light-dark(paper, night)` and the theme is a single `color-scheme` flip.
- *    Drift between the two grounds is unrepresentable.
  * 2. Equal weight, AA-verified. The eight status hues sit at ONE fixed OKLCH
  *    lightness/chroma per theme (Paper 48 % / 0.08 · Night 75 % / 0.12; the two
  *    neutrals `queued` and `skipped` keep the lightness and drop the chroma),
- *    so no state shouts louder than another by accident — and
- *    `styles/contrast.test.ts` converts every one of them to sRGB and asserts
- *    ≥ 4.5:1 as text on every surface and ≥ 3:1 as a mark against the track,
- *    in both themes. The table above the palette is that test's output.
- * 3. The type floor is 12 px. `--text-2xs` is 0.75 rem and nothing is smaller.
+ *    and `styles/contrast.test.ts` holds every one ≥ 4.5:1 as text on every
+ *    text surface and ≥ 3:1 as a mark against the track, in both lights.
+ * 3. Three inks, all of them text: every ink clears 4.5:1 on every text
+ *    surface in both lights (`contrast.test.ts` settled the L of each).
+ * 4. The type floor is 12 px; four sizes make a page (title 22 · section 15 ·
+ *    body 14 · meta 12.5); numerals are tabular; one shadow exists, for
+ *    overlays; radii are 3 / 6 / 10; the breakpoints are 640 / 900 / 1200.
  * ------------------------------------------------------------------ */
 
 @import 'tailwindcss';
 
 /* Two surfaces whose paint is a descendant relationship rather than a set of
-   utilities — rendered markdown, and the SVG route map. Both declare their rules
-   inside `@layer components`, so a utility on the element still wins and file
-   order here does not decide the cascade. */
+   utilities — rendered markdown and the session console's line grid. Each
+   declares its rules inside `@layer components`, so a utility on the element
+   still wins and file order here does not decide the cascade. The plan's route
+   map is not here: its sheet rides the map's own lazy chunk
+   (`screens/plan/map/route-map.css`). */
 @import './prose.css';
-@import './route-map.css';
 @import './console.css';
 
 /* ------------------------------------------------------------------ *
  * Fonts — vendored, hashed by Vite (no network at runtime, ever)
  *
- * The 4.0 voices, two latin variable files (SIL OFL 1.1, licence + notices in
- * `../assets/fonts/OFL.txt`): Instrument Sans for the UI, and the SAME file a
- * second time as the display face — the `font-stretch` descriptor clamps its
- * width axis condensed, which is what a departure board's titles and big
- * numerals want and what used to cost a separate condensed file. Martian Mono,
- * held semi-condensed the same way, is the data voice: shas, ids, money and
- * durations are half of every screen here, set in a face built for telemetry.
- * Never the @fontsource index CSS — it would precache every unicode subset
- * into the offline shell.
+ * Two latin variable files (SIL OFL 1.1, licence + notices in
+ * `../assets/fonts/OFL.txt`): Instrument Sans for everything a person reads,
+ * at its natural width — 7.0 retired the condensed display face that 4.0
+ * clamped out of the same file — and Martian Mono, held semi-condensed, for a
+ * machine's values only: shas, paths, commands, keys, ids. Never the
+ * @fontsource index CSS — it would precache every unicode subset into the
+ * offline shell.
  * ------------------------------------------------------------------ */
 
 @font-face {
   font-family: 'Instrument Sans';
   src: url('../assets/fonts/instrument-sans-var.woff2') format('woff2-variations');
   font-weight: 400 700;
-  /* The UI face never condenses: clamping the width axis at 100% here is what
-     guarantees body text cannot inherit a stray narrow width. */
+  /* The one UI face, at 100 % — body text, titles and labels share one width. */
   font-stretch: 100%;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Instrument Sans Display';
-  src: url('../assets/fonts/instrument-sans-var.woff2') format('woff2-variations');
-  font-weight: 400 700;
-  /* One value, not a range: every use of the display family renders at this
-     width — the timetable voice. The browser fetches the file once for both
-     faces. */
-  font-stretch: 80%;
   font-style: normal;
   font-display: swap;
 }
@@ -74,15 +57,15 @@
   font-family: 'Martian Mono';
   src: url('../assets/fonts/martian-mono-var.woff2') format('woff2-variations');
   font-weight: 100 800;
-  /* Semi-condensed: telemetry, not billboard. Martian Mono's natural width is
-     generous; 87.5% keeps a sha column near the density Plex Mono set. */
+  /* Semi-condensed: telemetry, not billboard. 87.5 % keeps a sha column at the
+     density the tables were budgeted on. */
   font-stretch: 87.5%;
   font-style: normal;
   font-display: swap;
 }
 
 /* ------------------------------------------------------------------ *
- * The two grounds — declared once, selected by `color-scheme`
+ * The two lights — declared once, selected by `color-scheme`
  *
  * `light-dark()` reads the computed `color-scheme`, so the entire theme switch
  * is the three rules below it. `system` is the absence of `data-theme`.
@@ -92,52 +75,41 @@
   color-scheme: light dark;
 
   /* ---- Surfaces ----
-     One room, two lights (4.0): both themes sit on ONE hue family (~h 220),
-     so flipping the theme reads as dimming the instrument room, not moving
-     rooms. 3.0's light theme was green-tinged (h 174–197) beside a blue
-     night — an accident of history, retired. The L/C geometry is unchanged,
-     so every measured contrast below moved by hundredths at most. */
-  --ground: light-dark(oklch(93.19% 0.0069 220), oklch(21.36% 0.0229 232.86));
-  --ground-deep: light-dark(oklch(90.00% 0.0090 221), oklch(18.83% 0.0201 233.18));
-  --surface: light-dark(oklch(100% 0 0), oklch(26.14% 0.0292 231.11));
-  --surface-raised: light-dark(oklch(97.58% 0.0044 218), oklch(29.22% 0.0325 229.87));
-  --rule: light-dark(oklch(84.71% 0.0144 222), oklch(33.14% 0.0373 223.89));
-  --rule-strong: light-dark(oklch(74.22% 0.0212 224), oklch(39.95% 0.0444 222.75));
+     One room, two lights: one cool neutral family at hue 230 with lower
+     chroma than 6.0, so a page is paper and not a tinted panel. Surfaces
+     differ by tone, never by shadow. Paper: the page is near-white, a card is
+     white, a recessed band a step down. Night: a dark cool grey, each raised
+     surface a step lighter. */
+  --ground: light-dark(oklch(98% 0.004 230), oklch(18% 0.012 230));
+  --ground-deep: light-dark(oklch(96% 0.006 230), oklch(15.5% 0.01 230));
+  --surface: light-dark(oklch(100% 0 0), oklch(21% 0.013 230));
+  --surface-raised: light-dark(oklch(99% 0.002 230), oklch(25% 0.014 230));
+  /* A rule is ink at a low alpha, so one hairline reads right on every
+     surface it crosses. */
+  --rule: light-dark(oklch(20% 0.014 230 / 8%), oklch(95% 0.008 230 / 10%));
+  --rule-strong: light-dark(oklch(20% 0.014 230 / 16%), oklch(95% 0.008 230 / 20%));
 
-  /* ---- Ink ---- */
-  --ink: light-dark(oklch(21.36% 0.0229 232.86), oklch(95.17% 0.0097 204.91));
-  --ink-muted: light-dark(oklch(43% 0.0283 227.06), oklch(74.72% 0.0244 220.82));
-  /* Faint ink is for true metadata only — timestamps, ids, hints. It is still
-     TEXT, set at 12px, so it clears AA's 4.5:1 on every surface text sits on
-     (6.0: it held only the large-text 3:1, and the tour's axe counted 768
-     places it was read small). Paper: 4.62 on deep, 5.09 on ground, 6.21 on
-     surface. Night: 4.87 on raised, 5.39 on surface. Muted moved a step darker
-     on paper so the three inks stay three. */
-  --ink-faint: light-dark(oklch(49% 0.0264 223.97), oklch(68% 0.0298 223.53));
+  /* ---- Ink ----
+     Three inks, and all three are TEXT: each clears AA's 4.5:1 on every text
+     surface in both lights (contrast.test.ts measures them). Paper 20 / 42 /
+     52 %, Night 95 / 77 / 67 %. Faint is for true metadata — a clock, an id, a
+     hint — set at the 12.5 px meta size; muted is a label or a secondary line;
+     an affordance is never faint. */
+  --ink: light-dark(oklch(20% 0.014 230), oklch(95% 0.008 230));
+  --ink-muted: light-dark(oklch(42% 0.02 230), oklch(77% 0.016 230));
+  --ink-faint: light-dark(oklch(52% 0.02 230), oklch(67% 0.02 230));
 
-  /* ---- The track the stations sit on ---- */
-  --track: light-dark(oklch(82.37% 0.0175 223), oklch(36.05% 0.0405 223.66));
+  /* ---- The line the stations sit on ---- */
+  --track: light-dark(oklch(89% 0.01 230), oklch(33% 0.018 230));
   --hatch: light-dark(oklch(48% 0.08 300 / 18%), oklch(75% 0.12 300 / 22%));
 
   /* ---- The status palette — eight UI states, one hue each ----
      Equal weight: Paper oklch(48% 0.08 h) · Night oklch(75% 0.12 h); the two
-     neutrals keep L and drop C. Hue is held across both themes so a state reads
-     the same way on either ground. Measured contrast (styles/contrast.test.ts
-     recomputes these on every run):
-
-                  Paper (ground / deep / surface / raised / track)   Night (ground / deep / surface / raised / track)
-       done         5.15 / 4.67 / 6.28 / 5.86 / 3.66                  8.27 / 8.73 / 7.27 / 6.57 / 5.06
-       running      5.35 / 4.85 / 6.52 / 6.09 / 3.80                  7.90 / 8.34 / 6.94 / 6.27 / 4.83
-       verifying    5.17 / 4.69 / 6.31 / 5.89 / 3.68                  8.23 / 8.69 / 7.23 / 6.54 / 5.03
-       queued       5.33 / 4.84 / 6.50 / 6.07 / 3.79                  7.91 / 8.35 / 6.95 / 6.28 / 4.83
-       waiting      5.53 / 5.02 / 6.75 / 6.30 / 3.93                  7.57 / 7.99 / 6.65 / 6.01 / 4.63
-       needs-you    5.44 / 4.94 / 6.64 / 6.20 / 3.87                  7.73 / 8.15 / 6.79 / 6.14 / 4.72
-       failed       5.58 / 5.06 / 6.80 / 6.35 / 3.96                  7.49 / 7.91 / 6.58 / 5.95 / 4.58
-       skipped      5.34 / 4.85 / 6.51 / 6.08 / 3.80                  7.90 / 8.33 / 6.94 / 6.27 / 4.83
-
-     `verifying` is running's family (a dashed line-style on a map or strip is
-     what tells the two apart at a glance; the label and icon do the rest), and
-     `running` is the only state that may pulse. */
+     neutrals keep L and drop C. Hue is held across both lights so a state
+     reads the same way on either ground. A hue paints a 6 px dot, a track
+     segment or a row's leading edge — never a filled chip behind text.
+     `verifying` is running's family (a dashed segment tells the two apart),
+     and `running` is the only state that may pulse. */
   --status-done: light-dark(oklch(48% 0.08 155), oklch(75% 0.12 155));
   --status-running: light-dark(oklch(48% 0.08 252), oklch(75% 0.12 252));
   --status-verifying: light-dark(oklch(48% 0.08 205), oklch(75% 0.12 205));
@@ -147,37 +119,31 @@
   --status-failed: light-dark(oklch(48% 0.08 25), oklch(75% 0.12 25));
   --status-skipped: light-dark(oklch(48% 0.012 230), oklch(75% 0.012 230));
 
-  /* ---- The one accent, and the ink that is not it (tokens 6.0) ----
+  /* ---- The one accent, and the ink that is not it ----
      Amber is a summons: `--accent` is the one door to it, and it is the
-     needs-you state. `--action` ("do this now" — the primary button) and
-     `--focus` (the ring) are high-contrast INK, because a primary button and
-     a focused control are not a person being summoned; the one amber button is
-     `Button variant="attention"`, used only from its allowlist
-     (`ui/button-attention.test.ts`). Nothing asks for the amber literal, and
+     needs-you state. `--action` (the primary button) and `--focus` (the ring)
+     are high-contrast INK, because a primary button and a focused control are
+     not a person being summoned. Nothing asks for the amber literal, and
      `styles/theme.test.ts` follows every token to its root to hold it so. */
   --accent: var(--status-needs-you);
   --action: var(--ink);
   --focus: var(--ink);
 
-
-  /* ---- Elevation ---- */
-  --shadow-card: light-dark(
-    0 1px 2px oklch(21.36% 0.0229 232.86 / 6%),
-    0 1px 0 oklch(100% 0 0 / 4%) inset
-  ),
-  light-dark(
-    0 8px 20px -18px oklch(21.36% 0.0229 232.86 / 40%),
-    0 8px 24px -16px oklch(0% 0 0 / 80%)
+  /* ---- Elevation: one shadow, for what floats over the page ----
+     A sheet, a dialog, a menu, a popover. Nothing in the page casts: a card
+     is a tone, a row is space. */
+  --shadow-overlay: light-dark(
+    0 12px 32px -12px oklch(20% 0.014 230 / 28%),
+    0 12px 32px -12px oklch(0% 0 0 / 70%)
   );
-  --glow-action: 0 0 0 3px color-mix(in oklab, var(--action) 14%, transparent);
 
   /* ---- Touch ----
      44px is Apple's floor for a target you are expected to hit with a thumb.
      16px is iOS's floor for a text input: focus a smaller one and the browser
      zooms the whole viewport to meet it and leaves it there. */
   --tap-min: 44px;
-  /* The narrowest a run strip's name may get before the row wraps instead —
-     a strip with no legible name is a coloured bar (control-tower phase 19). */
+  /* The narrowest a run row's name may get before the row wraps instead —
+     a row with no legible name is a coloured bar. */
   --strip-name-floor: 12ch;
   --text-input: 16px;
   /* The shell's height. lib/viewport.ts overwrites it with the visual
@@ -191,7 +157,7 @@
      them, and the Vitest theme guard asserts the two agree. */
   --bp-phone: 640px; /* one thumb, one column */
   --bp-shell: 900px; /* the rail gives way to the phone shell */
-  --bp-wide: 1200px; /* the plan detail stops being two columns */
+  --bp-wide: 1200px; /* the right panel docks beside the page */
 
   /* ---- Stacking order ----
      Every z-index in the app, in the order they may cover each other. */
@@ -201,24 +167,21 @@
   --z-scrim: 60; /* modals, sheets, menus, popovers */
   --z-toast: 70; /* toasts — above everything, including a modal */
 
-  --rail-width: 80px; /* the slim rail (6.0): a glyph over its name, the longest name wide */
+  --rail-width: 80px; /* the rail: a glyph and its word */
   --content-max: 1560px;
+  /* The reading measure: a sentence a person must read never runs past it. */
+  --measure: 72ch;
 
   /* ---- Density ----
-     The ONE lever behind `prefs.density`. Every card, tile and section stack
-     reads these four, so `data-density` on the root is the whole switch — the
-     same shape as the theme above, and the reason a density does not mean
-     editing forty className strings. Comfortable is what 3.0 shipped; compact
-     is roughly a fifth tighter, which is the difference between six rows and
-     seven on a phone without changing a single type size (the 12 px floor is
-     not negotiable, so density buys space out of padding, never out of ink). */
+     The ONE lever behind `prefs.density`. Every row, section and inspector
+     body reads these four, so `data-density` on the root is the whole switch.
+     Density buys space out of padding, never out of ink. */
   --pad-x: calc(var(--spacing) * 4);
   --pad-y: calc(var(--spacing) * 3);
   --tile-pad-x: calc(var(--spacing) * 3);
   --tile-pad-y: calc(var(--spacing) * 2.5);
-  /* The 3.0 header. A definite height so the one scroller below it gets a
-     definite remainder — a header that sizes to its contents makes the whole
-     shell relayout whenever a usage meter appears. */
+  /* The header. A definite height so the one scroller below it gets a
+     definite remainder. */
   --header-height: 48px;
 }
 
@@ -267,29 +230,25 @@
   --color-failed: var(--status-failed);
   --color-skipped: var(--status-skipped);
 
-
   --color-accent: var(--accent);
   --color-action: var(--action);
   /* The focus ring, as a utility. `:focus-visible` below paints it globally;
      a component that narrows the ring (`outline-1`) still has to name the
-     colour, and `outline-focus` was that name for two of them long before the
-     token was exposed — which is to say it painted nothing at all. */
+     colour. */
   --color-focus: var(--focus);
-  /* `state` is set by the `.state-*` classes below; any badge, dot, row or map
-     segment can then paint itself `text-state` / `bg-state` without knowing
-     which state it is showing. */
+  /* `state` is set by the `.state-*` classes below; any dot, row, segment or
+     station can then paint itself `text-state` / `bg-state` / `border-state`
+     without knowing which state it is showing. */
   --color-state: var(--state, var(--status-queued));
 
   --font-sans: 'Instrument Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --font-display: 'Instrument Sans Display', 'Arial Narrow', 'Instrument Sans', system-ui, sans-serif;
   --font-mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
   /* A ligature turns `!=` into `≠` and `->` into `→`. In a diff, a command or a
      phase id that is a lie about the bytes — so the `font-mono` utility itself
      turns them off, not only the `code` element below. */
   --font-mono--font-feature-settings: 'liga' 0, 'calt' 0;
 
-  --shadow-card: var(--shadow-card);
-  --shadow-action: var(--glow-action);
+  --shadow-overlay: var(--shadow-overlay);
 
   --ease-transit: cubic-bezier(0.2, 0.7, 0.3, 1);
 }
@@ -303,13 +262,22 @@
   --breakpoint-md: 900px;
   --breakpoint-lg: 1200px;
 
-  /* Display sizes are fluid: they are the ones that overflow a phone. The
-     reading sizes are NOT — body text that shrinks with the viewport is the
-     opposite of what a small screen wants.
+  /* ---- Four sizes make a page (7.0) ----
+     title 22/600 · section 15/600 · body 14/400 · meta 12.5/400. Fixed, never
+     fluid: a size that shrinks with the viewport is the opposite of what a
+     small screen wants. The floor is 12 px and `meta` sits just above it. */
+  --text-title: 1.375rem;
+  --text-title--line-height: 1.25;
+  --text-section: 0.9375rem;
+  --text-section--line-height: 1.4;
+  --text-body: 0.875rem;
+  --text-body--line-height: 1.5;
+  --text-meta: 0.78125rem;
+  --text-meta--line-height: 1.45;
 
-     The floor is 12 px: `--text-2xs` is for badges and counters in new code,
-     `--text-xs` is the smallest a sentence may be set in. Lifting these four
-     tokens is what raised every 2.x `text-2xs` site at once. */
+  /* The 6.x scale stays while `prose.css` sizes rendered markdown from it (no
+     page wears it); `2xs` is the floor and `xs` the smallest a sentence may be
+     set in. */
   --text-3xl: clamp(1.75rem, 1.35rem + 1.9vw, 2.25rem);
   --text-2xl: clamp(1.35rem, 1.16rem + 0.9vw, 1.6rem);
   --text-xl: clamp(1.12rem, 1.02rem + 0.5vw, 1.25rem);
@@ -319,35 +287,28 @@
   --text-xs: 0.8125rem;
   --text-2xs: 0.75rem;
 
-  /* A step tighter than 3.0 (was 3/6/10): a machined instrument, not an
-     app-store card. Chips and the focus ring sit at 2, controls at 5,
-     cards and sheets at 8. */
-  --radius-sm: 2px;
-  --radius: 5px;
-  --radius-lg: 8px;
+  /* Three radii: a dot, a control, an overlay. */
+  --radius-sm: 3px;
+  --radius: 6px;
+  --radius-lg: 10px;
 
   --duration-fast: 120ms;
   --duration-medium: 260ms;
   --duration-draw: 620ms;
   /* Tailwind v4 resolves the `duration-*` UTILITIES from the
-     `--transition-duration-*` namespace — the trio above alone left every
-     `duration-fast` class compiling to nothing (QA P3, a 3.0-wide ghost), so
-     transitions ran at the 150ms default. The bare trio stays for `var()`
-     consumers; these are what make the utilities real. */
+     `--transition-duration-*` namespace; the bare trio stays for `var()`
+     consumers, and these are what make the utilities real. */
   --transition-duration-fast: 120ms;
   --transition-duration-medium: 260ms;
   --transition-duration-draw: 620ms;
 
-  /* The motions the app has. `tailwindcss-animate` is not installed — these are
-     the whole vocabulary, so a component cannot invent another.
-
-     `fade` and `rise` are entrances: they play once, when something arrives.
-     `pulse-soft` is the only *continuing* one, and it exists because the board
-     has exactly one fact that changes while you are looking at it — a run that
-     is running. A static dot cannot distinguish "a session is thinking" from "a
-     session died and this page is stale", which is the single most common
-     reason someone reloads a console that was working. It is reserved for that;
-     nothing decorative may breathe. The global reduced-motion rule stops it. */
+  /* The motions the app has — the whole vocabulary, so a component cannot
+     invent another. `rise` is the one arrival (a thing appearing in the page),
+     `fade` is an overlay's scrim and sheet arriving, and `pulse-soft` is the
+     only CONTINUING motion: a live `running` thing that is being observed,
+     because a static dot cannot tell "a session is thinking" from "this page
+     is stale". Nothing decorative may breathe. The global reduced-motion rule
+     stops all three. */
   --animate-fade: fade 120ms cubic-bezier(0.2, 0.7, 0.3, 1);
   --animate-rise: rise 260ms cubic-bezier(0.2, 0.7, 0.3, 1);
   --animate-pulse-soft: pulse-soft 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
@@ -368,14 +329,13 @@
   50% { opacity: 0.35; }
 }
 
-/* The expand transition (docs/design.md §5, control-tower phase 19) — a
-   TRANSITION, not a fourth animation. A region opening in place grows its one
-   grid row from 0fr to 1fr: the height its content needs, which no max-height
-   can know, on the medium duration token. `@starting-style` supplies the first
-   frame, so a region that MOUNTS as it opens (a fold is not a cache —
-   `Disclosure`, the strip) still grows, and no script measures anything. The
-   global reduced-motion rule collapses it like every other transition. The row
-   clips while it grows; the clip margin lets a focus ring inside still paint. */
+/* The expand — a TRANSITION, not a fourth animation. A region opening in place
+   grows its one grid row from 0fr to 1fr: the height its content needs, which
+   no max-height can know, on the medium duration token. `@starting-style`
+   supplies the first frame, so a region that MOUNTS as it opens still grows,
+   and no script measures anything. The global reduced-motion rule collapses
+   it like every other transition. The row clips while it grows; the clip
+   margin lets a focus ring inside still paint. */
 .expand-region {
   display: grid;
   grid-template-rows: 1fr;
@@ -403,51 +363,28 @@
 /* ---- The thumb floor, without changing the drawn box ----
  *
  * `--tap-min` is 44px and almost nothing that needs it is 44px: a checkbox is
- * drawn at 16, a switch at 36×20, a chip's × at 12, a link in a sentence at
- * whatever the sentence is. Growing the drawn box to meet the floor is the
- * wrong trade every time — a 44px checkbox is a different control, and a 44px
- * line of prose is not prose.
+ * drawn at 16, a switch at 36×20, a link in a sentence at whatever the sentence
+ * is. Growing the drawn box to meet the floor is the wrong trade every time.
  *
  * So the HIT AREA is a transparent pseudo-element centred on the control, and
- * the drawn box does not move. `Checkbox` and `Switch` each had their own copy
- * of this (`-inset-3.5`, `-inset-3`), which is two numbers derived by hand from
- * one token and correct only for the size each was written against. These two
- * are derived from `--tap-min` itself and work at any size.
+ * the drawn box does not move. Both are derived from `--tap-min` itself and
+ * work at any size.
  *
- * `tap-area` is for a control that is a BOX — a checkbox, a switch, a chip's
- * remove button, a badge that is a link: 44 in both directions.
+ * `tap-area` is for a control that is a BOX — a checkbox, a switch, a remove
+ * button, a mark that is a link: 44 in both directions.
  *
  * `tap-line` is for a control that is TEXT, in or beside a sentence: the
- * element's own width, 44 tall. Widening a three-word link to 44px would put
- * its hit area over the words on either side of it.
+ * element's own width, 44 tall.
  *
  * Both set `position: relative`, so neither belongs on something already
- * absolutely positioned — put it on the control, not on its wrapper.
+ * absolutely positioned — put it on the control, not on its wrapper. Under a
+ * fine pointer they do nothing at all.
  *
- * Under a fine pointer they do nothing at all. A mouse does not need 44px and
- * an invisible overlay it cannot see is exactly the kind of thing that swallows
- * a click meant for the row underneath.
- *
- * ## Two ways an overlay is not a hit area, both measured
- *
- * **The host clips it.** The `::before` is absolutely positioned against the
- * HOST, so the host's own `overflow` cuts it back to the drawn box. `truncate`
- * is `overflow: hidden`: `tap-line truncate` measured a 44px `::before` on a
- * 187×20 link and all four corners of the intended square missed it. Put the
- * clip on an inner span and leave the host's overflow visible —
- * `features/insights/cost-vs-caps.tsx` and `features/plans/phases-tab.tsx` are
- * the shape. `styles/touch.test.ts` bans the pair outright.
- *
- * **It covers a neighbour.** The overlay overhangs its host by `(44 − height)/2`
- * top and bottom — 12.5px on a `text-2xs` line — and, being a positioned
- * descendant, it hit-tests ABOVE non-positioned siblings. Two measured
- * consequences: on the approve card the "Open where it lives" link took the
- * bottom 5px of Allow / Deny / Stop, and on Insights, where the plan lists are
- * 20px rows at a 24px pitch, every row's overlay covered 8px of the VISIBLE
- * text of the row above it — a thumb on the word it aimed at, opening the wrong
- * plan. So an overlay belongs on a link inside a SENTENCE, where its overhang
- * lands on prose. A control with controls above or below it takes `tap-row` or
- * `tap-cell` below instead.
+ * Two ways an overlay is not a hit area, both measured: the HOST clips it (a
+ * `truncate` host cuts the `::before` back to the drawn box — put the clip on
+ * an inner span), and it COVERS A NEIGHBOUR (the overlay overhangs by
+ * `(44 − height)/2` and hit-tests above non-positioned siblings — among
+ * stacked controls take `tap-row` or `tap-cell` below instead).
  */
 @utility tap-area {
   @media (hover: none) {
@@ -482,20 +419,12 @@
 
 /* ---- The same floor as the drawn BOX, for a control in a stack of them ----
  *
- * The two above float a hit area over the page and leave the box alone, which
- * is right for a control with room around it and wrong for one with neighbours
- * — see "It covers a neighbour" above. Where the overhang would land on another
- * control, the floor has to be the box, and the cost is vertical space. That is
- * the trade `tap-area`/`tap-line` exist to avoid, and it is the right trade
- * here: a list of links a thumb is meant to use is a list of 44px rows, not a
- * list of 20px rows with 44px of invisible claim over each other.
- *
- * `tap-row` is 44 tall and as wide as the control already was. `tap-cell` is 44
- * both ways, for a control that is a glyph or a short token with nothing beside
- * it to widen against.
- *
- * Both are inert under a fine pointer, like the pair above — a mouse sees the
- * layout it always saw.
+ * Where the overhang would land on another control, the floor has to be the
+ * box, and the cost is vertical space: a list of links a thumb is meant to use
+ * is a list of 44px rows. `tap-row` is 44 tall and as wide as the control
+ * already was. `tap-cell` is 44 both ways, for a control that is a glyph or a
+ * short token with nothing beside it to widen against. Both are inert under a
+ * fine pointer.
  */
 @utility tap-row {
   @media (hover: none) {
@@ -533,8 +462,8 @@
     background: var(--ground);
     color: var(--ink);
     font-family: var(--font-sans);
-    font-size: var(--text-md);
-    line-height: 1.55;
+    font-size: var(--text-body);
+    line-height: 1.5;
     /* Numbers line up in columns and do not jitter while they tick. */
     font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
@@ -542,21 +471,59 @@
     /* The shell owns its own scrolling; the document must not also scroll
        sideways when a table is wider than the phone. */
     overflow-x: hidden;
-    /* And it must not bounce. An app shell that rubber-bands shows a band of
-       empty ground under the tab bar every time a flick overshoots the end of a
-       page — the "blank space at the bottom" of a phone that is behaving
-       exactly as a *document* should and exactly as an *app* should not. */
+    /* And it must not bounce: an app shell that rubber-bands shows a band of
+       empty ground under the tab bar every time a flick overshoots. */
     overscroll-behavior: none;
   }
 
+  /* Titles are the UI face at 600 — no second face, no condensed width. */
   h1, h2, h3, h4 {
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-weight: 600;
-    line-height: 1.2;
-    /* A condensed grotesque tracks a hair tight at display sizes; body text
-       never inherits this (it is not a heading). */
+    line-height: 1.25;
     letter-spacing: -0.01em;
     margin: 0;
+  }
+
+  /* Text finds its own direction. A paragraph's base direction is its
+     document's, so under `dir="rtl"` the bidi algorithm reads English
+     backwards at its edges: a leading number moves to the far end ("1 left"
+     reads "left 1"), a trailing full stop to the front (quiet-console phase
+     27, phase 8's deferral). `plaintext` takes each paragraph's direction from
+     its first strong letter instead, as `dir="auto"` would — English reads left
+     to right in a right-to-left page, Persian right to left in a left-to-right
+     one — and touches nothing else: `direction`, and so every logical side and
+     the order of a row's items, stays the document's. An element that declares
+     its own `dir`, and everything inside it (a guide drawn `dir="rtl"`, a
+     `<bdi>`), keeps what it declared. A primitive the kit tells the PAGE's
+     direction (`data-dir-mirror`, `ui/direction.ts`) declares nothing: an
+     English option in a radio group still reads left to right. */
+  :where(p, h1, h2, h3, h4, h5, h6, li, dt, dd, th, td, caption, figcaption, legend, summary, blockquote, div, span, label, a, button):not(:where([dir]:not([data-dir-mirror]), body [dir]:not([data-dir-mirror]) *)) {
+    unicode-bidi: plaintext;
+  }
+
+  /* The ORDER is the text's; the ALIGNMENT stays the page's. `plaintext` alone
+     would align each block to its own start, and a Persian title in an English
+     list would leave the column's edge for the far one; `match-parent` reads
+     start and end against the parent's direction. Every text holder but a
+     button, which centres its label by its own rule: a span, a label or a link
+     laid out as a box (a flex item, a block) aligns its own lines too — a
+     Persian title in a row of English ones stood at the row's far end.
+     Blink and WebKit know the value only as `-webkit-match-parent` (Chromium
+     151: `CSS.supports('text-align', 'match-parent')` is false, and the
+     standard spelling alone left every block at `start`); Gecko reads the
+     standard one, which the other two drop as invalid. */
+  :where(p, h1, h2, h3, h4, h5, h6, li, dt, dd, th, td, caption, figcaption, legend, summary, blockquote, div, span, label, a):not(:where([dir]:not([data-dir-mirror]), body [dir]:not([data-dir-mirror]) *)) {
+    text-align: -webkit-match-parent;
+    text-align: match-parent;
+  }
+
+  /* A machine's value reads left to right in every document: a flag, a path or
+     a command read the other way is a different one ("--max-old-space-size"
+     turned into "max-old-space-size--"). */
+  code, kbd, samp, pre {
+    direction: ltr;
+    unicode-bidi: isolate;
   }
 
   code, pre, kbd, samp {
@@ -568,10 +535,8 @@
   }
 
   /* An absolute path is one unbreakable word, and one of them is wider than a
-     phone: the skill directory printed on Settings pushed the whole page 91px
-     sideways, tab bar and all. `.md` prose already allowed the break; every
-     `<code>` a component writes by hand did not. `pre` is excluded — a block of
-     shell wraps nowhere and scrolls inside itself instead. */
+     phone. `pre` is excluded — a block of shell wraps nowhere and scrolls
+     inside itself instead. */
   :not(pre) > code, kbd, samp {
     overflow-wrap: anywhere;
   }
@@ -585,7 +550,8 @@
   /* An input below 16px makes iOS zoom the viewport to meet it and stay there. */
   input, textarea, select { font-size: max(var(--text-input), 1em); }
 
-  ::selection { background: color-mix(in oklab, var(--accent) 30%, transparent); }
+  /* A selection is ink, lightly: nothing a person highlights is a summons. */
+  ::selection { background: color-mix(in oklab, var(--ink) 18%, transparent); }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -601,9 +567,10 @@
  * State → colour
  *
  * One class sets `--state`; everything downstream paints with it. This is what
- * lets a badge, a dot, a table row and a map segment agree without any of them
- * naming a colour. The eight are the UI states of `shared/status-vocab.js`;
- * `StatusBadge` and these classes are the only two places a hue is read.
+ * lets a dot, a word, a table row and a track segment agree without any of
+ * them naming a colour. The eight are the UI states of `shared/status-vocab.js`;
+ * the typed family (`ui/status/`) and these classes are the only two places a
+ * hue is read.
  * ------------------------------------------------------------------ */
 
 .state-done { --state: var(--status-done); }
@@ -614,7 +581,6 @@
 .state-needs-you { --state: var(--status-needs-you); }
 .state-failed { --state: var(--status-failed); }
 .state-skipped { --state: var(--status-skipped); }
-
 
 /* ------------------------------------------------------------------ *
  * Safe areas — the phone shell's floor and ceiling
@@ -635,11 +601,10 @@
  * The input floor, where it can actually win.
  *
  * The @layer base rule above states the same floor — and LOSES to any
- * text-sm/text-xs utility, because Tailwind's utilities layer outranks base
- * (verified in the shipped bundle; the ask-box's 12px input zoomed iOS and
- * left it zoomed). This unlayered twin beats every layered rule. Scoped to
- * coarse pointers so desktop density is untouched: the zoom-on-focus defect
- * only exists where a finger does.
+ * text-sm/text-xs utility, because Tailwind's utilities layer outranks base.
+ * This unlayered twin beats every layered rule. Scoped to coarse pointers so
+ * desktop density is untouched: the zoom-on-focus defect only exists where a
+ * finger does.
  * ------------------------------------------------------------------ */
 @media (pointer: coarse) {
   input, textarea, select { font-size: max(var(--text-input), 1em); }

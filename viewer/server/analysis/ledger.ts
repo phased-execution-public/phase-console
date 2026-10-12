@@ -306,6 +306,12 @@ export type LedgerSummary = {
   accounts: LedgerSummaryRow[];
   /** Runs whose journal read was cut — their figures are lower bounds. */
   truncatedRuns: number;
+  /**
+   * Sessions that never reported a cost, over every run — counted once here, so
+   * a page says the number without adding the plans' rows itself (quiet-console
+   * phase 19).
+   */
+  unknownSessions: number;
 };
 
 /** The same ledger, aggregated per plan and per account — what Insights draws. Most expensive first. */
@@ -321,8 +327,10 @@ export function summariseLedgers(ledgers: readonly { slug: string; ledger: RunLe
     return row;
   };
   let truncatedRuns = 0;
+  let unknownSessions = 0;
   ledgers.forEach(({ slug, ledger }, index) => {
     if (ledger.totals.truncated) truncatedRuns++;
+    unknownSessions += ledger.sessions.filter((session) => session.costUsd == null).length;
     const runKey = ledger.runId ?? `#${index}`;
     const plan = slot(plans, slug);
     plan.runIds.add(runKey);
@@ -341,5 +349,5 @@ export function summariseLedgers(ledgers: readonly { slug: string; ledger: RunLe
     [...map.values()]
       .map(({ runIds, ...row }) => ({ ...row, runs: runIds.size, costUsd: round(row.costUsd) }))
       .sort((a, b) => b.costUsd - a.costUsd || a.key.localeCompare(b.key));
-  return { plans: finish(plans), accounts: finish(accounts), truncatedRuns };
+  return { plans: finish(plans), accounts: finish(accounts), truncatedRuns, unknownSessions };
 }

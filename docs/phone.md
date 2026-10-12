@@ -325,8 +325,8 @@ nothing reminds for ever.
 ### When nothing would reach you
 
 A console that announces to nobody looks exactly like a console with nothing to say, so it checks.
-An announcement no subscribed device will take is recorded as `no-device` in the delivery ledger (Debug
-shows it); when the reason is that no device is subscribed at all, it is also logged, once per process,
+An announcement no subscribed device will take is recorded as `no-device` in the delivery ledger (Logs ▸
+Delivery shows it); when the reason is that no device is subscribed at all, it is also logged, once per process,
 as `push.no-device`. The console then
 judges its whole channel — a subscribed device, a notifier (`PHASE_CONSOLE_NOTIFY` or the profile's
 `notifyCommand`), or a webhook row — and while none of them reaches anyone it keeps one `push-broken`

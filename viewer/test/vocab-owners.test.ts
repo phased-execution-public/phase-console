@@ -139,6 +139,10 @@ import { PHASE_CLOCK_FIELDS } from '../shared/phase-clocks.js';
 import { SILENCE_KINDS } from '../shared/attention-model.js';
 import { LOCK_EVENT_KINDS, LOCK_FILTERS, LOCK_HOLDER_KINDS } from '../shared/lock-model.js';
 import { RESUME_AT_BOOT_MODES } from '../shared/automation-model.js';
+import { SCHEDULING_POLICIES } from '../shared/orchestration-model.js';
+import { EFFORT_LEVELS } from '../shared/run-settings.js';
+import { MESSAGING_WORDS } from '../shared/message-model.js';
+import { AUTOSTART_WORDS, DENSITIES, PREF_META, PROFILE_META, THEMES } from '../shared/prefs-model.js';
 import { DECISION_KEYS, DECISION_STATES, DECISION_SOURCES, NEED_CLASSES } from '../shared/decisions-model.js';
 import { REFUSAL_CAUSES, SITUATIONS, parseSituationKey } from '../shared/situation-model.js';
 import { RUNG_DRIVERS, RUNG_FAILURE_CAUSES, RUNG_VEHICLES } from '../shared/ladder-model.js';
@@ -498,6 +502,34 @@ test('the server re-exports the lifecycle OWNER objects, not copies', () => {
   assert.deepEqual(sorted(IN_FLIGHT), sorted(RUN_IN_FLIGHT), 'state.ts IN_FLIGHT');
 });
 
+test('the settings schema takes each key\'s words from their owner — the same array, never a copy (quiet-console phase 25)', () => {
+  // `PREF_META` (shared/prefs-model.js) is what Settings ▸ Everything draws a
+  // key from; a copied word list there would offer a word the writer refuses.
+  const owners = new Map<string, readonly string[]>([
+    ['theme', THEMES],
+    ['density', DENSITIES],
+    ['gitMode', GIT_MODES],
+    ['reviewerPolicy', REVIEWER_POLICIES],
+    ['isolation', ISOLATION_MODES],
+    ['settle', SETTLE_STRATEGIES],
+    ['worktreeRoot', WORKTREE_ROOTS],
+    ['worktreeRetention', WORKTREE_RETENTION],
+    ['landing', LAND_POLICIES],
+    ['conflictPolicy', CONFLICT_POLICIES],
+    ['messaging', MESSAGING_WORDS],
+    ['issuesMode', ISSUE_MODES],
+    ['isolationReclaim', ISOLATION_RECLAIM],
+    ['mcpPolicy', MCP_POLICIES],
+    ['schedulingPolicy', SCHEDULING_POLICIES],
+    ['resumeAtBoot', RESUME_AT_BOOT_MODES],
+    ['checkEffort', EFFORT_LEVELS],
+  ]);
+  const worded = Object.entries(PREF_META).filter(([, meta]) => meta.words !== undefined);
+  assert.deepEqual(sorted(worded.map(([key]) => key)), sorted([...owners.keys()]), 'every word row has its owner named here');
+  for (const [key, meta] of worded) assert.equal(meta.words, owners.get(key), `PREF_META.${key}.words`);
+  assert.equal(PROFILE_META.autostart.words, AUTOSTART_WORDS, 'PROFILE_META.autostart.words');
+});
+
 test('the two paint tables are keyed by exactly the lifecycle statuses', () => {
   // The compiler holds the Records total against the union; this holds them
   // free of INVENTED keys, which the compiler cannot see.
@@ -551,7 +583,7 @@ const VOCABULARIES: {
       // The two TS shadows of the owner's union, each commented back to it —
       // the same shape LIVE_VIA's shadows take. Any THIRD spelling fails.
       'server/service-core.ts',
-      'client/src/lib/api/runs.ts',
+      'client/src/data/api/runs.ts',
     ],
   },
   { name: 'plan statuses', members: PLAN_STATUSES, owner: 'shared/plan-vocab.js' },
@@ -578,8 +610,8 @@ const VOCABULARIES: {
       // (`plan`, `auto`, `dontAsk` are MODES). Naming a superset is not
       // re-declaring the vocabulary — `RUN_PERMISSIONS`, the one that IS the
       // three profiles, derives from the owner.
-      'client/src/features/run-setup/modes.ts',
-      'client/src/features/run-setup/schema.ts',
+      'client/src/screens/launch/model/modes.ts',
+      'client/src/screens/launch/model/schema.ts',
     ],
   },
   {
@@ -590,7 +622,7 @@ const VOCABULARIES: {
       // `RunSetupMode` is a superset that happens to contain the intents' words
       // — the run-setup dialog's own modes, a different vocabulary; the same
       // reasoning as the queue-kinds allowance below.
-      'client/src/features/run-setup/modes.ts',
+      'client/src/screens/launch/model/modes.ts',
     ],
   },
   {
@@ -599,7 +631,7 @@ const VOCABULARIES: {
     owner: 'shared/run-settings.js',
     allow: [
       // The run-setup picker's own ORDER; membership is the owner's.
-      'client/src/features/run-setup/modes.ts',
+      'client/src/screens/launch/model/modes.ts',
     ],
   },
   {
@@ -697,7 +729,7 @@ const VOCABULARIES: {
       // words. It is a different vocabulary — the run-setup dialog's own modes
       // — and naming a superset is not re-declaring this one. The same
       // reasoning as the permission-profiles allowance above.
-      'client/src/features/run-setup/modes.ts',
+      'client/src/screens/launch/model/modes.ts',
     ],
   },
   { name: 'boarding briefs', members: BOARDING_BRIEFS, owner: 'shared/run-lifecycle.js' },
@@ -964,15 +996,20 @@ const VOCABULARIES: {
   { name: 'worktree retention', members: WORKTREE_RETENTION, owner: 'shared/worktree-model.js' },
   /* Status model v2 (control-tower phase 16): the three questions a status now
    * answers instead of one enum — its tense, how a settled thing ended, and the
-   * Tower's bays — plus the facts a view carries beside its word and the note
-   * severities `StatusStack` speaks in. The badge family's prop types derive
-   * from these; a third spelling anywhere fails here. */
+   * Runs home's groups (its bays) — plus the facts a view carries beside its
+   * word and the note severities a banner speaks in. The status family's prop
+   * types derive from these; a third spelling anywhere fails here. */
   { name: 'status tenses', members: TENSES, owner: 'shared/status-model.js' },
   { name: 'budget kinds', members: BUDGET_KINDS, owner: 'shared/budget-model.js' },
   { name: 'status outcomes', members: OUTCOMES, owner: 'shared/status-model.js' },
   { name: 'tower bays', members: BAYS, owner: 'shared/bays.js' },
   { name: 'status facts', members: FACT_KINDS, owner: 'shared/status-model.js' },
   { name: 'note severities', members: NOTE_SEVERITIES, owner: 'shared/status-notes.js' },
+  /* The appearance words (quiet-console phase 21): the server's writer and the
+   * settings schema read them from their owner, and the browser's own copy of
+   * the preference derives its type from the same arrays (`lib/prefs.ts`). */
+  { name: 'themes', members: THEMES, owner: 'shared/prefs-model.js' },
+  { name: 'densities', members: DENSITIES, owner: 'shared/prefs-model.js' },
 ];
 
 /** Every source file the scan covers — tests excluded; they may say anything. */
@@ -1074,37 +1111,40 @@ test('the stray status tables are gone — each consumer reads the status model'
       gone: /\bQA_RESULT_UI\b|\bqaUiState\b/,
       what: 'the QA verdict paint table',
       readers: [
-        // The QA tab folded into the phase table's QA column and the drawer's
-        // QA section (control-tower phase 23).
-        'client/src/features/runs/phase-table.tsx',
-        'client/src/features/runs/phase-drawer.tsx',
-        'client/src/features/insights/index.tsx',
-        'client/src/components/qa-launcher.tsx',
+        // The phase grid's QA column, the drawer's QA section and the QA
+        // launcher (quiet-console phase 10).
+        'client/src/screens/plan/phases/table.tsx',
+        'client/src/screens/plan/phases/drawer.tsx',
+        // Insights' record of a plan's verdicts — the page's own file until
+        // quiet-console phase 19 gave the record one of its own.
+        'client/src/screens/insights/plan-record.tsx',
+        'client/src/screens/plan/phases/qa-launcher.tsx',
       ],
     },
     {
-      file: 'client/src/features/plans/phase-panel.tsx',
+      file: 'client/src/screens/plan/phases/panel.tsx',
       gone: /function handoffState\b/,
       what: 'the handoff word mapping',
-      readers: ['client/src/features/plans/phase-panel.tsx', 'client/src/features/plans/handoff-panel.tsx'],
+      readers: ['client/src/screens/plan/phases/panel.tsx', 'client/src/screens/plan/phases/handoff-panel.tsx'],
     },
     {
-      file: 'client/src/components/ui/status-stack.tsx',
+      file: 'client/src/ui/toast.tsx',
       gone: /\bconst ORDER\b|border-blocked|border-progress|border-action/,
       what: 'the note severity order and colour table',
-      readers: ['client/src/components/ui/status-stack.tsx', 'client/src/components/ui/toast.tsx'],
+      readers: ['client/src/ui/toast.tsx'],
     },
     {
-      file: 'client/src/features/runs/waiting-pane.tsx',
+      // The second queue moved to the 7.0 Run view (quiet-console phase 11).
+      file: 'client/src/screens/plan/run/waiting.tsx',
       gone: /row\.stuck \? 'bad'/,
       what: 'the red `stuck` chip',
-      readers: ['client/src/features/runs/waiting-pane.tsx'],
+      readers: ['client/src/screens/plan/run/waiting.tsx'],
     },
   ];
   const left = STRAYS.filter((s) => s.gone.test(src(s.file))).map((s) => `${s.file}: ${s.what}`);
   assert.deepEqual(left, [], 'fold these into shared/status-model.js');
   // …and every file that draws the concept now reads the model, by import.
-  const readsModel = /shared\/status-(model|notes)\.js|@\/components\/ui\/status['"/]|\.\/status\/(status|note)-icons/;
+  const readsModel = /shared\/status-(model|notes)\.js|@\/ui\/status['"/]|\.\/status\/(status|note)-icons/;
   const unread = STRAYS.flatMap((s) => s.readers).filter((f) => !readsModel.test(src(f)));
   assert.deepEqual(unread, [], 'these draw a status word, but nothing tells them how');
   // The retired helpers have no callers anywhere.

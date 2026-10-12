@@ -18,10 +18,11 @@ Everything on that page is an **item**. An item tells you:
 
 ## The page
 
-**Your turn** (`#/turn`, under Runs) lists every act only you can do. Under the title it says which round
-of the console read it, and when, and one sentence sums the page up: how many things need you now, which
-has waited longest, how many are being checked or coming up, and how many the AI handled since you last
-looked. The console composes that sentence by rules from its counts. No model writes it.
+**Your turn** (`#/turn`, under Runs) lists every act only you can do. Its heading is one sentence that
+sums the page up: how many things need you now, which has waited longest and what it holds, how many are
+being checked or coming up, and how many the AI handled since you last looked. Under it, the round that
+read it: *Round 14, read at 12:00. It last changed at 11:50.* The console composes that sentence by rules
+from its counts. No model writes it.
 
 Below it come six sections, always in this order:
 
@@ -31,8 +32,8 @@ Below it come six sections, always in this order:
 | **Needs one detail from you** | Decisions and questions: you answer instead of doing. |
 | **Coming up** | Acts that are not due yet (see Acts that come due later). |
 | **Being checked** | Items whose check is running. There is nothing to press until the verdict lands. |
-| **Done** | What was settled today, with the older ones beneath, under *Earlier*. |
-| **Handled by the AI** | What the AI settled on its own, instead of asking you. |
+| **Done** | What was settled today, folded under *What was settled*, with the older ones beneath, under *Earlier*. |
+| **Handled by the AI** | What the AI settled on its own, instead of asking you, folded under *What the AI handled*. |
 
 The page keeps itself current. Once a minute, and whenever a run writes to its journal, the console
 takes a *round*: it sends the reminders that are due, expires a window that closed, withdraws an item
@@ -42,20 +43,23 @@ out. A round that changed anything updates the page on every screen. A quiet rou
 `#/turn/<id>` opens one item, and a push opens its item there for you. The phone queue's older addresses,
 `#/approve` and `#/approve?step=<id>`, land on the page in one hop. The approval queue, the question card,
 the gate card and the errand card no longer draw a shape of their own: each shows the item as one row with
-its one button, and **Open on Your turn** takes you to the whole card. On the Tower, a Needs-you strip's
-one action is its oldest item's button, and **Your turn (n)** in the situation line counts items and
-opens the page.
+its one button, and **Open on Your turn** takes you to the whole card. On **Runs**, the **Your turn**
+group lists the same items, one line each, and a run your turn summons offers its oldest item's button as
+its one action; **Your turn (n)** in the situation line counts items and opens the page.
 
-Narrow the page by plan, run, kind, reason or risk, or search it for a title, a command or a plan. Every
-filter is part of the address, so a narrowed view is a link. **Export** downloads the open items and
-their guides as one Markdown document, and **Print** prints the same.
+Search it for a title, a command or a plan, and narrow it with **Filter** by plan, run, kind, reason or
+risk. Every filter is part of the address, so a narrowed view is a link, and *Showing 3 of 9 items* says
+so, with **Clear the filters**. Under **⋯**, **Export as Markdown** downloads the open items and their
+guides as one document, and **Print** prints the same. **Everything** unfolds **Done** and the handled log,
+and opens every folded card. On a phone the filters, **⋯** and **Everything** share one **View** sheet.
 
 ## Each item, and why only you
 
 An item is one card. Its head says what state it is in and what kind of act it is, then gives its title,
 then **Only you:** and the reason. Under that come the plan, phase and run it belongs to, each a link;
 what it unblocks; a countdown while its window runs; and roughly how long it takes. Then the guide, how
-it will be checked, and the buttons.
+it will be checked, and the buttons. **Inspect**, in the card's head, puts the item in the panel, and
+**Withdraw** takes back an item nobody needs any more.
 
 Every item carries one of ten reasons. The page's reason filter names them by these labels:
 
@@ -170,15 +174,16 @@ Beside the check, an item offers these. Each is a press only you make.
 
 A **permission** item is the AI meeting a wall and asking you. The card opens "Raised because the AI lacks
 permission to …" and shows the command, why the phase needs it, and the wall with its rule. It then offers
-one control for how far a grant should reach, with the risk of the chosen scope beside **Grant**: *This
-call*, *This phase*, *This plan*, *This repository* or *Always*. **I'll do it myself** turns the item into
+one control, **How far the grant reaches** — *This call*, *This phase*, *This plan*, *This repository* or
+*Always* — and the button names the reach, **Grant, this call** to **Grant, always**, with the risk of
+that scope beside it. **I'll do it myself** turns the item into
 your own act: its guide is the command, and its check resumes the session. **Deny** tells the session to
 find another way.
 
 A low or medium-risk grant is one press. A high-risk one asks you to type the rule back. A wall that is
 never granted offers no **Grant** at all, only why, and the steps to take yourself. **Grant every low-risk
-ask**, at the top of the page, grants every open low-risk ask in one press, each for this call or this
-phase only.
+ask (N)**, beside the **Do now** heading, grants every open low-risk ask in one press, each for this call
+or this phase only. A granted item stays until the console confirms the grant applied, and says so.
 
 The **Permissions** guide has the rest: the scopes, the tiers, the ledger, the never list and the owner key.
 

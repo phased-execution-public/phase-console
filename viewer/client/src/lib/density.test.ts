@@ -21,7 +21,12 @@ import { applyDensity, setPrefs } from './prefs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(join(HERE, '..', 'styles', 'theme.css'), 'utf8');
-const card = readFileSync(join(HERE, '..', 'components', 'ui', 'card.tsx'), 'utf8');
+// The kit's three surfaces that carry padding (7.0): the page frame, a card of
+// the card list, and a table cell.
+const kit = (...path: string[]) => readFileSync(join(HERE, '..', 'ui', ...path), 'utf8');
+const page = kit('page.tsx');
+const card = kit('grid', 'card-list.tsx');
+const table = kit('table.tsx');
 
 afterEach(() => {
   document.documentElement.removeAttribute('data-density');
@@ -55,12 +60,13 @@ describe('density', () => {
     }
   });
 
-  it('has the card and the tile read the tokens rather than fixed padding', () => {
-    // The whole switch is these three className strings. A card that goes back
-    // to `px-4 py-3` does not fail to compile, it just stops responding to the
+  it('has the page, the card and the table cell read the tokens rather than fixed padding', () => {
+    // The whole switch is these className strings. A surface that goes back to
+    // `px-4 py-3` does not fail to compile, it just stops responding to the
     // preference — silently, on one surface.
-    expect(card).toContain('px-(--pad-x) py-(--pad-y)');
+    expect(page).toContain('px-(--pad-x) py-(--pad-y)');
     expect(card).toContain('px-(--tile-pad-x) py-(--tile-pad-y)');
-    expect(card).not.toMatch(/className=\{cn\('px-4 py-3'/);
+    expect(table).toContain("'px-(--tile-pad-x) py-(--tile-pad-y)'");
+    for (const file of [page, card, table]) expect(file).not.toMatch(/'px-4 py-3'/);
   });
 });

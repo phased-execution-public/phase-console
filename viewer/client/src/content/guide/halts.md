@@ -7,22 +7,23 @@ stays quiet, and nothing restarts it until you do. A halt reads **Halted**, **Pa
 climbs what it can before it asks you.
 
 A halt is not painted as an alarm. **Halted** sits in the waiting paint with an alert glyph, in the
-Tower's **Waiting** bay. It turns amber, and moves to **Needs you**, only when something is asked of
-you: an errand, an approval or a sign-in.
+**Waiting** group on Runs. It turns amber only when something is asked of you — an errand, an approval or
+a sign-in — and stays where it is, while the ask joins **Your turn**.
 
 ## One card, one sentence, one way forward
 
-Every halt is explained by one card, the same wherever you meet it: in full on the run page under
-**Halted.** and in an expanded strip on the Tower, folded to a line in the plan's health panel.
+Every halt is explained by one card, the same wherever you meet it: in full at the top of the plan's
+**Run** view and in a run's opened line on Runs, folded to a line in the plan page's **Something's wrong**
+and in a past run's **Why it stopped**.
 
-- **The family**, one of nine, with an icon. The Tower lights a lamp for each; press one to narrow
-  the bays to that family. A family is never amber.
+- **The family**, one of nine, with an icon. Runs' **Filter** lights a lamp for each; press one to
+  narrow the groups to that family. A family is never amber.
 - **One sentence** saying what happened, with the fix the family usually wants under it.
 - **The controls** this stop needs: a budget's raise, **Clear the streak**, a row and a button for
   each phase that holds a run with nothing ready, or the plan a plan-mode session wants approved.
 - **The recommended button**, drawn first: the way forward the console would take itself. Further
-  ways fold under **More ways forward**. Once the run is live again the note reads
-  **Stopped earlier — running again.** and the card offers no buttons.
+  ways fold under **More ways forward**. Once the run is live again the card reads *The console
+  picked this run back up. What stopped it:* and offers no buttons.
 - **Details: the runner’s words, the ladder, the watch**, one press away: what the runner wrote,
   verbatim, what the ladder tried, and the refs the phase watches.
 
@@ -32,8 +33,8 @@ Every halt is explained by one card, the same wherever you meet it: in full on t
 | Family (lamp) | What stopped the run | What usually moves it |
 |---|---|---|
 | **Needs your decision** (**Decision**) | A session wrote a blocked handoff or needs a step only a person can take. A plan-mode session waits for you to approve its plan. A card went unanswered. A QA verdict holds every phase that is left. | Answer what it asks — approve, re-run or waive QA — then continue. |
-| **Credentials and accounts** (**Accounts**) | The run's Claude account was refused, now signs in as somebody else, or failed the checks at the start. | Sign in again, or move the run to another account, then continue. |
-| **Usage limits and budget** (**Limits**) | The run spent all the money it was allowed, or every model it may use is at its usage limit. | Switch account, or raise the budget. |
+| **Credentials and accounts** (**Accounts**) | The run's Claude account was refused, now signs in as somebody else, or failed the checks at the start. | Sign in again, then clear the account's retirement — or move the run to another account, then continue. |
+| **Usage limits and budget** (**Limits**) | The run spent all the money it was allowed, or every model it may use is at its usage limit. | Switch account, or raise the budget by minutes or dollars. |
 | **Environment and network** (**Environment**) | An MCP server a phase needs would not connect, or a session, a recovery or the console's drive loop crashed. | Continue once the network or the server is back, or continue without it. |
 | **Plan defect** (**Plan**) | The plan fails its lint, cannot be read, or has a verification line the console will not run as written. | Repair the plan file, then continue. |
 | **Verification and unfinished work** (**Verification**) | A phase finished and its verification did not pass, a session wrote no handoff, a verification command ran past its time limit twice, or too many phases failed in a row. | Resume the phase with the failure, close it out, or retry it. |
@@ -69,13 +70,13 @@ a rung that ran is not tried twice on one phase. The cheap ones come first: the 
 resumed, then a fresh briefed session; at a wall, an account or model switch.
 
 The ladder is bounded in rungs and dollars: by default three rungs and $100 a phase, ten rungs and
-$400 a run, $600 a day, each a knob on the **Automation · the ladder** card in Settings ▸ Automation.
+$400 a run, $600 a day, each a knob under **The ladder** in Settings ▸ Automation.
 When a rung fixes the phase, the run carries on by itself; under **Stop and ask me** it waits for you.
 
 When every rung is spent, or the situation was yours from the start, the phase is parked with one
 errand: the card headed **Needs you — phase N**, with what is needed, **How:** to give it, and what
-was already tried. The run page keeps each settled rung in its session ledger, under
-**Why it started and what it cost**, with an **Outcome** and a **Why**.
+was already tried. The run's page keeps each settled rung in its fold **What the ladder tried**, with an
+**Outcome** and a **Why**.
 
 - **Withdrawn** means the rung never ran. The phase was put back on the board, but no session started:
   another lane took its scope, or a park or halt took its place in the queue. It costs nothing, counts

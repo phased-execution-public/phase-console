@@ -1,11 +1,12 @@
 ## Nothing will start
 
-If the Autopilot tab shows the plan but every start button is dead, the console was started without
-`--allow-run`. **The line at the very top of this Guide page says which it is** — it reads this
-console's own switches rather than describing a console in general.
+If a plan's **Run** view says *This console is read-only for runs*, and every control there says *Needs
+--allow-run on this console.*, the console was started without `--allow-run`. **The first line of this
+Help sheet says which it is** — *Runs are enabled on this console.*, or *This console can show runs but not
+start them* — because it reads this console's own switches rather than describing a console in general.
 
-The fix is a restart with the flag: **Launch ▸ The eight switches** has the command, and Settings ▸
-Start with every capability composes it for you.
+The fix is a restart with the flag: **Starting up ▸ The eight switches** has the command, and Settings ▸
+Essentials ▸ **Start command** composes it for you, with **Copy the command**.
 
 **Is the machine ready at all?** `phase-console doctor` runs the checks a run's start would, with no
 plan in front of it — accounts, MCP servers, the machine's `claude` login, a delivery channel, the
@@ -31,9 +32,10 @@ Four ways a run comes to rest. **Only one of them is a problem.**
 Verification failed · the plan stopped linting · the board did not flip to done · two phases failed in
 a row · the budget ran out · the API refused the run's own credential · a person is needed.
 
-Read the halt reason on the Autopilot tab, fix the cause, then Retry that phase and start again. If
-the phase actually did its work and only failed to close itself out, **Closeout** is the verb rather
-than Retry — see **Autopilot**.
+Read the halt card at the top of the plan's **Run** view, fix the cause, then press its way forward —
+**Retry from scratch** for a phase whose attempt was wrong. If the phase actually did its work and only
+failed to close itself out, **Finish in its own session** is the move rather than a retry — see
+**Autopilot**.
 
 ## Parked
 
@@ -41,8 +43,8 @@ than Retry — see **Autopilot**.
 
 A gate that has not cleared · a lock held by another session · a phase that needs a decision.
 
-Clear the gate or release the lock, then start the run again. Nothing was lost — "Why this is
-stopped" names each blocker with its remedy.
+Clear the gate or release the lock, then start the run again. Nothing was lost — the run's fold **Ways
+forward** names each blocker with its remedy.
 
 **Every phase is done, but the run's branch is not on its trunk yet.** A run that works on its own
 branch finishes only once that branch, in every repository it mounted, is held by the trunk on
@@ -57,12 +59,12 @@ conflict and its files. The errand's card opens a merge errand tree; once the br
 A plan-level limit that only time fixes. A limit on one model instead switches model and carries on.
 
 Leave it: the run resumes itself at the stated time. Further out than twelve hours and it parks for
-you instead. With more than one account registered, **On usage limit ▸ switch** moves it to an
-account with headroom rather than waiting at all — and it does so *while the wall is happening*, off
+you instead. With more than one account registered, the launch's **On usage limit** set to *switch
+account, else wait* moves it to an account with headroom rather than waiting at all — and it does so *while the wall is happening*, off
 the session's own stream, rather than waiting for the session to exit. That matters because a session
 that hits the wall mid-turn often never exits: the CLI absorbs the 429 and retries every thirty
 seconds indefinitely. A lane in that state reads **Retrying** on its row, and if no account had
-headroom to move it to, the Tower's Needs-you bay raises it after a quarter of an hour. The run does not sit there
+headroom to move it to, Runs raises it under **Your turn** after a quarter of an hour. The run does not sit there
 silently either: the third such wall inside an hour with nowhere to move stops being merely noted —
 the phase waits out the window when its reset is known, or parks with an errand — and it announces
 under **Usage limits** either way.
@@ -90,12 +92,13 @@ Skip it deliberately.
 is not what you think it is — run `scripts/validate.sh <slug>` and read what it says.
 
 **A fix I made to the server did not work.** Node reads `server/` once, at startup; reloading the page
-reloads the client and nothing else. Settings ▸ *This process* says whether the code on disk is newer
-than the process, and has the button that restarts it.
+reloads the client and nothing else. Settings ▸ This instance ▸ **This process** says whether it is *Older
+than what is on disk — restart it*, **Restart the console** just below it restarts it, and every page says
+*This console is running older code than is on disk.* while it is.
 
 **404s in the browser console on the Runs page.** The same thing: a client from disk talking to a
 server that started before the autopilot existed. The page says so rather than showing a stack of
-failed requests.
+failed requests, and this sheet's first line reads *This console predates the autopilot.*
 
 **A card I answered on my phone is still on the laptop.** It is not — press it and you get a 404 for a
 decision already made, and the queue re-reads itself at that point.
@@ -105,11 +108,12 @@ system: macOS *System Settings ▸ Notifications ▸ your browser*, or Windows *
 Notifications*. A Focus or Do Not Disturb mode does the same thing silently.
 
 **Nothing can reach me at all.** No device is subscribed and no `PHASE_CONSOLE_NOTIFY` command is set,
-so announcements arrive in the inbox and stop there. The Notifications page says so at the top.
+so announcements arrive in the inbox and stop there. Settings ▸ Notifications says so under **Devices**,
+and the bell's **Announcements** opens with *Nothing can reach you out of band yet.*
 
-**The usage alerts went quiet.** Check whether **Usage alerts** got switched off — see **Alerts ▸
-Turning off the usage-limit alerts** for what that silences.
+**The usage alerts went quiet.** Check whether **Usage limits** got switched off in Settings ▸
+Notifications — see **Alerts ▸ Turning off the usage-limit alerts** for what that silences.
 
 **Two sessions on one phase.** Take the lock (`scripts/phase-lock.sh <slug> claim <N>`) before
-building, and release it when you stop. Insights ▸ What shape the work is in lists every claimed phase and how much
-lease is left.
+building, and release it when you stop. Sessions ▸ **Locks** lists every claim and who holds it, and
+Insights ▸ What shape the work is in shows how much lease each has left.

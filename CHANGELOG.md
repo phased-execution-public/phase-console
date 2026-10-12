@@ -20,6 +20,125 @@ into a web form at the moment of release.
 
 ## [Unreleased]
 
+## [7.0.0] - 2026-10-12
+
+**Quiet.** 7.0 rebuilds the console's web client from zero around one question — *does anything need
+me?* — answered in two seconds and fixed in one move, with everything else one expansion away. Seven
+places (Runs · Plans · Sessions · Repo · Insights · Logs · Settings) under one shell; one line per
+thing, a status drawn as a dot and a word, and three doors to depth on every page — **expand** in
+place, **inspect** in the panel, and **Everything**, a per-page switch that shows every column, fact
+and section. Every option the server has now has a door a person can reach: a registry names each
+route, event, setting and operator verb with the page that offers it, and a test holds it to the
+server both ways. The whole client works on a phone and a tablet, mirrored right to left, and stilled
+for anyone who asks for less motion. The free tree stays MIT. The server, the runner,
+the scripts and the skill are the same as 6.2's: nothing a 6.2 plan, session or script says changes,
+and `PE_API` stays 2.
+
+### Migration
+- **Every 6.2 address still lands, in one hop, with its query** (`client/src/shell/redirects.ts`):
+  `#/now…` and `#/ready` on the Runs home, `#/queue` on its Queued group, `#/approve` on Your turn,
+  `#/debug[/<section>]` on Logs, a 6.2 Runs bay (`?bay=`) on its group (`?group=`). A bookmark, a push
+  and a link a session wrote keep working.
+- **Debug is Logs.** The place is `#/logs/<section>` — Logs, Journal, Delivery, Health, Access — and
+  its chunk is `logs-*`.
+- **The run page folds into its plan.** A run is a plan's Run view, `#/plan/<slug>/run`, with its
+  earlier runs at `?view=history`; the Tower's six bays are the Runs home's groups.
+- **New read routes, no flag and no journal line:** `GET /api/prefs/schema` (every preference with its
+  type, default, section, description and where its value came from), `GET /api/ceiling`,
+  `GET /api/credentials` and `POST /api/credentials/probe`, `GET /api/doctor/strays`,
+  `GET /api/sizing`, `GET /api/report`, `GET /api/run/:slug/proofs` and
+  `GET /api/run/:slug/verifications`.
+- **A preference can be reset.** Settings ▸ Everything resets a key to its default, and a write keeps
+  only what the file held, what the write set and what differs from the default — so a reset leaves
+  the file rather than pinning the default in it.
+- **First paint is held at 170 KB served** (it was 190), in this build and the free one: the free
+  tree's gate now runs `check:dist` on its own client build.
+- **The 6.x client is gone.** `viewer/client/src/` holds `ui/`, `cards/`, `shell/`, `screens/` and
+  `data/` beside `lib/`, `styles/` and `content/`; the 6.x app, features, components and lib/api
+  directories and lib/queries.ts no longer exist. A patch or a fork against a 6.x client file has
+  nothing to apply to.
+
+### Added
+- **The map: seven places in three bands** (`DESTINATIONS` in `shared/route-meta.js`), the same in
+  both editions. The rail from 900 px carries the instance switcher, the seven places, Help and the
+  account meter; the header the page title, the situation words, search (⌘K) and the bell; below
+  900 px a tab bar — Runs · Plans · Sessions · Insights · More.
+- **Three doors on every page.** Expand opens a row where it stands and remembers it. Inspect puts a
+  record in the panel — a column at 1200 px and up that stays open across pages, a sheet from 900 to
+  1200, a bottom sheet on a phone — on four tabs, Overview · Actions · History · Raw. Everything is a
+  per-page switch at the end of the toolbar. Every list's toolbar is one row in one order: search ·
+  Filter · Group · Sort · View · ⋯ · Everything, and one View sheet on a phone.
+- **The Runs home** (`#/runs`): the situation sentence as its heading, then Your turn, Running,
+  Waiting, Queued, Ready to start and Settled today, one line per run with exactly one action — a
+  halted run's comes from its halt first (#278) — and All runs as a table view.
+- **Your turn** (`#/turn`) on the 7.0 cards: the headline and the round, six sections, every item's
+  explanation in the panel (`GET /api/turn/:id`) and *Withdraw* among its moves.
+- **Plans and a plan.** The library is one line per plan — mark, name, line, sessions left, moved —
+  as a list or cards, with closed plans and documents folded. A plan opens on its glance over three
+  views: Phases (one table with the spine in its identity cell, and the route map), Run (the run's
+  folds: sessions and their consoles, where the time went, why it started and what it cost, what the
+  ladder tried, ways forward) and Source.
+- **One launch form** with a quick view: the departure line and its route, the findings in order, the
+  turns it will ask for, presets, and nine rows that open in place at every width.
+- **Sessions** (`#/sessions`): every lane, terminal and Claude session on one grid, a session full
+  height, and the locks with their holders, narrowed by the server.
+- **Repo** as six addressed sections — History, Branches, Working trees, Changes, Settles and the
+  Issues desk — each record in the panel.
+- **Insights**: how long is left, what it costs, what a session may spend, this week's measurements,
+  velocity and approvals, each question answered by the server's own arithmetic.
+- **Logs**: the explorer and its live tail, the journal on a Gantt, delivery, health — the doctor, the
+  start ceiling and stray consoles — and access, plus the redacted bundle.
+- **Settings** as one place: an index with what each section holds, a section per address, search that
+  answers sections and keys with their controls, and **Everything** — every key the server describes,
+  with its value, default, origin, reset and, for a key only the CLI or the machine sets, the line
+  that sets it.
+- **The palette's *do*:** every operator verb, each saying when a capability flag disables it; and the
+  panel's *Actions* tab per record kind.
+- **The surface registry** (`client/src/data/surface.ts`): every route, server event, settings key
+  and operator verb, each with its door or an exemption naming its caller, held both ways by
+  `viewer/test/surface-parity.test.ts` with nothing left unassigned.
+- **The help guides describe 7.0**, in English and Persian: Runs home, the launch's one screen, and
+  Getting around's card per place and its three doors.
+
+### Changed
+- **Status is a dot and a word** (`client/src/ui/status/`): the eight hues at one weight paint a 6 px
+  dot, a track segment or a row's edge, never a chip behind text; settled things wear a hollow dot.
+- **One type face at four sizes, one cool neutral room in two lights**, rows separated by space, a card
+  only around a thing acted on as a unit, and one shadow, for overlays. The design law is
+  `viewer/docs/design.md`; every rule in it names its guard.
+- **One stream per browser.** A second tab no longer breaks the first (#236): one tab holds the
+  console's event stream and shares it with the others, and a session console asks for its run's
+  stream only while it is on screen.
+- **Lists read projections**, the slim run list for the home and the header, the full record only for
+  the open run (#234's client half).
+- **A long token breaks only where it must.** A path, a slug, a label or a command in a cell or a
+  sentence wraps at its own spaces first and breaks inside a word only when the word alone is wider
+  than its box (`wrap-anywhere`, where 6.x broke every word at the line's end).
+- **Phone, tablet, right to left and reduced motion are proven in a real browser** on every
+  destination: the three doors by thumb at 360 and 768 px, every stop mirrored under `dir="rtl"`,
+  text finding its own direction, and motion stilled when the system asks.
+
+### Removed
+- **The 6.x client** — its app, features, components and lib/api directories, lib/api.ts,
+  lib/queries.ts and the two helpers only they used — every shim, every lint exemption and every
+  frozen allowance that kept them, and seven dependencies only they used (`react-hook-form`,
+  `@hookform/resolvers` and five Radix primitives).
+
+### Fixed
+- **The phone's situation line has its inline padding** (#284).
+- **The owner's confirm prompt shows the request it confirms** — the body it replays, never a
+  self-chosen label (#277).
+- **An item leaves Your turn only when the server says so**, so a grant's Allow no longer dismisses an
+  item before the grant is known to have applied (#270).
+- **A decision step's options are its primary moves**, and a proof re-run reports its exit (#266).
+- **Retention's settings save** (#317).
+- **Settings ▸ Essentials ▸ Keyboard lists the keys the help sheet does**: ⌘K, `/`, ⌘I, Esc and the
+  panel edge's arrows (part of #334).
+- **Tests red only under the full gate's load** — the write menu, the figures, the help sheet, the
+  rehearsal and the notifications specs — were rewritten with the screens they drive (#247, #227, #269).
+- **Two node suites red since the rebuild began** — a stray status reader and a free package file list
+  missing a shared module (#293).
+
 ## [6.2.1] - 2026-10-08
 
 **The public tree names no paid package.** A patch to 6.2.0, with nothing to migrate: two strings in

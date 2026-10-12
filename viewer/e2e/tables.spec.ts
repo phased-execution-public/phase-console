@@ -4,14 +4,16 @@ import { coverage, scrollMain, touch } from './lib/grid.ts';
 import { VIEWPORTS, shoot } from './lib/shots.ts';
 
 /*
- * The grid in a real browser (control-tower phase 18): what jsdom cannot say.
+ * The grid in a real browser (control-tower phase 18; 7.0's `ui/grid` since
+ * quiet-console phase 20): what jsdom cannot say.
  *
  * jsdom lays nothing out, so the two promises that are ABOUT layout are held
  * here — a thousand rows draw only a window of `<tr>` while the header stays
- * pinned to the shell's one scroller, and a phone gets a card list with ONE
- * control above it, a View sheet holding the filters and the columns.
+ * pinned to the shell's one scroller, and a phone gets a card list under the
+ * search and ONE View button, whose sheet holds the filters, the grouping and
+ * the columns (7.0's toolbar keeps the search on the bar at every width).
  *
- * The subject is the Debug delivery ledger (`#/debug/delivery`), a Free table
+ * The subject is the Logs delivery ledger (`#/logs/delivery`), a Free table
  * that asks for a toolbar, a window and a kept view. Its rows are the answer to
  * one request, served here rather than seeded: a thousand deliveries in the
  * fixture's state would reach every stop of the tour, and the tour's ratchet
@@ -50,7 +52,7 @@ test.describe('the grid', () => {
   }, info) => {
     test.skip(touch(info.project.name), 'the desk table; a touch viewport is the card list');
     await serveLedger(page, 1000);
-    await page.goto('/#/debug/delivery');
+    await page.goto('/#/logs/delivery');
 
     const table = page.getByRole('table', { name: 'Delivery ledger' });
     // The window is on once the engine has landed: the table then says how
@@ -88,12 +90,12 @@ test.describe('the grid', () => {
     await shoot(page, info.project.name, 'tables-window');
   });
 
-  test('the phone rendering is a card list with one "View" sheet for filters and columns', async ({
+  test('the phone rendering is a card list under the search and one "View" sheet for the rest', async ({
     page,
   }, info) => {
     test.skip(info.project.name !== VIEWPORTS[0].name, 'the phone');
     await serveLedger(page, 1000);
-    await page.goto('/#/debug/delivery');
+    await page.goto('/#/logs/delivery');
 
     const list = page.getByRole('list', { name: 'Delivery ledger' });
     await expect(list).toBeVisible();
@@ -101,20 +103,19 @@ test.describe('the grid', () => {
     // The card list is windowed too: a phone is where a thousand nodes cost most.
     await expect.poll(async () => list.locator('li').count()).toBeLessThan(80);
 
-    // ONE control above the cards. No filter box of its own on a phone: the
-    // sheet holds every setting the desk spreads out.
+    // The search on the bar and ONE View button beside it: the sheet holds
+    // every other setting the desk spreads out.
+    await expect(
+      page.getByRole('searchbox', { name: 'Search the delivery ledger by announcement' }),
+    ).toBeVisible();
     const view = page.getByRole('button', { name: /^View/ });
     await expect(view).toHaveCount(1);
-    await expect(page.getByRole('searchbox')).toHaveCount(0);
 
     await shoot(page, info.project.name, 'tables-cards');
     await view.click();
     const sheet = page.getByRole('dialog', { name: 'View' });
     await expect(sheet).toBeVisible();
     await shoot(page, info.project.name, 'tables-view-sheet');
-    await expect(
-      sheet.getByRole('searchbox', { name: 'Filter delivery ledger by announcement' }),
-    ).toBeVisible();
     await expect(sheet.getByRole('group', { name: 'Outcome' })).toBeVisible();
     await expect(sheet.getByRole('radiogroup', { name: 'Group by' })).toBeVisible();
     await expect(sheet.getByRole('group', { name: 'Columns' })).toBeVisible();
@@ -127,7 +128,8 @@ test.describe('the grid', () => {
     await page.keyboard.press('Escape');
     await expect(sheet).toHaveCount(0);
     await expect(page.getByText('200 of 1000 shown')).toBeVisible();
-    await expect(list.getByRole('listitem').first()).toContainText('failed');
+    // The outcome in the vocabulary's word, as the desk's column draws it.
+    await expect(list.getByRole('listitem').first()).toContainText('Failed');
 
     // Two hundred cards are still a window, and it covers what the phone shows.
     await scrollMain(page, 0.5);

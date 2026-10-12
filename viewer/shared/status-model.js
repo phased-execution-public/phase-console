@@ -26,8 +26,8 @@
  * `test/status-model.test.ts` holds the paint, the attention and that list to
  * each other.
  *
- * Dependency-free ESM, imported by identity by the client (the typed badge
- * family under `client/src/components/ui/status/`) and the node suite. Every
+ * Dependency-free ESM, imported by identity by the client (the typed status
+ * family under `client/src/ui/status/`) and the node suite. Every
  * word table is keyed by exactly its owner list's members — the test imports
  * the owners and holds the keys to them, so the owners stay the only place a
  * member is written.
@@ -148,7 +148,7 @@ const SUPERSEDED = /** @type {const} */ ({ outcome: 'superseded' });
 
 /**
  * The note severities and their rows live in `shared/status-notes.js`, which
- * owns them: the first-paint barrel (`StatusStack`, the toast) imports that
+ * owns them: first paint (the banner and the toast in `@/ui`) imports that
  * module and never this one, so these tables stay out of first paint. Held
  * here by identity, as `WORD_ROWS.note`.
  */

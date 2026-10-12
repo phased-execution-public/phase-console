@@ -41,7 +41,7 @@ import type { RUNG_VEHICLES as VEHICLES, RUNG_DRIVERS as DRIVERS } from '../../.
 // `.ts` spelled out: the node test suite imports this file directly and node's
 // resolver adds no extensions (the client's bundler and tsc both accept it).
 import { actorFor, SITUATION_LABELS, parseSituationKey, situationKey, situationLabel } from './situation.ts';
-import type { Errand, RecoverySlot, RungRecord } from './api';
+import type { Errand, RecoverySlot, RungRecord } from '@/data/api';
 
 /**
  * Derived from the owner, never re-typed: the union used to be spelled out

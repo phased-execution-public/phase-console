@@ -52,7 +52,7 @@ emergency door, not a habit.
 | A setup prompt in `viewer/shared/setup-prompts.js` | its verbatim carriers (README.md, docs/install.md, the in-app guide) — `viewer/test/setup-prompts.test.ts` fails otherwise |
 | The Node floor | every gate: root + viewer `package.json` engines, `viewer/run`, `bin/phase-console.mjs` — plus the docs that state it. `viewer/test/node-floor.test.ts` lifts each gate's own predicate and RUNS it either side of every boundary, so they can no longer disagree silently, and it asserts the SIZE of that set so a gate cannot be dropped from the list quietly |
 | English docs | the Persian mirror (`README.fa.md`, `USAGE.fa.md`, `viewer/README.fa.md`) — **gated** since 3.1 by `viewer/test/docs-parity.test.ts`: heading counts per level, the flag set, and the images must match. Titles are translated, so it asserts structure and the tokens that survive translation, never prose |
-| A push category, a settings section, an engine mode, or a repo path a doc cites | the docs that name them — the same `docs-parity.test.ts` holds `docs/phone.md`'s table to `CATEGORIES`, every `Settings ▸ X` to the eight real sections, and every backticked repo path and bare script name in `docs/` + `references/` to a file that exists |
+| A push category, a settings section, an engine mode, or a repo path a doc cites | the docs that name them — the same `docs-parity.test.ts` holds `docs/phone.md`'s table to `CATEGORIES`, every `Settings ▸ X` to a section `viewer/client/src/screens/settings/nav.tsx` declares, and every backticked repo path and bare script name in `docs/`, `references/`, `SKILL.md` and the help sheet's guides to a file that exists |
 | A message a **user** reads at runtime that points at a doc — `--help`, a refusal, the in-app guide, `USAGE.md` | a link built from `DOCS_URL` (`viewer/server/config.ts`), never a repo-relative path. `docs/` is on the never-ship list, so the packed tarball has no `docs/` directory and a bare `docs/webhooks.md` is a pointer to a file that install does not have. Repo-relative paths stay right inside `docs/`, `references/` and `viewer/README.md`, which are read from a clone and gated on resolving |
 | Anything user-visible | a `CHANGELOG.md` line (open an `## [Unreleased]` section if none exists) |
 | Behaviour the **plugin listing** describes | `.claude-plugin/marketplace.json`'s `description` — the largest user-facing prose surface here. Since 3.1 `viewer/test/packaging.test.ts` carries a **version-staleness gate**: the newest version the description names must be at least the tree's MAJOR.MINOR. A patch may ship without touching it; a minor may not, because a minor is where the behaviour a listing describes changed |
@@ -69,15 +69,16 @@ wrapper does the two things `prepack` does that the assertions need (the pack `t
 `.ts` sibling, because `viewer/server/fallback-sw.js` is real tracked source sitting among the ~148
 emitted files. `--keep` leaves the tarball in place and prints its path, and `--tree DIR` packs
 another checkout of this repository, which is how a tag behind `HEAD` is released.
-The tarball is **9.7 MB** — 1072 entries, 27 MB unpacked, measured at **6.2.0** with the pack `tsc`
-emit in place, which is what a release actually packs (6.1.0 was 9.2 MB and 1011 entries, 6.0.0
-8.8 MB and 973, 5.1.0 7.1 MB and 693, 5.0.0 5.9 MB and 599, 4.0.0 4.7 MB and 503; 6.0 added the status
-model and its shared vocabularies, the person's-turn, queue, lock, clock and budget models, the run's
-new probes, ledgers and reports, and the emitted `.js` beside each, 6.1 the issue, door and CI-refusal
-vocabularies, the unit watch and the shell reader, and 6.2 Your turn's server — `turn/`, `owner/` and
-`permissions/` — its two shared vocabularies and the `owner` and `grants` verbs; the free tarball was
-755 entries at 6.0.0).
-`assert-tarball.sh` prints the same 1072: this
+The tarball is **10.2 MB** — 1254 entries, 27.5 MB unpacked, measured at **7.0.0** with the pack
+`tsc` emit in place, which is what a release actually packs (6.2.0 was 9.7 MB and 1072 entries, 6.1.0
+9.2 MB and 1011, 6.0.0 8.8 MB and 973, 5.1.0 7.1 MB and 693, 5.0.0 5.9 MB and 599, 4.0.0 4.7 MB and
+503; 6.0 added the status model and its shared vocabularies, the person's-turn, queue, lock, clock and
+budget models, the run's new probes, ledgers and reports, and the emitted `.js` beside each, 6.1 the
+issue, door and CI-refusal vocabularies, the unit watch and the shell reader, 6.2 Your turn's server —
+`turn/`, `owner/` and `permissions/` — its two shared vocabularies and the `owner` and `grants` verbs,
+and 7.0 the rebuilt client's sources and build, the settings schema and the stray-console reader; the
+free tarball was 755 entries at 6.0.0).
+`assert-tarball.sh` prints the same 1254: this
 tarball carries no directory entries, so the older note about `tar -tzf` counting them no longer
 applies, and the two numbers agreeing is now the expected answer rather than a discrepancy to
 explain. It was ~36 MB until 3.1 shipped the screencast from a
@@ -85,9 +86,91 @@ hosted URL instead of `assets/console.gif`, which is now on the never-ship list 
 cannot come back quietly. It grew from 2.2 MB at 3.1 because 3.2's `precompress` step writes a
 `.br`/`.gz` sibling beside every compressible file in `client/dist` — those are load-bearing, not
 slack: `server/http/static.ts` serves them and never compresses at request time, and
-`check-dist.mjs` gates first paint on the bytes that would actually be **served**. Re-measure with
+`check-dist.mjs` gates first paint — the entry and every modulepreload, at most 170 KB — on the bytes
+that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
+
+## Upgrading to 7.0.0
+
+The root `package.json` says 7.0.0, and `CHANGELOG.md` carries its section. 7.0.0 is a major version
+because the console's web client was rebuilt from zero (plan `quiet-console`, phases 1–29) and no 6.x
+client file is left. The server, the runner, the scripts and the skill are 6.2's: nothing a 6.2 plan,
+session or script writes stops working, and `PE_API` stays 2. What follows is what an operator, a
+script that reads the API or a fork of the client will notice.
+
+### The client: seven places, and every old address still lands
+
+- **Every 6.2 address lands, in one hop, with its query** (`viewer/client/src/shell/redirects.ts`):
+  `#/now…` and `#/ready` on the Runs home, `#/queue` on its Queued group, `#/approve` on Your turn,
+  `#/debug[/<section>]` on Logs, and a 6.2 Runs bay (`?bay=`) on its group (`?group=`). A bookmark, a
+  push and a link a session wrote keep working.
+- **Debug is Logs**, `#/logs/<section>`, and its chunk is `logs-*`. **A run is its plan's Run view**,
+  `#/plan/<slug>/run`, with its earlier runs at `?view=history`; the Tower's six bays are the Runs
+  home's groups.
+- **First paint is held at 170 KB served** (it was 190), in this build and the free one:
+  `viewer/scripts/check-dist.mjs` holds the ceiling, and the free tree's gate (`verify-free` in
+  `scripts/gates.sh`) runs `check:dist` on its own client build. 7.0.0 measures 131.2 KB.
+- **A patch or a fork against a 6.x client file has nothing to apply to.** `viewer/client/src/` holds
+  `ui/`, `cards/`, `shell/`, `screens/` and `data/` beside `lib/`, `styles/` and `content/`; the 6.x
+  app, features, components and lib/api directories, lib/api.ts and lib/queries.ts are gone, and so
+  are seven devDependencies only they used. The design law is `viewer/docs/design.md`, and every rule
+  in it names the guard that holds it.
+
+### The API: thin reads, the settings schema, and a reset that leaves the file
+
+Quiet-console phase 25 gave a route to what the console knew and no route said. Each is a read
+through one `Service` method, journals nothing and needs no capability flag; the one press, a
+re-probe, takes the console header like every write. `viewer/test/*-route.test.ts` holds each to its
+shape, and `viewer/client/src/data/surface.ts` gives each a row (the pages that draw them are phases 21
+and 26's).
+
+- **Above the "no source directory" wall** (they answer with no plan directory open):
+  `GET /api/ceiling` — the start ceiling's sliding hour (starts, dollars, the doors, the limit the next
+  automatic start would meet and when it frees) and the MCP probe's own; `GET /api/credentials` —
+  every credential id this machine is asked about (`gh`, `claude` and each id an open plan names),
+  held or not, with the plans that name it, never a value; `POST /api/credentials/probe {ids?}` — ask
+  those ids again now rather than read the minute-long cache; `GET /api/doctor/strays` — the stray
+  console processes `phase-console doctor` finds, listed only (stopping them stays
+  `phase-console doctor --stop-strays`); `GET /api/prefs/schema` — below.
+- **Below the wall** (409 with none open): `GET /api/sizing` — the session caps this console measured
+  beside the shipped ones, the caps a phase spawns under, the context model and sessions per phase;
+  `GET /api/report?since=&until=&replay=1` — the week in numbers as `phase-console report` folds it,
+  its ETA backtest and holder ETA included, remembered five minutes per question;
+  `GET /api/run/<slug>/proofs?phase=` and `GET /api/run/<slug>/verifications?phase=&run=&limit=` —
+  what a plan's sessions proved and every run of its §Verification lines, newest first, read from the
+  ledgers' files (a slug that is not one is a 400).
+- **The settings schema.** `viewer/shared/prefs-model.js` (`PREF_META`, `PROFILE_META`) describes every
+  preference and machine-profile field — group, type, words, unit, description, whether a page can
+  write it — and `GET /api/prefs/schema` answers each with its shipped default, its value, its source
+  (`default`, `config`, `instance`, `migrated` or `profile`) and the command line that changes it
+  where one exists. `viewer/test/prefs-schema.test.ts` holds the table to the stored type and to
+  `savePreferences`. A row marked `secret` (the profile's `webhooks` and `notifyCommand`) never
+  serves its value: a webhook is its origin and a masked tail, the command only `[withheld]`.
+- **`POST /api/prefs {"<key>": null}` now takes the key out of the file.** It used to write the
+  shipped default back in; now `config.json` (or the console's own file) keeps only what it already
+  held, what a write set, what differs from its default and whatever a reload would otherwise read
+  differently (`isolation` beside `gitMode: new-branch`) — so a reset key reads as `default` and a
+  later release's new default reaches it, and the console runs with what its next boot reads. A
+  dotted key resets one member of a map (`{"notify.needs-you": null}`), and a writable key with no
+  shipped default goes back to unset.
+- **`phase-console profile set`** writes `heapMb` and `heapSnapshotOnNearLimit` (`false` included),
+  and `viewer/shared/instances.mjs` exports the machine-wide key list as `PROFILE_MACHINE_KEYS`.
+- **Packaging:** the tarball gains `viewer/shared/prefs-model.js` and `bin/stray-consoles.mjs`, both
+  imported by the server now (`.github/scripts/assert-tarball.sh`).
+
+
+
+### Packaging: what the tarball holds
+
+- The root `package.json` `files` allowlist gained `viewer/shared/prefs-model.js` and
+  `viewer/shared/capability-model.js`, which the server imports since quiet-console phases 25 and 2,
+  and the free tree's allowlist the same two; `.github/scripts/assert-tarball.sh` asserts both and
+  `bin/stray-consoles.mjs`.
+- The tarball is 10.2 MB — 1254 entries, 27.5 MB unpacked, measured at 7.0.0 (the note under *How a
+  change becomes an update* above): the 6.x client's sources left it, and the 7.0 client's and its
+  build took their place.
+
 
 ## Upgrading to 6.2.1
 
@@ -313,8 +396,8 @@ notice it.
   refused credential or a lost network never counts — so a run halts on a streak later than 5.1.0 did.
 - **For forks of the client:** the 2.x `Chip`, its tones, the `--line-*` aliases, the 2.x colour
   utilities and the `.state-<board-word>` classes are deleted. A status draws through the typed family
-  under `components/ui/status/`; ESLint refuses a raw `StatusBadge` import outside it, and the status
-  ratchet is at zero.
+  under components/ui/status/ (`viewer/client/src/ui/status/` since 7.0); ESLint refuses a raw
+  `StatusBadge` import outside it, and the status ratchet is at zero.
 
 ### Plans: a person's turn, one superseded spelling, the new lints
 

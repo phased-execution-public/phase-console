@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, type
 import { configDir, instanceId, stateHome } from '../shared/instances.mjs';
 import {
   INSTANCE, INSTANCE_STATE_DIR, SKILL_DIR, STATE_DIR, agentEnabled, checkRoot, distRev, rememberRoot, loadPrefs, prefDefault,
-  savePrefs, serverIsStale, staticRoot, withAutomation,
+  savePrefs, serverIsStale, silentValues, staticRoot, withAutomation,
   type Flags, type Prefs, type RootCheck,
 } from './config.ts';
 import {
@@ -127,6 +127,21 @@ import {
 import { environmentReport, type EnvIssue } from './env-doctor.ts';
 // The check's effort (control-tower phase 134) is free; the chat's pair reads it too.
 import { isEffort } from './runner/spawn.ts';
+// The thin read routes (quiet-console phase 25).
+import { DENSITIES, PREF_META, THEMES } from '../shared/prefs-model.js';
+// Retention, writable from Settings ▸ This instance (quiet-console phase 23).
+import { RETENTION_DEFAULTS, retentionPatch, sanitiseRetention } from './retention-policy.ts';
+import { listStrayConsoles } from '../../bin/stray-consoles.mjs';
+import { ReportMemo, type ReportAnswer, type ReportQuery } from './analysis/report-view.ts';
+import { sizingView, type SizingView } from './analysis/sizing-model.ts';
+import {
+  CLI_PROBE_IDS, PROBE_CACHE_MS, credentialsHeld, forgetCredentialProbes, knownCredentialId,
+  type CredentialsView, type ProbeDeps,
+} from './credentials-probe.ts';
+import { prefsSchema as readPrefsSchema, type PrefsSchema } from './prefs-schema.ts';
+import { proofRows, proofsFile } from './runner/proofs.ts';
+import { ledgerPage, readLedger as readVerificationLedger, verificationsFile } from './runner/verify-ledger.ts';
+import type { CeilingView } from './start-ceiling.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { foldInboxTasks, type TaskItem } from './runner/tasks.ts';
 import { Journal } from './runner/journal.ts';
@@ -354,6 +369,8 @@ export class Service extends ServiceRecovery {
   private inboxGateAnswers = new Map<string, { revision: number; gates: Map<number, GateStatus | null> }>();
   /** The refills in flight, as `<slug>@<revision>`. */
   private inboxGateFills = new Set<string>();
+  /** The week in numbers, remembered five minutes per question — see `weekReport`. */
+  private readonly reportMemo = new ReportMemo();
 
   /**
    * Sign-ins whose definition this console wrote and has not taken back.
@@ -3888,6 +3905,8 @@ export class Service extends ServiceRecovery {
    */
   requestAuthority(reading: DoorReading, row: AuthorityRoute, input: {
     method: string; path: string; body: Record<string, unknown>; authority: AuthorityRoute['authority']; risk: string; label: string;
+    /** What the asker calls itself (a body's `by`) — kept as a claim beside the door's label, never as the label (#277). */
+    claims?: string;
   }): { status: number; answer: Record<string, unknown> } {
     if (bodyCarriesSecret(input.body)) {
       return { status: 400, answer: { error: 'That body carries a secret, so it is not kept to be asked of the owner — nothing was recorded.' } };
@@ -3896,7 +3915,7 @@ export class Service extends ServiceRecovery {
       return { status: 413, answer: { error: `A press asked of the owner keeps its body, and this one is over ${REQUEST_BODY_MAX / 1024} KB.` } };
     }
     const recorded = ownerState().requests.record({
-      door: reading.door, label: input.label, proof: reading.proof, row, authority: input.authority, risk: input.risk,
+      door: reading.door, label: input.label, proof: reading.proof, claims: input.claims, row, authority: input.authority, risk: input.risk,
       method: input.method, path: input.path, body: input.body,
     });
     if (!recorded.ok) return { status: recorded.status, answer: { error: recorded.error } };
@@ -4495,6 +4514,93 @@ export class Service extends ServiceRecovery {
   }
 
 
+  /* ---------------- thin read routes (quiet-console phase 25) ----------------
+   * What no route exposed, each a read of a seam that already existed: the
+   * measured session caps, the start ceiling's counters, a plan's proofs and
+   * verifications, the credentials this machine holds, the week in numbers,
+   * the stray consoles and the settings schema. None writes; none journals. */
+
+  /** `GET /api/sizing` — what a session may spend: the measured caps beside the shipped ones, the context model, sessions per phase. */
+  sessionSizing(): SizingView {
+    return sizingView(this.sizingCensus(), this.sizing);
+  }
+
+  /** `GET /api/ceiling` — the start ceiling's live counters, and the MCP probe's own beside them. */
+  startCeilingView(): { work: CeilingView; probe: CeilingView } {
+    return { work: this.startCeiling.view(), probe: this.probeCeiling.view() };
+  }
+
+  /** `GET /api/run/:slug/proofs` — what the plan's sessions proved, the last proof of each command, by phase. */
+  runProofs(slug: string, phase?: number): { slug: string; phase: number | null; proofs: ReturnType<typeof proofRows> } {
+    const proofs = this.root?.ok ? proofRows(proofsFile(this.root.path, slug), slug, phase) : [];
+    return { slug, phase: phase ?? null, proofs };
+  }
+
+  /** `GET /api/run/:slug/verifications` — every run of the plan's §Verification lines, newest first. */
+  runVerifications(slug: string, query: { phase?: number; run?: string; limit?: number }): { slug: string } & ReturnType<typeof ledgerPage> {
+    const rows = this.root?.ok ? readVerificationLedger(verificationsFile(this.root.path, slug), slug) : [];
+    return { slug, ...ledgerPage(rows, query) };
+  }
+
+  /** Every credential id an open plan names, and where — the plan's own line, or a phase's bullet. */
+  protected namedCredentials(): Map<string, { slug: string; phase?: number }[]> {
+    const out = new Map<string, { slug: string; phase?: number }[]>();
+    const add = (id: string, where: { slug: string; phase?: number }) => out.set(id, [...(out.get(id) ?? []), where]);
+    for (const record of this.store?.list() ?? []) {
+      const plan = record.plan;
+      if (!plan?.phased || plan.closed || this.isClosedPlan(record.slug)) continue;
+      for (const id of plan.sessionBudget.credentials ?? []) add(id, { slug: record.slug });
+      for (const row of plan.graph) {
+        for (const id of plan.phases[row.phase]?.credentials ?? []) add(id, { slug: record.slug, phase: row.phase });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * `GET /api/credentials` — every credential this machine is asked about (the
+   * CLI's own two and every id an open plan names), held or not, never a value.
+   * `fresh` (`POST /api/credentials/probe`) asks those ids again rather than
+   * reading the minute-long cache — every id when it names none. `deps` is how
+   * the probes reach the world, swapped by a test (`ProbeDeps`).
+   */
+  async credentialsView(fresh?: readonly string[], deps: ProbeDeps = {}): Promise<CredentialsView> {
+    const named = this.namedCredentials();
+    const ids = [...new Set([...CLI_PROBE_IDS, ...named.keys()])];
+    if (fresh) forgetCredentialProbes(fresh.length ? fresh : ids);
+    const verdicts = await credentialsHeld(ids, { ...deps, ...(this.root?.ok ? { cwd: this.root.path } : {}) });
+    return {
+      at: new Date().toISOString(),
+      cacheMs: PROBE_CACHE_MS,
+      credentials: verdicts.map((verdict) => ({ ...verdict, known: knownCredentialId(verdict.id), named: named.get(verdict.id) ?? [] })),
+    };
+  }
+
+  /** `GET /api/report` — the week in numbers over this console's runs, remembered five minutes per question. Null with no source open. */
+  weekReport(query: ReportQuery): ReportAnswer | null {
+    if (!this.root?.ok) return null;
+    return this.reportMemo.answer({
+      runsDir: consoleRunsDir(this.root.path), docsRoot: this.root.path, scriptsDir: this.flags.scriptsDir, instance: INSTANCE.name,
+    }, query);
+  }
+
+  /**
+   * `GET /api/doctor/strays` — the console processes on this machine whose
+   * code is gone. Listed only: stopping them is the CLI's. `scan` is the
+   * listing's own seam (`psText`, `exists`), swapped by a test.
+   */
+  async strayConsoles(
+    scan: Parameters<typeof listStrayConsoles>[0] = {},
+  ): Promise<{ at: string; strays: Awaited<ReturnType<typeof listStrayConsoles>>; stop: string }> {
+    return { at: new Date().toISOString(), strays: await listStrayConsoles(scan), stop: 'phase-console doctor --stop-strays' };
+  }
+
+  /** `GET /api/prefs/schema` — every preference and machine-profile field, described, with its value and where it came from. */
+  prefsSchema(): PrefsSchema {
+    return readPrefsSchema();
+  }
+
+
   savePreferences(input: Partial<Prefs> & { automation?: unknown }, opts: { by?: string } = {}): Prefs {
     // 🔑 **Either shape, one allowlist.** 3.5.0's `automation` object is
     // FLATTENED here and then picked apart exactly as a flat patch is, so the
@@ -4516,8 +4622,9 @@ export class Service extends ServiceRecovery {
     const picked: Partial<Prefs> = {};
     if (Array.isArray(patch.recentRoots)) picked.recentRoots = patch.recentRoots.filter((r): r is string => typeof r === 'string');
     if (typeof patch.lastRoot === 'string') picked.lastRoot = patch.lastRoot;
-    if (patch.theme === 'dark' || patch.theme === 'light' || patch.theme === 'system') picked.theme = patch.theme;
-    if (patch.density === 'comfortable' || patch.density === 'compact') picked.density = patch.density;
+    // The words from their owner (`shared/prefs-model.js`), which the settings schema offers too.
+    if (THEMES.includes(patch.theme as never)) picked.theme = patch.theme;
+    if (DENSITIES.includes(patch.density as never)) picked.density = patch.density;
     if (typeof patch.model === 'string') picked.model = patch.model;
     if (typeof patch.sort === 'string') picked.sort = patch.sort;
     // The Issues desk's added repositories (control-tower phase 118): an array
@@ -4678,6 +4785,17 @@ export class Service extends ServiceRecovery {
     // The relay's rules (phase 14): a LIST, replaced wholesale for the reason
     // the schedule is — an operator who deleted a rule meant it gone.
     if (patch.relayRules !== undefined) picked.relayRules = sanitiseRelayRules(patch.relayRules);
+    // How long every sink is kept (quiet-console phase 23): a MAP of numbers
+    // this console deletes files by. Each member a patch names is held to the
+    // loader's own floor (`retentionPatch`: above zero, `runRetainMin` from
+    // zero) and DROPPED when it fails, the stored value surviving; the members
+    // that pass are merged over the table in force and the whole is read
+    // through `sanitiseRetention`, which keeps a trim's tail under the size
+    // that triggers it. The sweep reads the file, so the next one uses it.
+    const retentionAsked = retentionPatch(patch.retention);
+    if (Object.keys(retentionAsked).length) {
+      picked.retention = sanitiseRetention({ ...this.prefs.retention, ...retentionAsked });
+    }
     // The reminders' own quiet hours (control-tower phase 43) are no preference
     // since phase 138 (#215): ONE quiet-hours setting, each device's. A page
     // from before the change that still sends `reminderQuiet` has it moved the
@@ -4692,25 +4810,75 @@ export class Service extends ServiceRecovery {
     // `null` returns a key to its shipped default (control-tower phase 53, #56)
     // — the one way to take an override back. It used to be dropped like a
     // typo: `{"ladderPerPhaseRungs": null}` answered 200 and the raised cap
-    // stayed, so only another explicit number could ever undo one. A key with
-    // no shipped default, or one this door does not know, is still dropped.
+    // stayed, so only another explicit number could ever undo one. Since
+    // quiet-console phase 25 the key also LEAVES the file (`savePrefs`'
+    // `unset`), so the schema reads it as the default however many saves
+    // follow; a writable key with no shipped default goes back to unset, and a
+    // dotted key takes one map member back (`{"notify.needs-you": null}`). A
+    // key this door does not know is still dropped.
     const reset: Record<string, unknown> = {};
+    const unset: string[] = [];
+    const notifyBack: string[] = [];
+    const retentionBack: string[] = [];
     for (const [key, value] of Object.entries(patch)) {
       if (value !== null) continue;
       const shipped = prefDefault(key);
-      if (shipped.known) reset[key] = shipped.value;
+      if (shipped.known) {
+        reset[key] = shipped.value;
+        unset.push(key);
+      } else if (PREF_META[key]?.writable && key.startsWith('notify.')) {
+        notifyBack.push(key.slice('notify.'.length));
+        unset.push(key);
+      } else if (PREF_META[key]?.writable && key.startsWith('retention.')) {
+        retentionBack.push(key.slice('retention.'.length));
+        unset.push(key);
+      } else if (PREF_META[key]?.writable && !key.includes('.')) {
+        reset[key] = undefined;
+        unset.push(key);
+      }
     }
-    const notify = patch.notify === null
+    const shippedNotify = prefDefault('notify').value as Prefs['notify'];
+    let notify = patch.notify === null
       ? reset.notify as Prefs['notify']
       : patch.notify === undefined
         ? this.prefs.notify
         : sanitiseCategories({ ...this.prefs.notify, ...patch.notify });
+    if (notifyBack.length) {
+      notify = sanitiseCategories({
+        ...notify,
+        ...Object.fromEntries(notifyBack.map((category) => [category, shippedNotify[category as keyof Prefs['notify']]])),
+      });
+    }
+    // A retention member taken back is its shipped number, and the whole table
+    // is read again — a tail kept under its trim, as the loader keeps it.
+    if (retentionBack.length) {
+      picked.retention = sanitiseRetention({
+        ...(picked.retention ?? this.prefs.retention),
+        ...Object.fromEntries(retentionBack.map((member) => [member, RETENTION_DEFAULTS[member as keyof typeof RETENTION_DEFAULTS]])),
+      });
+    }
+    // What this write SET, so the file keeps it even where it equals the
+    // default (an operator who pins a value means it): the picked keys, and
+    // each category a `notify` object named, each retention member it stored.
+    const set = [
+      ...Object.keys(picked),
+      ...(patch.notify && typeof patch.notify === 'object'
+        ? Object.keys(patch.notify).map((category) => `notify.${category}`) : []),
+      ...Object.keys(retentionAsked).map((member) => `retention.${member}`),
+    ];
     // Re-DERIVED, never carried: the flat keys are the truth and the object
     // is a view of them, so a write that moves one must move the other.
     const policyBefore = this.prefs.policy ?? {};
-    this.prefs = withAutomation({ ...this.prefs, ...(reset as Partial<Prefs>), ...picked, notify });
-    savePrefs(this.prefs);
+    let next = withAutomation({ ...this.prefs, ...(reset as Partial<Prefs>), ...picked, notify });
+    // A key taken back is what the next boot reads with the file silent about
+    // it — for `isolation` beside `gitMode: new-branch` that is `worktree`, not
+    // the shipped constant — so the console runs with what it will reload.
+    const silent = unset.filter((key) => !key.includes('.'));
+    if (silent.length) next = withAutomation({ ...next, ...(silentValues(next, silent) as Partial<Prefs>) });
+    this.prefs = next;
+    savePrefs(this.prefs, undefined, { set, unset });
     if (picked.policy) this.journalPolicyAnswers(policyBefore, picked.policy, opts.by ?? 'console');
+    else if (unset.includes('policy')) this.journalPolicyAnswers(policyBefore, {}, opts.by ?? 'console');
     // The healer decides with these — the ladder caps, the unblock and takeover
     // switches, gate delegation — and none of them are in the convergence
     // fingerprint, which reads the run, the board, the locks, the gate stamp and
@@ -4719,12 +4887,12 @@ export class Service extends ServiceRecovery {
     // the loop went on skipping with "nothing has changed since the last pass
     // found nothing to climb". Clearing the latch is the whole fix: the next
     // sweep asks again.
-    if (Object.keys(picked).length) this.converger.clearNoops();
+    if (Object.keys(picked).length || unset.length) this.converger.clearNoops();
     // The sweep clock reads `convergeEveryMs` only when it re-arms, so a change
     // (0 -> N, or N -> 0) would otherwise wait for the OLD interval to fire
     // once more — or, at 0, never be read again. `start()` is idempotent and
     // re-arms under the new value.
-    if (picked.convergeEveryMs !== undefined) this.converger.start();
+    if (picked.convergeEveryMs !== undefined || unset.includes('convergeEveryMs')) this.converger.start();
     return this.prefs;
   }
 

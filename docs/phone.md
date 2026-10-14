@@ -279,10 +279,13 @@ that work — the implementation is `node:crypto` and about four hundred lines.
 ### Your turn — a human step on the phone
 
 When a run needs an act only you can do — a sign-in that opens a browser, a device code, a token to
-paste, an approval on somebody else's dashboard — the push says so as *A phase needs you*, titled
-"Your turn: …" with the kind and the phase, and its body says what to do and where: *at the machine
-the console runs on* for a step that must be done there, nothing added for one you can do from the
-phone. A `device-code` step puts the code itself in the body, so the phone is enough. **Every push for
+paste, an approval on somebody else's dashboard — the push says so as *A phase needs you*, titled by
+the act itself ("Your turn: Sign the gh CLI in"; an operator act's "Now: Rotate the deploy key"), and
+its body says where and how it is checked, in words (since turn-by-turn phase 3): "Phase 3 of demo",
+or "the plan demo" for its own errand, *at the machine this console runs on* for a step that must be
+done there, nothing added for one you can do from the phone. A command or a proof ref never rides the
+lock screen — they are on the item. A `device-code` step puts the code itself in the body, so the
+phone is enough. **Every push for
 an item opens the item** — Your turn's `#/turn/<id>`, expanded with its guide and its buttons — the tap
 on the body and *Open* alike, and the bell's row and a webhook's link go to the same address (control-tower
 phase 138). No code you type, token or password is ever in a push — only a device code, which is useless
@@ -291,15 +294,18 @@ without your own signed-in browser.
 **The lock screen offers only what a paired device may press.** A pressed button is a signed action,
 and a signed action is the `device` door: the door table lets it make low and medium grants, answers and
 declines — nothing else on its own (`viewer/shared/door-model.js`, the one table every door is read
-from). So the buttons an item's push carries are read from that table, never written by hand:
+from). So the buttons an item's push carries are read from that table, never written by hand — and,
+since 7.1, chosen by the item's TYPE, the same word its card leads with (Task, Approval, Decision):
 
 | The item | Its two buttons | Why |
 |---|---|---|
-| an act — a sign-in, a code, a token, somebody else's approval | *Open* · **I did it** | *I did it* runs the item's proof on the console; a proof that lands resumes the phase's own session told what was proven, one that does not is said, and the item waits on. |
+| a Task — a sign-in, a code, a token, somebody else's approval | *Open* · **I did it** | *I did it* runs the item's proof on the console; a proof that lands resumes the phase's own session told what was proven, one that does not is said, and the item waits on. |
 | a permission item at low or medium risk — the wall an ask or an allow list, priced at its narrowest scope | **Allow** · **Deny** | *Allow* grants it at the NARROWEST scope the item offers (this one call), through the `device` door, exactly as the item's own Grant would; *Deny* tells the session to find another way. |
 | a permission item at high risk — a deny-wall rule, a capability, a profile raise | *Open* · **Deny** | A high grant needs the rule typed and, with an owner key, the key touched: the first button opens the item, where both are. The console reads the table again when a press arrives, so a grant pressed anyway is refused and the item opens. |
 | a permission item on the never list — a guard, a credential, a forced push, the host family | *Open* · **Deny** | No grant is offered through any door; the item says why, and the manual path. |
-| a decision — options to choose between | *Open* | Its answer is one of its options, on the page; a check of an unanswered decision would only send it back. |
+| an Approval that is a run request — a phase asked the run to isolate, switch account, raise its budget, stop or hold | **Approve** · **Deny** | Both are answers, which the `device` door may give: *Approve* takes the act through the run's own verb, *Deny* tells every phase that asked no. The console reads the door table again when the press arrives. |
+| any other Approval — a check by eye, a held plan, a request waiting for the owner | *Open* | Its yes needs the card — its evidence, its block, or the owner's key. |
+| a Decision — options to choose between | *Open* | Its answer is one of its options, on the page; a check of an unanswered decision would only send it back. |
 
 iOS draws no buttons at all and shows the notification, so there the tap is the whole answer: it opens
 the item.
@@ -368,8 +374,8 @@ Some notifications carry buttons, and pressing one answers without opening anyth
 |---|---|---|
 | **Allow** | Permission needed | Answers the card. The session unblocks where it stands. |
 | **Allow** | A phase needs you — a permission item a paired device may grant: low or medium risk at the narrowest scope it offers (control-tower phase 138) | Grants it at that scope — this one call — through the `device` door, as the item's own Grant would: the item settles, the session resumes by itself, and a *Permission granted* push opens Settings ▸ Permissions at the grant. Never on a high or never item: there the first button is the tap that opens the item. |
-| **Deny** | Permission needed; a permission item | Answers the card the other way, or denies the item; either way the session is told and finds another way. |
-| **Approve** | Gate needs a person, when the gate is a person's to clear (`manual`, or overdue) — never an `ai`/`auto` gate | Records the gate clearance in `gate-status.md` and lets the phase board. |
+| **Approve** | Gate needs a person, when the gate is a person's to clear (`manual`, or overdue) — never an `ai`/`auto` gate; a phase's run request (7.1) | Records the gate clearance in `gate-status.md` and lets the phase board; on a run request, takes the act the phases asked the run for. |
+| **Deny** | Permission needed; a permission item; a run request (7.1) | Answers the card the other way, or denies the item, or tells the phases that asked no; either way the session is told and finds another way. |
 | **Extend 2 h** | Permission needed — the T-15 and T-5 warning a card sends before it runs out, beside **Allow** | Moves the card's deadline two hours later. Inside the hook call's hour it simply moves; past it the session is told no at the hour and the card stands for twelve hours, and allowing it then resumes the phase with that one call granted once. |
 | **I did it** | A phase needs you — an act ("Your turn: …") | Runs the step's proof on the console. A proof that lands marks the step proven and resumes the phase's own session saying what was proven; one that does not land records what it read, and the step waits on. A step that names no proof is proven on your word. |
 

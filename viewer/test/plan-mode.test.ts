@@ -448,8 +448,9 @@ test('PM-6 — a held plan\'s errand row offers Approve and Reject, live run or 
     assert.deepEqual(verbs.slice(0, 2), ['approve-plan', 'reject-plan'], status);
     const [approve, reject] = row!.actions;
     assert.equal(approve.endpoint, '/api/run/demo/plan-approval');
-    assert.deepEqual(approve.body, { phase: 2, decision: 'approve' });
-    assert.deepEqual(reject.body, { phase: 2, decision: 'reject' });
+    // Bound to its run since turn-by-turn phase 5: a press for another run answers 409.
+    assert.deepEqual(approve.body, { phase: 2, decision: 'approve', expectRunId: 'r1' });
+    assert.deepEqual(reject.body, { phase: 2, decision: 'reject', expectRunId: 'r1' });
     assert.equal(reject.says?.field, 'reason', 'a rejection carries its reason');
   }
 });

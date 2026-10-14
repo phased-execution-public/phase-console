@@ -243,3 +243,12 @@ test('subKindOfNeed: a class is its own sub-kind, a key answers through its clas
   assert.equal(subKindOfNeed('unknown'), null);
   assert.equal(subKindOfNeed(undefined), null);
 });
+
+test('turn-by-turn phase 6: `run` is a need class — a run request, the RUN\'s act, nobody\'s decision row', async () => {
+  const model = await import('../shared/decisions-model.js');
+  assert.ok((model.NEED_CLASSES as readonly string[]).includes('run'));
+  assert.equal(model.DECISION_KEY_OF_NEED.run, null);
+  assert.equal(model.subKindOfNeed('run'), 'run');
+  assert.equal(model.isNeedWord('run'), true);
+  assert.equal(model.subKindOfNeed('permission.policy'), 'permission', 'the key a hub plan names stays permission — the runner reads the facts');
+});

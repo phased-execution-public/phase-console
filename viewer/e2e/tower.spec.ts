@@ -159,6 +159,18 @@ test('the Your turn group holds items, not rows — its count is its items, the 
   const count = Number(await turn.getAttribute('data-count'));
   expect(count, 'the seed puts items in Your turn').toBeGreaterThan(0);
   await expect(turn.getByTestId('item-row')).toHaveCount(count);
+  // Each row says the card's words (turn-by-turn phase 10): NOW and the type,
+  // then the composer's title — every row here is due, so every row says Now.
+  const words = turn.locator('[data-testid="item-row"] [data-testid="turn-row-words"]');
+  await expect(words).toHaveCount(count);
+  expect(
+    new Set(await words.evaluateAll((els) => els.map((el) => el.getAttribute('data-readiness')))),
+  ).toEqual(new Set(['now']));
+  expect(
+    (await words.evaluateAll((els) => els.map((el) => el.getAttribute('data-type')))).every((t) =>
+      ['approve', 'do', 'decide'].includes(String(t)),
+    ),
+  ).toBe(true);
   await expect(turn.locator('[data-strip]')).toHaveCount(0);
   // The run the items summon sits in Running, wearing the summons on its row.
   expect(fx.live, `the fixture's run must be live for Running to hold it (${fx.why ?? ''})`).toBe(true);

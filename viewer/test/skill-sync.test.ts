@@ -1143,3 +1143,36 @@ test('conventions, plan-format and the template carry Your turn as the code read
   assert.match(template, /Human step:\*\*[^\n]*· why: /, "the template's Human step example carries a why:");
   assert.match(template, /Guide language:/, 'the template offers the Guide language line');
 });
+
+test('turn-by-turn phase 12: the references and SKILL.md document what 7.1 gave a plan and a session — guide files, the three keys, the errands table, F41–F43 and run requests', async () => {
+  const { RUN_ACTS } = await import('../shared/verb-model.js');
+  const graph = read('scripts/phase-graph.sh');
+  // The three ids and their names, read from the lint's own printf lines.
+  const lint = (id: string) => {
+    const line = graph.split('\n').find((l) => l.includes('printf') && l.includes(id));
+    const name = line && /([a-z]+(?:-[a-z]+){2,}) —/.exec(line)?.[1];
+    assert.ok(name, `phase-graph.sh prints ${id} by name`);
+    return name!;
+  };
+  const ids = { F41: lint('F41'), F42: lint('F42'), F43: lint('F43') };
+  const docs = {
+    'references/turn.md': read('references/turn.md'),
+    'references/plan-format.md': read('references/plan-format.md'),
+    'SKILL.md': read('SKILL.md'),
+  };
+  for (const [file, text] of Object.entries(docs)) {
+    for (const [id, name] of Object.entries(ids)) {
+      assert.ok(text.includes(id), `${file} names ${id}`);
+      assert.ok(text.includes(name), `${file} names ${id} as \`${name}\``);
+    }
+    for (const key of ['guide:', 'options:', 'recommended:', 'deadline:', '## Operator errands']) {
+      assert.ok(text.includes(key), `${file} documents \`${key}\``);
+    }
+    assert.ok(/--needs run --run-act/.test(text), `${file} documents \`--needs run --run-act\``);
+  }
+  // The run acts are listed where a session reads how to ask for one.
+  for (const act of RUN_ACTS) {
+    assert.ok(docs['references/turn.md'].includes(`\`${act}\``), `references/turn.md names the run act ${act}`);
+  }
+  assert.ok(read('references/conventions.md').includes('`run` with `--run-act <act>`'), 'conventions lists `run` among the blocker short forms');
+});

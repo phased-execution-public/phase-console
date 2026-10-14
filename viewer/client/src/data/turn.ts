@@ -16,12 +16,18 @@ import type { HumanStepKind, HumanStepState } from '@shared/human-step-model.js'
 import type {
   HANDLED_LINK_KINDS,
   HANDLED_SOURCES,
+  ItemType,
+  PersonStatus,
   ProofType,
+  Readiness,
+  RouteTo,
+  StepsFrom,
   TurnGroup,
+  TurnRecord as SharedTurnRecord,
   WhyPerson,
 } from '@shared/turn-model.js';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import type { InboxAction, InboxItem } from './api/inbox';
+import { inboxApi, type InboxAction, type InboxItem, type TurnOption } from './api/inbox';
 import {
   humanStepsApi,
   type HumanStepRecord,
@@ -38,16 +44,17 @@ import { press, type Pressed } from './press';
 /**
  * Which record holds an item: the human-step ledger, the row's own (a gate, an
  * approval card, …), or — an owner request about no item the turn shows
- * (control-tower phase 148) — the request itself.
+ * (control-tower phase 148) — the request itself. Owned by
+ * `shared/turn-model.js` (`TURN_RECORDS`) since turn-by-turn phase 1.
  */
-export type TurnRecord = 'ledger' | 'projected' | 'request';
+export type TurnRecord = SharedTurnRecord;
 
 /** The `turn` view an inbox row carries when it asks a person for an act. */
 export type TurnView = {
   /** The item this row is: a ledger step's id, or the row's own id when the item is projected. */
   item: string;
   record: TurnRecord;
-  /** Where it came from — `server/turn/fold.ts` `TURN_SOURCES`. */
+  /** Where it came from — `shared/turn-model.js` `TURN_SOURCES`. */
   source: string;
   kind: HumanStepKind;
   why: WhyPerson;
@@ -55,6 +62,14 @@ export type TurnView = {
   group: TurnGroup;
   /** A permission item's record — on a ledger item and on the approval card it projects (phase 135). */
   permission?: PermissionRecord;
+  /**
+   * The card's words a ROW carries (turn-by-turn phase 10, `server/turn/fold.ts`
+   * `withRowWords`): the type, whether it is due, and NOT YET's *when* — so the
+   * Runs home and the bell say what the card says.
+   */
+  type?: ItemType;
+  readiness?: Readiness;
+  startWhen?: string;
 };
 
 /** A ledger item's own record — its reason, proof, options, waiters and attempts. Never a value. */
@@ -84,7 +99,20 @@ export type TurnStepDetail = {
   read?: string;
   note?: string;
   permission?: PermissionRecord;
+  /** What the person wrote with each check (turn-by-turn phase 5), oldest first — the card shows the latest. */
+  notes?: { attempt: number; text: string; at: string; by?: string }[];
+  /** A plan item's session item that covers it (turn-by-turn phase 7) — linked, never merged. */
+  coveredBy?: { id: string; phase: number; title: string };
+  /** The plan items this session item covers. */
+  covers?: { id: string; phase: number; title: string }[];
 };
+
+/**
+ * How a pressed projected item ended (turn-by-turn phase 5) — an approval
+ * card, a gate, a plan approval, an answered question, an ack-bound option:
+ * passed or closed, by whom, when, and what was pressed, in words.
+ */
+export type TurnSettled = { outcome: 'passed' | 'closed'; by: string; at: string; what: string };
 
 /** One thing to do, however many inbox rows stand for it. */
 export type TurnItem = TurnView & {
@@ -99,8 +127,53 @@ export type TurnItem = TurnView & {
   runId?: string;
   since: string;
   expiresAt?: string;
+  /** A human step's window end (#341) — when the act stops being open, never a countdown. */
+  openUntil?: string;
   href: string;
   actions: InboxAction[];
+  /*
+   * The card's words (turn-by-turn phase 1, `server/turn/fold.ts` `CardWords`):
+   * what is asked, where the person stands, whether it is due, where a press
+   * goes and who checks it. Optional so a 7.0 answer still reads.
+   */
+  type?: ItemType;
+  personStatus?: PersonStatus;
+  readiness?: Readiness;
+  /** *Goes to* — `ROUTE_META[route]` says it; never `supervisor` in the Free edition. */
+  route?: RouteTo;
+  /** *Checked by*, in words (`CHECKED_BY_LABEL`). */
+  checkedBy?: string;
+  /** A Done item that was pressed: passed or closed, by whom, when (turn-by-turn phase 5). */
+  settled?: TurnSettled;
+  /*
+   * The composer's words (turn-by-turn phase 3, `server/turn/compose.ts`): the
+   * meta in words, the steps by precedence and where they came from, the
+   * check in words, the clocks, and the check's verdicts. Optional here so a
+   * 7.0 console's answer still reads; the card draws them from phase 8.
+   */
+  meta?: string;
+  steps?: Guide['steps'];
+  stepsFrom?: StepsFrom;
+  check?: string;
+  trouble?: Guide['trouble'];
+  timing?: {
+    assignedAt: string;
+    startAt?: string;
+    startWhen?: string;
+    deadline?: string;
+    openUntil?: string;
+    submittedAt?: string;
+    checkedAt?: string;
+  };
+  verdict?: StepVerdictRecord | null;
+  verdicts?: StepVerdictRecord[];
+  /*
+   * What each source says (turn-by-turn phase 4): the ways on, each bound to
+   * its verb, at most one recommended; and the approval block of a yes or a
+   * no. Optional so a 7.0 answer still reads; the card draws them from phase 8.
+   */
+  options?: InboxItem['options'];
+  approval?: InboxItem['approval'] | null;
   humanStep?: InboxItem['humanStep'];
   category?: InboxItem['category'];
   /** A supervisor card's own facts (control-tower phase 139) — the page draws its card inside the item. */
@@ -163,14 +236,14 @@ export function errandRow(
  * ------------------------------------------------------------------ */
 
 /**
- * Does this row ask a person for an act NOW — an item of *Do now* or *Needs
- * one detail from you*? Not one coming up, being checked or done, and never an
- * `fyi` row: the page leaves those out too (`server/turn/index.ts`), and a
- * plan-wide note (a clash zone, an idle plan) asks nobody to press anything.
+ * Does this row ask a person for an act NOW — an item of *Approve*, *Do now*
+ * or *Decide* (`TURN_OPEN_GROUPS`, the groups v2 of turn-by-turn phase 9)?
+ * Not one coming up, being checked or done, and never an `fyi` row: the page
+ * leaves those out too (`server/turn/index.ts`), and a plan-wide note (a clash zone, an idle plan) asks nobody to press anything.
  */
 export function asksNow(row: Pick<InboxItem, 'turn' | 'severity'>): boolean {
   const group = row.turn?.group;
-  return row.severity !== 'fyi' && (group === 'now' || group === 'decide');
+  return row.severity !== 'fyi' && (group === 'approve' || group === 'now' || group === 'decide');
 }
 
 /** A row with no clock (a gate, a QA verdict) sorts LAST, as the inbox's own order puts it. */
@@ -259,6 +332,26 @@ export type TurnAnswer = {
   seen: string | null;
   /** Issue drafts wait on Repo ▸ Issues: how many, and the link. */
   issues: { count: number; href: string } | null;
+  /**
+   * The plans' heads-ups (turn-by-turn phase 4): an `## Operator errands` row
+   * no bullet names, with its steps — in no group and never counted. Optional
+   * so a 7.0 answer still reads; the page draws them from phase 9.
+   */
+  headsUp?: TurnItem[];
+  /**
+   * The page's strip (turn-by-turn phase 9, `server/turn/index.ts` `stripOf`):
+   * to do, checking, passed today and the nearest deadline. Optional so a 7.0
+   * answer still reads — the page counts its groups instead.
+   */
+  strip?: TurnStrip;
+};
+
+/** The strip's numbers and its *Next deadline* — `TurnAnswer.strip`. */
+export type TurnStrip = {
+  todo: number;
+  checking: number;
+  passedToday: number;
+  nextDeadline: { at: string; item: string; title: string } | null;
 };
 
 /**
@@ -350,6 +443,47 @@ export function useTurnItem(id: string | null | undefined, enabled = true) {
 export function withdrawItem(id: string, note?: string): Promise<Pressed<StepVerbAnswer>> {
   return press(() => humanStepsApi.humanStepWithdraw(id, note));
 }
+
+/**
+ * *Undo* on an item being checked (turn-by-turn phase 5): the check is taken
+ * back while it runs, and the item is To do — or Redo — again. Through the
+ * owner door like every press; the item moves when the `turn` event says so.
+ */
+export function undoCheck(id: string): Promise<Pressed<StepVerbAnswer>> {
+  return press(() => humanStepsApi.humanStepUndo(id));
+}
+
+/**
+ * *Give back to Phase N* (turn-by-turn phase 5): the item is handed back to
+ * the phase that raised it — the step is withdrawn and its raiser resumed to
+ * do it another way, or ask again better. The escalation's *Rewrite the guide*
+ * presses the same verb; this is the door any open ledger item of a phase has.
+ */
+export function giveBack(id: string, note?: string): Promise<Pressed<StepVerbAnswer>> {
+  return press(() => humanStepsApi.humanStepRewrite(id, note));
+}
+
+/**
+ * Press one of an item's options (turn-by-turn phase 5): its own verb, sent
+ * as the server bound it — the method, the endpoint and the body, with what
+ * the person typed in the field the option names (`says`), and only when they
+ * typed something. A run's verb carries `expectRunId`, so a card left open on
+ * a run that moved on is refused with a sentence (`PressRefusal.stale`) and
+ * presses nothing. A flagged option is off: it is never sent.
+ */
+export function pressOption(option: TurnOption, typed?: string): Promise<Pressed<unknown>> {
+  if (option.flag) return Promise.reject(new Error(`${option.label} is off on this console.`));
+  const action: InboxAction = {
+    verb: option.id,
+    label: option.label,
+    endpoint: option.verb.endpoint,
+    method: option.verb.method,
+    ...(option.verb.body !== undefined ? { body: option.verb.body } : {}),
+    ...(option.says ? { says: option.says } : {}),
+  };
+  return press(() => inboxApi.inboxAct(action, typed));
+}
+
 
 /**
  * Revoke one live grant (quiet-console phase 22): exactly what it changed is

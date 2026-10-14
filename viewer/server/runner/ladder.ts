@@ -796,7 +796,6 @@ export function undrivableSentence(
  * Errands
  * ------------------------------------------------------------------ */
 
-type Ask = { need: string; how: string };
 
 /**
  * An ask with its place in the decision manifest (phase 11, ZTD-10): the row
@@ -808,6 +807,112 @@ type Ask = { need: string; how: string };
  */
 export type KeyedAsk = Ask & { decisionKey: string; defaultAnswer: string | null };
 
+/**
+ * One way on from an errand, bound to the verb that takes it (turn-by-turn
+ * phase 4, §Architecture 3): the words a person reads — the label and what
+ * pressing it does — and the press itself, `{method, endpoint, body}`, with
+ * `:slug` and `:phase` filled where the errand stands (`askOptionsFor`). `on`
+ * keeps an option to a run that is live, or to one that has stopped — Recover
+ * refuses a live run, and "look again" is the live run's verb. `flag` is the
+ * capability that gates the press (`run` unless it says otherwise; `null` for
+ * a read that needs none); `says` names the body key a note goes in.
+ */
+export type AskOption = {
+  id: string;
+  label: string;
+  consequence: string;
+  recommended?: true;
+  verb: { method: 'POST'; endpoint: string; body?: Readonly<Record<string, unknown>> };
+  says?: { field: string; label: string; placeholder?: string };
+  flag?: 'run' | 'writes' | null;
+  on?: 'live' | 'stopped';
+};
+
+/**
+ * What a person is asked for, per situation. `need` and `how` are the errand's
+ * own two sentences (stored on the run, quoted by the ladder's card); `title`,
+ * `steps` and `check` are what Your turn draws for a situation a person can
+ * receive — the act in words, the numbered steps, and how it is checked — and
+ * `options` the ways on, each bound to its verb (`turn-asks.test.ts` holds
+ * every receivable situation to a title, a step and a check, and every option
+ * to a route the router serves). A situation nobody is asked about
+ * (`NOT_RECEIVABLE`) keeps need and how alone.
+ */
+type Ask = {
+  need: string;
+  how: string;
+  title?: string;
+  steps?: readonly string[];
+  check?: string;
+  options?: readonly AskOption[];
+};
+
+/**
+ * The situations whose errand asks nobody for anything — the board already
+ * reads the phase done, or a live session holds it — so they carry no card's
+ * words: their need is "Nothing".
+ */
+export const NOT_RECEIVABLE = Object.freeze(['superseded', 'foreign-live'] as const);
+
+/** "I did what it asked — look again" on a stopped run: re-read the board, stand down what is settled, climb what is left. */
+const RECOVER: AskOption = {
+  id: 'recover', label: 'Recover & continue', recommended: true, on: 'stopped',
+  consequence: 'The run reads the board again, stands down what the errand settled and climbs whatever is left.',
+  verb: { method: 'POST', endpoint: '/api/run/:slug/recover' },
+};
+
+/** The same on a live run — Recover refuses one: the phase is re-read and the run drives on. */
+const RECHECK: AskOption = {
+  id: 'recheck', label: 'I did it — look again', recommended: true, on: 'live',
+  consequence: 'The console reads this phase again and stands down what the errand settled; the run keeps driving.',
+  verb: { method: 'POST', endpoint: '/api/run/:slug/recheck', body: { phase: ':phase' } },
+};
+
+/** A person's own answer to a session's declared block (control-tower phase 88): recorded, then the phase re-boards. */
+const ANSWERED: AskOption = {
+  id: 'errand-answered', label: 'Done — continue', recommended: true,
+  consequence: 'Your answer and its note are recorded on the phase, and the phase boards again with them.',
+  verb: { method: 'POST', endpoint: '/api/run/:slug/phase/:phase/errand-answered' },
+  says: { field: 'note', label: 'Note', placeholder: 'What you did (optional)' },
+};
+
+const LOOK_AGAIN: readonly AskOption[] = Object.freeze([RECOVER, RECHECK]);
+
+/** Look again, recommending nothing — beside ways on of the situation's own, one of which is. */
+const LOOK_AGAIN_AFTER: readonly AskOption[] = Object.freeze(LOOK_AGAIN.map(({ recommended: _recommended, ...option }) => ({
+  ...option, label: option.id === 'recover' ? 'I recorded it — recover & continue' : 'I recorded it — look again',
+})));
+
+/**
+ * The gate's own Approve (turn-by-turn phase 5, §Architecture 4): a gate is
+ * opened by approving it — through the person's door, the phase retried — and
+ * never "proven" by a note while it stays shut.
+ */
+const APPROVE_GATE: AskOption = {
+  id: 'approve-gate', label: 'Approve the gate', recommended: true, flag: 'writes',
+  consequence: 'The gate opens, the phase starts again and the run carries on.',
+  verb: { method: 'POST', endpoint: '/api/plans/:slug/gate/:phase', body: { approve: true, continueRun: true } },
+};
+
+/** A run request's two answers (turn-by-turn phase 6) — its ONE approval, bound to the run's `run-request` verb. */
+const RUN_REQUEST_APPROVE: AskOption = {
+  id: 'run-request-approve', label: 'Approve', recommended: true,
+  consequence: 'The run takes the act the phase asked for, and every phase that asked carries on.',
+  verb: { method: 'POST', endpoint: '/api/run/:slug/run-request', body: { phase: ':phase', answer: 'approve' } },
+  says: { field: 'note', label: 'Note', placeholder: 'For a budget: how many dollars to add' },
+};
+const RUN_REQUEST_DENY: AskOption = {
+  id: 'run-request-deny', label: 'Deny',
+  consequence: 'The run does not take the act; every phase that asked is told no and carries on without it.',
+  verb: { method: 'POST', endpoint: '/api/run/:slug/run-request', body: { phase: ':phase', answer: 'deny' } },
+};
+
+/** "Done — continue", recommending nothing — beside the gate's Approve, which is. */
+const ANSWERED_AFTER: AskOption = (({ recommended: _recommended, ...option }) => option)(ANSWERED);
+
+/** The check a ladder errand gets when nothing more specific proves it: the console's own read after the press. */
+const READS_AGAIN = 'The console reads the phase again when you press: the errand stands down once what it asks for holds.';
+
 /** What a person is asked for, per situation — the one card, in words a stranger can act on. */
 const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
   'superseded': {
@@ -818,11 +923,56 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     need: 'A QA verdict of pass or waived for this phase — the recorded fail holds every dependent.',
     how: 'Press **Fix & re-QA** on the phase to run the fix-and-review loop again with settings of its own, '
       + '**Re-run QA** to review again without a fix session, or **Waive with a reason** to record `waived`.',
+    title: 'Decide what the failed QA review needs',
+    steps: [
+      'Read the latest QA report on the phase page.',
+      'Choose Fix & re-QA when the work is wrong, Re-run QA when the review failed on the environment, or Waive with a reason when the finding does not apply.',
+    ],
+    check: 'A verdict of pass or waived in the QA table settles it.',
+    options: [
+      {
+        id: 'qa-recover', label: 'Fix & re-QA', recommended: true,
+        consequence: 'A fix session reads the report, then a fresh review records the next round.',
+        verb: { method: 'POST', endpoint: '/api/run/:slug/qa-recover', body: { phase: ':phase' } },
+      },
+      {
+        id: 'qa-rerun', label: 'Re-run QA',
+        consequence: 'A fresh review runs without a fix session — for a verdict that failed on the environment, not the work.',
+        verb: { method: 'POST', endpoint: '/api/run/:slug/qa-rerun', body: { phase: ':phase' } },
+      },
+      {
+        id: 'qa-waive', label: 'Waive with a reason', flag: 'writes',
+        consequence: 'The QA table records waived with your reason, and the phases that wait on it may board.',
+        verb: { method: 'POST', endpoint: '/api/plans/:slug/qa-waive', body: { phase: ':phase' } },
+        says: { field: 'reason', label: 'Why this is waived', placeholder: 'what does not apply, and why' },
+      },
+      ...LOOK_AGAIN_AFTER,
+    ],
   },
   'qa-pending': {
     need: 'A QA verdict for this phase — the plan gates on QA and none is recorded.',
     how: 'Press **Re-run QA** on the phase to dispatch the review the gate is waiting for, or **Waive with a '
       + 'reason** to record `waived`. **Fix & re-QA** does both, when the phase needs work before it is reviewed.',
+    title: 'Get this phase a QA verdict',
+    steps: [
+      'Press Re-run QA to dispatch the review the gate is waiting for.',
+      'Or, when the review does not apply to this phase, waive it with a reason.',
+    ],
+    check: 'Any verdict in the QA table settles it.',
+    options: [
+      {
+        id: 'qa-rerun', label: 'Re-run QA', recommended: true,
+        consequence: 'The review the gate is waiting for is dispatched, and it records its verdict.',
+        verb: { method: 'POST', endpoint: '/api/run/:slug/qa-rerun', body: { phase: ':phase' } },
+      },
+      {
+        id: 'qa-waive', label: 'Waive with a reason', flag: 'writes',
+        consequence: 'The QA table records waived with your reason, and the phases that wait on it may board.',
+        verb: { method: 'POST', endpoint: '/api/plans/:slug/qa-waive', body: { phase: ':phase' } },
+        says: { field: 'reason', label: 'Why this is waived', placeholder: 'what does not apply, and why' },
+      },
+      ...LOOK_AGAIN_AFTER,
+    ],
   },
   'foreign-live': {
     need: 'Nothing — another live session holds this phase; the autopilot waits for it.',
@@ -831,14 +981,35 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
   'foreign-stale': {
     need: 'Permission to take over an expired claim over unfinished work.',
     how: 'Press Take over on the phase page, or release the claim and Retry.',
+    title: 'Decide whether to take over an expired claim',
+    steps: [
+      'Open the phase page and read who held the claim and what it left uncommitted.',
+      'Press Take over to continue that work in this run, or release the claim and press Recover & continue.',
+    ],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'waiting-external': {
     need: 'The external work the session declared it is waiting on to land.',
     how: 'Check the watch refs on the phase page; when they have landed, press Re-check (or Resume the session).',
+    title: 'See the external work the phase waits on through',
+    steps: [
+      'Open the phase page and read what the session said it is waiting on.',
+      'When that work has landed, press the button below so the console looks again.',
+    ],
+    check: 'The console checks the watch refs the session named; the phase resumes when they have landed.',
+    options: LOOK_AGAIN,
   },
   'gated-manual': {
     need: 'A person to clear the manual gate — its numbered steps are on the Gate card.',
     how: 'Do the steps, then press Approve on the phase\'s Gate card (or run gate-approve.sh); the run retries the phase.',
+    title: 'Clear the manual gate',
+    steps: [
+      'Open the phase page and follow the numbered steps on its Gate card.',
+      'Press Approve on the Gate card once they are done.',
+    ],
+    check: 'Your approval opens the gate, and the run retries the phase.',
+    options: [APPROVE_GATE, ...LOOK_AGAIN_AFTER],
   },
   'plan-broken': {
     // The fallback, for a plan-broken errand written without the issue that
@@ -847,100 +1018,323 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     // "make it pass validate.sh" was an instruction nobody could act on.
     need: 'The plan-health issue this phase stopped on — the health panel names it.',
     how: 'Open the plan, fix what the health panel reports (validate.sh is the lint half of it), then Retry — or press Repair with a new agent.',
+    title: 'Fix what the plan\'s health panel reports',
+    steps: [
+      'Open the plan and read its health panel.',
+      'Fix what it names in the plan file, or press Repair with a new agent.',
+      'Then press Recover & continue.',
+    ],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'mcp-unavailable': {
     need: 'The named MCP server signed in and reachable, or a decision to run without it.',
     how: 'Sign the server in under Settings ▸ MCP, or press Continue without these servers on the run page.',
+    title: 'Sign the MCP server in, or run without it',
+    steps: [
+      'Open Settings ▸ MCP and sign the server in until it reads connected.',
+      'Or continue the run without it.',
+    ],
+    check: 'The console probes the server again before the phase boards.',
+    options: [
+      {
+        id: 'mcp-continue', label: 'Continue without these servers', recommended: true, on: 'stopped',
+        consequence: 'The phase boards without the unreachable servers, and its session is told which are missing.',
+        verb: { method: 'POST', endpoint: '/api/run/:slug/mcp-continue' },
+      },
+      RECHECK,
+    ],
   },
   'resource-wall': {
     need: 'Headroom: an account with usage left, a sign-in, more budget, or a model that is not limited.',
     how: 'Register or sign in an account under Settings ▸ Accounts, raise the budget on the run page, or wait for the window shown on the meter.',
+    title: 'Give the run room to work',
+    steps: [
+      'Register or sign in an account with usage left under Settings ▸ Accounts, or raise the budget on the run page.',
+      'Or wait for the window the meter shows.',
+    ],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'resource-wall:usage': {
     need: 'An account whose usage window has room, or the current window to reopen.',
     how: 'Pick another account on the run page, or wait for the reset time the meter shows; the run continues by itself.',
+    title: 'Give the run an account with room, or wait for the reset',
+    steps: [
+      'Pick another account with room on the run page, or register one under Settings ▸ Accounts.',
+      'Or wait for the reset time the meter shows — the run continues by itself.',
+    ],
+    check: 'The console reads the meters again; the run continues once an account has room.',
+    options: LOOK_AGAIN,
   },
   'resource-wall:auth': {
     need: 'A signed-in Claude account for this run.',
     how: 'Run claude login for the machine account, or sign in a console profile under Settings ▸ Accounts, then Continue.',
+    title: 'Sign a Claude account in for this run',
+    steps: [
+      'Open a sign-in terminal and sign the machine login in, or sign a console profile in under Settings ▸ Accounts.',
+      'Then check again, so the console reads the login.',
+    ],
+    check: 'The console reads the account\'s login again: the run continues once it reads signed in.',
+    options: [
+      {
+        id: 'login', label: 'Open a sign-in terminal', recommended: true,
+        consequence: 'A terminal opens with the sign-in command; finish it in the browser it opens.',
+        verb: { method: 'POST', endpoint: '/api/auth/login' },
+      },
+      {
+        id: 'recheck', label: 'Check again', flag: null,
+        consequence: 'The console reads every account\'s login again.',
+        verb: { method: 'POST', endpoint: '/api/accounts/refresh' },
+      },
+    ],
   },
   'resource-wall:budget': {
     need: 'More budget — the run or phase has spent what it was allowed.',
     how: 'Raise the budget on the run page and press Continue.',
+    title: 'Raise the run\'s budget',
+    steps: ['Raise the budget on the run page.', 'Then press Recover & continue.'],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'resource-wall:model': {
     need: 'A model that is not rate-limited, or the first model\'s window to reopen.',
     how: 'Pick a model on the run page, or wait for the reset the meter shows.',
+    title: 'Pick a model that is not limited, or wait for the reset',
+    steps: ['Pick another model on the run page.', 'Or wait for the reset the meter shows.'],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'blocked-declared': {
     need: 'What the session said it is blocked on — read its Outstanding section.',
     how: 'Clear the blocker, then Retry (or Resume the session with an instruction).',
+    title: 'Clear what the session is blocked on',
+    steps: ['Read the Outstanding section of the phase\'s handoff.', 'Clear the blocker it names, then tell the console you are done.'],
+    check: 'Your word is the check: the phase boards again with your note.',
+    options: [ANSWERED],
   },
   'blocked-declared:lock': {
     need: 'The lock holder to finish or release — the phase queues behind it.',
     how: 'Nothing, usually; if the holder is dead, Force release on the phase page.',
+    title: 'See the lock the phase queues behind released',
+    steps: ['Nothing, usually — the phase boards when the holder finishes.', 'If the holder is dead, press Force release on the phase page.'],
+    check: 'The console sees the lock free, and the phase queues in.',
+    options: LOOK_AGAIN,
   },
   'blocked-declared:credential': {
     need: 'The credential the session named and no session holds (a sign-in, a key, a token).',
     how: 'Provide it where the handoff says, then Resume the session with an instruction or Retry.',
+    title: 'Provide the credential the session named',
+    steps: ['Read where the handoff says the credential goes.', 'Store it there — never in a note — then tell the console you are done.'],
+    check: 'Your word is the check: the phase boards again and its session reads the credential.',
+    options: [ANSWERED],
   },
   'blocked-declared:permission': {
     need: 'A permission the AI lacks — the session named the act, and the wall the console recorded for its lane says what stopped it.',
-    how: "Your turn holds a permission item for it, with the command, why the phase needs it, the wall and its risk: Grant (what it does today is written on it), Deny — the session is told to find another way — or I'll do it myself, which makes the command your own act; your I've done this carries the session on. Settings ▸ Permissions shows and reverses a strike. A wall marked never offers no grant: do the step by hand.",
+    // Never a claim the turn may not keep (turn-by-turn phase 6): the item
+    // exists only when the console recorded the wall the declaration cites.
+    how: "When the console recorded the wall it names, Your turn holds a permission item for it, with the command, why the phase needs it, the wall and its risk: Grant (what it does today is written on it), Deny — the session is told to find another way — or I'll do it myself, which makes the command your own act; your I've done this carries the session on. When nothing refused it, there is no item: Done — continue resumes the phase to run it. Settings ▸ Permissions shows and reverses a strike. A wall marked never offers no grant: do the step by hand.",
+    title: 'Decide on a permission the session lacks',
+    steps: ['Read the command, why the phase needs it and the wall that stopped it.', "Grant it at a scope, deny it, or do it yourself and say so."],
+    check: 'Your grant, or your denial, settles it.',
+    options: [ANSWERED],
   },
   'blocked-declared:protected-path': {
     need: "An edit the CLI's own wall reserves for an interactive session — a path such as `.claude/**`, which no unattended session may change whatever this console allows.",
     how: 'Make that edit by hand in this checkout, or open an interactive session here and make it; commit it on the run branch, then Retry — the session resumes with the edit in place. No policy on this console can allow it.',
+    title: 'Make a protected edit by hand',
+    steps: [
+      'Make the edit by hand in the run\'s checkout, or in an interactive session there.',
+      'Commit it on the run branch, then tell the console you are done.',
+    ],
+    check: 'Your word is the check: the session resumes with the edit in place.',
+    options: [ANSWERED],
   },
   'blocked-declared:human-acts': {
     need: 'The acts the plan keeps for a person — the session named them (a merge, a sign-off, a production step) and stopped rather than do them.',
     how: "Do them by hand and Retry; or press Delegate to the session, which records that you handed them over and resumes the session with your words — the run's permission policy still applies to every act.",
+    title: 'Do the acts the plan keeps for a person',
+    steps: ['Read the acts the session named in its handoff.', 'Do them by hand, then tell the console you are done.'],
+    check: 'Your word is the check: the phase boards again with your note.',
+    options: [ANSWERED],
+  },
+  // A run request (turn-by-turn phase 6, #286): an act only the RUN can take,
+  // which no session may press — ONE approval per run and act on Your turn,
+  // every phase that asked a waiter on it.
+  'blocked-declared:run': {
+    need: 'An act only the run can take — relaunch isolated, switch account, raise the budget, stop or hold — which the phase asked for and no session can take itself.',
+    how: 'Your turn holds ONE approval for it per run and act, naming every phase that asked: Approve takes the act through the run verb of its name, Deny tells every phase that asked no.',
+    title: 'Approve what the phase asked the run to do',
+    steps: [
+      'Read the act the phase asked the run for, and why.',
+      'Approve it — the run takes the act — or deny it, and the phases that asked are told no.',
+    ],
+    check: 'Your answer is the result: the run takes the act, or the phases carry on without it.',
+    options: [RUN_REQUEST_APPROVE, RUN_REQUEST_DENY],
   },
   'blocked-declared:gate': {
     need: 'The approval or sign-off the session said it is waiting for.',
     how: 'Give it (or clear the gate), then Retry.',
+    title: 'Give the approval the session is waiting for',
+    steps: ['Read what the session said it needs signed off.', 'Give it, or clear the gate, then tell the console you are done.'],
+    check: 'Your word is the check: the phase boards again with your note.',
+    // A gate is opened by its Approve (turn-by-turn phase 5); a sign-off
+    // outside any gate is still "Done — continue".
+    options: [APPROVE_GATE, ANSWERED_AFTER],
   },
   'blocked-declared:external': {
     need: 'The external thing the session is waiting on (CI, a PR, a deploy window) to land.',
     how: 'Check its watch refs; when it has landed, Re-check or Retry.',
+    title: 'See the external work the session waits on through',
+    steps: ['Read what the session said it is waiting on.', 'When it has landed, press the button below so the console looks again.'],
+    check: 'The console checks the watch refs the session named; the phase resumes when they have landed.',
+    options: LOOK_AGAIN,
   },
   'blocked-declared:unknown': {
     need: 'A reading of the session\'s Outstanding section — the blocker it named fits no machine category and one unblock session did not clear it.',
     how: 'Clear what it names, then Resume the session with an instruction or Retry; or split the remaining work into a new phase.',
+    title: 'Read what the session is blocked on and clear it',
+    steps: ['Read the Outstanding section of the phase\'s handoff.', 'Clear what it names, or split the remaining work into a new phase, then tell the console you are done.'],
+    check: 'Your word is the check: the phase boards again with your note.',
+    options: [ANSWERED],
   },
   'verify-red': {
     need: 'The phase\'s §Verification to pass — the ladder\'s sessions could not make it green.',
     how: 'Read What failed on the phase page, fix it (or fix the verification command if it is wrong), then Re-check or Retry.',
+    title: 'Make the phase\'s checks pass',
+    steps: ['Read What failed on the phase page.', 'Fix the cause, or the command if the command is wrong.'],
+    check: 'The console runs the phase\'s checks again: green closes the phase.',
+    options: LOOK_AGAIN,
   },
   'verify-red:reopened': {
     need: "The phase's §Verification to pass — its handoff reads complete, but the verification the console ran is red, and the one fix session did not make it green. Its dependents wait on it.",
     how: 'Read What failed on the phase page, fix the cause (or the command, if the command is wrong), then Re-check — a green verification closes the phase and releases its dependents.',
+    title: 'Make the reopened phase\'s checks pass',
+    steps: ['Read What failed on the phase page.', 'Fix the cause, or the command if the command is wrong.'],
+    check: 'The console runs the phase\'s checks again: green closes the phase and releases its dependents.',
+    options: LOOK_AGAIN,
   },
   'done-unrecorded': {
     need: 'A complete handoff for work that verifies green.',
     how: 'Run new-handoff.sh for the phase and commit it, or Resume the session and ask it to close out.',
+    title: 'Record the phase\'s handoff',
+    steps: ['Write and commit a complete handoff for the phase, or resume its session and ask it to close out.'],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'work-in-progress': {
     need: 'Someone to finish the phase — the ladder\'s sessions did not carry it to its exit criteria.',
     how: 'Resume the session with an instruction, or boot the phase by hand from its boot prompt; commit and hand off when done.',
+    title: 'Finish the phase',
+    steps: ['Resume the session with an instruction, or boot the phase by hand from its boot prompt.', 'Commit and hand off when it is done.'],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'never-started': {
     need: 'The phase to be run — it never started and the ladder could not board it.',
     how: 'Press Retry, or boot it by hand from its boot prompt.',
+    title: 'Start the phase',
+    steps: ['Press Recover & continue, or boot the phase by hand from its boot prompt.'],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'never-started:refusal': {
     need: 'A person to read what the model refused, and decide what to do about the phase.',
     how: 'Open the phase\'s evidence — the refusal text is quoted there verbatim. Re-boarding gets the same answer to the same prompt, so change what is asked (the plan\'s wording, the phase\'s scope) or run it by hand.',
+    title: 'Read what the model refused, and change what is asked',
+    steps: [
+      'Open the phase\'s evidence and read the refusal, quoted verbatim.',
+      'Change what is asked — the plan\'s wording or the phase\'s scope — or run the phase by hand.',
+    ],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'never-started:skill-missing': {
     need: 'The skill the boot prompt invokes to load on THIS machine — the CLI answered "Unknown command".',
     how: 'Check the install: `claude` sees the skill (`/phased-execution` resolves), and Settings ▸ Automation ▸ skills names one that exists. `phase-console install-skill` re-links it. This is an environment fault, not a phase fault — the next attempt runs the same broken install.',
+    title: 'Repair the skill install on this machine',
+    steps: [
+      'Check that claude sees the skill on this machine.',
+      'Check that Settings ▸ Automation ▸ skills names one that exists, and re-link it if not.',
+    ],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
   'unknown': {
     need: 'A person to read the evidence — it fits no situation the autopilot knows.',
     how: 'Open Why is this not done? on the phase page; act on what it shows, then Retry or Re-check — and file the shape so the classifier learns it.',
+    title: 'Read why the phase is not done',
+    steps: ['Open Why is this not done? on the phase page.', 'Act on what it shows.'],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
   },
 });
+
+/** A situation's card words — the ASK row a key falls to, as `errandFor` reads it. */
+export type AskWords = { title: string; steps: readonly string[]; check: string; options: readonly AskOption[] };
+
+/** The ASK row for a situation key — its own, its id's, else `unknown`'s. */
+function askOf(situationKeyOrId: string): Ask {
+  const { id, sub } = parseSituationKey(situationKeyOrId);
+  return ASKS[situationKey(id, sub)] ?? ASKS[id] ?? ASKS.unknown!;
+}
+
+/**
+ * The card words of a situation a person can receive (turn-by-turn phase 4),
+ * or null for one nobody is asked about. Read by the inbox's errand row, so
+ * the bell, the Runs home and Your turn name the same act and offer the same
+ * ways on.
+ */
+export function askFor(situationKeyOrId: string): AskWords | null {
+  const ask = askOf(situationKeyOrId);
+  if (!ask.title || !ask.steps?.length || !ask.check) return null;
+  return { title: ask.title, steps: ask.steps, check: ask.check, options: ask.options ?? [] };
+}
+
+/** Every ASK row by key, with its card words — what `turn-asks.test.ts` walks. */
+export function askTable(): Readonly<Record<string, { need: string; how: string } & Partial<AskWords>>> {
+  return ASKS;
+}
+
+/** A body value with its `:phase` filled. */
+function bindValue(value: unknown, phase: number): unknown {
+  return value === ':phase' ? phase : value;
+}
+
+/**
+ * An errand's ways on, bound where it stands: the endpoint's `:slug` and
+ * `:phase` filled, a body's `':phase'` the number, and only the options that
+ * fit a live run or a stopped one. An option that needs a phase is dropped on
+ * a run-level errand, which has none.
+ */
+export type BoundAskOption = Omit<AskOption, 'verb' | 'on'> & { verb: { method: 'POST'; endpoint: string; body?: Record<string, unknown> } };
+
+export function askOptionsFor(
+  situationKeyOrId: string, at: { slug: string; phase: number | null; live: boolean },
+): BoundAskOption[] {
+  const bound = bindOptions(askOf(situationKeyOrId).options ?? LOOK_AGAIN, at);
+  // A person's answer needs the phase it re-boards: a run-level errand looks again instead.
+  return bound.length ? bound : bindOptions(LOOK_AGAIN, at);
+}
+
+function bindOptions(options: readonly AskOption[], at: { slug: string; phase: number | null; live: boolean }): BoundAskOption[] {
+  const out: BoundAskOption[] = [];
+  for (const option of options) {
+    if (option.on && option.on !== (at.live ? 'live' : 'stopped')) continue;
+    const needsPhase = option.verb.endpoint.includes(':phase') || Object.values(option.verb.body ?? {}).includes(':phase');
+    if (needsPhase && at.phase == null) continue;
+    const phase = at.phase ?? 0;
+    const endpoint = option.verb.endpoint
+      .replace(':slug', encodeURIComponent(at.slug))
+      .replace(':phase', String(phase));
+    const body = option.verb.body
+      ? Object.fromEntries(Object.entries(option.verb.body).map(([key, value]) => [key, bindValue(value, phase)]))
+      : undefined;
+    const { on: _on, verb: _verb, ...rest } = option;
+    out.push({ ...rest, verb: { method: option.verb.method, endpoint, ...(body ? { body } : {}) } });
+  }
+  return out;
+}
 
 /**
  * The errand for a situation once its rungs are spent (or at once, for a

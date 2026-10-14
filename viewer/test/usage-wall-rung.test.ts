@@ -546,7 +546,7 @@ test('UW-3: a ladder that defers to the healer raises a visible card at once —
     const retry = row!.actions.find((action) => action.verb === 'retry');
     assert.ok(retry, 'Retry boards it now');
     assert.equal(retry!.endpoint, '/api/run/demo/retry');
-    assert.deepEqual(retry!.body, { phase: 1 });
+    assert.deepEqual(retry!.body, { phase: 1, expectRunId: state.id }, 'bound to its run (turn-by-turn phase 5)');
   } finally {
     await loop.stop().catch(() => undefined);
     cleanup();

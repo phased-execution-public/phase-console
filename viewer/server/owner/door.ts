@@ -265,6 +265,8 @@ export const AUTHORITY_METHODS: Readonly<Record<string, AuthorityVerb>> = Object
   checkHumanStep: 'attest',
   dismissHumanStep: 'decline',
   answerHumanStep: 'answer',
+  // A phase's run request (turn-by-turn phase 6): its ONE approval, answered.
+  answerRunRequest: 'answer',
   declineHumanStep: 'decline',
   denyHumanStep: 'decline',
   convertHumanStep: 'decline',

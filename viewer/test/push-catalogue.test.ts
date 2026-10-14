@@ -141,6 +141,31 @@ test('TD-4: a grant’s push opens Settings ▸ Permissions ▸ Grants at that g
   assert.equal(categoryOf('granted').urgent, false);
 });
 
+test('TD-6 (turn-by-turn phase 3): push titles are the composer\'s — the act, never "phase 0", never a raw command or a proof ref', async () => {
+  const { humanStepPush, humanStepReminderPush } = await import('../server/push/catalogue.ts');
+  const { composeItem } = await import('../server/turn/compose.ts');
+  const { KIND_META } = await import('../shared/human-step-model.js');
+  const act = {
+    id: 'own', kind: 'operator-act', label: KIND_META['operator-act'].label, title: 'Rotate the deploy key (E-4)', where: 'host' as const,
+    slug: 'site', phase: 0, openCommand: 'vercel env add KEY production', proof: 'cmd:"vercel env ls production"', proofType: 'probe',
+  };
+  const first = humanStepPush(act);
+  const composed = composeItem({ source: 'plan', record: 'ledger', kind: 'operator-act', proofType: 'probe', slug: 'site', phase: 0, step: act, now: Date.now() });
+  assert.equal(first.message.title, `Now: ${composed.title}`, 'the title is the composer\'s act');
+  assert.equal(first.message.title, 'Now: Rotate the deploy key');
+  assert.ok(!first.message.body.includes('vercel env add'), 'no raw command on the lock screen');
+  assert.doesNotMatch(first.message.body, /cmd:|\bphase 0\b/);
+  assert.match(first.message.body, /^The plan site — at the machine this console runs on\. The console checks that a check command passes\.$/);
+  const reminder = humanStepReminderPush(act, 3);
+  assert.equal(reminder.message.title, 'Still your turn: Rotate the deploy key');
+  assert.doesNotMatch(`${reminder.message.title} ${reminder.message.body}`, /\bphase 0\b/i, 'a reminder never says phase 0');
+  assert.match(reminder.message.body, /Reminder 3\.$/);
+  // Any other kind says "Your turn", and the phase in words.
+  const sign = humanStepPush({ ...act, id: 's', kind: 'browser-login', label: KIND_META['browser-login'].label, title: 'Sign the gh CLI in', phase: 4, slug: 'demo', proof: 'credential:gh' });
+  assert.equal(sign.message.title, 'Your turn: Sign the gh CLI in');
+  assert.match(sign.message.body, /^Phase 4 of demo — at the machine this console runs on\. The console checks that the gh CLI is signed in\.$/);
+});
+
 test('AP-7: pushes the channel failed to deliver are summarised, newest first, the count honest past what is kept', () => {
   const undelivered = Array.from({ length: UNDELIVERED_KEEP + 3 }, (_, i) => ({
     category: 'halted', title: `Run halted #${i + 1}`, at: new Date(NOW - (60 - i) * 60_000).toISOString(),

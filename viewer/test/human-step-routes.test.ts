@@ -32,6 +32,10 @@
  *   HR-11 that form is the only door that sends them: no other file under
  *         `server/` passes `autoOpenShown`, so converge, a webhook and `bin/`
  *         open nothing on the machine.
+ *   HR-12 a bound option names its run (turn-by-turn phase 5): every run verb
+ *         an option may bind — and the gate's Approve — refuses a press whose
+ *         `expectRunId` is not the plan's run with a 409 and a sentence, and
+ *         carries on when it is.
  */
 
 import './state-sandbox.ts';
@@ -553,3 +557,42 @@ test('HR-11 — the launch form is the only door that sends `autoOpenShown`: con
   const sending = routes.slice(routes.indexOf("case 'start': {"), routes.indexOf("case 'ask':"));
   assert.match(sending, /autoOpenShown: Array\.isArray\(body\.autoOpen\)/, 'and the one sender is the start case');
 });
+
+test('HR-12 — a bound option names its run: on a superseded or different run every bound verb answers 409 with a sentence', async () => {
+  const h = harness();
+  try {
+    const { state } = parked(h, BROWSER);
+    const verbs: [string, Record<string, unknown>][] = [
+      ['identity', { choice: 'continue' }], ['isolate', {}], ['stop', {}], ['hold', {}], ['release', {}],
+      ['switch-account', { accountId: 'default' }], ['plan-approval', { phase: 3, decision: 'approve' }],
+      ['recover', {}], ['recheck', { phase: 3 }], ['phase/3/errand-answered', { note: 'done' }],
+    ];
+    for (const [verb, body] of verbs) {
+      const stale = await call(h.svc, 'POST', `/api/run/${SLUG}/${verb}`, { ...body, expectRunId: 'run-before' });
+      assert.equal(stale.status, 409, verb);
+      assert.equal(
+        stale.body.error,
+        `This was asked of run run-before of ${SLUG}, and the plan's run is ${state.id} now — nothing was pressed. `
+          + 'Read the item again: it says what the new run needs.',
+        verb,
+      );
+      assert.deepEqual(stale.body.stale, { expected: 'run-before', current: state.id }, verb);
+    }
+    // `resolve` already names its run: the binding is that name.
+    const resolve = await call(h.svc, 'POST', `/api/run/${SLUG}/resolve`, { runId: state.id, expectRunId: 'run-before' });
+    assert.equal(resolve.status, 409);
+    assert.deepEqual(resolve.body.stale, { expected: 'run-before', current: state.id });
+    // The gate's Approve, bound to an item of a run, the same.
+    const gate = await call(h.svc, 'POST', `/api/plans/${SLUG}/gate/3`, { approve: true, expectRunId: 'run-before' });
+    assert.equal(gate.status, 409);
+    assert.match(String(gate.body.error), /nothing was pressed/);
+    // Bound to the run that stands, the press goes through to the verb itself.
+    const held = await call(h.svc, 'POST', `/api/run/${SLUG}/hold`, { expectRunId: state.id });
+    assert.equal(held.body.stale, undefined, 'not refused as stale');
+    // A plan with no run at all.
+    const none = await call(h.svc, 'POST', '/api/run/beta/hold', { expectRunId: 'run-before' });
+    assert.equal(none.status, 409);
+    assert.equal(none.body.error, 'This was asked of run run-before of beta, and no run of beta stands now — nothing was pressed.');
+  } finally { h.cleanup(); }
+});
+

@@ -26,7 +26,8 @@ import { fileURLToPath } from 'node:url';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseGuide, type Guide } from '@shared/guide-grammar.js';
-import { GuideView, claudeCodeCommand, guideOf } from './guide';
+import { claudeCodeCommand } from '@/ui/code-block';
+import { GuideView, guideOf } from './guide';
 
 const TEXT = `The release pushes as you, so only you can sign the CLI in.
 
@@ -234,5 +235,27 @@ describe('G-6 the one grammar reads a stored guide', () => {
     expect(guideOf('## Nonsense\nnot a guide')).toBeNull();
     expect(guideOf(undefined)).toBeNull();
     expect(guideOf({ lang: 'en' })).toBeNull();
+  });
+});
+
+describe('G-8 a step’s command is the one command block (turn-by-turn phase 8)', () => {
+  it('a template step says what to fill in first and offers no plain Copy', () => {
+    render(
+      <GuideView
+        itemId="g8"
+        guide={{
+          version: 1,
+          lang: 'en',
+          dir: 'ltr',
+          summary: '',
+          steps: [{ text: 'Sign in', code: 'gh auth login --hostname <host>' }],
+          trouble: [],
+        }}
+      />,
+    );
+    const step = screen.getByTestId('guide-step');
+    expect(within(step).getByTestId('guide-command').getAttribute('dir')).toBe('ltr');
+    expect(within(step).getByTestId('code-template').textContent).toBe('Fill in <host> first.');
+    expect(within(step).queryByRole('button', { name: 'Copy' })).toBeNull();
   });
 });

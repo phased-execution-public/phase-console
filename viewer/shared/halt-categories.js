@@ -129,6 +129,8 @@ export const SUB_KIND_CATEGORY = Object.freeze({
   'blocked-declared:credential': 'credentials',
   'blocked-declared:external': 'external',
   'blocked-declared:lock': 'conflict',
+  // A run request is the run's own act — what an operator does to a run.
+  'blocked-declared:run': 'operator',
   'never-started:refusal': 'credentials',
 });
 

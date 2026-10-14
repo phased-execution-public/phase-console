@@ -128,6 +128,27 @@ describe('press()', () => {
     await expect(press(pause)).rejects.toMatchObject({ rules: ['Bash(gti push:*)'] });
   });
 
+  it('a 409 with a stale block is refused with the run it was asked of and the run that stands (turn-by-turn phase 5)', async () => {
+    const words = 'This was asked of run r-1 of demo, and the plan’s run is r-2 now — nothing was pressed.';
+    answers = [[409, { error: words, stale: { expected: 'r-1', current: 'r-2' } }]];
+    const refused = await press(pause).catch((cause: unknown) => cause);
+    expect(refused).toBeInstanceOf(PressRefusal);
+    expect(refused).toMatchObject({
+      status: 409,
+      message: words,
+      stale: { expected: 'r-1', current: 'r-2' },
+    });
+    // No run stands at all: `current` is null, and it is still a refusal with its sentence.
+    answers = [[409, { error: 'no run of demo stands now', stale: { expected: 'r-1', current: null } }]];
+    calls = 0;
+    await expect(press(pause)).rejects.toMatchObject({ stale: { expected: 'r-1', current: null } });
+  });
+
+  it('a 400 or a 403 carries no stale block', async () => {
+    answers = [[403, { error: 'no', door: 'device', stale: { expected: 'r-1', current: 'r-2' } }]];
+    await expect(press(pause)).rejects.toMatchObject({ status: 403, stale: null });
+  });
+
   it('any other refusal is the request’s own error, unwrapped', async () => {
     answers = [[409, { error: 'A session is already working on that phase.', session: 's-1' }]];
     const refused = await press(pause).catch((cause: unknown) => cause);

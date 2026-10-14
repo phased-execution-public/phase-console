@@ -147,7 +147,9 @@ test('HS-2 — a declared step is recorded, announced ONCE with its actions, and
     assert.deepEqual(HUMAN_STEP_PUSH_ACTIONS.map((a) => a.title), ['Open', 'I did it']);
     assert.equal((payload.step as { code?: string }).code, 'WDJB-MJHT', 'a device code rides the push, on purpose');
     assert.match(String(payload.body), /WDJB-MJHT/);
-    assert.match(String(payload.title), /^Your turn: enter a device code — demo phase 4$/);
+    // The composer's words (turn-by-turn phase 3): the act, then where and how it is checked.
+    assert.equal(String(payload.title), 'Your turn: Enter the code the CLI printed');
+    assert.match(String(payload.body), /^Phase 4 of demo\. The code is WDJB-MJHT\./);
 
     const view = buildInbox({ humanSteps: svc.humanStepsNow().open() });
     const rows = view.items.filter((item) => item.kind === 'human-step' && item.id.includes(step.id));
@@ -155,7 +157,8 @@ test('HS-2 — a declared step is recorded, announced ONCE with its actions, and
     const row = rows[0];
     assert.equal(row.severity, 'needs-you');
     assert.equal(row.phase, 4);
-    assert.match(row.need, /Enter the code the CLI printed — code WDJB-MJHT/);
+    assert.equal(row.title, 'Enter the code the CLI printed', 'the row is titled by the act');
+    assert.match(row.need, /The code is WDJB-MJHT\./);
     assert.match(row.how, /From any device: open https:\/\/github\.com\/login\/device/);
     assert.equal(row.since, step.declaredAt);
 
@@ -179,7 +182,7 @@ test('HS-2 — the push words name the kind and the phase; the detail a webhook 
   assert.match(push.message.body, /ABCD-1234/);
   assert.doesNotMatch(push.message.detail, /ABCD-1234/);
   const host = humanStepPush({ id: 'x', kind: 'os-prompt', label: KIND_META['os-prompt'].label, title: 'Unlock the keychain', where: 'host', slug: 'demo', phase: 2 });
-  assert.match(host.message.body, /at the machine the console runs on/);
+  assert.match(host.message.body, /at the machine this console runs on/);
   assert.equal(host.step.code, undefined);
 });
 
@@ -267,7 +270,7 @@ test('HS-3 — needs-human --step parks the phase on a PERSON: the ledger, an un
     assert.equal(actorFor('blocked-declared', 'human-acts'), 'person');
     const errand = state.recoveries?.['1']?.errand;
     assert.equal(errand?.situation, 'blocked-declared:human-acts');
-    assert.match(String(errand?.need), /Your turn — sign in in a browser: Sign the gh CLI in to the acme org/);
+    assert.match(String(errand?.need), /^Sign in in a browser: Sign the gh CLI in to the acme org\.$/);
     const lines = readFileSync(journalFile(r.root, 'demo', state.id), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     const journalled = lines.filter((l: { event: string }) => l.event === 'phase.human-step');
     assert.equal(journalled.length, 1);
@@ -444,4 +447,46 @@ test('HS-6 — a verdict rides its move: the item keeps the last and every one, 
     const read = readLedger(file).steps.get(old.id)!;
     assert.deepEqual([read.state, read.attempts, read.verdict, read.verdicts, read.read], ['notified', 1, undefined, undefined, 'pending']);
   } finally { s.cleanup(); }
+});
+
+// ---- turn-by-turn phase 2: a plan bullet's guide FILE -----------------------
+
+test('turn-by-turn 2: a guide: file becomes the guide; outside the root, a symlink escaping it, oversized or secret-shaped is refused with a sentence', async () => {
+  const { readGuideFile } = await import('../server/turn/guide-file.ts');
+  const { symlinkSync } = await import('node:fs');
+  const base = mkdtempSync(join(tmpdir(), 'pc-guide-file-'));
+  const root = join(base, 'root');
+  try {
+    mkdirSync(join(root, 'docs', 'guides'), { recursive: true });
+    writeFileSync(join(base, 'outside.md'), 'Outside.\n\n## Steps\n1. Never read.\n');
+    writeFileSync(join(root, 'docs', 'guides', 'ok.md'), 'Why it matters.\n\n## Steps\n1. Open the page.\n   Link: [it](https://example.com/)\n2. Press Save.\n\n## If it goes wrong\n- Nothing saves — press it again.\n');
+    const good = readGuideFile(root, 'docs/guides/ok.md');
+    assert.equal(good.ok, true);
+    assert.deepEqual(good.ok && good.guide.steps.map((s) => s.text), ['Open the page.', 'Press Save.']);
+    assert.equal(good.ok && good.guide.trouble.length, 1);
+
+    const refused = (rel: string) => {
+      const read = readGuideFile(root, rel);
+      assert.equal(read.ok, false, rel);
+      return read.ok ? '' : read.why;
+    };
+    assert.match(refused('../outside.md'), /is not a path under the docs root/);
+    assert.match(refused('/etc/hosts'), /is not a path under the docs root/);
+    assert.match(refused('docs/guides/missing.md'), /is not a file under the docs root/);
+    // A link inside the root that leads out of it is refused as surely as ../
+    symlinkSync(join(base, 'outside.md'), join(root, 'docs', 'guides', 'escape.md'));
+    assert.match(refused('docs/guides/escape.md'), /leads outside the docs root/);
+    // A link that stays inside is read.
+    symlinkSync(join(root, 'docs', 'guides', 'ok.md'), join(root, 'docs', 'guides', 'alias.md'));
+    assert.equal(readGuideFile(root, 'docs/guides/alias.md').ok, true);
+    writeFileSync(join(root, 'docs', 'guides', 'big.md'), `Big.\n\n## Steps\n1. ${'x'.repeat(30 * 1024)}\n`);
+    assert.match(refused('docs/guides/big.md'), /bytes, and a guide is 24576 at most/);
+    const token = ['gh', 'p_', 'a'.repeat(36)].join('');
+    writeFileSync(join(root, 'docs', 'guides', 'secret.md'), `Why.\n\n## Steps\n1. Paste ${token} into the box.\n`);
+    const why = refused('docs/guides/secret.md');
+    assert.match(why, /line 4 carries a secret-shaped value/);
+    assert.ok(!why.includes(token), 'the refusal never carries the value');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

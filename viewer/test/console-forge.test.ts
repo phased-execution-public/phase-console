@@ -498,6 +498,7 @@ test('OD-5: every call of an authority method in the router is reached by an AUT
     'edit-prefs': [{ body: { theme: 'dark' } }],
     'run-settings': [{ body: { maxParallel: 1 } }],
     'answer-question': [{ body: { approvalId: 'a1', key: 'q', label: 'yes' } }],
+    'answer-run-request': [{ body: { phase: 3, answer: 'approve' } }],
     'approve-plan': [{ body: { phase: 1, decision: 'approve' } }],
     'delegate-step': [{ body: { phase: 1, instruction: 'do it yourself' } }],
     'remember-ruling': [{ body: { scope: 'global' } }],

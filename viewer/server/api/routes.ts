@@ -143,6 +143,39 @@ function json(res: ServerResponse, status: number, body: unknown): void {
  * like success to every client, which is how a button came to "work" while
  * doing nothing at all.
  */
+/**
+ * A press bound to a run that is not the run it would act on (turn-by-turn
+ * phase 5, §Architecture 4): an option carries `expectRunId`, the run it was
+ * raised for, and the route answers 409 with a sentence when the plan's run is
+ * another one now — a successor, none at all, or one that was dismissed — so a
+ * card left open on a page never presses the run that came after it. `resolve`
+ * already names its run (`runId`), so its binding is that name. Null: press it.
+ */
+async function staleBinding(
+  service: Service, slug: string, body: Record<string, unknown>, verb: string,
+): Promise<{ error: string; stale: { expected: string; current: string | null } } | null> {
+  const expected = typeof body.expectRunId === 'string' ? body.expectRunId.slice(0, 64) : '';
+  if (!expected) return null;
+  let current: string | null;
+  let dismissed = false;
+  if (verb === 'resolve' || verb === 'unresolve') {
+    current = typeof body.runId === 'string' ? body.runId.slice(0, 64) : null;
+  } else {
+    const run = await service.runFor(slug);
+    current = run?.id ?? null;
+    dismissed = Boolean(run?.resolved) && verb !== 'unresolve';
+  }
+  if (current === expected && !dismissed) return null;
+  const error = current === null
+    ? `This was asked of run ${expected} of ${slug}, and no run of ${slug} stands now — nothing was pressed.`
+    : current === expected
+      ? `Run ${expected} of ${slug} was dismissed — nothing was pressed. Read the plan's run again for what it needs now.`
+      : `This was asked of run ${expected} of ${slug}, and the plan's run is ${current} now — nothing was pressed. `
+        + 'Read the item again: it says what the new run needs.';
+  log.info('turn.press-stale', { slug, verb, expected, current });
+  return { error, stale: { expected, current } };
+}
+
 function answerRun(res: ServerResponse, run: unknown, refusal: string): void {
   if (run) json(res, 200, { run });
   else json(res, 409, { error: refusal });
@@ -1605,6 +1638,8 @@ async function routeApi(
      * rows:
      *   POST /api/human-steps/:id/override {note?} — Accept anyway: passed, the owner's, unverified
      *   POST /api/human-steps/:id/rewrite  {note?} — withdraw it; its raiser is resumed to send a new version
+     *   POST /api/human-steps/:id/undo     {} — turn-by-turn phase 5: a running check taken back; the item
+     *        returns to To do (or Redo), and a verdict arriving after it is dropped by its attempt
      *   POST /api/human-steps/suspected    {slug, phase} — phase 44: a silent lane's suspected
      *        person's turn made a step on a person's request (the inbox's silent row posts it)
      */
@@ -1620,7 +1655,7 @@ async function routeApi(
         return true;
       }
       if (req.method === 'GET' && rest.length === 1) {
-        const answer = service.turnExplain(rest[0]!);
+        const answer = await service.turnItemExplain(rest[0]!);
         if (answer.ok) json(res, 200, answer);
         else json(res, answer.status, { error: answer.error });
         return true;
@@ -1681,6 +1716,8 @@ async function routeApi(
                         : verb === 'evidence' ? service.attachHumanStepEvidence(id, body, moves)
                           : verb === 'override' ? await service.overrideHumanStep(id, body, moves)
                             : verb === 'rewrite' ? await service.rewriteHumanStep(id, body, moves)
+                              // Turn-by-turn phase 5: a running check taken back.
+                              : verb === 'undo' ? service.undoHumanStep(id, body, moves)
                               : verb === 'deny' ? await service.denyHumanStep(id, body, moves)
                                 : verb === 'convert' ? await service.convertHumanStep(id, body, moves)
                                   // The scoped grant (control-tower phase 149): the door
@@ -1695,7 +1732,7 @@ async function routeApi(
         json(res, status, rest2);
         return true;
       }
-      json(res, 405, { error: 'GET /api/human-steps, POST /api/human-steps/suspected, or POST /api/human-steps/:id/<open|check|snooze|cannot|dismiss|answer|decline|ask|evidence|override|rewrite|deny|convert|grant>' });
+      json(res, 405, { error: 'GET /api/human-steps, POST /api/human-steps/suspected, or POST /api/human-steps/:id/<open|check|snooze|cannot|dismiss|answer|decline|ask|evidence|override|rewrite|undo|deny|convert|grant>' });
       return true;
     }
 
@@ -3101,7 +3138,16 @@ async function routeApi(
 
         const id = typeof body.id === 'string' ? body.id.slice(0, 256) : '';
         if (!id) { json(res, 400, { error: 'pass {"id": "<inbox item id>"}' }); return true; }
-        json(res, 200, { ok: service.ackInbox(id, by) });
+        const ok = service.ackInbox(id, by);
+        // An item's option bound to the ack (turn-by-turn phase 5): `answer`
+        // names it, and its settled record moves the item to Done. A person's
+        // answer only: a session's or the supervisor's ack marks the row seen
+        // and moves nothing off a person's page.
+        const door = stampedDoor(req) ?? transportDoor(req, service.flags ?? {});
+        if (ok && typeof body.answer === 'string' && body.answer && !isAgentDoor(door.door)) {
+          await service.settleAnsweredRow(id, body.answer.slice(0, 80), by);
+        }
+        json(res, 200, { ok });
         return true;
       }
 
@@ -3418,6 +3464,9 @@ async function routeApi(
             return true;
           }
           const body = await readBody(req);
+          // The gate's Approve bound to an item names its run too (turn-by-turn phase 5).
+          const stale = await staleBinding(service, slug, body, 'gate');
+          if (stale) { json(res, 409, stale); return true; }
           const actor = actorOfRequest(req, service.flags, body);
           const outcome = await service.approveGate(slug, phase, {
             approve: body.approve !== false,
@@ -4059,6 +4108,12 @@ async function routeApi(
         const refusal = guardRun(req, service);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = await readBody(req);
+        // A bound option names the run it was raised for (turn-by-turn phase
+        // 5): a stale card never acts on the run that came after it.
+        if (verb !== 'start') {
+          const stale = await staleBinding(service, slug, body, verb);
+          if (stale) { json(res, 409, stale); return true; }
+        }
 
         // `POST /api/run/:slug/phase/:n/errand-answered {note}` — "Done —
         // continue" (control-tower phase 88, #124): a person answers the errand
@@ -4449,6 +4504,16 @@ async function routeApi(
           // #131): `continue` on the login the account answers now, or `move`
           // to a registered account that answers the identity the run started
           // on (`accountId`, else the first that does). Both resume the run.
+          // A phase's run request (turn-by-turn phase 6, #286): the ONE approval
+          // per run and act, answered as its item is — Approve takes the act.
+          case 'run-request': {
+            const actor = actorOfRequest(req, service.flags, body);
+            const result = await service.answerRunRequest(slug, body, { by: actor.by, actor: pressActor(actor) });
+            if (result.ok) { json(res, 200, result); return true; }
+            const { status, ...refused } = result;
+            json(res, status, refused);
+            return true;
+          }
           case 'identity': {
             const choice = body.choice === 'continue' || body.choice === 'move' ? body.choice : null;
             if (!choice) { json(res, 400, { error: 'pass {"choice": "continue"} or {"choice": "move", "accountId"?: "<id>"}' }); return true; }

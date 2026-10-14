@@ -96,7 +96,7 @@ import { grantRuleOf } from './permissions/grants.ts';
 import { GRANT_SCOPE_WORDS, riskOf } from '../shared/turn-model.js';
 import type { HumanStep } from './human-steps.ts';
 import { HUMAN_STEP_FOLDS, KIND_META, humanStepView, type HumanStepView } from '../shared/human-step-model.js';
-import { HALT_CATEGORY_LABELS, HUMAN_STEP_CATEGORY, categoryOfSituation, type HaltCategory } from '../shared/halt-categories.js';
+import { HALT_CATEGORY_LABELS, categoryOfSituation, humanStepCategory, type HaltCategory } from '../shared/halt-categories.js';
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -112,7 +112,12 @@ import { phaseHref, planHref, toHash } from '../shared/routes.js';
 import { OPERATOR_ISSUE_SCOPE } from '../shared/issues-model.js';
 import { parseSituationKey, situationLabel } from '../shared/situation-model.js';
 import { isPersonErrand } from '../shared/recovery-model.js';
-import { itemOfErrand, ledgerTurn, turnOf, type TurnView } from './turn/fold.ts';
+import { itemOfErrand, ledgerTurn, turnOf, withRowWords, type TurnView } from './turn/fold.ts';
+import { isRunRequestOf } from './turn/run-requests.ts';
+import {
+  actTitle, composeErrandTitle, composeStepRow, boundToRun, gateOption, identityAsk, stepGateOf, supervisorTitle, type ApprovalBlock, type AskFacts, type TurnOption,
+} from './turn/compose.ts';
+import { askFor, askOptionsFor, type BoundAskOption } from './runner/ladder.ts';
 import { isLiveStatus } from '../shared/status-vocab.js';
 import { ISOLATED, pairKey } from '../shared/worktree-model.js';
 import { INSTANCE_STATE_DIR } from './config.ts';
@@ -206,6 +211,12 @@ export type InboxItem = {
    * however long it takes.
    */
   expiresAt?: string;
+  /**
+   * ISO 8601 — when a person's act stops being open: a human step's window
+   * (turn-by-turn phase 3, #341). Never a countdown to an answer by rule —
+   * that is `expiresAt`, a relayed question's alone — and never a deadline.
+   */
+  openUntil?: string;
   actions: InboxAction[];
   /** Where in the console it lives. */
   href: string;
@@ -247,6 +258,21 @@ export type InboxItem = {
    * parsing a sentence. Only on a `supervisor` row.
    */
   supervisor?: InboxSupervisorView;
+  /**
+   * The ways on, each bound to the verb that takes it (turn-by-turn phase 4):
+   * an errand's from its situation's ASK, a conflict's, a QA verdict's, a
+   * relayed question's and a session's ask — at most one recommended. The
+   * row's `actions` stay what its buttons press.
+   */
+  options?: TurnOption[];
+  /**
+   * The approval block of a row that is a yes or a no (turn-by-turn phase 4):
+   * a gate, a plan to approve, a permission card, a supervisor's suggestion —
+   * what it is, who asked, what approving does and what denying leaves.
+   */
+  approval?: ApprovalBlock;
+  /** The situation's card words on an errand row (`runner/ladder.ts` `askFor`) — the act, its steps, its check. */
+  ask?: AskFacts;
 };
 
 /** What a `supervisor` row carries of its card — see `InboxItem.supervisor`. */
@@ -288,6 +314,8 @@ export type InboxErrand = {
   step?: { kind: string; act?: string; path?: string };
   /** The ledger item the errand IS (`Errand.stepId`, control-tower phase 132). */
   stepId?: string;
+  /** An identity park's two logins (`Errand.identity`, turn-by-turn phase 4). */
+  identity?: { was: string; now: string };
 };
 
 /**
@@ -773,7 +801,21 @@ export type InboxSupervisorCard = {
   cap?: { ok?: false; cap: string; limit: number; count: number };
   /** The item an escalation was raised as (control-tower phase 136) — its row is the item's own. */
   item?: string;
+  /** An escalation's in-app press, when its verb has no CLI line (turn-by-turn phase 4). */
+  action?: EscalationAction | null;
 };
+
+/** An escalation's in-app press: its label, and the route with the body it needs. */
+export type EscalationAction = { label: string; method: 'POST'; endpoint: string; body?: Record<string, unknown> };
+
+/** An escalation's press as a row's action — gated by --allow-run, like every run verb. */
+function escalationAction(action: EscalationAction, flags: InboxFacts['flags']): InboxAction {
+  return {
+    verb: 'escalation-act', label: action.label, endpoint: action.endpoint, method: action.method,
+    ...(action.body ? { body: action.body } : {}),
+    ...gatedBy('run', flags?.allowRun),
+  };
+}
 
 /** One issue draft, narrowed to what its row is decided from — `pro/issues/drafts.ts`'s `IssueDraft` is one. */
 export type InboxIssueDraft = {
@@ -941,15 +983,65 @@ type Draft = Omit<InboxItem, 'id' | 'ack'> & { subject?: string };
 
 function mint(draft: Draft): InboxItem {
   const { subject, ...wire } = draft;
+  const id = inboxItemId({
+    kind: draft.kind,
+    ...(draft.slug ? { slug: draft.slug } : {}),
+    ...(draft.phase != null ? { phase: draft.phase } : {}),
+    ...(draft.runId ? { runId: draft.runId } : {}),
+    ...(subject ? { subject } : {}),
+  });
+  // An option that marks the row seen names the row by its id, which only
+  // exists once it is minted (`ackOption`).
+  const options = wire.options?.map((option) => {
+    const own = option.verb.body as { id?: unknown } | undefined;
+    const minted = own?.id === ROW_ID ? { ...option, verb: { ...option.verb, body: { ...own, id } } } : option;
+    return { ...minted, verb: boundToRun(minted.verb, draft) };
+  });
+  const actions = wire.actions.map((action) => boundToRun(action, draft));
+  return { id, ...wire, actions, ...(options ? { options } : {}) };
+}
+
+
+
+/** The placeholder an option's body carries for the row's own id, filled by `mint`. */
+const ROW_ID = ':id';
+
+/**
+ * An option that does nothing but mark the row seen — the way on when the
+ * act happens somewhere the console cannot reach (a foreign terminal, a
+ * conflict left for when the branches meet).
+ */
+function ackOption(id: string, label: string, consequence: string): TurnOption {
+  // `answer` names the option (turn-by-turn phase 5): the ack route keeps a
+  // settled record for it, so the item moves to Done rather than standing.
+  return { id, label, consequence, verb: { method: 'POST', endpoint: '/api/inbox/ack', body: { id: ROW_ID, answer: id } } };
+}
+
+/** The flag an action needs, from its option's word. */
+function optionFlag(flag: BoundAskOption['flag'], flags: InboxFacts['flags']): { flag?: string } {
+  if (flag === null) return {};
+  if (flag === 'writes') return gatedBy('writes', flags?.allowWrites);
+  return gatedBy('run', flags?.allowRun);
+}
+
+/** A bound option as the row's action — the same press, the button's words. */
+function actionOfOption(option: TurnOption): InboxAction {
   return {
-    id: inboxItemId({
-      kind: draft.kind,
-      ...(draft.slug ? { slug: draft.slug } : {}),
-      ...(draft.phase != null ? { phase: draft.phase } : {}),
-      ...(draft.runId ? { runId: draft.runId } : {}),
-      ...(subject ? { subject } : {}),
-    }),
-    ...wire,
+    verb: option.id, label: option.label, endpoint: option.verb.endpoint, method: option.verb.method,
+    ...(option.verb.body !== undefined ? { body: option.verb.body } : {}),
+    ...(option.says ? { says: option.says } : {}),
+    ...(option.flag ? { flag: option.flag } : {}),
+  };
+}
+
+/** An action as an option — the same press, with what choosing it does. */
+function optionOfAction(action: InboxAction, consequence: string, recommended = false): TurnOption {
+  return {
+    id: action.verb, label: action.label, consequence,
+    ...(recommended ? { recommended: true } : {}),
+    verb: { method: action.method, endpoint: action.endpoint, ...(action.body !== undefined ? { body: action.body } : {}) },
+    ...(action.says ? { says: action.says } : {}),
+    ...(action.flag ? { flag: action.flag } : {}),
   };
 }
 
@@ -1077,7 +1169,6 @@ function errandDrafts(facts: InboxFacts): Draft[] {
     for (const errand of errands) {
       const { id, sub } = parseSituationKey(errand.situation);
       const auth = id === 'resource-wall' && sub === 'auth';
-      const mcp = id === 'mcp-unavailable' || mcpParked;
       const phase = positivePhase(errand.phase);
       // A plan a plan-mode phase presented and a person has not decided
       // (control-tower phase 11, #34): the row carries the two answers, live
@@ -1108,6 +1199,28 @@ function errandDrafts(facts: InboxFacts): Draft[] {
       // The ledger item this errand IS (control-tower phase 132, #209): its
       // row presses that item — one item, one done path.
       const item = planPending ? undefined : errandItemOf(facts, run, errand, phase ?? null);
+      // The identity park (turn-by-turn phase 4): the run's account answers
+      // another login now, and the person chooses — continue on it, or move
+      // the run to a profile of the login it started on. Two options, both
+      // bound to the run's identity verb, and nothing else: a sign-in, a
+      // re-check or a dismiss would each answer a question nobody asked.
+      const identity = auth && !planPending && !unlanded && run.halt?.kind === 'identity-changed'
+        ? identityAsk(run.slug, errand.identity?.was, errand.identity?.now)
+        : null;
+      // The situation's card words and ways on (turn-by-turn phase 4): ONE
+      // table, the ladder's ASKS — the act, its steps, its check, and the
+      // options bound to their verbs, which the row's actions derive from.
+      // A run the MCP preflight parked offers its servers' way on, whatever
+      // the errand's situation — save a person's own errand, which they answer.
+      const askKey = mcpParked && !isPersonErrand(errand.situation) ? 'mcp-unavailable' : errand.situation;
+      // An errand a ledger item stands behind says the ITEM's words and verbs.
+      const ask = identity ? identity.ask : planPending || unlanded || item ? null : askFor(askKey);
+      const options: TurnOption[] = identity
+        ? identity.options
+        : planPending || unlanded || item
+          ? []
+          : askOptionsFor(askKey, { slug: run.slug, phase: phase ?? null, live })
+            .map(({ flag, ...option }) => ({ ...option, ...optionFlag(flag, flags) }));
       out.push({
         kind: 'errand',
         severity: 'needs-you',
@@ -1115,9 +1228,11 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         slug: run.slug,
         ...(phase != null ? { phase } : {}),
         runId: run.id,
+        // The act (turn-by-turn phase 3): the item's own title when one stands
+        // behind the errand, else what the errand's need names, and where.
         title: unlanded
           ? `${run.slug} — ${errand.need.replace(/\.$/, '')}`
-          : `${run.slug} — ${phase != null ? `phase ${phase} needs you` : 'needs you'}`,
+          : item ? actTitle(item.title) : composeErrandTitle(errand, run.slug, phase, ask),
         ...(unlanded ? { category: { word: 'conflict' as const, label: HALT_CATEGORY_LABELS.conflict } } : familyOf(errand.situation)),
         need: errand.need,
         how: tree
@@ -1127,6 +1242,17 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         ...(errand.tried?.length ? { tried: [...errand.tried] } : {}),
         humanStep: errandStep(errand, phase, planPending),
         ...(item ? { turn: ledgerTurn(item) } : {}),
+        ...(ask ? { ask } : {}),
+        ...(options.length ? { options } : {}),
+        // A plan a plan-mode phase presented is a yes or a no.
+        ...(planPending ? {
+          approval: {
+            what: `The plan Phase ${phase} of ${run.slug} presented, before it acts`,
+            askedBy: `The session of Phase ${phase} of ${run.slug}`,
+            ifApproved: 'The session carries the plan out as written',
+            ifDenied: 'The session is told your reason, and does not carry the plan out as written',
+          },
+        } : {}),
         since: stableSince(errand.at, run.halt?.at, run.updatedAt),
         href: planHref(run.slug, 'run'),
         actions: [
@@ -1169,90 +1295,23 @@ function errandDrafts(facts: InboxFacts): Draft[] {
                   ...gatedBy('run', flags.allowRun),
                 },
               ]
-          // Signing in first, because continuing before it is a session that
-          // reports success, spends a turn and changes nothing.
-          : auth
-            ? [
-                {
-                  verb: 'login',
-                  label: 'Open a sign-in terminal',
-                  endpoint: '/api/auth/login',
-                  method: 'POST' as const,
-                  ...gatedBy('run', flags.allowRun),
-                },
-                {
-                  verb: 'recheck',
-                  label: 'Check again',
-                  endpoint: '/api/accounts/refresh',
-                  method: 'POST' as const,
-                },
-              ]
-            // A person's ask is answered by the person (control-tower phase
-            // 88, #124). When an item stands behind it (phase 132, #209) the
-            // answer is *I've done this — check* on that item: the step ends
-            // proven and resumes the session, never withdrawn as dismissed.
-            : phase != null && isPersonErrand(errand.situation) && item
-              ? (item.kind === 'permission' ? permissionItemActions(item.id, item) : errandItemActions(item.id))
-            // With none, "Done — continue" records the answer and its note and
-            // re-boards the phase. Recover re-derived the same ask from the
-            // session's stale declaration and read as broken.
-            : phase != null && isPersonErrand(errand.situation)
-              ? [
-                  {
-                    verb: 'errand-answered',
-                    label: 'Done — continue',
-                    endpoint: `/api/run/${encodeURIComponent(run.slug)}/phase/${phase}/errand-answered`,
-                    method: 'POST' as const,
-                    says: { field: 'note', label: 'Note', placeholder: 'What you did (optional)' },
-                    ...gatedBy('run', flags.allowRun),
-                  },
-                ]
-            : live
-              // Recover refuses a live run and Dismiss would resolve one, so
-              // neither is offered — but "I did what it asked, look again" is
-              // true in both states and is the only verb that is. It re-reads
-              // the board and stands down what the errand settled; on a live
-              // run that is exactly what a person wants after doing the thing.
-              // Without it the one pointer to a QA hold sat there for sixteen
-              // hours with no button at all while its run drove on around it.
-              ? [
-                  {
-                    verb: 'recheck',
-                    label: 'I did it — look again',
-                    endpoint: runVerb(run.slug, 'recheck'),
-                    method: 'POST' as const,
-                    // `recheck` is a PHASE verb (`recoverPhase`), so the body
-                    // carries the phase. A live-run errand always has one —
-                    // the filter above keeps only phase-level errands while a
-                    // run is live — but the fallback is explicit rather than a
-                    // `!` that would send `NaN` if that ever changed.
-                    body: { phase: phase ?? 0 },
-                    ...gatedBy('run', flags.allowRun),
-                  },
-                ]
-            : mcp
-              ? [
-                  {
-                    verb: 'mcp-continue',
-                    label: 'Continue without these servers',
-                    endpoint: runVerb(run.slug, 'mcp-continue'),
-                    method: 'POST' as const,
-                    ...gatedBy('run', flags.allowRun),
-                  },
-                ]
-              : [
-                  // "I did what it asked — look again": it re-reads the board,
-                  // stands down what the errand settled, and continues or
-                  // climbs whatever is left.
-                  {
-                    verb: 'recover',
-                    label: 'Recover & continue',
-                    endpoint: runVerb(run.slug, 'recover'),
-                    method: 'POST' as const,
-                    ...gatedBy('run', flags.allowRun),
-                  },
-                ]),
-          ...(live ? [] : [dismissAction(run)]),
+          // A person's ask is answered by the person (control-tower phase
+          // 88, #124). When an item stands behind it (phase 132, #209) the
+          // answer is *I've done this — check* on that item: the step ends
+          // proven and resumes the session, never withdrawn as dismissed.
+          : !identity && phase != null && isPersonErrand(errand.situation) && item
+            ? (item.kind === 'permission' ? permissionItemActions(item.id, item) : gateBoundActions(item, flags) ?? errandItemActions(item.id))
+            // Every other errand's buttons ARE its options (turn-by-turn
+            // phase 4): the ASK row's ways on, bound where the errand stands —
+            // signing in first on an auth wall, because continuing before it
+            // is a session that reports success and changes nothing; "Done —
+            // continue" on a person's own errand, which records the answer
+            // and re-boards the phase; "I did it — look again" on a live run,
+            // which Recover refuses; Continue without these servers on an MCP
+            // park; Recover & continue on any other stop.
+            : options.map(actionOfOption)),
+          // An identity park offers its two options and nothing else.
+          ...(live || identity ? [] : [dismissAction(run)]),
         ],
       });
     }
@@ -1392,6 +1451,9 @@ function approvalDrafts(facts: InboxFacts): Draft[] {
             title: approval.title || 'Check it by eye', lines: [approval.detail],
           })
           : undefined,
+        // Every card here is a yes or a no (turn-by-turn phase 4): what is
+        // asked, by whom, and what each answer does.
+        approval: approvalBlockOf(approval, phase ?? null),
         since: stableSince(approval.createdAt),
         expiresAt: approval.expiresAt,
         href: approval.slug ? planHref(approval.slug, 'run') : toHash(routeFor('approval')),
@@ -1410,6 +1472,38 @@ function approvalDrafts(facts: InboxFacts): Draft[] {
         ],
       };
     });
+}
+
+/**
+ * A permission card's or a verification card's approval block: the call (or
+ * the check), the session that asked, and what Allow and Deny each do — a
+ * standing card strikes its rule for the plan, a converted one grants the one
+ * call, a live one lets the call run once.
+ */
+function approvalBlockOf(
+  approval: Pick<InboxApproval, 'kind' | 'title' | 'slug' | 'standing' | 'converted' | 'onTimeout'>, phase: number | null,
+): ApprovalBlock {
+  const who = approval.slug
+    ? `The session of ${phase != null ? `Phase ${phase} of ${approval.slug}` : `the plan ${approval.slug}`}`
+    : 'A session on this console';
+  if (approval.kind === 'verify') {
+    return {
+      what: approval.title || 'A check by eye the session cannot make',
+      askedBy: who,
+      ifApproved: 'You confirm it holds, and the phase goes on',
+      ifDenied: 'The phase is told it does not hold',
+    };
+  }
+  return {
+    what: approval.title || 'A tool call the session wants to make',
+    askedBy: who,
+    ifApproved: approval.standing
+      ? "The rule is struck for this plan and the phase's own session resumes"
+      : approval.converted
+        ? 'The phase resumes with this one call granted once'
+        : 'The call runs, once, and the session goes on',
+    ifDenied: `The session is told to find another way${approval.onTimeout ? ` — and if nobody answers, it ${approval.onTimeout}` : ''}`,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1435,7 +1529,16 @@ function questionDrafts(facts: InboxFacts): Draft[] {
     const answered = approval.question.answers ?? {};
     for (const item of approval.question.items) {
       if (answered[item.key]) continue;
-      const silence = recommendedOption(item.options) ?? item.options[0]?.label;
+      const marked = recommendedOption(item.options);
+      const silence = marked ?? item.options[0]?.label;
+      const actions: InboxAction[] = item.options.map((option, index) => ({
+        verb: `answer-${index + 1}`,
+        label: option.label.slice(0, 80),
+        endpoint: runVerb(approval.slug!, 'answer'),
+        method: 'POST' as const,
+        body: { approvalId: approval.id, key: item.key, label: option.label },
+        ...gatedBy('run', flags.allowRun),
+      }));
       out.push({
         kind: 'question',
         severity: 'urgent',
@@ -1453,14 +1556,14 @@ function questionDrafts(facts: InboxFacts): Draft[] {
         since: stableSince(approval.createdAt),
         ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}),
         href: planHref(approval.slug, 'run'),
-        actions: item.options.map((option, index) => ({
-          verb: `answer-${index + 1}`,
-          label: option.label.slice(0, 80),
-          endpoint: runVerb(approval.slug!, 'answer'),
-          method: 'POST' as const,
-          body: { approvalId: approval.id, key: item.key, label: option.label },
-          ...gatedBy('run', flags.allowRun),
-        })),
+        actions,
+        // Its options, the one the session marked recommended named — never
+        // the first made primary by its place (turn-by-turn phase 4).
+        options: actions.map((action, index) => optionOfAction(
+          action,
+          item.options[index]?.description || `The session is answered "${item.options[index]?.label ?? action.label}" and goes on.`,
+          Boolean(marked) && item.options[index]?.label === marked,
+        )),
       });
     }
   }
@@ -1526,6 +1629,17 @@ function sessionAskDrafts(facts: InboxFacts): Draft[] {
           : 'Go to the terminal it is running in and answer the prompt — the console cannot answer for it.',
         since: stableSince(session.waiting?.since),
         href: toHash(routeFor('session-ask')),
+        // Its ways on (turn-by-turn phase 4): a lane is answered from here,
+        // in your words; any other session in its own terminal.
+        options: lane
+          ? [{
+            id: 'steer', label: 'Answer it from here', recommended: true,
+            consequence: 'Your words reach the session as an instruction for the rest of the phase.',
+            verb: { method: 'POST' as const, endpoint: runVerb(lane.slug, 'steer'), body: { phase: lane.phase } },
+            says: { field: 'instruction', label: 'Your answer', placeholder: 'What the session should do' },
+            ...gatedBy('run', facts.flags?.allowRun),
+          }, ackOption('terminal', "I'll answer it in its terminal", 'The console marks this seen; you answer the prompt where the session runs.')]
+          : [ackOption('terminal', "I'll answer it in its terminal", 'The console cannot answer for it; this marks it seen, and you answer the prompt where the session runs.')],
         actions: lane
           ? [{
             verb: 'steer',
@@ -1556,6 +1670,107 @@ function sessionAskDrafts(facts: InboxFacts): Draft[] {
  * dedupe by id, because the ids genuinely differ.
  */
 const ISSUE_KINDS_OWNED_ELSEWHERE = new Set(['qa-fail', 'stale-lock']);
+
+/** What choosing each QA road does — the option's consequence. */
+const QA_CONSEQUENCES: Readonly<Record<string, string>> = Object.freeze({
+  'qa-recover': 'A fix session reads the report, then a fresh review records the next round.',
+  'qa-rerun': 'A fresh review runs and records its verdict — for a verdict owed, or one that failed on the environment.',
+  'qa-waive': 'The QA table records waived with your reason, and the phases that wait on it may board.',
+});
+
+/** A QA row's buttons — the session, then fix → re-review → waive, cheapest belief first (issue #11). */
+function qaRowActions(slug: string, phase: number, failed: boolean, mode: string, flags: NonNullable<InboxFacts['flags']>): InboxAction[] {
+  return [
+    {
+      verb: 'qa-session',
+      label: 'Start a QA session',
+      endpoint: '/api/terminal',
+      method: 'POST',
+      // `kind` is NOT optional here, even though the route defaults it.
+      // A mint with no kind is a SHELL mint, and a shell mint never
+      // reaches parseQaRequest/resolveQa/buildAgentLaunch — it drops
+      // `intent` on the floor and hands back a bare `$SHELL -l` while
+      // the toast says "done", so the phase goes unreviewed. It is also
+      // what makes the gate below true: a claude mint is guarded by
+      // `guardAgent` (--allow-agent, the flag the QA launcher names
+      // too), a shell mint by --allow-terminal, which this row does not
+      // claim.
+      body: { kind: 'claude', intent: 'qa', slug: slug, phase: phase },
+      ...gatedBy('agent', flags.allowAgent),
+    },
+    // There is deliberately no one-press "Record a verdict" here. There
+    // was, and it could not work: the body carried neither `result` nor
+    // `report`, both of which `writes.ts` requires, so every press
+    // answered with a WriteError — on the one row an operator reaches
+    // for when a QA verdict has wedged their plan. It cannot be fixed by
+    // filling the fields in either: pass, fail and waived are a
+    // judgement, and a button that picks one for you is worse than no
+    // button. The verdict form lives on the phase page, which is where
+    // `href` points and what `how` now names.
+    // The three QA-recovery verbs (issue #11). Before them this row
+    // offered one thing — "start a QA session" — which is the right
+    // answer to a PENDING verdict and the wrong one to a failed one: a
+    // review of unfixed code fails again, and the ladder's own `qa-fix`
+    // rung had already spent its caps proving it. `Fix & re-QA` is the
+    // loop with settings of its own; `Re-run QA` is the review alone,
+    // for a verdict that failed on the environment rather than the
+    // work; `Waive` is the decision, and it is the one of the three
+    // that carries the operator's own words.
+    //
+    // Ordered fix → re-review → waive, cheapest BELIEF first: "the work
+    // is wrong", then "the review was wrong", then "the finding does
+    // not apply". `Fix & re-QA` is offered only on a `fail`, because a
+    // pending verdict names no findings for a fix session to read.
+    ...(failed
+      ? [
+          {
+            verb: 'qa-recover',
+            label: 'Fix & re-QA',
+            endpoint: runVerb(slug, 'qa-recover'),
+            method: 'POST' as const,
+            body: { phase: phase },
+            ...gatedBy('run', flags.allowRun),
+          },
+        ]
+      : []),
+    {
+      verb: 'qa-rerun',
+      label: 'Re-run QA',
+      endpoint: runVerb(slug, 'qa-rerun'),
+      method: 'POST' as const,
+      body: { phase: phase },
+      ...gatedBy('run', flags.allowRun),
+    },
+    {
+      verb: 'qa-waive',
+      label: 'Waive with a reason',
+      endpoint: planVerb(slug, 'qa-waive'),
+      method: 'POST' as const,
+      body: { phase: phase },
+      // The one action on this row that takes the operator's own words,
+      // and it must: a waiver with no reason is a plan forgetting what
+      // it decided not to fix. The server refuses one without it.
+      says: {
+        field: 'reason',
+        label: 'Why this is waived',
+        placeholder: 'what does not apply, and why',
+      },
+      ...gatedBy('writes', flags.allowWrites),
+    },
+    ...(mode === 'on'
+      ? []
+      : [
+          {
+            verb: 'qa-mode',
+            label: 'Turn QA on for this plan',
+            endpoint: planVerb(slug, 'qa-mode'),
+            method: 'POST' as const,
+            body: { phase: phase },
+            ...gatedBy('writes', flags.allowWrites),
+          },
+        ]),
+  ];
+}
 
 function planDrafts(facts: InboxFacts): Draft[] {
   const out: Draft[] = [];
@@ -1629,6 +1844,14 @@ function planDrafts(facts: InboxFacts): Draft[] {
             kind: HUMAN_STEP_FOLDS.gate, fold: 'gate', title: `Clear the gate on ${plan.slug} phase ${phase.phase}`,
             lines: [phase.gate.detail, phase.gateCheck ? `What it checks: ${phase.gateCheck}` : null],
           }),
+          // A gate is a yes or a no (turn-by-turn phase 4): what it opens, who
+          // set it, and what each answer does — never its check command.
+          approval: {
+            what: `Open the gate on Phase ${phase.phase} of ${plan.slug}`,
+            askedBy: `The plan ${plan.slug} — its gate needs a person`,
+            ifApproved: `The gate opens, Phase ${phase.phase} boards and the run continues`,
+            ifDenied: `Leave it shut: Phase ${phase.phase} does not board until the gate is approved`,
+          },
           since: planSince,
           href: phaseHref(plan.slug, phase.phase),
           actions: [
@@ -1666,6 +1889,14 @@ function planDrafts(facts: InboxFacts): Draft[] {
         // resting state, not an ask.
         const pending = row.result === 'pending' && gates && stateOf.get(row.phase) === 'done';
         if (!failed && !pending) continue;
+        const qaActions = qaRowActions(plan.slug, row.phase, failed, mode, flags);
+        // Its options (turn-by-turn phase 4): the three verdict roads, the
+        // cheapest belief first, one recommended — the fix on a fail, the
+        // review on a pending verdict.
+        const qaOption = (verb: string): TurnOption | null => {
+          const action = qaActions.find((candidate) => candidate.verb === verb);
+          return action ? optionOfAction(action, QA_CONSEQUENCES[verb] ?? action.label, verb === (failed ? 'qa-recover' : 'qa-rerun')) : null;
+        };
         out.push({
           kind: 'qa',
           // `subject` is the RESULT, so pending → fail re-raises with a new id:
@@ -1709,96 +1940,8 @@ function planDrafts(facts: InboxFacts): Draft[] {
           }),
           since: planSince,
           href: phaseHref(plan.slug, row.phase),
-          actions: [
-            {
-              verb: 'qa-session',
-              label: 'Start a QA session',
-              endpoint: '/api/terminal',
-              method: 'POST',
-              // `kind` is NOT optional here, even though the route defaults it.
-              // A mint with no kind is a SHELL mint, and a shell mint never
-              // reaches parseQaRequest/resolveQa/buildAgentLaunch — it drops
-              // `intent` on the floor and hands back a bare `$SHELL -l` while
-              // the toast says "done", so the phase goes unreviewed. It is also
-              // what makes the gate below true: a claude mint is guarded by
-              // `guardAgent` (--allow-agent, the flag the QA launcher names
-              // too), a shell mint by --allow-terminal, which this row does not
-              // claim.
-              body: { kind: 'claude', intent: 'qa', slug: plan.slug, phase: row.phase },
-              ...gatedBy('agent', flags.allowAgent),
-            },
-            // There is deliberately no one-press "Record a verdict" here. There
-            // was, and it could not work: the body carried neither `result` nor
-            // `report`, both of which `writes.ts` requires, so every press
-            // answered with a WriteError — on the one row an operator reaches
-            // for when a QA verdict has wedged their plan. It cannot be fixed by
-            // filling the fields in either: pass, fail and waived are a
-            // judgement, and a button that picks one for you is worse than no
-            // button. The verdict form lives on the phase page, which is where
-            // `href` points and what `how` now names.
-            // The three QA-recovery verbs (issue #11). Before them this row
-            // offered one thing — "start a QA session" — which is the right
-            // answer to a PENDING verdict and the wrong one to a failed one: a
-            // review of unfixed code fails again, and the ladder's own `qa-fix`
-            // rung had already spent its caps proving it. `Fix & re-QA` is the
-            // loop with settings of its own; `Re-run QA` is the review alone,
-            // for a verdict that failed on the environment rather than the
-            // work; `Waive` is the decision, and it is the one of the three
-            // that carries the operator's own words.
-            //
-            // Ordered fix → re-review → waive, cheapest BELIEF first: "the work
-            // is wrong", then "the review was wrong", then "the finding does
-            // not apply". `Fix & re-QA` is offered only on a `fail`, because a
-            // pending verdict names no findings for a fix session to read.
-            ...(failed
-              ? [
-                  {
-                    verb: 'qa-recover',
-                    label: 'Fix & re-QA',
-                    endpoint: runVerb(plan.slug, 'qa-recover'),
-                    method: 'POST' as const,
-                    body: { phase: row.phase },
-                    ...gatedBy('run', flags.allowRun),
-                  },
-                ]
-              : []),
-            {
-              verb: 'qa-rerun',
-              label: 'Re-run QA',
-              endpoint: runVerb(plan.slug, 'qa-rerun'),
-              method: 'POST' as const,
-              body: { phase: row.phase },
-              ...gatedBy('run', flags.allowRun),
-            },
-            {
-              verb: 'qa-waive',
-              label: 'Waive with a reason',
-              endpoint: planVerb(plan.slug, 'qa-waive'),
-              method: 'POST' as const,
-              body: { phase: row.phase },
-              // The one action on this row that takes the operator's own words,
-              // and it must: a waiver with no reason is a plan forgetting what
-              // it decided not to fix. The server refuses one without it.
-              says: {
-                field: 'reason',
-                label: 'Why this is waived',
-                placeholder: 'what does not apply, and why',
-              },
-              ...gatedBy('writes', flags.allowWrites),
-            },
-            ...(mode === 'on'
-              ? []
-              : [
-                  {
-                    verb: 'qa-mode',
-                    label: 'Turn QA on for this plan',
-                    endpoint: planVerb(plan.slug, 'qa-mode'),
-                    method: 'POST' as const,
-                    body: { phase: row.phase },
-                    ...gatedBy('writes', flags.allowWrites),
-                  },
-                ]),
-          ],
+          options: ['qa-recover', 'qa-rerun', 'qa-waive'].map(qaOption).filter((option): option is TurnOption => option !== null),
+          actions: qaActions,
         });
       }
     }
@@ -3302,6 +3445,14 @@ function conflictDrafts(facts: InboxFacts): Draft[] {
         // plan when neither does.
         href: target ? planHref(target.slug, 'run') : toHash('runs'),
         actions,
+        // Its options (turn-by-turn phase 4): serialize the run that can
+        // move, or leave the two and resolve the conflict once.
+        options: [
+          ...actions.map((action) => optionOfAction(
+            action, 'The run drops its own checkout and waits its turn in the shared one, so the two stop editing the same files at once.', true,
+          )),
+          ackOption('leave', 'Leave them, and resolve the conflict when the branches meet', 'Nothing moves now; the conflict is resolved once, when the branches meet. This marks it seen.'),
+        ],
       });
     }
   }
@@ -3484,7 +3635,7 @@ function messageDrafts(facts: InboxFacts): Draft[] {
 export type InboxHumanStep = Pick<
   HumanStep, 'id' | 'kind' | 'title' | 'where' | 'slug' | 'phase' | 'runId' | 'declaredAt' | 'until'
   | 'openUrl' | 'openCommand' | 'proof' | 'code' | 'lines'
-> & Partial<Pick<HumanStep, 'state' | 'birth' | 'dueWhen' | 'dueAt' | 'why' | 'proofType' | 'proofWords' | 'source' | 'permission'>>;
+> & Partial<Pick<HumanStep, 'state' | 'birth' | 'dueWhen' | 'dueAt' | 'why' | 'proofType' | 'proofWords' | 'source' | 'permission' | 'options'>>;
 
 /**
  * A person's turn (control-tower phase 41): one `needs-you` row per open
@@ -3547,6 +3698,23 @@ export function permissionItemActions(id: string, step: Pick<InboxHumanStep, 'pe
 }
 
 /**
+ * A gate-bound item's verbs (turn-by-turn phase 5): its proof reads a gate's
+ * row, so its press is that gate's Approve — through the person's door, the
+ * run carried on — never *check* or an answer, which once proved it while the
+ * gate stayed shut. *Snooze* and *I can't do this* stand as for any item.
+ * Null for an item no gate binds, or one whose gate names no phase.
+ */
+function gateBoundActions(step: Pick<InboxHumanStep, 'id' | 'proof' | 'title' | 'slug'>, flags: InboxFacts['flags']): InboxAction[] | null {
+  const gate = stepGateOf(step);
+  if (gate?.phase == null) return null;
+  const option = gateOption(step.slug, gate.phase);
+  return [
+    { ...actionOfOption(option), ...gatedBy('writes', flags?.allowWrites) },
+    ...humanStepActions(step.id).filter((action) => action.verb !== 'check'),
+  ];
+}
+
+/**
  * A person errand's row when an item stands behind it (control-tower phase
  * 132): the item's own verbs — since phase 137 every check carries the one
  * wording, so the errand's row and the step's are the same three.
@@ -3579,11 +3747,16 @@ function humanStepDrafts(facts: InboxFacts): Draft[] {
     if (phase == null && !own) continue;
     const meta = KIND_META[step.kind];
     if (!meta) continue;
-    const open = step.openUrl ? `open ${step.openUrl}` : step.openCommand ? `run \u0060${step.openCommand}\u0060` : '';
-    const scope = own ? `${step.slug} (the plan's own)` : `${step.slug} phase ${phase}`;
     // *Coming up* (control-tower phase 121, #182): an act born before it is
     // due is shown, never a summons — it becomes one when its ref lands.
     const upcoming = step.state === 'upcoming';
+    // The family it lights on the Tower's annunciator (control-tower phase 42):
+    // an `operator-act` by its REASON (phase 130), every other kind by its kind
+    // — a plan's act at the machine (`why: physical`) is the environment (turn-by-turn phase 1).
+    const family = humanStepCategory(step.kind, step.why);
+    // The words are the composer's (turn-by-turn phase 3): the act as the
+    // title, why only the person fits it, where and how — the proof in words.
+    const words = composeStepRow(step);
     out.push({
       kind: 'human-step',
       severity: upcoming ? 'fyi' : 'needs-you',
@@ -3591,16 +3764,10 @@ function humanStepDrafts(facts: InboxFacts): Draft[] {
       slug: step.slug,
       ...(phase != null ? { phase } : {}),
       ...(step.runId ? { runId: step.runId } : {}),
-      title: `${upcoming ? 'Coming up' : 'Your turn'} — ${meta.label.toLowerCase()} for ${scope}`,
-      // The family its kind lights on the Tower's annunciator (control-tower phase 42).
-      ...(HUMAN_STEP_CATEGORY[step.kind]
-        ? { category: { word: HUMAN_STEP_CATEGORY[step.kind]!, label: HALT_CATEGORY_LABELS[HUMAN_STEP_CATEGORY[step.kind]!] } }
-        : {}),
-      need: `${step.title}${step.code ? ` — code ${step.code}` : ''}`,
-      how: `${upcoming && step.dueWhen ? `Not yet — due when ${step.dueWhen} lands; then, ` : ''}`
-        + `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}${open ? `: ${open}` : ''}`
-        + `${step.lines?.length ? ` (${step.lines.map((line, i) => `${i + 1}. ${line}`).join(' ')})` : ''}`
-        + `. ${step.proof ? `${step.proof} proves it` : `What proves it: ${meta.proof}`}; when it is done, press I did it — check.`,
+      title: words.title,
+      category: { word: family, label: HALT_CATEGORY_LABELS[family] },
+      need: words.need,
+      how: words.how,
       humanStep: humanStepView({
         kind: step.kind, title: step.title, where: step.where, state: step.state, stepId: step.id,
         ...(step.lines ? { lines: step.lines } : {}),
@@ -3614,12 +3781,25 @@ function humanStepDrafts(facts: InboxFacts): Draft[] {
       // A step that came due is a new summons: an ack given to its *Coming up*
       // row is older than this, so it no longer hides the row (phase 121).
       since: !upcoming && step.dueAt ? step.dueAt : step.declaredAt,
-      ...(step.until ? { expiresAt: step.until } : {}),
+      // Its window is when the act stops being open — never a relayed
+      // question's countdown to an answer by rule (#341).
+      ...(step.until ? { openUntil: step.until } : {}),
       href: phase != null ? phaseHref(step.slug, phase) : planHref(step.slug),
-      actions: step.kind === 'permission' ? permissionItemActions(step.id, step) : humanStepActions(step.id),
+      actions: [
+        ...(step.kind === 'permission' ? permissionItemActions(step.id, step) : gateBoundActions(step, facts.flags) ?? humanStepActions(step.id)),
+        // An escalation raised as this item, whose act is pressed in the app
+        // (turn-by-turn phase 4): the press rides the item, never its route as text.
+        ...(step.birth === 'supervisor' ? supervisorActionFor(facts, step.id) : []),
+      ],
     });
   }
   return out;
+}
+
+/** The in-app press of the escalation an item was raised as, if it has one. */
+function supervisorActionFor(facts: InboxFacts, id: string): InboxAction[] {
+  const card = (facts.supervisorCards ?? []).find((candidate) => candidate.kind === 'escalation' && candidate.item === id && candidate.action);
+  return card?.action ? [escalationAction(card.action, facts.flags)] : [];
 }
 
 /* ------------------------------------------------------------------ *
@@ -3678,7 +3858,20 @@ export function buildInbox(facts: InboxFacts = {}, now: number = Date.now(), opt
     const item = mint(draft);
     if (seen.has(item.id)) continue;
     const turn = turnOf(draft, item.id, (id) => steps.get(id), (cardId) => cards.get(cardId));
-    if (turn) item.turn = turn;
+    // The card's words ride the row (turn-by-turn phase 10): what the Runs
+    // home, the bell and a push say is what the card says.
+    if (turn) {
+      const step = turn.record === 'ledger' ? steps.get(turn.item) : undefined;
+      item.turn = withRowWords(turn, {
+        state: step?.state ?? null,
+        dueWhen: step?.dueWhen ?? item.humanStep?.dueWhen ?? null,
+        hasOptions: Boolean(item.options?.length || step?.options?.length),
+        // A run request is a yes or a no (turn-by-turn phase 6): `turnView`
+        // gives its item the approval block the row does not carry.
+        hasApproval: Boolean(item.approval) || Boolean(step && isRunRequestOf(step)),
+        now,
+      });
+    }
     seen.add(item.id);
     const ack = ackFor(facts.acks, item.id, item.since);
     if (ack) {

@@ -210,3 +210,70 @@ test('PW-6 / G5: a declaration citing a wall nothing recorded is refused — "no
     assert.equal(verdict.sentence, G5_SENTENCE.replace(/["\\]/g, "'"));
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * The honest path (turn-by-turn phase 6, #286, §Architecture 5.1): G5 never
+ * drops a run-level ask, no errand says Your turn holds an item it does not,
+ * and no handled row says "the AI could run it" for a run-level ask.
+ * ------------------------------------------------------------------ */
+
+const { answerDeclaredProbe } = await import('../server/declared-probe.ts');
+const { runDir, newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
+const { askTable } = await import('../server/runner/ladder.ts');
+const { G5_ERRAND_HOW } = await import('../shared/turn-model.js');
+const { handledOfJournal } = await import('../server/turn/handled.ts');
+const { harness: turnHarness, SLUG: TURN_SLUG } = await import('./turn-harness.ts');
+const { mkdirSync, writeFileSync } = await import('node:fs');
+const { join } = await import('node:path');
+
+test('RR-G5: a permission block the compatibility rule reads as a run request is never refused at the door, and nothing says the AI runs it', async () => {
+  const h = turnHarness();
+  try {
+    const state = newRun({ slug: TURN_SLUG, root: h.root, onlyPhases: [3] } as never);
+    saveRun(state);
+    const dir = runDir(h.root, TURN_SLUG);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `run-${state.id}-p3-outcome.json.tmp.4343`);
+    writeFileSync(path, JSON.stringify({
+      version: 1, slug: TURN_SLUG, phase: 3, status: 'blocked', needs: 'permission',
+      reason: 'Operator: stop this run and start it again isolated', watch: [], written_at: new Date().toISOString(),
+    }));
+    const journalled: { kind: string; data: Record<string, unknown> }[] = [];
+    const deps = {
+      root: h.root, probe: async () => ({ landed: null, refs: [] }), walls: () => [],
+      journal: (_slug: string, _run: string | null, kind: string, data: Record<string, unknown>) => { journalled.push({ kind, data }); },
+    };
+    const refused = await answerDeclaredProbe({ slug: TURN_SLUG, phase: 3, file: path }, deps);
+    assert.equal((refused as { verdict: string }).verdict, 'guard', 'no run request: G5 refuses as before');
+    journalled.length = 0;
+    const run = await answerDeclaredProbe({ slug: TURN_SLUG, phase: 3, file: path }, { ...deps, runRequest: () => true });
+    assert.equal((run as { verdict: string }).verdict, 'pending', 'a run-level ask parks; the runner records it as an isolate request');
+    assert.equal(journalled.length, 0, 'no turn-refused line, so no handled row');
+    // The handled reading of a G5 line is the only "nothing refused it" row — and a run request writes none.
+    const row = handledOfJournal({ slug: TURN_SLUG, runId: state.id, seq: 1, t: Date.now(), event: 'run.run-requested', phase: 3, data: { act: 'isolate' } } as never);
+    assert.equal(row, null, 'a run request is never a handled "the AI runs it"');
+  } finally { h.cleanup(); }
+});
+
+test('RR-G5: no errand says Your turn holds a permission item it does not', async () => {
+  const how = askTable()['blocked-declared:permission']!.how;
+  assert.doesNotMatch(how, /^Your turn holds a permission item/, 'the ASK never claims the item unconditionally');
+  assert.match(how, /When nothing refused it, there is no item/);
+  assert.doesNotMatch(G5_ERRAND_HOW, /Your turn holds a permission item for it/);
+  const h = turnHarness();
+  try {
+    const state = newRun({ slug: TURN_SLUG, root: h.root, onlyPhases: [3] } as never);
+    const record = phaseRecord(state, 3);
+    record.status = 'parked';
+    record.declared = { status: 'blocked', needs: 'permission', rule: 'Bash(npm publish:*)', command: 'npm publish', at: new Date().toISOString() } as never;
+    saveRun(state);
+    (h.svc as unknown as { announceErrand: (data: unknown) => void }).announceErrand({
+      slug: TURN_SLUG, runId: state.id, phase: 3,
+      errand: { at: 'a1', situation: 'blocked-declared:permission', need: 'A permission the AI lacks', how, tried: [] },
+    });
+    assert.equal(h.svc.humanStepsNow().open().length, 0, 'G5 refused it at ingest: no item');
+    const pushed = JSON.stringify(h.pushes);
+    assert.doesNotMatch(pushed, /Your turn holds a permission item for it/, 'the push names no item that does not exist');
+    assert.match(pushed, /Your turn holds no/);
+  } finally { h.cleanup(); }
+});

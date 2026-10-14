@@ -10,10 +10,12 @@
  * holds it. A projected item (a gate, an approval card, a relayed question)
  * has no explain view — its record is its row — and the panel says so. An item
  * that stands for a permission card carries the card's own verbs as Actions,
- * pressed at the card the item names.
+ * pressed at the card the item names. Why only a person fits it is said once
+ * (#332): one *Only you* row, the reason's sentence and never its label too.
  */
 
 import { KIND_META } from '@shared/human-step-model.js';
+import { whyPersonWords } from '@shared/turn-model.js';
 import { BIRTH_WORDS, MoveLine, stamp } from '@/cards/human-step-card';
 import type { HumanStepRecord } from '@/data/human-steps';
 import { useTurnItem, type TurnItem } from '@/data/turn';
@@ -42,11 +44,15 @@ export function ExplainOverview({ item }: { item: TurnItem; record?: HumanStepRe
   const gone = ledger && explain.isError && explain.error instanceof ApiError && explain.error.status === 404;
   const view = ledger && explain.data ? explain.data : null;
   const step = item.step;
+  // Why only a person fits it, said ONCE (#332): the explain view's sentence,
+  // else the reason's own — a projected item's is the composer's need, which
+  // the panel then does not repeat beside it.
+  const why = view?.whyPerson ?? (ledger || !item.need ? whyPersonWords(step?.why ?? item.why) : item.need);
   const facts: KeyValueItem[] = [
     [
       'Only you',
       <span data-testid="turn-explain-why">
-        {view?.whyPerson ?? (step?.why ? `${step.why}` : item.why)}
+        {why}
         {(view?.whySource ?? step?.whySource) === 'inferred' ? ' (inferred from its kind)' : ''}
       </span>,
     ],
@@ -132,9 +138,8 @@ export function ExplainOverview({ item }: { item: TurnItem; record?: HumanStepRe
   return (
     <div className="flex min-w-0 flex-col gap-3" data-testid="turn-explain">
       {!ledger && (
-        <p className="max-w-(--measure) text-meta text-ink-muted">
-          A projected item: its record is the row it stands for
-          {item.need ? `. ${item.need}` : ''}
+        <p className="max-w-(--measure) text-meta text-ink-muted" data-testid="turn-explain-projected">
+          A projected item: its record is the row it stands for.
         </p>
       )}
       {gone && (
@@ -199,27 +204,36 @@ export function approvalIdOf(item: Pick<TurnItem, 'actions' | 'permission'>): st
   return grant && 'approvalId' in grant ? grant.approvalId : undefined;
 }
 
-/** Show the item in the panel. */
-export function inspectItem({ item, record }: { item: TurnItem; record: HumanStepRecord | undefined }): void {
+/**
+ * Show the item in the panel. `open: false` hands the panel the record without
+ * opening it — what `#/turn/<id>` does where the panel would cover the card.
+ */
+export function inspectItem(
+  { item, record }: { item: TurnItem; record: HumanStepRecord | undefined },
+  options: { open?: boolean } = {},
+): void {
   const state = record?.state ?? item.step?.state ?? item.humanStep?.state ?? 'notified';
   const risk = item.permission?.risk ?? item.step?.permission?.risk ?? record?.permission?.risk;
   const title = record?.title ?? item.step?.title ?? item.title;
   const where = item.slug ? `${item.slug}${item.phase != null ? `, phase ${item.phase}` : ''}` : item.source;
   const card = approvalIdOf(item);
-  inspect({
-    key: `turn:${item.item}`,
-    title,
-    description: `${KIND_META[item.kind]?.label ?? item.kind} — ${where}.`,
-    meta: (
-      <>
-        <OpsStatus vocab="step" word={state} />
-        {risk && <OpsStatus vocab="risk" word={risk} />}
-        <Mono value={item.item} chars={16} copyable />
-      </>
-    ),
-    overview: <ExplainOverview item={item} record={record} />,
-    ...(card ? { actions: <ActionsTab kind="approval" args={{ id: card }} /> } : {}),
-    ...(record ? { history: <ItemHistory record={record} /> } : {}),
-    raw: JSON.stringify(record ?? item, null, 2),
-  });
+  inspect(
+    {
+      key: `turn:${item.item}`,
+      title,
+      description: `${KIND_META[item.kind]?.label ?? item.kind} — ${where}.`,
+      meta: (
+        <>
+          <OpsStatus vocab="step" word={state} />
+          {risk && <OpsStatus vocab="risk" word={risk} />}
+          <Mono value={item.item} chars={16} copyable />
+        </>
+      ),
+      overview: <ExplainOverview item={item} record={record} />,
+      ...(card ? { actions: <ActionsTab kind="approval" args={{ id: card }} /> } : {}),
+      ...(record ? { history: <ItemHistory record={record} /> } : {}),
+      raw: JSON.stringify(record ?? item, null, 2),
+    },
+    options,
+  );
 }

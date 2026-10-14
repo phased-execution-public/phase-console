@@ -121,7 +121,7 @@ and Access — every log this console writes on one time axis, plus the redacted
 nine, Everything last: every key `GET /api/prefs/schema` describes, with its value, where it came from
 and its reset. **Your turn** (`#/turn`, `screens/turn/`; control-tower phases 130–139, 148 and 149) is
 a head that lights Runs: every act only a person can do as one item — why only they fit it, a guide, a
-proof the console checks — in five groups plus *Handled by the AI*, read from `GET /api/turn`, which
+proof the console checks — in six groups plus *Handled by the AI*, read from `GET /api/turn`, which
 the server's `turn/` folds from every source through one door (`raiseTurn`); `#/approve` lands there,
 and the approval, gate, question and errand cards elsewhere draw the item and link to it. A permission
 item is answered by a scoped grant (`server/permissions/grants.ts`, `grants.ndjson`), and an owner key
@@ -201,7 +201,101 @@ establish — a vocabulary lives in `shared/` and is imported by identity by ser
   `scripts/turn.env`): the ten reasons only a person fits (`WHY_PERSON`, `REASON_META`) and those each
   kind allows (`KIND_REASONS`), the proof types, `VERDICTS`, the grant scopes, `GRANT_RISK` and the
   never list's reasons, the page's `TURN_GROUPS`, `HANDLED_SOURCES`, the walls and the guard's exit
-  (`GUARD_REFUSAL_EXIT`, 4). `shared/guide-grammar.js` is the one guide parser, server and page alike.
+  (`GUARD_REFUSAL_EXIT`, 4) — and, since turn-by-turn phase 1, the card contract: every item's `type`
+  (`ITEM_TYPES`), `personStatus` (`PERSON_STATUSES`), `readiness` (`READINESS`) and `route` (`ROUTE_TO`),
+  derived once each (`typeOf`, `personStatusOf`, `readinessOf`, `routeOf`) over `TURN_SOURCES` and
+  `TURN_RECORDS`, which it owns. `shared/guide-grammar.js` is the one guide parser, server and page alike.
+  Since turn-by-turn phase 3 every person-facing word of an item — its title (the act), meta, steps by
+  precedence (`STEPS_FROM`), check, timing — and the inbox row's and the push's words come from ONE
+  composer, `server/turn/compose.ts`; a proof ref is said in words by `shared/proof-words.js`, never
+  shown (`cmd:`, `POST /api`, "phase 0" reach no person), and a projected item's assigned clock is
+  `server/turn/first-seen.ts`'s.
+  Since turn-by-turn phase 4 the ladder's `ASKS` table (`runner/ladder.ts`) is the one source of an
+  errand's card words — a title, steps, a check and options bound to their verbs (`askFor`,
+  `askOptionsFor`; `NOT_RECEIVABLE` names the situations nobody is asked about) — and an errand row's
+  buttons derive from its options. Gate, plan-approval, permission, supervisor-suggestion and
+  owner-request items carry an `approval` block (what, who asked, if approved, if denied); conflict,
+  QA, question and session-ask items carry `options`, at most one recommended. An identity park offers
+  exactly its two options, both bound to the run's `identity` verb; a supervisor escalation whose verb
+  has no CLI line is an in-app action on its item, never a route written as a command; a plan's
+  `## Operator errands` rows no bullet names are `headsUp` items, in no group and never counted.
+  Since turn-by-turn phase 5 a press goes where the item says: every option is pressed from its own
+  `verb` through `data/press.ts`, and a run verb's body carries `expectRunId` (bound in `inbox.ts`
+  `mint` and `turn/compose.ts` `boundToRun`), which the route refuses with a 409 and a sentence when
+  the plan's run is another one (`staleBinding`, logged `turn.press-stale`); every item says *Goes
+  to* (`route`) and *Checked by* (`checkedBy`, from `CHECKED_BY_LABEL`). *Undo*
+  (`POST /api/human-steps/:id/undo`) takes a running check back — the item returns to To do or
+  Redo and a verdict for that attempt is dropped — and a terminal press waits a few seconds on the
+  page with *Undo* before it is sent (`client/src/data/undo-window.ts`). A check's note is kept on
+  its attempt for every proof type (`step.notes`). A pressed projected item — an approval card, a
+  gate, a plan approval, a relayed question, an ack-bound option — leaves a settled record
+  (`server/turn/settled.ts`, `turn-settled.json`), so Done shows it as Passed or Closed with who
+  pressed it and when. An item whose proof reads a gate's row is opened by that gate's Approve,
+  never by an answer or a note.
+  Since turn-by-turn phase 6 an act only the RUN can take — `RUN_ACTS` in `shared/verb-model.js`:
+  isolate, switch-account, raise-budget, stop, hold — is a run request, never a permission:
+  `phase-outcome.sh … blocked --needs run --run-act <act>` (the `run` need class,
+  `blocked-declared:run`), journalled `run.run-requested`, and a `permission` declaration naming no
+  rule or command on a shared checkout whose lane is not on `pe/<slug>` is read as `isolate`
+  (`server/turn/run-requests.ts` `isolateCompat`, which G5 never refuses). Its item is ONE approval
+  per run and act, every declaring phase a waiter (`POST /api/run/<slug>/run-request`): Approve takes
+  the act through the run verb of its name, Deny resumes the waiters told no. In Pro the supervisor's
+  `run-requested` remedy presses isolate and hold (`RUN_ACT_AUTONOMY`), the reversible remedies ship
+  at `press`, and a refused press (409) counts as pressed for its root cause (#286).
+  Since turn-by-turn phase 7 an item nobody needs any more closes itself. ONE predicate,
+  `server/runner/supersede.ts` (`supersedeReading`, its refusals named in `SUPERSEDE_REFUSALS`), says
+  when a stopped run is SUPERSEDED: a later, unabandoned run of its plan whose scope covers what it
+  still owes, the old run not live, not unlanded, not stopped about the plan, not reopened or dismissed
+  by a person. The identity park skips such a run and never overwrites an operator's stop; the read
+  resolver annotates it `resolved {auto, reason: "superseded by run <id>", supersededBy}` (journal
+  `run.superseded`, reversible with `unresolve`); and the round's stale pass (`server/turn/stale.ts`)
+  closes the run-specific items of a superseded, resolved or finished run, of a phase done on the
+  board, or whose errand is gone — each with a `console` row under *Handled by the AI* — and moves a
+  world act (`KIND_OUTLIVES_RUN` in `shared/turn-model.js`) to the successor's lane (`ledger.relane`).
+  G7 never folds two operator acts of different phases (#261, #257); a plan item names the session
+  item that covers it (`coverLinks`: the same act, or its errands ref), linked, never merged; and a
+  session's decision its phase moved past closes as settled by that act, out of the supervisor's
+  `turn-unopened` reach (#290).
+  Since turn-by-turn phase 8 every item is drawn as ONE card in the board's anatomy
+  (`viewer/docs/design.md` §Your turn): NOW or NOT YET with its *when*, the type's mark, the
+  person's status (the typed family's `turn` member, `TurnStatus`/`TurnReadiness`, status-model
+  vocabularies `turn` and `readiness`), the title and meta, a timing grid on ONE page clock
+  (`client/src/ui/clock.ts`: 1 s while a grid is on screen, else 30 s, never 1 s under reduced
+  motion), why once, the verdict before the steps, *From the AI*, the steps on the line, *How it's
+  checked*, *Goes to* / *Checked by*, and ONE act form per type, its primary chosen by the move
+  table `cardMoveOf` (`client/src/cards/turn/moves.ts`, IC-v2). Every command a person runs is
+  the one command block, `client/src/ui/code-block.tsx`, which marks a `<placeholder>` command as a
+  template.
+  Since turn-by-turn phase 9 the page is the board in 7.0's grammar. The groups are v2,
+  `TURN_GROUPS` — *Approve* · *Do now* · *Decide* · *Being checked* · *Coming up* · *Done* —
+  placed by `groupOf` from the item's type and readiness (an approval to Approve, NOT YET to
+  Coming up), `TURN_OPEN_GROUPS` the three the headline, the strip, `asksNow` and the situation
+  line count; *Handled by the AI* is a section, never a group, and a heads-up sits in a section
+  of its own after it. `GET /api/turn` carries `strip` (to do, checking, passed today, the next
+  deadline, `stripOf`); the page draws it (`screens/turn/strip.tsx`) with the round as the live
+  line on the one page clock, then one toolbar row whose Filter (Status, Time, Plan, Type, Goes
+  to), Group, Sort and View all live in the address, the groups, and *Where the plans stand*
+  (`screens/turn/plans-strip.tsx`). `#/turn/<id>` marks its card and opens the panel on it where
+  the panel stands beside the page (1200 and up). The explain view's `whyPerson` is the reason's
+  sentence alone (`whyPersonWords`, #332), and *Export* carries each item's options, timing and
+  approval block.
+  Since turn-by-turn phase 10 every other surface speaks the card's words. An inbox row's `turn`
+  view carries the card's `type`, `readiness` and NOT YET's `startWhen`, and sits in the group its
+  card sits in (`withRowWords` in `server/turn/fold.ts`, applied in `buildInbox`). The Runs home's
+  Your turn rows and the bell's needs-you rows lead with NOW or NOT YET and the type's mark
+  (`client/src/cards/turn/row-words.tsx`) over the composer's title. A decision with options, and
+  an approval that is no permission, open the card. A push's lock screen is chosen by TYPE
+  (`lockScreenOf` in `server/push/actions.ts`): a Task gets *Open* and *I did it*, a run request's
+  Approval gets *Approve* and *Deny* (both answers the `device` door may give, read again at
+  `POST /api/push/action`), any other Approval or a Decision gets *Open*, and a permission item
+  keeps its grant-or-open and *Deny*.
+  Since turn-by-turn phase 11 `viewer/test/turn-cards-coverage.test.ts` walks every card the console
+  can raise — every kind × ledger state × birth and every projected source, in both editions — and
+  fails one missing its type, status, readiness, route, *Checked by*, check or (while open) steps,
+  options or approval block, or showing a machine word.
+  The person-facing account of all
+  of it is the help guide's *Your turn* (`client/src/content/guide/your-turn.md` and its `.fa.md`
+  twin), `references/turn.md` for a session, and `viewer/README.md` §Your turn.
 - `shared/door-model.js` — who pressed: the seven `PRESS_DOORS`, the `AUTHORITY_VERBS`, `DOOR_MAY` in
   its two modes (no owner key: `local` presses what it always could; a key: a press through a door
   that may not make it is a request the owner confirms) and `AUTHORITY_ROUTES`, the table the hook's
@@ -366,14 +460,21 @@ rather than refusing.
   the package manager's own directory flag; Setup is resolved from the SAME directory, because the
   runner hands both one cwd, and an install counts only for its own ecosystem. Its word lists stay in
   `phase-graph.sh`, not `verify.env`: no runtime reader asks them. The advisory family is therefore
-  F15–F19, F22–F23, F28, F30, F32–F36 and F38–F40 — seventeen ids (F40, `human-step-no-why`,
-  control-tower phase 130: a `Human step:` with no `why:`, given its kind's default reason); F14 gates, and so do F26
+  F15–F19, F22–F23, F28, F30, F32–F36, F38–F41 and F43 — nineteen ids (F40, `human-step-no-why`,
+  control-tower phase 130: a `Human step:` with no `why:`, given its kind's default reason; F41,
+  `human-step-no-guide`, and F43, `errand-row-unbound`, turn-by-turn phase 2: a task or decision with
+  no guide file, no options and no bound `## Operator errands` row, and a table row no bullet names —
+  `HUMAN_STEP_GUIDED_KINDS` and the one awk, `errand_refs`, stay in `phase-graph.sh`); F14 gates, and so do F26
   (`note-target-unknown`), F27 (`land-word-unknown`), F29
   (`landed-gate-unknown-phase`), F31 (`permission-mode-unknown`, control-tower phase 11): a
   `Permission mode:` line or bullet whose word is not one of `scripts/permission.env`'s, which the
   reader falls through exactly as F27's do — and F37 (`human-step-superseded`,
   `human-step-kind-unknown`, `human-step-field-invalid`, phase 41): a `Human step:` bullet the reader
   skips, the 5.1.0 `<who, what, proof ref>` spelling named with the grammar that replaced it.
+  F42 (`guide-file-missing`, turn-by-turn phase 2) gates too: a `Human step:`'s `guide:` that is not a
+  file under the docs root. The bullet's three newer keys — `options:`, `recommended:`, `deadline:` —
+  are validated by both parsers and printed by neither: `--human-steps` stays byte-identical, and the
+  console reads them, and the `## Operator errands` table (`server/parse/errands.ts`), from the plan.
 - **An empty `ready` set is four facts, so the engine says which.** `--memory-block` is the only
   engine command the runner reads, and it emitted five bucket lines — collapsing "finished", "all in
   flight", "closed" and "nothing can ever move again" into one silence. It now also emits

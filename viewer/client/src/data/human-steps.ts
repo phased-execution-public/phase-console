@@ -248,6 +248,8 @@ export type StepVerbAnswer = {
   verdict?: StepVerdictRecord;
   escalated?: true;
   rewrite?: { at: string };
+  /** `undo` (turn-by-turn phase 5): the running check taken back — where the item now stands, and the attempt dropped. */
+  undo?: { to: 'opened' | 'returned'; attempt: number };
   resumed?: { launched: boolean; why?: string };
   snoozed?: { until: string };
   /** `answer` / `decline` (phase 133): what was recorded, and the ONE resume each waiter got. */
@@ -297,6 +299,12 @@ export const humanStepsApi = {
   /** *Rewrite the guide* — the escalation's way out: the item is withdrawn and its raiser asked for a new version. */
   humanStepRewrite: (id: string, note?: string) =>
     post<StepVerbAnswer>(at(id, 'rewrite'), note ? { note } : {}),
+  /**
+   * *Undo* on an item being checked (turn-by-turn phase 5) — the check taken
+   * back while it runs: the item is To do (or Redo) again, and a verdict that
+   * lands later is dropped by its attempt. 409 when it is not being checked.
+   */
+  humanStepUndo: (id: string) => post<StepVerbAnswer>(at(id, 'undo'), {}),
   /**
    * *Withdraw* (quiet-console phase 8) — the owner takes an open item off Your
    * turn: the console's own `dismiss`, pressed by a person through the owner

@@ -59,6 +59,7 @@ export const POLICY_CLASSES = Object.freeze(
     'credential-block',
     'permission-block',
     'protected-path-block',
+    'run-request',
     'gate-block',
     'external-block',
     'lock-block',
@@ -262,6 +263,16 @@ export const POLICY_TABLE = Object.freeze([
     blurb:
       "An edit the CLI's own wall reserves for an interactive session, or an act the plan keeps for a person: " +
       'always a person\'s, as an errand naming the act — or handed to the session with "Delegate to the session".',
+  },
+  {
+    class: 'run-request',
+    decisionKey: 'stop',
+    journal: 'run.run-requested',
+    situations: ['blocked-declared:run'],
+    automatic: [],
+    blurb:
+      'A phase asked for an act only the run can take — relaunch isolated, switch account, raise the budget, stop, hold: ' +
+      'the supervisor takes it (Pro) or one approval per run and act asks a person (Free); never a permission item.',
   },
   {
     class: 'gate-block',

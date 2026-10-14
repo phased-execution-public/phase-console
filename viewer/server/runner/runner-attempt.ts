@@ -10,7 +10,7 @@
  */
 import { parkOnStep, stepJournalFields } from '../human-steps.ts';
 import { refusalFields } from '../turn/guard.ts';
-import { KIND_META } from '../../shared/human-step-model.js';
+import { composeStepErrand } from '../turn/compose.ts';
 import { comparedClause, stampTrees, type TreeStamp } from './tree-state.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
@@ -4259,6 +4259,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
           ...budgetStamp,
           at: new Date().toISOString(),
         };
+        await this.noteRunRequest(phase, record);
         clearWatchBookkeeping(record);
         const clock = this.armDeclaredClock(phase, record, declared);
         // What was asked, on the testimony — the instant a `poll-park` of this
@@ -4432,19 +4433,15 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // The errand IS the step (control-tower phase 132, #209): one item,
           // announced once by the step, answered by checking it.
           slot.errand.stepId = step.id;
-          // The errand names the act in the step's own words — what, where,
-          // and what proves it — rather than the generic `human-acts` ask.
-          const meta = KIND_META[step.kind];
-          slot.errand.need = `Your turn — ${meta.label.toLowerCase()}: ${step.title}`;
-          slot.errand.how = `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}`
-            + `${step.openUrl ? `, open ${step.openUrl}` : step.openCommand ? `, run \`${step.openCommand}\`` : ''}`
-            + `${step.proof ? `; ${step.proof} proves it` : ''}. When it is done, press I've done this — check: the same session resumes.`;
+          // The errand names the act in the composer's words (turn-by-turn
+          // phase 3) — what, where, and the proof in words — rather than the
+          // generic `human-acts` ask.
+          const words = composeStepErrand(step);
+          slot.errand.need = words.need;
+          slot.errand.how = `${words.how} The same session resumes.`;
           // Not due yet (control-tower phase 121): nobody is summoned until its
-          // due-when ref lands — then the step's own push says NOW.
-          if (step.state === 'upcoming') {
-            slot.errand.need = `Coming up — ${meta.label.toLowerCase()}: ${step.title}`;
-            slot.errand.upcoming = true;
-          }
+          // due-when ref lands — then the step's own push says now.
+          if (step.state === 'upcoming') slot.errand.upcoming = true;
         }
         const planHeld = declared.needs === PLAN_APPROVAL_NEED;
         const held = planHeld ? record.planApproval : undefined;

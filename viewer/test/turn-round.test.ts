@@ -18,6 +18,14 @@
  *   RD-8  the round's proof pass never RUNS a proof (no `cmd:`, no `unit:`, whatever raised the
  *         item), and a landed proof is settled as the console's act — its door
  *         `watch-landed`, never the operator's.
+ *   RD-10 (turn-by-turn phase 7) the stale pass closes ONLY the run-specific items of a
+ *         superseded run, each with its reason under Handled, and a world act on the
+ *         old run reappears on the successor's lane — open; a run a disjoint scoped
+ *         run follows is not superseded, and its items stand.
+ *   RD-11 (#290) a session's decision card whose phase moved past it — the supervisor
+ *         applied an option and resumed it, or a person Retried — closes as settled by
+ *         that act, and the supervisor's `turn-unopened` never sees it; a sign-in the
+ *         phase moved past still stands (control-tower phase 132's rule).
  */
 
 import './state-sandbox.ts';
@@ -30,6 +38,8 @@ import { harness, call, SLUG } from './turn-harness.ts';
 const { TurnRound, ROUND_DEBOUNCE_MS } = await import('../server/turn/round.ts');
 const { headlineOf } = await import('../server/turn/headline.ts');
 const { shapeVerdict } = await import('../server/turn/verdict.ts');
+const stateModule = await import('../server/runner/state.ts');
+const stateOf = () => stateModule;
 
 type Passes = ConstructorParameters<typeof TurnRound>[0];
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -39,6 +49,7 @@ function fakePasses(over: Partial<Passes> = {}, order: string[] = []): Passes {
   return {
     grants: () => note('grants', 0),
     clock: () => note('clock', { reminded: [], expired: [], dismissed: [] }),
+    stale: async () => note('stale', { closed: [], moved: [] }),
     covered: () => note('covered', []),
     escalate: () => note('escalate', []),
     due: async () => note('due', { due: [], proven: [] }),
@@ -56,7 +67,7 @@ test('RD-1: the passes run in order; the counter rises only when the turn change
     emit: (state) => emitted.push(state.n), failed: (pass) => failed.push(pass), now: () => Date.parse('2026-10-07T10:00:00Z'),
   });
   let state = await round.run('clock');
-  assert.deepEqual(order, ['grants', 'clock', 'covered', 'escalate', 'due', 'proofs']);
+  assert.deepEqual(order, ['grants', 'clock', 'stale', 'covered', 'escalate', 'due', 'proofs']);
   assert.equal(state.n, 0, 'nothing changed: the counter stays');
   assert.equal(state.at, '2026-10-07T10:00:00.000Z');
   assert.deepEqual(emitted, []);
@@ -64,7 +75,7 @@ test('RD-1: the passes run in order; the counter rises only when the turn change
   state = await round.run('clock');
   assert.equal(state.n, 1);
   assert.equal(state.changedAt, '2026-10-07T10:00:00.000Z');
-  assert.deepEqual(state.last, { due: 1, proven: 0, expired: 0, withdrawn: 0, escalated: 0, reminded: 0, grantsEnded: 0 });
+  assert.deepEqual(state.last, { due: 1, proven: 0, expired: 0, withdrawn: 0, closed: 0, moved: 0, escalated: 0, reminded: 0, grantsEnded: 0 });
   assert.deepEqual(emitted, [1], 'ONE event for the round that changed something');
   // A reminder and a grant ending move nothing on the page.
   due = [];
@@ -306,6 +317,7 @@ test('RD-7: on a fake clock, the real passes: a window that closed expires, and 
     const round = new TurnRound({
       grants: () => svc.sweepGrants.call(h.svc) as number,
       clock: (now) => svc.humanStepClockTick.call(h.svc, now) as { reminded: string[]; expired: string[]; dismissed: string[] },
+      stale: (now) => svc.turnStalePass.call(h.svc, now) as Promise<{ closed: string[]; moved: string[] }>,
       covered: (now) => svc.turnCoveredPass.call(h.svc, now) as string[],
       escalate: (now) => svc.turnEscalatePass.call(h.svc, now) as string[],
       due: (now) => svc.humanStepDuePass.call(h.svc, now) as Promise<{ due: string[]; proven: string[] }>,
@@ -326,3 +338,136 @@ test('RD-7: on a fake clock, the real passes: a window that closed expires, and 
   }
 });
 
+
+test('RD-10: the stale pass closes only a superseded run\'s run-specific items, each with its reason under Handled — a world act moves to the successor\'s lane, open', async () => {
+  const h = harness();
+  try {
+    const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
+    // Run A: stopped by the operator "relaunch isolated"; run B started after it, unscoped.
+    const a = newRun({ slug: SLUG, root: h.root } as never);
+    a.createdAt = '2026-10-10T17:00:00.000Z';
+    a.status = 'halted' as never;
+    a.stoppedBy = 'operator';
+    a.halt = { at: '2026-10-10T17:20:00.000Z', reason: 'stopped — relaunch isolated', phase: 3, kind: 'operator-stop' } as never;
+    phaseRecord(a, 3).status = 'parked' as never;
+    saveRun(a);
+    const b = newRun({ slug: SLUG, root: h.root } as never);
+    b.createdAt = '2026-10-10T17:31:00.000Z';
+    b.status = 'halted' as never;
+    saveRun(b);
+    // Run C: an older run of the plan whose only successor is a scoped run of OTHER phases.
+    const raise = (phase: number, runId: string, step: Record<string, unknown>) => {
+      const raised = h.svc.recordHumanStep({ slug: SLUG, phase, birth: 'console', runId, step });
+      assert.ok(raised && !('refused' in raised), JSON.stringify(raised));
+      return raised as { id: string };
+    };
+    const question = raise(3, a.id, { kind: 'decision', title: 'Which branch?', why: 'decision', options: [{ id: 'o1', label: 'main' }, { id: 'o2', label: 'dev' }], source: { kind: 'relay', ref: 'q-1' } });
+    const errand = raise(3, a.id, { kind: 'operator-act', title: 'Clear the failure streak', why: 'reserved', source: { kind: 'errand', ref: 'failure-streak' } });
+    const signIn = raise(3, a.id, { kind: 'mcp-login', title: 'Sign the MCP server docs in', where: 'host', source: { kind: 'preflight', ref: 'mcp:docs' } });
+    const svc = h.svc as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const pass = await (svc.turnStalePass as (now?: number) => Promise<{ closed: string[]; moved: string[] }>).call(h.svc, Date.now());
+    assert.deepEqual(new Set(pass.closed), new Set([question.id, errand.id]), 'only the run-specific items close');
+    assert.deepEqual(pass.moved, [signIn.id], 'the world act moves');
+    const ledger = h.svc.humanStepsNow();
+    for (const id of [question.id, errand.id]) {
+      assert.equal(ledger.get(id)?.state, 'dismissed');
+      assert.match(ledger.get(id)?.note ?? '', new RegExp(`nobody needs it any more: run ${a.id} was superseded by run ${b.id}`));
+    }
+    const moved = ledger.get(signIn.id)!;
+    assert.ok(['declared', 'notified'].includes(moved.state), `still open: ${moved.state}`);
+    assert.equal(moved.runId, b.id, 'it stands on the successor\'s lane');
+    assert.deepEqual(moved.waiters.map((w) => w.runId), [b.id], 'the old run\'s lane is gone');
+    // Each with its reason under Handled — the console's own close.
+    const turn = await call(h.svc, 'GET', '/api/turn');
+    const rows = (turn.body.handled as { source: string; what: string }[]).filter((row) => row.source === 'console');
+    // Three items, and the read itself resolved run A "superseded by run B" — its asks closed with it.
+    assert.equal(rows.length, 4, JSON.stringify(rows));
+    assert.ok(rows.some((row) => row.what === `Closed what run ${a.id} asked — it was superseded by run ${b.id}, so nobody needs it any more`));
+    const { loadRun } = await import('../server/runner/state.ts');
+    const after = loadRun(h.root, SLUG, a.id, null)!;
+    assert.equal(after.resolved?.reason, `superseded by run ${b.id}`);
+    assert.equal(after.resolved?.auto, true);
+    assert.equal(after.stoppedBy, 'operator', 'the operator\'s stop is kept');
+    assert.ok(rows.some((row) => /Closed “Which branch\?” — nobody needs it any more: run .* was superseded by run /.test(row.what)));
+    assert.ok(rows.some((row) => new RegExp(`Moved “Sign the MCP server docs in” to run ${b.id}`).test(row.what)));
+    // A second pass moves nothing: the moved act is the successor's now.
+    const again = await (svc.turnStalePass as (now?: number) => Promise<{ closed: string[]; moved: string[] }>).call(h.svc, Date.now());
+    assert.deepEqual(again, { closed: [], moved: [] });
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('RD-10: a run followed only by a scoped run of OTHER phases is not superseded — its items stand', async () => {
+  const h = harness();
+  try {
+    const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
+    const a = newRun({ slug: SLUG, root: h.root, onlyPhases: [3] } as never);
+    a.createdAt = '2026-10-10T17:00:00.000Z';
+    a.status = 'halted' as never;
+    phaseRecord(a, 3).status = 'parked' as never;
+    saveRun(a);
+    const c = newRun({ slug: SLUG, root: h.root, onlyPhases: [4, 5] } as never);
+    c.createdAt = '2026-10-10T18:00:00.000Z';
+    saveRun(c);
+    const raised = h.svc.recordHumanStep({
+      slug: SLUG, phase: 3, birth: 'console', runId: a.id,
+      step: { kind: 'decision', title: 'Which tag?', why: 'decision', options: [{ id: 'o1', label: 'v1' }, { id: 'o2', label: 'v2' }], source: { kind: 'relay', ref: 'q-2' } },
+    }) as { id: string };
+    const svc = h.svc as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const pass = await (svc.turnStalePass as (now?: number) => Promise<{ closed: string[]; moved: string[] }>).call(h.svc, Date.now());
+    assert.deepEqual(pass, { closed: [], moved: [] });
+    assert.notEqual(h.svc.humanStepsNow().get(raised.id)?.state, 'dismissed');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('RD-11 (#290): a decision card its phase moved past closes as settled by that act — and turn-unopened never sees it', () => {
+  const h = harness();
+  try {
+    const { newRun, phaseRecord, saveRun } = stateOf();
+    const state = newRun({ slug: SLUG, root: h.root } as never);
+    const decision = h.svc.raiseTurn({
+      slug: SLUG, phase: 3, birth: 'session', runId: state.id, sessionId: 'sess-3',
+      step: {
+        kind: 'decision', title: 'Amend the plan, or ask the owner?', why: 'decision', why_source: 'declared', proof_type: 'answer',
+        options: [{ id: 'amend', label: 'Amend' }, { id: 'owner', label: 'Ask the owner' }], recommended: 'amend',
+      },
+    });
+    assert.ok(decision && !('refused' in decision), JSON.stringify(decision));
+    const signIn = h.svc.raiseTurn({
+      slug: SLUG, phase: 3, birth: 'session', runId: state.id, sessionId: 'sess-3',
+      step: { kind: 'browser-login', title: 'Sign gh in', proof_type: 'attest', open_command: 'gh auth login' },
+    });
+    assert.ok(signIn && !('refused' in signIn));
+    const record = phaseRecord(state, 3);
+    // Parked on the decision: it stands, and the supervisor sees it.
+    record.status = 'parked' as never;
+    record.declared = { status: 'needs-human', reason: 'amend or ask', at: new Date().toISOString(), step: { id: decision.id, kind: 'decision' } } as never;
+    state.status = 'parked' as never;
+    saveRun(state);
+    const svc = h.svc as unknown as Record<string, (...args: unknown[]) => unknown>;
+    // The supervisor's facts are Pro's (`turnFactsForSupervisor`); the Free tree has no supervisor to keep it from.
+    const pro = typeof svc.turnFactsForSupervisor === 'function';
+    const facts = () => (pro ? (svc.turnFactsForSupervisor.call(h.svc) as { id: string }[]).map((one) => one.id) : []);
+    if (pro) assert.ok(facts().includes(decision.id));
+    const later = Date.now() + 60_000;
+    svc.humanStepClockTick.call(h.svc, later);
+    assert.notEqual(h.svc.humanStepsNow().get(decision.id)?.state, 'dismissed', 'while its phase waits on it, it stands');
+    // The supervisor applied "amend" and resumed the phase: a new attempt, no longer declaring it.
+    delete record.declared;
+    record.status = 'running' as never;
+    record.attemptStartedAt = new Date(Date.now() + 1_000).toISOString();
+    state.status = 'running' as never;
+    saveRun(state);
+    if (pro) assert.ok(!facts().includes(decision.id), 'turn-unopened never pins a note about it');
+    svc.humanStepClockTick.call(h.svc, later);
+    const closed = h.svc.humanStepsNow().get(decision.id)!;
+    assert.equal(closed.state, 'dismissed');
+    assert.match(closed.note ?? '', /settled by the act that resumed phase 3 at .* — the phase moved past it/);
+    assert.notEqual(h.svc.humanStepsNow().get(signIn.id)?.state, 'dismissed', 'a sign-in the phase moved past still stands');
+  } finally {
+    h.cleanup();
+  }
+});

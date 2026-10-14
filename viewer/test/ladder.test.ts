@@ -973,3 +973,17 @@ test('SH-6: a person\'s switch is never reverted without a live wall on their ch
   const elsewhere = switchRungDecision({ from: choice.accountId, wall: 'usage', current: { ok: false, headroomPct: 0 }, candidates: [{ id: 'acct-346a', headroomPct: 90 }], choice });
   assert.deepEqual(elsewhere, { act: 'switch', accountId: 'acct-346a', reverts: null });
 });
+
+test('turn-by-turn phase 6: a run request climbs nothing — its errand at once, Approve and Deny bound to the run-request verb', async () => {
+  const { RUNGS_BY_SITUATION } = await import('../shared/ladder-model.js');
+  const { askFor, askOptionsFor } = await import('../server/runner/ladder.ts');
+  assert.deepEqual([...RUNGS_BY_SITUATION['blocked-declared:run']!], [], 'no session can take a run act, so nothing spends');
+  assert.ok(askFor('blocked-declared:run'), 'a person receives it, with card words');
+  const options = askOptionsFor('blocked-declared:run', { slug: 'demo', phase: 4, live: true });
+  assert.deepEqual(options.map((o) => [o.id, o.verb.endpoint, (o.verb.body as Record<string, unknown>).answer, (o.verb.body as Record<string, unknown>).phase]), [
+    ['run-request-approve', '/api/run/demo/run-request', 'approve', 4],
+    ['run-request-deny', '/api/run/demo/run-request', 'deny', 4],
+  ]);
+  assert.equal(options.filter((o) => o.recommended).length, 1);
+  assert.equal(decisionKeyOfSituation('blocked-declared:run'), 'stop');
+});

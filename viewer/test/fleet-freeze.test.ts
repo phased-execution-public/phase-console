@@ -373,7 +373,7 @@ const START_SITES: { file: string; count: number; note: string }[] = [
   },
   {
     file: 'server/service-runs.ts',
-    count: 10 + SEAM_SITES,
+    count: 11 + SEAM_SITES,
     note: 'retryPhase (an operator door that nonetheless QUEUES — it funnels into a phase, and '
       + "every phase goes through admit()) · recoverPlan (goes through: its halt path uses the "
       + "EXEMPT `button` trigger — and refuses 409 first under a hold that binds the plan, #93) · "
@@ -389,7 +389,10 @@ const START_SITES: { file: string; count: number; note: string }[] = [
       + '(`repairCheckout`, control-tower phase 90 — an operator door, refused 409 under a hold that '
       + 'binds the plan, as Resume is) · a person\'s raise of a spent run budget (`raiseBudget`, '
       + 'control-tower phase 14 — an operator door: the raise is a person\'s Continue, started under '
-      + '`pressActor`, and a phase-scoped raise goes through `pressRetry` instead)' + SEAM_NOTE,
+      + '`pressActor`, and a phase-scoped raise goes through `pressRetry` instead) · a person\'s '
+      + 'Release of a held run whose run-request waiter parked behind the hold (`releaseRun`, '
+      + 'turn-by-turn phase 11 — an operator door: the release is a person\'s press, started under '
+      + '`pressActor`, and resumes the board the hold kept reserved)' + SEAM_NOTE,
   },
   {
     file: 'server/service-recovery.ts',

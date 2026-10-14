@@ -35,6 +35,7 @@ const { SITUATION_SUB_ACTOR, SUB_KINDS, actorFor, protectedPathOf } = await impo
 const { rungsFor } = await import('../shared/ladder-model.js');
 const { decisionKeyOfSituation } = await import('../shared/policy-model.js');
 const { NEED_CLASSES } = await import('../shared/decisions-model.js');
+const { G5_ERRAND_HOW } = await import('../shared/turn-model.js');
 type RunState = import('../server/runner/state.ts').RunState;
 type Errand = import('../server/runner/state.ts').Errand;
 type SpawnFn = import('../server/runner/spawn.ts').SpawnFn;
@@ -421,7 +422,9 @@ test('SR-5 — healer: the errand written for a pending declared block with no d
     assert.deepEqual(drives, [], 'nothing was driven: no rung of the ladder can be');
     const slot = disk.recoveries?.['2'];
     assert.equal(slot?.errand?.situation, 'blocked-declared:permission', JSON.stringify(slot?.errand));
-    assert.match(slot?.errand?.how ?? '', /No rung of blocked-declared:permission's ladder can be driven here/);
+    // No wall was recorded for the lane, so G5 refused the declaration and the errand says so
+    // (turn-by-turn phase 6, the honest path) rather than "no rung can be driven here".
+    assert.equal(slot?.errand?.how, G5_ERRAND_HOW);
     assert.equal(disk.phases['2'].status, 'parked', 'the errand\'s phase reads parked, never pending under an open ask');
     assert.ok(said.some((a) => a.category === 'needs-you' && a.phase === 2), JSON.stringify(said));
     assert.deepEqual(scopeLeftOpen(disk), [2]);

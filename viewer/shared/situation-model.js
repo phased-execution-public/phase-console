@@ -205,7 +205,11 @@ export const SUB_KINDS = Object.freeze({
   // see `CLASSIFIER_ONLY_SUB_KINDS`. `human-acts` joined in control-tower
   // phase 53 (#54): the classifier's reading of a session's `--needs
   // human-acts` — acts the plan keeps for a person — which used to fall
-  // through to the prose regexes and land in `unknown`.
+  // through to the prose regexes and land in `unknown`. `run` joined in
+  // turn-by-turn phase 6 (#286): a run request, `--needs run --run-act <act>` —
+  // an act only the RUN can take (relaunch isolated, switch account, raise the
+  // budget, stop, hold), which a session declared as `permission` and nobody
+  // could grant.
   'blocked-declared': Object.freeze(
     /** @type {const} */ ([
       'lock',
@@ -215,6 +219,7 @@ export const SUB_KINDS = Object.freeze({
       'gate',
       'external',
       'human-acts',
+      'run',
       'unknown',
     ]),
   ),

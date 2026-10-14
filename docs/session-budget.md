@@ -233,7 +233,9 @@ merges over the table, written only by `scripts/decisions.sh`. The human-step bu
 since control-tower phase 41 — `- **Human step:** <kind> · <what> · open: <url or command> · proof:
 <ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]`, one of eighteen
 kinds — legal under the plan's `## Operator errands` heading too, as the plan's own act — and the
-5.1.0 `<who, what, proof ref>` spelling it replaced fails the lint by name (F37).
+5.1.0 `<who, what, proof ref>` spelling it replaced fails the lint by name (F37). Its later keys
+(`why`, `effort`, `unblocks`, `guide`, and since 7.1 `options`, `recommended`, `deadline`) and the
+`## Operator errands` table the console reads beside it are in `references/plan-format.md`.
 
 **The wait budget is a total, and spending it is never a failure.** `**Wait budget:** 48h` is the
 TOTAL wall-clock one phase may spend parked across every wait it declares — not a window per wait;

@@ -23,6 +23,7 @@ import { runDir } from './state.ts';
 import { OUTCOME_STATUSES } from '../../shared/run-lifecycle.js';
 import type { OutcomeStatus } from '../../shared/run-lifecycle.js';
 import { humanStepKindOf, redactSecrets } from '../../shared/human-step-model.js';
+import { isRunAct, type RunAct } from '../../shared/verb-model.js';
 import type { DeclaredStep } from '../human-steps.ts';
 
 /**
@@ -64,6 +65,12 @@ export type PhaseOutcome = {
   rule?: string;
   /** … and the command it refused. Both optional, both beside `needs`. */
   command?: string;
+  /**
+   * A RUN REQUEST's act (turn-by-turn phase 6, #286): `blocked --needs run
+   * --run-act <act>` — one of `RUN_ACTS` (`shared/verb-model.js`). Kept only
+   * beside `needs: run`; any other word is dropped here.
+   */
+  run_act?: RunAct;
   /** ISO time the session suggests re-checking at (waiting-external only). */
   resume_after?: string;
   /**
@@ -156,13 +163,14 @@ export function inboxOutcomePhase(file: string): number | null {
  * a record written from a declaration without `--needs` carries no `needs`
  * key at all (the classifier reads absence as "fall back to the prose").
  */
-export function needsOf(outcome: Pick<PhaseOutcome, 'needs' | 'rule' | 'command'>): {
-  needs?: string; rule?: string; command?: string;
+export function needsOf(outcome: Pick<PhaseOutcome, 'needs' | 'rule' | 'command' | 'run_act'>): {
+  needs?: string; rule?: string; command?: string; runAct?: RunAct;
 } {
   return {
     ...(outcome.needs ? { needs: outcome.needs } : {}),
     ...(outcome.rule ? { rule: outcome.rule } : {}),
     ...(outcome.command ? { command: outcome.command } : {}),
+    ...(outcome.needs === 'run' && outcome.run_act ? { runAct: outcome.run_act } : {}),
   };
 }
 
@@ -223,6 +231,7 @@ export function readOutcome(
     ...(typeof parsed.needs === 'string' && /^[a-z][a-z0-9.-]{0,63}$/.test(parsed.needs) ? { needs: parsed.needs } : {}),
     ...(typeof parsed.rule === 'string' && parsed.rule ? { rule: parsed.rule.slice(0, 200) } : {}),
     ...(typeof parsed.command === 'string' && parsed.command ? { command: parsed.command.slice(0, 500) } : {}),
+    ...(parsed.needs === 'run' && isRunAct(parsed.run_act) ? { run_act: parsed.run_act } : {}),
     ...(typeof parsed.resume_after === 'string' && parsed.resume_after
       ? { resume_after: parsed.resume_after }
       : {}),

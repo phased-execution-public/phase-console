@@ -2244,7 +2244,9 @@ export abstract class RunnerControl extends RunnerBase {
       account: now.account, was: identityEcho(was), now: identityEcho(now), ...(phase != null ? { phase } : {}),
     });
     const words = identityChangeWords(state.slug, was, now);
-    const errand: Errand = { ...errandFor('resource-wall:auth', [], phase ?? 0, new Date().toISOString(), null), need: words.need, how: words.how };
+    const errand: Errand = {
+      ...errandFor('resource-wall:auth', [], phase ?? 0, new Date().toISOString(), null), need: words.need, how: words.how, identity: words.identity,
+    };
     state.errand = errand;
     this.record('run.errand', { ...errand, reason: 'the identity behind the run\'s account changed', by: 'runner' });
     if (phase != null) this.emit('phase', { phase, status: state.phases[String(phase)]?.status ?? 'parked', errand });
@@ -5176,6 +5178,11 @@ export abstract class RunnerControl extends RunnerBase {
     return this.inject('msg', framed, 'peer', undefined, phase, () => framed).ok;
   }
 
+  /** Does this runner still hold a lane for the phase — a session running, or one winding down from its park? */
+  laneHeld(phase: number): boolean {
+    return this.lanes.has(phase);
+  }
+
   /** Is there a lane with open stdin for that phase? — the `stdin` transport's precondition. */
   canTell(phase: number): boolean {
     return this.laneFor(phase)?.handle?.open() === true;
@@ -5867,6 +5874,7 @@ export abstract class RunnerControl extends RunnerBase {
             ...needsOf(declared),
             at: new Date().toISOString(),
           };
+          await this.noteRunRequest(phase, record);
           if (declared.watch.length) record.watch = declared.watch;
           clearWatchBookkeeping(record);
           if (clock) {

@@ -38,6 +38,8 @@ import {
   RunStatus,
   SeverityMark,
   STATUS_ICONS,
+  TurnReadiness,
+  TurnStatus,
   statusIcon,
   type OpsVocab,
   type WordOf,
@@ -124,6 +126,24 @@ describe('every member renders a dot, a word and the three data-* attributes', (
     expectComplete(el);
     expectDot(el);
   });
+  it('TurnStatus and TurnReadiness draw the card’s two words (turn-by-turn phase 8)', () => {
+    for (const status of ['todo', 'checking', 'passed', 'redo', 'not-doing', 'closed', 'owner'] as const) {
+      const { container, unmount } = render(<TurnStatus status={status} />);
+      const el = mark(container);
+      expectComplete(el);
+      expectDot(el);
+      expect(el.getAttribute('data-vocab')).toBe('turn');
+      unmount();
+    }
+    const todo = mark(render(<TurnStatus status="todo" />).container);
+    expect(todo.getAttribute('data-attention')).toBe('needs-you');
+    const now = render(<TurnReadiness readiness="now" />);
+    expect(mark(now.container).textContent).toContain('Now');
+    now.unmount();
+    const later = render(<TurnReadiness readiness="not-yet" when="when Phase 13 of demo is done" />);
+    expect(mark(later.container).getAttribute('data-attention')).toBe('none');
+    expect(later.getByTestId('turn-readiness-when').textContent).toBe('when Phase 13 of demo is done');
+  });
   it('OpsStatus draws Your turn’s four vocabularies — step, verdict, risk, grant', () => {
     for (const vocab of ['step', 'verdict', 'risk', 'grant'] as const) {
       expect(STATUS_VOCABS).toContain(vocab);
@@ -146,6 +166,8 @@ describe('every member renders a dot, a word and the three data-* attributes', (
       'auth',
       'entitlement',
       'mcp',
+      'turn',
+      'readiness',
     ]);
     const ops = STATUS_VOCABS.filter((v) => !own.has(v)) as OpsVocab[];
     expect(ops.length).toBeGreaterThan(10);

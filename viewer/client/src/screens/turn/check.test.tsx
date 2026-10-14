@@ -152,13 +152,13 @@ beforeEach(() => {
 });
 
 describe('CK-1 a decision item’s primary is its options', () => {
-  it('draws the options and Send my answer, disabled until one is chosen — never a check', async () => {
+  it('draws the options and Send my decision, disabled until one is chosen — never a check', async () => {
     post.mockResolvedValue({ ok: true, answered: { option: 'monday', at: AT }, resumes: [] });
     wrap(<TurnItemCard item={DECISION} perform={vi.fn()} />);
     const card = screen.getByTestId('turn-item');
     const primary = within(card).getByTestId('turn-primary') as HTMLButtonElement;
-    expect(primary.getAttribute('data-move')).toBe('answer');
-    expect(primary.textContent).toBe('Send my answer');
+    expect(primary.getAttribute('data-move')).toBe('decide');
+    expect(primary.textContent).toBe('Send my decision');
     expect(primary.disabled).toBe(true);
     expect(within(card).queryByRole('button', { name: /check/i })).toBeNull();
     const options = within(card).getAllByRole('radio');
@@ -167,6 +167,11 @@ describe('CK-1 a decision item’s primary is its options', () => {
     fireEvent.click(options[0]!);
     await waitFor(() => expect(primary.disabled).toBe(false));
     fireEvent.click(primary);
+    // A decision ends the item: it waits out the undo window first (turn-by-turn phase 5).
+    const held = within(card).getByTestId('turn-held');
+    expect(held.textContent).toContain('Your decision');
+    expect(post).not.toHaveBeenCalled();
+    fireEvent.click(within(held).getByTestId('turn-held-send'));
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith('/api/human-steps/d-1/answer', { option: 'monday' }),
     );

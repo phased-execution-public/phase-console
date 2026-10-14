@@ -61,7 +61,7 @@ export type SeedInfo = {
 /** The seeded items: each id, and the group `GET /api/turn` puts it in. */
 export type TurnSeed = {
   id: string;
-  group: 'now' | 'decide' | 'upcoming' | 'checking' | 'done';
+  group: 'approve' | 'now' | 'decide' | 'checking' | 'upcoming' | 'done';
   kind: string;
 }[];
 
@@ -148,8 +148,22 @@ ${rows}
 
 ## Phases
 
-${sections}`;
+${sections}${slug === 'tower' ? ERRANDS_MD : ''}`;
 }
+
+/**
+ * The tower plan's operator errands (turn-by-turn phase 10): one row no
+ * \`Human step:\` bullet names, so Your turn shows it as a Heads-up — a thing
+ * to know, in no group and never counted.
+ */
+const ERRANDS_MD = `
+
+## Operator errands
+
+| Id | When | What only the owner can do | Exact steps | Expected | How the agent verifies |
+|---|---|---|---|---|---|
+| E-1 | Before the next release | Renew the estate's domain for another year | Open the registrar and renew the domain for one year | The registrar shows the new expiry date | The domain still answers after its old expiry |
+`;
 
 function handoffMd(slug: string, phase: number, title: string, blocks: number[]): string {
   return `---
@@ -568,13 +582,16 @@ function seedIssues(box: ConsoleSandbox, anchor: number): void {
 /**
  * Your turn's items (control-tower phase 137, #214): the human-step ledger,
  * written as the console writes it — a v2 declaration per item, then its
- * moves — with an item in every group the page draws:
+ * moves — with an item in every group the page draws (the groups v2,
+ * turn-by-turn phase 9):
  *
+ *   - *Approve*: a permission the lane's wall raised (`turn-permit`), answered
+ *     by a grant at a scope;
  *   - *Do now*: a sign-in whose guide carries a command too long for a phone
  *     (it scrolls inside its card), a secret the check sent back once (the
  *     verdict and what to redo), and an operator act whose guide is Persian —
  *     right-to-left, its command left-to-right;
- *   - *Needs one detail*: a decision with three options, one recommended;
+ *   - *Decide*: a decision with three options, one recommended;
  *   - *Coming up*: an act whose due-when is a date a month away;
  *   - *Being checked*: a check in flight — its `at` is AHEAD of the anchor, so
  *     the console's sweep of interrupted checks (six minutes) leaves it alone
@@ -684,6 +701,12 @@ function seedTurn(box: ConsoleSandbox, anchor: number): TurnSeed {
       ]),
     }),
     move('turn-now-secret', 'notified', 'notify', at(119), { by: 'console' }),
+    // Three reminders already sent (turn-by-turn phase 10): the next is a day
+    // out, so the reminder clock leaves it on Redo for the whole tour — a
+    // reminder moves a step back to `notified`, which reads To do.
+    move('turn-now-secret', 'notified', 'remind', at(118), { by: 'console', pushed: false }),
+    move('turn-now-secret', 'notified', 'remind', at(117), { by: 'console', pushed: false }),
+    move('turn-now-secret', 'notified', 'remind', at(116), { by: 'console', pushed: false }),
     move('turn-now-secret', 'opened', 'open', at(100), { where: 'here' }),
     move('turn-now-secret', 'checking', 'check', at(60)),
     move('turn-now-secret', 'returned', 'return', at(59), {
@@ -795,6 +818,51 @@ function seedTurn(box: ConsoleSandbox, anchor: number): TurnSeed {
       },
     }),
     move('turn-permit', 'notified', 'notify', at(34), { by: 'console' }),
+
+    // An Approval with its block (turn-by-turn phase 10): a phase's run
+    // request — the ONE approval per run and act, Approve recommended — whose
+    // card says what, who asked, and what each answer does.
+    declare('turn-run-request', 25, {
+      kind: 'decision',
+      birth: 'console',
+      title: 'Relaunch this run isolated',
+      why: 'decision',
+      proofType: 'answer',
+      lines: [
+        'Phase 7 asked the run for this — a session cannot take an act of the run itself.',
+        'Approve: The run stops at its next boundary and starts again in a checkout of its own.',
+        'Deny: The run stays in its shared checkout; the phases that asked are told no.',
+      ],
+      options: [
+        {
+          id: 'approve',
+          label: 'Approve',
+          consequence: 'The run stops at its next boundary and starts again in a checkout of its own.',
+          recommended: true,
+        },
+        {
+          id: 'deny',
+          label: 'Deny',
+          consequence: 'The run stays in its shared checkout; the phases that asked are told no.',
+        },
+      ],
+      source: { kind: 'run-request', ref: 'isolate' },
+    }),
+    move('turn-run-request', 'notified', 'notify', at(24), { by: 'console' }),
+
+    // Done, Closed: an act the console closed without the person — nobody
+    // needed it any more — in the last day.
+    declare('turn-closed', 400, {
+      kind: 'operator-act',
+      title: 'Restart the build machine after the kernel update',
+      why: 'physical',
+      proofType: 'attest',
+    }),
+    move('turn-closed', 'notified', 'notify', at(399), { by: 'console' }),
+    move('turn-closed', 'dismissed', 'dismiss', at(180), {
+      by: 'console',
+      note: 'The phase it waited for is done.',
+    }),
   ];
   const dir = join(box.stateHome, 'phase-console');
   mkdirSync(dir, { recursive: true });
@@ -836,6 +904,35 @@ function seedTurn(box: ConsoleSandbox, anchor: number): TurnSeed {
       },
     })}\n`,
   );
+  // Waiting for the owner (turn-by-turn phase 10): a press a script made that
+  // only the owner confirms — an item of its own, its person's status `owner`.
+  writeFileSync(
+    join(dir, 'owner-requests.json'),
+    `${JSON.stringify({
+      version: 1,
+      requests: [
+        {
+          id: 'e2e0request0',
+          at: at(12),
+          state: 'open',
+          door: 'local',
+          label: 'script',
+          proof: 'loopback',
+          press: 'edit-prefs',
+          authority: 'policy-widen',
+          risk: 'medium',
+          method: 'POST',
+          path: '/api/prefs',
+          body: { relayMode: 'last-resort' },
+          summary:
+            "change the console's preferences — its standing policy answers and relay rules among them",
+          item: null,
+          repeats: 0,
+          fingerprint: 'e2e0request0',
+        },
+      ],
+    })}\n`,
+  );
   writeFileSync(
     join(dir, 'handled.ndjson'),
     `${JSON.stringify({
@@ -857,6 +954,9 @@ function seedTurn(box: ConsoleSandbox, anchor: number): TurnSeed {
     { id: 'turn-upcoming', group: 'upcoming', kind: 'operator-act' },
     { id: 'turn-checking', group: 'checking', kind: 'physical' },
     { id: 'turn-done', group: 'done', kind: 'claude-login' },
-    { id: 'turn-permit', group: 'now', kind: 'permission' },
+    { id: 'turn-permit', group: 'approve', kind: 'permission' },
+    { id: 'turn-run-request', group: 'approve', kind: 'decision' },
+    { id: 'turn-closed', group: 'done', kind: 'operator-act' },
+    { id: 'request:e2e0request0', group: 'approve', kind: 'decision' },
   ];
 }

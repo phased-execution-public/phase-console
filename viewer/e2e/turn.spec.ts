@@ -6,7 +6,11 @@
  * This spec measures what only the turn has, on the fixture's own items
  * (`seedTurn`: one in every group), at all four viewports:
  *
- *   - every seeded item is in its group, and the groups are in the page's order;
+ *   - every seeded item is in its group, and the groups v2 are in the page's
+ *     order with their labels (turn-by-turn phase 9); the strip says its three
+ *     numbers and the next deadline; *Where the plans stand* names the plan;
+ *   - `#/turn/<id>` marks its card and, where the panel stands beside the page
+ *     (1280), opens the panel on it; below, the panel stays shut over nothing;
  *   - every primary action wins `elementFromPoint` at its own centre, and is a
  *     thumb tall on touch;
  *   - the long command scrolls inside its own block: the block is no wider than
@@ -17,7 +21,13 @@
  *     typed rule sits above where a keyboard rises, and once typed, Grant wins
  *     its own centre — nothing overflows;
  *   - Settings ▸ Permissions opens at the grant the `granted` push names, its
- *     Revoke wins its centre, and nothing overflows.
+ *     Revoke wins its centre, and nothing overflows;
+ *   - every type × status the seed holds is drawn in the card's words
+ *     (turn-by-turn phase 10): a NOT YET Task with its *when*, a Task on Redo
+ *     with its steps, a Checking item offering only Undo, an Approval with its
+ *     block, a Decision with its recommended option, a Heads-up, Done Passed
+ *     and Done Closed, and a request Waiting for the owner — each with its
+ *     timing grid — and nothing overflows.
  */
 
 import { expect, test, type Page } from '@playwright/test';
@@ -25,7 +35,9 @@ import { expect, test, type Page } from '@playwright/test';
 import { axeFindings, focusFindings, layoutFindings, still } from './lib/probes.ts';
 import { VIEWPORTS, fixture, shoot, visit } from './lib/shots.ts';
 
-const ORDER = ['now', 'decide', 'upcoming', 'checking', 'done', 'handled'];
+/** The groups v2 (turn-by-turn phase 9), then the handled log. */
+const ORDER = ['approve', 'now', 'decide', 'checking', 'upcoming', 'done', 'handled'];
+const LABELS = ['Approve', 'Do now', 'Decide', 'Being checked', 'Coming up', 'Done', 'Handled by the AI'];
 
 /** Unfold what the page folds: *Done* and the handled log. */
 async function unfold(page: Page): Promise<void> {
@@ -48,6 +60,19 @@ test('every group holds its item, in order, and every primary wins its own centr
     .getByTestId('turn-section')
     .evaluateAll((els) => els.map((el) => el.getAttribute('data-section')));
   expect(sections).toEqual(ORDER);
+  const labels = await page.locator('[data-testid="turn-section"] h2').evaluateAll((els) =>
+    // The title's own box (#296): the heading's count is a box beside it.
+    els.map((el) => (el.querySelector('[data-slot="title"]') ?? el.firstChild)?.textContent?.trim() ?? ''),
+  );
+  expect(labels).toEqual(LABELS);
+  // The strip: three numbers, the live line and the next deadline.
+  const strip = page.getByTestId('turn-strip');
+  await expect(strip.getByTestId('turn-strip-todo')).toHaveAttribute('data-value', /^[1-9]\d*$/);
+  await expect(strip.getByTestId('turn-strip-checking')).toHaveAttribute('data-value', '1');
+  await expect(strip.getByTestId('turn-round')).toBeVisible();
+  await expect(strip.getByTestId('turn-next-deadline')).toContainText('Next deadline');
+  // Where the plans stand: the plan the open items name.
+  await expect(page.locator('[data-testid="turn-plan"][data-plan="tower"]')).toHaveCount(1);
 
   await unfold(page);
   for (const seeded of fx.turn) {
@@ -214,4 +239,87 @@ test('Settings ▸ Permissions opens at the granted push’s grant, and holds on
   expect(await axeFindings(page, 'dark'), 'axe, dark').toEqual([]);
   await page.emulateMedia({ colorScheme: 'light' });
   await shoot(page, info.project.name, 'settings-permissions');
+});
+
+test('#/turn/<id> marks its card, and opens the panel on it where the panel stands beside the page', async ({
+  page,
+}, info) => {
+  const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
+  if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
+  const fx = await fixture();
+  await visit(page, { name: 'turn-focus', hash: '#/turn/turn-decide' }, fx.anchor);
+  const card = page.locator('[data-testid="turn-item"][data-item="turn-decide"]');
+  await expect(card).toHaveAttribute('aria-current', 'true');
+  const explain = page.getByTestId('turn-explain');
+  if (viewport.width >= 1200) {
+    await expect(explain).toBeVisible();
+    await expect(page.getByTestId('turn-explain-why')).toHaveCount(1);
+  } else {
+    // A sheet would cover the card the push landed on: the panel waits for Inspect.
+    await expect(explain).toHaveCount(0);
+  }
+  const layout = (await layoutFindings(page, { touch: viewport.touch })).filter(
+    (f) => f.cls === 'overflow' || f.cls === 'escape',
+  );
+  expect(layout, `${viewport.name}: overflow with the item focused`).toEqual([]);
+  await shoot(page, info.project.name, 'turn-focus');
+});
+
+/** Every type × status the seed holds (turn-by-turn phase 10): what each card must say. */
+const SHAPES: readonly {
+  id: string;
+  type: string;
+  status: string;
+  readiness?: string;
+  says?: string;
+  testIds?: string[];
+}[] = [
+  { id: 'turn-upcoming', type: 'do', status: 'todo', readiness: 'not-yet', testIds: ['turn-readiness-when'] },
+  { id: 'turn-now-secret', type: 'do', status: 'redo', readiness: 'now', testIds: ['turn-verdict'] },
+  { id: 'turn-checking', type: 'do', status: 'checking', says: 'Undo' },
+  { id: 'turn-run-request', type: 'approve', status: 'todo', readiness: 'now', testIds: ['turn-approval'] },
+  { id: 'request:e2e0request0', type: 'approve', status: 'owner', testIds: ['turn-request'] },
+  { id: 'turn-decide', type: 'decide', status: 'todo', readiness: 'now', says: 'Recommended' },
+  { id: 'turn-done', type: 'do', status: 'passed' },
+  { id: 'turn-closed', type: 'do', status: 'closed' },
+];
+
+test('every type and status the seed holds is drawn in the card’s words, with its timing grid', async ({
+  page,
+}, info) => {
+  const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
+  if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
+  const fx = await fixture();
+  await visit(page, { name: 'turn-shapes', hash: '#/turn' }, fx.anchor);
+  await unfold(page);
+  for (const shape of SHAPES) {
+    const card = page.locator(`[data-testid="turn-item"][data-item="${shape.id}"]`);
+    await expect(card, shape.id).toHaveCount(1);
+    await expect(card, `${shape.id} type`).toHaveAttribute('data-type', shape.type);
+    await expect(card, `${shape.id} status`).toHaveAttribute('data-person-status', shape.status);
+    if (shape.readiness)
+      await expect(card.getByTestId('turn-readiness').first()).toHaveAttribute(
+        'data-readiness',
+        shape.readiness,
+      );
+    await expect(card.getByTestId('turn-type').first(), `${shape.id} says its type`).toBeVisible();
+    for (const id of shape.testIds ?? [])
+      await expect(card.getByTestId(id).first(), `${shape.id} ${id}`).toBeVisible();
+    if (shape.says) await expect(card, `${shape.id} says ${shape.says}`).toContainText(shape.says);
+  }
+  // The timing grid on every open card.
+  for (const id of ['turn-upcoming', 'turn-now-secret', 'turn-run-request', 'turn-decide']) {
+    await expect(page.locator(`[data-item="${id}"] [data-testid="turn-timing"]`), `${id} timing`).toHaveCount(
+      1,
+    );
+  }
+  // The Heads-up: a thing to know, in its own section, never counted.
+  const heads = page.getByTestId('turn-heads-up');
+  await expect(heads).toHaveCount(1);
+  await expect(heads.locator('[data-testid="turn-item"][data-type="know"]')).toHaveCount(1);
+  const found = (await layoutFindings(page, { touch: viewport.touch })).filter(
+    (f) => f.cls === 'overflow' || f.cls === 'escape',
+  );
+  expect(found, `${viewport.name}: overflow on Your turn`).toEqual([]);
+  await shoot(page, info.project.name, 'turn-shapes');
 });

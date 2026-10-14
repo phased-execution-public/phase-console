@@ -16,7 +16,15 @@
  */
 import './state-sandbox.ts';
 import { HUMAN_STEP_STATES } from '../shared/human-step-model.js';
-import { GRANT_STATES, RISK_TIERS, VERDICTS } from '../shared/turn-model.js';
+import {
+  GRANT_STATES,
+  PERSON_STATUSES,
+  PERSON_STATUS_LABEL,
+  READINESS,
+  READINESS_LABEL,
+  RISK_TIERS,
+  VERDICTS,
+} from '../shared/turn-model.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -116,7 +124,15 @@ const OWNERS: Record<string, readonly string[]> = {
   verdict: VERDICTS,
   risk: RISK_TIERS,
   grant: GRANT_STATES,
+  // The card (turn-by-turn phase 8).
+  turn: PERSON_STATUSES,
+  readiness: READINESS,
 };
+
+test('the card’s two words wear their owner’s labels — one wording, held equal', () => {
+  for (const word of PERSON_STATUSES) assert.equal(WORD_ROWS.turn[word].label, PERSON_STATUS_LABEL[word], `turn:${word}`);
+  for (const word of READINESS) assert.equal(WORD_ROWS.readiness[word].label, READINESS_LABEL[word], `readiness:${word}`);
+});
 
 /* ------------------------------------------------------------------ *
  * 1. Total

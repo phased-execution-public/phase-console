@@ -359,7 +359,9 @@ describe('the thumb floor is a hit area, not a class', () => {
    */
   const BOX_FLOOR: Readonly<Record<string, number>> = Object.freeze({
     // Your turn — an item's links stack under its buttons, and the page's lists stack links:
-    'cards/item-card.tsx': 2, // the facts' plan / phase / run / unblocks links, "Open where it lives"
+    'cards/item-card.tsx': 1, // "Open where it lives"
+    'cards/turn/head.tsx': 1, // the meta's plan / phase / run / unblocks links share one class (turn-by-turn phase 8)
+    'cards/turn/steps.tsx': 1, // a plan item's and a session item's links to each other
     'screens/turn/index.tsx': 1, // "Repo ▸ Issues" under the toolbar
     'screens/turn/handled.tsx': 1, // a handled row's plan and web links share one class
     'screens/turn/inspector.tsx': 1, // the explain view's plan / phase / run links

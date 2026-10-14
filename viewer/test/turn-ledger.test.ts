@@ -10,6 +10,11 @@
  *   TL-3  the ledger stays append-only, last state wins: `returned` and
  *         `declined` are states like any other; two lanes declaring one
  *         sign-in are ONE item with two waiters (G7).
+ *   TL-4  (turn-by-turn phase 7, #261, #257) two operator acts of different
+ *         phases stay TWO items, each on its own clock; a plan item names the
+ *         session item that covers it — by the same act, or by its errands
+ *         ref — linked, never merged; a world act moved to a successor run
+ *         stands on that run's lane.
  */
 import './state-sandbox.ts';
 import assert from 'node:assert/strict';
@@ -19,7 +24,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
-  HUMAN_STEP_LINE_VERSION, HumanStepLedger, declareHumanStep, otherWaiters, readLedger,
+  HUMAN_STEP_LINE_VERSION, HumanStepLedger, coverLinks, declareHumanStep, otherWaiters, readLedger,
   type HumanStep, type TurnRefused,
 } from '../server/human-steps.ts';
 
@@ -163,5 +168,82 @@ test('the guard at ingest: an act the run may already do raises nothing; one a r
     assert.equal(permission.why, 'permission');
     assert.equal(permission.proofType, 'grant');
     assert.deepEqual(permission.permission, { wall: 'deny', command: 'git push origin main', rule: 'Bash(git push:*)' });
+  } finally { done(); }
+});
+
+test('TL-4, G7: two operator acts of different phases stay two items — the act of each phase, on its own clock (#261, #257)', () => {
+  const { ledger, done } = scratch();
+  try {
+    let pushes = 0;
+    const deps = { ledger, announce: () => { pushes++; return true; } };
+    const act = { kind: 'operator-act', title: 'Rotate the deploy key', why: 'reserved', why_source: 'declared', proof_type: 'attest', open_command: 'deploy-keys rotate' };
+    const three = asStep(declareHumanStep(deps, { slug: 'demo', phase: 3, birth: 'session', runId: 'r1', step: act }));
+    const four = asStep(declareHumanStep(deps, { slug: 'demo', phase: 4, birth: 'session', runId: 'r1', step: act }));
+    assert.notEqual(four.id, three.id, 'two phases, two acts');
+    assert.equal(ledger.open().length, 2);
+    assert.equal(pushes, 2, 'each announced on its own');
+    assert.deepEqual(four.waiters.map((w) => w.phase), [4]);
+    // A sign-in met by both phases is still the world's one item (G7 stands).
+    const signIn = { kind: 'browser-login', title: 'Sign gh in', open_command: 'gh auth login', proof: 'cmd:"gh auth status"' };
+    const s3 = asStep(declareHumanStep(deps, { slug: 'demo', phase: 3, birth: 'session', runId: 'r1', step: signIn }));
+    const s4 = asStep(declareHumanStep(deps, { slug: 'demo', phase: 4, birth: 'session', runId: 'r1', step: signIn }));
+    assert.equal(s4.id, s3.id);
+  } finally { done(); }
+});
+
+test('TL-4: a plan item names the session item that covers it — the same act, or its errands ref in the session\'s words — linked, never merged', () => {
+  const { ledger, done } = scratch();
+  try {
+    const deps = { ledger, announce: () => true };
+    const tunnel = asStep(declareHumanStep(deps, { slug: 'demo', phase: 0, birth: 'plan', step: { kind: 'operator-act', title: 'Create the tunnel and its hostnames (E-4)', why: 'reserved' } }));
+    const token = asStep(declareHumanStep(deps, { slug: 'demo', phase: 0, birth: 'plan', step: { kind: 'operator-act', title: 'Mint the service token (E-3)', why: 'reserved' } }));
+    const alone = asStep(declareHumanStep(deps, { slug: 'demo', phase: 0, birth: 'plan', step: { kind: 'operator-act', title: 'Approve the release train (E-6)', why: 'reserved' } }));
+    const session = asStep(declareHumanStep(deps, {
+      slug: 'demo', phase: 3, birth: 'session', runId: 'r1',
+      step: {
+        kind: 'operator-act', title: 'Set up the tunnel, the token and the access apps', why: 'reserved', why_source: 'declared', proof_type: 'attest',
+        guide: { text: 'Covers E-3 and E-4 in one pass.\n\n## Steps\n1. Open the dashboard and create the tunnel.\n' },
+      },
+    }));
+    const elsewhere = asStep(declareHumanStep(deps, {
+      slug: 'other', phase: 2, birth: 'session', runId: 'r2',
+      step: { kind: 'operator-act', title: 'Approve the release train (E-6)', why: 'reserved', why_source: 'declared', proof_type: 'attest' },
+    }));
+    const links = coverLinks(ledger.open());
+    assert.deepEqual(links.coveredBy.get(tunnel.id), { id: session.id, phase: 3, title: session.title });
+    assert.deepEqual(links.coveredBy.get(token.id), { id: session.id, phase: 3, title: session.title });
+    assert.deepEqual(links.covers.get(session.id)?.map((one) => one.id).sort(), [tunnel.id, token.id].sort());
+    assert.equal(links.coveredBy.get(alone.id), undefined, 'another plan\'s session covers nothing here');
+    assert.equal(links.covers.get(elsewhere.id), undefined);
+    // Linked, never merged: every item keeps its own record.
+    assert.equal(ledger.open().length, 5);
+    // The same act re-raised by a session covers it too.
+    const same = asStep(declareHumanStep(deps, {
+      slug: 'demo', phase: 5, birth: 'session', runId: 'r1',
+      step: { kind: 'operator-act', title: 'approve the release train (E-6)', why: 'reserved', why_source: 'declared', proof_type: 'attest' },
+    }));
+    assert.equal(coverLinks(ledger.open()).coveredBy.get(alone.id)?.id, same.id);
+    // A dismissed session item covers nothing.
+    ledger.move(session.id, 'dismissed', { by: 'test', verb: 'dismiss' });
+    assert.equal(coverLinks([...readLedger(ledger.file).steps.values()]).coveredBy.get(tunnel.id), undefined);
+  } finally { done(); }
+});
+
+test('TL-4: a world act moved to a successor run stands on its lane — its own lane and its waiters, the old session gone', () => {
+  const { ledger, done } = scratch();
+  try {
+    const deps = { ledger, announce: () => true };
+    const signIn = { kind: 'browser-login', title: 'Sign gh in', open_command: 'gh auth login', proof: 'cmd:"gh auth status"' };
+    const step = asStep(declareHumanStep(deps, { slug: 'demo', phase: 3, birth: 'session', runId: 'rA', sessionId: 'sA', step: signIn }));
+    asStep(declareHumanStep(deps, { slug: 'demo', phase: 4, birth: 'session', runId: 'rA', step: signIn }));
+    const moved = ledger.relane(step.id, { slug: 'demo', phase: 3, from: 'rA', to: 'rB' }) as HumanStep;
+    assert.equal(moved.runId, 'rB');
+    assert.equal(moved.sessionId, undefined, 'the old run\'s session goes with it');
+    assert.deepEqual(moved.waiters.map((w) => `${w.phase}:${w.runId}`), ['3:rB', '4:rA']);
+    assert.equal(moved.state, step.state, 'a move changes no state');
+    // Read back from the file, the same.
+    assert.equal(readLedger(ledger.file).steps.get(step.id)?.runId, 'rB');
+    // A lane it does not have is no news.
+    assert.equal((ledger.relane(step.id, { slug: 'demo', phase: 9, from: 'rA', to: 'rB' }) as HumanStep).waiters.length, 2);
   } finally { done(); }
 });

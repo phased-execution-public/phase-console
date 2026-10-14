@@ -154,6 +154,19 @@ test('with dir="rtl" Your turn mirrors and nothing overflows', async ({ page }, 
     page: getComputedStyle(document.querySelector('[data-turn-page]')!).direction,
   }));
   expect(dir).toEqual({ doc: 'rtl', page: 'rtl' });
+  // Every section heading keeps its count apart from its title (#296): the
+  // two boxes are a gap apart, never touching ("Do now5").
+  const touching = await page.evaluate(() =>
+    [...document.querySelectorAll('[data-turn-page] [data-slot="count"]')].flatMap((count) => {
+      const title = count.parentElement?.querySelector('[data-slot="title"]');
+      if (!title) return [`${count.textContent}: no title box`];
+      const a = title.getBoundingClientRect();
+      const b = count.getBoundingClientRect();
+      const gap = Math.max(b.left - a.right, a.left - b.right);
+      return gap >= 6 ? [] : [`${title.textContent} ${count.textContent}: ${gap.toFixed(1)} px`];
+    }),
+  );
+  expect(touching, `${viewport.name}: a heading's count touches its title`).toEqual([]);
   await fits(page, `${viewport.name} Your turn`, viewport.touch);
   await page.evaluate(() => document.querySelector('main')?.scrollTo(0, 0));
   await settle(page);

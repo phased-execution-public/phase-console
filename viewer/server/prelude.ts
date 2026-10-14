@@ -52,7 +52,8 @@ import type { PolicyPrefs } from './runner/policy.ts';
 import type { AccountRequirement, ManifestDecision, ResolvedManifest, RunVerifyApprovals } from './runner/state.ts';
 import type { SkillApi, SkillApiMismatch } from './skill-copy.ts';
 import type { HumanStepDirective } from './parse/plan.ts';
-import { isOpenableUrl, type HumanStepKind, type HumanStepWhere } from '../shared/human-step-model.js';
+import { erefOf, isOpenableUrl, type HumanStepKind, type HumanStepWhere } from '../shared/human-step-model.js';
+import type { WhyPerson } from '../shared/turn-model.js';
 
 /** One probe's answer: the word, the reason, and (when some but not all failed) the warnings. */
 export type ProbeVerdict = {
@@ -95,6 +96,21 @@ export type PreludeStep = {
   credential?: string;
   /** The watch ref it is `upcoming` until (control-tower phase 121); phase 0 is the plan's own. */
   due?: string;
+  /*
+   * Everything else the bullet says (turn-by-turn phase 2) — carried to the
+   * ledger item whole, where the 7.0 door dropped it: why only a person fits
+   * it, the minutes it takes, the phases it unblocks, its guide FILE (read at
+   * the ask, `readGuideFile`), a decision's options and the recommended one,
+   * when it must be done by, and the `## Operator errands` row its text names.
+   */
+  why?: WhyPerson;
+  effortMin?: number;
+  unblocks?: number[];
+  guide?: string;
+  options?: { id: string; label: string; consequence?: string }[];
+  recommended?: string;
+  deadline?: string;
+  eref?: string;
   /**
    * The ledger item that already asks for this act (control-tower phase 139): the
    * id of an OPEN human step of this plan, born `plan`, with the same phase, kind
@@ -286,6 +302,14 @@ export async function doorSteps(
       ...(step.autoOpen ? { autoOpen: step.autoOpen } : {}),
       ...(step.credential ? { credential: step.credential } : {}),
       ...(step.due ? { due: step.due } : {}),
+      ...(step.why ? { why: step.why } : {}),
+      ...(step.effortMinutes !== undefined ? { effortMin: step.effortMinutes } : {}),
+      ...(step.unblocks?.length ? { unblocks: [...step.unblocks] } : {}),
+      ...(step.guide ? { guide: step.guide } : {}),
+      ...(step.options?.length ? { options: step.options.map((option) => ({ ...option })) } : {}),
+      ...(step.recommended ? { recommended: step.recommended } : {}),
+      ...(step.deadline ? { deadline: step.deadline } : {}),
+      ...(step.eref ? { eref: step.eref } : {}),
     };
     if (!step.proof || !probe) return base;
     try {
@@ -295,6 +319,36 @@ export async function doorSteps(
       return { ...base, read: `the proof could not run: ${String((error as Error)?.message ?? error).slice(0, 200)}` };
     }
   }));
+}
+
+/**
+ * What the launch door hands the ledger for one owed step (control-tower phase
+ * 44; turn-by-turn phase 2): the step in the declaration's own shape, which
+ * `sanitiseStep` holds to the language — the bullet's kind, text, place, link
+ * or command, proof, window, self-open word, credential and due ref, and,
+ * since 7.1, everything else it says: the reason (declared, so never marked
+ * inferred), the minutes, what it unblocks, its guide (the FILE's text, read by
+ * the caller under the docs root), a decision's options with the recommended
+ * one, and when it must be done by.
+ */
+export function planStepInput(step: PreludeStep, guideText?: string): Record<string, unknown> {
+  return {
+    kind: step.kind, title: step.what, where: step.where,
+    ...(step.open && 'url' in step.open ? { open_url: step.open.url } : {}),
+    ...(step.open && 'command' in step.open ? { open_command: step.open.command } : {}),
+    ...(step.proof ? { proof: step.proof } : {}),
+    ...(step.windowMinutes !== undefined ? { windowMinutes: step.windowMinutes } : {}),
+    ...(step.autoOpen ? { auto_open: step.autoOpen } : {}),
+    ...(step.credential ? { credential: step.credential } : {}),
+    // Upcoming until its ref lands (control-tower phase 121).
+    ...(step.due ? { due_when: step.due } : {}),
+    ...(step.why ? { why: step.why } : {}),
+    ...(step.effortMin !== undefined ? { effort: step.effortMin } : {}),
+    ...(step.unblocks?.length ? { unblocks: step.unblocks.map(String) } : {}),
+    ...(guideText ? { guide: { text: guideText } } : {}),
+    ...(step.options?.length ? { options: step.options, ...(step.recommended ? { recommended: step.recommended } : {}) } : {}),
+    ...(step.deadline ? { deadline: step.deadline } : {}),
+  };
 }
 
 /**
@@ -308,16 +362,23 @@ export type HeldStep = { id: string; slug: string; birth: string; phase: number;
  * The ledger item that already asks for a listed step's act, or undefined — THE
  * match of "asked once". It is an OPEN step of this plan, born `plan`: a session's
  * or the console's step of the same words was raised for another reason and never
- * stands in for the plan's own ask. Same phase, same kind, same title. The service
- * skips a second ask on it (`askAtTheDoor`) and the prelude names it as the step's
- * `item`, so the launch form and the door cannot disagree about "already asked".
+ * stands in for the plan's own ask. Same phase, same kind, and then the same
+ * `## Operator errands` ref first (turn-by-turn phase 2) — the trailing "(E-N…)"
+ * of the step's text, read off a 7.0 item's title too, so an item raised before
+ * the bullet's words were edited is still the one that asks — else the same
+ * title. The service skips a second ask on it (`askAtTheDoor`) and the prelude
+ * names it as the step's `item`, so the launch form and the door cannot disagree
+ * about "already asked".
  */
 export function itemOf(
-  step: Pick<PreludeStep, 'phase' | 'kind' | 'what'>, held: readonly HeldStep[], slug: string,
+  step: Pick<PreludeStep, 'phase' | 'kind' | 'what'> & { eref?: string }, held: readonly HeldStep[], slug: string,
 ): string | undefined {
   const title = step.what.trim();
-  return held.find((open) => open.slug === slug && open.birth === 'plan'
-    && open.phase === step.phase && open.kind === step.kind && open.title === title)?.id;
+  const mine = held.filter((open) => open.slug === slug && open.birth === 'plan'
+    && open.phase === step.phase && open.kind === step.kind);
+  const eref = step.eref ?? erefOf(title);
+  return (eref ? mine.find((open) => erefOf(open.title) === eref) : undefined)?.id
+    ?? mine.find((open) => open.title === title)?.id;
 }
 
 /** The listed steps, each naming the item that already asks for it — a pre-cleared step is never asked, so it names none. */

@@ -203,7 +203,7 @@ import {
 } from '../shared/human-step-model.js';
 import {
   GRANT_SCOPES, GRANT_STATES, HANDLED_LINK_KINDS, HANDLED_SOURCES, PROOF_TYPES, RISK_TIERS, RULE_FAMILIES, TURN_GROUPS, VERDICT_BY, VERDICTS,
-  WALLS, WHY_PERSON,
+  WALLS, WHY_PERSON, ITEM_TYPES, PERSON_STATUSES, READINESS, ROUTE_TO, TURN_SOURCES, TURN_RECORDS, STEPS_FROM,
 } from '../shared/turn-model.js';
 
 import {
@@ -992,6 +992,18 @@ const VOCABULARIES: {
    * `permission-item.test.ts` — and `runner/verify.ts` names the same five
    * words in a refusal list of its own.) */
   { name: 'rule families', members: RULE_FAMILIES, owner: 'shared/turn-model.js' },
+  /* The card contract (turn-by-turn phase 1): what an item asks for, where it
+   * stands for the person, whether it is due, where a press goes — and the
+   * sources and records the tables are keyed by, owned here since that phase
+   * (`server/turn/fold.ts` re-exports them by identity). */
+  { name: 'item types', members: ITEM_TYPES, owner: 'shared/turn-model.js' },
+  { name: 'person statuses', members: PERSON_STATUSES, owner: 'shared/turn-model.js' },
+  { name: 'readiness', members: READINESS, owner: 'shared/turn-model.js' },
+  { name: 'routes', members: ROUTE_TO, owner: 'shared/turn-model.js' },
+  { name: 'turn sources', members: TURN_SOURCES, owner: 'shared/turn-model.js' },
+  { name: 'turn records', members: TURN_RECORDS, owner: 'shared/turn-model.js' },
+  // Where an item's steps came from (turn-by-turn phase 3, the composer).
+  { name: 'steps from', members: STEPS_FROM, owner: 'shared/turn-model.js' },
   { name: 'isolation directives', members: ISOLATION_DIRECTIVES, owner: 'shared/worktree-model.js' },
   { name: 'worktree retention', members: WORKTREE_RETENTION, owner: 'shared/worktree-model.js' },
   /* Status model v2 (control-tower phase 16): the three questions a status now

@@ -21,7 +21,7 @@
  * FREE, not Pro (operator decision 6): the language is both editions.
  */
 
-import { HUMAN_STEP_KINDS, HUMAN_STEP_SETTLED_STATES } from './human-step-model.js';
+import { HUMAN_STEP_KINDS, HUMAN_STEP_SETTLED_STATES, HUMAN_STEP_STATES } from './human-step-model.js';
 
 /* ------------------------------------------------------------------ *
  * Why a person — required on every item
@@ -75,6 +75,21 @@ export const REASON_META = Object.freeze({
  */
 function reason(label, sentence, cannot) {
   return Object.freeze({ label, sentence, cannot });
+}
+
+/**
+ * Why only a person fits an item, said ONCE (#332): the reason's sentence,
+ * capitalised, as the inspector's *Only you* row reads it — the row already
+ * labels it, so the label is never said before it ("Only you hold the secret:
+ * only you hold the secret it needs." was the same reason twice). A word no
+ * reason holds is named as it is.
+ * @param {string|null|undefined} why
+ * @returns {string}
+ */
+export function whyPersonWords(why) {
+  const meta = /** @type {Record<string, {sentence: string}>} */ (REASON_META)[String(why ?? '')];
+  if (!meta) return `Its reason is ${String(why ?? 'unknown')}.`;
+  return `${meta.sentence.charAt(0).toUpperCase()}${meta.sentence.slice(1)}.`;
 }
 
 /**
@@ -449,46 +464,64 @@ export function neverReason(cell) {
  * ------------------------------------------------------------------ */
 
 /**
- * *Do now* · *Needs one detail from you* · *Coming up* · *Being checked* ·
- * *Done* — derived by `groupOf(step)`, never stored.
+ * The page's groups, v2 (turn-by-turn phase 9): *Approve* · *Do now* ·
+ * *Decide* · *Being checked* · *Coming up* · *Done* — derived by
+ * `groupOf(item)` from the item's type and readiness, never stored. *Handled
+ * by the AI* is a section of the page, never a group, and a heads-up is in none.
  * @typedef {(typeof TURN_GROUPS)[number]} TurnGroup
  */
 export const TURN_GROUPS = Object.freeze(
-  /** @type {const} */ (['now', 'decide', 'upcoming', 'checking', 'done']),
+  /** @type {const} */ (['approve', 'now', 'decide', 'checking', 'upcoming', 'done']),
 );
 
 /** What each group is called on the page. @type {Readonly<Record<TurnGroup, string>>} */
 export const TURN_GROUP_LABEL = Object.freeze({
+  approve: 'Approve',
   now: 'Do now',
-  decide: 'Needs one detail from you',
-  upcoming: 'Coming up',
+  decide: 'Decide',
   checking: 'Being checked',
+  upcoming: 'Coming up',
   done: 'Done',
 });
 
+/** The groups that are the person's to act on now — what the headline and the strip count as to do. */
+export const TURN_OPEN_GROUPS = Object.freeze(/** @type {const} */ (['approve', 'now', 'decide']));
+
 /**
- * The group an item is drawn in — total over the states: a settled one
- * is done, an upcoming one is coming up, one being checked is being checked,
- * an open decision needs one detail, and every other open one (a returned one
- * included — it has to be redone) is the person's to do now.
- * @param {{state?: string, kind?: string, proofType?: string}} step
+ * The group an item is drawn in — total over the states, and by type and
+ * readiness: a settled one (or one whose person's status says it is over) is
+ * done, one being checked is being checked, one NOT YET due is coming up; of
+ * the rest an approval is to approve, a decision to decide, and every other
+ * open one (a returned one included — it has to be redone) is the person's to
+ * do now. With no `type` given, the type is derived from what the item carries.
+ * @param {{state?: string|null, kind?: string, proofType?: string|null, source?: string, record?: string,
+ *   hasOptions?: boolean, hasApproval?: boolean, type?: string, readiness?: string, personStatus?: string}} item
  * @returns {TurnGroup}
  */
-export function groupOf(step) {
-  const state = String(step?.state ?? '');
-  if (state === 'upcoming') return 'upcoming';
-  if (state === 'checking') return 'checking';
-  if (SETTLED.has(state)) return 'done';
-  if (step?.kind === 'decision' || step?.proofType === 'answer') return 'decide';
+export function groupOf(item) {
+  const state = String(item?.state ?? '');
+  const status = String(item?.personStatus ?? '');
+  if (SETTLED.has(state) || status === 'passed' || status === 'not-doing' || status === 'closed')
+    return 'done';
+  if (state === 'checking' || status === 'checking') return 'checking';
+  if (state === 'upcoming' || item?.readiness === 'not-yet') return 'upcoming';
+  const type = item?.type ?? typeOf(item ?? {});
+  if (type === 'approve') return 'approve';
+  if (type === 'decide') return 'decide';
   return 'now';
 }
 
 /** The settled states, read once from the human-step model. */
 const SETTLED = new Set(/** @type {readonly string[]} */ (HUMAN_STEP_SETTLED_STATES));
 
-/** Who handled something instead of asking a person. */
+/**
+ * Who handled something instead of asking a person. `console` (turn-by-turn
+ * phase 7) is the console's own close: an item nobody needs any more — its run
+ * superseded, resolved or finished, its phase done on the board, its cause gone,
+ * or settled by the supervisor's act — closed or moved with its reason.
+ */
 export const HANDLED_SOURCES = Object.freeze(
-  /** @type {const} */ (['guard', 'auto-grant', 'relay-rule', 'ladder', 'supervisor', 'session']),
+  /** @type {const} */ (['guard', 'auto-grant', 'relay-rule', 'ladder', 'supervisor', 'session', 'console']),
 );
 
 /**
@@ -518,12 +551,439 @@ export const G5_SENTENCE =
   'nothing refused this — run it: this console recorded no wall for this lane that the declaration names, so the call was never ' +
   'refused. Run the command; if it is refused, the refusal is recorded and a declaration citing it raises an item.';
 
+/**
+ * What a permission errand says when G5 refused its declaration at ingest
+ * (turn-by-turn phase 6, the honest path): no item was raised, so the errand
+ * names none — never "Your turn holds a permission item for it".
+ */
+export const G5_ERRAND_HOW =
+  'Nothing refused the command the session named: this console recorded no wall for its lane, so Your turn holds no ' +
+  'permission item for it. Recover & continue resumes the phase to run the command itself; if it is refused then, the ' +
+  'refusal is recorded and a declaration citing it raises the item.';
+
 /** The rules, by name, in the order the door runs them. */
 export const GUARD_RULES = Object.freeze(/** @type {const} */ (['G1', 'G2', 'G3', 'G4', 'G5', 'G6', 'G7']));
 
+/* ------------------------------------------------------------------ *
+ * The card contract (turn-by-turn phase 1, §Architecture 2)
+ *
+ * Every card is drawn from the same words, each derived ONCE here from what the
+ * item already carries — its kind, where it came from, which record holds it,
+ * how it is proven, its ledger state — and carried on every `GET /api/turn`
+ * item: the TYPE (what the person is asked for), the PERSON'S STATUS (where
+ * the item stands for them), the READINESS (whether it is due) and the ROUTE
+ * (where a press goes, and who resumes). `category` stays the status lamp's
+ * family (`humanStepCategory`) and is never drawn as the type.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where an item came from — one word each (control-tower phase 132). The
+ * ledger's: a plan bullet, a session's declaration, a person errand, a
+ * credential or MCP preflight, an unanswerable relay question, a converted
+ * stall, the supervisor's raise. The projected: the approval broker's card, a
+ * gate, a plan-approval hold, a QA ask, a live relay question, a
+ * person-check, a sign-in, an MCP sign-in, a conflict, a session's ask. And an
+ * authority press another door asked the owner for (control-tower phase 148).
+ * @typedef {(typeof TURN_SOURCES)[number]} TurnSource
+ */
+export const TURN_SOURCES = Object.freeze(
+  /** @type {const} */ ([
+    'plan',
+    'session',
+    'errand',
+    'preflight',
+    'relay',
+    'stall',
+    'supervisor',
+    'approval',
+    'gate',
+    'plan-approval',
+    'qa',
+    'question',
+    'person-check',
+    'sign-in',
+    'mcp-auth',
+    'conflict',
+    'session-ask',
+    'request',
+    // A phase's run request (turn-by-turn phase 6, #286): ONE approval per run and act.
+    'run-request',
+  ]),
+);
+
+/**
+ * Which record holds an item: the human-step ledger, another record the item
+ * is projected from (a card, a gate, a question), or an owner request.
+ * @typedef {(typeof TURN_RECORDS)[number]} TurnRecord
+ */
+export const TURN_RECORDS = Object.freeze(/** @type {const} */ (['ledger', 'projected', 'request']));
+
+/**
+ * What the person is asked for. `approve` — a yes or no on something an AI, a
+ * plan or a session wants to do; `do` — an act only a person can do; `decide`
+ * — choose among named options; `know` — nothing to do (an unbound errand
+ * row, never counted).
+ * @typedef {(typeof ITEM_TYPES)[number]} ItemType
+ */
+export const ITEM_TYPES = Object.freeze(/** @type {const} */ (['approve', 'do', 'decide', 'know']));
+
+/** What each type is called, and what it asks, in one line. @type {Readonly<Record<ItemType, Readonly<{label: string, sense: string}>>>} */
+export const TYPE_META = Object.freeze({
+  approve: Object.freeze({
+    label: 'Approval',
+    sense: 'Say yes or no to something the AI, a plan or a session wants to do.',
+  }),
+  do: Object.freeze({ label: 'Task', sense: 'Something only you can do.' }),
+  decide: Object.freeze({ label: 'Decision', sense: 'Choose one of the options.' }),
+  know: Object.freeze({ label: 'Heads-up', sense: 'Nothing to do — it is here so you know.' }),
+});
+
+/**
+ * The type a kind asks for when nothing else decides it: a decision is
+ * decided, a check by eye or a permission is a yes or no, every other kind is
+ * an act. Total over the kinds.
+ * @type {Readonly<Record<import('./human-step-model.js').HumanStepKind, ItemType>>}
+ */
+export const KIND_TYPE = Object.freeze({
+  'browser-login': 'do',
+  'device-code': 'do',
+  'one-time-code': 'do',
+  'secret-entry': 'do',
+  'claude-login': 'do',
+  'mcp-login': 'do',
+  'os-prompt': 'do',
+  'os-permission': 'do',
+  'third-party-approval': 'do',
+  physical: 'do',
+  'person-check': 'approve',
+  decision: 'decide',
+  'protected-path': 'do',
+  'interactive-prompt': 'do',
+  captcha: 'do',
+  'email-link': 'do',
+  'operator-act': 'do',
+  permission: 'approve',
+});
+
+/**
+ * The sources whose PROJECTED card is a yes or no — a gate, a permission card,
+ * a held plan, a check by eye, an owner request, a supervisor's suggestion
+ * card — keyed by every source, so a source added without an answer is a type
+ * error. A ledger item's source never makes it an approval: the supervisor's
+ * raised escalation is an act, its standing suggestion card a yes or no.
+ * @type {Readonly<Record<TurnSource, boolean>>}
+ */
+export const SOURCE_APPROVES = Object.freeze({
+  plan: false,
+  session: false,
+  errand: false,
+  preflight: false,
+  relay: false,
+  stall: false,
+  supervisor: true,
+  approval: true,
+  gate: true,
+  'plan-approval': true,
+  qa: false,
+  question: false,
+  'person-check': true,
+  'sign-in': false,
+  'mcp-auth': false,
+  conflict: false,
+  'session-ask': false,
+  request: true,
+  'run-request': true,
+});
+
+/**
+ * The item's type, derived once. In order: an unbound row is a heads-up; an
+ * owner request, an approval block, a grant, or a projected card of an
+ * approving source is an approval; options, an answer for proof or a decision
+ * kind are a decision; otherwise the kind's own type.
+ * @param {{kind?: string, source?: string, record?: string, proofType?: string|null, hasOptions?: boolean, hasApproval?: boolean, bound?: boolean}} item
+ * @returns {ItemType}
+ */
+export function typeOf(item) {
+  if (item.bound === false) return 'know';
+  if (item.record === 'request' || item.source === 'request') return 'approve';
+  if (item.hasApproval || item.proofType === 'grant') return 'approve';
+  const kindType = /** @type {Record<string, ItemType>} */ (KIND_TYPE)[String(item.kind ?? '')];
+  if (kindType === 'approve') return 'approve';
+  const approves = /** @type {Record<string, boolean>} */ (SOURCE_APPROVES)[String(item.source ?? '')];
+  if (item.record !== 'ledger' && approves) return 'approve';
+  if (item.hasOptions || item.proofType === 'answer' || kindType === 'decide') return 'decide';
+  return 'do';
+}
+
+/**
+ * Where an item stands for the PERSON — the ledger's states told in a
+ * person's words, plus the owner's: to do, being checked, passed, sent back to
+ * redo, not doing it, closed without them, and waiting for the owner (an
+ * owner-door request).
+ * @typedef {(typeof PERSON_STATUSES)[number]} PersonStatus
+ */
+export const PERSON_STATUSES = Object.freeze(
+  /** @type {const} */ (['todo', 'checking', 'passed', 'redo', 'not-doing', 'closed', 'owner']),
+);
+
+/** What each person's status is called. @type {Readonly<Record<PersonStatus, string>>} */
+export const PERSON_STATUS_LABEL = Object.freeze({
+  todo: 'To do',
+  checking: 'Checking',
+  passed: 'Passed',
+  redo: 'Redo',
+  'not-doing': 'Not doing',
+  closed: 'Closed',
+  owner: 'Waiting for the owner',
+});
+
+/**
+ * The ledger's states, each told as a person's status. Total over the states
+ * (a state added without a row is a type error): every open state before a
+ * check is to do — `upcoming` included, which its readiness says is not yet
+ * due — a returned one is to redo, a declined one or one the person cannot do
+ * is theirs not to do, and one that expired or was withdrawn closed without them.
+ * @type {Readonly<Record<import('./human-step-model.js').HumanStepState, PersonStatus>>}
+ */
+export const STATE_PERSON_STATUS = Object.freeze({
+  upcoming: 'todo',
+  declared: 'todo',
+  notified: 'todo',
+  opened: 'todo',
+  checking: 'checking',
+  returned: 'redo',
+  proven: 'passed',
+  declined: 'not-doing',
+  expired: 'closed',
+  cannot: 'not-doing',
+  dismissed: 'closed',
+});
+
+/**
+ * The person's status, derived once: an owner request waits for the owner; a
+ * ledger state answers by its row; an item with no state (a projected card)
+ * answers by its last verdict, else it is to do.
+ * @param {{state?: string|null, verdict?: string|null, record?: string}} item
+ * @returns {PersonStatus}
+ */
+export function personStatusOf(item) {
+  if (item.record === 'request') return 'owner';
+  const byState = /** @type {Record<string, PersonStatus>} */ (STATE_PERSON_STATUS)[String(item.state ?? '')];
+  if (byState) return byState;
+  if (item.verdict === 'passed') return 'passed';
+  if (item.verdict === 'rejected' || item.verdict === 'needs-info') return 'redo';
+  return 'todo';
+}
+
+/**
+ * Whether the act is due: NOW, or NOT YET (an `upcoming` step, or one whose
+ * start is ahead). A card shows it only while the person has the act to do.
+ * @typedef {(typeof READINESS)[number]} Readiness
+ */
+export const READINESS = Object.freeze(/** @type {const} */ (['now', 'not-yet']));
+
+/** What each readiness is called. @type {Readonly<Record<Readiness, string>>} */
+export const READINESS_LABEL = Object.freeze({ now: 'Now', 'not-yet': 'Not yet' });
+
+/**
+ * The readiness, derived once — always one word: an `upcoming` step is not
+ * yet due, so is a stateless item still waiting on its due-when ref, and so is
+ * one whose start is ahead of `now`; everything else is due now.
+ * @param {{state?: string|null, dueWhen?: string|null, startAt?: string|null, now?: number}} item
+ * @returns {Readiness}
+ */
+export function readinessOf(item) {
+  if (item.state === 'upcoming') return 'not-yet';
+  if (!item.state && typeof item.dueWhen === 'string' && item.dueWhen) return 'not-yet';
+  const start = typeof item.startAt === 'string' ? Date.parse(item.startAt) : NaN;
+  if (Number.isFinite(start) && start > (item.now ?? Date.now())) return 'not-yet';
+  return 'now';
+}
+
+/** Is the readiness drawn for a person's status — only while the act is still theirs to do. */
+export function readinessShown(/** @type {string} */ personStatus) {
+  return personStatus === 'todo' || personStatus === 'redo';
+}
+
+/**
+ * Where a press goes — *Goes to*: the PHASE (its session resumes), the
+ * SUPERVISOR (Pro) or the RUN (Free) — the run applies the act and resumes —
+ * the GATE (it opens and its phase boards), or the CONSOLE (it checks; the
+ * phases that wait on it board).
+ * @typedef {(typeof ROUTE_TO)[number]} RouteTo
+ */
+export const ROUTE_TO = Object.freeze(
+  /** @type {const} */ (['phase', 'supervisor', 'run', 'gate', 'console']),
+);
+
+/** What each route is called, and who resumes, in words. @type {Readonly<Record<RouteTo, Readonly<{label: string, resumes: string}>>>} */
+export const ROUTE_META = Object.freeze({
+  phase: Object.freeze({ label: 'The phase', resumes: 'its session picks up where it stopped' }),
+  supervisor: Object.freeze({
+    label: 'The supervisor',
+    resumes: 'the supervisor applies it and the run carries on',
+  }),
+  run: Object.freeze({ label: 'The run', resumes: 'the run applies it and carries on' }),
+  gate: Object.freeze({ label: 'The gate', resumes: 'the gate opens and its phase starts' }),
+  console: Object.freeze({
+    label: 'The console',
+    resumes: 'the console checks it, and the phases waiting on it start',
+  }),
+});
+
+/**
+ * Where each source's press goes, before the edition and the birth speak —
+ * total over the sources. `run` is the run-level word; Pro tells it as the
+ * supervisor (`routeOf`). A preflight, a sign-in and an owner request are
+ * checked by the console before anything boards; a conflict and the
+ * supervisor's own items are the run's; everything else resumes its phase.
+ * @type {Readonly<Record<TurnSource, Exclude<RouteTo, 'supervisor'>>>}
+ */
+export const SOURCE_ROUTE = Object.freeze({
+  plan: 'phase',
+  session: 'phase',
+  errand: 'phase',
+  preflight: 'console',
+  relay: 'phase',
+  stall: 'phase',
+  supervisor: 'run',
+  approval: 'phase',
+  gate: 'gate',
+  'plan-approval': 'phase',
+  qa: 'phase',
+  question: 'phase',
+  'person-check': 'phase',
+  'sign-in': 'console',
+  'mcp-auth': 'console',
+  conflict: 'run',
+  'session-ask': 'phase',
+  request: 'console',
+  // The run takes it — the supervisor, in Pro (`routeOf`).
+  'run-request': 'run',
+});
+
+/**
+ * The route, derived once. In order: an item the supervisor raised is the
+ * run's; a plan's own act (every waiter at phase 0 — the plan's `## Operator
+ * errands`) is the console's; an errand no ledger step stands behind is the
+ * ladder's ask on a halt — the run's; otherwise the source's row. The run is
+ * the supervisor in Pro; Free has no supervisor and answers `run`.
+ * @param {{birth?: string|null, source?: string, record?: string, waiters?: ReadonlyArray<{phase?: number|string}>|null, phase?: number|string|null, edition?: string}} item
+ * @returns {RouteTo}
+ */
+export function routeOf(item) {
+  /** @type {Exclude<RouteTo, 'supervisor'>} */
+  let route =
+    /** @type {Record<string, Exclude<RouteTo, 'supervisor'>>} */ (SOURCE_ROUTE)[String(item.source ?? '')] ??
+    'phase';
+  if (item.birth === 'supervisor') route = 'run';
+  else if (item.source === 'errand' && item.record === 'projected') route = 'run';
+  else if (item.birth === 'plan' || item.source === 'plan') {
+    const phases = item.waiters?.length
+      ? item.waiters.map((waiter) => Number(waiter.phase))
+      : [Number(item.phase)];
+    route = phases.every((phase) => phase === 0) ? 'console' : 'phase';
+  }
+  return route === 'run' && item.edition === 'pro' ? 'supervisor' : route;
+}
+
+/**
+ * *Checked by* — who or what decides the item is done, in words, keyed by the
+ * proof types (no second list).
+ * @type {Readonly<Record<ProofType, string>>}
+ */
+export const CHECKED_BY_LABEL = Object.freeze({
+  probe: 'The console runs a check',
+  answer: 'Your answer is the result',
+  judgement: 'A checking session reads your evidence',
+  attest: 'Your word',
+  grant: 'Your grant',
+});
+
+/**
+ * Where an item's steps came from (turn-by-turn phase 3, `server/turn/compose.ts`),
+ * first that exists: an authored guide, the plan's errands row, the step's own
+ * lines, the situation's ask, or a minimal guide from what it opens and its proof.
+ * @typedef {(typeof STEPS_FROM)[number]} StepsFrom
+ */
+export const STEPS_FROM = Object.freeze(
+  /** @type {const} */ (['guide', 'errand', 'lines', 'ask', 'minimal']),
+);
+
+/**
+ * Does a kind's act outlive the run that raised it (turn-by-turn phase 7,
+ * §Architecture 5.2)? A WORLD act — a sign-in, a secret stored, a tunnel
+ * built, a third party's approval, hands at a device — is still owed by the
+ * plan when the run that met it is replaced, so the round's stale pass moves
+ * it to the successor's lane (`server/turn/stale.ts`). Anything else is
+ * RUN-SPECIFIC — a code a session printed, a dialog it raised, a decision or a
+ * permission its session asked for, a protected edit on its tree — and closes
+ * with the run. One row per kind, asserted at load.
+ * @type {Readonly<Record<import('./human-step-model.js').HumanStepKind, boolean>>}
+ */
+export const KIND_OUTLIVES_RUN = Object.freeze({
+  'browser-login': true,
+  'device-code': false,
+  'one-time-code': false,
+  'secret-entry': true,
+  'claude-login': true,
+  'mcp-login': true,
+  'os-prompt': false,
+  'os-permission': true,
+  'third-party-approval': true,
+  physical: true,
+  'person-check': false,
+  decision: false,
+  'protected-path': false,
+  'interactive-prompt': false,
+  captcha: false,
+  'email-link': true,
+  'operator-act': true,
+  permission: false,
+});
+
+/**
+ * The sources whose items are about the RUN itself, whatever their kind: an
+ * errand, a relayed question, a stall, a run request — each closes with its run.
+ */
+export const RUN_BOUND_SOURCES = Object.freeze(
+  /** @type {const} */ (['errand', 'relay', 'stall', 'console', 'run-request']),
+);
+
+/**
+ * Is this item a world act — one the stale pass moves to a successor run
+ * rather than closes? A supervisor's item and one raised from a run-bound
+ * source are the run's; any other follows its kind.
+ * @param {{ kind: string; birth?: string; source?: { kind?: string } | null }} step
+ */
+export function outlivesRun(step) {
+  if (step.birth === 'supervisor') return false;
+  if (
+    step.birth === 'console' &&
+    RUN_BOUND_SOURCES.includes(/** @type {never} */ (step.source?.kind ?? 'console'))
+  )
+    return false;
+  return /** @type {Record<string, boolean>} */ (KIND_OUTLIVES_RUN)[step.kind] === true;
+}
+
 /** Every kind has a reason list — asserted at load, so a kind added without one fails the first import. */
 for (const kind of HUMAN_STEP_KINDS) {
+  // …and says whether its act outlives its run (turn-by-turn phase 7).
+  if (typeof (/** @type {Record<string, unknown>} */ (KIND_OUTLIVES_RUN)[kind]) !== 'boolean') {
+    throw new Error(`turn-model: KIND_OUTLIVES_RUN has no row for the kind ${kind}`);
+  }
   if (!(/** @type {Record<string, unknown>} */ (KIND_REASONS)[kind])) {
     throw new Error(`turn-model: KIND_REASONS has no row for the kind ${kind}`);
+  }
+  // …and a type (turn-by-turn phase 1).
+  if (!(/** @type {Record<string, unknown>} */ (KIND_TYPE)[kind])) {
+    throw new Error(`turn-model: KIND_TYPE has no row for the kind ${kind}`);
+  }
+}
+
+/** Every state is told as a person's status — a state added without a row fails the first import. */
+for (const state of HUMAN_STEP_STATES) {
+  if (!(/** @type {Record<string, unknown>} */ (STATE_PERSON_STATUS)[state])) {
+    throw new Error(`turn-model: STATE_PERSON_STATUS has no row for the state ${state}`);
   }
 }

@@ -10,8 +10,10 @@
  *
  *   ID-1 on the card as it opens: the why, every step with its command,
  *        expected result, warning and link (its full address), the fix, how it
- *        is checked, the effort, the countdown, what it unblocks, the verdict
- *        with the attempt and what to redo, the AI's note;
+ *        is checked, the effort, the timing grid (assigned, do it, deadline,
+ *        open until, you sent it, checked), what it unblocks, where a press
+ *        goes and who checks it, the verdict with the attempt and what to redo,
+ *        the AI's note (turn-by-turn phase 8);
  *   ID-2 one press in (the history): who raised it and when, every attempt
  *        side by side with its verdict and evidence, every move, the
  *        question and the answer;
@@ -207,7 +209,12 @@ describe('ID-1 on the card as it opens', () => {
     expect(check).toContain('security find-generic-password');
     expect(check).toContain('The keychain answers with the item.');
     expect(within(card).getByTestId('turn-effort').textContent).toContain('About 5 min');
-    expect(within(card).getByTestId('turn-due').textContent).toContain('in 3 h');
+    // The timing grid: the window is "Open until", never a deadline, and a missing deadline is said.
+    expect(within(card).getByTestId('turn-open-until').textContent).toContain('closes in 3 h');
+    expect(within(card).getByTestId('turn-assigned').textContent).toContain('2 h 45 m ago');
+    expect(within(card).getByTestId('turn-do-it').textContent).toContain('Now');
+    expect(within(card).getByTestId('turn-deadline').textContent).toContain('None set');
+    expect(within(card).getByTestId('turn-checked').textContent).toContain('20 m ago');
     const unblocks = within(card).getByTestId('turn-unblocks');
     expect(within(unblocks).getByRole('link', { name: 'phase 5' })).toBeTruthy();
     expect(within(unblocks).getByRole('link', { name: 'beta phase 2' })).toBeTruthy();
@@ -225,7 +232,7 @@ describe('ID-1 on the card as it opens', () => {
     );
     expect(within(card).getByTestId('turn-ai-note').textContent).toContain('found no item by that name');
     // The one primary — the redo is checked once done — and never a field for the value.
-    expect(within(card).getByTestId('turn-primary').textContent).toBe(CHECK_LABEL);
+    expect(within(card).getByTestId('turn-primary').textContent).toBe("I've redone it");
     expect(within(card).getByTestId('step-secret-where')).toBeTruthy();
     expect(within(card).queryByRole('textbox')).toBeNull();
   });

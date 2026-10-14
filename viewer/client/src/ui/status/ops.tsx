@@ -7,7 +7,17 @@ import type { Chrome, WordOf } from './view';
  * phase, a plan, QA, an account and an MCP server each have their wrapper.
  */
 type OwnMember =
-  'run' | 'phase' | 'board' | 'plan' | 'qa-result' | 'qa-mode' | 'auth' | 'entitlement' | 'mcp';
+  | 'run'
+  | 'phase'
+  | 'board'
+  | 'plan'
+  | 'qa-result'
+  | 'qa-mode'
+  | 'auth'
+  | 'entitlement'
+  | 'mcp'
+  | 'turn'
+  | 'readiness';
 
 /** Every other word the console paints — the console's machinery and the plan file's lesser words. */
 export type OpsVocab = Exclude<StatusVocab, OwnMember>;

@@ -1,5 +1,5 @@
 /**
- * The policy table (phase 11, ZTD-10 / QRL-3): 19 classes, each tied to one
+ * The policy table (phase 11, ZTD-10 / QRL-3): 20 classes, each tied to one
  * manifest key; every ask the ladder can raise governed by exactly one class;
  * every journal name in the table a real row of `docs/journal-events.md`;
  * the answer vocabularies the plan format documents; the resolution order
@@ -30,10 +30,10 @@ import { keyedAsks } from '../server/runner/ladder.ts';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..', '..');
 
-test('19 classes, each with one manifest key, in the audit\'s order; the vocabularies are what the plan format documents', () => {
-  assert.equal(POLICY_TABLE.length, 19);
+test('20 classes (19 + the run request, turn-by-turn phase 6), each with one manifest key, in the audit\'s order; the vocabularies are what the plan format documents', () => {
+  assert.equal(POLICY_TABLE.length, 20);
   assert.deepEqual(POLICY_TABLE.map((r) => r.class), [...POLICY_CLASSES]);
-  assert.equal(new Set(POLICY_CLASSES).size, 19);
+  assert.equal(new Set(POLICY_CLASSES).size, 20);
   for (const row of POLICY_TABLE) {
     assert.ok((DECISION_KEYS as readonly string[]).includes(row.decisionKey), `${row.class} → ${row.decisionKey}`);
     assert.ok(row.blurb.length > 20, `${row.class} blurb`);

@@ -16,6 +16,9 @@
  *   - `relay-rule` — a relayed question the console answered by rule
  *     (`phase.question-answered`, `by` anything but `human`);
  *   - `ladder` — a recovery that let the run carry on (`run.recovery-continue`);
+ *   - `console` — the console's own close (turn-by-turn phase 7): a superseded
+ *     run's asks (`run.superseded`), and the round's stale pass, which records
+ *     each item it closes or moves to a successor run with its reason;
  *   - `supervisor` (Pro) — what the supervisor pressed, written by its engine;
  *   - `session` — a session's own `phase-outcome.sh <slug> <N> handled`, which
  *     appends to a file of the SESSIONS' own beside it, `handled-sessions.ndjson`
@@ -23,7 +26,7 @@
  *     every line of its file reads as `session` whatever it claims: never a
  *     console source, never a fold, never a console row's count (the push review
  *     of b5542fdd — a session appending `"source":"guard"` spoke as the console).
- * The first four are read off the journal line as it is written
+ * The first four, and a superseded run, are read off the journal line as it is written
  * (`handledOfJournal`), so each row links the line that says it.
  *
  * A console source FOLDS: one row per rule per phase, with a count — 452
@@ -385,6 +388,16 @@ export function handledOfJournal(line: JournalLineSeen): HandledInput | null {
         fold: `${situation}\n${rung}`,
       };
     }
+    case 'run.superseded': {
+      // A stopped run a later run replaced (turn-by-turn phase 7): its errands,
+      // its identity question and its run-level asks leave Your turn with it.
+      const by = words(data.by, 64);
+      if (!by) return null;
+      return {
+        slug, runId, links, source: 'console',
+        what: `Closed what run ${runId} asked — it was superseded by run ${by}, so nobody needs it any more`,
+      };
+    }
     default:
       return null;
   }
@@ -396,4 +409,5 @@ export const HANDLED_EVENTS = Object.freeze([
   'phase.approval-auto-granted',
   'phase.question-answered',
   'run.recovery-continue',
+  'run.superseded',
 ] as const);

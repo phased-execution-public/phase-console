@@ -12,54 +12,136 @@ Everything on that page is an **item**. An item tells you:
 - where to do it: **At the machine** (the computer the console runs on) or **Any device**, your phone
   included;
 - how it will be checked;
-- one button to start, chosen by the kind of item and where it stands: *Open sign-in*, *Open the link*,
-  *Open in terminal*, *Enter it at the machine*, *Send my answer*, *I've done this — check*, or, for a
-  permission, *Grant*.
+- one button to start, chosen by the type of item and where it stands: *I've done this — check* for a
+  task, with *Open sign-in*, *Open the link*, *Open in terminal* or *Enter it at the machine* beside it;
+  *Send my decision* for a decision; *Approve* and *Deny* for an approval, or, for a permission,
+  *Approve* at a scope; *Got it* for a heads-up.
 
 ## The page
 
 **Your turn** (`#/turn`, under Runs) lists every act only you can do. Its heading is one sentence that
 sums the page up: how many things need you now, which has waited longest and what it holds, how many are
-being checked or coming up, and how many the AI handled since you last looked. Under it, the round that
-read it: *Round 14, read at 12:00. It last changed at 11:50.* The console composes that sentence by rules
-from its counts. No model writes it.
+being checked or coming up, and how many the AI handled since you last looked. The console composes that
+sentence by rules from its counts. No model writes it.
 
-Below it come six sections, always in this order:
+Under the heading sits the strip: three numbers, **to do**, **checking** and **passed today**; then the
+live line, the round that read the page (*Round 14, read at 12:00. It last changed at 11:50.*); and **Next
+deadline**, the nearest deadline any open item carries, with how long is left or how overdue it is. Its
+title is a link to that item.
 
-| Section | What is in it |
+Below the strip come six groups, always in this order, and an empty group says so in one line:
+
+| Group | What is in it |
 |---|---|
-| **Do now** | Items waiting for you to act, including any that a check sent back. |
-| **Needs one detail from you** | Decisions and questions: you answer instead of doing. |
-| **Coming up** | Acts that are not due yet (see Acts that come due later). |
+| **Approve** | Approvals: a yes or a no on something the AI, a plan or a session wants to do — a permission, a gate, a held plan, a run request. |
+| **Do now** | Tasks waiting for you to act, including any that a check sent back to redo. |
+| **Decide** | Decisions and questions: you choose one of the options instead of doing. |
 | **Being checked** | Items whose check is running. There is nothing to press until the verdict lands. |
+| **Coming up** | Acts that are not due yet (see Acts that come due later). |
 | **Done** | What was settled today, folded under *What was settled*, with the older ones beneath, under *Earlier*. |
-| **Handled by the AI** | What the AI settled on its own, instead of asking you, folded under *What the AI handled*. |
+
+After the groups, **Handled by the AI** lists what the AI settled on its own instead of asking you, folded
+under *What the AI handled*. It is a section of the page, not a group. A plan's errand that no step names
+is a **Heads-up**: nothing checks it or waits on it, it is counted nowhere, and it sits in its own section
+after the handled log until you press *Got it*. Last, **Where the plans stand** gives one line for every
+plan the open items name: how many of its phases are done, the phase it is on now, the phase it can take
+next, and how many of its items wait on you, which is a link to the page narrowed to that plan.
 
 The page keeps itself current. Once a minute, and whenever a run writes to its journal, the console
 takes a *round*: it sends the reminders that are due, expires a window that closed, withdraws an item
 nobody needs any more, brings a coming-up act due, reads the proofs it can and ends the grants that ran
 out. A round that changed anything updates the page on every screen. A quiet round changes nothing.
 
-`#/turn/<id>` opens one item, and a push opens its item there for you. The phone queue's older addresses,
-`#/approve` and `#/approve?step=<id>`, land on the page in one hop. The approval queue, the question card,
-the gate card and the errand card no longer draw a shape of their own: each shows the item as one row with
-its one button, and **Open on Your turn** takes you to the whole card. On **Runs**, the **Your turn**
-group lists the same items, one line each, and a run your turn summons offers its oldest item's button as
-its one action; **Your turn (n)** in the situation line counts items and opens the page.
+A round also closes what nobody needs any more. When you start a plan again, the new run supersedes the
+old one, and the old run's own items close themselves: an identity question, a refused checkout, a
+streak of failures. An act that outlives a run, such as a sign-in, a secret or an errand at the
+machine, moves to the new run and stays open. An item also closes when its phase is done on the board,
+or when the errand behind it is gone. Each closed item reads **Closed** and leaves a row under
+**Handled by the AI** saying why. A card that names a run acts only on that run: pressed after a new run
+took its place, it refuses and says so, and the old run is never touched.
 
-Search it for a title, a command or a plan, and narrow it with **Filter** by plan, run, kind, reason or
-risk. Every filter is part of the address, so a narrowed view is a link, and *Showing 3 of 9 items* says
-so, with **Clear the filters**. Under **⋯**, **Export as Markdown** downloads the open items and their
-guides as one document, and **Print** prints the same. **Everything** unfolds **Done** and the handled log,
-and opens every folded card. On a phone the filters, **⋯** and **Everything** share one **View** sheet.
+`#/turn/<id>` opens one item: the page scrolls to its card, marks it, and opens the panel on it, for an
+item the ledger holds and for one the console projects from a gate or a card alike. A push opens its item
+there for you. The phone queue's older addresses, `#/approve` and `#/approve?step=<id>`, land on the page
+in one hop. The approval queue, the question card, the gate card and the errand card no longer draw a
+shape of their own: each shows the item as one row with its one button, and **Open on Your turn** takes
+you to the whole card. On **Runs**, the **Your turn** group lists the same items, one line each, and a run
+your turn summons offers its oldest item's button as its one action; **Your turn (n)** in the situation
+line counts items and opens the page.
+
+The toolbar is one row. Search it for a title, a command or a plan. **Filter** narrows it by **Status**,
+**Time** (past its deadline, a deadline ahead, raised in the last day, waiting more than a day), **Plan**,
+**Type** and **Goes to**; with **Everything** on it also offers run, kind, reason and risk. **Group** puts
+the open items under what is asked (the six groups) or under their plan. **Sort** puts the oldest, the
+newest or the nearest deadline first. **View** draws every card whole, or **Compact**, folded to its head.
+Every filter, the grouping, the order and the view are part of the address, so a narrowed view is a link,
+and *Showing 3 of 9 items* says so, with **Clear the filters**. Under **⋯**, **Export as Markdown**
+downloads the open items as one document, each with its options, its timing and what an approval is
+about, and **Print** prints the same. **Everything** unfolds **Done** and the handled log, and opens every
+folded card. On a phone the filters, **Group**, **Sort**, **View**, **⋯** and **Everything** share one
+**View** sheet.
 
 ## Each item, and why only you
 
-An item is one card. Its head says what state it is in and what kind of act it is, then gives its title,
-then **Only you:** and the reason. Under that come the plan, phase and run it belongs to, each a link;
-what it unblocks; a countdown while its window runs; and roughly how long it takes. Then the guide, how
-it will be checked, and the buttons. **Inspect**, in the card's head, puts the item in the panel, and
-**Withdraw** takes back an item nobody needs any more.
+An item is one card. Its head says three things. First, whether the act is due: **NOW** means you can
+do it this minute; **NOT YET** means it opens later, and says when, as a time or as the thing it waits
+for (*when Phase 13 is done*). A NOT YET card has nothing to press. Second, what type of act it is:
+
+| Type | What it asks of you | Its buttons |
+|---|---|---|
+| **Approval** | A yes or a no on something the AI, a plan or a session wants to do. | **Approve** and **Deny**, each with a note; a permission is approved at a scope. |
+| **Task** | Something only you can do: sign in, type a code, store a secret, pay, act at a device or at the machine. | **I've done this — check**, with the button that opens it beside it. |
+| **Decision** | A choice among named options, the recommended one marked. | The options, a note, and **Send my decision**. |
+| **Heads-up** | Nothing. It is there so you know. | **Got it**. |
+
+Third, where you stand with it:
+
+| Status | What it means |
+|---|---|
+| **To do** | It waits for you. |
+| **Checking** | You said it is done and the check is running; **Undo: I'm not finished** takes it back. |
+| **Passed** | The check passed, or your answer settled it. |
+| **Redo** | The check sent it back, with exactly what to redo. |
+| **Not doing** | You said you will not do it, or that you cannot. |
+| **Closed** | It ended without you: it expired, it was withdrawn, or the run that needed it moved on. |
+| **Waiting for the owner** | Another door asked for it, and the console's owner confirms it with the owner key. |
+
+Then it gives its title, which names the act, then the plan, phase and run it belongs to, each a link,
+what it unblocks and roughly how long it takes. A plan's own errand is named by its id, *the plan's own
+errand E-4*.
+
+Under the title sits the **timing grid**, every clock of the item on one page clock, so a countdown moves
+every second while the card is on screen:
+
+| Cell | What it says |
+|---|---|
+| **Assigned** | When it became yours, and how long ago. |
+| **Do it** | *Now*, or when it opens: a time with a countdown, or the thing it waits for. |
+| **Deadline** | When it must be done by, what is left or how overdue it is, with a bar. *None set* when the plan named none. |
+| **Open until** | When the item stops being open. It is the item's window, never its deadline. |
+| **You sent it** | When you pressed the check. |
+| **Checked** | When the verdict landed. |
+
+The first three are always there; the other three appear once the item has them. Then comes **Only
+you:** and the reason, once. A verdict that sent the item back comes next, before the guide, with its
+numbered steps to redo. **From the AI** says what the session tried first and its last word. Then the
+guide, **How it's checked**, and two lines that say where your press goes:
+
+| Goes to | What happens when you press |
+|---|---|
+| **The phase** | Its session picks up where it stopped. |
+| **The run** | The run applies it and carries on. |
+| **The gate** | The gate opens and its phase starts. |
+| **The console** | The console checks it, and the phases waiting on it start. |
+
+
+**Checked by** says who decides it is done: *The console runs a check*, *A checking session reads your
+evidence*, *Your answer is the result*, *Your word* or *Your grant*.
+
+Last come the buttons, one act form for the item's type. A press that ends an item, *Approve*, *Deny*,
+*Not doing this* or *Send my decision*, waits a few seconds on the page with **Undo** before it is sent.
+**Inspect**, in the card's head, puts the item in the panel, and **Withdraw** takes back an item nobody
+needs any more.
 
 Every item carries one of ten reasons. The page's reason filter names them by these labels:
 
@@ -84,7 +166,10 @@ cannot reach the system, or that a rule reserves the act, and the AI could in fa
 refuses to raise it and tells the session to run the commands itself. Those refusals are not lost: they
 appear under **Handled by the AI**.
 
-The guide is a short why, then the steps as stations on a line. Tick a station once that step is done. The
+The guide is a short why, then the steps as stations on a line. It comes from the first of these that
+exists: the guide the session or the plan wrote for the item, the row of the plan's errands table the
+item names, the console's own words for that situation, or, last, the link or command to open and the
+check said in words. So every item has steps, even one raised by an older console. Tick a station once that step is done. The
 tick is yours, kept in this browser; the check, not the tick, decides when the item is done. A step may
 also say what you should see (**Expect**), warn you of something (**Warning**) and carry a link.
 **If it goes wrong** lists symptoms and what to do about each. A guide carries its language: one written in
@@ -143,7 +228,8 @@ when it lands, on every screen at once.
   check read.
 - **Back to you.** The item returns to **Do now**. It says *Back to you — attempt 2: …* with exactly what to
   redo, and it resumes nothing. When the check needs one more detail it says *Back to you — attempt 2 needs
-  one detail: …*. Every attempt keeps its own evidence and verdict, side by side in the history.
+  one detail: …*. The card reads **Redo**, shows those steps before the guide, and its button becomes
+  **I've redone it**. Every attempt keeps its own evidence and verdict, side by side in the history.
 - **After three rejections** (the shipped number; Settings ▸ Automation changes it) the item asks how it
   should end: **Rewrite the guide**, which withdraws the item and asks its session for a better one;
   **I can't do this**; or **Accept anyway**. *Accept anyway* is the owner's press. It asks once more, then
@@ -156,47 +242,69 @@ for that one item and the owner's *Accept anyway* write a verdict.
 
 Beside the check, an item offers these. Each is a press only you make.
 
-- **Send my answer.** A decision shows its options as cards, each with what choosing it means and the
-  recommended one marked, and a note you can add. A note is an answer by itself when no option fits. Your
+- **Send my decision.** A decision shows its options as cards, each with what choosing it means and the
+  recommended one marked, and a note you can add. Nothing is chosen for you. A note is an answer by itself when no option fits. Your
   answer goes back to the waiting session as one resume per waiter: `The operator answered <option>:
   <note>`. When the answer names a key of the plan's `## Decisions` table, the console writes it there first.
 - **Not doing this.** Where the raiser allows it, you can decline, with a reason. The item ends as
   *declined*, which is your own no; *withdrawn* is the console's word for an item nobody needs any more. The
   session is told `The operator declined: <reason>. Do not ask again; …` and finds another way.
-- **I can't.** Say why and press **Hand it back**. The item becomes an errand carrying your words, and it
-  does not repeat.
-- **Ask.** A question about the task. The session reads it when it resumes.
+- **Hand it back.** It opens three ways to give the item back instead of doing it. **Give back to Phase
+  N** returns it to the phase that raised it: its session takes it back and finds another way, or raises
+  a better version. **Ask the session a question** sends your question; the session reads it when it
+  resumes. **I can't do this** asks why, and the item becomes an errand carrying your words, and it does
+  not repeat.
+- **Undo.** While an item is **Checking**, **Undo: I'm not finished** takes your press back: the item
+  returns to **To do**, or to **Redo** if a check had sent it back, and a verdict that arrives for that
+  attempt is dropped. A press that ends an item waits a few seconds on the page with its own **Undo**
+  before it is sent; after that it is settled.
 - **Attach.** A note, an image or a file as evidence for this attempt: 160 KB a piece and six an attempt,
   screened for secrets, kept on this machine under its hash, and never pushed or journalled.
-- **Snooze.** Holds the next reminder back by an hour.
+- **Snooze.** Holds the next reminder back by an hour, four hours, or until tomorrow.
 
 ## When the AI lacks permission
 
 A **permission** item is the AI meeting a wall and asking you. The card opens "Raised because the AI lacks
 permission to …" and shows the command, why the phase needs it, and the wall with its rule. It then offers
 one control, **How far the grant reaches** — *This call*, *This phase*, *This plan*, *This repository* or
-*Always* — and the button names the reach, **Grant, this call** to **Grant, always**, with the risk of
+*Always* — and the button names the reach, **Approve, this call** to **Approve, always**, with the risk of
 that scope beside it. **I'll do it myself** turns the item into
 your own act: its guide is the command, and its check resumes the session. **Deny** tells the session to
 find another way.
 
 A low or medium-risk grant is one press. A high-risk one asks you to type the rule back. A wall that is
-never granted offers no **Grant** at all, only why, and the steps to take yourself. **Grant every low-risk
-ask (N)**, beside the **Do now** heading, grants every open low-risk ask in one press, each for this call
+never granted offers no **Approve** at all, only why, and the steps to take yourself. **Grant every low-risk
+ask (N)**, beside the **Approve** heading, grants every open low-risk ask in one press, each for this call
 or this phase only. A granted item stays until the console confirms the grant applied, and says so.
 
 The **Permissions** guide has the rest: the scopes, the tiers, the ledger, the never list and the owner key.
+
+## When the run must act
+
+Some things a phase cannot do for itself, because they belong to the whole run: run it again in a
+checkout of its own, move it to another account, raise a phase's dollar budget, stop it, or hold it so
+that no new phase starts. A phase that needs one of these asks the run, and the ask is a **run
+request**, never a permission.
+
+A run request is an **Approval** in the **Approve** group, one item for each run and act however many
+phases asked. Its title is the act, *Relaunch this run isolated*, *Move this run to another account*,
+*Raise the phase's dollar budget*, *Stop this run* or *Hold this run*, and it says what happens if you
+approve and what happens if you deny. **Approve** takes the act on the run, and the phases that asked
+carry on from it. For a budget, write the amount in the note. **Deny** leaves the run as it is, and the
+phases that asked are told no. The card acts only on the run it names: if a new run of the plan has taken
+its place, the press refuses and says so.
+
 
 ## Reminders, snoozing and quiet hours
 
 A waiting item is repeated after 15 minutes, an hour and six hours, then once a day, until it is done or
 its window closes (seven days, when the item names none). **Snooze** holds the next reminder back by an
-hour. Reminders keep each device's own quiet hours, set in Settings ▸ Notifications ▸ Devices: a reminder
+hour, four hours or until tomorrow. Reminders keep each device's own quiet hours, set in Settings ▸ Notifications ▸ Devices: a reminder
 that falls due while every device that would hear it is quiet waits for the first one to wake, and it is
 never urgent, so it never breaks through. The reminder is not dropped.
 
 A reminder stops when the item settles: proven, declined with **Not doing this**, handed back with
-**I can't**, or expired.
+**Hand it back**, or expired.
 
 ## Acts that come due later
 

@@ -968,3 +968,29 @@ test('LS-13: a reminder never breaks through a device’s quiet hours — the it
   assert.ok(outcomes.includes('reminder:quiet'), `a reminder is held by quiet hours: ${outcomes.join(', ')}`);
   assert.ok(outcomes.includes('first:sent'), `the urgent first push breaks through: ${outcomes.join(', ')}`);
 });
+
+test('LS-14: a run request’s lock screen is Approve and Deny only where --allow-run lets the console take the act — and the press is refused without it (turn-by-turn phase 10)', async () => {
+  const { runRequestTurnInput } = await import('../server/turn/run-requests.ts');
+  const APPROVE = { action: 'approve', title: 'Approve' };
+  const w = await lockScreen();
+  try {
+    // A console without --allow-run (the helper's): Open alone, nothing signed.
+    const off = w.svc.recordHumanStep(runRequestTurnInput({ slug: 'alpha', phase: 1, runId: 'run-rr' }, 'isolate', 'a shared checkout') as never)!;
+    const offPush = w.pushOf(off.id)!;
+    assert.deepEqual(offPush.message.step?.actions, [OPEN], 'no run act is offered where the console could not take it');
+    assert.equal(offPush.message.callback ?? null, null, 'nothing is signed');
+    const item = attention.inboxItemId({ kind: 'human-step', slug: 'alpha', phase: 1, runId: 'run-rr', subject: off.id });
+    const refused = await w.svc.performInboxAction(item, 'approve', 'notification', DEVICE as never);
+    assert.equal(refused.ok, false);
+    assert.equal((refused as { status: number }).status, 403);
+    assert.match((refused as { error: string }).error, /--allow-run/);
+    // With --allow-run: Approve, left of Deny, both signed.
+    (w.svc.flags as { allowRun: boolean }).allowRun = true;
+    const on = w.svc.recordHumanStep(runRequestTurnInput({ slug: 'alpha', phase: 1, runId: 'run-rr2' }, 'hold', 'hold the plan') as never)!;
+    const onPush = w.pushOf(on.id)!;
+    assert.deepEqual(onPush.message.step?.actions, [APPROVE, DENY]);
+    const token = actions.readActionToken(onPush.message.callback);
+    assert.ok(!('error' in token));
+    assert.deepEqual(token.verbs, ['approve', 'deny']);
+  } finally { w.cleanup(); }
+});

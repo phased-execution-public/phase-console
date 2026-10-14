@@ -74,7 +74,7 @@ function stepItem(kind: HumanStepKind, over: Parameters<typeof humanStepView>[0]
     slug: 'alpha',
     phase: 3,
     runId: 'r1',
-    title: `Your turn — ${KIND_META[kind].label.toLowerCase()} for alpha phase 3`,
+    title: view.title,
     need: view.title,
     how: '',
     since: '2026-09-30T09:00:00.000Z',

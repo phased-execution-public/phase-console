@@ -1,9 +1,11 @@
 /**
- * The six sections of Your turn (7.0, quiet-console phase 8): *Do now* ·
- * *Needs one detail from you* · *Coming up* · *Being checked* · *Done* ·
+ * The sections of Your turn — the groups v2 (turn-by-turn phase 9): *Approve*
+ * · *Do now* · *Decide* · *Being checked* · *Coming up* · *Done*, then
  * *Handled by the AI*, in that order, each a heading with its count and at
  * most one control, a hairline between them (design.md §1, principle 7), and
  * in each one card per item — a card because an item is acted on as a unit.
+ * Grouped by plan (`?group=plan`), the open items stand under one heading per
+ * plan instead, and *Done* and the handled log follow as they are.
  *
  * An empty section stays as one line saying so: the order is the thing a
  * glance learns, and a section that vanished when empty would move every one
@@ -36,6 +38,8 @@ export interface TurnSectionsProps {
   settling: readonly Settling[];
   /** The section `#/turn/<id>` names an item in — its fold opens. */
   focusedSection: SectionId | null;
+  /** View ▸ Compact: every open card folded to its head. */
+  compact?: boolean;
   /** A section's one control — *Do now*'s *Grant every low-risk ask*. */
   asideOf?: (section: TurnSection) => ReactNode;
   /** The item, drawn by the page: the card with its parts, its moves and its inspect. */
@@ -86,6 +90,7 @@ export function TurnSections({
   handledSince,
   settling,
   focusedSection,
+  compact = false,
   asideOf,
   renderItem,
 }: TurnSectionsProps) {
@@ -102,7 +107,10 @@ export function TurnSections({
     if (focusedSection === 'done') setDoneOpen(true);
   }, [focusedSection]);
 
-  const heldIn = (id: SectionId) => settling.filter((one) => one.item.group === id);
+  const heldIn = (id: TurnSection['id']) =>
+    settling.filter((one) =>
+      id.startsWith('plan:') ? `plan:${one.item.slug ?? ''}` === id : one.item.group === id,
+    );
 
   return (
     <div className="flex min-w-0 flex-col divide-y divide-rule" data-testid="turn-sections">
@@ -122,7 +130,9 @@ export function TurnSections({
                   <HandledList rows={section.handled} />
                 </Disclosure>
               ) : (
-                <p className="text-body text-ink-muted">{EMPTY_WORDS.handled}</p>
+                <p className="text-body text-ink-muted" data-testid="turn-section-empty">
+                  {EMPTY_WORDS.handled}
+                </p>
               )}
             </SectionBlock>
           );
@@ -152,7 +162,9 @@ export function TurnSections({
                   <EarlierSteps steps={earlier} />
                 </Disclosure>
               ) : (
-                <p className="text-body text-ink-muted">{EMPTY_WORDS.done}</p>
+                <p className="text-body text-ink-muted" data-testid="turn-section-empty">
+                  {EMPTY_WORDS.done}
+                </p>
               )}
             </SectionBlock>
           );
@@ -163,7 +175,7 @@ export function TurnSections({
               <Items>
                 {section.items.map((item) => (
                   <li key={item.item} className="min-w-0">
-                    {renderItem(item, section.id === 'upcoming' && !everything)}
+                    {renderItem(item, !everything && (compact || section.id === 'upcoming'))}
                   </li>
                 ))}
                 {held.map((one) => (
@@ -173,7 +185,9 @@ export function TurnSections({
                 ))}
               </Items>
             ) : (
-              <p className="text-body text-ink-muted">{EMPTY_WORDS[section.id]}</p>
+              <p className="text-body text-ink-muted" data-testid="turn-section-empty">
+                {EMPTY_WORDS[section.id as SectionId] ?? 'Nothing here.'}
+              </p>
             )}
           </SectionBlock>
         );

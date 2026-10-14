@@ -166,6 +166,66 @@ ledger_file() { # <slug>
   [ "$status" -eq 2 ]
 }
 
+@test "outcome: blocked --needs run --run-act writes ONE run request; an unknown act or a stray shape is exit 2" {
+  # turn-by-turn phase 6 (#286): an act only the RUN can take is declared as a
+  # run request, never as a permission ask nobody can grant.
+  run pe_outcome demo 8 blocked --needs run --run-act isolate --reason "relaunch isolated"
+  [ "$status" -eq 0 ]
+  expected='{
+  "version": 1,
+  "slug": "demo",
+  "phase": 8,
+  "status": "blocked",
+  "reason": "relaunch isolated",
+  "needs": "run",
+  "run_act": "isolate",
+  "watch": [],
+  "written_at": "2026-08-10T21:10:03Z"
+}'
+  [ "$(cat "$PE_OUTCOME_FILE")" = "$expected" ]
+  rm -f "$PE_OUTCOME_FILE"
+  # every act of the twin is accepted
+  # shellcheck source=/dev/null
+  . "$PE_SCRIPTS/turn.env"
+  [ "$RUN_ACTS" = "isolate switch-account raise-budget stop hold" ]
+  for act in $RUN_ACTS; do
+    run pe_outcome demo 8 blocked --needs run --run-act "$act"
+    [ "$status" -eq 0 ] || { echo "$act refused: $output"; return 1; }
+    grep -q "\"run_act\": \"$act\"" "$PE_OUTCOME_FILE"
+    rm -f "$PE_OUTCOME_FILE"
+  done
+  # an unknown act, a run request with no act, on the wrong status or need, or
+  # beside a step, a rule or a command: exit 2, nothing written
+  run pe_outcome demo 8 blocked --needs run --run-act relaunch
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "unknown --run-act: relaunch"
+  run pe_outcome demo 8 blocked --needs run
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "--needs run needs --run-act <act>"
+  run pe_outcome demo 8 needs-human --needs run --run-act stop
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 8 blocked --needs permission --run-act isolate
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 8 blocked --needs run --run-act isolate --rule 'Bash(x)'
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 8 complete --run-act hold
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 8 ruling --what "chose A" --run-act hold
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+@test "outcome: a bare --act still means --step operator-act, never a run request" {
+  run pe_outcome demo 8 needs-human --needs human-acts --act --title "Restart the build box" --open-command "ssh box sudo reboot" --proof 'date:2026-08-11T00:00:00Z'
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  grep -q '"kind": "operator-act"' "$PE_OUTCOME_FILE"
+  ! grep -q '"run_act"' "$PE_OUTCOME_FILE"
+  rm -f "$PE_OUTCOME_FILE"
+  run pe_outcome demo 8 blocked --needs run --run-act isolate --act
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
 @test "outcome: --needs/--rule/--command are refused on a status that does not ask, and on a ruling" {
   run pe_outcome demo 8 complete --needs gates
   [ "$status" -eq 2 ]

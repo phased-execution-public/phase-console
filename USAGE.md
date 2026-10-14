@@ -170,14 +170,23 @@ then it is due, with one notification — `NOW:` and its command, or its title f
 its proof clears it and resumes the phase that needed it.
 
 **Your turn: every act only a person can do, on one page.** `#/turn`, titled *Your turn* and lighting Runs,
-lists them in six sections, always in this order: *Do now*, *Needs one detail from you*, *Coming up*,
-*Being checked*, *Done* and *Handled by the AI*. Each item is one card: why only you can do it (one of ten
-reasons — `permission`, `identity`, `secret`, `money`, `legal`, `decision`, `physical`, `reach`,
-`third-party` or `reserved`), the plan, phase and run it belongs to, what it unblocks, the effort, its guide as
-steps, how it will be checked, and one primary action. A guide's commands are copyable — *Copy* as
+lists them in six groups, always in this order: *Approve*, *Do now*, *Decide*, *Being checked*, *Coming up*
+and *Done*, then the sections *Handled by the AI*, *Heads-up* and *Where the plans stand*; a strip above
+them counts what is to do, checking and passed today and names the next deadline. Each item is one card
+of one type — an *Approval* (Approve or Deny), a *Task* (*I've done this — check*), a *Decision* (its
+options and *Send my decision*) or a *Heads-up* (*Got it*) — led by NOW or NOT YET and the person's status:
+*To do*, *Checking*, *Passed*, *Redo*, *Not doing*, *Closed*, or *Waiting for the owner*. It says why only you
+can do it (one of ten reasons — `permission`, `identity`, `secret`, `money`, `legal`, `decision`, `physical`,
+`reach`, `third-party` or `reserved`), the plan, phase and run it belongs to, what it unblocks, the effort,
+a timing grid (*Assigned*, *Do it*, *Deadline*, *Open until*, *You sent it*, *Checked*), its guide as steps,
+how it will be checked, *Goes to* (the phase, the run, the gate or the console) and *Checked by*, and one
+act form for its type. A press that ends an item waits a few seconds with *Undo* before it is sent, *Undo:
+I'm not finished* takes back a running check, and *Hand it back* gives the item back to its phase, asks its
+session a question or says you cannot. A card that names a run refuses, with a sentence, once a newer run
+of the plan has taken its place, and a round closes the old run's own items by itself. A guide's commands are copyable — *Copy* as
 written, *Copy for Claude Code* behind a `!` — and are never run by the page; a link shows its whole address
-before it opens; a guide written in Persian is drawn right to left, its commands left to right. The plan, run,
-kind, reason and risk filters and the search live in the address; *Export* downloads the open items as one
+before it opens; a guide written in Persian is drawn right to left, its commands left to right. The status,
+time, plan, type and goes-to filters, the grouping, the order, the view and the search live in the address; *Export* downloads the open items as one
 Markdown document and *Print* prints the same. `#/approve` and `#/approve?step=<id>` land on the page and a
 push opens `#/turn/<id>`. The approval queue, a question, a gate and an errand all draw the same item with
 *Open on Your turn*; the Runs home's Your turn group keeps runs and one line linking here, and *Your turn (n)* in the
@@ -191,7 +200,13 @@ item; a relayed question the console will not answer by rule raises a `decision`
 options. A session raises its own with `phase-outcome.sh … needs-human --step`, and the console holds the
 declaration to a reason its kind allows (`--why`), a guide (`--guide`: a why paragraph, `## Steps` and `## If it
 goes wrong`; at most 20 steps and 24 KB) and a proof a person can read. It refuses what the AI could do itself
-with exit 4, and a step with no proof with exit 2; `references/turn.md` is the session's reference.
+with exit 4, and a step with no proof with exit 2; `references/turn.md` is the session's reference. A plan
+writes its own: a `Human step:` bullet names a guide file (`guide:`), a decision's `options:` and
+`recommended:`, and a `deadline:`, or ends with the id of a row of its `## Operator errands` table, whose
+steps become the card's; a row no bullet names is shown as a *Heads-up*. An act only the run can take —
+relaunch it isolated, move it to another account, raise a phase's budget, stop it, hold it — is a run
+request (`phase-outcome.sh … blocked --needs run --run-act <act>`): one *Approval* per run and act, which
+the run applies when you approve.
 
 **The check.** *I've done this — check* gets a verdict: passed; rejected, with exactly what to redo (the
 item says *Back to you*, the attempt and the miss); or needs-info. A command's proof is read at once and a

@@ -116,6 +116,11 @@ export const PERSON_WORDS = Object.freeze({
   'step:returned': 'a check sent the act back with what to redo, and only the person can redo it',
   'verdict:rejected': 'the check rejected what the person sent, and only the person can send it again',
   'verdict:needs-info': 'the check needs one more thing from the person before it can pass',
+  // The card (turn-by-turn phase 8): where the item stands for the person, and
+  // whether it is due — told in the person's own words.
+  'turn:todo': 'an act only a person can do is theirs to do, and nothing else moves it',
+  'turn:redo': 'a check sent the act back with what to redo, and only the person can redo it',
+  'readiness:now': 'the act is due now, and only the person it is asked of can do it',
 });
 
 /* ------------------------------------------------------------------ *
@@ -446,6 +451,23 @@ export const WORD_ROWS = Object.freeze({
     spent: row('Spent', 'check-check', 'done', 'settled', OK),
     expired: row('Expired', 'timer-off', 'skipped', 'settled', STOPPED),
     revoked: row('Revoked', 'ban', 'skipped', 'settled', STOPPED),
+  }),
+  // The card's status and readiness (turn-by-turn phase 8) — owners `PERSON_STATUSES`
+  // and `READINESS` (`shared/turn-model.js`), whose `PERSON_STATUS_LABEL` and
+  // `READINESS_LABEL` these labels are (the test holds them equal; this file
+  // imports no turn table, so the status chunk stays small).
+  turn: Object.freeze({
+    todo: row('To do', 'hand', 'needs-you', 'standing', PERSON),
+    checking: row('Checking', 'search-check', 'verifying', 'live'),
+    passed: row('Passed', 'circle-check', 'done', 'settled', OK),
+    redo: row('Redo', 'undo-2', 'needs-you', 'standing', PERSON),
+    'not-doing': row('Not doing', 'circle-slash', 'skipped', 'settled', STOPPED),
+    closed: row('Closed', 'archive-x', 'skipped', 'settled', SUPERSEDED),
+    owner: row('Waiting for the owner', 'key-round', 'waiting', 'standing', FYI),
+  }),
+  readiness: Object.freeze({
+    now: row('Now', 'hand', 'needs-you', 'standing', PERSON),
+    'not-yet': row('Not yet', 'clock', 'queued', 'standing'),
   }),
 });
 

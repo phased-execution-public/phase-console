@@ -330,6 +330,8 @@ const ROUTES: readonly SurfaceRow[] = [
   route('POST', '/api/human-steps/:id/rewrite', at(turnPage, 'human-steps#humanStepsApi.humanStepRewrite'), {
     authority: 'decline',
   }),
+  // *Undo* on an item being checked (turn-by-turn phase 5): the running check taken back.
+  route('POST', '/api/human-steps/:id/undo', at(turnPage, 'turn#undoCheck')),
   route('POST', '/api/human-steps/:id/deny', at(turnPage, BY_INBOX), { authority: 'decline' }),
   route('POST', '/api/human-steps/:id/convert', at(turnPage, BY_INBOX), { authority: 'decline' }),
   route('POST', '/api/human-steps/:id/grant', at(turnPage, 'permissions#permissionsApi.grant'), {
@@ -739,6 +741,11 @@ const ROUTES: readonly SurfaceRow[] = [
   route('POST', '/api/run/:slug/pause', at(runsHome, 'lifecycle#useLifecycle'), runFlag),
   route('POST', '/api/run/:slug/resume', at(runsHome, 'lifecycle#useLifecycle'), runFlag),
   route('POST', '/api/run/:slug/identity', at(runView, 'api/runs#runsApi.runIdentity'), runFlag),
+  // A phase's run request (turn-by-turn phase 6): the errand's two options on Your turn.
+  route('POST', '/api/run/:slug/run-request', at(turnPage, 'turn#pressOption'), {
+    ...runFlag,
+    authority: 'answer',
+  }),
   route('POST', '/api/run/:slug/hold', at(runsHome, 'lifecycle#useLifecycle'), runFlag),
   route('POST', '/api/run/:slug/release', at(runsHome, 'lifecycle#useLifecycle'), runFlag),
   route('POST', '/api/run/:slug/switch-account', at(runView, 'accounts#useSwitchAccount'), runFlag),
@@ -1174,6 +1181,7 @@ const VERBS: readonly SurfaceRow[] = [
   verb('ask', at(runView, 'api/runs#runsApi.runAsk'), runFlag),
   verb('answer', at(turnPage, BY_INBOX), { ...runFlag, authority: 'answer' }),
   verb('identity', at(runView, 'api/runs#runsApi.runIdentity'), runFlag),
+  verb('run-request', at(turnPage, 'turn#pressOption'), { ...runFlag, authority: 'answer' }),
   verb('freeze', at(runsHome, 'lifecycle#useLifecycle'), runFlag),
   verb('thaw', at(runsHome, 'lifecycle#useLifecycle'), runFlag),
   verb('stop', at(runsHome, 'lifecycle#useLifecycle'), runFlag),

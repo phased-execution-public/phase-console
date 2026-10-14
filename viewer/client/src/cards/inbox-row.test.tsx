@@ -142,6 +142,24 @@ describe('a question row', () => {
     mount(item({ kind: 'approval', severity: 'urgent' }));
     expect(screen.queryByTestId('inbox-window')).toBeNull();
   });
+
+  it('a human step whose window ends in days is no countdown to an answer by rule (#341)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-15T12:00:00.000Z'));
+    mount(
+      item({
+        id: 'human-step:demo:4:s1',
+        kind: 'human-step',
+        severity: 'needs-you',
+        title: 'Supply the payment key',
+        openUntil: '2026-09-22T12:00:12.000Z',
+        // A row an older console built still carries the window here.
+        expiresAt: '2026-09-22T12:00:12.000Z',
+      }),
+    );
+    expect(screen.queryByTestId('inbox-window')).toBeNull();
+    expect(document.body.textContent).not.toMatch(/s to answer/);
+  });
 });
 
 describe('a row on a list merged across consoles', () => {

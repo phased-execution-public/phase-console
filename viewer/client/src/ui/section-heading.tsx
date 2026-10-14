@@ -23,13 +23,23 @@ export function SectionHeading({
   return (
     <div className={cn('flex min-w-0 items-baseline justify-between gap-3', className)}>
       <Tag className="min-w-0 text-section font-semibold text-ink" {...props}>
-        {children}
-        {/* The gap is on BOTH sides: an English title and its count are one
-            left-to-right run whatever the document's direction, so under
-            `dir="rtl"` a margin on the count's start edge lands outside the
-            run and the count touches the title (quiet-console phase 27). */}
-        {count != null && (
-          <span className="mx-2 text-meta font-normal text-ink-faint tabular-nums">{count}</span>
+        {/* The title and its count are two boxes of one flex pair with a gap
+            between them, never one line of text (#296): an English title and
+            its number resolve as one left-to-right run whatever the document's
+            direction, so under `dir="rtl"` a margin on the count landed outside
+            that run and drew "Do now5". A gap is between boxes, and boxes
+            survive bidi. With no count the title is the heading's own text. */}
+        {count != null ? (
+          <span className="inline-flex max-w-full min-w-0 items-baseline gap-2">
+            <span className="min-w-0" data-slot="title">
+              {children}
+            </span>
+            <span className="shrink-0 text-meta font-normal text-ink-faint tabular-nums" data-slot="count">
+              {count}
+            </span>
+          </span>
+        ) : (
+          children
         )}
       </Tag>
       {aside != null && <div className="flex shrink-0 items-center gap-2">{aside}</div>}

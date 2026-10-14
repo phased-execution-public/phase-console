@@ -26,6 +26,7 @@ export const SOURCE_WORDS: Readonly<Record<HandledSource, string>> = Object.free
   ladder: 'The recovery ladder handled it',
   supervisor: 'The supervisor handled it',
   session: 'The session handled it itself',
+  console: 'The console closed it — nobody needed it any more',
 });
 
 const LINK_WORDS: Readonly<Record<HandledRow['links'][number]['kind'], string>> = Object.freeze({

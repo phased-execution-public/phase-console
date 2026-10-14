@@ -15,6 +15,7 @@
  *   TP-8 Inspect hands the panel the item, and its Overview reads `GET /api/turn/:id`;
  *   TP-9 *Withdraw* posts the console's dismiss through the owner door, and the
  *        item is HELD on the page until the server's `turn` event (#270).
+ *   TP-v2 (turn-by-turn phase 9) — the block at the end of this file.
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -162,6 +163,7 @@ const PERMIT = item('permit-1', 'permission', 'notified', 'now', {
 
 function answer(over: Partial<TurnAnswer['groups']> = {}): TurnAnswer {
   const groups: TurnAnswer['groups'] = {
+    approve: [],
     now: [item('now-1', 'browser-login', 'notified', 'now')],
     decide: [
       item('decide-1', 'decision', 'notified', 'decide', {
@@ -193,12 +195,18 @@ function answer(over: Partial<TurnAnswer['groups']> = {}): TurnAnswer {
       },
     ],
     counts: {
+      approve: groups.approve.length,
       now: groups.now.length,
       decide: groups.decide.length,
       upcoming: groups.upcoming.length,
       checking: groups.checking.length,
       done: groups.done.length,
-      total: groups.now.length + groups.decide.length + groups.upcoming.length + groups.checking.length,
+      total:
+        groups.approve.length +
+        groups.now.length +
+        groups.decide.length +
+        groups.upcoming.length +
+        groups.checking.length,
       handled: 1,
     },
     seen: null,
@@ -273,24 +281,27 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });
 
-describe('TP-1 the headline, the round and the six sections', () => {
+describe('TP-1 the headline, the round and the sections', () => {
   it('draws them in order', async () => {
     mount();
     expect((await screen.findByTestId('turn-headline')).textContent).toBe(ANSWER.headline);
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(ANSWER.headline);
     expect(screen.getByTestId('turn-round').textContent).toContain('Round 14');
     const sections = screen.getAllByTestId('turn-section').map((s) => s.getAttribute('data-section'));
-    expect(sections).toEqual(['now', 'decide', 'upcoming', 'checking', 'done', 'handled']);
+    expect(sections).toEqual(['approve', 'now', 'decide', 'checking', 'upcoming', 'done', 'handled']);
     const headings = screen
       .getAllByRole('heading', { level: 2 })
       .map((h) => h.textContent?.replace(/\d+$/, ''));
+    // The groups v2 (turn-by-turn phase 9), then the handled log, then where the plans stand.
     expect(headings).toEqual([
+      'Approve',
       'Do now',
-      'Needs one detail from you',
-      'Coming up',
+      'Decide',
       'Being checked',
+      'Coming up',
       'Done',
       'Handled by the AI',
+      'Where the plans stand',
     ]);
     expect(screen.getByTestId('turn-issues').textContent).toContain('2 issue drafts wait');
     // The page remembers the look, for the next one's handled count.
@@ -315,8 +326,8 @@ describe('TP-2 the filters live in the address', () => {
     const { onNavigate } = mount('#/turn/now-1');
     await screen.findByTestId('turn-headline');
     const panel = await openFilter();
-    fireEvent.change(within(panel).getByTestId('turn-filter-kind'), { target: { value: 'decision' } });
-    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('#/turn/now-1?kind=decision'));
+    fireEvent.change(within(panel).getByTestId('turn-filter-plan'), { target: { value: 'beta' } });
+    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('#/turn/now-1?plan=beta'));
   });
 
   it('the search is a filter too', () => {
@@ -512,5 +523,231 @@ describe('TP-9 Withdraw, and the hold (#270)', () => {
     expect(screen.queryAllByTestId('turn-item').map((el) => el.getAttribute('data-item'))).not.toContain(
       'permit-1',
     );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * TP-v2 (turn-by-turn phase 9): the strip, the groups v2 with an empty
+ * group's one line, Group · Sort · View in the address, `#/turn/<id>`
+ * opening the panel for a ledger and a projected item, the reason said once
+ * (#332), the heads-ups, where the plans stand, and Export's options,
+ * timing and approval blocks.
+ * ------------------------------------------------------------------ */
+
+const GATE: TurnItem = {
+  ...item('gate-1', 'decision', 'notified', 'approve'),
+  record: 'projected',
+  source: 'gate',
+  why: 'decision',
+  proofType: 'answer',
+  type: 'approve',
+  personStatus: 'todo',
+  readiness: 'now',
+  route: 'gate',
+  rows: ['gate:alpha:4'],
+  title: 'Open the gate on phase 4',
+  need: 'A person signs this phase off.',
+  step: undefined,
+  humanStep: undefined,
+  timing: { assignedAt: '2026-10-07T11:00:00.000Z', deadline: '2026-10-07T15:00:00.000Z' },
+  approval: {
+    what: 'Phase 4 starts once the gate opens.',
+    askedBy: 'The plan, on phase 4',
+    ifApproved: 'The gate opens and phase 4 boards.',
+    ifDenied: 'The gate stays shut; the phase waits.',
+  },
+  options: [
+    {
+      id: 'approve',
+      label: 'Approve',
+      recommended: true,
+      consequence: 'phase 4 boards',
+      verb: { method: 'POST', endpoint: '/api/plan/alpha/gate/4/approve' },
+    },
+    { id: 'deny', label: 'Deny', verb: { method: 'POST', endpoint: '/api/plan/alpha/gate/4/deny' } },
+  ],
+};
+
+function v2(): TurnAnswer {
+  const base = answer({ approve: [GATE] });
+  return {
+    ...base,
+    counts: { ...base.counts, approve: 1, total: base.counts.total + 1 },
+    strip: {
+      todo: 3,
+      checking: 1,
+      passedToday: 1,
+      nextDeadline: { at: '2026-10-07T15:00:00.000Z', item: 'gate-1', title: 'Open the gate on phase 4' },
+    },
+    headsUp: [
+      {
+        ...item('eref:E-1', 'operator-act', 'notified', 'upcoming'),
+        record: 'projected',
+        type: 'know',
+        title: 'The site moves to its own domain',
+        step: undefined,
+        humanStep: undefined,
+      },
+    ],
+  };
+}
+
+describe('TP-v2 the page in 7.0’s grammar (turn-by-turn phase 9)', () => {
+  it('draws the strip — to do, checking, passed today, the live line and the next deadline', async () => {
+    read.mockResolvedValue(v2());
+    mount();
+    const strip = await screen.findByTestId('turn-strip');
+    expect(within(strip).getByTestId('turn-strip-todo').getAttribute('data-value')).toBe('3');
+    expect(within(strip).getByTestId('turn-strip-todo').textContent).toBe('3to do');
+    expect(within(strip).getByTestId('turn-strip-checking').getAttribute('data-value')).toBe('1');
+    expect(within(strip).getByTestId('turn-strip-passed').textContent).toContain('passed today');
+    expect(within(strip).getByTestId('turn-round').textContent).toContain('Round 14');
+    const next = within(strip).getByTestId('turn-next-deadline');
+    expect(next.textContent).toContain('Next deadline: Open the gate on phase 4');
+    expect(within(next).getByRole('link').getAttribute('href')).toBe('#/turn/gate-1');
+  });
+
+  it('says "none set" when no open item carries a deadline, and counts the groups for a 7.0 answer', async () => {
+    mount();
+    const strip = await screen.findByTestId('turn-strip');
+    expect(within(strip).getByTestId('turn-next-deadline').textContent).toBe('Next deadline: none set.');
+    expect(within(strip).getByTestId('turn-strip-todo').getAttribute('data-value')).toBe('2');
+  });
+
+  it('draws the six groups in order with their counts, Handled by the AI after them, and an empty group in one line', async () => {
+    read.mockResolvedValue(v2());
+    mount();
+    await screen.findByTestId('turn-headline');
+    const ids = screen.getAllByTestId('turn-section').map((s) => s.getAttribute('data-section'));
+    expect(ids).toEqual(['approve', 'now', 'decide', 'checking', 'upcoming', 'done', 'handled']);
+    const heads = screen
+      .getAllByRole('heading', { level: 2 })
+      .map((h) => h.textContent?.replace(/\d+$/, ''))
+      .slice(0, 7);
+    expect(heads).toEqual([
+      'Approve',
+      'Do now',
+      'Decide',
+      'Being checked',
+      'Coming up',
+      'Done',
+      'Handled by the AI',
+    ]);
+    expect(within(section('approve')).getByTestId('turn-item').getAttribute('data-item')).toBe('gate-1');
+    // An empty group stays, saying so in one plain line.
+    read.mockResolvedValue({ ...v2(), groups: { ...v2().groups, decide: [] } });
+    mount();
+    await waitFor(() => expect(screen.getAllByText('No decision waits on you.').length).toBeGreaterThan(0));
+  });
+
+  it('draws the heads-ups after the handled log, and where the plans stand last', async () => {
+    read.mockResolvedValue(v2());
+    mount();
+    const heads = await screen.findByTestId('turn-heads-up');
+    expect(within(heads).getByTestId('turn-item').getAttribute('data-item')).toBe('eref:E-1');
+    const plans = screen.getByTestId('turn-plans');
+    expect(
+      within(plans)
+        .getAllByTestId('turn-plan')
+        .map((p) => p.getAttribute('data-plan')),
+    ).toEqual(['alpha', 'beta']);
+    const waiting = within(plans).getAllByTestId('turn-plan-waiting')[0]!;
+    expect(waiting.textContent).toBe('2 wait on you');
+    expect(waiting.getAttribute('href')).toBe('#/turn?plan=alpha');
+    // The order on the page: the handled log, then the heads-ups, then the plans.
+    const handled = section('handled');
+    expect(handled.compareDocumentPosition(heads) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(heads.compareDocumentPosition(plans) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('keeps Status, Time, Plan, Type and Goes to in the Filter slot, each written into the address', async () => {
+    read.mockResolvedValue(v2());
+    const { onNavigate } = mount('#/turn');
+    await screen.findByTestId('turn-headline');
+    const panel = await openFilter();
+    for (const name of ['status', 'time', 'plan', 'type', 'to']) {
+      expect(within(panel).getByTestId(`turn-filter-${name}`)).toBeTruthy();
+    }
+    // The 7.0 four wait under Everything.
+    expect(within(panel).queryByTestId('turn-filter-kind')).toBeNull();
+    fireEvent.change(within(panel).getByTestId('turn-filter-type'), { target: { value: 'approve' } });
+    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('#/turn?type=approve'));
+    fireEvent.change(within(panel).getByTestId('turn-filter-to'), { target: { value: 'gate' } });
+    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('to=gate'));
+  });
+
+  it('an address narrows by the card’s words', async () => {
+    read.mockResolvedValue(v2());
+    mount('#/turn?type=approve');
+    await screen.findByTestId('turn-headline');
+    expect(
+      screen
+        .getAllByTestId('turn-item')
+        .filter((el) => el.closest('[data-testid="turn-section"]'))
+        .map((el) => el.getAttribute('data-item')),
+    ).toEqual(['gate-1']);
+  });
+
+  it('groups by plan and folds every card under View ▸ Compact, from the address', async () => {
+    read.mockResolvedValue(v2());
+    mount('#/turn?group=plan&view=compact');
+    await screen.findByTestId('turn-headline');
+    const ids = screen.getAllByTestId('turn-section').map((s) => s.getAttribute('data-section'));
+    expect(ids).toEqual(['plan:alpha', 'plan:beta', 'done', 'handled']);
+    const gate = screen.getAllByTestId('turn-item').find((el) => el.getAttribute('data-item') === 'gate-1')!;
+    expect(within(gate).getByTestId('turn-item-toggle')).toBeTruthy();
+  });
+
+  it('#/turn/<id> focuses a ledger item and opens the panel on it', async () => {
+    mount('#/turn/now-1');
+    await screen.findByTestId('turn-headline');
+    const named = screen.getAllByTestId('turn-item').find((el) => el.getAttribute('data-item') === 'now-1')!;
+    expect(named.getAttribute('aria-current')).toBe('true');
+    await waitFor(() => expect(inspected).toHaveBeenCalled());
+    expect((inspected.mock.calls.at(-1)![0] as { key: string }).key).toBe('turn:now-1');
+  });
+
+  it('#/turn/<id> focuses a projected item and opens the panel on it too', async () => {
+    read.mockResolvedValue(v2());
+    mount('#/turn/gate-1');
+    await screen.findByTestId('turn-headline');
+    const named = screen.getAllByTestId('turn-item').find((el) => el.getAttribute('data-item') === 'gate-1')!;
+    expect(named.getAttribute('aria-current')).toBe('true');
+    await waitFor(() => expect(inspected).toHaveBeenCalled());
+    const record = inspected.mock.calls.at(-1)![0] as { key: string; raw: string };
+    expect(record.key).toBe('turn:gate-1');
+    expect(record.raw).toContain('"source": "gate"');
+  });
+
+  it('the inspector says why only a person fits it ONCE (#332)', async () => {
+    const client = new QueryClient({ ...queryClientConfig, defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouterProvider initial="#/turn">
+          <ExplainOverview item={GATE} record={undefined} />
+        </MemoryRouterProvider>
+      </QueryClientProvider>,
+    );
+    const why = screen.getByTestId('turn-explain-why').textContent!;
+    expect(why).toBe('A person signs this phase off.');
+    const overview = screen.getByTestId('turn-explain').textContent!;
+    expect(overview.split('A person signs this phase off.').length - 1).toBe(1);
+  });
+
+  it('Export carries the options, the timing and the approval block', () => {
+    const text = turnMarkdown(v2(), sectionsOf(v2(), {}), new Map());
+    expect(text).toContain('## Approve');
+    expect(text).toContain('### Open the gate on phase 4');
+    expect(text).toContain('- Type: Approval');
+    expect(text).toContain('- Status: To do, NOW');
+    expect(text).toContain('- Deadline: 2026-10-07T15:00:00.000Z');
+    expect(text).toContain('- Assigned: 2026-10-07T11:00:00.000Z');
+    expect(text).toContain('- Goes to: The gate');
+    expect(text).toContain('#### The approval');
+    expect(text).toContain('- If approved: The gate opens and phase 4 boards.');
+    expect(text).toContain('- If denied: The gate stays shut; the phase waits.');
+    expect(text).toContain('#### The options');
+    expect(text).toContain('- Approve (recommended): phase 4 boards');
+    expect(text).toContain('- Deny');
   });
 });

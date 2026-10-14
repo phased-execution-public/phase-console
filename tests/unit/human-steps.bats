@@ -89,7 +89,7 @@ tab() { printf '\t'; }
   run pg bad-human-steps --lint
   [ "$status" -eq 1 ]
   assert_contains "$output" 'phase 1: human-step-superseded — "- **Human step:** the owner signs the release'
-  assert_contains "$output" 'is the 5.1.0 <who, what, proof ref> spelling, which nothing reads; write it as "- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]" (F37)'
+  assert_contains "$output" 'is the 5.1.0 <who, what, proof ref> spelling, which nothing reads; write it as "- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host] [· credential: <id>] [· due: <ref>] [· why: <reason>] [· effort: <duration>] [· unblocks: <phases>] [· guide: <file>] [· options: id=Label[::consequence] | …] [· recommended: <id>] [· deadline: <ISO 8601>]" (F37)'
 }
 
 @test "lint: an unknown kind fails by name (F37)" {
@@ -253,13 +253,14 @@ outcome_env() {
 
 # ---- the owner's moves (control-tower phase 133, #210) -------------------------
 
-@test "vocabulary: the owner's eleven verbs, each one a word a ledger move records" {
+@test "vocabulary: the owner's twelve verbs, each one a word a ledger move records" {
   # shellcheck source=/dev/null
   . "$PE_DIR/scripts/human-steps.env"
   set -- $HUMAN_STEP_VERBS
-  [ "$#" -eq 11 ]
-  # Phase 134 adds the owner's Accept anyway (override) and the escalation's rewrite.
-  for verb in answer decline ask attach override rewrite; do
+  [ "$#" -eq 12 ]
+  # Phase 134 adds the owner's Accept anyway (override) and the escalation's rewrite;
+  # turn-by-turn phase 5 adds undo (a running check taken back).
+  for verb in answer decline ask attach override rewrite undo; do
     case " $HUMAN_STEP_VERBS " in *" $verb "*) ;; *) echo "no verb $verb"; return 1 ;; esac
   done
   for verb in $HUMAN_STEP_VERBS; do
@@ -351,4 +352,84 @@ outcome_env() {
   run pe_outcome demo 8 needs-human --needs external --act --title "x" --due-when "lock:demo/8"
   [ "$status" -eq 2 ]
   [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+# ---- guided steps (turn-by-turn phase 2) ------------------------------------
+# options:, recommended: and deadline: are read and validated by the engine but
+# never printed: the --human-steps TSV stays byte for byte what it was, and the
+# console reads the three from the plan itself (parse/plan.ts).
+
+guided_docs() {
+  setup_docs guided guided
+  mkdir -p "$DOCS_ROOT/docs/guides"
+  printf 'Why it matters.\n\n## Steps\n1. Rotate it.\n' > "$DOCS_ROOT/docs/guides/rotate-key.md"
+}
+
+@test "guided: the three keys lint clean, and --human-steps prints the same eight-to-thirteen fields as before" {
+  guided_docs
+  run pg guided --lint
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "LINT OK: guided"
+  run pg guided --human-steps 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "decision$(tab)choose where the nightly build runs (E-1)$(tab)$(tab)$(tab)any$(tab)$(tab)$(tab)$(tab)$(tab)decision$(tab)5$(tab)$(tab)" ]
+  run pg guided --human-steps 2
+  [ "$output" = "operator-act$(tab)rotate the deploy key on the build box$(tab)https://example.com/keys$(tab)cmd:\"true\"$(tab)host$(tab)$(tab)$(tab)$(tab)$(tab)reserved$(tab)10$(tab)3$(tab)docs/guides/rotate-key.md" ]
+}
+
+@test "guided: F42 — a guide: file that does not exist under the docs root GATES" {
+  setup_docs guided guided
+  run pg guided --lint
+  [ "$status" -eq 1 ]
+  assert_contains "$output" 'phase 2: guide-file-missing — the operator-act step "rotate the deploy key on the build box" names guide: docs/guides/rotate-key.md, which is not a file under the docs root (F42)'
+}
+
+@test "guided: F43 — a table row no bullet names is advised about, by id; F41 is quiet for bound, guided and optioned steps" {
+  guided_docs
+  run pg guided --lint
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "F43 errand-row-unbound — the ## Operator errands row E-5 has no Human step bullet"
+  [[ "$output" != *"row E-1 "* ]]
+  [[ "$output" != *"row E-4 "* ]]
+  [[ "$output" != *"F41"* ]]
+}
+
+@test "guided: F41 — a task or decision with no guide, no options and no table row is advised about, never refused" {
+  guided_docs
+  printf -- '- **Human step:** physical · plug the key in · proof: `cmd:"true"` · why: physical\n' >> "$DOCS_ROOT/docs/plans/guided.md"
+  printf -- '- **Human step:** operator-act · flip the switch (E-9) · proof: `cmd:"true"` · why: reserved\n' >> "$DOCS_ROOT/docs/plans/guided.md"
+  printf -- '- **Human step:** browser-login · sign the CLI in · proof: `cmd:"true"`\n' >> "$DOCS_ROOT/docs/plans/guided.md"
+  run pg guided --lint
+  [ "$status" -eq 0 ]
+  assert_contains "$output" 'F41 phase 0: human-step-no-guide — the physical step "plug the key in" names no guide:, no options: and no ## Operator errands row'
+  assert_contains "$output" 'F41 phase 0: human-step-no-guide — the operator-act step "flip the switch (E-9)"'
+  [[ "$output" != *'F41 phase 0: human-step-no-guide — the browser-login'* ]]
+}
+
+@test "guided: options, recommended and deadline are held to their grammar (F37)" {
+  guided_docs
+  {
+    printf -- '- **Human step:** operator-act · pick one · options: a=A | b=B\n'
+    printf -- '- **Human step:** decision · pick one · options: a=A\n'
+    printf -- '- **Human step:** decision · pick two · options: a=A | a=B\n'
+    printf -- '- **Human step:** decision · pick three · options: A B=x | b=B\n'
+    printf -- '- **Human step:** decision · pick four · options: a=A | b=B · recommended: c\n'
+    printf -- '- **Human step:** decision · pick five · recommended: a\n'
+    printf -- '- **Human step:** decision · pick six · deadline: next week\n'
+    printf -- '- **Human step:** decision · pick seven · deadline: 2026-13-01\n'
+  } >> "$DOCS_ROOT/docs/plans/guided.md"
+  run pg guided --lint
+  [ "$status" -eq 1 ]
+  assert_contains "$output" 'human-step-field-invalid — options: belong to a decision step, not operator-act (F37)'
+  assert_contains "$output" 'human-step-field-invalid — options: a decision offers 2 to 8 options, separated by | (F37)'
+  assert_contains "$output" 'human-step-field-invalid — options: "a" is named twice (F37)'
+  assert_contains "$output" 'human-step-field-invalid — options: "A B=x" is not id=Label[::consequence]'
+  assert_contains "$output" 'human-step-field-invalid — recommended: "c" is not one of the step'"'"'s options (a b) (F37)'
+  assert_contains "$output" 'human-step-field-invalid — recommended: "a" is not one of the step'"'"'s options (F37)'
+  assert_contains "$output" 'human-step-field-invalid — deadline: "next week" is not an ISO 8601 date or instant'
+  assert_contains "$output" 'human-step-field-invalid — deadline: "2026-13-01" is not an ISO 8601 date or instant'
+  assert_contains "$output" "LINT FAIL: guided (8 issue[s])"
+  # A refused bullet is not a step; the good ones beside it still are.
+  run pg guided --human-steps 0
+  [ "${#lines[@]}" -eq 2 ]
 }

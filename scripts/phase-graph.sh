@@ -533,7 +533,7 @@ DEFAULT_PERMISSION_MODE="acceptEdits"
 HUMAN_STEP_KINDS="browser-login device-code one-time-code secret-entry claude-login mcp-login os-prompt os-permission third-party-approval physical person-check decision protected-path interactive-prompt captcha email-link operator-act permission"
 HUMAN_STEP_WHERE="host any"
 HUMAN_STEP_AUTO_OPEN="host"
-HUMAN_STEP_BULLET_KEYS="open proof where window auto-open credential due why effort unblocks guide"
+HUMAN_STEP_BULLET_KEYS="open proof where window auto-open credential due why effort unblocks guide options recommended deadline"
 HUMAN_STEP_DEFAULT_WHERE="browser-login:host device-code:any one-time-code:host secret-entry:any claude-login:host mcp-login:host os-prompt:host os-permission:host third-party-approval:any physical:host person-check:any decision:any protected-path:host interactive-prompt:host captcha:any email-link:any operator-act:host permission:any"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/human-steps.env" ] && . "$SCRIPT_DIR/human-steps.env"
@@ -552,7 +552,8 @@ KIND_REASONS=""
 DECISION_KEYS="permission.policy permission.destructive issues credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce plan-approval"
 DECISION_STATES="answered outstanding waived"
 DECISION_SOURCES="plan run default ruling"
-NEED_CLASSES="lock permission credential gate external"
+NEED_CLASSES="lock permission credential gate external run"
+RUN_ACTS="isolate switch-account raise-budget stop hold"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/decisions.env" ] && . "$SCRIPT_DIR/decisions.env"
 
@@ -2821,7 +2822,7 @@ waits_on_refs() {  # waits_on_refs <phase> → one ref per line: backticked span
 # nothing ever parsed it, so a plan carrying it asked for a step the console
 # never saw. The reader skips it and F37 names it with the new grammar. The
 # JS twin is `humanStepsFor` in parse/plan.ts (engine-parity holds them).
-HUMAN_STEP_GRAMMAR='- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host] [· due: <ref>]'
+HUMAN_STEP_GRAMMAR='- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any · window: <duration> [· auto-open: host] [· credential: <id>] [· due: <ref>] [· why: <reason>] [· effort: <duration>] [· unblocks: <phases>] [· guide: <file>] [· options: id=Label[::consequence] | …] [· recommended: <id>] [· deadline: <ISO 8601>]'
 
 # Phase 0 is the plan ITSELF (control-tower phase 121): its own acts are bullets
 # under `## Operator errands`, which no phase owns — an act the operator owes the
@@ -2850,6 +2851,7 @@ _human_step_parse() {  # _human_step_parse <body>
   tab="$(printf '\t')"
   HS_KIND=""; HS_WHAT=""; HS_OPEN=""; HS_PROOF=""; HS_WHERE=""; HS_WINDOW=""; HS_AUTO=""; HS_CRED=""; HS_DUE=""; HS_BAD=""
   HS_WHY=""; HS_EFFORT=""; HS_UNBLOCKS=""; HS_GUIDE=""
+  HS_OPTIONS=""; HS_OPTIONS_IDS=""; HS_RECOMMENDED=""; HS_DEADLINE=""
   fields="$(printf '%s\n' "$1" | sed -E "s/[[:space:]]*·[[:space:]]*/$tab/g" | tr "$tab" '\n')"
   while IFS= read -r field; do
     n=$((n + 1))
@@ -2874,6 +2876,9 @@ _human_step_parse() {  # _human_step_parse <body>
       effort) HS_EFFORT="$value" ;;
       unblocks) HS_UNBLOCKS="$value" ;;
       guide) HS_GUIDE="$value" ;;
+      options) HS_OPTIONS="$value" ;;
+      recommended) HS_RECOMMENDED="$(printf '%s' "$value" | tr 'A-Z' 'a-z')" ;;
+      deadline) HS_DEADLINE="$value" ;;
     esac
   done <<EOF
 $fields
@@ -2956,6 +2961,46 @@ EOF
     printf '%s' "$HS_GUIDE" | grep -qE '^[A-Za-z0-9._/-]+\.md$' \
       || { HS_BAD="guide: \"$HS_GUIDE\" is not a markdown file under the docs root"; return 3; }
   fi
+  # A decision's options, the one recommended, and a deadline (turn-by-turn
+  # phase 2): `options: id=Label[::consequence] | …` — two to eight, each id
+  # once, a decision step's alone; `recommended:` names one of them; and
+  # `deadline:` is the moment it must be done BY (where `due:` is when it
+  # starts). The JS twin is `humanStepOptionsOf` / `deadlineOk` in
+  # `shared/human-step-model.js`, which `parseHumanStepBody` reads through.
+  if [ -n "$HS_OPTIONS" ]; then
+    [ "$HS_KIND" = decision ] || { HS_BAD="options: belong to a decision step, not $HS_KIND"; return 3; }
+    value="$(printf '%s\n' "$HS_OPTIONS" | awk '
+      { n = split($0, part, /\|/)
+        for (i = 1; i <= n; i++) {
+          o = part[i]; gsub(/^[ \t]+|[ \t]+$/, "", o)
+          eq = index(o, "="); id = substr(o, 1, eq - 1); rest = substr(o, eq + 1)
+          sep = index(rest, "::"); label = sep ? substr(rest, 1, sep - 1) : rest
+          gsub(/^[ \t]+|[ \t]+$/, "", label)
+          if (eq < 2 || id !~ /^[a-z0-9][a-z0-9-]*$/ || length(id) > 32) { print "bad\t" o; exit }
+          if (label == "" || length(label) > 120) { print "label\t" id; exit }
+          if (id in seen) { print "twice\t" id; exit }
+          seen[id] = 1; ids = ids (ids == "" ? "" : " ") id
+        }
+        if (n < 2 || n > 8) { print "count\t" n; exit }
+        print "ok\t" ids }')"
+    case "$value" in
+      ok"$tab"*) HS_OPTIONS_IDS="${value#ok"$tab"}" ;;
+      bad"$tab"*) HS_BAD="options: \"${value#bad"$tab"}\" is not id=Label[::consequence] (an id is a-z, 0-9 and -)"; return 3 ;;
+      label"$tab"*) HS_BAD="options: \"${value#label"$tab"}\" needs a label of 1 to 120 characters"; return 3 ;;
+      twice"$tab"*) HS_BAD="options: \"${value#twice"$tab"}\" is named twice"; return 3 ;;
+      *) HS_BAD="options: a decision offers 2 to 8 options, separated by |"; return 3 ;;
+    esac
+  fi
+  if [ -n "$HS_RECOMMENDED" ]; then
+    case " $HS_OPTIONS_IDS " in
+      *" $HS_RECOMMENDED "*) : ;;
+      *) HS_BAD="recommended: \"$HS_RECOMMENDED\" is not one of the step's options${HS_OPTIONS_IDS:+ ($HS_OPTIONS_IDS)}"; return 3 ;;
+    esac
+  fi
+  if [ -n "$HS_DEADLINE" ]; then
+    printf '%s' "$HS_DEADLINE" | grep -Eq '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])([T ]([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]+)?)?(Z|[+-][0-9]{2}:?[0-9]{2})?)?$' \
+      || { HS_BAD="deadline: \"$HS_DEADLINE\" is not an ISO 8601 date or instant (2026-10-20, 2026-10-20T17:00Z)"; return 3; }
+  fi
   # A URL-shaped `open:` (a scheme before the first colon) must be http(s);
   # anything else is a command, which only the embedded terminal runs.
   if printf '%s' "$HS_OPEN" | grep -qE '^[A-Za-z][A-Za-z0-9+.-]*:[^[:space:]]'; then
@@ -2997,6 +3042,13 @@ human_step_issues() {
     while IFS= read -r body; do
       [ -z "$body" ] && continue
       rc=0; _human_step_parse "$body" || rc=$?
+      # F42 `guide-file-missing` (turn-by-turn phase 2) — GATING: a guide the
+      # bullet names that is not a file under the docs root is a step the door
+      # raises with no guide, which is what the bullet was written to prevent.
+      if [ "$rc" -eq 0 ] && [ -n "$HS_GUIDE" ] && [ ! -f "$DOCS_ROOT/$HS_GUIDE" ]; then
+        printf 'phase %s: guide-file-missing — the %s step "%s" names guide: %s, which is not a file under the docs root (F42)\n' \
+          "$p" "$HS_KIND" "$(printf '%s' "$HS_WHAT" | cut -c1-60)" "$HS_GUIDE"
+      fi
       case "$rc" in
         1) printf 'phase %s: human-step-superseded — "- **Human step:** %s" is the 5.1.0 <who, what, proof ref> spelling, which nothing reads; write it as "%s" (F37)\n' \
              "$p" "$(printf '%s' "$body" | cut -c1-80)" "$HUMAN_STEP_GRAMMAR" ;;
@@ -3037,6 +3089,72 @@ EOF
     done <<EOF
 $(human_steps_for_phase "$p" | awk -F'\t' '$1 != "" && $10 == "" { print $1 "\t" $2 }')
 EOF
+  done
+  return 0
+}
+
+# The `## Operator errands` table and the bullets bound to it (turn-by-turn
+# phase 2) — ONE awk over the plan: `row<TAB>E-N` for each table row whose Id
+# cell is an E-ref, `bound<TAB>E-N` for each E-ref a Human step bullet's text
+# carries as "(E-N…)". The console reads the table's other columns itself
+# (`server/parse/errands.ts`); bash needs only the ids.
+errand_refs() {
+  awk '
+    /^##[ \t]/ { sec = (tolower($0) ~ /^##[ \t]+operator errands/) }
+    sec && /^[ \t]*\|/ {
+      split($0, cell, "|"); id = cell[2]
+      gsub(/[ \t*`]/, "", id)
+      if (id ~ /^E-[0-9]+$/) print "row\t" id
+    }
+    tolower($0) ~ /^[ \t]*[-*][ \t]*\*{0,2}human[ \t]+step/ {
+      s = $0
+      while (match(s, /\(E-[0-9]+([^0-9A-Za-z_)][^)]*)?\)/)) {
+        ref = substr(s, RSTART + 1, RLENGTH - 2); sub(/[^0-9E-].*$/, "", ref)
+        print "bound\t" ref
+        s = substr(s, RSTART + RLENGTH)
+      }
+    }
+  ' "$plan_file"
+}
+
+# F41 `human-step-no-guide` (turn-by-turn phase 2) — ADVISORY. A task or a
+# decision whose words are the plan's own — an operator act, an act at the
+# machine, a third party's approval, a decision — with no guide file, no
+# options and no `## Operator errands` row bound by its "(E-N)": the person
+# gets a title and a proof, and no steps. The kinds a console walks a person
+# through itself (a sign-in, a code, a prompt) are not asked about. The list
+# stays here, not in human-steps.env: no runtime reader asks it.
+HUMAN_STEP_GUIDED_KINDS="operator-act physical third-party-approval decision"
+human_step_guide_advisories() {
+  local p body rows eref
+  rows=" $(errand_refs | awk -F'\t' '$1 == "row" { printf "%s ", $2 }')"
+  for p in $(human_step_phases); do
+    while IFS= read -r body; do
+      [ -z "$body" ] && continue
+      _human_step_parse "$body" || continue
+      case " $HUMAN_STEP_GUIDED_KINDS " in *" $HS_KIND "*) ;; *) continue ;; esac
+      [ -n "$HS_GUIDE$HS_OPTIONS" ] && continue
+      eref="$(printf '%s' "$HS_WHAT" | sed -nE 's/.*\((E-[0-9]+)([^0-9A-Za-z_)][^)]*)?\).*/\1/p')"
+      [ -n "$eref" ] && case "$rows" in *" $eref "*) continue ;; esac
+      printf 'F41 phase %s: human-step-no-guide — the %s step "%s" names no guide:, no options: and no ## Operator errands row, so the person gets a title and no steps; add guide: <file>, or a table row ending its text with (E-N)\n' \
+        "$p" "$HS_KIND" "$(printf '%s' "$HS_WHAT" | cut -c1-60)"
+    done <<EOF
+$(human_step_bodies "$p")
+EOF
+  done
+  return 0
+}
+
+# F43 `errand-row-unbound` (turn-by-turn phase 2) — ADVISORY, ids only. A row
+# of the `## Operator errands` table that no Human step bullet names: the
+# console shows it as a Heads-up — nothing checks it, nothing waits on it.
+errand_row_advisories() {
+  local id
+  for id in $(errand_refs | awk -F'\t' '
+    $1 == "row" { if (!($2 in seen)) order[++n] = $2; seen[$2] = 1 }
+    $1 == "bound" { bound[$2] = 1 }
+    END { for (i = 1; i <= n; i++) if (!(order[i] in bound)) print order[i] }'); do
+    printf 'F43 errand-row-unbound — the ## Operator errands row %s has no Human step bullet ending its text with (%s), so nothing checks it or waits on it; it is shown as a heads-up\n' "$id" "$id"
   done
   return 0
 }
@@ -4682,6 +4800,10 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   printf -- '    %s/phase-outcome.sh %s %s blocked --needs <key> --reason "<what you need>"\n' "$CMD" "$slug" "$bp_show"
   printf -- '`--needs` is REQUIRED on `blocked` and `needs-human` (exit 2 without it): a decision key from\n'
   printf 'the list above, or its short form (%s). Never ask in prose — prose reaches nobody.\n' "$(printf '%s' "$NEED_CLASSES" | sed 's/ /, /g')"
+  # A run-level act (turn-by-turn phase 6, #286) is the RUN's to take, never a
+  # permission ask: a session cannot press its own console, and a permission
+  # item nobody can grant is an ask that reaches nobody.
+  printf 'An act only the RUN can take (%s) is `blocked --needs run --run-act <act>`, never `permission`.\n' "$(printf '%s' "$RUN_ACTS" | sed 's/ /, /g')"
   _bp_mark scope
   sc="${REPOS[$p]:-all}"
   printf '\nThis phase'\''s SCOPE (the repos it touches, from the plan'\''s Repos column): %s\n' "$sc"
@@ -4952,6 +5074,8 @@ case "$mode" in
       _advise F28 land_needs_lane_advisories
       _advise F30 note_done_advisories
       _advise F38 human_step_advisories
+      _advise F41 human_step_guide_advisories
+      _advise F43 errand_row_advisories
     fi
     if [ -n "$issues" ]; then
       # A closed plan still gets its problems named — they just stop being a gate.

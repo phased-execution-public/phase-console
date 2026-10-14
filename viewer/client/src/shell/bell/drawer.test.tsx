@@ -607,3 +607,70 @@ describe('the two pure helpers', () => {
     });
   });
 });
+
+describe('the needs-you rows say the card’s words (turn-by-turn phase 10)', () => {
+  it('each row leads with NOW or NOT YET and the type, and its title is the composer’s', async () => {
+    inbox.mockResolvedValue({
+      items: [
+        item({
+          id: 'gate:demo:4',
+          kind: 'gate',
+          title: 'Approve the gate of phase 4 of demo',
+          turn: {
+            item: 'gate:demo:4',
+            record: 'projected',
+            source: 'gate',
+            kind: 'decision',
+            why: 'decision',
+            proofType: 'answer',
+            group: 'approve',
+            type: 'approve',
+            readiness: 'now',
+          },
+        }),
+        item({
+          id: 'errand:demo:5::later',
+          title: 'Tap the hardware key',
+          severity: 'fyi',
+          turn: {
+            item: 'errand:demo:5::later',
+            record: 'projected',
+            source: 'errand',
+            kind: 'operator-act',
+            why: 'physical',
+            proofType: 'attest',
+            group: 'upcoming',
+            type: 'do',
+            readiness: 'not-yet',
+            startWhen: 'when phase 4 of demo is done',
+          },
+        }),
+      ],
+      generatedAt: '',
+    });
+    mount();
+    const gate = (await screen.findByText('Approve the gate of phase 4 of demo')).closest(
+      '[data-testid="inbox-row"]',
+    ) as HTMLElement;
+    const gateWords = within(gate).getByTestId('turn-row-words');
+    expect(gateWords.getAttribute('data-type')).toBe('approve');
+    expect(gateWords.getAttribute('data-readiness')).toBe('now');
+    expect(within(gateWords).getByText('Approval')).toBeTruthy();
+    const later = screen
+      .getByText('Tap the hardware key')
+      .closest('[data-testid="inbox-row"]') as HTMLElement;
+    const laterWords = within(later).getByTestId('turn-row-words');
+    expect(laterWords.getAttribute('data-readiness')).toBe('not-yet');
+    expect(within(laterWords).getByTestId('turn-readiness-when').textContent).toBe(
+      'when phase 4 of demo is done',
+    );
+    expect(within(laterWords).getByText('Task')).toBeTruthy();
+  });
+
+  it('a row nothing waits on says no card words', async () => {
+    inbox.mockResolvedValue({ items: [item()], generatedAt: '' });
+    mount();
+    await screen.findByText('demo — phase 4 needs you');
+    expect(screen.queryByTestId('turn-row-words')).toBeNull();
+  });
+});

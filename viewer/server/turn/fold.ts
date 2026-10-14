@@ -21,24 +21,21 @@
 
 import { HUMAN_STEP_FOLDS, type HumanStepKind } from '../../shared/human-step-model.js';
 import {
-  defaultReason, groupOf, inferProofType, reasonAllowed, type ProofType, type TurnGroup, type WhyPerson,
+  CHECKED_BY_LABEL, defaultReason, groupOf, inferProofType, personStatusOf, readinessOf, reasonAllowed, routeOf, typeOf, TURN_SOURCES,
+  type ItemType, type PersonStatus, type ProofType, type Readiness, type RouteTo, type TurnGroup, type TurnRecord,
+  type TurnSource, type WhyPerson,
 } from '../../shared/turn-model.js';
 import { isPersonErrand } from '../../shared/recovery-model.js';
+import { whenWords } from '../../shared/proof-words.js';
 import type { PermissionDetail } from '../permissions/walls.ts';
 
-/** Where an item came from — §Architecture 19's sources, one word each. */
-export const TURN_SOURCES = Object.freeze([
-  // the ledger's
-  'plan', 'session', 'errand', 'preflight', 'relay', 'stall', 'supervisor',
-  // the projected
-  'approval', 'gate', 'plan-approval', 'qa', 'question', 'person-check', 'sign-in', 'mcp-auth', 'conflict', 'session-ask',
-  // an authority press another door asked the owner for (control-tower phase 148)
-  'request',
-] as const);
-export type TurnSource = (typeof TURN_SOURCES)[number];
-
-/** Which record holds an item. */
-export type TurnRecord = 'ledger' | 'projected' | 'request';
+/**
+ * Where an item came from, and which record holds it — §Architecture 19's
+ * sources, one word each. Owned by `shared/turn-model.js` since turn-by-turn
+ * phase 1, whose card tables are keyed by them; re-exported here by identity.
+ */
+export { TURN_SOURCES };
+export type { TurnRecord, TurnSource };
 
 /** The `turn` view an inbox row carries when it asks a person for an act. */
 export type TurnView = {
@@ -56,6 +53,14 @@ export type TurnView = {
    * ledger's for a raised wall, the card's for the broker's projected ask.
    */
   permission?: PermissionDetail;
+  /**
+   * The card's words a ROW carries (turn-by-turn phase 10): its type and
+   * whether it is due, and NOT YET's *when* in words — so the Runs home, the
+   * bell and the phone say what the card says. Set by `withRowWords`.
+   */
+  type?: ItemType;
+  readiness?: Readiness;
+  startWhen?: string;
 };
 
 /** The inbox kinds nothing waits on — they stay in the bell, never in the turn. */
@@ -76,6 +81,8 @@ const STEP_SOURCES: Readonly<Record<string, TurnSource>> = Object.freeze({
   // (control-tower phase 135): the session's lane met it, so it is the session's.
   wall: 'session',
   convert: 'session',
+  // A phase's run request (turn-by-turn phase 6): the run's to take.
+  'run-request': 'run-request',
   // A console-raised step with no source of its own is a converted stall
   // reading — the one console birth before this phase.
   console: 'stall',
@@ -133,7 +140,7 @@ export function ledgerTurn(step: FoldStep): TurnView {
     ?? 'attest';
   const source = STEP_SOURCES[step.source?.kind ?? ''] ?? STEP_SOURCES[step.birth ?? ''] ?? 'stall';
   return {
-    item: step.id, record: 'ledger', source, kind, why, proofType, group: groupOf({ state: step.state, kind, proofType }),
+    item: step.id, record: 'ledger', source, kind, why, proofType, group: groupOf({ state: step.state, kind, proofType, source, record: 'ledger' }),
     ...(kind === 'permission' && step.permission ? { permission: step.permission as PermissionDetail } : {}),
   };
 }
@@ -142,7 +149,7 @@ export function ledgerTurn(step: FoldStep): TurnView {
 function projected(id: string, fold: { source: TurnSource; kind: HumanStepKind; why: WhyPerson; proofType: ProofType }, state?: string | null): TurnView {
   return {
     item: id, record: 'projected', source: fold.source, kind: fold.kind, why: fold.why, proofType: fold.proofType,
-    group: groupOf({ ...(state ? { state } : {}), kind: fold.kind, proofType: fold.proofType }),
+    group: groupOf({ ...(state ? { state } : {}), kind: fold.kind, proofType: fold.proofType, source: fold.source, record: 'projected' }),
   };
 }
 
@@ -156,7 +163,7 @@ function projected(id: string, fold: { source: TurnSource; kind: HumanStepKind; 
 export function errandIsItem(situation: string | null | undefined): boolean {
   if (!isPersonErrand(situation)) return false;
   const sub = String(situation ?? '').split(':')[1] ?? '';
-  return sub !== 'gate' && sub !== 'protected-path' && sub !== 'permission';
+  return sub !== 'gate' && sub !== 'protected-path' && sub !== 'permission' && sub !== 'run';
 }
 
 /** Is this errand a permission wall's — the item the lane's recorded wall raised (control-tower phase 135)? */
@@ -184,6 +191,14 @@ export function itemOfErrand<T extends FoldStep & { slug: string; phase: number 
   if (wallErrand(at.errand.situation)) {
     return open.find((step) => step.birth === 'console' && step.kind === 'permission' && step.source?.kind === 'wall'
       && step.slug === at.slug && Number(step.phase) === at.phase && step.runId === at.runId);
+  }
+  // A run request's errand IS the one approval per run and act its phase
+  // asked for or joined as a waiter (turn-by-turn phase 6).
+  if (at.errand.situation === 'blocked-declared:run') {
+    return open.find((step) => step.birth === 'console' && step.source?.kind === 'run-request' && step.slug === at.slug
+      && step.runId === at.runId
+      && [{ phase: step.phase }, ...((step as { waiters?: readonly { phase: number | string }[] }).waiters ?? [])]
+        .some((w) => Number(w.phase) === at.phase));
   }
   if (!errandIsItem(at.errand.situation)) return undefined;
   return open.find((step) => step.birth === 'console' && step.source?.kind === 'errand' && step.slug === at.slug
@@ -232,4 +247,78 @@ export function turnOf(
   if (!fold) return undefined;
   const item = projected(id, fold);
   return row.kind === 'approval' && row.permission ? { ...item, permission: row.permission } : item;
+}
+
+/**
+ * The card's words (turn-by-turn phase 1, §Architecture 2) — what every `GET
+ * /api/turn` item carries: its type, the person's status, its readiness, where
+ * a press goes and — since phase 5 — *Checked by*, in words, from the one label
+ * map over the proof types (`CHECKED_BY_LABEL`).
+ */
+export type CardWords = { type: ItemType; personStatus: PersonStatus; readiness: Readiness; route: RouteTo; checkedBy: string };
+
+/**
+ * The four words of one item, each derived once by `shared/turn-model.js`
+ * from what the item already carries — its view, and a ledger item's record —
+ * in the console's edition. Pure.
+ */
+export function cardWordsOf(view: Pick<TurnView, 'kind' | 'source' | 'record' | 'proofType'>, facts: {
+  state?: string | null;
+  birth?: string | null;
+  waiters?: readonly { phase?: number | string }[] | null;
+  phase?: number | null;
+  dueWhen?: string | null;
+  startAt?: string | null;
+  verdict?: string | null;
+  hasOptions?: boolean;
+  /** The item carries an approval block (turn-by-turn phase 4) — a yes or a no. */
+  hasApproval?: boolean;
+  /** A plan's errands row no bullet names (turn-by-turn phase 4) — a heads-up. */
+  bound?: boolean;
+  edition: 'free' | 'pro';
+  now: number;
+}): CardWords {
+  return {
+    type: typeOf({
+      kind: view.kind, source: view.source, record: view.record, proofType: view.proofType, hasOptions: Boolean(facts.hasOptions),
+      hasApproval: Boolean(facts.hasApproval), ...(facts.bound === false ? { bound: false } : {}),
+    }),
+    personStatus: personStatusOf({ state: facts.state ?? null, verdict: facts.verdict ?? null, record: view.record }),
+    readiness: readinessOf({ state: facts.state ?? null, dueWhen: facts.dueWhen ?? null, startAt: facts.startAt ?? null, now: facts.now }),
+    route: routeOf({
+      birth: facts.birth ?? null, source: view.source, record: view.record, waiters: facts.waiters ?? null,
+      phase: facts.phase ?? null, edition: facts.edition,
+    }),
+    checkedBy: CHECKED_BY_LABEL[view.proofType],
+  };
+}
+
+/**
+ * A row's view with the card's words (turn-by-turn phase 10): the type, the
+ * readiness and NOT YET's *when* — derived by the same rules `GET /api/turn`
+ * uses (`typeOf`, `readinessOf`, `whenWords`) — and the group the page puts it
+ * in, re-placed the way `turnView` re-places it (an approval to Approve, a
+ * decision to Decide, NOT YET to Coming up), so a row and its card never sit in
+ * two groups. Coming up, Being checked and Done stand as the fold placed them.
+ * Pure.
+ */
+export function withRowWords(view: TurnView, facts: {
+  state?: string | null;
+  dueWhen?: string | null;
+  hasOptions?: boolean;
+  hasApproval?: boolean;
+  now: number;
+}): TurnView {
+  const type = typeOf({
+    kind: view.kind, source: view.source, record: view.record, proofType: view.proofType,
+    hasOptions: Boolean(facts.hasOptions), hasApproval: Boolean(facts.hasApproval),
+  });
+  const readiness = readinessOf({ state: facts.state ?? null, dueWhen: facts.dueWhen ?? null, now: facts.now });
+  const group = view.group === 'upcoming' || view.group === 'checking' || view.group === 'done'
+    ? view.group
+    : groupOf({ state: facts.state ?? null, type, readiness });
+  return {
+    ...view, type, readiness, group,
+    ...(readiness === 'not-yet' && facts.dueWhen ? { startWhen: whenWords(facts.dueWhen) } : {}),
+  };
 }

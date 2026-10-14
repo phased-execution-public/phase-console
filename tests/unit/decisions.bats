@@ -158,6 +158,9 @@ twin() {  # twin <slug> <rows…>  — write a decisions.md twin in the writer's
   assert_contains "$output" "  - [answered] relay: off"
   assert_contains "$output" "blocked --needs <key> --reason"
   assert_contains "$output" '`--needs` is REQUIRED on `blocked` and `needs-human`'
+  # a run-level act is the run's (turn-by-turn phase 6): the class and the acts
+  assert_contains "$output" 'short form (lock, permission, credential, gate, external, run)'
+  assert_contains "$output" 'is `blocked --needs run --run-act <act>`, never `permission`'
   # order: bootstrap list → decisions → scope
   boot="$(printf '%s\n' "$output" | grep -n 'Bootstrap from disk only' | cut -d: -f1)"
   dec="$(printf '%s\n' "$output" | grep -n "This phase's DECISIONS" | cut -d: -f1)"

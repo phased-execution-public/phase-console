@@ -20,6 +20,99 @@ into a web form at the moment of release.
 
 ## [Unreleased]
 
+## [7.1.0] - 2026-10-13
+
+**Your turn, told step by step.** 7.1 makes every item on Your turn a card a person can act on without
+reading anything else: one of four types — an Approval, a Task, a Decision or a Heads-up — with
+numbered steps, NOW or NOT YET and when, a timing grid, where a press goes and who checks it, and one
+act form for its type. Every word on the card comes from one composer, so the bell, the Runs home, the
+lock screen and the page say the same thing. What only the run can do, what went stale and what the
+AI could do itself no longer reaches a person as a chore. The free tree stays MIT. Nothing a 7.0
+plan, session or script says changes, and `PE_API` stays 2: an item a 7.0 console raised keeps its id
+and state and gains the new words when it is read.
+
+### Migration
+- **The page's groups are v2** (`TURN_GROUPS`): *Approve* · *Do now* · *Decide* · *Being checked* ·
+  *Coming up* · *Done*, placed by the item's type and readiness, with *Handled by the AI*, *Heads-up* and
+  *Where the plans stand* as sections. 7.0's *Needs one detail from you* is gone: such an item is a Task
+  on Redo in *Do now*.
+- **`GET /api/turn` gains the card contract** on every item — `type`, `personStatus`, `readiness`,
+  `route`, `checkedBy`, `timing`, `steps`, `verdict` and `verdicts`, and `options` or `approval` where they
+  apply — plus `strip` and `headsUp` on the answer. Every field 7.0 sent is still there.
+- **A plan's `Human step:` bullet takes three more keys**, `options:`, `recommended:` and `deadline:`,
+  validated by both parsers and printed by neither, so `phase-graph.sh --human-steps` is byte-identical;
+  its `guide:` key is now read as a file under the docs root (F42 `guide-file-missing` gates).
+- **New routes:** `POST /api/human-steps/:id/undo` and `POST /api/run/:slug/run-request` (an authority
+  route). A run verb pressed from a card carries `expectRunId` and answers 409 with a sentence when the
+  plan's run is another one.
+- **New state files** under the instance's state directory: `turn-first-seen.json` (when a projected
+  item was first seen) and `turn-settled.json` (how a pressed projected item ended).
+
+### Added
+- **The card** (`client/src/cards/turn/`): NOW or NOT YET with its *when*, the type's mark, the
+  person's status (*To do*, *Checking*, *Passed*, *Redo*, *Not doing*, *Closed*, *Waiting for the
+  owner*), the title that names the act and its meta, a timing grid on one page clock (*Assigned*, *Do
+  it*, *Deadline*, *Open until*, *You sent it*, *Checked*), why only you, once, the verdict before the
+  steps, *From the AI*, the numbered steps, *How it's checked*, *Goes to* and *Checked by*, and one act
+  form per type, its primary chosen by one move table. Every command a person runs is one command
+  block, and a command with a `<placeholder>` is a template to fill in.
+- **The page**: a strip (to do, checking, passed today, the next deadline) under the headline; one
+  toolbar row whose Filter (Status, Time, Plan, Type, Goes to), Group, Sort and View live in the
+  address; *Heads-up*; and *Where the plans stand*, one line per plan. `#/turn/<id>` marks its card and
+  opens the panel on it where the panel stands beside the page.
+- **One composer** (`server/turn/compose.ts`) writes every word of every item and of its inbox row
+  and push. Steps come from the authored guide, else the plan's errands row, else the situation's own
+  words, else a minimal guide from the link or command and the check said in words
+  (`shared/proof-words.js`); no proof ref, route or "phase 0" reaches a person.
+- **Plan-born guides**: a `Human step:` bullet's `guide:` file is read, and a plan's `## Operator
+  errands` table is read by its headers; a bullet ending in `(E-N)` takes that row's steps, and a row
+  no bullet names is a Heads-up. New advisories F41 `human-step-no-guide` and F43
+  `errand-row-unbound`, and the gate F42 `guide-file-missing`.
+- **What each situation asks**: every ask the console raises carries a title, steps, a check and
+  options bound to their verbs; a gate, a plan approval, a permission and an owner request carry an
+  approval block (what, who asked, if approved, if denied); an identity park offers exactly its two
+  choices.
+- **Where a press goes**: *Undo: I'm not finished* takes back a running check; a press that ends an
+  item waits a few seconds on the page with *Undo*; *Hand it back* gives an item back to its phase
+  (*Give back to Phase N*), asks its session a question, or says you cannot; a pressed approval card, gate,
+  plan approval or question leaves a record, so Done shows how it ended, by whom and when.
+- **Run requests**: `phase-outcome.sh … blocked --needs run --run-act <act>` asks the run to relaunch
+  isolated, switch account, raise a phase's budget, stop or hold — one Approval per run and act, every
+  asking phase a waiter; Approve takes the act and resumes them, Deny tells them no.
+- **Items that close themselves**: a stopped run a later run of its plan supersedes is resolved by
+  itself (journal `run.superseded`, undone by `unresolve`), and the round closes its run-specific items,
+  those of a phase the board reads done and those whose errand is gone — each with a row under
+  *Handled by the AI* — while a sign-in, a secret or an errand at the machine moves to the new run.
+- **Every surface in the card's words**: the Runs home's and the bell's rows lead with NOW or NOT
+  YET and the type, and a push's lock screen is chosen by type — a Task *Open* and *I did it*, a run
+  request *Approve* and *Deny* on a console with `--allow-run`.
+- **The help guide's *Your turn*, in English and Persian**, explains the four types, the statuses,
+  NOW and NOT YET, the timing grid, *Goes to* and *Checked by*, *Undo*, *Hand it back* and run
+  requests; the README, USAGE, `viewer/README.md` and `references/turn.md` say the same.
+- **Tests**: every card the console can raise is walked in both editions and held whole
+  (`viewer/test/turn-cards-coverage.test.ts`), and the tower rehearsal drives a card's round trips on
+  real consoles.
+
+### Changed
+- **A permission is approved at a scope** — *Approve, this call* to *Approve, always* — and sits in
+  *Approve*, where *Grant every low-risk ask* now stands.
+- **A decision's button is *Send my decision***, and nothing is chosen for you.
+- **The identity park skips a superseded run** and never overwrites an operator's stop.
+- **An operator's act is an act of its phase**: two phases asking for one command are two items,
+  each on its own clock (#261, #257).
+
+### Fixed
+- **`human-step-model.test.ts` expects the births there are** (#271).
+- **An inbox row no longer reads a human step's window as a question's countdown** (#341).
+- **An act due at a date ahead reads *Coming up*, not notified at once** (#255).
+- **An answer pressed while its run is still parking reaches the run** (#273), and **an in-process
+  resume through an automatic door no longer takes the person's slot** (#268).
+- **Your turn's panel says a person's reason once** (#332).
+- **A section heading's count keeps its gap right to left** (#296).
+- **A run request a live run declares raises its item** before the run reaches disk, an answer that
+  arrives first raises the item and answers it, a hold released on a parked run resumes the phase that
+  waited, and a Done run request keeps its approval block.
+
 ## [7.0.0] - 2026-10-12
 
 **Quiet.** 7.0 rebuilds the console's web client from zero around one question — *does anything need

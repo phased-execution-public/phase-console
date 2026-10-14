@@ -41,6 +41,14 @@ for p in \
   "viewer/server/turn/handled.ts" \
   "viewer/server/turn/headline.ts" \
   "viewer/server/turn/round.ts" \
+  "viewer/server/turn/plan-items.ts" \
+  "viewer/server/turn/guide-file.ts" \
+  "viewer/server/turn/compose.ts" \
+  "viewer/server/turn/first-seen.ts" \
+  "viewer/server/turn/settled.ts" \
+  "viewer/server/turn/run-requests.ts" \
+  "viewer/server/turn/stale.ts" \
+  "viewer/server/parse/errands.ts" \
   "viewer/server/owner/door.ts" \
   "viewer/server/owner/passkey.ts" \
   "viewer/server/owner/registry.ts" \
@@ -95,6 +103,7 @@ for p in \
   "viewer/shared/human-step-model.js" \
   "viewer/shared/turn-model.js" \
   "viewer/shared/guide-grammar.js" \
+  "viewer/shared/proof-words.js" \
   "viewer/shared/instances.mjs" \
   "viewer/shared/recovery-model.js" \
   "viewer/shared/halt-categories.js" \
@@ -141,6 +150,7 @@ for p in \
   "viewer/server/runner/wait-budget.ts" \
   "viewer/server/runner/queue-episodes.ts" \
   "viewer/server/runner/run-paths.ts" \
+  "viewer/server/runner/supersede.ts" \
   "viewer/server/runner/tree-state.ts" \
   "viewer/server/runner/scope-drift.ts" \
   "viewer/server/actor.ts" \

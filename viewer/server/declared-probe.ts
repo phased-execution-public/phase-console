@@ -106,6 +106,13 @@ export type DeclaredProbeDeps = {
    * session), and then a permission declaration is explained, never refused.
    */
   walls?: (slug: string, runId: string | null, phase: number) => readonly RecordedWall[] | null;
+  /**
+   * Is this permission declaration a run request by the compatibility rule
+   * (turn-by-turn phase 6)? Then G5 never refuses it: the runner records it as
+   * an `isolate` request, and a run-level ask is never dropped at the door.
+   */
+  runRequest?: (slug: string, runId: string | null, phase: number,
+    declared: { needs?: string | null; rule?: string | null; command?: string | null }) => boolean;
 };
 
 function same(a: string, b: string): boolean {
@@ -181,7 +188,9 @@ export async function answerDeclaredProbe(
   // G5 (control-tower phase 135): a permission block names a wall this
   // console recorded for the declaring lane, or nothing refused it — the
   // session hears "run it" (exit 4) while it is still here to.
-  if (declared.status === 'blocked' && declared.needs === 'permission' && deps.walls) {
+  const runLevel = declared.status === 'blocked' && declared.needs === 'permission'
+    && deps.runRequest?.(slug, shape[1] ?? null, phase, { needs: declared.needs, rule: declared.rule ?? null, command: declared.command ?? null }) === true;
+  if (declared.status === 'blocked' && declared.needs === 'permission' && deps.walls && !runLevel) {
     const walls = deps.walls(slug, shape[1] ?? null, phase);
     const verdict = walls ? guardWall({ rule: declared.rule ?? null, command: declared.command ?? null }, walls) : null;
     if (verdict && !verdict.ok) {

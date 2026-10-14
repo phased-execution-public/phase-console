@@ -16,6 +16,7 @@
  *         and `GET /api/turn` carries the newest rows and the count since the last look;
  *   HD-6  a session writes a file of its own, read as `session` whatever a line
  *         claims — never a console source, a fold, or a console row's count.
+ *   (turn-by-turn phase 7: `run.superseded` is the console's own close, under HD-2.)
  */
 
 import './state-sandbox.ts';
@@ -82,9 +83,15 @@ test('HD-2: each source is read off its own journal line, linked to it; a person
   assert.equal(ladder.source, 'ladder');
   assert.match(ladder.what, /Recovered phase 5 from lane-lost \(retry\), and the run carried on/);
   assert.equal(at('phase.start', {}), null);
+  // A superseded run (turn-by-turn phase 7): its asks closed by the console, the reason named.
+  const superseded = at('run.superseded', { by: 'rB', reason: 'superseded by run rB' })!;
+  assert.equal(superseded.source, 'console');
+  assert.match(superseded.what, /Closed what run r9 asked — it was superseded by run rB/);
+  assert.deepEqual(superseded.links, [{ kind: 'journal', ref: 'alpha/r9#77' }]);
+  assert.equal(at('run.superseded', {}), null, 'a line naming no successor is no close');
   // Every source the reader writes is a word of the vocabulary, and the events it reads are named.
-  for (const one of [guard, relay, ladder]) assert.ok((HANDLED_SOURCES as readonly string[]).includes(one.source));
-  assert.deepEqual([...HANDLED_EVENTS].sort(), ['phase.approval-auto-granted', 'phase.question-answered', 'phase.turn-refused', 'run.recovery-continue']);
+  for (const one of [guard, relay, ladder, superseded]) assert.ok((HANDLED_SOURCES as readonly string[]).includes(one.source));
+  assert.deepEqual([...HANDLED_EVENTS].sort(), ['phase.approval-auto-granted', 'phase.question-answered', 'phase.turn-refused', 'run.recovery-continue', 'run.superseded']);
 });
 
 test('HD-3: a session\'s phase-outcome.sh handled row reads beside the console\'s — and a link is held to its four kinds', () => {

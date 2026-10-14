@@ -8,6 +8,7 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `service.ts` holds the concrete class.
  */
+import { isolateCompat, isRunRequestOf } from './turn/run-requests.ts';
 import { basename, join, resolve } from 'node:path';
 import { availableParallelism, homedir, loadavg } from 'node:os';
 import { isSchedulingPolicy, loadGuardFactor, schedulingPolicy, type SchedulingPolicy } from '../shared/orchestration-model.js';
@@ -154,6 +155,7 @@ import {
 } from './human-steps.ts';
 import { raiseTurn as raiseAtTheDoor } from './turn/index.ts';
 import { HANDLED_FILE, HandledLedger, handledOfJournal, type HandledInput, type HandledRow, type JournalLineSeen } from './turn/handled.ts';
+import { SETTLED_FILE, SettledStore, settledOfJournal, type SettledRecord } from './turn/settled.ts';
 import { TurnRound, type RoundState } from './turn/round.ts';
 import { count } from './counters.ts';
 import { ruleFamilyOf, wallTurnInput, type RecordedWall, type TodayGrant } from './permissions/walls.ts';
@@ -2741,6 +2743,10 @@ export abstract class ServiceBase {
       }
       : {
         approvalId: approval.id, kind: approval.kind, decision: approval.status, decidedBy: approval.decidedBy ?? null,
+        // The door it was decided through and its title (turn-by-turn phase 5):
+        // a person's press is kept as a settled record, which Done shows.
+        ...(approval.decidedDoor ? { door: approval.decidedDoor } : {}),
+        title: approval.title.slice(0, 200),
         waitedMs: Math.max(0, (Date.parse(approval.decidedAt ?? '') || Date.now()) - Date.parse(approval.createdAt)),
         ...(approval.recovered ? { recovered: true } : {}),
         // The why a person decided with, which the card kept and this line
@@ -3590,7 +3596,7 @@ export abstract class ServiceBase {
    * its own run's policy — then the ledger, ONE item per wall (G7), one push.
    * A refusal raises nothing and says why; the caller parks the phase on it.
    */
-  raiseTurn(input: DeclareInput, opts: { message?: TurnMessage } = {}): HumanStep | TurnRefused | null {
+  raiseTurn(input: DeclareInput, opts: { message?: TurnMessage; quiet?: boolean } = {}): HumanStep | TurnRefused | null {
     try {
       const judge = input.judge !== undefined ? input.judge
         : input.birth === 'session' ? this.commandJudgeFor(input.runId ?? null) : null;
@@ -3598,7 +3604,9 @@ export abstract class ServiceBase {
       // source, and the item's ONE push — in the source's own words when it
       // brings them (an errand, a relayed question), under the item's tag.
       return raiseAtTheDoor(
-        { ledger: this.humanStepsNow(), announce: (step) => this.announceHumanStep(step, 0, opts.message) },
+        // `quiet` (turn-by-turn phase 6): an item the supervisor is about to
+        // take itself is listed, never pushed — it must not reach a person.
+        { ledger: this.humanStepsNow(), announce: (step) => (opts.quiet ? false : this.announceHumanStep(step, 0, opts.message)) },
         { ...input, judge },
       );
     } catch (error) {
@@ -3674,7 +3682,9 @@ export abstract class ServiceBase {
    * never news, so it never breaks through a device's quiet hours.
    */
   protected announceHumanStep(step: HumanStep, n = 0, message?: TurnMessage): boolean {
-    const screen = lockScreenOf(step);
+    // A run request's Approve and Deny are a run verb's answers: offered only
+    // where `--allow-run` lets the console take the act (turn-by-turn phase 10).
+    const screen = lockScreenOf({ ...step, runAct: this.flags.allowRun ? isRunRequestOf(step) : null });
     const facts = { ...step, label: KIND_META[step.kind].label, actions: screen.buttons };
     const push = n > 0 ? humanStepReminderPush(facts, n) : humanStepPush(facts);
     // A source that brings its own words (control-tower phase 132) says them
@@ -3705,6 +3715,8 @@ export abstract class ServiceBase {
 
   /** Items a live grant now covers, and supervisor items whose subject settled — withdrawn (phase 136, `ServiceRecovery`). */
   protected abstract turnCoveredPass(now?: number): string[];
+  /** The round's stale pass (turn-by-turn phase 7) — `ServiceRecovery.turnStalePass`. */
+  protected abstract turnStalePass(now?: number): Promise<{ closed: string[]; moved: string[] }>;
 
   /** Items returned `turnEscalateAfter` times and not yet escalated — escalated once (phase 136, `ServiceRecovery`). */
   protected abstract turnEscalatePass(now?: number): string[];
@@ -3746,6 +3758,7 @@ export abstract class ServiceBase {
     return (this.turnRound ??= new TurnRound({
       grants: () => this.sweepGrants(),
       clock: (now) => this.humanStepClockTick(now) as { reminded: string[]; expired: string[]; dismissed: string[] },
+      stale: (now) => this.turnStalePass(now),
       covered: (now) => this.turnCoveredPass(now),
       escalate: (now) => this.turnEscalatePass(now),
       due: (now) => this.humanStepDuePass(now) as Promise<{ due: string[]; proven: string[] }>,
@@ -3759,11 +3772,34 @@ export abstract class ServiceBase {
     }));
   }
 
-  /** One line a run's journal wrote: a thing handled is recorded, and a round is woken. */
+  /**
+   * One line a run's journal wrote: a thing handled is recorded, a person's
+   * press on a projected item is kept as its settled record (turn-by-turn
+   * phase 5), and a round is woken.
+   */
   protected onJournalLine(line: JournalLineSeen): void {
     const handled = handledOfJournal(line);
     if (handled) this.recordHandled(handled);
+    const settled = settledOfJournal(line);
+    if (settled) this.recordSettled(settled);
     this.turnRound?.poke(line.entry.event);
+  }
+
+  /** The settled records of pressed projected items (turn-by-turn phase 5): `<instance state>/turn-settled.json`. */
+  protected settledStore: SettledStore | null = null;
+
+  /** The one writer of `turn-settled.json`, made on first use. */
+  settledNow(): SettledStore {
+    return (this.settledStore ??= new SettledStore(join(INSTANCE_STATE_DIR, SETTLED_FILE)));
+  }
+
+  /** Keep a press's settled record — a failure is logged, never thrown into the press it records. */
+  recordSettled(record: SettledRecord): void {
+    try {
+      this.settledNow().record(record);
+    } catch (error) {
+      log.warn('human-steps.ledger-unwritable', { file: SETTLED_FILE, error: (error as Error)?.message ?? String(error) });
+    }
   }
 
   /**
@@ -6334,6 +6370,21 @@ export abstract class ServiceBase {
         if (!run || (runId && run.id !== runId)) return null;
         const record = run.phases[String(phase)];
         return record ? (record.walls ?? []) : null;
+      },
+      // The compatibility rule's facts (turn-by-turn phase 6): a permission
+      // declaration with no rule or command on a shared checkout whose lane is
+      // not on `pe/<slug>` is a run request to isolate, which G5 never refuses —
+      // the runner records it as one. The lane's branch is what its claim
+      // named: its own, the run's `pe/<slug>`, or (a default-branch run) the
+      // branch its shared checkout stands on, which is never `pe/<slug>`.
+      runRequest: (slug, runId, phase, declared) => {
+        if (!this.root?.ok) return false;
+        const run = latestRun(this.root.path, slug, this.liveRunIds());
+        if (!run || (runId && run.id !== runId)) return false;
+        const child = run.children?.[String(phase)];
+        const shared = run.checkout !== 'worktree' && !child?.worktree;
+        const branch = child?.branch ?? (run.gitMode === 'new-branch' && !run.detachAt ? `pe/${slug}` : null);
+        return isolateCompat({ slug, declared: { status: 'blocked', ...declared }, shared, branch });
       },
       probe: (slug, phase, refs) => this.watchClock.probeDeclared(slug, phase, refs, { budgetMs: DECLARED_PROBE_BUDGET_MS }),
       journal: (slug, runId, kind, data, phase) => {

@@ -1,34 +1,33 @@
 /**
- * One item of Your turn, whole (7.0; control-tower phase 137, #214).
+ * One item of Your turn, whole — the board's card in 7.0's language
+ * (control-tower phase 137, #214; rebuilt by turn-by-turn phase 8 around the
+ * Owner To-Do Board's anatomy, `viewer/docs/design.md` §Your turn).
  *
  * A card, because an item is acted on as a unit, and a quiet one: the server
- * decided what the item is (`GET /api/turn`); this file only draws it, top to
- * bottom in the order a person needs it —
+ * decided what the item is (`GET /api/turn` — its type, the person's status,
+ * whether it is due, where a press goes, every word); this file only draws it,
+ * top to bottom in the order a person needs it:
  *
- *   1. its state as a dot and a word, the verdict's and the risk's beside it,
- *      the kind's mark and where it is done;
- *   2. the title, and "Only you:" with the reason — its sentence from
- *      `REASON_META`, said to be inferred when the raiser named none;
- *   3. the facts — the plan, the phase and the run, each a link; what it
- *      unblocks; a countdown while its window runs; the effort;
- *   4. the verdict, when a check sent it back: the attempt and exactly what to
- *      redo — read BEFORE the guide, because it changes what the guide is for;
- *   5. the guide, on the line (`guide.tsx`) — or, for an item that carries
- *      none, its own numbered lines and its command;
- *   6. how it will be checked, in words, by its proof type;
- *   7. ONE primary move, chosen by `primaryMoveOf` from the kind and the state
- *      — then *Not doing this* (only where the raiser allows it), *I can't*,
- *      *Snooze*, *Ask* and *Attach*; after the third miss, the escalation's
- *      three ways out;
- *   8. what the AI tried first, and its last word;
- *   9. one press in, the history — who raised it and when, every move, every
+ *   1. the head (`turn/head.tsx`): NOW, or NOT YET with its *when*; the type's
+ *      mark; the person's status as a dot and a word; the title; the meta;
+ *   2. the timing grid on the one page clock (`turn/timing.tsx`);
+ *   3. why only the person fits it — once;
+ *   4. the verdict BEFORE the steps (`turn/verdict.tsx`): Redo with its numbered
+ *      fixes, or the check still running, or how it ended;
+ *   5. *From the AI*, the numbered steps on the line, the plan/session link,
+ *      *How it's checked*, *Goes to* and *Checked by* (`turn/steps.tsx`);
+ *   6. ONE act form per type (`turn/act.tsx`, `decision-card.tsx`), its primary
+ *      chosen by the move table (`turn/moves.ts`, IC-v2) — and *Undo: I'm not
+ *      finished* while a check runs; an action the console's flags switch off
+ *      is drawn disabled with the flag that turns it on;
+ *   7. one press in, the history — who raised it and when, every move, every
  *      attempt side by side with its evidence, the questions, the answer — and
  *      one more, the raw record.
  *
- * Never a field for a secret: a `secret-entry` item says where the value goes.
- * A projected item — a gate, an approval card, a relayed question — keeps the
- * actions its row carries, pressed verbatim (`perform`), as every inbox action
- * is; the item's own verbs go through the owner door (`data/press.ts`). The
+ * Never a field for a secret: a `secret-entry` item says where the value goes,
+ * and its check takes no note. Every press goes through `data/press.ts` (the
+ * owner door); a terminal one — Approve, Deny, Not doing this, Send my
+ * decision — waits out the undo window on the page (`data/undo-window.ts`). The
  * pieces a screen draws INSIDE an item — a permission item's own card, the
  * owner's pending requests, the supervisor's card, a link's QR — are lent by
  * the screen (`parts`), and the card says what it can without them.
@@ -36,223 +35,76 @@
 
 import { useEffect, useId, useState, type ComponentType, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, Timer } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
 
+import { humanStepView, type HumanStepState, type HumanStepView } from '@shared/human-step-model.js';
 import {
-  HUMAN_STEP_SETTLED_STATES,
-  KIND_META,
-  humanStepView,
-  type HumanStepKind,
-  type HumanStepState,
-  type HumanStepView,
-} from '@shared/human-step-model.js';
-import { REASON_META, type ProofType } from '@shared/turn-model.js';
-import type { InboxAction, InboxItem } from '@/data/api';
+  personStatusOf,
+  readinessOf,
+  readinessShown,
+  typeOf,
+  type ItemType,
+  type PersonStatus,
+  type Readiness,
+} from '@shared/turn-model.js';
+import type { InboxAction, InboxItem, TurnOption } from '@/data/api';
 import {
   humanStepsApi as api,
   type HumanStepRecord,
   type PermissionRecord,
   type StepEvidenceInput,
   type StepVerbAnswer,
-  type StepVerdictRecord,
 } from '@/data/human-steps';
 import { keys } from '@/data/keys';
 import { patchHumanStep } from '@/data/live';
 import type { AuthorityRequest } from '@/data/owner';
-import { press } from '@/data/press';
-import type { TurnItem, TurnRecord } from '@/data/turn';
-import { useNow } from '@/lib/clock';
+import { press, type Pressed } from '@/data/press';
+import { giveBack, pressOption, undoCheck, type TurnItem } from '@/data/turn';
+import { useHeldPress } from '@/data/undo-window';
 import { cn } from '@/lib/cn';
-import { phaseHref, planHref, runHref, toHash } from '@/shell/routes';
+import { toHash } from '@/shell/routes';
 import { Button, Input, KeyValue, toast, type KeyValueItem } from '@/ui';
+import { CodeBlock } from '@/ui/code-block';
 import { Disclosure } from '@/ui/disclosure';
 import { MicField } from '@/ui/mic-field';
 import { OpsStatus } from '@/ui/status';
-import { Textarea } from '@/ui/textarea';
-import { DecisionCard } from './decision-card';
-import { CommandBlock, GuideView, guideOf } from './guide';
+import { DecisionCard, type DecisionAnswer, type DecisionOption } from './decision-card';
+import { guideOf } from './guide';
 import {
   BIRTH_WORDS,
   DeviceCode,
-  DueLine,
   KindMark,
   MoveLine,
   RawRecord,
   SecretWhere,
   WhereWord,
   errorWords,
-  span,
   stamp,
   useStepVerbs,
 } from './human-step-card';
-import { CHECK_LABEL, primaryActOf, primaryLabel } from './human-step-words';
+import { primaryActOf, primaryLabel } from './human-step-words';
 import { StepTerminalSheet } from './step-terminal-sheet';
+import { ApprovalAct, FlaggedActions, HeadsUpAct, HeldLine, TaskAct, UndoAct } from './turn/act';
+import { Head, Meta, WhyLine } from './turn/head';
+import {
+  NONE_WORDS,
+  approveLabelOf,
+  cardMoveOf,
+  denyLabelOf,
+  isGrantItem,
+  saysNo,
+  saysYes,
+  type CardMove,
+} from './turn/moves';
+import { CoverLinks, FromTheAI, HowChecked, Routing, Steps } from './turn/steps';
+import { TimingGrid, timingOf } from './turn/timing';
+import { CheckingLine, SettledLine, Verdict } from './turn/verdict';
 
 type Perform = (item: InboxItem, action: InboxAction, says?: string) => void;
 
 /* ------------------------------------------------------------------ *
- * The primary move — by kind and state, and nothing else
+ * The item's facts, as the card reads them
  * ------------------------------------------------------------------ */
-
-/**
- * What an item's ONE primary action is. `row` presses one of the item's own
- * row actions verbatim; `answer` is *Send my answer*; `open`, `terminal` and
- * `machine` are the kind's own opener; `check` is *I've done this — check*;
- * `none` says why there is nothing to press.
- */
-export type PrimaryMove =
-  | { move: 'none'; why: 'settled' | 'upcoming' | 'checking' | 'no-action' }
-  | { move: 'row'; action: InboxAction }
-  | { move: 'answer' }
-  | { move: 'open' | 'terminal' | 'machine' }
-  | { move: 'check' };
-
-export type PrimaryInput = {
-  kind: HumanStepKind;
-  state: HumanStepState;
-  record: TurnRecord;
-  proofType?: ProofType | null | undefined;
-  openUrl?: string | undefined;
-  openCommand?: string | undefined;
-  actions: readonly InboxAction[];
-};
-
-const SETTLED: ReadonlySet<string> = new Set(HUMAN_STEP_SETTLED_STATES);
-
-/** A permission item ends by a grant; failing one, by doing it yourself; failing that, by a denial. */
-const PERMISSION_ORDER = Object.freeze(['grant', 'convert', 'deny'] as const);
-
-/**
- * The primary move:
- *
- * - a settled item, one not due yet and one being checked have none — the
- *   ledger refuses a press on the second, and a check already holds the third;
- * - a projected item or a request leads with its row's first pressable action;
- * - a permission item with its Grant, else *I'll do it myself*, else *Deny*;
- * - a decision, a person-check, or anything proven by an answer, with
- *   *Send my answer*;
- * - every other item with its kind's own opener while it is declared or
- *   notified, and with the check once it was opened or came back.
- */
-export function primaryMoveOf(input: PrimaryInput): PrimaryMove {
-  if (SETTLED.has(input.state)) return { move: 'none', why: 'settled' };
-  if (input.state === 'upcoming') return { move: 'none', why: 'upcoming' };
-  if (input.state === 'checking') return { move: 'none', why: 'checking' };
-  const pressable = input.actions.filter((action) => !action.flag);
-  if (input.record !== 'ledger') {
-    const first = pressable[0];
-    return first ? { move: 'row', action: first } : { move: 'none', why: 'no-action' };
-  }
-  if (input.kind === 'permission' || input.proofType === 'grant') {
-    for (const verb of PERMISSION_ORDER) {
-      const action = pressable.find((candidate) => candidate.verb === verb);
-      if (action) return { move: 'row', action };
-    }
-    return { move: 'none', why: 'no-action' };
-  }
-  if (input.kind === 'decision' || input.kind === 'person-check' || input.proofType === 'answer') {
-    return { move: 'answer' };
-  }
-  if (input.state === 'opened' || input.state === 'returned') return { move: 'check' };
-  const act = primaryActOf({ kind: input.kind, openUrl: input.openUrl, openCommand: input.openCommand });
-  return act === 'open' || act === 'terminal' || act === 'machine' ? { move: act } : { move: 'check' };
-}
-
-/** What the primary says — the row's own label, the opener's, or the check's one wording. */
-export function primaryMoveLabel(move: PrimaryMove, kind: HumanStepKind): string | null {
-  switch (move.move) {
-    case 'none':
-      return null;
-    case 'row':
-      return move.action.label;
-    case 'answer':
-      return 'Send my answer';
-    case 'check':
-      return CHECK_LABEL;
-    default:
-      return primaryLabel(move.move, kind);
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * The item's words
- * ------------------------------------------------------------------ */
-
-/** How the item is checked, said by its proof type — never a verdict, only the method. */
-function CheckWords({
-  proofType,
-  proof,
-  proofWords,
-  kind,
-}: {
-  proofType: ProofType | null | undefined;
-  proof: string | undefined;
-  proofWords: string | undefined;
-  kind: HumanStepKind;
-}) {
-  let words: ReactNode;
-  switch (proofType) {
-    case 'probe':
-      words = (
-        <>
-          The console checks it itself: it runs{' '}
-          {proof ? <code className="font-mono wrap-anywhere text-ink">{proof}</code> : 'the proof'} and passes
-          when that answers yes.{proofWords ? ` ${proofWords}` : ''}
-        </>
-      );
-      break;
-    case 'judgement':
-      words = <>An AI checker reads what you did against this: {proofWords ?? KIND_META[kind].proof}.</>;
-      break;
-    case 'answer':
-      words = 'Your answer is the proof: the session carries on with it.';
-      break;
-    case 'attest':
-      words = 'Your word is the proof: press it once it is done.';
-      break;
-    case 'grant':
-      words =
-        'Your grant is the proof: the session carries on under it, and a denial tells it to find another way.';
-      break;
-    default:
-      words = <>What proves it: {proofWords ?? KIND_META[kind].proof}.</>;
-  }
-  return (
-    <p data-testid="turn-check-words" className="max-w-prose text-meta text-ink-muted">
-      <span className="font-medium text-ink">How it is checked. </span>
-      {words}
-    </p>
-  );
-}
-
-/** What it unblocks: the declared phases and every waiting session's, once each. */
-export function unblocksOf(
-  item: Pick<TurnItem, 'step'>,
-  record?: Pick<HumanStepRecord, 'unblocks' | 'waiters'>,
-): { slug: string; phase: number }[] {
-  const seen = new Set<string>();
-  const out: { slug: string; phase: number }[] = [];
-  const all = [
-    ...(record?.unblocks ?? item.step?.unblocks ?? []),
-    ...(record?.waiters ?? item.step?.waiters ?? []),
-  ];
-  for (const { slug, phase } of all) {
-    const key = `${slug}/${phase}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ slug, phase });
-  }
-  return out;
-}
-
-/** The item's window end — the ledger's, else the turn's, else the row's. */
-function dueOf(item: TurnItem, record: HumanStepRecord | undefined): string | undefined {
-  return record?.windowEnd ?? record?.until ?? item.step?.until ?? item.expiresAt;
-}
-
-function effortWords(minutes: number): string {
-  return minutes < 60 ? `About ${minutes} min` : `About ${span(minutes * 60_000)}`;
-}
 
 /** The inbox row a projected item is pressed as — `perform` keys its busy state on the row's id. */
 function rowOf(item: TurnItem): InboxItem {
@@ -274,16 +126,62 @@ function viewOf(item: TurnItem, record: HumanStepRecord | undefined, state: Huma
   return humanStepView(input as Parameters<typeof humanStepView>[0]);
 }
 
+/**
+ * The card's three words — type, the person's status, readiness — as the
+ * server derived them, re-derived from the ledger record when the page holds
+ * a newer one (a live patch lands before the next read), and derived here for
+ * a 7.0 answer that carries none.
+ */
+export function cardWordsOf(
+  item: TurnItem,
+  record: HumanStepRecord | undefined,
+  state: HumanStepState,
+): { type: ItemType; personStatus: PersonStatus; readiness: Readiness } {
+  const verdict = record?.verdict?.state ?? item.verdict?.state ?? null;
+  const type =
+    item.type ??
+    typeOf({
+      kind: item.kind,
+      source: item.source,
+      record: item.record,
+      proofType: item.proofType,
+      hasOptions: Boolean(item.options?.length || item.step?.options?.length),
+      hasApproval: Boolean(item.approval),
+    });
+  const personStatus = item.settled
+    ? item.settled.outcome
+    : record || !item.personStatus
+      ? personStatusOf({ state: item.record === 'projected' ? null : state, verdict, record: item.record })
+      : item.personStatus;
+  const readiness =
+    record || !item.readiness
+      ? readinessOf({ state: item.record === 'projected' ? null : state, dueWhen: record?.dueWhen ?? null })
+      : item.readiness;
+  return { type, personStatus, readiness };
+}
+
+/** Is the act's answer a secret or a code — so its check takes no note, and the card draws no field for one. */
+const NO_NOTE_KINDS: ReadonlySet<string> = new Set(['secret-entry', 'one-time-code', 'device-code']);
+
+/** The row verbs that END an item — a yes or a no — held for the undo window before they are sent. */
+const HELD_VERBS: ReadonlySet<string> = new Set(['approve', 'allow', 'deny', 'grant']);
+
+/** A run request's act, when the item is one (turn-by-turn phase 6). */
+function runActOf(item: TurnItem): string | null {
+  const source = item.step?.source;
+  return source?.kind === 'run-request' && source.ref ? source.ref : null;
+}
+
 /* ------------------------------------------------------------------ *
  * Pressing — the item's own verbs beside the step card's
  * ------------------------------------------------------------------ */
 
-type ItemBusy = 'answer' | 'decline' | 'ask' | 'attach' | 'override' | 'rewrite' | null;
+type ItemBusy = 'answer' | 'decline' | 'ask' | 'attach' | 'override' | 'rewrite' | 'undo' | null;
 
 /**
- * The verbs only an item has — answer, decline, ask, attach, and the
- * escalation's two — each through the owner door, each answer patched straight
- * into the caches, and the inbox (the turn sits under its key) re-read
+ * The verbs only an item has — answer, decline, ask, attach, the escalation's
+ * two, give back and undo — each through the owner door, each answer patched
+ * straight into the caches, and the inbox (the turn sits under its key) re-read
  * whatever happened.
  */
 function useItemVerbs(id: string | undefined) {
@@ -295,10 +193,18 @@ function useItemVerbs(id: string | undefined) {
     call: (id: string) => Promise<StepVerbAnswer>,
     said: string,
   ) {
+    return runPressed(which, (at) => press(() => call(at)), said);
+  }
+
+  async function runPressed(
+    which: Exclude<ItemBusy, null>,
+    pressIt: (id: string) => Promise<Pressed<StepVerbAnswer>>,
+    said: string,
+  ) {
     if (!id) return null;
     setBusy(which);
     try {
-      const pressed = await press(() => call(id));
+      const pressed = await pressIt(id);
       if (pressed.state === 'asked') {
         toast(pressed.words, 'info', 8000);
         return null;
@@ -317,10 +223,10 @@ function useItemVerbs(id: string | undefined) {
 
   return {
     busy,
-    answer: (body: { option?: string; note?: string }) =>
+    answer: (body: DecisionAnswer) =>
       run('answer', (at) => api.humanStepAnswer(at, body), 'Answer sent — the session carries on with it.'),
     decline: (reason: string) =>
-      run('decline', (at) => api.humanStepDecline(at, reason), 'Declined — the session is told why.'),
+      run('decline', (at) => api.humanStepDecline(at, reason), 'Not doing it — the session is told why.'),
     ask: (text: string) =>
       run('ask', (at) => api.humanStepAsk(at, text), 'Asked — the session reads it when it resumes.'),
     attach: (evidence: StepEvidenceInput) =>
@@ -337,112 +243,17 @@ function useItemVerbs(id: string | undefined) {
         (at) => api.humanStepRewrite(at),
         'Withdrawn — the session is asked for a better guide.',
       ),
+    /** *Give back to Phase N* (turn-by-turn phase 5) — the phase that raised it takes it back. */
+    giveBack: (phase: number) =>
+      runPressed('rewrite', (at) => giveBack(at), `Given back — phase ${phase} takes it from here.`),
+    /** *Undo: I'm not finished* on a running check (turn-by-turn phase 5) — the item is yours to do again. */
+    undo: () => runPressed('undo', (at) => undoCheck(at), 'Check taken back — it is yours to do again.'),
   };
-}
-
-/** A file, as the evidence route takes it: base64, with its type and name. */
-function readEvidence(file: File): Promise<StepEvidenceInput> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error('The file could not be read.'));
-    reader.onload = () => {
-      const data = String(reader.result ?? '').replace(/^data:[^,]*,/, '');
-      resolve(
-        file.type.startsWith('image/')
-          ? { kind: 'image', data, mime: file.type, name: file.name }
-          : { kind: 'file', data, name: file.name },
-      );
-    };
-    reader.readAsDataURL(file);
-  });
 }
 
 /* ------------------------------------------------------------------ *
  * The pieces
  * ------------------------------------------------------------------ */
-
-function Fact({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
-  return (
-    <div className="flex min-w-0 flex-col" data-testid={testId}>
-      <dt className="text-meta text-ink-muted">{label}</dt>
-      <dd className="min-w-0 text-body break-words text-ink">{children}</dd>
-    </div>
-  );
-}
-
-const link = 'tap-row text-ink underline decoration-rule-strong underline-offset-2 hover:decoration-ink';
-
-/** Where it belongs, what it unblocks, when it is due and what it costs — each a fact with its name. */
-function Facts({
-  item,
-  record,
-  live,
-}: {
-  item: TurnItem;
-  record: HumanStepRecord | undefined;
-  live: boolean;
-}) {
-  const due = live ? dueOf(item, record) : undefined;
-  const now = useNow(Boolean(due), 30_000);
-  const end = due ? Date.parse(due) : NaN;
-  const unblocks = unblocksOf(item, record);
-  const effort = record?.effortMin ?? item.step?.effortMin;
-  const runId = item.runId ?? record?.runId;
-  return (
-    <dl data-testid="turn-facts" className="flex min-w-0 flex-wrap gap-x-6 gap-y-2">
-      {item.slug && (
-        <Fact label="Plan">
-          <a className={link} href={planHref(item.slug)}>
-            {item.slug}
-          </a>
-        </Fact>
-      )}
-      {item.slug && item.phase != null && (
-        <Fact label="Phase">
-          {item.phase ? (
-            <a className={link} href={phaseHref(item.slug, item.phase)}>
-              Phase {item.phase}
-            </a>
-          ) : (
-            'The plan itself'
-          )}
-        </Fact>
-      )}
-      {item.slug && runId && (
-        <Fact label="Run">
-          <a className={cn(link, 'font-mono text-meta')} href={runHref(item.slug)} title={runId}>
-            {runId.slice(0, 8)}
-          </a>
-        </Fact>
-      )}
-      {unblocks.length > 0 && (
-        <Fact label="Unblocks" testId="turn-unblocks">
-          {unblocks.map(({ slug, phase }, index) => (
-            <span key={`${slug}/${phase}`}>
-              {index > 0 && ', '}
-              <a className={link} href={phaseHref(slug, phase)}>
-                {slug === item.slug ? `phase ${phase}` : `${slug} phase ${phase}`}
-              </a>
-            </span>
-          ))}
-        </Fact>
-      )}
-      {Number.isFinite(end) && (
-        <Fact label="Due" testId="turn-due">
-          <span className="inline-flex items-center gap-1 tabular-nums">
-            <Timer size={13} aria-hidden className="shrink-0 text-ink-muted" />
-            {end > now ? `in ${span(end - now)}` : `the window closed ${span(now - end)} ago`}
-          </span>
-        </Fact>
-      )}
-      {effort != null && (
-        <Fact label="Effort" testId="turn-effort">
-          {effortWords(effort)}
-        </Fact>
-      )}
-    </dl>
-  );
-}
 
 /** What stopped the AI, why the phase needs it, and what a grant would do — a permission item's own facts. */
 function PermissionFacts({ permission }: { permission: PermissionRecord }) {
@@ -465,7 +276,7 @@ function PermissionFacts({ permission }: { permission: PermissionRecord }) {
           {permission.need}
         </p>
       )}
-      {permission.command && <CommandBlock code={permission.command} />}
+      {permission.command && <CodeBlock code={permission.command} testId="guide-command" />}
       {permission.never ? (
         <p data-testid="turn-permission-never">
           <span className="font-medium">It is never granted. </span>
@@ -474,7 +285,7 @@ function PermissionFacts({ permission }: { permission: PermissionRecord }) {
         </p>
       ) : permission.grant ? (
         <p>
-          <span className="font-medium">What Grant does. </span>
+          <span className="font-medium">What Approve does. </span>
           {permission.grant.label}
         </p>
       ) : null}
@@ -482,47 +293,18 @@ function PermissionFacts({ permission }: { permission: PermissionRecord }) {
   );
 }
 
-/**
- * A check's answer: what was proven, or exactly what to redo and which attempt
- * it was. Back with the person, it wears the summons on its leading edge — a
- * rule in the hue, never a filled band; passed, it goes quiet.
- */
-function Verdict({ verdict }: { verdict: StepVerdictRecord }) {
-  const passed = verdict.state === 'passed';
+/** An approval's block: what is asked, who asked, and what each answer does. */
+function ApprovalBlock({ approval }: { approval: NonNullable<TurnItem['approval']> }) {
+  const rows: KeyValueItem[] = [
+    ['What', approval.what],
+    ['Asked by', approval.askedBy],
+    ['If you approve', approval.ifApproved],
+    ['If you deny', approval.ifDenied],
+    approval.scopes?.length ? ['Scopes', approval.scopes.join(', ')] : null,
+  ];
   return (
-    <div
-      data-testid="turn-verdict"
-      data-verdict={verdict.state}
-      className={cn(
-        'flex min-w-0 max-w-prose flex-col gap-2 border-s-2 ps-3 text-body text-ink',
-        passed ? 'border-rule-strong' : 'state-needs-you border-state',
-      )}
-    >
-      <p>
-        <span className="font-medium">
-          {passed
-            ? verdict.unverified
-              ? 'Passed on your word, unverified: '
-              : 'Passed: '
-            : verdict.state === 'needs-info'
-              ? `Back to you — attempt ${verdict.attempt} needs one detail: `
-              : `Back to you — attempt ${verdict.attempt}: `}
-        </span>
-        {verdict.note}
-      </p>
-      {!passed && verdict.redo.length > 0 && (
-        <div>
-          <p className="font-medium">Redo</p>
-          <ol className="list-decimal ps-5" data-testid="turn-redo">
-            {verdict.redo.map((line, index) => (
-              <li key={`${index}-${line}`}>{line}</li>
-            ))}
-          </ol>
-        </div>
-      )}
-      {verdict.read.length > 0 && (
-        <p className="text-meta text-ink-muted">The check read: {verdict.read.join('; ')}</p>
-      )}
+    <div data-testid="turn-approval" className="max-w-prose">
+      <KeyValue items={rows} />
     </div>
   );
 }
@@ -538,10 +320,13 @@ function Escalation({
   attempts: number;
   busy: boolean;
   onRewrite: () => void;
-  onCannot: () => void;
+  onCannot: (reason: string) => void;
   onOverride: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const [reason, setReason] = useState('');
+  const reasonId = useId();
   return (
     <div
       data-testid="turn-escalation"
@@ -557,11 +342,41 @@ function Escalation({
             The item is withdrawn and the session asked for a better one.
           </span>
         </li>
-        <li className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <Button size="sm" disabled={busy} onClick={onCannot}>
-            I can’t do this
-          </Button>
-          <span className="text-meta text-ink-muted">It becomes an errand, with your reason.</span>
+        <li className="flex flex-col gap-1.5">
+          <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Button size="sm" disabled={busy} aria-expanded={asking} onClick={() => setAsking((was) => !was)}>
+              I can’t do this
+            </Button>
+            <span className="text-meta text-ink-muted">It becomes an errand, with your reason.</span>
+          </span>
+          {asking && (
+            <form
+              className="flex min-w-0 flex-wrap items-end gap-1.5"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!reason.trim()) return;
+                onCannot(reason.trim());
+                setAsking(false);
+                setReason('');
+              }}
+            >
+              <label
+                htmlFor={reasonId}
+                className="flex min-w-0 flex-1 flex-col gap-1 text-meta text-ink-muted"
+              >
+                Why not? Who can do it, or what is in the way.
+                <Input
+                  id={reasonId}
+                  block
+                  value={reason}
+                  onChange={(event) => setReason(event.target.value)}
+                />
+              </label>
+              <Button size="sm" type="submit" disabled={busy || !reason.trim()}>
+                Hand it back
+              </Button>
+            </form>
+          )}
         </li>
         <li className="flex flex-wrap items-center gap-x-3 gap-y-1">
           {confirming ? (
@@ -656,8 +471,16 @@ function Attempts({ record }: { record: HumanStepRecord }) {
   );
 }
 
-/** One press in: who raised it and when, every move, every attempt, the questions, the answer — and the raw record. */
-function History({ item, record }: { item: TurnItem; record: HumanStepRecord | undefined }) {
+/** One press in: who raised it and when, its kind and where, every move and attempt, the questions, the answer — and the raw record. */
+function History({
+  item,
+  record,
+  view,
+}: {
+  item: TurnItem;
+  record: HumanStepRecord | undefined;
+  view: HumanStepView;
+}) {
   const moves = record?.moves ?? [];
   const questions = record?.question ?? [];
   const answer = record?.answer;
@@ -677,6 +500,8 @@ function History({ item, record }: { item: TurnItem; record: HumanStepRecord | u
         {who}, {stamp(declared)}
       </span>,
     ],
+    ['What it is', <KindMark kind={item.kind} />],
+    item.record === 'ledger' ? ['Where', <WhereWord where={view.where} />] : null,
     source && [
       'From',
       <>
@@ -765,6 +590,29 @@ function PhoneLink({ url, children }: { url: string; children?: ReactNode }) {
   );
 }
 
+/** *Got it* on a heads-up — a mark kept in this browser: nothing checks a heads-up or waits on it. */
+const SEEN = (item: string) => `turn:seen:${item}`;
+function useSeen(item: string): [boolean, () => void] {
+  const [seen, setSeen] = useState(() => {
+    try {
+      return window.localStorage.getItem(SEEN(item)) === '1';
+    } catch {
+      return false;
+    }
+  });
+  return [
+    seen,
+    () => {
+      setSeen(true);
+      try {
+        window.localStorage.setItem(SEEN(item), '1');
+      } catch {
+        /* a private window keeps it for this visit */
+      }
+    },
+  ];
+}
+
 /* ------------------------------------------------------------------ *
  * The card
  * ------------------------------------------------------------------ */
@@ -772,8 +620,8 @@ function PhoneLink({ url, children }: { url: string; children?: ReactNode }) {
 /**
  * The pieces a screen lends the card — drawn INSIDE an item, and owned by the
  * screen that answers them. Each is optional: without a permission card the
- * item says what stopped the AI and offers its own moves; without the owner's
- * requests, nothing is drawn for them.
+ * item says what stopped the AI and offers its own Approve and Deny; without
+ * the owner's requests, nothing is drawn for them.
  */
 export interface ItemCardParts {
   /** A ledger permission item, answered on a card of its own — the scopes, the risk, the typed rule, the owner key. */
@@ -790,7 +638,7 @@ export interface ItemCardParts {
   /**
    * The outcome of a check just pressed, in words — what the proof read, the
    * exit it saw, what to redo (quiet-console phase 8, #266). Drawn in the
-   * verdict's place, before the guide, and the ledger's verdict of the same
+   * verdict's place, before the steps, and the ledger's verdict of the same
    * attempt is not drawn twice.
    */
   CheckOutcome?: ComponentType<{ answer: StepVerbAnswer; record?: HumanStepRecord | undefined }>;
@@ -816,33 +664,6 @@ export interface ItemCardProps {
   moves?: ReactNode;
 }
 
-type Form = 'decline' | 'cannot' | 'ask' | 'attach' | null;
-
-const FORM_WORDS: Readonly<
-  Record<Exclude<Form, null>, { label: string; placeholder: string; submit: string }>
-> = {
-  decline: {
-    label: 'Why not? The session is told, and finds another way.',
-    placeholder: 'What should happen instead',
-    submit: 'Decline it',
-  },
-  cannot: {
-    label: 'Why not? It becomes an errand with your words.',
-    placeholder: 'Who can do it, or what is in the way',
-    submit: 'Hand it back',
-  },
-  ask: {
-    label: 'Your question. The session reads it when it resumes.',
-    placeholder: 'What is unclear',
-    submit: 'Ask',
-  },
-  attach: {
-    label: 'A note for this attempt, or a file below.',
-    placeholder: 'What you did, what you saw',
-    submit: 'Attach',
-  },
-};
-
 const NO_PARTS: ItemCardParts = {};
 
 export function ItemCard({
@@ -861,60 +682,77 @@ export function ItemCard({
     if (focused) setOpen(true);
   }, [focused]);
   const titleId = useId();
-  const formId = useId();
   const state: HumanStepState = record?.state ?? item.step?.state ?? item.humanStep?.state ?? 'notified';
   const view = viewOf(item, record, state);
   const verbs = useStepVerbs(view);
   const extra = useItemVerbs(item.record === 'ledger' ? item.item : undefined);
-  const [form, setForm] = useState<Form>(null);
-  const [text, setText] = useState('');
-  const [file, setFile] = useState<File | null>(null);
+  const client = useQueryClient();
+  // A terminal press waits here for the undo window before it is sent (turn-by-turn phase 5).
+  const held = useHeldPress();
+  const holding = held.held !== null;
+  const [optionBusy, setOptionBusy] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
   const [said, setSaid] = useState('');
+  const [seen, markSeen] = useSeen(item.item);
   const { PermissionCard, OwnerRequests, CheckOutcome } = parts;
 
   const ledger = item.record === 'ledger';
-  const settled = SETTLED.has(state);
-  const upcoming = state === 'upcoming';
-  const checking = state === 'checking';
+  const words = cardWordsOf(item, record, state);
+  const card: TurnItem = { ...item, ...words };
+  const status = words.personStatus;
+  const settled = status === 'passed' || status === 'not-doing' || status === 'closed';
   const live = !settled;
+  const notYet = words.readiness === 'not-yet' && readinessShown(status);
+  const checking = status === 'checking';
   const proofType = record?.proofType ?? item.step?.proofType ?? item.proofType;
   const why = record?.why ?? item.step?.why ?? item.why;
   const inferred = (record?.whySource ?? item.step?.whySource) === 'inferred';
   const guide = guideOf(record?.guide ?? item.step?.guide);
-  const options = record?.options ?? item.step?.options ?? [];
-  const allowDecline = Boolean(record?.allowDecline ?? item.step?.allowDecline);
-  const verdict = record?.verdict;
+  const verdict = record?.verdict ?? item.verdict ?? undefined;
   const attempts = record?.attempts ?? item.step?.attempts ?? 0;
   const permission = item.permission ?? item.step?.permission ?? record?.permission;
-  // A ledger permission item is answered on its own card where the screen
-  // lends one: the scopes, the risk, the typed rule and the owner key — and its
-  // moves are that card's.
+  // A ledger permission item is answered on its own card where the screen lends
+  // one: the scopes, the risk, the typed rule and the owner key.
   const ownCard = Boolean(permission && ledger && PermissionCard);
   const risk = item.permission?.risk ?? item.step?.permission?.risk ?? record?.permission?.risk;
   const row = rowOf(item);
-  const move = primaryMoveOf({
-    kind: item.kind,
-    state,
+  const timing = timingOf(item, record);
+
+  // The ways on. A ledger decision's options are answered through its own
+  // verb; a projected item's are each bound to the verb that takes them
+  // (turn-by-turn phase 5), and the row buttons the server derived from them
+  // are the same presses, so they are not drawn twice.
+  const ledgerOptions: readonly DecisionOption[] = ledger
+    ? (record?.options ?? item.step?.options ?? [])
+    : [];
+  const bound: readonly TurnOption[] =
+    live && !item.supervisor && !(ledger && ledgerOptions.length) ? (item.options ?? []) : [];
+  const boundTo = (action: InboxAction) =>
+    bound.some(
+      (option) =>
+        option.id === action.verb ||
+        (option.verb.endpoint === action.endpoint && option.verb.method === action.method),
+    );
+  // A ledger item's row carries the step's own verbs, which this card offers in
+  // its own form — only a permission's grant, deny and convert are its row's.
+  const grantItem = isGrantItem({ kind: item.kind, proofType, record: item.record });
+  const rowActions = ledger && !grantItem ? [] : item.actions.filter((action) => !boundTo(action));
+  const options: readonly DecisionOption[] = ledgerOptions.length ? ledgerOptions : bound;
+  const move: CardMove = cardMoveOf({
+    type: words.type,
+    personStatus: status,
+    readiness: words.readiness,
     record: item.record,
+    kind: item.kind,
     proofType,
-    openUrl: view.openUrl,
-    openCommand: view.openCommand,
-    actions: item.actions,
+    actions: rowActions,
+    options,
+    supervisor: Boolean(item.supervisor),
   });
-  const label = primaryMoveLabel(move, item.kind);
-  const pressable = item.actions.filter((action) => !action.flag);
-  const rest =
-    move.move === 'row' ? pressable.filter((action) => action !== move.action) : ledger ? [] : pressable;
-  // A box for words only when a row action THIS card presses asks for them —
-  // a ledger step's row carries *I can't do this* with a reason, but the card
-  // asks that in its own form, so its row actions are never drawn here.
-  const says = (move.move === 'row' ? [move.action, ...rest] : rest).find((action) => action.says)?.says;
-  const escalated = Boolean(record?.escalatedAt) && live && !upcoming;
-  const tried = record?.tried;
-  const note = record?.note ?? item.step?.note;
+  const pressable = rowActions.filter((action) => !action.flag);
+  const runAct = runActOf(item);
+  const escalated = Boolean(record?.escalatedAt) && live && !notYet;
   const title = record?.title ?? item.step?.title ?? item.title;
-  const openable = Boolean(ledger && (view.openUrl || view.openCommand));
-  const otherOpener = openable && move.move !== 'open' && move.move !== 'terminal' && move.move !== 'machine';
   // A check just pressed answers in words (#266), where the screen lends the
   // part: its outcome takes the verdict's place, and the ledger's verdict of
   // the same attempt — patched in by the same answer — is not drawn twice.
@@ -923,60 +761,285 @@ export function ItemCard({
   const echoed = Boolean(
     fresh?.verdict && verdict && fresh.verdict.attempt === verdict.attempt && fresh.verdict.at === verdict.at,
   );
+  const notes = item.step?.notes ?? [];
+  const lastNote = notes.length ? notes[notes.length - 1] : undefined;
+  const giveBackPhase =
+    ledger && item.route === 'phase' && item.phase != null && item.phase > 0 ? item.phase : null;
+  const opener = (() => {
+    if (!ledger || !(view.openUrl || view.openCommand)) return undefined;
+    const act = primaryActOf({ kind: item.kind, openUrl: view.openUrl, openCommand: view.openCommand });
+    if (act === 'open') return { label: primaryLabel(act, item.kind), onOpen: () => verbs.open('url') };
+    if (act === 'terminal' || act === 'machine')
+      return { label: primaryLabel(act, item.kind), onOpen: () => verbs.open('command') };
+    return { label: view.openUrl ? 'Open the link' : 'Open in terminal', onOpen: () => verbs.open() };
+  })();
 
-  function pressPrimary() {
-    switch (move.move) {
-      case 'row':
-        perform(row, move.action, says ? said : undefined);
-        return;
-      case 'open':
-        verbs.open('url');
-        return;
-      case 'terminal':
-      case 'machine':
-        verbs.open('command');
-        return;
-      case 'check':
-        verbs.check();
-        return;
-      default:
-        return;
-    }
+  /** A row action: a yes or a no waits out the undo window; anything else goes at once. */
+  function pressRow(action: InboxAction, words?: string) {
+    if (HELD_VERBS.has(action.verb)) held.hold(action.label, () => perform(row, action, words));
+    else perform(row, action, words);
   }
 
-  async function submit() {
-    const words = text.trim();
-    if (form === 'attach') {
-      const evidence: StepEvidenceInput | null = file
-        ? await readEvidence(file).catch((cause: unknown) => {
-            toast(errorWords(cause), 'warn', 8000);
-            return null;
-          })
-        : words
-          ? { kind: 'note', text: words }
-          : null;
-      if (!evidence) return;
-      await extra.attach(evidence);
-    } else if (!words) {
+  /** A bound option, sent through the undo window — a refusal said on the item, in the server's sentence. */
+  function sendOption(option: TurnOption, typed: string | undefined) {
+    setRefusal(null);
+    held.hold(option.label, async () => {
+      setOptionBusy(true);
+      try {
+        const pressed = await pressOption(option, typed);
+        if (pressed.state === 'asked') toast(pressed.words, 'info', 8000);
+        else toast(`${option.label} — done.`, 'ok');
+      } catch (cause) {
+        // A stale run, a door that may not press, a rule: the server's sentence, where the press was made.
+        setRefusal(errorWords(cause));
+      } finally {
+        setOptionBusy(false);
+        for (const queryKey of keys.afterInboxAct()) void client.invalidateQueries({ queryKey });
+      }
+    });
+  }
+
+  /** A decision sent: a ledger answer, or the chosen bound option with its typed words. */
+  function sendDecision(answer: DecisionAnswer) {
+    if (ledgerOptions.length || (ledger && !bound.length)) {
+      held.hold('Your decision', () => void extra.answer(answer));
       return;
-    } else if (form === 'decline') {
-      await extra.decline(words);
-    } else if (form === 'cannot') {
-      verbs.cannot(words);
-    } else if (form === 'ask') {
-      await extra.ask(words);
     }
-    setForm(null);
-    setText('');
-    setFile(null);
+    const option = bound.find((candidate) => candidate.id === answer.option);
+    if (option) sendOption(option, answer.note);
   }
 
-  const working =
-    (move.move === 'check' && verbs.busy === 'check') ||
-    ((move.move === 'open' || move.move === 'terminal' || move.move === 'machine') &&
-      verbs.busy === 'open') ||
-    (move.move === 'row' && busy === `${row.id}:${move.action.verb}`);
-  const needsWords = move.move === 'row' && move.action.says?.field === 'rule' && !said.trim();
+  /** The approval's two presses, from whichever source the item carries them in. */
+  function approvalPresses(): {
+    onApprove?: (note: string | undefined) => void;
+    onDeny?: (note: string | undefined) => void;
+    approveLabel?: string;
+    denyLabel?: string;
+  } {
+    const yesOption = options.find((option) => !option.flag && saysYes(option));
+    const noOption = options.find((option) => !option.flag && saysNo(option));
+    if (yesOption || noOption) {
+      const send = (option: DecisionOption) => (note: string | undefined) => {
+        if (ledgerOptions.length) {
+          held.hold(option.label, () => void extra.answer({ option: option.id, ...(note ? { note } : {}) }));
+          return;
+        }
+        const boundOption = bound.find((candidate) => candidate.id === option.id);
+        if (boundOption) sendOption(boundOption, boundOption.says ? note : undefined);
+      };
+      return {
+        ...(yesOption ? { onApprove: send(yesOption), approveLabel: approveLabelOf(yesOption.label) } : {}),
+        ...(noOption ? { onDeny: send(noOption), denyLabel: denyLabelOf(noOption.label) } : {}),
+      };
+    }
+    const yesRow = pressable.find((action) => saysYes(action));
+    const noRow = pressable.find((action) => saysNo(action));
+    if (yesRow || noRow) {
+      return {
+        ...(yesRow
+          ? {
+              onApprove: (note) => pressRow(yesRow, yesRow.says ? note : undefined),
+              approveLabel: approveLabelOf(yesRow.label),
+            }
+          : {}),
+        ...(noRow
+          ? {
+              onDeny: (note) => pressRow(noRow, noRow.says ? note : undefined),
+              denyLabel: denyLabelOf(noRow.label),
+            }
+          : {}),
+      };
+    }
+    if (ledger) {
+      // A check by eye with no options: the answer is the note, said as a yes or a no.
+      return {
+        onApprove: (note) =>
+          held.hold('Approve', () => void extra.answer({ note: note ? `Approved: ${note}` : 'Approved.' })),
+        onDeny: (note) =>
+          held.hold('Deny', () => void extra.answer({ note: note ? `Denied: ${note}` : 'Denied.' })),
+      };
+    }
+    return {};
+  }
+
+  /** The row actions the act form did not take — drawn beside it, never as a second primary. */
+  function restOf(taken: readonly InboxAction[]): InboxAction[] {
+    return pressable.filter((action) => !taken.includes(action));
+  }
+
+  /** Row actions beside a form — each a plain button, a no in the failed hue. */
+  function restButtons(actions: readonly InboxAction[]): ReactNode {
+    return actions.map((action) => (
+      <Button
+        key={action.verb}
+        variant={saysNo(action) ? 'danger' : 'default'}
+        data-verb={action.verb}
+        disabled={busy === `${row.id}:${action.verb}` || (holding && HELD_VERBS.has(action.verb))}
+        onClick={() => pressRow(action, action.says ? said : undefined)}
+      >
+        {action.label}
+      </Button>
+    ));
+  }
+
+  function actForm(): ReactNode {
+    switch (move.move) {
+      case 'undo':
+        return <UndoAct busy={extra.busy === 'undo'} onUndo={() => void extra.undo()} />;
+      case 'got-it':
+        return <HeadsUpAct done={seen} onGotIt={markSeen} />;
+      case 'check':
+        return (
+          <TaskAct
+            redo={move.redo}
+            verbs={{
+              check: verbs.check,
+              snooze: verbs.snooze,
+              cannot: verbs.cannot,
+              decline: (reason) => held.hold('Not doing this', () => void extra.decline(reason)),
+              ask: extra.ask,
+              attach: extra.attach,
+              giveBack: (phase) => void extra.giveBack(phase),
+            }}
+            busy={{
+              check: verbs.busy === 'check',
+              snooze: verbs.busy === 'snooze',
+              open: verbs.busy === 'open',
+              other: extra.busy !== null,
+            }}
+            noteAllowed={!NO_NOTE_KINDS.has(item.kind)}
+            allowDecline={Boolean(record?.allowDecline ?? item.step?.allowDecline)}
+            giveBackPhase={giveBackPhase}
+            opener={opener}
+            onError={(words) => toast(words, 'warn', 8000)}
+          />
+        );
+      case 'decide':
+        return (
+          <>
+            <DecisionCard
+              options={options}
+              mode={ledgerOptions.length || (ledger && !bound.length) ? 'ledger' : 'bound'}
+              busy={extra.busy === 'answer' || optionBusy}
+              disabled={holding}
+              refusal={refusal}
+              onSend={sendDecision}
+            />
+            {pressable.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5" data-testid="turn-moves" data-print="hide">
+                {restButtons(pressable)}
+              </div>
+            )}
+          </>
+        );
+      case 'grant':
+        if (ownCard && PermissionCard && permission) return null;
+        return (
+          <ApprovalAct
+            {...grantPresses()}
+            busy={holding}
+            noteLabel="Why, if you want to say. The session reads it."
+          />
+        );
+      case 'approve': {
+        const presses = approvalPresses();
+        const taken = pressable.filter((action) => saysYes(action) || saysNo(action));
+        return (
+          <ApprovalAct
+            {...presses}
+            more={restButtons(restOf(taken))}
+            busy={holding || optionBusy || extra.busy === 'answer'}
+            noteHint={
+              runAct === 'raise-budget'
+                ? 'To approve, write only how many dollars to add — for example 10 or $12.50.'
+                : undefined
+            }
+            noteRequired={runAct === 'raise-budget'}
+          >
+            {item.approval && <ApprovalBlock approval={item.approval} />}
+          </ApprovalAct>
+        );
+      }
+      case 'row':
+        return (
+          <div
+            data-testid="turn-act"
+            data-type={words.type}
+            className="flex min-w-0 flex-col gap-3"
+            data-print="hide"
+          >
+            {move.action.says && (
+              <MicField
+                label={move.action.says.label}
+                placeholder={move.action.says.placeholder}
+                value={said}
+                onChange={setSaid}
+                disabled={Boolean(busy)}
+              />
+            )}
+            <div className="flex flex-wrap items-center gap-1.5" data-testid="turn-moves">
+              <Button
+                variant="primary"
+                data-testid="turn-primary"
+                data-move="row"
+                data-verb={move.action.verb}
+                disabled={
+                  busy === `${row.id}:${move.action.verb}` ||
+                  (move.action.says?.field === 'rule' && !said.trim()) ||
+                  (holding && HELD_VERBS.has(move.action.verb))
+                }
+                onClick={() => pressRow(move.action, move.action.says ? said : undefined)}
+              >
+                {busy === `${row.id}:${move.action.verb}` ? 'Working…' : move.action.label}
+              </Button>
+              {restButtons(restOf([move.action]))}
+            </div>
+          </div>
+        );
+      case 'none':
+        if (move.why === 'checking') return null;
+        return (
+          <p data-testid="turn-nothing" data-why={move.why} className="max-w-prose text-meta text-ink-muted">
+            {NONE_WORDS[move.why]}
+          </p>
+        );
+      default:
+        return null;
+    }
+  }
+
+  /** A permission item with no card lent: its row's grant is Approve, its deny Deny, and *I'll do it myself* beside them. */
+  function grantPresses(): {
+    onApprove?: (note: string | undefined) => void;
+    onDeny?: (note: string | undefined) => void;
+    approveLabel?: string;
+    denyLabel?: string;
+    children?: ReactNode;
+  } {
+    const grant = pressable.find((action) => action.verb === 'grant');
+    const deny = pressable.find((action) => action.verb === 'deny');
+    const convert = pressable.find((action) => action.verb === 'convert');
+    return {
+      ...(grant ? { onApprove: () => pressRow(grant), approveLabel: approveLabelOf(grant.label) } : {}),
+      ...(deny ? { onDeny: (note) => pressRow(deny, note), denyLabel: denyLabelOf(deny.label) } : {}),
+      ...(convert
+        ? {
+            children: (
+              <Button
+                data-verb="convert"
+                className="self-start"
+                disabled={busy === `${row.id}:convert`}
+                onClick={() => perform(row, convert)}
+              >
+                {convert.label}
+              </Button>
+            ),
+          }
+        : {}),
+    };
+  }
+
+  const flagged = rowActions.filter((action) => action.flag);
 
   return (
     <article
@@ -985,6 +1048,9 @@ export function ItemCard({
       data-item={item.item}
       data-kind={item.kind}
       data-state={state}
+      data-type={words.type}
+      data-person-status={status}
+      data-readiness={words.readiness}
       data-group={item.group}
       data-record={item.record}
       aria-current={focused ? 'true' : undefined}
@@ -994,39 +1060,15 @@ export function ItemCard({
         focused ? 'border-ink' : 'border-rule',
       )}
     >
-      <header className="flex min-w-0 flex-col gap-2">
-        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
-          <span data-testid="turn-state">
-            <OpsStatus vocab="step" word={state} />
-          </span>
-          {verdict && <OpsStatus vocab="verdict" word={verdict.state} />}
-          {risk && <OpsStatus vocab="risk" word={risk} />}
-          <KindMark kind={item.kind} />
-          {ledger && <WhereWord where={view.where} />}
-          {onInspect && (
-            <Button
-              variant="ghost"
-              size="sm"
-              data-testid="turn-inspect"
-              data-print="hide"
-              className="ms-auto"
-              onClick={onInspect}
-            >
-              Inspect
-            </Button>
-          )}
-        </div>
-        <h3 id={titleId} data-testid="turn-title" className="max-w-prose text-section font-semibold text-ink">
-          {title}
-        </h3>
-        <p data-testid="turn-why" className="max-w-prose text-body text-ink">
-          <span className="font-medium">Only you: </span>
-          {REASON_META[why]?.sentence ?? why}
-          {inferred && <span className="text-ink-muted"> (inferred from its kind)</span>}
-        </p>
-      </header>
+      <Head item={card} titleId={titleId} title={title} when={timing.startWhen} onInspect={onInspect}>
+        {risk && <OpsStatus vocab="risk" word={risk} />}
+      </Head>
 
-      <Facts item={item} record={record} live={live} />
+      <Meta item={item} record={record} />
+
+      <TimingGrid timing={timing} notYet={notYet} live={live} />
+
+      <WhyLine item={item} why={why} inferred={inferred} />
 
       {folded && (
         <Button
@@ -1043,7 +1085,7 @@ export function ItemCard({
             aria-hidden
             className={cn('transition-transform duration-fast ease-transit', open && 'rotate-180')}
           />
-          {open ? 'Fold it' : upcoming ? 'What it will ask' : 'What it asked, and how it ended'}
+          {open ? 'Fold it' : notYet ? 'What it will ask' : 'What it asked, and how it ended'}
         </Button>
       )}
 
@@ -1052,76 +1094,20 @@ export function ItemCard({
         data-print="open"
         className={cn('min-w-0 flex-col gap-4', open ? 'flex' : 'hidden')}
       >
-        {upcoming && <DueLine dueWhen={record?.dueWhen ?? view.dueWhen} />}
-        {item.record !== 'ledger' && !item.supervisor && (item.need || item.how) && (
-          <div className="flex max-w-prose flex-col gap-1 text-body text-ink">
-            {item.need && <p>{item.need}</p>}
-            {item.how && <p className="text-ink-muted">{item.how}</p>}
-          </div>
-        )}
         {item.request && (
           <p data-testid="turn-request" className="max-w-prose text-body text-ink">
             {item.request.ask}
           </p>
         )}
         {!ownCard && OwnerRequests && <OwnerRequests requests={item.requests} />}
-        {permission &&
-          (ownCard && PermissionCard ? (
-            <PermissionCard
-              item={item}
-              permission={permission}
-              row={row}
-              perform={perform}
-              busy={busy}
-              live={live && !upcoming && !checking}
-            />
-          ) : (
-            <PermissionFacts permission={permission} />
-          ))}
+
+        {/* The verdict, BEFORE the steps — it changes what they are for. */}
         {fresh && CheckOutcome && <CheckOutcome answer={fresh} record={record} />}
-        {verdict && verdict.state !== 'passed' && live && !echoed && <Verdict verdict={verdict} />}
-        {view.code && <DeviceCode code={view.code} />}
-        {view.act && view.path && (
-          <p className="max-w-prose text-body text-ink-muted" data-testid="step-protected">
-            The edit is to <code className="font-mono text-meta text-ink">{view.path}</code>: {view.act}
-          </p>
+        {verdict && verdict.state !== 'passed' && live && !checking && !echoed && (
+          <Verdict verdict={verdict} />
         )}
-        {guide ? (
-          <GuideView guide={guide} itemId={item.item} />
-        ) : (
-          <>
-            {view.lines.length > 0 && (
-              <ol
-                data-testid="turn-lines"
-                className="flex max-w-prose list-decimal flex-col gap-1 ps-5 text-body text-ink"
-              >
-                {view.lines.map((line, index) => (
-                  <li key={`${index}-${line}`}>{line}</li>
-                ))}
-              </ol>
-            )}
-            {view.openCommand && !permission && <CommandBlock code={view.openCommand} />}
-          </>
-        )}
-        {view.qr && live && (
-          <PhoneLink url={view.qr}>
-          </PhoneLink>
-        )}
-        {item.kind === 'secret-entry' && live && <SecretWhere where={record?.secretWhere} />}
-        {(ledger || proofType) && (
-          <CheckWords
-            proofType={proofType}
-            proof={record?.proof ?? item.step?.proof}
-            proofWords={record?.proofWords ?? item.step?.proofWords}
-            kind={item.kind}
-          />
-        )}
-        {checking && (
-          <p data-testid="turn-checking" className="max-w-prose text-body text-ink">
-            Being checked{attempts ? ` — attempt ${attempts}` : ''}. The verdict lands here; nothing to press
-            until it does.
-          </p>
-        )}
+        {checking && <CheckingLine attempts={attempts} ledger={ledger} />}
+        {item.settled && <SettledLine settled={item.settled} />}
         {verdict && verdict.state === 'passed' && !echoed && <Verdict verdict={verdict} />}
         {settled && record?.answer && !verdict && (
           <p className="max-w-prose text-body text-ink">
@@ -1130,86 +1116,76 @@ export function ItemCard({
           </p>
         )}
 
-        {says && live && !upcoming && !ownCard && (
-          <MicField
-            label={says.label}
-            placeholder={says.placeholder}
-            value={said}
-            onChange={setSaid}
-            disabled={Boolean(busy)}
+        <FromTheAI
+          tried={record?.tried}
+          note={record?.note ?? item.step?.note}
+          overruled={record?.overruled}
+        />
+
+        {permission && !ownCard && <PermissionFacts permission={permission} />}
+
+        {view.code && <DeviceCode code={view.code} />}
+        {view.act && view.path && (
+          <p className="max-w-prose text-body text-ink-muted" data-testid="step-protected">
+            The edit is to <code className="font-mono text-meta text-ink">{view.path}</code>: {view.act}
+          </p>
+        )}
+        <CoverLinks coveredBy={item.step?.coveredBy} covers={item.step?.covers} />
+        <Steps
+          item={item}
+          guide={guide}
+          lines={view.lines}
+          fallback={
+            view.openCommand && !permission ? (
+              <CodeBlock code={view.openCommand} testId="guide-command" />
+            ) : undefined
+          }
+        />
+        {!guide &&
+          !item.steps?.length &&
+          !view.lines.length &&
+          item.record !== 'ledger' &&
+          !item.supervisor &&
+          item.how && <p className="max-w-prose text-body text-ink-muted">{item.how}</p>}
+        {view.qr && live && (
+          <PhoneLink url={view.qr}>
+          </PhoneLink>
+        )}
+        {item.kind === 'secret-entry' && live && <SecretWhere where={record?.secretWhere} />}
+        {(ledger || proofType || item.check) && (
+          <HowChecked
+            check={item.check}
+            proofType={proofType}
+            proof={record?.proof ?? item.step?.proof}
+            proofWords={record?.proofWords ?? item.step?.proofWords}
+            kind={item.kind}
           />
         )}
+        <Routing route={item.route} checkedBy={item.checkedBy} />
+        {lastNote && (
+          <p data-testid="turn-check-note" className="max-w-prose text-body text-ink">
+            <span className="font-medium">Your note with attempt {lastNote.attempt}: </span>
+            {lastNote.text}
+          </p>
+        )}
 
-        {move.move === 'answer' && (
-          <DecisionCard
-            options={options}
-            busy={extra.busy === 'answer'}
-            onSend={(answer) => void extra.answer(answer)}
+        {/* ONE act form, by the move table — a permission's is the card the screen lends, an approval at a scope. */}
+        {ownCard && PermissionCard && permission ? (
+          <PermissionCard
+            item={item}
+            permission={permission}
+            row={row}
+            perform={perform}
+            busy={busy}
+            live={live && !notYet && !checking}
           />
+        ) : (
+          actForm()
         )}
+        {live && flagged.length > 0 && <FlaggedActions actions={flagged} />}
+        {held.held && <HeldLine held={held.held} onUndo={held.undo} onSendNow={held.sendNow} />}
 
 
-        {live && !upcoming && !ownCard && !item.supervisor && (
-          <div className="flex flex-wrap items-center gap-1.5" data-testid="turn-moves" data-print="hide">
-            {label && move.move !== 'answer' && (
-              <Button
-                variant="primary"
-                data-testid="turn-primary"
-                data-move={move.move}
-                {...(move.move === 'row' ? { 'data-verb': move.action.verb } : {})}
-                disabled={working || needsWords}
-                onClick={pressPrimary}
-              >
-                {working ? 'Working…' : label}
-              </Button>
-            )}
-            {otherOpener && !checking && (
-              <Button disabled={verbs.busy === 'open'} onClick={() => verbs.open()}>
-                Open again
-              </Button>
-            )}
-            {rest.map((action) => (
-              <Button
-                key={action.verb}
-                variant={action.verb === 'deny' ? 'danger' : 'default'}
-                data-verb={action.verb}
-                disabled={busy === `${row.id}:${action.verb}`}
-                onClick={() => perform(row, action, says ? said : undefined)}
-              >
-                {action.label}
-              </Button>
-            ))}
-            {ledger && !permission && (
-              <>
-                {allowDecline && !checking && (
-                  <Button
-                    variant="ghost"
-                    aria-expanded={form === 'decline'}
-                    onClick={() => setForm('decline')}
-                  >
-                    Not doing this
-                  </Button>
-                )}
-                {!checking && (
-                  <Button variant="ghost" aria-expanded={form === 'cannot'} onClick={() => setForm('cannot')}>
-                    I can’t
-                  </Button>
-                )}
-                {!checking && (
-                  <Button variant="ghost" disabled={verbs.busy === 'snooze'} onClick={verbs.snooze}>
-                    Snooze
-                  </Button>
-                )}
-                <Button variant="ghost" aria-expanded={form === 'ask'} onClick={() => setForm('ask')}>
-                  Ask
-                </Button>
-                <Button variant="ghost" aria-expanded={form === 'attach'} onClick={() => setForm('attach')}>
-                  Attach
-                </Button>
-              </>
-            )}
-          </div>
-        )}
 
         {moves && (
           <div
@@ -1221,90 +1197,14 @@ export function ItemCard({
           </div>
         )}
 
-        {form && (
-          <form
-            data-testid={`turn-form-${form}`}
-            data-print="hide"
-            className="flex max-w-prose flex-col gap-2"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void submit();
-            }}
-          >
-            <label htmlFor={`${formId}-words`} className="text-meta text-ink-muted">
-              {FORM_WORDS[form].label}
-            </label>
-            {form === 'attach' || form === 'ask' ? (
-              <Textarea
-                id={`${formId}-words`}
-                rows={2}
-                block
-                value={text}
-                placeholder={FORM_WORDS[form].placeholder}
-                onChange={(event) => setText(event.target.value)}
-              />
-            ) : (
-              <Input
-                id={`${formId}-words`}
-                block
-                value={text}
-                placeholder={FORM_WORDS[form].placeholder}
-                onChange={(event) => setText(event.target.value)}
-              />
-            )}
-            {form === 'attach' && (
-              <label className="flex flex-col gap-1 text-meta text-ink-muted">
-                A screenshot or a file — kept on this machine, by its hash
-                <Input
-                  type="file"
-                  className="h-auto py-1.5"
-                  onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-                />
-              </label>
-            )}
-            <div className="flex flex-wrap gap-1.5">
-              <Button
-                type="submit"
-                disabled={(form === 'attach' ? !text.trim() && !file : !text.trim()) || extra.busy !== null}
-              >
-                {FORM_WORDS[form].submit}
-              </Button>
-              <Button variant="ghost" type="button" onClick={() => setForm(null)}>
-                Not now
-              </Button>
-            </div>
-          </form>
-        )}
-
         {escalated && (
           <Escalation
             attempts={attempts}
             busy={extra.busy !== null}
             onRewrite={() => void extra.rewrite()}
-            onCannot={() => setForm('cannot')}
+            onCannot={verbs.cannot}
             onOverride={() => void extra.override()}
           />
-        )}
-
-        {(tried || note) && (
-          <div
-            data-testid="turn-ai-note"
-            className="flex max-w-prose flex-col gap-1 text-meta text-ink-muted"
-          >
-            {tried && (
-              <p>
-                <span className="font-medium text-ink">What the AI tried first. </span>
-                {tried}
-                {record?.overruled ? ' It asked anyway, past the guard.' : ''}
-              </p>
-            )}
-            {note && (
-              <p>
-                <span className="font-medium text-ink">Its last word. </span>
-                {note}
-              </p>
-            )}
-          </div>
         )}
 
         {!ledger && (
@@ -1316,7 +1216,7 @@ export function ItemCard({
           </a>
         )}
 
-        <History item={item} record={record} />
+        <History item={item} record={record} view={view} />
       </div>
 
       {view.openCommand && (

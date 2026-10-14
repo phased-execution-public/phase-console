@@ -12,12 +12,18 @@
  * - a permission leads with its Grant (or the broker card's Allow) — but a
  *   high or never one leads with the page itself: granting it there asks for
  *   the rule typed back and the owner key, which a row cannot;
- * - a decision leads with the page, where its options sit side by side — save
- *   a projected one with exactly one answer that asks for no words, pressed
- *   here (a gate's Approve asks for its evidence, so it is the page's);
+ * - a decision — and an approval that is no permission — leads with the page,
+ *   where its options or its approval block sit side by side: a decision with
+ *   options opens its card (turn-by-turn phase 10) — save a projected one with
+ *   exactly one answer that asks for no words, pressed here (a gate's Approve
+ *   asks for its evidence, so it is the page's);
  * - a step leads with the human-step card's primary — its kind's opener or its
  *   check, or a folded card's recommended verb, exactly as the server spelled it;
  * - anything else with its first pressable action, pressed verbatim.
+ *
+ * Since turn-by-turn phase 10 the row says the card's words first — NOW or NOT
+ * YET and the type's mark (`cards/turn/row-words.tsx`) — and its title is the
+ * composer's, the act, exactly as the card heads it.
  *
  * Reached through `lazy-item-row.tsx`, never imported directly: the step card's
  * glyphs, verbs and terminal sheet are no first paint's business.
@@ -30,6 +36,7 @@ import { turnHref } from '@/shell/routes';
 import { Button } from '@/ui';
 import { OpsStatus } from '@/ui/status';
 import { HumanStepPrimary, KindMark } from './human-step-card';
+import { TurnRowWords } from './turn/row-words';
 
 type Perform = (item: InboxItem, action: InboxAction, says?: string) => void;
 
@@ -43,7 +50,9 @@ export type RowPrimary =
 const PERMISSION_ORDER = Object.freeze(['grant', 'allow', 'convert', 'deny'] as const);
 
 /** The row's ONE primary, by rule — see the file's head. */
-export function rowPrimaryOf(row: Pick<InboxItem, 'turn' | 'humanStep' | 'actions'>): RowPrimary {
+export function rowPrimaryOf(
+  row: Pick<InboxItem, 'turn' | 'humanStep' | 'actions'> & Partial<Pick<InboxItem, 'options'>>,
+): RowPrimary {
   const group = row.turn?.group;
   if (group === 'upcoming') return { move: 'none', why: 'upcoming' };
   if (group === 'checking') return { move: 'none', why: 'checking' };
@@ -58,7 +67,9 @@ export function rowPrimaryOf(row: Pick<InboxItem, 'turn' | 'humanStep' | 'action
     }
     return { move: 'page' };
   }
-  if (group === 'decide') {
+  if (group === 'decide' || group === 'approve' || row.turn?.type === 'decide') {
+    // A decision with options opens its card: its options sit side by side there.
+    if ((row.options?.length ?? 0) > 1) return { move: 'page' };
     // One answer, and one that asks for no words: a box for evidence is the page's.
     const only = pressable.length === 1 && row.turn?.record !== 'ledger' ? pressable[0] : undefined;
     return only && !only.says ? { move: 'row', action: only } : { move: 'page' };
@@ -166,11 +177,14 @@ export default function ItemRow({
       data-item={itemIdOf(row)}
       data-kind={kind}
       data-record={row.turn?.record}
+      data-type={row.turn?.type}
       className={cn('flex min-w-0 flex-col gap-1.5', className)}
     >
+      <TurnRowWords turn={row.turn} />
       <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+        {/* The composer's title — the act, as the card heads it (turn-by-turn phase 3). */}
         <span data-testid="item-row-title" className="min-w-0 flex-1 basis-40 text-body font-medium text-ink">
-          {row.humanStep?.title ?? row.title}
+          {row.title || row.humanStep?.title}
         </span>
         {kind && <KindMark kind={kind} />}
         {risk && <OpsStatus vocab="risk" word={risk} />}

@@ -458,6 +458,11 @@ export const RUNGS_BY_SITUATION = Object.freeze({
   // a rung.
   'blocked-declared:human-acts': Object.freeze([]),
   'blocked-declared:gate': Object.freeze([]),
+  // A run request (turn-by-turn phase 6, #286): empty on purpose. No session
+  // can take a run-level act — it cannot press its own console — so nothing
+  // spends: the request is recorded once per run and act, the supervisor takes
+  // it (Pro) or ONE approval asks a person (Free), and the phase waits.
+  'blocked-declared:run': Object.freeze([]),
   'blocked-declared:external': Object.freeze([
     R(
       'poll-park',

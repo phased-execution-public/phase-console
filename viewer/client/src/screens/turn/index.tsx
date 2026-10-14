@@ -1,33 +1,37 @@
 /**
  * `#/turn` — Your turn (7.0, quiet-console phase 8; control-tower phase 137,
- * #214, §Architecture 19).
+ * #214, §Architecture 19; the board in 7.0's grammar since turn-by-turn phase 9).
  *
  * ```
- * Two things wait on you; one unblocks phase 4.      ← the heading IS the headline
- * Round 14, read at 12:00. It last changed at 11:50.  ← the lead
- * [search]  Filter (2)                 ⋯  Everything
- * Do now 2 ─────────────────── Grant every low-risk ask (1)
- *   ┌ the item card: its state, its title, why only you, the guide on the line, ONE move ┐
- * Needs one detail from you 1 ───────────────────────
- * Coming up 1 ───  Being checked 1 ───  Done 3 (folded) ───  Handled by the AI 4 (folded)
+ * Two need you now — the oldest (Sign gh in) has waited 3 h.   ← the heading IS the headline
+ * 3 to do   1 checking   2 passed today                       ← the strip
+ * Round 14, read at 12:00. It last changed at 11:50. Next deadline: Sign gh in, in 3 h.
+ * [search]  Filter (2)  Group  Sort  View        ⋯  Everything
+ * Approve 1 ─────────────────── Grant every low-risk ask (1)
+ *   ┌ the item card (cards/item-card): NOW · type · status · title … ONE move ┐
+ * Do now 2 ─── Decide 1 ─── Being checked 1 ─── Coming up 1 ─── Done 3 (folded)
+ * Handled by the AI 4 (folded) ─── Heads-up 1 ─── Where the plans stand 2
  * ```
  *
  * Every act only a person can do, on one page under one name: the headline
- * the console composed is the page's one sentence, the round is its clock, and
- * six sections follow in a fixed order, one card per item (`cards/item-card`,
- * lent the page's parts: the permission card, the owner's requests, the
- * check's outcome). The page decides nothing about an item — `GET /api/turn`
- * folded and grouped them — and owns only the reading: the filters and the
- * search, kept in the address so a narrowed view is a link; Inspect, which
- * shows an item's explain view in the panel; *Withdraw*; *Export* and *Print*;
- * where a push lands (`#/turn/<id>` opens that item and scrolls to it); and
- * the hold — an item pressed here leaves the list only on the server's `turn`
- * event (#270), never on the press.
+ * the console composed is the page's one sentence, the strip its numbers and
+ * its clock, and the groups v2 follow in a fixed order, one card per item
+ * (`cards/item-card`, lent the page's parts: the permission card, the owner's
+ * requests, the check's outcome). The page decides nothing about an item —
+ * `GET /api/turn` folded and grouped them — and owns only the reading: the
+ * filters (Status, Time, Plan, Type, Goes to), the search, Group, Sort and
+ * View, all kept in the address so a narrowed view is a link; Inspect, which
+ * shows an item's explain view in the panel; *Withdraw*; *Export* and
+ * *Print*; where a push lands (`#/turn/<id>` focuses that item, scrolls to it
+ * and opens the panel on it — a projected item too — where the panel stands
+ * beside the page, and below that hands it the record); and the hold — an item
+ * pressed here leaves the list only on the server's `turn` event (#270),
+ * never on the press.
  */
 
 import './turn.css';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { HUMAN_STEP_SETTLED_STATES } from '@shared/human-step-model.js';
 import { errorWords } from '@/cards/human-step-card';
@@ -35,13 +39,15 @@ import { useInboxActions } from '@/cards/inbox-row';
 import type { HumanStepRecord } from '@/data/human-steps';
 import { keys } from '@/data/keys';
 import { replayWords } from '@/data/press';
-import { useHumanSteps, useTurn, withdrawItem, type TurnAnswer, type TurnItem } from '@/data/turn';
+import { useHumanSteps, useTurn, withdrawItem, type TurnItem } from '@/data/turn';
+import { BP_WIDE } from '@/lib/media';
 import { scrollIntoScroller } from '@/lib/scroll';
 import { useNavigate } from '@/shell/router';
 import { repoHref, toHash, type Route } from '@/shell/routes';
-import { Button, Empty, Page, Skeleton, toast, useEverything } from '@/ui';
+import { Button, Empty, Page, SectionHeading, Skeleton, toast, useEverything } from '@/ui';
 import { ConfirmButton } from '@/ui/confirm';
 import { NativeSelect } from '@/ui/native-select';
+import { RadioGroup, RadioItem } from '@/ui/radio-group';
 import { Toolbar, type ToolbarVerb } from '@/ui/toolbar';
 import { downloadMarkdown, turnMarkdown } from './export';
 import { GrantEveryLowRisk, useSettling } from './grants';
@@ -49,8 +55,16 @@ import { TurnSections } from './groups';
 import { inspectItem } from './inspector';
 import {
   FACET_KEYS,
+  FILTER_KEYS,
   FILTER_LABEL,
+  GROUPINGS,
+  MORE_FACET_KEYS,
+  SORTS,
+  VIEWS,
   activeFacets,
+  arrangeValue,
+  arrangementOf,
+  byPlan,
   facetsOf,
   filtering,
   filtersHref,
@@ -59,10 +73,20 @@ import {
   itemOf,
   openSections,
   sectionsOf,
+  type ArrangeKey,
+  type Arrangement,
+  type FacetKey,
   type TurnFacet,
   type TurnSection,
 } from './page-model';
 import { TurnItemCard, turnParts } from './parts';
+import { PlansStrip } from './plans-strip';
+import { TurnStrip } from './strip';
+
+/** Does the panel stand beside the page — the column, at 1200 px and up? */
+function panelBeside(): boolean {
+  return typeof window.matchMedia === 'function' && window.matchMedia(`(min-width: ${BP_WIDE}px)`).matches;
+}
 
 /** The person's last look, for the handled count — kept in this browser. */
 const SEEN_KEY = 'turn:seen';
@@ -77,39 +101,14 @@ function readSeen(): string | null {
 
 const SETTLED: ReadonlySet<string> = new Set(HUMAN_STEP_SETTLED_STATES);
 
-function clockTime(iso: string | null | undefined): string {
-  if (!iso) return '';
-  const at = new Date(iso);
-  return Number.isFinite(at.getTime())
-    ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : iso;
-}
-
-/** The round, its time, and when it last changed the turn — the page's lead. */
-function RoundLine({ round }: { round: TurnAnswer['round'] }) {
-  return (
-    <span data-testid="turn-round">
-      {/* Round 0 is a console no round has changed the turn on yet: no number to give. */}
-      {round.n > 0 ? `Round ${round.n}, read` : 'Read'} at{' '}
-      <time dateTime={round.at}>{clockTime(round.at)}</time>.
-      {round.changedAt ? (
-        <>
-          {' '}
-          It last changed at <time dateTime={round.changedAt}>{clockTime(round.changedAt)}</time>.
-        </>
-      ) : null}
-    </span>
-  );
-}
-
-/** One of the five selects of the Filter slot. */
+/** One select of the Filter slot. */
 function FilterSelect({
   name,
   value,
   facets,
   onChange,
 }: {
-  name: (typeof FACET_KEYS)[number];
+  name: FacetKey;
   value: string | undefined;
   facets: TurnFacet[];
   onChange: (value: string) => void;
@@ -136,11 +135,39 @@ function FilterSelect({
   );
 }
 
+/** One of Group, Sort and View: its choices as radios, each with what it does. */
+function Choices<V extends string>({
+  name,
+  value,
+  options,
+  onChange,
+}: {
+  name: string;
+  value: V;
+  options: readonly { id: V; label: string; blurb: string }[];
+  onChange: (value: V) => void;
+}) {
+  return (
+    <RadioGroup aria-label={name} value={value} onValueChange={(next) => onChange(next as V)}>
+      {options.map((option) => (
+        <RadioItem
+          key={option.id}
+          id={`turn-${name.replace(/\W+/g, '-').toLowerCase()}-${option.id}`}
+          value={option.id}
+          label={option.label}
+          description={option.blurb}
+        />
+      ))}
+    </RadioGroup>
+  );
+}
+
 export default function TurnPage({ route }: { route: Route }) {
   const client = useQueryClient();
   const go = useNavigate();
   const focus = route.segments[1] ?? null;
   const filters = useMemo(() => filtersOf(route.query), [route.query]);
+  const arrange = useMemo(() => arrangementOf(route.query), [route.query]);
   const [seen] = useState(readSeen);
   const turn = useTurn(true, seen);
   const ledger = useHumanSteps();
@@ -153,8 +180,17 @@ export default function TurnPage({ route }: { route: Route }) {
     () => new Map((ledger.data?.steps ?? []).map((step) => [step.id, step] as const)),
     [ledger.data],
   );
-  const sections = useMemo(() => (answer ? sectionsOf(answer, filters) : []), [answer, filters]);
-  const facets = useMemo(() => facetsOf(answer), [answer]);
+  // The Time filter reads the answer's own clock: a filtered page does not move under a tick.
+  const readAt = answer ? Date.parse(answer.round.at) || Date.now() : Date.now();
+  const sections = useMemo(
+    () => (answer ? sectionsOf(answer, filters, readAt, arrange.sort) : []),
+    [answer, filters, readAt, arrange.sort],
+  );
+  const shownSections = useMemo(
+    () => (arrange.group === 'plan' ? byPlan(sections) : sections),
+    [sections, arrange.group],
+  );
+  const facets = useMemo(() => facetsOf(answer, readAt), [answer, readAt]);
   const earlier = useMemo(() => historyOf(ledger.data?.steps, answer), [ledger.data, answer]);
   const focused = itemOf(answer, focus ?? undefined);
   const [query, setQuery] = useState(filters.q ?? '');
@@ -170,13 +206,22 @@ export default function TurnPage({ route }: { route: Route }) {
     }
   }, [answer?.round.at]);
 
-  // A push opens one item: the page scrolls to it once (its section unfolds itself).
+  // A push opens one item: the page scrolls to it once (its section unfolds
+  // itself) and opens the panel on it — a ledger item or a projected one.
   const focusedId = focused?.item;
+  const focusedRef = useRef<{ item: TurnItem; record: HumanStepRecord | undefined } | null>(null);
+  focusedRef.current = focused
+    ? { item: focused, record: focused.record === 'ledger' ? records.get(focused.item) : undefined }
+    : null;
   useEffect(() => {
     if (!focusedId) return;
     const frame = window.requestAnimationFrame(() => {
       const el = document.getElementById(`turn-item-${focusedId}`);
       if (el) scrollIntoScroller(el, 'start');
+      // The panel opens where it stands BESIDE the page (the column, 1200 and
+      // up); below, it would be a sheet over the very card the push landed on,
+      // so it takes the record and waits for Inspect or ⌘I.
+      if (focusedRef.current) inspectItem(focusedRef.current, { open: panelBeside() });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [focusedId]);
@@ -248,6 +293,11 @@ export default function TurnPage({ route }: { route: Route }) {
   const narrowed = filtering(filters);
   const shown = sections.filter((s) => s.id !== 'handled').reduce((n, s) => n + s.count, 0);
   const total = sections.filter((s) => s.id !== 'handled').reduce((n, s) => n + s.total, 0);
+  const headsUp = answer.headsUp ?? [];
+  const arrangeTo = <K extends ArrangeKey>(key: K, value: Arrangement[K]) =>
+    go(filtersHref(route, { [key]: arrangeValue(key, value) }), { replace: true });
+  const label = <T extends { id: string; label: string }>(list: readonly T[], id: string) =>
+    list.find((one) => one.id === id)?.label ?? id;
 
   const verbs: ToolbarVerb[] = [
     {
@@ -264,7 +314,7 @@ export default function TurnPage({ route }: { route: Route }) {
   ];
 
   const clear = () =>
-    go(filtersHref(route, { plan: '', run: '', kind: '', why: '', risk: '', q: '' }), { replace: true });
+    go(filtersHref(route, Object.fromEntries(FILTER_KEYS.map((key) => [key, '']))), { replace: true });
 
   const renderItem = (item: TurnItem, folded: boolean) => {
     const record: HumanStepRecord | undefined = item.record === 'ledger' ? records.get(item.item) : undefined;
@@ -301,15 +351,28 @@ export default function TurnPage({ route }: { route: Route }) {
     );
   };
 
+  // A permission is an approval since the groups v2: its batch grant sits on *Approve*.
   const asideOf = (section: TurnSection) =>
-    section.id === 'now' ? (
-      <GrantEveryLowRisk items={[...answer.groups.now, ...answer.groups.decide]} onSettled={settle} />
+    section.id === 'approve' ? (
+      <GrantEveryLowRisk
+        items={[
+          ...(answer.groups.approve ?? []),
+          ...(answer.groups.now ?? []),
+          ...(answer.groups.decide ?? []),
+        ]}
+        onSettled={settle}
+      />
     ) : null;
+  const facetKeys: FacetKey[] = [
+    ...FACET_KEYS,
+    // The four 7.0 filters stay readable from any address; Everything offers them.
+    ...MORE_FACET_KEYS.filter((key) => everything.on || Boolean(filters[key])),
+  ];
 
   return (
     <Page
       title={<span data-testid="turn-headline">{answer.headline}</span>}
-      lead={<RoundLine round={answer.round} />}
+      lead={<TurnStrip answer={answer} />}
       data-turn-page=""
       data-testid="turn-page"
     >
@@ -331,7 +394,7 @@ export default function TurnPage({ route }: { route: Route }) {
               data-testid="turn-filters"
               className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2"
             >
-              {FACET_KEYS.map((name) => (
+              {facetKeys.map((name) => (
                 <FilterSelect
                   key={name}
                   name={name}
@@ -341,6 +404,40 @@ export default function TurnPage({ route }: { route: Route }) {
                 />
               ))}
             </div>
+          ),
+        }}
+        group={{
+          value: label(GROUPINGS, arrange.group),
+          active: arrange.group === 'asked' ? 0 : 1,
+          panel: (
+            <Choices
+              name="Group your turn"
+              value={arrange.group}
+              options={GROUPINGS}
+              onChange={(value) => arrangeTo('group', value)}
+            />
+          ),
+        }}
+        sort={{
+          value: label(SORTS, arrange.sort),
+          panel: (
+            <Choices
+              name="Order your turn"
+              value={arrange.sort}
+              options={SORTS}
+              onChange={(value) => arrangeTo('sort', value)}
+            />
+          ),
+        }}
+        view={{
+          value: label(VIEWS, arrange.view),
+          panel: (
+            <Choices
+              name="Draw your turn"
+              value={arrange.view}
+              options={VIEWS}
+              onChange={(value) => arrangeTo('view', value)}
+            />
           ),
         }}
         more={verbs}
@@ -382,16 +479,40 @@ export default function TurnPage({ route }: { route: Route }) {
       ) : null}
 
       <TurnSections
-        sections={sections}
+        sections={shownSections}
         filters={filters}
         everything={everything.on}
         earlier={earlier}
         handledSince={answer.counts.handled}
         settling={settling}
         focusedSection={focused?.group ?? null}
+        compact={arrange.view === 'compact'}
         asideOf={asideOf}
         renderItem={renderItem}
       />
+
+      {headsUp.length > 0 && (
+        <section
+          aria-labelledby="turn-section-heads-up"
+          data-testid="turn-heads-up"
+          className="flex min-w-0 flex-col gap-3 border-t border-rule py-5"
+        >
+          <SectionHeading id="turn-section-heads-up" count={headsUp.length}>
+            Heads-up
+          </SectionHeading>
+          <ul className="flex list-none flex-col gap-3 p-0">
+            {headsUp.map((item) => (
+              <li key={item.item} className="min-w-0">
+                {renderItem(item, !everything.on && arrange.view === 'compact')}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <div className="border-t border-rule" data-print="hide">
+        <PlansStrip answer={answer} waitingHref={(slug) => filtersHref(route, { plan: slug })} />
+      </div>
     </Page>
   );
 }

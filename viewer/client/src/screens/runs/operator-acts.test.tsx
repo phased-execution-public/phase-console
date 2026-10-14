@@ -132,9 +132,9 @@ describe('OA-C1 a due act leads with its command', () => {
     withClient(<HumanStepCard item={act('notified')} />);
     const card = screen.getByTestId('human-step-card');
     expect(within(card).getByTestId('step-primary').getAttribute('data-act')).toBe('terminal');
-    const command = within(card).getByTestId('step-command');
-    expect(command.textContent).toContain(COMMAND);
-    expect(within(command).getByRole('button', { name: /copy/i })).toBeTruthy();
+    const command = within(card).getByTestId('step-command-block');
+    expect(within(command).getByTestId('step-command').textContent).toContain(COMMAND);
+    expect(within(command).getByRole('button', { name: 'Copy command' })).toBeTruthy();
     expect(within(card).queryByTestId('step-due')).toBeNull();
   });
 });
@@ -238,7 +238,14 @@ describe('OA-C4 Your turn', () => {
   }
 
   function mount(states: ('upcoming' | 'notified')[]) {
-    const groups: TurnAnswer['groups'] = { now: [], decide: [], upcoming: [], checking: [], done: [] };
+    const groups: TurnAnswer['groups'] = {
+      approve: [],
+      now: [],
+      decide: [],
+      upcoming: [],
+      checking: [],
+      done: [],
+    };
     for (const state of states) groups[state === 'upcoming' ? 'upcoming' : 'now'].push(turnItem(state));
     const at = new Date(NOW).toISOString();
     read.mockResolvedValue({
@@ -247,6 +254,7 @@ describe('OA-C4 Your turn', () => {
       groups,
       handled: [],
       counts: {
+        approve: 0,
         now: groups.now.length,
         decide: 0,
         upcoming: groups.upcoming.length,

@@ -1,7 +1,7 @@
 # A person's turn — the session's reference
 
 Contents: When to ask a person · The declaration · The reasons · The guide · A template per kind ·
-The proof and the check · The guard · A permission block · The answer's road back · What you handled ·
+The proof and the check · The guard · A permission block · A run request · The answer's road back · What you handled ·
 The doors
 
 `SKILL.md` Mode 2 states the rule in one paragraph; this file is its detail. A person's turn is an act
@@ -40,7 +40,8 @@ bash "$PE_SCRIPTS/phase-outcome.sh" <slug> <N> needs-human --needs <key> --step 
   [--step-line "<step>"]… [--code <device code>] [--credential <id>] [--tried "<what you ran and how it failed>"]
 ```
 
-Then hand off `in-progress` and stop. `--act` is `--step operator-act`. The flags:
+Then hand off `in-progress` and stop. `--act` is `--step operator-act`. An act only the RUN can
+take is no step at all — §A run request. The flags:
 
 | Flag | What it says |
 |---|---|
@@ -118,6 +119,23 @@ line. At most 20 steps and 24 KB; `http` and `https` links only; every line pass
 and a refusal names the line, never the value. The page draws each command with *Copy* and *Copy for
 Claude Code* (which puts `!` in front) and never runs one.
 
+**A plan writes its guide the same way, for the console to read** (turn-by-turn phase 2). A plan's
+`- **Human step:**` bullet names the file with `guide: <path under the docs root>` (a plan's
+guides usually live under `docs/handoffs/<slug>/guides/`); the console reads it at the launch door and
+again on every read of Your turn, so an edit flows to the card. A path that is not a file fails the
+lint (F42 `guide-file-missing`, a gate); a file the grammar refuses — a secret-shaped line, a link that is not http(s), a symlink
+that leads out of the docs root, more than 24 KB — costs the item its guide, never the item. A plan
+that keeps its steps in an `## Operator errands` table instead ends the bullet's text with the row's
+id, `(E-4)`, and the console builds the guide from that row: each `` `! cmd` `` a command step, the
+prose around them steps in their own words, a `<placeholder>` command marked to fill in. A decision
+bullet says its choices itself: `options: box=The build box::it runs all night | cloud=The cloud
+runner · recommended: box`. And `deadline: 2026-10-20T17:00Z` says when it must be done by — an end,
+where `due:` is when it starts. Two advisories keep a plan honest about its guides, and neither
+gates: a task or decision bullet with no `guide:`, no `options:` and no bound table row (F41
+`human-step-no-guide` — the person would get a title and no steps), and a table row no bullet names
+(F43 `errand-row-unbound` — the console shows it as a Heads-up that nothing checks or waits on).
+`references/plan-format.md` has the grammar.
+
 **Write the guide in the language the plan names**: a `**Guide language:**` line in its §Session
 budget (`fa`, `en`, …), else English, and pass that tag as `--lang`. A right-to-left guide is drawn
 right to left with its commands, refs and numbers left to right; your `--title` and the console's own
@@ -179,7 +197,7 @@ Seven rules, run at the declaration's pre-check and again when the console takes
 | G4 | a declared `permission` or `reserved` reason whose every guide command this run's own policy allows; a declared `reach` with no `--tried` | 4 | run the commands it names; if one fails, declare again with `--tried` — accepted, and marked overruled by evidence |
 | G5 | a permission block that cites no wall this console recorded for your lane: "nothing refused this — run it" | 4 | run the command; if it is refused, the refusal is recorded and the same declaration raises an item |
 | G6 | a secret in any value, a guide line included | 2 | say where the person types or stores it, never the value |
-| G7 | nothing — the same item from another lane joins it as one more waiter | 0 | wait: every waiter is resumed when it is proven |
+| G7 | nothing — the same item from another lane joins it as one more waiter (never an `operator-act`: two phases' acts are two items, turn-by-turn phase 7) | 0 | wait: every waiter is resumed when it is proven |
 
 A command a RULE stops (the deny wall, or an ask with nobody to answer it) does not refuse the
 declaration: the item is re-shaped as a `permission` item naming the wall. A guide with no command is
@@ -208,6 +226,28 @@ for `call`, the one call. A forced or deleting push, the host commands (`sudo`, 
 sandbox or network wall and Claude Code's own classifier are the never list: no grant exists through
 any door, so do not declare blocked on one expecting a grant — say what remains instead.
 
+
+## A run request
+
+An act only the RUN can take — relaunch it isolated, move it to another account, raise its budget, stop
+it, hold it — is never a person's permission: a session cannot press its own console (`console-forge`),
+so a permission ask for one reaches nobody. Declare it, hand off `in-progress`, and stop:
+
+```
+bash "$PE_SCRIPTS/phase-outcome.sh" <slug> <N> blocked --needs run --run-act <act> --reason "<why the run must>"
+```
+
+`--run-act` is one of `RUN_ACTS` (`scripts/turn.env`; owner `viewer/shared/verb-model.js`): `isolate`
+(a checkout of its own at the next boundary), `switch-account` (the account with the most headroom, at
+the boundary), `raise-budget` (the phase's dollar budget — money, so always a person's), `stop`, `hold`.
+`--needs run` without it, `--run-act` anywhere else, or an act not on the list is exit 2. The runner
+journals `run.run-requested` once per declaration and the item is ONE approval per run and act, every
+phase that asked a waiter on it: *Approve* takes the act through the run verb of its name (a raise names
+its dollars in the note), *Deny* resumes every waiter told no. In Pro the supervisor's `run-requested`
+remedy presses `isolate` and `hold` itself (logged under *Handled by the AI*), suggests `switch-account`
+and leaves `raise-budget` and `stop` to the person. A plan that already asks with `--needs
+permission.policy` and no rule or command, on a shared checkout whose lane is not on `pe/<slug>`, is
+read as `--run-act isolate` — the compatibility rule — and G5 never refuses it.
 ## The answer's road back
 
 You are resumed once, in your own session, with the console's sentence — never the person's raw

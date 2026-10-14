@@ -305,6 +305,8 @@ const PERMISSION = Object.freeze({ status: /** @type {const} */ ('blocked'), nee
 const GATES = Object.freeze({ status: /** @type {const} */ ('needs-human'), needs: 'gates' });
 /** …a person's act. */
 const HUMAN = Object.freeze({ status: /** @type {const} */ ('needs-human'), needs: 'human-acts' });
+/** …an act only the run can take (turn-by-turn phase 6, #286). */
+const RUN = Object.freeze({ status: /** @type {const} */ ('blocked'), needs: 'run' });
 /** …a person's answer to its own question. */
 const AMBIGUITY = Object.freeze({ status: /** @type {const} */ ('blocked'), needs: 'ambiguity' });
 
@@ -345,6 +347,13 @@ export const AUTHORITY_ROUTES = Object.freeze([
     authority: 'profile-raise',
     declare: PERMISSION,
     summary: "change a run's settings — its permission profile, carve-out and auto-grant among them",
+  }),
+  press('answer-run-request', 'POST /api/run/:slug/run-request', {
+    authority: 'answer',
+    // The CLI form is fenced too: a session that asked must never approve its own request.
+    cli: ['run run-request'],
+    declare: RUN,
+    summary: "answer a phase's run request — take the act it asked the run for, or tell the phases no",
   }),
   press('answer-question', 'POST /api/run/:slug/answer', {
     authority: 'answer',

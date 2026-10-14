@@ -38,6 +38,8 @@ const read = (rel: string): string => readFileSync(join(SRC, rel), 'utf8');
 /** The family that may draw a person's ask — and the API layer, which draws nothing. */
 const FAMILY = (rel: string): boolean =>
   rel.startsWith('screens/turn/') ||
+  // The card's parts since turn-by-turn phase 8: its head, timing grid, steps, act forms and verdict.
+  rel.startsWith('cards/turn/') ||
   rel.startsWith('data/') ||
   [
     'cards/item-card.tsx',
@@ -179,6 +181,7 @@ test('TS-5 Not doing this is the person’s no; Withdraw is the owner’s, on Yo
   assert.match(fetchers, /humanStepWithdraw:[^\n]*\n[^\n]*at\(id, 'dismiss'\)/);
   assert.match(read('data/turn.ts'), /export function withdrawItem\(/);
   assert.match(read('screens/turn/index.tsx'), /\bwithdrawItem\(/);
-  assert.match(read('cards/item-card.tsx'), />\s*Not doing this\s*</);
+  // The person's no is the Task's act form since turn-by-turn phase 8 (`cards/turn/act.tsx`).
+  assert.match(read('cards/turn/act.tsx'), />\s*Not doing this\s*</);
 });
 

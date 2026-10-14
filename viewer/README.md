@@ -828,7 +828,66 @@ states. The guard (G1–G7) runs at the declaration's pre-check and again at ing
 proof, unless the answer is the result (exit 2); a declared `permission` or `reserved` item whose every
 command the run's own policy allows, a `reach` with no `--tried`, and a permission block citing no recorded
 wall are refused with exit 4 (`GUARD_REFUSAL_EXIT`); the same item declared by another lane is one item with
-another waiter, every waiter resumed when it is proven.
+another waiter, every waiter resumed when it is proven — except an operator's act, which is an act of its phase:
+two phases asking for one command are two items, each on its own clock (turn-by-turn phase 7). An item nobody
+needs any more closes itself: the round's stale pass (`server/turn/stale.ts`) closes the run-specific items of a
+run a later run superseded (`server/runner/supersede.ts`), resolved or finished, of a phase the board reads done,
+or whose errand is gone, each with its reason under *Handled by the AI*, and moves a world act — a sign-in, a
+secret, an operator's act — to the successor's lane; a plan item names the session item that covers it.
+
+**The card, and its one composer** (7.1). Every item on `GET /api/turn` carries the card contract of
+`shared/turn-model.js`, each word derived once: a `type` (`ITEM_TYPES`: `approve`, `do`, `decide`, `know` —
+*Approval*, *Task*, *Decision*, *Heads-up*; `typeOf`), the person's status (`PERSON_STATUSES`: *To do*,
+*Checking*, *Passed*, *Redo*, *Not doing*, *Closed*, plus *Waiting for the owner*; a total table over the
+eleven ledger states and the verdict, `personStatusOf`), a `readiness` (`now` or `not-yet`, with `startWhen`
+in words or `startAt`; `readinessOf`), a `route` (*Goes to*: `phase`, `run`, `gate` or `console`, `routeOf`;
+`ROUTE_META` says who resumes) and `checkedBy` (*Checked by*, a label map over the proof types). Every word a
+person reads — the title, which names the act; the meta, where a plan's own errand is "the plan's own errand
+E-4"; the steps; the check in words; the timing (`assignedAt`, `startAt`/`startWhen`, `deadline`, `openUntil`,
+`submittedAt`, `checkedAt`); the verdicts; the options and the approval block — is written by ONE composer,
+`server/turn/compose.ts`, and the inbox row, the bell, the Runs home and the push read the same words. The
+steps come from the first source that exists (`STEPS_FROM`): the authored guide (a session's `--guide`, a
+plan bullet's `guide:` file, read at read time under the docs root, 24 KB at most, through the grammar and
+the secret screen), the plan's `## Operator errands` row the item's E-ref binds (`server/parse/errands.ts`,
+read by header name; only an explicit `` `! cmd` `` is a command step), the situation's ask (the ladder's
+`ASKS` table, `runner/ladder.ts`, with its title, steps, check and options bound to verbs), else a minimal
+guide from the open link or command and the proof said by `shared/proof-words.js` — so no proof ref, route
+or "phase 0" reaches a person, and an item a 7.0 console raised gains the same words with nothing rewritten.
+A plan item is composed from the CURRENT plan, cached per plan revision and guide mtime
+(`server/turn/plan-items.ts`); an errands row no bullet names is a `headsUp` item, in no group and never
+counted. A projected item's assigned clock comes from `server/turn/first-seen.ts`
+(`turn-first-seen.json`).
+
+**Where a press goes** (7.1). An option or action is bound to `{method, endpoint, body}` and pressed through
+`client/src/data/press.ts`; a run verb's body carries `expectRunId`, and the route refuses it 409 with a
+sentence when the plan's run is another one (`staleBinding`, logged `turn.press-stale`), so a stale card never
+acts on a successor. `POST /api/human-steps/:id/undo` takes a running check back — the item returns to To do
+or Redo and that attempt's verdict is dropped — and a terminal press (Approve, Deny, Not doing this, Send my
+decision) waits on the page for the undo window before it is sent (`client/src/data/undo-window.ts`); settled
+ledger states stay terminal. *Hand it back* offers *Give back to Phase N* (`…/rewrite`), a question for the
+session (`…/ask`) and *I can't do this* (`…/cannot`). An item whose proof reads a gate's row opens only by that
+gate's Approve. A pressed projected item — an approval card, a gate, a plan approval, a relayed question, an
+ack-bound option — leaves a settled record (`server/turn/settled.ts`, `turn-settled.json`), so Done shows it
+Passed or Closed, with who pressed and when.
+
+**Run requests** (7.1). An act only the run can take — `RUN_ACTS` in `shared/verb-model.js`: `isolate`,
+`switch-account`, `raise-budget`, `stop`, `hold` — is declared `phase-outcome.sh … blocked --needs run
+--run-act <act>` (need class `run`, `blocked-declared:run`) and journalled `run.run-requested`. A `permission`
+declaration that names no rule or command, on a shared checkout whose lane is not on `pe/<slug>`, is read as
+`isolate` (`server/turn/run-requests.ts`). Its item is ONE approval per run and act, every declaring phase a
+waiter, answered on `POST /api/run/:slug/run-request` (an authority route): Approve takes the act through the
+run verb of its name and resumes the waiters, Deny resumes them told no, and both journal
+`run.run-request-decided`. `isolate` switches only a new-branch run in place; on a run that commits on its
+standing branch it answers 409 and the item stays with the person.
+
+**Items that close themselves** (7.1). One predicate, `server/runner/supersede.ts`, says when a stopped run is
+superseded by a later, unabandoned run of its plan that covers what it still owes; the identity park skips it,
+the read resolver marks it `resolved {supersededBy}` (journal `run.superseded`, reversible with `unresolve`),
+and the round's stale pass (`server/turn/stale.ts`) closes the run-specific items of a superseded, resolved or
+finished run, of a phase the board reads done, or whose errand is gone — each with a `console` row under
+*Handled by the AI* — and moves a world act (`KIND_OUTLIVES_RUN`) to the successor's lane. Two operator acts of
+different phases are never folded into one item, and a plan item names the session item that covers it
+(`coverLinks`), linked, never merged.
 
 **The moves.** Reading is ungated. Every verb is a `POST /api/human-steps/:id/<verb>` with the cross-site
 check, attributed to an actor: `open` (on the machine behind `--allow-terminal` or `--allow-agent`, an
@@ -933,12 +992,18 @@ risk, in full: a process running as you that deliberately rewrites the console's
 below the owner key, and can replace the key registry itself; the console walls the paths a session takes and
 makes every grant visible, and it is not a boundary against your own account.
 
-**The page, and the old cards.** Six sections in a fixed order (`TURN_GROUPS`: *Do now*, *Needs one detail from
-you*, *Coming up*, *Being checked*, *Done*, then *Handled by the AI*). Each item is one card — why only you, the
-plan, phase and run, what it unblocks with a countdown, the effort, its guide as stations on a line (each
-step's tick kept in the browser), every command copyable as it is and behind `!` for your own Claude Code
-session and never run by the page, how it will be checked, and ONE primary action chosen by its kind and state.
-Filters and the search live in the address; under **⋯**, **Export as Markdown** downloads the open
+**The page, and the old cards.** The strip (`TurnAnswer.strip`, `stripOf`: to do, checking, passed today, the
+next deadline) with the round as its live line, one toolbar row, then six groups in a fixed order
+(`TURN_GROUPS`: *Approve*, *Do now*, *Decide*, *Being checked*, *Coming up*, *Done*; `groupOf` places an item
+by its type and readiness, and `TURN_OPEN_GROUPS`, the first three, are what the headline and the situation
+line count), then the sections *Handled by the AI*, *Heads-up* and *Where the plans stand*. Each item is one card
+(`client/src/cards/turn/`, `viewer/docs/design.md` §Your turn): NOW or NOT YET, the type's mark, the status
+word, the title and meta, the timing grid on one page clock (`client/src/ui/clock.ts`), why once, the verdict
+before the guide, *From the AI*, its guide as stations on a line (each step's tick kept in the browser), every
+command in the one command block (`ui/code-block.tsx`), copyable as it is and behind `!` for your own Claude
+Code session and never run by the page, *How it's checked*, *Goes to* and *Checked by*, and ONE act form per
+type, its primary chosen by the move table `cardMoveOf` (`cards/turn/moves.ts`). The filters (Status, Time,
+Plan, Type, Goes to), the grouping, the order, the view and the search live in the address; under **⋯**, **Export as Markdown** downloads the open
 items as one document and **Print** prints it; **Inspect** puts an item in the panel; and a guide
 carries its language (a Persian one is drawn right to left, its commands left to right). `#/approve` and `#/approve?step=<id>` land on the page in one hop and a push opens `#/turn/<id>`. The
 approval queue, its question card, the gate card and the errand card each draw the same item — one row, the

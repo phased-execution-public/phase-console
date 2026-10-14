@@ -9,6 +9,10 @@
  *   2. `clock`    — an interrupted check goes back to waiting, an item nobody
  *                   needs any more is withdrawn, a window that closed expires,
  *                   a reminder that is due is sent;
+ *   2a. `stale`   — (turn-by-turn phase 7) an item whose run was superseded,
+ *                   resolved or finished, whose phase the board reads done, or
+ *                   whose cause is gone closes with its reason; a world act on a
+ *                   superseded run moves to the successor's lane (`turn/stale.ts`);
  *   3. `covered`  — an item the AI can now do is withdrawn and its waiters
  *                   resumed (a permission item a live grant covers), and a
  *                   supervisor's item whose subject settled goes with it;
@@ -41,6 +45,10 @@ export type RoundChange = {
   proven: string[];
   expired: string[];
   withdrawn: string[];
+  /** Closed by the stale pass — nobody needs them any more (turn-by-turn phase 7). */
+  closed: string[];
+  /** Moved to a successor run's lane by the stale pass. */
+  moved: string[];
   escalated: string[];
   reminded: string[];
   grantsEnded: number;
@@ -52,6 +60,7 @@ export type RoundCounts = { [K in keyof RoundChange]: number };
 export type RoundPasses = {
   grants: (now: number) => number;
   clock: (now: number) => { reminded: string[]; expired: string[]; dismissed: string[] };
+  stale: (now: number) => Promise<{ closed: string[]; moved: string[] }>;
   covered: (now: number) => string[];
   escalate: (now: number) => string[];
   due: (now: number) => Promise<{ due: string[]; proven: string[] }>;
@@ -71,17 +80,19 @@ export type RoundState = {
   last: RoundCounts | null;
 };
 
-const empty = (): RoundChange => ({ due: [], proven: [], expired: [], withdrawn: [], escalated: [], reminded: [], grantsEnded: 0 });
+const empty = (): RoundChange => ({ due: [], proven: [], expired: [], withdrawn: [], closed: [], moved: [], escalated: [], reminded: [], grantsEnded: 0 });
 
 /** Did a round move the turn? Reminders and grants ending do not. */
 export function roundChanged(change: RoundChange): boolean {
-  return change.due.length + change.proven.length + change.expired.length + change.withdrawn.length + change.escalated.length > 0;
+  return change.due.length + change.proven.length + change.expired.length + change.withdrawn.length
+    + change.closed.length + change.moved.length + change.escalated.length > 0;
 }
 
 export function countsOf(change: RoundChange): RoundCounts {
   return {
     due: change.due.length, proven: change.proven.length, expired: change.expired.length,
-    withdrawn: change.withdrawn.length, escalated: change.escalated.length, reminded: change.reminded.length,
+    withdrawn: change.withdrawn.length, closed: change.closed.length, moved: change.moved.length,
+    escalated: change.escalated.length, reminded: change.reminded.length,
     grantsEnded: change.grantsEnded,
   };
 }
@@ -179,6 +190,9 @@ export class TurnRound {
     change.reminded.push(...clock.reminded);
     change.expired.push(...clock.expired);
     change.withdrawn.push(...clock.dismissed);
+    const stale = await this.guardedAsync('stale', { closed: [] as string[], moved: [] as string[] }, () => this.passes.stale(now));
+    change.closed.push(...stale.closed);
+    change.moved.push(...stale.moved);
     change.withdrawn.push(...this.guarded('covered', [] as string[], () => this.passes.covered(now)));
     change.escalated.push(...this.guarded('escalate', [] as string[], () => this.passes.escalate(now)));
     const due = await this.guardedAsync('due', { due: [] as string[], proven: [] as string[] }, () => this.passes.due(now));

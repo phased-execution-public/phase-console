@@ -3058,6 +3058,25 @@ export const runsApi = {
       choice,
       ...(accountId ? { accountId } : {}),
     }),
+  /**
+   * A phase's run request answered (turn-by-turn phase 6, #286): the ONE
+   * approval per run and act — `approve` takes the act (a budget raise names
+   * its dollars in the note), `deny` tells every phase that asked no. The
+   * errand's options press the same route through `pressOption`.
+   */
+  runRequest: (
+    slug: string,
+    phase: number,
+    answer: 'approve' | 'deny',
+    note?: string,
+    expectRunId?: string,
+  ) =>
+    post<{ ok: true }>(`/api/run/${q(slug)}/run-request`, {
+      phase,
+      answer,
+      ...(note ? { note } : {}),
+      ...(expectRunId ? { expectRunId } : {}),
+    }),
   // `resumed` says which of the two it did (control-tower phase 77, #102):
   // took back a pause not yet reached, or started a settled pause again — or,
   // since control-tower phase 110 (#176), a parked, halted or interrupted run.

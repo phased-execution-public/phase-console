@@ -352,17 +352,25 @@ test('on a phone the push’s one tap lands on the item on Your turn: the action
   await expect(card).toHaveAttribute('aria-current', 'true');
   await expect(card.getByTestId('turn-title')).toHaveText('Pair the deploy CLI');
 
+  // The check is the one primary (turn-by-turn phase 8); the sign-in opener sits beside it.
   const primary = card.getByTestId('turn-primary');
-  await expect(primary).toHaveText('Open sign-in');
-  await primary.scrollIntoViewIfNeeded();
-  await still(page);
-  const wins = await primary.evaluate((el) => {
-    const r = el.getBoundingClientRect();
-    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-    return { hit: Boolean(hit && (hit === el || el.contains(hit))), height: r.height };
-  });
-  expect(wins.hit, 'the primary action wins its own centre').toBe(true);
-  expect(wins.height).toBeGreaterThanOrEqual(44);
+  await expect(primary).toHaveText("I've done this — check");
+  const opener = card.getByTestId('turn-open');
+  await expect(opener).toHaveText('Open sign-in');
+  for (const [name, target] of [
+    ['the primary action', primary],
+    ['the opener', opener],
+  ] as const) {
+    await target.scrollIntoViewIfNeeded();
+    await still(page);
+    const wins = await target.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return { hit: Boolean(hit && (hit === el || el.contains(hit))), height: r.height };
+    });
+    expect(wins.hit, `${name} wins its own centre`).toBe(true);
+    expect(wins.height).toBeGreaterThanOrEqual(44);
+  }
 
   const code = card.getByTestId('step-code');
   await expect(code).toHaveText('WDJB-MJHT');

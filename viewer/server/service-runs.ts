@@ -9,6 +9,7 @@
  * more. Read the chain in order; `service.ts` holds the concrete class.
  */
 import { parkOnStep, stepJournalFields, type HumanStep, type StepVerbResult } from './human-steps.ts';
+import { readGuideFile } from './turn/guide-file.ts';
 import { itemOfErrand } from './turn/fold.ts';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, relative } from 'node:path';
@@ -48,6 +49,7 @@ import {
   degradedState, hasShutdownWork, onDegraded, requestRestart, requestShutdown, stopPlan, supervisor,
 } from './lifecycle.ts';
 import { log } from './log.ts';
+import { supersededBy } from './runner/supersede.ts';
 import {
   CATEGORIES, Push, isPlanProgress, routeFor, sanitiseCategories, tagFor, type CategoryId,
 } from './push/index.ts';
@@ -89,7 +91,7 @@ import { wantsDefaultCheckout } from '../shared/worktree-model.js';
 import { phaseClocks } from '../shared/phase-clocks.js';
 import { wallReading, withWallWhy } from '../shared/situation-model.js';
 import { mergeDecisions, subKindOfNeed } from '../shared/decisions-model.js';
-import { PreludeRefusal, doorOpens, itemOf, preludeFor, resolvedManifest, scopedSteps, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
+import { PreludeRefusal, doorOpens, itemOf, planStepInput, preludeFor, resolvedManifest, scopedSteps, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
 import type { PreludeStep, SkillApiFacts } from './prelude.ts';
 import { openUrlOnHost, type HostOpen } from './host-open.ts';
 import { GitStrategyRefusal, type GitStrategyLine } from './prelude.ts';
@@ -150,6 +152,22 @@ export function pressRefusal(error: unknown, fallback: string): { ok: false; sta
     error: (error as Error)?.message || fallback,
     ...(error instanceof RecoveryBusyError && error.sessionId ? { sessionId: error.sessionId } : {}),
   };
+}
+
+/**
+ * Who saw an errand answered, when no person pressed (turn-by-turn phase 5,
+ * #268) — the subject of the resume's first sentence, named by the door the
+ * actor came through: the console's watch or clock, the supervisor, a session.
+ * It said "The operator (watch) has done …" to a session a watch resumed.
+ */
+function automaticWitness(actor: StartActor): string {
+  if (actor.door === 'watch-landed') return "The console's watch saw";
+  if (actor.door === 'wait-clock') return "The console's wait clock saw";
+  switch (pressDoorOf(actor)) {
+    case 'supervisor': return `The supervisor (${actor.by}) found`;
+    case 'session': return `A session (${actor.by}) reported`;
+    default: return `The console (${isAutomatic(actor) ? actor.door : actor.by}) found`;
+  }
 }
 
 /** `execFile` with stdout kept, for the unit reader — a 10 s timeout the runtime enforces. */
@@ -894,17 +912,7 @@ export abstract class ServiceRuns extends ServiceLive {
       if (itemOf(step, held, slug)) continue;
       const recorded = this.recordHumanStep({
         slug, phase: step.phase, birth: 'plan',
-        step: {
-          kind: step.kind, title: step.what, where: step.where,
-          ...(step.open && 'url' in step.open ? { open_url: step.open.url } : {}),
-          ...(step.open && 'command' in step.open ? { open_command: step.open.command } : {}),
-          ...(step.proof ? { proof: step.proof } : {}),
-          ...(step.windowMinutes !== undefined ? { windowMinutes: step.windowMinutes } : {}),
-          ...(step.autoOpen ? { auto_open: step.autoOpen } : {}),
-          ...(step.credential ? { credential: step.credential } : {}),
-          // Upcoming until its ref lands (control-tower phase 121).
-          ...(step.due ? { due_when: step.due } : {}),
-        },
+        step: planStepInput(step, this.doorGuide(slug, step)),
       });
       if (!recorded) continue;
       const [open] = doorOpens([step], gate);
@@ -913,6 +921,22 @@ export abstract class ServiceRuns extends ServiceLive {
       opening.push(this.openAtTheDoor(recorded, open.url, opts.by ?? 'launch'));
     }
     return Promise.all(opening);
+  }
+
+  /**
+   * A plan bullet's `guide:` FILE, read for the door's ask (turn-by-turn phase
+   * 2) through `readGuideFile` — under the docs root, no link escaping it, the
+   * size limit, the one grammar and its secret screen. A refusal is logged as a
+   * sentence and the item is raised without a guide: the read-time composition
+   * (`turn/plan-items.ts`) tries again from the current plan on every read.
+   */
+  private doorGuide(slug: string, step: PreludeStep): string | undefined {
+    const root = this.root?.path;
+    if (!step.guide || !root) return undefined;
+    const read = readGuideFile(root, step.guide);
+    if (read.ok) return read.text;
+    log.warn('human-steps.guide-refused', { slug, phase: step.phase, kind: step.kind, guide: step.guide, why: read.why });
+    return undefined;
   }
 
   /**
@@ -1589,7 +1613,20 @@ export abstract class ServiceRuns extends ServiceLive {
       } catch { /* keep the card */ }
     }
 
-    for (const state of resolveRunsAgainst(runs, boards, qaHeld)) {
+    // A stopped run a later run of its plan replaced (turn-by-turn phase 7)
+    // reads resolved "superseded by run <id>" — journalled on the old run, once.
+    const supersede = {
+      live: this.liveRunIds(),
+      superseded: (run: RunState, by: RunState) => {
+        try {
+          Journal.for(this.root!.path, run.slug, run.id).append('run.superseded', {
+            by: by.id, reason: run.resolved?.reason ?? null, halt: run.halt?.kind ?? null, status: run.status,
+            ...(by.onlyPhases?.length ? { onlyPhases: by.onlyPhases } : {}),
+          });
+        } catch { /* the annotation is worth more than its line */ }
+      },
+    };
+    for (const state of resolveRunsAgainst(runs, boards, qaHeld, supersede)) {
       // Same contract as `settle()`: the correction sticks, but a read must not
       // fail because the disk did.
       try { saveRun(state); } catch { /* the annotation is worth less than the read */ }
@@ -2101,6 +2138,8 @@ export abstract class ServiceRuns extends ServiceLive {
         ...(opts.instruction ? { instruction: opts.instruction } : {}), actor: opts.actor,
       });
       if (!out.ok) return { ok: false, status: 409, error: out.reason };
+      // A loop already parking never reaches that boundary (#273): see `pressResume`.
+      this.continueAfterPress(slug, state.id, phase, opts.actor, { reservedOnly: true });
       return this.pressVerdict(slug, runner.current() ?? state, {
         runId: state.id, phase, session: out.sessionId, brief: out.brief,
       });
@@ -2431,11 +2470,22 @@ export abstract class ServiceRuns extends ServiceLive {
     const actor = asActor(who, 'Service.releaseRun');
     const runner = this.liveRunner(slug);
     if (runner?.releaseHold(actor.by, actor.reason)) return runner.current();
+    let held = false;
     const state = this.editStoredRun(slug, (run) => {
-      if (run.hold) this.journalStoredEdit(run, 'run.released', {}, actor);
+      if (run.hold) { held = true; this.journalStoredEdit(run, 'run.released', {}, actor); }
       run.hold = null;
     });
     this.scheduler.poll();
+    // A held run whose loop parked while a person's board stood reserved —
+    // a run request's waiter, resumed while the hold admitted nothing — is
+    // resumed by the release, or that board is lost with the loop that held
+    // it (turn-by-turn phase 11, the tower rehearsal's run-request trip).
+    if (held && state && !runIsOver(state)
+      && Object.values(state.phases).some((record) => record.status !== 'done' && record.boardingHint?.by === PERSON_SLOT_BY)) {
+      void this.startRun(slug, { actor: pressActor(actor), resumeRunId: state.id }).catch(() => {
+        // The release stands either way; the run's own Resume is the person's next press.
+      });
+    }
     return state;
   }
 
@@ -3365,15 +3415,29 @@ export abstract class ServiceRuns extends ServiceLive {
     const account = state.accountId ?? DEFAULT_ACCOUNT_ID;
     if (!this.root?.ok || !bound || bound.account !== account || now.account !== account || bound.key === now.key) return false;
     if (state.halt?.kind === 'identity-changed') return false;
+    // Nobody is asked about a run that is over (turn-by-turn phase 7, §Context
+    // 1): one a person or the board resolved, or one a later run of its plan
+    // replaced — the stopped "relaunch isolated" run whose park once
+    // overwrote the operator's stop and sat on Your turn for a day.
+    if (state.resolved) return false;
+    let successor: RunState | null = null;
+    try { successor = supersededBy(state, listRuns(this.root.path, state.slug, this.liveRunIds()), { live: this.liveRunIds() }); } catch { successor = null; }
+    if (successor) {
+      log.info('turn.identity-park-skipped', { slug: state.slug, runId: state.id, supersededBy: successor.id });
+      return false;
+    }
     const words = identityChangeWords(state.slug, bound, now);
     const at = new Date().toISOString();
     const phase = state.halt?.phase ?? state.activePhase ?? undefined;
-    const errand: Errand = { ...errandFor('resource-wall:auth', [], phase ?? 0, at, null), need: words.need, how: words.how };
+    const errand: Errand = { ...errandFor('resource-wall:auth', [], phase ?? 0, at, null), need: words.need, how: words.how, identity: words.identity };
+    // An operator's stop stays the operator's (turn-by-turn phase 7): the park
+    // adds the identity question, and converge still reads a stop a person
+    // made — never one the system wrote over it. A resolution is never touched.
     const park = (stored: RunState) => {
+      const operatorStop = stored.stoppedBy === 'operator';
       setRunState(stored, 'halted');
-      stored.stoppedBy = 'system';
+      stored.stoppedBy = operatorStop ? 'operator' : 'system';
       stored.halt = { at, reason: words.halt, ...(phase != null ? { phase } : {}), kind: 'identity-changed' };
-      stored.resolved = null;
       stored.errand = errand;
       stored.finishedReason = words.halt;
     };
@@ -4025,6 +4089,13 @@ export abstract class ServiceRuns extends ServiceLive {
     if (mode === 'resume' && live && driving?.id === target.id && !runIsOver(driving)) {
       const out = live.boardAtBoundary(phase, { ...(opts.instruction ? { instruction: opts.instruction } : {}), actor: opts.actor });
       if (!out.ok) return { ok: false, status: 409, error: out.reason };
+      // The boundary may never come (turn-by-turn phase 5, #273): a press that
+      // lands while the loop is parking — its last pass already read nothing
+      // boardable, or it is past `run.parked` and draining — is reserved on a
+      // loop that will not go round again, and the reservation dies with it.
+      // When the loop ends with this press still unspent, the run is continued
+      // so the next loop boards it, as a resume on a stopped run would be.
+      this.continueAfterPress(slug, target.id, phase, opts.actor, { reservedOnly: true });
       return this.pressVerdict(slug, live.current() ?? target, { runId: target.id, phase, session: out.sessionId, brief: out.brief });
     }
     if (offer.resumable && offer.sessionId) {
@@ -4039,8 +4110,13 @@ export abstract class ServiceRuns extends ServiceLive {
         };
       }
       try {
+        // The person slot is a PERSON's (turn-by-turn phase 5, #268): the
+        // round's road back, the supervisor's verb and the chat's tools press
+        // here too, through doors of their own, and their resume is the
+        // console's act — never ledgered as a press nobody made.
         const run = await this.recoverPhase(slug, phase, mode, {
-          ...(opts.instruction ? { instruction: opts.instruction } : {}), by: opts.actor.by, person: true,
+          ...(opts.instruction ? { instruction: opts.instruction } : {}), by: opts.actor.by,
+          ...(isPersonsAct(opts.actor) ? { person: true } : {}),
         });
         this.continueAfterPress(slug, target.id, phase, opts.actor);
         return this.pressVerdict(slug, run ?? target,
@@ -4058,7 +4134,8 @@ export abstract class ServiceRuns extends ServiceLive {
    * the last words — and the operator's instruction, beside the reason the
    * phase's own session was not resumed. Through `startRun({reboard})`, the
    * one seam every re-board uses, so the run's loop boards it under normal
-   * admission; the rung sits in the person slot, reading no cap.
+   * admission; a person's rung sits in the person slot, reading no cap, and an
+   * automatic door's is counted like any rung (#268).
    */
   private async reboardForPerson(
     slug: string, target: RunState, phase: number, mode: 'resume' | 'closeout',
@@ -4097,13 +4174,25 @@ export abstract class ServiceRuns extends ServiceLive {
     const at = new Date().toISOString();
     const record = target.phases[String(phase)];
     const situation = personSituationOf(record);
+    // Only a person's press boards in the person slot, outside every rung cap
+    // (turn-by-turn phase 5, #268). An automatic door's resume — the round's
+    // landing, the supervisor, the chat — is the console's own rung: counted,
+    // signed `console`, and naming the door that pressed it.
+    const persons = isPersonsAct(opts.actor);
+    const slotBy = persons ? PERSON_SLOT_BY : 'console';
     this.editStoredRunById(slug, target.id, (state) => {
-      const rung = accountPersonRung((state.recoveries ??= {}), phase, {
-        situation, rung: 'reboard-resume-brief', at, note: `a person's ${mode === 'closeout' ? 'closeout' : 'resume'}, boarded fresh`,
-      });
+      const entry = {
+        situation, rung: 'reboard-resume-brief' as const, at,
+        note: `${persons ? "a person's" : `${opts.actor.door}'s`} ${mode === 'closeout' ? 'closeout' : 'resume'}, boarded fresh`,
+      };
+      const recoveries = (state.recoveries ??= {});
+      const rung = persons
+        ? accountPersonRung(recoveries, phase, entry)
+        : accountRung((recoveries[String(phase)] ??= { attempts: 0, lastAt: at }), entry);
       journalOf(state)('phase.rung', {
         situation, rung: rung.rung, params: null, brief: 'resume', vehicle: 'runner',
-        attempt: state.recoveries?.[String(phase)]?.attempts ?? 1, by: PERSON_SLOT_BY, slot: 'person', why,
+        attempt: state.recoveries?.[String(phase)]?.attempts ?? 1, by: slotBy,
+        ...(persons ? { slot: 'person' } : { door: opts.actor.door }), why,
       }, phase);
     });
     // The press's own actor, threaded: this door is whoever pressed (SLF-1).
@@ -4113,7 +4202,7 @@ export abstract class ServiceRuns extends ServiceLive {
         actor: actor,
         resumeRunId: target.id,
         reboard: [{
-          phase, situation, rung: 'reboard-resume-brief', brief: 'resume', by: PERSON_SLOT_BY,
+          phase, situation, rung: 'reboard-resume-brief', brief: 'resume', by: slotBy,
           ...(instruction ? { instruction } : {}),
         }],
         // What `retryPhase` carries forward, for the same two reasons.
@@ -4276,13 +4365,21 @@ export abstract class ServiceRuns extends ServiceLive {
       this.editStoredRunById(slug, target.id, (stored) => applyErrandAnswer(stored, phase, answer));
       journalOf(target)('phase.errand-answered', { by: answer.by, note: words, situation: answer.situation ?? null }, phase);
     }
+    const asks = need ? ` ("${need.replace(/\s+/g, ' ').slice(0, 400)}")` : '';
+    // Said by the door that pressed it (turn-by-turn phase 5, #268): only a
+    // person's press is "the operator has done"; the round's landing, the
+    // supervisor and the chat say what happened, and claim no person acted.
+    const persons = isPersonsAct(actor);
     const instruction = composed ?? [
-      `The operator (${actor.by}) has done what this phase asked a person for`
-        + `${need ? ` ("${need.replace(/\s+/g, ' ').slice(0, 400)}")` : ''} and answered it: `
-        + `${proven ? `I've done this — check, and the check proved it (${proven.read}). ` : 'Done — continue. '}`
+      (persons
+        ? `The operator (${actor.by}) has done what this phase asked a person for${asks} and answered it: `
+          + `${proven ? `I've done this — check, and the check proved it (${proven.read}). ` : 'Done — continue. '}`
+        : `${automaticWitness(actor)} what this phase asked a person for${asks} done`
+          + `${proven ? `: its proof landed (${proven.read})` : ''}. No operator pressed anything — this resume is the `
+          + "console's own. ")
         + 'Carry on from where the session stopped. Check what the errand was for before relying on it, and do not '
         + 'declare needs-human for the same thing again unless it is still not true.',
-      words ? `Their note: ${words}` : '',
+      words ? `${persons ? 'Their' : 'The'} note: ${words}` : '',
       proven?.asked ?? '',
     ].filter(Boolean).join('\n\n');
     return this.pressResume(slug, phase, 'resume', { instruction, actor });
@@ -4673,18 +4770,31 @@ export abstract class ServiceRuns extends ServiceLive {
    * tower rehearsal: the answered plan's next phase never boarded, and converge
    * leaves a run a person pressed). Nothing happens when something else already
    * drives the plan, when runs are off, or under `autoContinueRecovery: false`.
+   *
+   * `reservedOnly` is a boundary board's tail (turn-by-turn phase 5, #273): the
+   * press was reserved on a LIVE loop, so only that reservation left unspent
+   * when the loop ended continues the run — the loop's own ending is never
+   * second-guessed as a healed recovery.
    */
-  private continueAfterPress(slug: string, runId: string, phase: number, actor: StartActor): void {
+  private continueAfterPress(
+    slug: string, runId: string, phase: number, actor: StartActor, opts: { reservedOnly?: boolean } = {},
+  ): void {
     const runner = this.runners.get(slug);
     if (!runner) return;
-    void runner.wait().then(async () => {
+    // Armed inside the chain, so nothing in the tail can fail the press that
+    // armed it: a press now arms it on a LIVE loop too (#273), and whatever
+    // goes wrong waiting on that loop is the warning below, never a 500.
+    void Promise.resolve().then(() => runner.wait()).then(async () => {
       if (!this.flags.allowRun || this.liveRunner(slug) || this.fleetHoldFor(slug)) return;
       const state = runner.current();
       if (!state || state.id !== runId) return;
       const record = state.phases[String(phase)];
       const hint = record?.boardingHint;
+      // Boarding spends the hint, so a person-slot hint on a pending record is
+      // exactly a press nothing boarded.
       const fresh = Boolean(hint && hint.by === PERSON_SLOT_BY && record?.status === 'pending');
-      const healed = state.status === 'parked' && !state.halt && this.prefs.autoContinueRecovery !== false;
+      const healed = !opts.reservedOnly
+        && state.status === 'parked' && !state.halt && this.prefs.autoContinueRecovery !== false;
       if (!fresh && !healed) return;
       await this.startRun(slug, {
         // Spelled out, not shorthand: SLF-1 reads the door off `actor: <name>`.
@@ -6121,6 +6231,15 @@ export abstract class ServiceRuns extends ServiceLive {
           ...needsOf(declared),
           at: new Date().toISOString(),
         };
+        // A run request a hand session named (turn-by-turn phase 6): the same
+        // one line a lane's writes (`RunnerBase.noteRunRequest`). The
+        // compatibility rule reads a LANE's facts, so it is the runner's alone.
+        if (rec.declared.status === 'blocked' && rec.declared.runAct) {
+          journal.append('run.run-requested', {
+            act: rec.declared.runAct, compat: false, askedAs: null, reason: rec.declared.reason ?? null,
+            sessionId: declared.session_id ?? null,
+          }, phase);
+        }
         if (declared.watch.length) rec.watch = declared.watch;
         clearWatchBookkeeping(rec);
         // A HUMAN STEP with no runner live (control-tower phase 41): the same

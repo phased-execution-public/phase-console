@@ -253,7 +253,8 @@ describe('PC-2 a low or a medium grant is one press, through the owner door', ()
     post.mockResolvedValue(granted('call'));
     card(item());
     const primary = screen.getByTestId('turn-primary');
-    expect(primary.textContent).toMatch(/^Grant/);
+    // The permission card is an approval (turn-by-turn phase 8): Approve at the chosen scope.
+    expect(primary.textContent).toMatch(/^Approve, this call/);
     expect((primary as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(primary);
     await waitFor(() => expect(post).toHaveBeenCalledTimes(1));

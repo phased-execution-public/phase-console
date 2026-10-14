@@ -7,7 +7,7 @@
 #
 # Usage: phase-outcome.sh <slug> <phase> <status> [--reason TEXT] [--watch REF]...
 #                         [--wait-minutes N | --until ISO8601]
-#                         [--needs KEY] [--rule TEXT] [--command TEXT]
+#                         [--needs KEY] [--rule TEXT] [--command TEXT] [--run-act ACT]
 #        phase-outcome.sh <slug> <phase> ruling --what TEXT [--why TEXT]
 #                         [--kind ambiguity|deviation|deferral] [--cost-if-wrong TEXT]
 #                         [--needs KEY] [--remember plan|global]
@@ -39,6 +39,14 @@
 #             the manifest lacks", a defect report, not 39 % of asks.
 #   --rule / --command  optional structured fields for a permission block —
 #             the rule that refused and the command it refused — beside --needs.
+#   --run-act ACT  blocked --needs run ONLY (turn-by-turn phase 6, #286): an act
+#             only the RUN can take — relaunch isolated, switch account, raise
+#             the budget, stop, hold (scripts/turn.env RUN_ACTS: isolate
+#             switch-account raise-budget stop hold). A session cannot press its
+#             own console, so this is never a permission ask: the supervisor
+#             takes it (Pro) or ONE approval asks a person (Free). `--needs run`
+#             without it, or it with anything but `blocked --needs run`, or an
+#             act not on the list, is exit 2. (`--act` stays `--step operator-act`.)
 #   --step KIND  needs-human ONLY (control-tower phase 41): the ask is a HUMAN
 #             STEP — a typed act only a person can do — rather than a free-text
 #             errand. KIND is one of scripts/human-steps.env HUMAN_STEP_KINDS;
@@ -168,7 +176,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # The decision manifest's vocabulary — the OWNER is viewer/shared/decisions-model.js,
 # decisions.env its bash twin (held equal by viewer/test/decisions-model.test.ts).
 DECISION_KEYS="permission.policy permission.destructive issues credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce plan-approval"
-NEED_CLASSES="lock permission credential gate external"
+NEED_CLASSES="lock permission credential gate external run"
+RUN_ACTS="isolate switch-account raise-budget stop hold"
 # Why a --watch naming the declaring phase's OWN lock is refused (#42): the
 # console claims that lock for the session and releases it at its closeout, so
 # the watch fired on the phase's own teardown and resumed a session for work
@@ -203,9 +212,10 @@ GUARD_REFUSAL_EXIT=4
 usage() {
   echo 'usage: phase-outcome.sh <slug> <phase> <complete|waiting-external|blocked|needs-human|partial|no-defect>' >&2
   echo '                        [--reason TEXT] [--watch REF]... [--wait-minutes N | --until ISO8601]' >&2
-  echo '                        [--needs KEY] [--rule TEXT] [--command TEXT]' >&2
+  echo '                        [--needs KEY] [--rule TEXT] [--command TEXT] [--run-act ACT]' >&2
   echo '   --wait-minutes/--until: waiting-external | blocked | needs-human' >&2
   echo '   --needs KEY: REQUIRED on blocked | needs-human — a decision key from scripts/decisions.env' >&2
+  echo "   --run-act ACT: blocked --needs run only — an act only the run can take ($RUN_ACTS)" >&2
   echo '   --step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any] [--proof REF]' >&2
   echo '        [--step-line TEXT]... [--code CODE] [--credential ID] [--due-when REF]: needs-human only — a human step' >&2
   echo '   --act: --step operator-act — the operator'"'"'s own act (a command or a click path), due when --due-when lands' >&2
@@ -496,7 +506,7 @@ _names_own_phase() {  # _names_own_phase <ref>
 WATCH_REF_MAX=1000
 
 reason=""; wait_minutes=""; until_iso=""
-needs=""; rule=""; command_text=""
+needs=""; rule=""; command_text=""; run_act=""
 watch_count=0; watch_json=""
 what=""; why=""; kind=""; cost=""; remember=""; by_word=""; for_whom=""
 exit_code=""; in_dir=""
@@ -523,6 +533,7 @@ while [ $# -gt 0 ]; do
     --needs)        needs="${2:?--needs needs a decision key}"; shift 2 ;;
     --rule)         rule="${2:?--rule needs text}"; shift 2 ;;
     --command)      command_text="${2:?--command needs text}"; shift 2 ;;
+    --run-act)      run_act="${2:?--run-act needs an act}"; shift 2 ;;
     --what)         what="${2:?--what needs text}"; shift 2 ;;
     --note)         note_text="${2:?--note needs text}"; shift 2 ;;
     --link)
@@ -659,7 +670,7 @@ fi
 # belongs to another one is an error rather than a silent no-op.
 if [ "$mode" = progress ]; then
   if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
-     || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$needs" ] || [ -n "$what$why$kind$cost$for_whom$remember$by_word" ] \
+     || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$needs" ] || [ -n "$run_act" ] || [ -n "$what$why$kind$cost$for_whom$remember$by_word" ] \
      || [ -n "$exit_code$in_dir" ]; then
     echo 'progress takes --label, --done and --of only' >&2; exit 2
   fi
@@ -688,7 +699,7 @@ _handled_screen() {  # _handled_screen <flag> <value> — a secret-shaped value 
 }
 if [ "$mode" = handled ]; then
   if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
-     || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$needs" ] || [ -n "$why$kind$cost$for_whom$remember$by_word" ] \
+     || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$needs" ] || [ -n "$run_act" ] || [ -n "$why$kind$cost$for_whom$remember$by_word" ] \
      || [ -n "$exit_code$in_dir" ]; then
     echo 'handled takes --what, --note and --link only' >&2; exit 2
   fi
@@ -708,8 +719,8 @@ elif [ -n "$note_text$handled_links" ]; then
 fi
 if [ "$mode" = ruling ]; then
   if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
-     || [ -n "$rule" ] || [ -n "$command_text" ]; then
-    echo '--reason/--watch/--wait-minutes/--until/--rule/--command belong to an outcome status, not to a ruling' >&2; exit 2
+     || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$run_act" ]; then
+    echo '--reason/--watch/--wait-minutes/--until/--rule/--command/--run-act belong to an outcome status, not to a ruling' >&2; exit 2
   fi
   [ -n "$what" ] || { echo '--what is required for a ruling (say what you decided)' >&2; exit 2; }
   # Absent means the weakest of the three: a session that simply chose between
@@ -760,8 +771,8 @@ fi
 # is refused on it (the ruling flags already were, just above).
 if [ "$mode" = proof ]; then
   if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
-     || [ -n "$rule" ] || [ -n "$needs" ]; then
-    echo '--reason/--watch/--wait-minutes/--until/--rule/--needs belong to an outcome status, not to verified' >&2; exit 2
+     || [ -n "$rule" ] || [ -n "$needs" ] || [ -n "$run_act" ]; then
+    echo '--reason/--watch/--wait-minutes/--until/--rule/--needs/--run-act belong to an outcome status, not to verified' >&2; exit 2
   fi
   [ -n "$command_text" ] || { echo '--command is required for verified: the command as your §Verification writes it' >&2; exit 2; }
   case "$exit_code" in
@@ -788,10 +799,25 @@ case "$status" in
       *" $needs "*) : ;;
       *) echo "unknown --needs word: $needs (want one of: $DECISION_KEYS — or: $NEED_CLASSES)" >&2; exit 2 ;;
     esac
+    # A run request (turn-by-turn phase 6, #286): an act only the RUN can take.
+    # It names its act, it is `blocked` (the phase waits on the run, never on a
+    # person's hands), and it is never a permission ask in disguise.
+    if [ "$needs" = run ] || [ -n "$run_act" ]; then
+      [ "$needs" = run ] || { echo "--run-act belongs to blocked --needs run: an act only the run can take is a run request, never --needs $needs" >&2; exit 2; }
+      [ "$status" = blocked ] || { echo "--needs run is a run request: declare it blocked --needs run --run-act <act>, not $status" >&2; exit 2; }
+      [ -n "$run_act" ] || { echo "--needs run needs --run-act <act>: one of $RUN_ACTS" >&2; exit 2; }
+      case " $RUN_ACTS " in
+        *" $run_act "*) : ;;
+        *) echo "unknown --run-act: $run_act (want one of: $RUN_ACTS)" >&2; exit 2 ;;
+      esac
+      if [ -n "$step_kind" ] || [ -n "$step_flags" ] || [ -n "$rule" ] || [ -n "$command_text" ]; then
+        echo "--run-act takes no --step/--act/--rule/--command: the run takes the act, so there is nothing for a person to run or a rule to name" >&2; exit 2
+      fi
+    fi
     ;;
   *)
-    if [ "$mode" = outcome ] && { [ -n "$needs" ] || [ -n "$rule" ] || [ -n "$command_text" ]; }; then
-      echo "--needs/--rule/--command only make sense with blocked or needs-human, not $status" >&2; exit 2
+    if [ "$mode" = outcome ] && { [ -n "$needs" ] || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$run_act" ]; }; then
+      echo "--needs/--rule/--command/--run-act only make sense with blocked or needs-human, not $status" >&2; exit 2
     fi
     ;;
 esac
@@ -1384,6 +1410,7 @@ reason_line="$( [ -n "$reason" ] && printf '\n  "reason": "%s",' "$(_json_str "$
 needs_line="$( [ -n "$needs" ] && printf '\n  "needs": "%s",' "$(_json_str "$needs")" || true )"
 rule_line="$( [ -n "$rule" ] && printf '\n  "rule": "%s",' "$(_json_str "$rule")" || true )"
 command_line="$( [ -n "$command_text" ] && printf '\n  "command": "%s",' "$(_json_str "$command_text")" || true )"
+run_act_line="$( [ -n "$run_act" ] && printf '\n  "run_act": "%s",' "$run_act" || true )"
 step_line=""
 if [ -n "$step_kind" ]; then
   step_line="
@@ -1426,7 +1453,7 @@ json="{
   \"version\": 1,
   \"slug\": \"$(_json_str "$slug")\",
   \"phase\": $phase,
-  \"status\": \"$status\",${reason_line}${needs_line}${rule_line}${command_line}${step_line}${resume_line}${session_line}${trace_line}${span_line}
+  \"status\": \"$status\",${reason_line}${needs_line}${rule_line}${command_line}${run_act_line}${step_line}${resume_line}${session_line}${trace_line}${span_line}
   \"watch\": [$watch_json],
   \"written_at\": \"$(_json_str "$now")\"
 }"

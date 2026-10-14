@@ -1905,10 +1905,13 @@ test('an errand on a LIVE run carries the recheck action', () => {
   const [errand] = buildInbox(live, NOW).items.filter((i) => i.kind === 'errand');
   assert.ok(errand, 'a live run still raises its phase errand');
   const verbs = errand.actions.map((a) => a.verb);
-  assert.deepEqual(verbs, ['recheck'], 'recheck alone — recover 409s and dismiss would resolve a live run');
-  const [action] = errand.actions;
+  // Its ASK's ways on (turn-by-turn phase 4): the verdict roads, then look
+  // again — never recover (it 409s) nor dismiss (it would resolve a live run).
+  assert.deepEqual(verbs, ['qa-rerun', 'qa-waive', 'recheck'], 'the QA roads and recheck — recover 409s and dismiss would resolve a live run');
+  const action = errand.actions.find((a) => a.verb === 'recheck')!;
   assert.equal(action.endpoint, '/api/run/lr/recheck');
-  assert.deepEqual(action.body, { phase: 5 }, 'recheck is a PHASE verb and needs one');
+  // …bound to the run it was raised for (turn-by-turn phase 5): a stale card never presses a successor.
+  assert.deepEqual(action.body, { phase: 5, expectRunId: 'r' }, 'recheck is a PHASE verb and needs one');
 });
 
 test('editing the plan file un-acks nothing', () => {
@@ -2089,7 +2092,7 @@ test('a relayed question is one urgent row per unanswered question, one action p
   assert.deepEqual(colour.actions.map((action) => action.label), ['Red', 'Blue (Recommended)']);
   assert.deepEqual(colour.actions[1], {
     verb: 'answer-2', label: 'Blue (Recommended)', endpoint: '/api/run/demo/answer', method: 'POST',
-    body: { approvalId: 'q1', key: 'colour:which-colour', label: 'Blue (Recommended)' },
+    body: { approvalId: 'q1', key: 'colour:which-colour', label: 'Blue (Recommended)', expectRunId: 'run-9' },
   });
   assert.equal(colour.id, inboxItemId({ kind: 'question', slug: 'demo', phase: 3, runId: 'run-9', subject: 'q1:colour:which-colour' }));
   // Gated like the permission card beside it.
@@ -2380,7 +2383,7 @@ test('an ask addressed to the operator is a needs-you row with Answer (a reply, 
   ]);
   // The message routes are Pro's, so the free tree's copy does not spell them (#282).
   // The reply goes back to the sender, and the words are the person's own.
-  assert.deepEqual(row.actions[0].body, { to: 'phase:demo/4', phase: 4 });
+  assert.deepEqual(row.actions[0].body, { to: 'phase:demo/4', phase: 4, expectRunId: 'r1' });
   assert.deepEqual(row.actions[0].says, { field: 'text', label: 'Your answer', placeholder: 'What the session should know' });
   assert.equal(row.actions[0].flag, undefined, 'the run flag is on, so Answer is pressable');
   assert.equal(row.actions[1].says, undefined, 'an ack carries no words');
@@ -2543,4 +2546,159 @@ test('phase 132: every row that asks a person for an act carries a turn view; th
     { item: step.turn?.item, record: step.turn?.record, source: step.turn?.source, kind: step.turn?.kind, why: step.turn?.why, proofType: step.turn?.proofType },
     { item: 'step-i1', record: 'ledger', source: 'session', kind: 'device-code', why: 'identity', proofType: 'probe' },
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * turn-by-turn phase 4 — what each source says: the identity park's two
+ * options, the approval blocks, the options with at most one recommended
+ * ------------------------------------------------------------------ */
+
+const { turnView } = await import('../server/turn/index.ts');
+
+/** A run parked on an identity change, its errand naming both logins. */
+function identityFacts(): InboxFacts {
+  return {
+    runs: [{
+      id: 'run-id', slug: 'ledger', status: 'halted', stoppedBy: 'system',
+      halt: { at: '2026-08-22T09:00:00.000Z', reason: 'the machine login changed identity', kind: 'identity-changed' },
+      errand: {
+        phase: 0, situation: 'resource-wall:auth', tried: [], at: '2026-08-22T09:00:00.000Z',
+        need: "A person's choice: the machine login now answers new@example.com, not admin@example.com.",
+        how: 'Choose "Continue on new@example.com", or "Move the run to admin@example.com\'s profile".',
+        identity: { was: 'admin@example.com', now: 'new@example.com' },
+      },
+    }],
+    flags: { allowRun: true },
+    acks: {},
+  };
+}
+
+test('TB4-1: the identity park offers exactly two options bound to the run\'s identity verb, naming both logins — no sign-in, re-check or dismiss', () => {
+  const view = buildInbox(identityFacts(), NOW);
+  const row = view.items.find((item) => item.kind === 'errand')!;
+  assert.ok(row, 'the park raises its errand');
+  assert.deepEqual(row.options?.map((o) => o.id), ['continue', 'move']);
+  for (const option of row.options!) {
+    assert.equal(option.verb.method, 'POST');
+    assert.equal(option.verb.endpoint, '/api/run/ledger/identity');
+  }
+  // Each names the run it answers (turn-by-turn phase 5).
+  assert.deepEqual(row.options!.map((o) => o.verb.body), [{ choice: 'continue', expectRunId: 'run-id' }, { choice: 'move', expectRunId: 'run-id' }]);
+  assert.match(row.options![0]!.label, /new@example\.com/, 'continue names the new login');
+  assert.match(row.options![1]!.label, /admin@example\.com/, 'move names the login the run started on');
+  assert.ok(!row.options!.some((o) => o.recommended), 'whose login pays is the person\'s call');
+  assert.deepEqual(row.actions.map((a) => a.verb), ['continue', 'move'], 'its buttons are its two options and nothing else');
+  assert.ok(!row.actions.some((a) => /login|refresh|resolve/.test(a.endpoint)), 'no sign-in, re-check or dismiss');
+  // The item says the prerequisite of the move in its steps, and no route.
+  const turn = turnView(view, { now: NOW });
+  const item = Object.values(turn.groups).flat().find((i) => i.rows.includes(row.id))!;
+  assert.equal(item.options.length, 2);
+  assert.ok(item.steps.some((s) => /register and sign in that profile under Settings ▸ Accounts/.test(s.text)), JSON.stringify(item.steps));
+  assert.ok(!/POST \/api/.test(`${item.need} ${item.how} ${item.steps.map((s) => s.text).join(' ')}`));
+  assert.equal(item.type, 'decide');
+});
+
+test('TB4-1: an auth wall that is NOT an identity change keeps its sign-in and re-check', () => {
+  const f = identityFacts();
+  f.runs![0]!.halt = { at: '2026-08-22T09:00:00.000Z', reason: 'signed out', kind: 'run-preflight' };
+  const row = buildInbox(f, NOW).items.find((item) => item.kind === 'errand')!;
+  assert.deepEqual(row.actions.map((a) => a.verb), ['login', 'recheck', 'dismiss']);
+  assert.equal(row.options?.find((o) => o.id === 'login')?.recommended, true);
+});
+
+/** Every part of an approval block, non-empty. */
+function assertBlock(block: InboxItem['approval'], where: string): void {
+  assert.ok(block, `${where} carries an approval block`);
+  for (const key of ['what', 'askedBy', 'ifApproved', 'ifDenied'] as const) {
+    assert.ok(block![key]?.trim(), `${where}: its ${key}`);
+    assert.ok(!/POST \/api|\bcmd:/.test(block![key]), `${where}: ${key} names no route or ref`);
+  }
+}
+
+test('TB4-3: the gate, the plan to approve, the permission card, the supervisor\'s suggestion and the owner\'s request carry an approval block', () => {
+  const base = facts();
+  const view = buildInbox({
+    ...base,
+    runs: [...(base.runs ?? []), {
+      id: 'run-plan', slug: 'demo', status: 'running',
+      phases: { '3': { phase: 3, status: 'waiting', planApproval: { state: 'pending', sha: 'abc' } } },
+      recoveries: { '3': { errand: { phase: 3, situation: 'blocked-declared:gate', tried: [], need: 'a plan to approve', how: 'approve it', at: '2026-08-22T09:00:00.000Z' } } },
+    }],
+  } as InboxFacts, NOW);
+  const gate = view.items.find((item) => item.kind === 'gate')!;
+  assertBlock(gate.approval, 'the gate');
+  assert.match(gate.approval!.what, /Open the gate on Phase 6 of demo/);
+  const plan = view.items.find((item) => item.kind === 'errand' && item.runId === 'run-plan')!;
+  assertBlock(plan.approval, 'the plan to approve');
+  const tool = view.items.find((item) => item.kind === 'approval')!;
+  assertBlock(tool.approval, 'the permission card');
+  assert.match(tool.approval!.askedBy, /Phase 4 of demo/);
+  const rows = [gate, plan, tool];
+  // Every one of them is an Approval on Your turn.
+  const turn = turnView(view, {
+    now: NOW,
+    requests: [{
+      id: 'rq1', state: 'open', at: '2026-08-22T11:00:00.000Z', door: 'local', label: 'a script', verb: 'resume',
+      method: 'POST', path: '/api/run/demo/resume', body: '{}', summary: 'resume the run of demo — from a script',
+    } as never],
+  });
+  const items = Object.values(turn.groups).flat();
+  for (const row of rows) {
+    const item = items.find((i) => i.rows.includes(row.id))!;
+    assert.ok(item.approval, `${row.kind}: the item carries its block`);
+    assert.equal(item.type, 'approve', `${row.kind} is an Approval`);
+  }
+  const request = items.find((i) => i.source === 'request')!;
+  assertBlock(request.approval as never, 'the owner\'s request');
+  assert.equal(request.type, 'approve');
+});
+
+/** At most one recommended, and every option bound to a verb. */
+function assertOptions(options: InboxItem['options'], where: string, min = 1): void {
+  assert.ok((options?.length ?? 0) >= min, `${where} carries options`);
+  assert.ok(options!.filter((o) => o.recommended).length <= 1, `${where}: at most one recommended`);
+  for (const option of options!) {
+    assert.ok(option.label && option.verb.endpoint.startsWith('/api/'), `${where}: ${option.id} is bound`);
+  }
+}
+
+test('TB4-3: the conflict, the QA verdict, the relayed question and the session\'s ask carry options, at most one recommended', () => {
+  const createdAt = '2026-08-22T11:00:00.000Z';
+  const view = buildInbox(facts({
+    git: bothSee(CONFLICT),
+    approvals: [{
+      id: 'q1', runId: 'run-9', slug: 'demo', phase: 4, kind: 'question', status: 'pending', createdAt,
+      question: { items: [{ key: 'colour:which', question: 'Which colour?', options: [{ label: 'Red' }, { label: 'Blue (Recommended)' }] }], answers: {} },
+    }],
+    sessions: [
+      { sessionId: 'sess-lane', kind: 'autopilot', presence: 'live', waiting: { since: createdAt, kind: 'permission' }, plan: { slug: 'demo', phase: 9, strong: true } },
+      { sessionId: 'sess-own', kind: 'interactive', presence: 'live', cwd: '/work/x', waiting: { since: createdAt, kind: 'elicitation' } },
+    ],
+  } as never), NOW);
+  const conflict = view.items.find((item) => item.kind === 'conflict')!;
+  assertOptions(conflict.options, 'the conflict', 2);
+  assert.equal(conflict.options!.find((o) => o.id === 'leave')!.verb.endpoint, '/api/inbox/ack');
+  // …and the option it answers with, so the item moves to Done (turn-by-turn phase 5).
+  assert.deepEqual(conflict.options!.find((o) => o.id === 'leave')!.verb.body, { id: conflict.id, answer: 'leave' }, 'the ack names the row, minted');
+  const failed = view.items.find((item) => item.kind === 'qa' && item.phase === 2)!;
+  assertOptions(failed.options, 'the failed QA verdict', 3);
+  assert.equal(failed.options!.find((o) => o.recommended)?.id, 'qa-recover', 'a fail recommends the fix');
+  const owed = view.items.find((item) => item.kind === 'qa' && item.phase === 3)!;
+  assert.equal(owed.options!.find((o) => o.recommended)?.id, 'qa-rerun', 'an owed verdict recommends the review');
+  const question = view.items.find((item) => item.kind === 'question')!;
+  assertOptions(question.options, 'the relayed question', 2);
+  assert.equal(question.options!.find((o) => o.recommended)?.label, 'Blue (Recommended)', 'the recommended one is the one the session marked, not the first');
+  const lane = view.items.find((item) => item.kind === 'session-ask' && /permission/.test(item.title))!;
+  assertOptions(lane.options, 'the lane\'s ask', 1);
+  assert.equal(lane.options![0]!.verb.endpoint, '/api/run/demo/steer');
+  const own = view.items.find((item) => item.kind === 'session-ask' && /answer/.test(item.title))!;
+  assertOptions(own.options, 'a session\'s own terminal', 1);
+  // On Your turn they are Decisions with their options.
+  const items = Object.values(turnView(view, { now: NOW }).groups).flat();
+  for (const row of [conflict, failed, question, lane]) {
+    const item = items.find((i) => i.rows.includes(row.id))!;
+    assert.ok(item.options.length >= 1, `${row.kind}: the item carries its options`);
+    assert.ok(item.options.filter((o) => o.recommended).length <= 1);
+    assert.equal(item.check, 'The option you choose is the result.', `${row.kind}: its check`);
+  }
 });

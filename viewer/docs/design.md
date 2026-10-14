@@ -503,6 +503,130 @@ of the screen.
    stop at 360, 768, 1024 and 1280 is held to the EMPTY register: the fix is the page, never the
    baseline. Open the pictures in `e2e/.shots/` and READ them.
 
+## Your turn — the card's law
+
+Turn-by-turn phase 8 drew every item on Your turn as ONE card in the anatomy of the Owner To-Do Board.
+A card wraps an item because the item is acted on as a unit (§1, principle 7). The server decides
+every word: `GET /api/turn` gives each item its type, the person's status, whether it is due, where
+a press goes and the composed words. The card only draws them (`client/src/cards/item-card.tsx` and
+its parts under `client/src/cards/turn/`). Each rule names its guard.
+
+**The anatomy, top to bottom** (`client/src/cards/turn/head.tsx`, `timing.tsx`, `verdict.tsx`,
+`steps.tsx`, `act.tsx`):
+
+1. **The head.** NOW, or NOT YET with its *when* in words. The type's mark: a glyph and a word,
+   Approval, Task, Decision or Heads-up (`TYPE_META`). The person's status as a dot and a word. Inspect.
+   Readiness is drawn only while the act is still the person's (`readinessShown`: To do or Redo). The
+   status and the readiness are the typed family's `turn` member, `TurnStatus` and `TurnReadiness`
+   (`client/src/ui/status/turn.tsx`). Their words are rows of `shared/status-model.js` (vocabularies
+   `turn` and `readiness`), and their labels are `PERSON_STATUS_LABEL` and `READINESS_LABEL`, held
+   equal by `test/status-model.test.ts`. Amber paints only To do, Redo and Now.
+2. **The title**, which names the act, and **the meta**: plan, phase, run, what it unblocks and
+   the effort. Each is its own fact and a link where it can be. Never a dotted string.
+3. **The timing grid**, on one page clock. *Assigned*, *Do it* and *Deadline* are always drawn: a
+   missing deadline reads "None set". *Open until*, *You sent it* and *Checked* are drawn when the
+   item has them. The window is *Open until* and is never called a deadline. A deadline carries
+   what is left (or how overdue, in the failed hue) and a bar from assigned to deadline, which is
+   the line's mark `LoadMeter`.
+4. **Why, once.** "Only you:" with the reason's sentence, or the composer's need on a projected
+   item. Never both.
+5. **The verdict, BEFORE the steps.** A verdict changes what the steps are for. Redo shows what the
+   check found and the exact fixes, numbered. A running check says the verdict lands here. A settled
+   item says how it ended, by whom and when. Back with the person, the box wears the summons as a
+   leading rule, never a filled band.
+6. ***From the AI***: what it tried first and its last word.
+7. **The numbered steps on the line.** These are the guide's track (§7). The card uses the authored
+   guide whole, else the composer's steps. A plan item and the session item that covers it are
+   linked ("Steps from Phase N's session") and never merged.
+8. ***How it's checked***, in words, then ***Goes to*** (`ROUTE_META`, with who resumes) and
+   ***Checked by*** (`CHECKED_BY_LABEL`).
+9. **ONE act form**, by the move table.
+10. **The history**, one press in, and **the raw record**, one more (the datum ledger).
+
+**The move table** (`client/src/cards/turn/moves.ts`, `cardMoveOf`) is the contract. Every type ×
+status × readiness × record has exactly one primary:
+
+| When | The one primary |
+|---|---|
+| Passed, Not doing, Closed | none (settled) |
+| a Heads-up | *Got it* |
+| Checking | a ledger item's *Undo: I'm not finished*, and nothing else; a projected item, none |
+| Waiting for the owner | the request's first pressable action |
+| NOT YET | none until it is due, said in words |
+| an Approval | *Approve*, with *Deny* beside it; a permission's through its grant |
+| a Decision | its options, then *Send my decision* |
+| a Task | *I've done this — check*, or *I've redone it* on Redo, never the opener or a terminal; a projected Task, its row's first pressable action |
+
+**The act form per type** (`client/src/cards/turn/act.tsx`, `client/src/cards/decision-card.tsx`):
+
+- **Task.** The check, with a note for it. Never a note on an item whose answer is a secret or a
+  code: a field there invites the value. The opener (*Open sign-in*, *Open in terminal*) sits beside
+  the check. *Attach evidence*. Then three folded choices. *Not doing this* appears where the
+  raiser allows it. *Snooze* offers an hour, four hours or until tomorrow. *Hand it back* offers the
+  phase that raised it, a question for its session, or "I can't do this".
+- **Decision.** Radio options, each with what choosing it means. The recommended one is named in
+  words and never pre-selected. Then a note and *Send my decision*. A projected decision's option
+  that takes words opens its own box. A flagged option is disabled and names its flag.
+- **Approval.** *Approve* and *Deny*, with a note. A run request's raise of money says beside the note
+  that the note is the amount. A permission is its own card's approval: *Approve* at a scope, the
+  risk, the typed rule for a high grant, and *Deny* (`client/src/screens/turn/permission-card.tsx`).
+- **Heads-up.** *Got it*, a mark kept in this browser. Nothing checks a heads-up or waits on it.
+
+Terminal presses (Approve, Deny, Not doing this, Send my decision) wait out the undo window on the
+page (`client/src/data/undo-window.ts`). An action the console's flags switch off is drawn
+disabled, with the flag that turns it on, and is never the primary.
+
+**One command block** (`client/src/ui/code-block.tsx`) shows every command a person is meant to
+run, in a guide step, on a step's own card, in the terminal sheet and in Settings ▸ Reach. It reads
+left to right in any page and scrolls in its own focusable, named box. It offers *Copy* and *Copy
+for Claude Code* (behind `!`), never a way to run. A command holding a `<placeholder>` is a
+template. It says "Fill in <name> first", marks each placeholder, and offers *Copy the template*,
+never a plain *Copy*. A shell redirect is never read as a placeholder.
+
+**One page clock** (`client/src/ui/clock.ts`). Every figure reads one module-level `now` through
+`useSyncExternalStore`, so a tick re-renders the figures that read it and never the card or the page.
+The clock ticks every second while a timing grid is on screen (an IntersectionObserver, through
+`useFineClock`) and every thirty seconds otherwise. It runs no timer when nothing reads it. Under
+`prefers-reduced-motion: reduce` it never takes the one-second tick: a second-by-second countdown
+is motion, and the figures say minutes.
+
+**The page** (turn-by-turn phase 9, `client/src/screens/turn/`). The headline is the heading. The
+strip under it is words with figures on one line, never tiles: *to do*, *checking* and *passed
+today*, then the round as the live line and *Next deadline*, which reads the page clock. One
+toolbar row follows: search, Filter (Status, Time, Plan, Type, Goes to), Group, Sort, View, ⋯
+(Export, Print), Everything. Every choice lives in the address. The six groups come next, in
+`TURN_GROUPS` order, each with its count and one plain line when empty. *Handled by the AI*, the
+heads-ups and *Where the plans stand* (one line per plan) follow them. `#/turn/<id>` marks its
+card and opens the panel on it only where the panel stands beside the page. Below 1200 a sheet
+would cover the card the push landed on. Guards: `screens/turn/page.test.tsx` (TP-v2),
+`page-model.test.ts` (PM-v2), `e2e/turn.spec.ts`.
+
+**Every other surface speaks the card's words** (turn-by-turn phase 10). An inbox row carries the
+card's type, readiness and NOT YET's *when*, and sits in the group its card sits in (`withRowWords`,
+`server/turn/fold.ts`). The Runs home's Your turn rows and the bell's needs-you rows lead with NOW or
+NOT YET and the type's mark, then the composer's title (`client/src/cards/turn/row-words.tsx`); no
+surface writes a word of its own for an item. A push's lock screen is chosen by type
+(`lockScreenOf`, `server/push/actions.ts`): a Task gets *Open* and *I did it*, a run request *Approve*
+and *Deny* only where the console runs with `--allow-run`, any other Approval or a Decision *Open*.
+
+**No card is ever half a card** (turn-by-turn phase 11). `test/turn-cards-coverage.test.ts` walks every
+item the console can raise — every kind in every ledger state from every birth, and every projected
+source — in both editions, and fails the item that lacks a type, a status, a readiness while it is the
+person's, a route its edition may say, *Checked by*, a check in words, or, while open, a step, its
+options or its approval block; and any machine word a person would read.
+
+**Its guards.** `client/src/cards/item-card.test.tsx` holds IC-v2 (the table, and the card drawing
+exactly its one primary over every type × status, ledger and projected) and IC-7 to IC-11.
+`client/src/cards/item-card.datums.test.tsx` holds every fact within two presses.
+`client/src/cards/turn/timing.test.tsx` holds the grid, NOT YET's *when*, the tick that re-renders
+no page, overdue, and the clock's rule. `client/src/cards/turn/card.a11y.test.tsx` holds axe in every
+type × status in both lights, the mirror under `dir="rtl"`, and the thumb floor.
+`client/src/ui/code-block.test.tsx` and `client/src/cards/guide.test.tsx` hold the command block.
+`client/src/ui/status/family.test.tsx` holds the `turn` member. `test/turn-surfaces-scan.test.ts`
+names `client/src/cards/turn/` in the family that may draw a person's ask. In the browser,
+`e2e/register.spec.ts`, `e2e/rtl.spec.ts` and `e2e/doors.spec.ts` measure the card at 360, 768, 1024
+and 1280.
+
 ## 12. The guards — what holds each rule
 
 Paths are from `viewer/`; `tests/unit/gates.bats` is the repository root's.

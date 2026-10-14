@@ -38,6 +38,7 @@ import {
   type RunHome,
 } from '@/data/run-groups';
 import { isClosedStatus } from '@/lib/closure';
+import { rowPrimaryOf } from '@/cards/item-row';
 import { situationParts } from '@/shell/situation-line';
 import { turnHref } from '@/shell/routes';
 import {
@@ -666,7 +667,7 @@ describe('a person’s turn is a summons (control-tower phase 42)', () => {
       runId: 'busy',
       slug: 'busy',
       phase: 2,
-      title: 'Your turn — sign in in a browser for busy phase 2',
+      title: 'Sign the gh CLI in',
       // The server's word for its kind's family (`HUMAN_STEP_CATEGORY`).
       category: { word: 'credentials', label: 'Credentials and accounts' },
       humanStep: humanStepView({
@@ -1015,5 +1016,101 @@ describe('the hold binding this console’s runs', () => {
       by: 'operator',
     });
     expect(bindingHoldOf(undefined)).toBeNull();
+  });
+});
+
+describe('the rows say the card’s words (turn-by-turn phase 10)', () => {
+  const words = (
+    id: string,
+    type: string,
+    readiness: string,
+    group: string,
+    over: Record<string, unknown> = {},
+  ) => turnOf(id, 'now', { type, readiness, group, ...over });
+
+  it('the Your turn rows carry the type, NOW or NOT YET and the composer’s title through the fold', () => {
+    const inbox = [
+      item({
+        id: 'task',
+        kind: 'human-step',
+        title: 'Sign gh in to the acme org',
+        turn: words('task', 'do', 'now', 'now'),
+      }),
+      item({
+        id: 'gate',
+        kind: 'gate',
+        title: 'Approve the gate of phase 4',
+        turn: words('gate', 'approve', 'now', 'approve', { source: 'gate' }),
+      }),
+      item({
+        id: 'later',
+        kind: 'human-step',
+        severity: 'fyi',
+        title: 'Tap the key',
+        turn: words('later', 'do', 'not-yet', 'upcoming', { startWhen: 'when phase 3 of alpha is done' }),
+      }),
+    ];
+    const model = groupRuns({ runs: [], lanes: [], inbox, now: NOW });
+    expect(model.items.map((one) => [one.title, one.turn?.type, one.turn?.readiness])).toEqual([
+      ['Sign gh in to the acme org', 'do', 'now'],
+      ['Approve the gate of phase 4', 'approve', 'now'],
+    ]);
+    // NOT YET is coming up — counted in no group, its *when* on its row.
+    expect(model.upcoming.map((one) => [one.id, one.turn?.readiness, one.turn?.startWhen])).toEqual([
+      ['later', 'not-yet', 'when phase 3 of alpha is done'],
+    ]);
+    expect(model.counts['needs-you']).toBe(2);
+  });
+
+  it('a decision with options opens its card; an approval that asks for words opens it too', () => {
+    const option = (id: string) => ({
+      id,
+      label: id,
+      verb: { method: 'POST' as const, endpoint: `/api/x/${id}` },
+    });
+    const press = (verb: string, says = false) => ({
+      verb,
+      label: verb,
+      endpoint: `/api/x/${verb}`,
+      method: 'POST' as const,
+      ...(says ? { says: { field: 'evidence', label: 'Evidence' } } : {}),
+    });
+    // Two options, side by side on the card: the row offers the card.
+    expect(
+      rowPrimaryOf({
+        turn: words('d', 'decide', 'now', 'decide'),
+        actions: [press('a'), press('b')],
+        options: [option('a'), option('b')],
+      }),
+    ).toEqual({ move: 'page' });
+    // Options ride even where the row has one button: still the card.
+    expect(
+      rowPrimaryOf({
+        turn: words('d', 'decide', 'now', 'decide'),
+        actions: [press('a')],
+        options: [option('a'), option('b')],
+      }),
+    ).toEqual({ move: 'page' });
+    // A gate's Approve asks for its evidence — the card's.
+    expect(
+      rowPrimaryOf({
+        turn: words('g', 'approve', 'now', 'approve', { source: 'gate' }),
+        actions: [press('approve', true)],
+      }),
+    ).toEqual({ move: 'page' });
+    // One answer that asks for no words is pressed on the row.
+    const one = press('ack');
+    expect(rowPrimaryOf({ turn: words('q', 'decide', 'now', 'decide'), actions: [one] })).toEqual({
+      move: 'row',
+      action: one,
+    });
+    // A Task leads with its step's own primary; NOT YET offers nothing but the link.
+    expect(
+      rowPrimaryOf({ turn: words('t', 'do', 'now', 'now'), humanStep: {} as never, actions: [] }),
+    ).toEqual({ move: 'step' });
+    expect(rowPrimaryOf({ turn: words('u', 'do', 'not-yet', 'upcoming'), actions: [] })).toEqual({
+      move: 'none',
+      why: 'upcoming',
+    });
   });
 });

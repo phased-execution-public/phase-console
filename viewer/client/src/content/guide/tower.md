@@ -110,7 +110,7 @@ the runs of closed plans.
 The header of every page carries the home's sentence in short: *3 need you*, *Your turn (1)*, *2 live* —
 or *checkout-rewrite is running — phase 3* when exactly one run is live — *1 waiting*, *2 queued*, *4
 phases ready*, *$41 today*. A pending permission counts as needing you. *Your turn (n)* counts only the
-items waiting on you now, under **Do now** and **Needs one detail from you**, an errand and the step it
+items waiting on you now, under **Approve**, **Do now** and **Decide**, an errand and the step it
 describes counting once; what is coming up, being checked or done is not in it.
 
 On a desk each figure is a link — to its group, such as `#/runs?group=needs-you`, to `#/turn` for *Your

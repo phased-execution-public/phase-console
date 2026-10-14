@@ -174,6 +174,9 @@ import { parseQaRounds, type QaRoundRow } from './parse/folder.ts';
 import { errandIsItem, errandTurnInput } from './turn/index.ts';
 import { wallErrand } from './turn/fold.ts';
 import { guardWall } from './turn/guard.ts';
+import { isRunRequestOf, runActOf, runRequestTurnInput } from './turn/run-requests.ts';
+import { RUN_ACT_META, type RunAct } from '../shared/verb-model.js';
+import { G5_ERRAND_HOW } from '../shared/turn-model.js';
 import { answeredByItem, grantedByItem, ruleFamilyOf, wallOfHookDenial } from './permissions/walls.ts';
 import { callMatches, callSubject } from './permissions/grants.ts';
 import { readFileSync } from 'node:fs';
@@ -188,6 +191,22 @@ export const BOARD_RETRY_MS = 60_000;
 
 export abstract class ServiceLive extends ServiceBase {
   /**
+   * The phase record a declaration's errand is announced for — the LIVE
+   * runner's own, while it holds that run, else the stored run's. The errand is
+   * announced on the runner's event before the run reaches the disk, so a read
+   * of the stored run alone still said `running` with nothing declared, and a
+   * live run's request or wall raised no item (turn-by-turn phase 11, found by
+   * the tower rehearsal's run-request trip).
+   */
+  protected declaredRecordOf(slug: string, runId: string, phase: number): RunPhaseRecord | undefined {
+    const live = this.runners.get(slug)?.current();
+    if (live && live.id === runId && live.phases[String(phase)]?.declared) return live.phases[String(phase)];
+    if (!this.root?.ok) return undefined;
+    const run = latestRun(this.root.path, slug, this.liveRunIds());
+    return run && run.id === runId ? run.phases[String(phase)] : undefined;
+  }
+
+  /**
    * A `blocked --needs permission` declaration's item (control-tower phase
    * 135): G5 — the wall it cites among those recorded for its lane (the
    * console's own deny with a rule included) — raised through the one door,
@@ -195,9 +214,7 @@ export abstract class ServiceLive extends ServiceBase {
    * declaration is refused (journalled), and its errand stands as before.
    */
   protected raiseDeclaredWall(slug: string, runId: string, phase: number): boolean {
-    if (!this.root?.ok) return false;
-    const run = latestRun(this.root.path, slug, this.liveRunIds());
-    const record = run && run.id === runId ? run.phases[String(phase)] : undefined;
+    const record = this.declaredRecordOf(slug, runId, phase);
     if (!record) return false;
     const walls = [...(record.walls ?? [])];
     const denied = record.toolDenied;
@@ -213,6 +230,47 @@ export abstract class ServiceLive extends ServiceBase {
       slug, runId, phase, ...(record.sessionId ? { sessionId: record.sessionId } : {}),
       wall: verdict.wall, need: record.declared?.reason ?? null,
     }) !== null;
+  }
+
+  /**
+   * A run request's item (turn-by-turn phase 6, #286, §Architecture 5.1): ONE
+   * approval per (run, act), every declaring phase a waiter on it — raised
+   * through the one door for the first phase that asks, a waiter added for
+   * each that asks again. Listed but never pushed when the supervisor will take
+   * the act itself (`supervisorTakes`). False when the record names no run
+   * act: the errand stands as it is.
+   */
+  protected raiseRunRequest(slug: string, runId: string, phase: number): boolean {
+    const record = this.declaredRecordOf(slug, runId, phase);
+    const act = runActOf(record?.declared);
+    if (!record || !act) return false;
+    const ledger = this.humanStepsNow();
+    const open = ledger.open().find((step) => isRunRequestOf(step) === act && step.slug === slug && step.runId === runId);
+    if (open) {
+      if (Number(open.phase) !== phase) {
+        ledger.addWaiter(open.id, { slug, phase, runId, ...(record.sessionId ? { sessionId: record.sessionId } : {}) });
+        log.info('turn.waiter-added', { id: open.id, kind: open.kind, slug, phase });
+      }
+      return true;
+    }
+    const meta = RUN_ACT_META[act];
+    const raised = this.raiseTurn(
+      runRequestTurnInput({ slug, phase, runId, ...(record.sessionId ? { sessionId: record.sessionId } : {}) },
+        act, record.declared?.reason ?? null, record.declared?.compat === true),
+      {
+        quiet: this.supervisorTakes(slug, act),
+        message: { title: `${slug} · ${meta.title}`, body: `Phase ${phase} asked the run for it. ${meta.ifApproved}`.slice(0, 200) },
+      },
+    );
+    return Boolean(raised && !('refused' in raised));
+  }
+
+  /**
+   * Will the supervisor take this run act itself, now (Pro)? The Free console
+   * has none, so every run request is a person's ONE approval.
+   */
+  protected supervisorTakes(_slug: string, _act: RunAct): boolean {
+    return false;
   }
 
   /** A released lock's phase stops fencing its scope — `ServiceRuns.noteFenceReleased`. */
@@ -549,8 +607,15 @@ export abstract class ServiceLive extends ServiceBase {
     // A permission errand IS the permission item its lane's recorded wall
     // raises (control-tower phase 135, #212) — the session's declaration held
     // to G5 — announced ONCE as that item. Nothing recorded: the errand below.
-    if (runId && phase != null && !event?.settled && errand.situation && wallErrand(errand.situation)
-      && this.raiseDeclaredWall(slug, runId, phase)) return;
+    // A run request (turn-by-turn phase 6) IS the one approval per run and act.
+    if (runId && phase != null && !event?.settled && errand.situation === 'blocked-declared:run'
+      && this.raiseRunRequest(slug, runId, phase)) return;
+    if (runId && phase != null && !event?.settled && errand.situation && wallErrand(errand.situation)) {
+      if (this.raiseDeclaredWall(slug, runId, phase)) return;
+      // G5 refused it (turn-by-turn phase 6, the honest path): no item was
+      // raised, so the push must not say Your turn holds one.
+      errand.how = G5_ERRAND_HOW;
+    }
     if (runId && phase != null && !event?.settled && errand.situation && errandIsItem(errand.situation)) {
       const raised = this.raiseTurn(
         errandTurnInput({ slug, phase, runId }, { situation: errand.situation, need: errand.need, ...(errand.how ? { how: errand.how } : {}) }),
@@ -1882,6 +1947,15 @@ export abstract class ServiceLive extends ServiceBase {
     const ok = opts.approve ? Boolean(gate?.clear) : outcome.ok;
     log.info('gate.approve', { slug, phase, approve: opts.approve, ok, by: opts.by, code: outcome.code });
     if (ok) this.invalidateAll();
+    // A gate a person approved is Done on Your turn (turn-by-turn phase 5): a
+    // gate writes no run journal line, so its settled record is kept here.
+    if (ok && opts.approve && person) {
+      this.recordSettled({
+        item: inboxItemId({ kind: 'gate', slug, phase }), at: new Date().toISOString(), source: 'gate', outcome: 'passed',
+        by: opts.by ?? opts.actor?.by ?? 'a person', title: `Open the gate on Phase ${phase} of ${slug}`,
+        what: 'Approved the gate', slug, phase,
+      });
+    }
 
     let resumed = false;
     if (ok && opts.approve && opts.continueRun) {

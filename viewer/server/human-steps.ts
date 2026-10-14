@@ -53,8 +53,9 @@ import { log } from './log.ts';
 import {
   CREDENTIAL_ID_RE, DEVICE_CODE_RE, HUMAN_STEP_DEFAULT_WINDOW_MS, HUMAN_STEP_MOVES, HUMAN_STEP_OPEN_STATES,
   HUMAN_STEP_STATES, HUMAN_STEP_STILL_MOVES, HUMAN_STEP_WHERE, KIND_META, REMINDER_SERIES_MS,
-  canTransition, dueRefOk, humanStepKindOf, isOpenableUrl, looksLikeSecret, redactSecrets,
+  canTransition, deadlineOk, dueRefOk, humanStepKindOf, isOpenableUrl, looksLikeSecret, redactSecrets,
   type HumanStepBirth, type HumanStepKind, type HumanStepMove, type HumanStepState, type HumanStepWhere,
+  erefOf,
 } from '../shared/human-step-model.js';
 import {
   GRANT_SCOPES, PROOF_TYPES, RISK_TIERS, RULE_FAMILIES, WALLS, WHY_PERSON, defaultReason, inferProofType, reasonAllowed,
@@ -202,6 +203,11 @@ export type HumanStep = {
   /** A decision's options, one recommended, and whether the person may decline. */
   options?: StepOption[];
   allowDecline?: boolean;
+  /**
+   * When the act must be done BY (turn-by-turn phase 2) — a plan bullet's
+   * `deadline:`, an ISO 8601 date or instant. An end, where `dueWhen` is a start.
+   */
+  deadline?: string;
   /** How many times the person said *I've done this — check*. */
   attempts: number;
   /** Every session this one item unblocks (G7: the same wall met again is another waiter, never another item). */
@@ -235,7 +241,19 @@ export type HumanStep = {
   verdicts?: StepVerdict[];
   /** When its rejections escalated it to the owner — ONCE. */
   escalatedAt?: string;
+  /**
+   * What the person wrote with each check (turn-by-turn phase 5) — kept on the
+   * attempt it was sent with, for EVERY proof type: a judgement reads it, and
+   * a probe's, an answer's or an attest's is shown on the item all the same.
+   */
+  notes?: StepNote[];
 };
+
+/** The most a check's note keeps — what the check route already bounds it to. */
+export const CHECK_NOTE_MAX = 2_000;
+
+/** A check's note, on the attempt it was sent with. */
+export type StepNote = { attempt: number; text: string; at: string; by?: string };
 
 /** A decision's answer, as the ledger keeps it — the option's label beside its id, the note redacted. */
 export type StepAnswer = { option?: string; label?: string; note?: string; at: string; by?: string; door?: string };
@@ -262,6 +280,11 @@ type MoveLine = {
   until?: string;
   /** `wait` (G7): the session that met the same wall again. */
   waiter?: StepWaiter;
+  /**
+   * `wait` (turn-by-turn phase 7): the run whose lane `waiter` REPLACES — a
+   * world act moved to the run that superseded the one it was raised in.
+   */
+  moves?: string;
   /** `answer` (phase 133): the decision's answer. */
   answer?: StepAnswer;
   /** `ask`: the question. */
@@ -274,6 +297,8 @@ type MoveLine = {
   escalated?: true;
   /** `return` (phase 134): what the proof read — the card says it, as it did before a check sent anything back. */
   read?: string;
+  /** `check` (turn-by-turn phase 5): the note the person sent with it — kept on the attempt it starts. */
+  sent?: string;
 };
 
 /** One line of a step's history, as `history` answers it — the datums a card shows. */
@@ -318,7 +343,13 @@ function foldMove(known: HumanStep, state: HumanStepState, move: MoveLine): Huma
     case 'check':
       // The start of a check (`checking`) is the act; its unlanded end (back to
       // `notified`) carries what the proof read.
-      if (state === 'checking') { next.checks = (known.checks ?? 0) + 1; next.checkedAt = move.at; next.actedAt = move.at; }
+      if (state === 'checking') {
+        next.checks = (known.checks ?? 0) + 1; next.checkedAt = move.at; next.actedAt = move.at;
+        if (typeof move.sent === 'string' && move.sent) {
+          const note: StepNote = { attempt: (known.attempts ?? 0) + 1, text: move.sent, at: move.at, ...(move.by ? { by: move.by } : {}) };
+          next.notes = [...(known.notes ?? []), note];
+        }
+      }
       else if (typeof move.note === 'string') next.read = move.note;
       break;
     case 'prove':
@@ -329,7 +360,20 @@ function foldMove(known: HumanStep, state: HumanStepState, move: MoveLine): Huma
     case 'snooze': if (move.snoozeUntil) next.snoozeUntil = move.snoozeUntil; break;
     case 'due': next.dueAt = move.at; if (move.until) next.until = move.until; break;
     case 'wait':
-      if (move.waiter && !next.waiters.some((w) => sameWaiter(w, move.waiter!))) next.waiters = [...next.waiters, move.waiter];
+      if (move.waiter && typeof move.moves === 'string' && move.moves) {
+        // A lane moved to a successor run: the old run's lane on that phase is
+        // the new one now — the item's own lane included — and its session,
+        // which belonged to the old run, goes with it.
+        const to = move.waiter;
+        const moved = (w: StepWaiter) => w.slug === to.slug && w.phase === to.phase && (w.runId ?? '') === move.moves;
+        const kept = next.waiters.filter((w) => !moved(w) && !sameWaiter(w, to));
+        const first = next.waiters.findIndex(moved);
+        next.waiters = first < 0 ? [...kept, to] : [...kept.slice(0, first), to, ...kept.slice(first)];
+        if (known.slug === to.slug && known.phase === to.phase && (known.runId ?? '') === move.moves) {
+          next.runId = to.runId;
+          delete next.sessionId;
+        }
+      } else if (move.waiter && !next.waiters.some((w) => sameWaiter(w, move.waiter!))) next.waiters = [...next.waiters, move.waiter];
       break;
     case 'answer': if (move.answer) next.answer = move.answer; break;
     case 'return': if (typeof move.read === 'string') next.read = move.read; break;
@@ -502,6 +546,13 @@ export function sanitiseStep(raw: unknown, birth: HumanStepBirth): CleanStep | n
   const options = optionsOf(input.options, input.recommended);
   if (options.length) step.options = options;
   if ((input.allow_decline ?? input.allowDecline) === true) step.allowDecline = true;
+  // When it must be done by (turn-by-turn phase 2): the shape the plan's
+  // `deadline:` key is held to, or nothing.
+  if (input.deadline !== undefined) {
+    const deadline = typeof input.deadline === 'string' ? input.deadline.trim() : '';
+    if (deadlineOk(deadline)) step.deadline = deadline;
+    else dropped.push('deadline');
+  }
   // The manifest key a decision answers (control-tower phase 133): named only
   // by a declaration that says so, never inferred from `--needs`, whose words
   // are policies (`ambiguity: ruling`) an answer to one question must not
@@ -736,6 +787,8 @@ export type MoveExtra = {
   verdict?: StepVerdict;
   escalated?: true;
   read?: string;
+  /** `check` (turn-by-turn phase 5): the note sent with it, redacted and bounded here. */
+  sent?: string;
 };
 
 /**
@@ -749,6 +802,43 @@ export function turnKey(step: Pick<HumanStep, 'kind' | 'title'> & Partial<Pick<H
   }
   const what = step.openCommand ?? step.openUrl ?? step.credential ?? step.title.trim().toLowerCase();
   return [step.kind, what.replace(/\s+/g, ' ').trim()].join('\u0000');
+}
+
+/** One item as another names it — a link, never a merge (turn-by-turn phase 7). */
+export type StepLink = { id: string; phase: number; title: string };
+
+/** Every errands-table ref a text names, as `E-<n>` — "(E-4)", "E-1, E-3 and E-4". */
+function erefsIn(text: string): Set<string> {
+  return new Set([...text.matchAll(/\bE-(\d+)\b/g)].map((m) => `E-${Number(m[1])}`));
+}
+
+/**
+ * A plan item and the session item that covers it are LINKED (turn-by-turn
+ * phase 7, §Architecture 5.3) — never merged: each keeps its own proof and its
+ * own lane, and the plan item names where its steps now are ("Steps from Phase
+ * 3's session"). A session item of the same plan covers a plan item when it is
+ * the same act (`turnKey`), or when its title, lines or guide name the plan
+ * item's errands ref — the session that re-raised E-1, E-3 and E-4 under one
+ * guide covers all three. A dismissed session item covers nothing.
+ */
+export function coverLinks(steps: readonly HumanStep[]): { coveredBy: Map<string, StepLink>; covers: Map<string, StepLink[]> } {
+  const coveredBy = new Map<string, StepLink>();
+  const covers = new Map<string, StepLink[]>();
+  const plans = steps.filter((step) => step.birth === 'plan');
+  if (!plans.length) return { coveredBy, covers };
+  const sessions = steps.filter((step) => step.birth === 'session' && step.state !== 'dismissed')
+    .sort((a, b) => a.declaredAt.localeCompare(b.declaredAt));
+  const link = (step: HumanStep): StepLink => ({ id: step.id, phase: step.phase, title: step.title });
+  for (const plan of plans) {
+    const eref = erefOf(plan.title);
+    const key = turnKey(plan);
+    const by = sessions.find((session) => session.slug === plan.slug && (turnKey(session) === key || (eref
+      && erefsIn([session.title, ...(session.lines ?? []), typeof session.guide === 'string' ? session.guide : JSON.stringify(session.guide ?? '')].join('\n')).has(eref))));
+    if (!by) continue;
+    coveredBy.set(plan.id, link(by));
+    covers.set(by.id, [...(covers.get(by.id) ?? []), link(plan)]);
+  }
+  return { coveredBy, covers };
 }
 
 /** Is this step still open — one of the states short of settled (an `upcoming` one included)? */
@@ -866,6 +956,28 @@ export class HumanStepLedger {
   }
 
   /**
+   * Move a lane of an open step from one run to another (turn-by-turn phase
+   * 7): a world act raised in a run a later run superseded is still owed by
+   * the plan, so it stands on the successor's lane — a `wait` line naming the
+   * run it `moves` from, which changes no state. A lane the step does not have
+   * is no news.
+   */
+  relane(id: string, lane: { slug: string; phase: number; from: string; to: string }): HumanStep | MoveRefusal {
+    const step = this.get(id);
+    if (!step) return { refused: 'unknown-step', to: 'notified' };
+    if (!isOpenStep(step)) return { refused: 'transition', from: step.state, to: step.state };
+    const has = (w: StepWaiter) => w.slug === lane.slug && w.phase === lane.phase && (w.runId ?? '') === lane.from;
+    if (!step.waiters.some(has) && !has({ slug: step.slug, phase: step.phase, ...(step.runId ? { runId: step.runId } : {}) })) return step;
+    this.append({
+      v: HUMAN_STEP_LINE_VERSION, id, state: step.state, at: this.now().toISOString(), verb: 'wait', by: 'console',
+      waiter: { slug: lane.slug, phase: lane.phase, runId: lane.to }, moves: lane.from,
+    });
+    const moved = this.get(id)!;
+    this.changed(moved);
+    return moved;
+  }
+
+  /**
    * Move a step to `to`, if the state machine allows it — the one door every
    * verb uses. `note` is words about the move, redacted like everything else.
    */
@@ -888,6 +1000,7 @@ export class HumanStepLedger {
       ...(extra.verdict ? { verdict: extra.verdict } : {}),
       ...(extra.escalated ? { escalated: true as const } : {}),
       ...(extra.read ? { read: redactSecrets(extra.read.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, 280) } : {}),
+      ...(extra.sent ? { sent: redactSecrets(extra.sent.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, CHECK_NOTE_MAX) } : {}),
     };
     this.append(line);
     const moved = this.get(id)!;
@@ -995,8 +1108,17 @@ export function declareHumanStep(
   // closes. Never across plans: a proof, a check or (from phase 149) a grant
   // made for one plan's item must not resume, or answer for, another plan.
   const key = turnKey(clean.step);
-  const twin = input.birth !== 'session' ? undefined : deps.ledger.open().find((open) =>
-    open.birth === 'session' && open.slug === input.slug && open.phase !== input.phase && turnKey(open) === key);
+  // An act starts with its due-when (#255): a declaration that waits on a
+  // start of its own never joins an item already due, nor one waiting on
+  // another start — a date ahead stays upcoming, unannounced.
+  const due = clean.step.dueWhen ?? '';
+  // An operator's act is an act OF ITS PHASE (turn-by-turn phase 7, #261,
+  // #257): two phases that each ask for the same command ask for it twice, each
+  // on its own clock, so they never fold — a sign-in or a wall is the world's,
+  // met again, and still does.
+  const twin = input.birth !== 'session' || clean.step.kind === 'operator-act' ? undefined : deps.ledger.open().find((open) =>
+    open.birth === 'session' && open.slug === input.slug && open.phase !== input.phase && turnKey(open) === key
+    && (open.state === 'upcoming' ? open.dueWhen ?? '' : '') === due);
   if (twin) {
     const waited = deps.ledger.addWaiter(twin.id, {
       slug: input.slug, phase: input.phase,

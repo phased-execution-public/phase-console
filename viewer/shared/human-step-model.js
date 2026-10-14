@@ -237,6 +237,12 @@ export const HUMAN_STEP_BIRTHS = Object.freeze(
  * (`5m`, `1h`, or bare minutes), `unblocks:` — the phases it unblocks, comma
  * separated, and `guide:` — a guide file under the docs root, in the grammar
  * of `shared/guide-grammar.js`.
+ *
+ * Turn-by-turn phase 2 adds three: `options:` — a decision's choices,
+ * `id=Label[::consequence] | …` (`humanStepOptionsOf`), `recommended:` — the
+ * id of one of them, and `deadline:` — the ISO 8601 moment it must be done by
+ * (`deadlineOk`). A bullet's text may end "(E-N…)", which binds it to the row
+ * E-N of the plan's `## Operator errands` table (`server/parse/errands.ts`).
  */
 export const HUMAN_STEP_BULLET_KEYS = Object.freeze(
   /** @type {const} */ ([
@@ -251,8 +257,71 @@ export const HUMAN_STEP_BULLET_KEYS = Object.freeze(
     'effort',
     'unblocks',
     'guide',
+    'options',
+    'recommended',
+    'deadline',
   ]),
 );
+
+/**
+ * A decision bullet's `options:` (turn-by-turn phase 2) —
+ * `id=Label[::consequence] | id=Label …`, two to eight, each id once (a-z, 0-9
+ * and `-`, at most 32), each label 1 to 120 characters — read exactly as
+ * `_human_step_parse` reads it. Undefined when the text is not that grammar.
+ * @param {unknown} text
+ * @returns {{ id: string, label: string, consequence?: string }[] | undefined}
+ */
+export function humanStepOptionsOf(text) {
+  const parts = String(text ?? '')
+    .split('|')
+    .map((part) => part.trim());
+  if (parts.length < 2 || parts.length > 8) return undefined;
+  /** @type {{ id: string, label: string, consequence?: string }[]} */
+  const out = [];
+  for (const part of parts) {
+    const eq = part.indexOf('=');
+    const id = eq > 0 ? part.slice(0, eq) : '';
+    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(id) || out.some((o) => o.id === id)) return undefined;
+    const rest = part.slice(eq + 1);
+    const sep = rest.indexOf('::');
+    const label = (sep === -1 ? rest : rest.slice(0, sep)).trim();
+    if (!label || label.length > 120) return undefined;
+    const consequence = sep === -1 ? '' : rest.slice(sep + 2).trim();
+    out.push({ id, label, ...(consequence ? { consequence } : {}) });
+  }
+  return out;
+}
+
+/**
+ * The `## Operator errands` row a step's text names — its last "(E-N…)", as
+ * hub's plans end a bullet ("… (E-4, hub #105)") — or undefined (turn-by-turn
+ * phase 2). The bullet and the table row are bound by this ref, and an item the
+ * 7.0 launch door raised (titled with the bullet's text) is matched by it too.
+ * @param {unknown} text
+ * @returns {string | undefined}
+ */
+export function erefOf(text) {
+  const matches = [...String(text ?? '').matchAll(/\(E-(\d+)\b[^)]*\)/g)];
+  const last = matches[matches.length - 1];
+  return last ? `E-${Number(last[1])}` : undefined;
+}
+
+/**
+ * A bullet's `deadline:` — an ISO 8601 date or instant (turn-by-turn phase 2),
+ * the shape the F37 lint reads (`_human_step_parse`). A deadline is when the
+ * act must be done BY — an end — where `due:` is when it starts.
+ */
+export const DEADLINE_RE =
+  /^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])([T ]([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]+)?)?(Z|[+-][0-9]{2}:?[0-9]{2})?)?$/;
+
+/**
+ * Is a `deadline:` value the shape `DEADLINE_RE` reads?
+ * @param {unknown} text
+ * @returns {boolean}
+ */
+export function deadlineOk(text) {
+  return DEADLINE_RE.test(String(text ?? ''));
+}
 
 /**
  * Is a `due:` value a watch ref the console can poll — each scheme's SHAPE,
@@ -299,7 +368,9 @@ export const REMINDER_SERIES_MS = Object.freeze([
  * (a question about the task) and `attach` (evidence). Phase 134 (#211) adds
  * `override` — the owner's *Accept anyway*, the ONE route that writes a
  * verdict — and `rewrite`, the escalation's *Rewrite the guide*, which
- * withdraws the item (a `dismiss` move) and resumes its raiser. `answer`, `decline` and `override` carry the owner's authority
+ * withdraws the item (a `dismiss` move) and resumes its raiser. Turn-by-turn
+ * phase 5 adds `undo` — a check taken back while it runs: the item returns to
+ * where it stood, and a verdict that arrives later is dropped by its attempt. `answer`, `decline` and `override` carry the owner's authority
  * (`door-model.js` `AUTHORITY_ROUTES`); the rest do not. Not registered in `vocab-owners` for the reason `HUMAN_STEP_WHERE`
  * is not: common words match prose everywhere.
  */
@@ -316,6 +387,7 @@ export const HUMAN_STEP_VERBS = Object.freeze(
     'attach',
     'override',
     'rewrite',
+    'undo',
   ]),
 );
 
@@ -331,7 +403,7 @@ export const HUMAN_STEP_VERBS = Object.freeze(
  * answered, which proves it; `ask` and `attach` — a question and a piece of
  * evidence, which move no state (`HUMAN_STEP_STILL_MOVES`). Phase 134 adds
  * `override` — the owner accepted an item anyway, recorded as the owner's and
- * unverified.
+ * unverified. Turn-by-turn phase 5 adds `undo` — a running check taken back.
  * @typedef {(typeof HUMAN_STEP_MOVES)[number]} HumanStepMove
  */
 export const HUMAN_STEP_MOVES = Object.freeze(
@@ -354,6 +426,7 @@ export const HUMAN_STEP_MOVES = Object.freeze(
     'attach',
     'override',
     'rewrite',
+    'undo',
   ]),
 );
 

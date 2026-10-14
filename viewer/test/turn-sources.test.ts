@@ -347,3 +347,100 @@ test('TS-2: the approval broker\'s ask is a PROJECTED permission item carrying i
   assert.equal(permission?.risk, 'low');
   assert.equal(permission?.grant?.effect, 'broker');
 });
+
+// ---- turn-by-turn phase 2: a plan item's words from the CURRENT plan --------
+
+const GUIDED_PLAN = `---
+slug: guided
+created: 2026-10-12
+status: active
+phases: 2
+---
+
+# guided
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | keys | — | — | app | it works |
+| 2 | box | 1 | — | app | it ships |
+
+## Phases
+
+### Phase 1 — keys
+- **Human step:** operator-act · rotate the deploy key · proof: \`cmd:"true"\` · why: reserved · effort: 10m · guide: docs/guides/rotate.md · deadline: 2026-10-21
+- **Human step:** decision · choose where the build runs · options: box=The box::it runs all night | cloud=The cloud · recommended: box
+
+### Phase 2 — box
+- **Human step:** operator-act · restart the build box after the upgrade, then comment restarted (E-2, hub #105) · proof: \`cmd:"true"\` · why: reach
+
+## Operator errands
+
+Every \`!\` line runs from \`~/work/acme\`.
+
+| Id | Phase · issues | What only the owner can do | Exact steps | Expected | How the agent verifies |
+|---|---|---|---|---|---|
+| E-2 | 2 · acme #14 | restart the build box | \`! bash scripts/box.sh restart\` then comment \`restarted\` on acme #14 | the box answers | \`! bash scripts/box.sh --check\` |
+`;
+
+test('turn-by-turn 2: a plan item\'s guide comes from the bullet\'s file, the guide it was raised with, or its errands-table row — read from the plan NOW', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-turn-plan-items-'));
+  try {
+    mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+    mkdirSync(join(root, 'docs', 'handoffs', 'guided'), { recursive: true });
+    mkdirSync(join(root, 'docs', 'guides'), { recursive: true });
+    writeFileSync(join(root, 'docs', 'plans', 'guided.md'), GUIDED_PLAN, 'utf8');
+    writeFileSync(join(root, 'docs', 'guides', 'rotate.md'), 'The old key leaked.\n\n## Steps\n1. Open the key page.\n2. Press Rotate.\n', 'utf8');
+    const { svc } = service(root);
+    const raise = (phase: number, step: Record<string, unknown>) => {
+      const raised = svc.raiseTurn({ slug: 'guided', phase, birth: 'plan', step } as never);
+      assert.ok(raised && !('refused' in raised));
+      return raised.id;
+    };
+    // Raised as the 7.0 door raised them: the title and the proof, nothing else.
+    const fileItem = raise(1, { kind: 'operator-act', title: 'rotate the deploy key', proof: 'cmd:"true"' });
+    const ledgerItem = raise(1, {
+      kind: 'decision', title: 'choose where the build runs',
+      guide: { text: 'Pick one.\n\n## Steps\n1. Read the cost note.\n' },
+    });
+    // A 7.0 item titled with the bullet's OLD words — matched by its (E-2…).
+    const tableItem = raise(2, { kind: 'operator-act', title: 'restart the build box (E-2, hub #105)', proof: 'cmd:"true"' });
+    const items = async () => {
+      const turn = await svc.turnAnswer();
+      return new Map(Object.values(turn.groups).flat().map((item) => [item.item, item]));
+    };
+    let byId = await items();
+    const file = byId.get(fileItem)!.step!;
+    assert.equal(file.guideFrom, 'plan-file');
+    assert.deepEqual(file.guide?.steps.map((s) => s.text), ['Open the key page.', 'Press Rotate.']);
+    assert.deepEqual([file.effortMin, file.deadline, file.why, file.whySource], [10, '2026-10-21', 'reserved', 'declared'],
+      'the bullet\'s effort, deadline and reason, though the ledger holds none');
+    const ledger = byId.get(ledgerItem)!.step!;
+    assert.equal(ledger.guideFrom, 'ledger');
+    assert.deepEqual(ledger.options?.map((o) => [o.id, o.recommended ?? false]), [['box', true], ['cloud', false]]);
+    assert.equal(byId.get(ledgerItem)!.type, 'decide');
+    const table = byId.get(tableItem)!.step!;
+    assert.equal(table.guideFrom, 'errands-table');
+    assert.equal(table.eref, 'E-2');
+    assert.deepEqual(table.guide?.steps.map((s) => [s.text, s.code ?? null]),
+      [['Run this command.', 'bash scripts/box.sh restart'], ['comment `restarted` on acme #14', null]]);
+    assert.match(table.guide?.summary ?? '', /runs? from `~\/work\/acme`/);
+    assert.equal(table.errand?.verifyCommand, 'bash scripts/box.sh --check');
+
+    // A plan edit flows to the card with no ledger write: the guide file changes, and so does the item.
+    const ledgerBefore = readFileSync(join(INSTANCE_STATE_DIR, 'human-steps.ndjson'), 'utf8');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    writeFileSync(join(root, 'docs', 'guides', 'rotate.md'), 'The old key leaked.\n\n## Steps\n1. Press Rotate now.\n', 'utf8');
+    byId = await items();
+    assert.deepEqual(byId.get(fileItem)!.step!.guide?.steps.map((s) => s.text), ['Press Rotate now.']);
+    assert.equal(readFileSync(join(INSTANCE_STATE_DIR, 'human-steps.ndjson'), 'utf8'), ledgerBefore, 'nothing written to the ledger');
+    // A guide file that is refused costs the item its file guide, never the item.
+    writeFileSync(join(root, 'docs', 'guides', 'rotate.md'), `Why.\n\n## Steps\n1. Paste ${['gh', 'p_', 'b'.repeat(36)].join('')}.\n`, 'utf8');
+    byId = await items();
+    assert.ok(byId.has(fileItem));
+    assert.equal(byId.get(fileItem)!.step!.guide, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

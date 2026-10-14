@@ -2,7 +2,8 @@
  * The permission card (7.0, quiet-console phase 8; control-tower phase 138,
  * #215; §Architecture 19 "the permission card, by rule").
  *
- * A permission item is answered here in ONE press. The card says why it was
+ * A permission item is an APPROVAL (turn-by-turn phase 8): *Approve* at a
+ * scope, or *Deny*, with a note — answered here in ONE press. The card says why it was
  * raised — "Raised because the AI lacks permission to …", the command, why the
  * phase needs it, the wall and its rule — then offers the scopes the item's
  * wall allows as ONE control, narrowest first, each saying what it covers and
@@ -32,7 +33,7 @@
 import { useId, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { GRANT_SCOPE_WORDS, type GrantScope, type RiskTier, type Wall } from '@shared/turn-model.js';
-import { CommandBlock } from '@/cards/guide';
+import { CodeBlock } from '@/ui/code-block';
 import { stamp } from '@/cards/human-step-card';
 import type { InboxAction, InboxItem } from '@/data/api';
 import type { PermissionRecord } from '@/data/human-steps';
@@ -413,7 +414,9 @@ export function PermissionCard({
             {permission.need}
           </p>
         )}
-        {permission.command && !permission.never && <CommandBlock code={permission.command} />}
+        {permission.command && !permission.never && (
+          <CodeBlock code={permission.command} testId="guide-command" />
+        )}
         <p className="text-meta text-ink-muted">
           Stopped by {WALL_WORDS[permission.wall] ?? permission.wall}
           {permission.rule ? (
@@ -442,7 +445,7 @@ export function PermissionCard({
             {permission.command && (
               <li className="flex flex-col gap-1">
                 <span>The command, to run yourself if you mean it:</span>
-                <CommandBlock code={permission.command} />
+                <CodeBlock code={permission.command} testId="guide-command" />
               </li>
             )}
             <li>
@@ -571,7 +574,7 @@ export function PermissionCard({
           )}
           {!permission.never && scope && (
             <label className="flex max-w-(--measure) flex-col gap-1 text-meta text-ink-muted">
-              Why (optional). The session reads it.
+              A note, if you want to say why. The session reads it.
               <Input
                 value={reason}
                 block
@@ -598,7 +601,7 @@ export function PermissionCard({
                   ? 'Granting…'
                   : high && !rule
                     ? 'Show the rule to type'
-                    : `Grant, ${SCOPE_LABEL[scope].toLowerCase()}`}
+                    : `Approve, ${SCOPE_LABEL[scope].toLowerCase()}`}
               </Button>
             )}
             {convert && (

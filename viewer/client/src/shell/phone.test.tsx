@@ -97,9 +97,9 @@ const COUNTS: ShellCounts = {
 const NO_TURN = {
   round: { at: '2026-10-09T00:00:00.000Z', n: 0, ranAt: null, changedAt: null },
   headline: 'Nothing needs you now.',
-  groups: { now: [], decide: [], upcoming: [], checking: [], done: [] },
+  groups: { approve: [], now: [], decide: [], upcoming: [], checking: [], done: [] },
   handled: [],
-  counts: { now: 0, decide: 0, upcoming: 0, checking: 0, done: 0, total: 0, handled: 0 },
+  counts: { approve: 0, now: 0, decide: 0, upcoming: 0, checking: 0, done: 0, total: 0, handled: 0 },
   seen: null,
   issues: null,
 } as TurnAnswer;

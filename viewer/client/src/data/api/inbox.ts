@@ -128,6 +128,8 @@ export type InboxItem = {
   since: string;
   /** ISO 8601 — when the ask stops being a person's to answer (a relayed question's window). */
   expiresAt?: string;
+  /** ISO 8601 — when a person's act stops being open (a human step's window) — never a countdown (#341). */
+  openUntil?: string;
   actions: InboxAction[];
   /** Where in the console it lives. */
   href: string;
@@ -159,6 +161,34 @@ export type InboxItem = {
    * escalation needs, and the cap that held it. Only on a `supervisor` row.
    */
   supervisor?: InboxSupervisorView;
+  /**
+   * The ways on, each bound to the verb that takes it, at most one recommended
+   * (turn-by-turn phase 4) — an errand's, a conflict's, a QA verdict's, a
+   * relayed question's and a session's ask. The row's `actions` stay its buttons.
+   */
+  options?: TurnOption[];
+  /** A yes or a no's block: what, who asked, if approved, if denied (turn-by-turn phase 4). */
+  approval?: ApprovalBlock;
+};
+
+/** One way on, bound to its verb — `server/turn/compose.ts` `TurnOption`. */
+export type TurnOption = {
+  id: string;
+  label: string;
+  consequence?: string;
+  recommended?: boolean;
+  verb: { method: 'POST' | 'GET' | 'DELETE'; endpoint: string; body?: unknown };
+  says?: { field: string; label: string; placeholder?: string };
+  flag?: string;
+};
+
+/** What a yes or a no is about — `server/turn/compose.ts` `ApprovalBlock`. */
+export type ApprovalBlock = {
+  what: string;
+  askedBy: string;
+  ifApproved: string;
+  ifDenied: string;
+  scopes?: string[];
 };
 
 /** What a `supervisor` row carries of its card — `server/inbox.ts` `InboxSupervisorView`. */

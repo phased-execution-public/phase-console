@@ -202,6 +202,8 @@ signin() { pe_outcome demo 8 needs-human --needs credential --step browser-login
 
 @test "turn: a bullet with no why: is an advisory (F40), never a gate" {
   setup_docs turn turn
+  # The guide the fixture's first bullet names exists (F42 gates on a missing one).
+  mkdir -p "$DOCS_ROOT/guides" && printf 'Why.\n\n## Steps\n1. Sign in.\n' > "$DOCS_ROOT/guides/gh-sign-in.md"
   run pg turn --lint
   [ "$status" -eq 0 ]
   [[ "$output" == *"F40 phase 2: human-step-no-why — the operator-act step \"restart the box\" names no why:"*"(reserved)"* ]]

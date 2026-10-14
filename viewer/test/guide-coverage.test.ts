@@ -234,6 +234,63 @@ test('the Your turn guide names the page, its groups, every reason, and the chec
   assert.doesNotMatch(text, /typed once into the card's form/, 'your-turn.md still says a secret is typed into the card');
 });
 
+test('turn-by-turn phase 9: both Your turn guides name every v2 label — the groups, the six statuses and the owner, NOW and NOT YET, Goes to, Checked by, Undo, the strip and the filters', async () => {
+  const { TURN_GROUP_LABEL, PERSON_STATUS_LABEL, READINESS_LABEL, TYPE_META, ITEM_TYPES } = await import('../shared/turn-model.js');
+  const model = viewerFile('client/src/screens/turn/page-model.ts');
+  // The filter slot's five, read from the page's own table.
+  const filters = ['status', 'time', 'plan', 'type', 'to'].map((key) => {
+    const label = new RegExp(`\\n  ${key}: '([^']+)',`).exec(model)?.[1];
+    assert.ok(label, `page-model.ts labels the filter ${key}`);
+    return label!;
+  });
+  const words = [
+    ...Object.values(TURN_GROUP_LABEL),
+    ...Object.values(PERSON_STATUS_LABEL),
+    ...Object.values(READINESS_LABEL).map((label) => label.toUpperCase()),
+    ...ITEM_TYPES.map((type) => TYPE_META[type].label),
+    ...filters,
+    'Handled by the AI', 'Heads-up', 'Where the plans stand', 'Next deadline', 'passed today',
+    'Goes to', 'Checked by', 'Undo', 'Group', 'Sort', 'View',
+  ];
+  for (const id of ['your-turn', 'your-turn.fa']) {
+    const text = flat(read(id));
+    for (const word of words) assert.ok(text.includes(word), `${id}.md names "${word}"`);
+    assert.ok(!text.includes('Needs one detail from you'), `${id}.md still names the 7.0 group "Needs one detail from you"`);
+  }
+});
+
+test('turn-by-turn phase 12: both Your turn guides explain the timing grid, Goes to and Checked by, Undo, Hand it back and the run requests — in the words the card draws', async () => {
+  const { ROUTE_META, CHECKED_BY_LABEL } = await import('../shared/turn-model.js');
+  const { RUN_ACT_META } = await import('../shared/verb-model.js');
+  // The grid's cells, read from the card itself, so a renamed cell reds the guides.
+  const cells = [...viewerFile('client/src/cards/turn/timing.tsx').matchAll(/<Cell label="([^"]+)"/g)].map((m) => m[1]!);
+  assert.equal(cells.length, 6, 'timing.tsx draws six cells');
+  const act = viewerFile('client/src/cards/turn/act.tsx');
+  assert.ok(act.includes('Give back to Phase {giveBackPhase}'), 'the card still offers Give back to Phase N');
+  const moves = viewerFile('client/src/cards/turn/moves.ts');
+  const moveLabel = (key: string) => {
+    const found = new RegExp(`\\n  ${key}: (?:'([^']+)'|"([^"]+)"),`).exec(moves);
+    const label = found?.[1] ?? found?.[2];
+    assert.ok(label, `moves.ts labels the move ${key}`);
+    return label!;
+  };
+  const words = [
+    ...cells,
+    // Free's routes; the supervisor's row is Pro and said inside a region.
+    ...(['phase', 'run', 'gate', 'console'] as const).map((to) => ROUTE_META[to].label),
+    ...Object.values(CHECKED_BY_LABEL),
+    ...Object.values(RUN_ACT_META).map((meta) => meta.title),
+    moveLabel('undo'), moveLabel('decide'), moveLabel('redo'), moveLabel('gotIt'),
+    'Hand it back', 'Give back to Phase', 'Ask the session a question', "I can't do this", 'None set',
+  ];
+  for (const id of ['your-turn', 'your-turn.fa']) {
+    const text = flat(read(id));
+    for (const word of words) assert.ok(text.includes(word), `${id}.md names "${word}"`);
+    assert.ok(!/\bGrant, (this call|always)\b/.test(text), `${id}.md still names the 7.0 grant button; the card says "Approve, <scope>"`);
+    assert.ok(!text.includes('Send my answer'), `${id}.md still names the 7.0 decision button; the card says "Send my decision"`);
+  }
+});
+
 test('the permissions guide says what a grant is — its scopes, its tiers, the never list and the three publishing asks', async () => {
   const { RISK_TIERS, HOST_COMMANDS, GRANT_SCOPES } = await import('../shared/turn-model.js');
   const { OPEN_PR_ASK, PUBLISH_ASK } = await import('../server/runner/approvals.ts');

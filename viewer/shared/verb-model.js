@@ -347,6 +347,14 @@ export const OPERATOR_VERBS = Object.freeze([
   }),
   verb('plan-approval', 'act', 'POST /api/run/:slug/plan-approval', { actor: 'label', method: 'decidePlan' }),
   verb('settings', 'act', 'POST /api/run/:slug/settings', { actor: 'label', method: 'configureRun' }),
+  // A phase's run request (turn-by-turn phase 6, #286): the ONE approval per
+  // run and act — Approve takes the act, Deny tells every phase that asked no.
+  verb('run-request', 'act', 'POST /api/run/:slug/run-request', {
+    actor: 'press',
+    method: 'answerRunRequest',
+    cli: cli(['slug', 'phase'], { '--answer': 'answer', '--note': 'note' }),
+    summary: "answer a phase's run request — approve takes the act, deny tells the phases that asked no",
+  }),
 ]);
 
 /** The verbs by name — derived, never re-typed. */
@@ -355,6 +363,69 @@ export const VERB_NAMES = Object.freeze(OPERATOR_VERBS.map((row) => row.name));
 /** One row by name, or `undefined`. */
 export function verbNamed(name) {
   return OPERATOR_VERBS.find((row) => row.name === name);
+}
+
+/**
+ * The acts only the RUN can take, which a phase asks for with `phase-outcome.sh
+ * … blocked --needs run --run-act <act>` (turn-by-turn phase 6, #286). A session
+ * cannot press its own console (`console-forge`), so a run-level ask declared
+ * as a permission reached nobody: the supervisor takes a run request (Pro), or
+ * ONE approval per run and act asks a person (Free). Each is an operator verb
+ * BY NAME — asserted below — none an authority verb and none on the never list
+ * (`test/turn-run-requests.test.ts`). Bash twin: `scripts/turn.env` RUN_ACTS.
+ */
+export const RUN_ACTS = Object.freeze(
+  /** @type {const} */ (['isolate', 'switch-account', 'raise-budget', 'stop', 'hold']),
+);
+
+/** @typedef {(typeof RUN_ACTS)[number]} RunAct */
+
+/**
+ * Each run act's words: the act as a title, and what approving or denying it
+ * does. A person meets them on the ONE approval (Free) and in *Handled by the
+ * AI* (Pro); `server/turn/compose.ts` composes the item from them.
+ * @type {Readonly<Record<RunAct, Readonly<{ title: string, ifApproved: string, ifDenied: string }>>>}
+ */
+export const RUN_ACT_META = Object.freeze({
+  isolate: Object.freeze({
+    title: 'Relaunch this run isolated',
+    ifApproved: 'The run stops at its next boundary and starts again in a checkout of its own.',
+    ifDenied: 'The run stays in its shared checkout; the phases that asked are told no.',
+  }),
+  'switch-account': Object.freeze({
+    title: 'Move this run to another account',
+    ifApproved: 'The run moves to the account with the most headroom at its next boundary.',
+    ifDenied: 'The run stays on its account; the phases that asked are told no.',
+  }),
+  'raise-budget': Object.freeze({
+    title: "Raise the phase's dollar budget",
+    ifApproved:
+      "The phase's dollar budget is raised by the amount you write in the note, and the phase retried.",
+    ifDenied: 'The budget stays as it is; the phases that asked are told no.',
+  }),
+  stop: Object.freeze({
+    title: 'Stop this run',
+    ifApproved: 'The run stops; its live sessions are ended the safe way.',
+    ifDenied: 'The run keeps going; the phases that asked are told no.',
+  }),
+  hold: Object.freeze({
+    title: 'Hold this run',
+    ifApproved: 'No new phase is admitted; the running ones finish.',
+    ifDenied: 'The run keeps admitting phases; the phases that asked are told no.',
+  }),
+});
+
+for (const act of RUN_ACTS) {
+  if (!verbNamed(act)) throw new Error(`verb-model: run act ${act} is not an operator verb`);
+}
+
+/**
+ * Is `word` a run act?
+ * @param {unknown} word
+ * @returns {word is RunAct}
+ */
+export function isRunAct(word) {
+  return typeof word === 'string' && /** @type {readonly string[]} */ (RUN_ACTS).includes(word);
 }
 
 /**

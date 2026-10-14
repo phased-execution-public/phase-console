@@ -77,6 +77,7 @@ import { useHumanSteps } from '@/data/turn';
 import { cn } from '@/lib/cn';
 import { useRoute } from '@/shell/router';
 import { Button, Input, KeyValue, toast, type KeyValueItem } from '@/ui';
+import { CodeBlock } from '@/ui/code-block';
 import { CopyButton } from '@/ui/copy-button';
 import { Disclosure } from '@/ui/disclosure';
 import { OpsStatus, STATUS_ICONS } from '@/ui/status';
@@ -281,9 +282,10 @@ export function useStepVerbs(view: HumanStepView) {
    * either way (#266) — proven, being checked, or not yet, in the verdict's
    * own words (what the proof read, the exit it saw).
    */
-  function check() {
+  function check(note?: string) {
     if (!id) return;
-    void run('check', () => api.humanStepCheck(id)).then((got) => {
+    const said = note?.trim();
+    void run('check', () => (said ? api.humanStepCheck(id, said) : api.humanStepCheck(id))).then((got) => {
       if (!got) return;
       if (got.check?.landed || got.verdict?.state === 'passed') toast('Proven — the phase carries on.', 'ok');
       else if (got.check?.state === 'checking')
@@ -292,9 +294,10 @@ export function useStepVerbs(view: HumanStepView) {
     });
   }
 
-  function snooze() {
+  /** *Snooze* — an hour by default; the card's menu offers longer. */
+  function snooze(minutes = 60) {
     if (!id) return;
-    void run('snooze', () => api.humanStepSnooze(id, 60)).then((got) => {
+    void run('snooze', () => api.humanStepSnooze(id, minutes)).then((got) => {
       if (got?.snoozed) toast(`No reminder before ${clockTime(got.snoozed.until)}.`, 'ok');
     });
   }
@@ -372,14 +375,7 @@ export function DeviceCode({ code }: { code: string }) {
 
 /** What an operator act asks to be run, in its own words — a queue of commands a person can copy. */
 function StepCommand({ command }: { command: string }) {
-  return (
-    <div className="flex min-w-0 flex-wrap items-center gap-2" data-testid="step-command">
-      <code dir="ltr" className="min-w-0 font-mono text-meta wrap-anywhere text-ink select-all">
-        {command}
-      </code>
-      <CopyButton text={command} label="Copy command" />
-    </div>
-  );
+  return <CodeBlock code={command} testId="step-command" copyLabel="Copy command" />;
 }
 
 /** Not due yet: what the act waits on before it becomes a person's turn. */
@@ -712,8 +708,10 @@ function StepRow({ item, view, perform, busy, className }: HumanStepCardProps & 
       className={cn('flex min-w-0 flex-col gap-2', className)}
     >
       <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+        {/* The row's title is the composer's — the act, as the card heads it
+            (turn-by-turn phase 10); the step's own words are the fallback. */}
         <span data-testid="step-title" className="min-w-0 flex-1 basis-48 text-body font-medium text-ink">
-          {view.title}
+          {(item.kind === 'human-step' && item.title) || view.title}
         </span>
         <KindMark kind={view.kind} />
         <WhereWord where={view.where} />
@@ -888,7 +886,7 @@ function FullCard({
             variant="ghost"
             data-testid="step-snooze"
             disabled={verbs.busy === 'snooze'}
-            onClick={verbs.snooze}
+            onClick={() => verbs.snooze()}
           >
             Snooze
           </Button>

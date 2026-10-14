@@ -121,6 +121,8 @@ export const DECISION_KEY_OF_NEED = Object.freeze({
   credential: 'credentials',
   gate: 'gates',
   external: 'waits',
+  // A run request (turn-by-turn phase 6) is the RUN's act, nobody's decision row.
+  run: null,
 });
 
 /**

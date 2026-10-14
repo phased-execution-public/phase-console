@@ -177,9 +177,15 @@ export function SituationLine({
   );
 }
 
-/** Your turn's figure: what a person owes NOW — Do now and Needs one detail, the two groups the page's own headline counts. */
-export function turnsOf(turn: { counts: { now: number; decide: number } } | undefined): number {
-  return turn ? turn.counts.now + turn.counts.decide : 0;
+/**
+ * Your turn's figure: what a person owes NOW — Approve, Do now and Decide, the
+ * groups the page's own headline counts (the groups v2, turn-by-turn phase 9).
+ * A 7.0 console's answer has no Approve, and counts as zero there.
+ */
+export function turnsOf(
+  turn: { counts: { approve?: number; now: number; decide: number } } | undefined,
+): number {
+  return turn ? (turn.counts.approve ?? 0) + turn.counts.now + turn.counts.decide : 0;
 }
 
 export default function SituationSlot({

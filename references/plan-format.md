@@ -304,7 +304,8 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    person can do on its own bullet, so the launch door can ask for it before anything spawns:
    `- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any ·
    window: <duration> [· auto-open: host] [· credential: <id>] [· due: <ref>] [· why: <reason>]
-   [· effort: <duration>] [· unblocks: <phases>] [· guide: <file>]`. The kind and what to do are
+   [· effort: <duration>] [· unblocks: <phases>] [· guide: <file>] [· options: id=Label[::consequence] | …]
+   [· recommended: <id>] [· deadline: <ISO 8601>]`. The kind and what to do are
    positional; every later field is `key: value`, in any order, a value in one pair of backticks read
    without them. The kind is one of eighteen (`scripts/human-steps.env`, owner
    `viewer/shared/human-step-model.js`): `browser-login`, `device-code`, `one-time-code`,
@@ -317,17 +318,51 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    the step open by itself on the machine — a PLAN's step only, never a session's; `credential:` is
    the registry id a `secret-entry` stores under; `due:` is a watch ref the step waits on before it is
    due — until it lands the step is `upcoming`, listed under *Coming up*, unannounced and its window
-   not started, and when it lands the step is due with ONE push, `NOW: <command>` (a `due:` that fits no
+   not started, and when it lands the step is due with ONE push, `Now: <the act>` (a `due:` that fits no
    scheme's shape — a date with no time, a `phase:` with no number — fails F37 by name). Your turn's four
    (control-tower phase 130, #207): `why:` — why only a person fits it, a reason from
    `scripts/turn.env`'s `WHY_PERSON` that the kind allows (`KIND_REASONS`, owner
    `viewer/shared/turn-model.js`; one the kind does not allow fails F37), `effort:` — how long it takes
    the person, `unblocks:` — the phases it unblocks (`12,13`), and `guide:` — a guide file under the
    docs root in the grammar of `viewer/shared/guide-grammar.js` (a why paragraph, `## Steps` with
-   numbered steps and their commands, `## If it goes wrong`; 20 steps and 24 KB at most). A phase may
-   carry several. The same bullet under a top-level `## Operator errands` heading is the PLAN's own act —
+   numbered steps and their commands, `## If it goes wrong`; 20 steps and 24 KB at most). The console
+   READS that file (turn-by-turn phase 2): at the launch door, into the item, and again on every read of
+   Your turn, so an edit to it flows to the card — realpath under the docs root (a symlink that leads
+   out is refused), 24 KB at most, the guide grammar and its secret screen; a file it refuses costs the
+   item its guide, never the item, and a path that is not a file fails the lint (**F42**
+   `guide-file-missing`, a gate). Three more keys (turn-by-turn phase 2): `options:` — a `decision`
+   step's choices, two to eight, `id=Label[::consequence]` separated by `|` (an id is a-z, 0-9 and `-`);
+   `recommended:` — the id of one of them; and `deadline:` — the ISO 8601 date or instant the act must
+   be done BY (`2026-10-20`, `2026-10-20T17:00Z`) — an END, where `due:` is a START. None of the three
+   is printed by `--human-steps`, whose lines stay what they were; the console reads them from the plan.
+   A phase may carry several. The same bullet under a top-level `## Operator errands` heading is the PLAN's own act —
    phase `0`, asked at every launch and listed with the rest, e.g.
    `- **Human step:** operator-act · Publish the release · open: npm publish · proof: cmd:"npm view my-package version" · due: unit:build-box/nightly-build.service`.
+   **The `## Operator errands` table** (turn-by-turn phase 2). The same section may hold one table, a
+   row per act, that the console reads for the act's steps — the bullet keeps the machine's fields
+   (kind, proof, due), the row keeps a person's: `| Id | Phase · why | What only the owner can do |
+   Exact steps | Expected | How the agent verifies |`. Columns are found by NAME (`Id` or `Ref`; `What
+   only the owner can do` or `What`; `Exact steps` or `Steps`; `Expected`; `How the agent verifies` or
+   `Verify`), the second column is free and kept as written, and a bullet is BOUND to its row when its
+   text ends with the row's id in parentheses — `… (E-4)`, `… (E-4, hub #105)`. In `Exact steps` a
+   backticked `` `! cmd` `` is a command step and everything else is prose, kept as one step (the
+   console never invents steps from sentences); a command holding a `<placeholder>` is shown as a
+   template to fill in; a `\|` or a pipe inside backticks stays in its cell; the preamble's "runs from
+   `<dir>`" is kept as a hint. A guide comes from the bullet's `guide:` file first, then from its row.
+   A row no bullet names is a heads-up — nothing checks it or waits on it — and is advised about
+   (**F43** `errand-row-unbound`, by id). An item the 7.0 door raised is matched to its bullet by the
+   same `(E-N…)`, so it gains the row's steps with no ledger write and is never asked twice:
+   ```markdown
+   ## Operator errands
+
+   Every `!` line runs from `~/work/acme`.
+
+   | Id | Phase · why | What only the owner can do | Exact steps | Expected | How the agent verifies |
+   |---|---|---|---|---|---|
+   | E-1 | 3 · third-party | restart the build box | `! bash ops/box.sh restart` then comment `restarted` on #14 | the box answers | `! bash ops/box.sh --check` |
+
+   - **Human step:** operator-act · restart the build box after the upgrade (E-1) · open: bash ops/box.sh --check · proof: cmd:"bash ops/box.sh --check" · why: reach · due: phase:my-plan/3
+   ```
    Read back with `phase-graph.sh <slug> --human-steps [N]` (`0` for the plan's own; a ninth field, the
    `due:` ref, when the bullet names one, and four more — why, effort in minutes, unblocks, guide —
    when it names one of those). **The 5.1.0 spelling `- **Human step:** <who, what,
@@ -337,7 +372,10 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    (`human-step-field-invalid`). A step with no `proof:` is advised about (**F38**
    `human-step-no-proof`): only a person's word can close it. A step with no `why:` is advised about
    too (**F40** `human-step-no-why`) — never a gate: the item is given its kind's default reason,
-   marked inferred.
+   marked inferred. And a task or a decision whose words are the plan's own — an `operator-act`, a
+   `physical` act, a `third-party-approval`, a `decision` — with no `guide:`, no `options:` and no bound
+   table row is advised about (**F41** `human-step-no-guide`): the person would get a title and no
+   steps. The kinds the console walks a person through itself (a sign-in, a code, a prompt) are not.
    **Spelling the model.** The `**Target model:**` value may be an alias (`opus`), a full id
    (`claude-opus-5`), or either carrying the `[1m]` window suffix (`opus[1m]`, `claude-opus-5[1m]`) — all
    parse the same. The suffix, not the alias, is what claims the ~200K budget (`references/sizing.md`;
@@ -419,7 +457,10 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    vocabulary order (a plan with no manifest prints nothing and lints clean). The boot prompt hands
    every phase its rows, `outstanding` first, together with the one duty the manifest puts on a
    session: a block is declared **by key** — `phase-outcome.sh <slug> <N> blocked --needs <key>` —
-   never asked in prose (`references/conventions.md` §Rulings). The other direction exists too: a
+   never asked in prose (`references/conventions.md` §Rulings). An act only the RUN can take —
+   isolate it, switch its account, raise its budget, stop or hold it — is no decision key and no
+   permission: it is `blocked --needs run --run-act <act>`, a run request the supervisor takes (Pro)
+   or one approval per run and act asks a person for (`references/turn.md` §A run request). The other direction exists too: a
    ruling that names its key (`… ruling --needs <key> --remember plan`) becomes a twin row with
    `source: ruling` the moment it is recorded, and the console's inbox offers the same for any
    keyed ruling — which is how what one plan's sessions decided seeds the next plan's manifest

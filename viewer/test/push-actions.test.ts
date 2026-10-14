@@ -35,6 +35,8 @@ import {
   mintActionToken,
   notificationButtons,
   readActionToken,
+  lockScreenOf,
+  lockScreenTypeOf,
 } from '../server/push/actions.ts';
 import { inboxItemId } from '../shared/attention-model.js';
 import { notificationActions, actionOf, actionRequest } from '../shared/sw-push.js';
@@ -168,7 +170,9 @@ test('the answerable verbs are exactly the six that ANSWER something', () => {
   // lands resumes anything — an answer, never a start. `grant` (control-tower
   // phase 138, #215) is a permission item's *Allow*: a grant at the item's
   // narrowest scope, minted only where the `device` door may press it.
-  assert.deepEqual(Object.keys(PUSH_ACTION_VERBS), ['allow', 'grant', 'deny', 'approve', 'extend', 'check']);
+  // `approve` sits before `deny` since turn-by-turn phase 10: a run request's
+  // lock screen is Approve then Deny, the yes on the left like Allow's.
+  assert.deepEqual(Object.keys(PUSH_ACTION_VERBS), ['allow', 'grant', 'approve', 'deny', 'extend', 'check']);
   for (const forbidden of ['recover', 'stop', 'freeze', 'steer', 'release', 'restart', 'dismiss', 'login']) {
     assert.equal(isPushActionVerb(forbidden), false, `${forbidden} must not be answerable from a notification`);
   }
@@ -181,6 +185,10 @@ test('buttons come out in the catalogue order, whatever order they went in', () 
     { action: 'deny', title: 'Deny' },
   ]);
   assert.deepEqual(notificationButtons(['approve']), [{ action: 'approve', title: 'Approve' }]);
+  assert.deepEqual(notificationButtons(['deny', 'approve']), [
+    { action: 'approve', title: 'Approve' },
+    { action: 'deny', title: 'Deny' },
+  ]);
   assert.deepEqual(notificationButtons(['recover']), []);
 });
 
@@ -265,4 +273,46 @@ test('a review-held phase gets the notification and NOT the Approve button', asy
   // never puts on a `gated` event. Same regex `runner-loop.ts` boards on.
   assert.match(live, /const humanGate = \/\^\(manual\|human\|OVERDUE\)\$\/i\.test\(gate\?\.kind \?\? ''\)/);
   assert.match(live, /\.\.\.\(approvable\s*\n?\s*\?\s*\{ answer:/);
+});
+
+/* ------------------------------------------------------------------ *
+ * 4. the lock screen per type (turn-by-turn phase 10)
+ * ------------------------------------------------------------------ */
+
+test('PA-10: the lock screen offers what the card offers, by its type, and only what the device door may press', () => {
+  const OPEN = { action: 'open', title: 'Open' };
+  // A Task: Open and I did it — the proof runs on the console.
+  const task = lockScreenOf({ kind: 'browser-login', proofType: 'probe' });
+  assert.equal(lockScreenTypeOf({ kind: 'browser-login', proofType: 'probe' }), 'do');
+  assert.deepEqual(task.buttons, [OPEN, { action: 'check', title: 'I did it' }]);
+  assert.deepEqual(task.verbs, ['check']);
+  // A Decision: Open alone — its answer is one of its options, on the card.
+  for (const decision of [
+    { kind: 'decision', proofType: 'answer' },
+    { kind: 'operator-act', proofType: 'answer' },
+    { kind: 'operator-act', options: [{ id: 'a' }, { id: 'b' }] },
+  ]) {
+    assert.equal(lockScreenTypeOf(decision), 'decide', JSON.stringify(decision));
+    assert.deepEqual(lockScreenOf(decision), { buttons: [OPEN], verbs: [] });
+  }
+  // An Approval that is a run request: Approve and Deny — both ANSWERS, which
+  // the device door may press — the yes on the left.
+  const request = lockScreenOf({ kind: 'operator-act', proofType: 'answer', runAct: 'isolate', options: [{}, {}] });
+  assert.equal(lockScreenTypeOf({ kind: 'operator-act', runAct: 'isolate' }), 'approve');
+  assert.deepEqual(request.buttons, [
+    { action: 'approve', title: 'Approve' },
+    { action: 'deny', title: 'Deny' },
+  ]);
+  assert.deepEqual(request.verbs, ['approve', 'deny']);
+  // An Approval the lock screen cannot answer (a check by eye has no run act): Open alone.
+  assert.equal(lockScreenTypeOf({ kind: 'person-check' }), 'approve');
+  assert.deepEqual(lockScreenOf({ kind: 'person-check' }), { buttons: [OPEN], verbs: [] });
+  // A permission item keeps its grant-or-open and Deny (control-tower phase 138).
+  const low = lockScreenOf({ kind: 'permission', permission: { wall: 'ask', family: 'any', scopes: ['call', 'phase'] } });
+  assert.deepEqual(low.verbs, ['grant', 'deny']);
+  const never = lockScreenOf({ kind: 'permission', permission: { wall: 'guard', family: 'any', scopes: [], never: true } });
+  assert.deepEqual(never.buttons, [OPEN, { action: 'deny', title: 'Deny' }]);
+  assert.deepEqual(never.verbs, ['deny']);
+  // Every list keeps the platform cap.
+  for (const screen of [task, request, low, never]) assert.ok(screen.buttons.length <= MAX_NOTIFICATION_ACTIONS);
 });

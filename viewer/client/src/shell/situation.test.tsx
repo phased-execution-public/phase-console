@@ -106,11 +106,11 @@ function turn(
   groups: Partial<Record<'now' | 'decide' | 'upcoming' | 'checking' | 'done', number>> = {},
   handled = 0,
 ) {
-  const n = { now: 0, decide: 0, upcoming: 0, checking: 0, done: 0, ...groups };
+  const n = { approve: 0, now: 0, decide: 0, upcoming: 0, checking: 0, done: 0, ...groups };
   return {
     round: { at: NOW, n: 1, ranAt: null, changedAt: null },
     headline: '',
-    groups: { now: [], decide: [], upcoming: [], checking: [], done: [] },
+    groups: { approve: [], now: [], decide: [], upcoming: [], checking: [], done: [] },
     handled: [],
     // The server's own fold (`server/turn/index.ts`): the open total over the
     // four live groups, and the AI's handled count beside it.

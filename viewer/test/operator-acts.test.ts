@@ -11,7 +11,7 @@
  *         --due-when <ref>`), it is born `upcoming` — shown, never pushed,
  *         never reminded, never expired — and its inbox row is *Coming up*;
  *   OA-2  the moment its ref lands it becomes `declared` with ONE push,
- *         "NOW: <command>", then `notified`; its window starts then; a second
+ *         "Now: <the act>", then `notified`; its window starts then; a second
  *         landing pushes nothing;
  *   OA-3  the console's own pass probes every upcoming act's due-when ref and
  *         every plan act's proof — a date past is due, a date ahead is not, a
@@ -100,8 +100,9 @@ test('OA-1 — `--act --due-when` reaches the ledger as an upcoming operator act
     assert.equal(row!.severity, 'fyi', 'coming up is not needs-you');
     assert.equal(row!.humanStep?.state, 'upcoming');
     assert.equal(row!.humanStep?.dueWhen, ACT.due_when);
-    assert.match(row!.title, /^Coming up — carry out a task for demo phase 7$/);
-    assert.match(row!.how, /due when gh:acme\/app#run\/42 lands/);
+    // The composer's words (turn-by-turn phase 3): the act, and its start in words — never the ref.
+    assert.equal(row!.title, ACT.title);
+    assert.match(row!.how, /^Not yet — it starts when the run 42 in acme\/app finishes; then/);
   } finally {
     s.cleanup();
   }
@@ -162,7 +163,7 @@ test('OA-1 — a session\'s act that is not due summons nobody: its park\'s erra
 });
 
 /* ------------------------------------------------------------------ *
- * OA-2 — due: ONE push, "NOW: <command>"
+ * OA-2 — due: ONE push, "Now: <the act>" — never the raw command on the lock screen
  * ------------------------------------------------------------------ */
 
 test('OA-2 — the due-when ref lands: declared, ONE push saying NOW and the command, notified; the window starts now', () => {
@@ -194,17 +195,18 @@ test('OA-2 — the due-when ref lands: declared, ONE push saying NOW and the com
     assert.ok(again && 'refused' in again, 'an act is due once');
     assert.equal(pushed.length, 1);
 
-    // The words: NOW and the exact command, on the lock screen.
+    // The words: now, and the act — the command stays on the item, off the lock screen.
     const push = humanStepPush({ ...due, label: KIND_META['operator-act'].label });
-    assert.equal(push.message.title, 'NOW: phase-console update hub --when-idle');
-    assert.match(push.message.body, /Restart the hub console on the new build — demo phase 7/);
+    assert.equal(push.message.title, 'Now: Restart the hub console on the new build');
+    assert.match(push.message.body, /^Phase 7 of demo/);
+    assert.ok(!push.message.body.includes('phase-console update hub'), 'no raw command on the lock screen');
     // A click path names its act instead.
     const click = humanStepPush({
       id: 'c', kind: 'operator-act', label: KIND_META['operator-act'].label, title: 'Add the signing key in Vercel',
       where: 'any', slug: 'site', phase: 0, openUrl: 'https://vercel.com/acme/site/settings',
     });
-    assert.equal(click.message.title, 'NOW: Add the signing key in Vercel');
-    assert.match(click.message.body, /the plan site/, 'phase 0 is the plan itself');
+    assert.equal(click.message.title, 'Now: Add the signing key in Vercel');
+    assert.match(click.message.body, /^The plan site/, 'the plan\'s own act is the plan itself');
   } finally {
     s.cleanup();
   }
@@ -256,7 +258,7 @@ test('OA-3 — the pass makes due what has landed and only that; a plan act whos
     const mine = pushed.slice(before).filter((p) => (p.message.step as { id?: string } | undefined)?.id === dueNow.id);
     assert.equal(mine.length, 1, 'ONE push, at the moment it became due');
     assert.equal(mine[0]!.category, 'needs-you');
-    assert.equal(mine[0]!.message.title, `NOW: ${ACT.open_command}`);
+    assert.equal(mine[0]!.message.title, `Now: ${ACT.title}`);
 
     // A second pass is quiet: due once, pushed once.
     await svc.humanStepDuePass();
@@ -361,7 +363,8 @@ test('OA-4 — one list across plans: every act due now before any coming up, ea
     const gamma = rows.find((row) => row.humanStep?.stepId === ownAct.id)!;
     assert.equal(gamma.slug, 'gamma');
     assert.equal(gamma.phase, undefined);
-    assert.match(gamma.title, /for gamma \(the plan's own\)$/);
+    assert.equal(gamma.title, 'Renew the domain', 'titled by the act');
+    assert.equal(gamma.href, '#/plan/gamma/phases', 'a row of the plan');
   } finally {
     s.cleanup();
   }

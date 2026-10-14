@@ -332,3 +332,18 @@ test('an operator act lights the family of its REASON, and every reason has one 
   assert.equal(humanStepCategory('browser-login', 'secret'), 'credentials', 'any other kind lights its own family');
   assert.equal(humanStepCategory('permission', 'permission'), 'decision');
 });
+
+test('the inbox row of a plan operator act lights its REASON’s family — at the machine is the environment (turn-by-turn phase 1)', async () => {
+  const { buildInbox } = await import('../server/inbox.ts');
+  const at = '2026-10-07T11:00:00.000Z';
+  const act = {
+    id: 'step-plan-act', kind: 'operator-act', title: 'Plug the test board in', where: 'host', slug: 'alpha', phase: 3,
+    birth: 'plan', state: 'notified', declaredAt: at, at, why: 'physical', proofType: 'attest', source: { kind: 'plan-bullet' },
+  };
+  const rowOf = (step: Record<string, unknown>) =>
+    buildInbox({ humanSteps: [step] } as never, Date.parse('2026-10-07T12:00:00.000Z'), { all: true }).items.find((row) => row.kind === 'human-step');
+  assert.deepEqual(rowOf(act)?.category, { word: 'environment', label: HALT_CATEGORY_LABELS.environment });
+  // No reason named: the default (`reserved`) is a decision; any other kind lights its own family.
+  assert.equal(rowOf({ ...act, why: undefined })?.category?.word, 'decision');
+  assert.equal(rowOf({ ...act, kind: 'browser-login', why: 'secret' })?.category?.word, 'credentials');
+});

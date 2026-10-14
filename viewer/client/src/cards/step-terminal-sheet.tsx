@@ -15,7 +15,7 @@
 import { Suspense, lazy } from 'react';
 import type { StepTerminalTicket } from '@/data/human-steps';
 import { Spinner } from '@/ui';
-import { CopyButton } from '@/ui/copy-button';
+import { CodeBlock } from '@/ui/code-block';
 import { Sheet, SheetContent } from '@/ui/sheet';
 
 /** The emulator, behind the one dynamic import of the sessions pane. */
@@ -42,16 +42,12 @@ export function StepTerminalSheet({ ticket, command, title, onClose }: StepTermi
         bodyClassName="flex min-h-0 flex-col gap-2 px-3 pb-3"
       >
         <div data-testid="step-terminal" className="flex min-w-0 flex-col gap-2">
-          <div className="flex min-w-0 items-start gap-2">
-            <code
-              data-testid="step-terminal-command"
-              dir="ltr"
-              className="min-w-0 flex-1 overflow-x-auto rounded bg-ground px-2.5 py-1.5 font-mono text-meta whitespace-pre text-ink select-all"
-            >
-              {command}
-            </code>
-            <CopyButton text={command} label="Copy command" />
-          </div>
+          <CodeBlock
+            code={command}
+            testId="step-terminal-command"
+            copyLabel="Copy command"
+            claudeCode={false}
+          />
           <div className="h-[min(22rem,calc(var(--app-height,100%)*0.55))] min-h-48 overflow-hidden rounded bg-ground-deep">
             {ticket && (
               <Suspense

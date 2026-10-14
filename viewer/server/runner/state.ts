@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { DEFAULT_PRIORITY, type RunPriority } from '../../shared/orchestration-model.js';
+import type { RunAct } from '../../shared/verb-model.js';
 import type { AttemptWindow } from '../../shared/phase-clocks.js';
 import {
   DEFAULT_CONFLICT, DEFAULT_LAND,
@@ -48,6 +49,7 @@ import type { LandingProof, WorktreeRefusal } from './worktree.ts';
 import type { HolderEta } from './scheduler.ts';
 import type { CiNotRun } from '../watch-refs.ts';
 import { pidAlive, pidHoldsWork, processState, type ProcessState } from '../pid.ts';
+import { autoResolveSuperseded } from './supersede.ts';
 import type { PermissionProfile } from './approvals.ts';
 import type { RecordedWall } from '../permissions/walls.ts';
 import type { PermissionMode } from './spawn.ts';
@@ -1407,6 +1409,16 @@ export type PhaseRecord = {
     rule?: string;
     command?: string;
     /**
+     * A run request's act (turn-by-turn phase 6, #286) — `needs: run` with the
+     * act the phase asked the RUN to take. `compat` marks one the console READ
+     * as a run request from recorded facts (a `permission` declaration naming
+     * no rule or command, on a shared checkout whose lane is not on
+     * `pe/<slug>`), with the word the session used kept in `askedAs`.
+     */
+    runAct?: RunAct;
+    compat?: boolean;
+    askedAs?: string;
+    /**
      * The landing that resumed this declaration, written ON the declaration
      * rather than beside it.
      *
@@ -2304,18 +2316,22 @@ export function identityEcho(identity: IdentityLike): IdentityLike {
  * two ways on, each with the verb that takes it. One copy, shared by the
  * runner's park and the service's park of a run no loop drives.
  */
-export function identityChangeWords(slug: string, was: IdentityLike, now: IdentityLike): { halt: string; need: string; how: string } {
+export function identityChangeWords(_slug: string, was: IdentityLike, now: IdentityLike): {
+  halt: string; need: string; how: string; identity: { was: string; now: string };
+} {
   const who = (i: IdentityLike) => i.email ?? i.org ?? `identity ${i.key.slice(0, 8)}`;
   const label = was.account === 'default' ? 'the machine login' : `account ${was.account}`;
+  // The how names the two presses in words (turn-by-turn phase 4): the item
+  // carries both as options bound to the run's identity verb, and no route
+  // is written where a person reads.
   return {
     halt: `${label} changed identity — it is now ${who(now)} (was ${who(was)}, whom this run started on); `
       + 'parked until a person chooses: continue on the new login, or move to the profile of the identity it started on',
     need: `A person's choice: ${label} now answers ${who(now)}, not ${who(was)}, whose login this run started on — `
       + 'nothing resumes on somebody else\'s login by itself.',
-    how: `Continue on the new login (${who(now)}): press "Continue on the new login" on the run `
-      + `(POST /api/run/${slug}/identity {"choice":"continue"}). Or move the run to the profile of ${who(was)}: `
-      + `press "Move to ${who(was)}'s profile" ({"choice":"move"}) — register and sign in a profile as ${who(was)} `
-      + 'under Settings ▸ Accounts first if there is none.',
+    how: `Choose "Continue on ${who(now)}" to go on with the new login, or "Move the run to ${who(was)}'s profile" — `
+      + `register and sign in a profile as ${who(was)} under Settings ▸ Accounts first if there is none.`,
+    identity: { was: who(was), now: who(now) },
   };
 }
 
@@ -2341,6 +2357,12 @@ export function applyErrandAnswer(state: RunState, phase: number, answer: Errand
 export type Errand = {
   phase: number;
   situation: string;
+  /**
+   * The two logins of an identity park (turn-by-turn phase 4): the one the run
+   * started on and the one its account answers now, as a person reads them —
+   * the item's two options name both.
+   */
+  identity?: { was: string; now: string };
   tried: string[];
   need: string;
   how: string;
@@ -2578,6 +2600,12 @@ export type RunResolution = {
    * dismissal written before this was kept, or when the board could not be read.
    */
   ready?: number[];
+  /**
+   * The run that replaced this one (turn-by-turn phase 7): set when the
+   * superseded predicate (`runner/supersede.ts`) resolved it, with `auto` true
+   * and the reason "superseded by run <id>".
+   */
+  supersededBy?: string;
 };
 
 /**
@@ -6133,6 +6161,13 @@ export function resolveRunsAgainst(
    * fail-safe direction an unreadable board takes.
    */
   qaHeld: ReadonlyMap<string, ReadonlySet<number>> = new Map(),
+  /**
+   * The superseded predicate's facts (turn-by-turn phase 7): which runs are
+   * driven now, and who is told when a run is resolved as superseded. Absent,
+   * nothing is resolved as superseded — a caller that cannot say what is live
+   * must not close a run.
+   */
+  supersede?: { live: LiveRuns; superseded?: (run: RunState, by: RunState) => void },
 ): RunState[] {
   const changed: RunState[] = [];
   for (const run of runs) {
@@ -6161,7 +6196,15 @@ export function resolveRunsAgainst(
     const records = RECORD_RECONCILABLE.includes(run.status) && !run.reopenedAt
       ? reconcileRecordsAgainstBoard(run, board)
       : { changed: false, closed: [] };
-    const resolved = autoResolveRun(run, board, qaHeld.get(run.slug));
+    let resolved = autoResolveRun(run, board, qaHeld.get(run.slug));
+    // Not overtaken by the board — replaced by a later run of the plan? The
+    // board's phases are the plan's, so an unscoped run's debt is known.
+    if (!resolved && supersede && !run.reopenedAt) {
+      const by = autoResolveSuperseded(run, runs, {
+        live: supersede.live, board, planPhases: Object.keys(board).map(Number).filter(Number.isInteger),
+      });
+      if (by) { resolved = true; supersede.superseded?.(run, by); }
+    }
     // Last, and independent of the two above: both of those annotate a run that
     // is over without ever moving it off a status the UI paints `needs-you`, and
     // `autoResolveRun` returns early for one already resolved — so nothing

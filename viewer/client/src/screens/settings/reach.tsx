@@ -29,6 +29,7 @@ import { SETUP_PROMPTS } from '@shared/setup-prompts.js';
 import type { ServeCommand, TailscaleDevice, TailscaleServe, TailscaleStatus } from '@/data/api';
 import { useTailscale } from '@/data/machine';
 import { Banner, KeyValue, Mono, RelativeTime, Skeleton } from '@/ui';
+import { CodeBlock } from '@/ui/code-block';
 import { CopyButton } from '@/ui/copy-button';
 import { Disclosure } from '@/ui/disclosure';
 import { SettingsGroup } from './setting';
@@ -112,18 +113,9 @@ export function reachMismatch(
   return null;
 }
 
+/** A setup line, in the one command block (`ui/code-block.tsx`): a template says what to fill in first. */
 function CommandBlock({ text, label }: { text: string; label: string }) {
-  return (
-    <div className="flex min-w-0 items-start gap-2">
-      <pre
-        dir="ltr"
-        className="m-0 min-w-0 flex-1 whitespace-pre-wrap wrap-anywhere rounded-sm bg-ground-deep p-2 font-mono text-meta leading-relaxed text-ink"
-      >
-        {text}
-      </pre>
-      <CopyButton text={text} label={label} />
-    </div>
-  );
+  return <CodeBlock code={text} copyLabel={label} claudeCode={false} testId="reach-command" />;
 }
 
 /** The commands, in the order that never leaves a live-but-broken address. */

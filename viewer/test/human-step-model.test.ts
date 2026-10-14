@@ -88,13 +88,22 @@ test('eighteen kinds and eleven states, frozen, each word once', () => {
   assert.deepEqual([...HUMAN_STEP_BIRTHS], ['plan', 'session', 'console', 'supervisor']);
 });
 
+test('#271: every one of the four births tells a card where its press goes (turn-by-turn phase 1)', async () => {
+  const { ROUTE_TO, routeOf } = await import('../shared/turn-model.js');
+  assert.equal(HUMAN_STEP_BIRTHS.length, 4, 'four births — plan, session, console, supervisor');
+  const routes = Object.fromEntries(HUMAN_STEP_BIRTHS.map((birth) => [birth, routeOf({ birth, source: birth === 'console' ? 'preflight' : birth, record: 'ledger', waiters: [{ phase: 2 }] })]));
+  for (const route of Object.values(routes)) assert.ok((ROUTE_TO as readonly string[]).includes(route));
+  assert.deepEqual(routes, { plan: 'phase', session: 'phase', console: 'console', supervisor: 'run' });
+});
+
 test('the open and settled states partition the eleven', () => {
   assert.deepEqual([...HUMAN_STEP_OPEN_STATES, ...HUMAN_STEP_SETTLED_STATES], [...HUMAN_STEP_STATES]);
   assert.deepEqual([...HUMAN_STEP_OPEN_STATES], ['upcoming', 'declared', 'notified', 'opened', 'checking', 'returned']);
 });
 
 test('the plan bullet gains why, effort, unblocks and guide; returned and declined move as phase 130 says', () => {
-  assert.deepEqual(HUMAN_STEP_BULLET_KEYS.slice(-4), ['why', 'effort', 'unblocks', 'guide']);
+  // Turn-by-turn phase 2 appends options, recommended and deadline after them.
+  assert.deepEqual(HUMAN_STEP_BULLET_KEYS.slice(-7), ['why', 'effort', 'unblocks', 'guide', 'options', 'recommended', 'deadline']);
   assert.ok(canTransition('checking', 'returned'), 'a check sends a step back');
   assert.ok(!canTransition('notified', 'returned'), 'only a check does');
   for (const from of ['upcoming', 'declared', 'notified', 'opened', 'checking', 'returned']) {

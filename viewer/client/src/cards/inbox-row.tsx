@@ -42,6 +42,7 @@ import { MicField } from '@/ui/mic-field';
 // By its own path, never the family's index: it reads no status table.
 import { SeverityMark } from '@/ui/status/severity';
 import { LazyHumanStepCard } from './human-step-lazy';
+import { TurnRowWords } from './turn/row-words';
 
 /* ------------------------------------------------------------------ *
  * Performing one
@@ -279,8 +280,9 @@ export function InboxRow({
   const says = item.actions.find((action) => action.says)?.says;
   const paint = SEVERITY_UI[item.severity] ?? 'queued';
   const since = Date.parse(item.since);
-  // A relayed question's window (phase 14): the console answers by rule when it closes.
-  const windowLeft = useWindowLeft(item.expiresAt);
+  // A relayed question's window (phase 14): the console answers by rule when it
+  // closes. Only a question's — any other row's clock is not an answer by rule (#341).
+  const windowLeft = useWindowLeft(item.kind === 'question' ? item.expiresAt : undefined);
   const href = hrefFor ? hrefFor(item) : toHash(item.href);
   // An operator's own issue draft belongs to no plan: its slug is the ledger's
   // name, `_operator`, which says nothing to a person.
@@ -331,67 +333,71 @@ export function InboxRow({
             aria-label={`${checked ? 'Unpick' : 'Pick'} ${item.title}`}
           />
         )}
-        {step ? (
-          <LazyHumanStepCard
-            item={item}
-            variant="row"
-            perform={perform}
-            {...(busy ? { busy } : {})}
-            className="min-w-0 flex-1"
-          />
-        ) : (
-          <div className="min-w-0 flex-1">
-            <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
-              <SeverityMark severity={item.severity}>
-                {INBOX_KIND_LABELS[item.kind] ?? item.kind}
-              </SeverityMark>
-              {/* The halt family of the stop, named by the server so this row
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+          {/* The card's words first (turn-by-turn phase 10): NOW or NOT YET, and the type. */}
+          <TurnRowWords turn={item.turn} />
+          {step ? (
+            <LazyHumanStepCard
+              item={item}
+              variant="row"
+              perform={perform}
+              {...(busy ? { busy } : {})}
+              className="min-w-0 flex-1"
+            />
+          ) : (
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+                <SeverityMark severity={item.severity}>
+                  {INBOX_KIND_LABELS[item.kind] ?? item.kind}
+                </SeverityMark>
+                {/* The halt family of the stop, named by the server so this row
                   loads none of the family's tables. */}
-              {item.category && (
-                <span
-                  data-halt-category={item.category.word}
-                  className="shrink-0 text-meta font-medium text-ink-muted"
+                {item.category && (
+                  <span
+                    data-halt-category={item.category.word}
+                    className="shrink-0 text-meta font-medium text-ink-muted"
+                  >
+                    {item.category.label}
+                  </span>
+                )}
+                {/*
+                 * `min-w-48` is the title saying what it is worth: beside a
+                 * badge and a clock that cannot shrink, `min-w-0` alone shrank
+                 * the one thing that says WHICH errand this is to nothing. The
+                 * line wraps, so the clock takes the next line instead.
+                 * `relative`: a positioned link hit-tests above the pick box's
+                 * thumb-floor overlay, which overhangs its 16 px box.
+                 */}
+                <a
+                  href={href}
+                  onClick={open}
+                  className="min-w-48 flex-1 truncate font-medium text-ink hover:underline relative"
+                  title={item.title}
                 >
-                  {item.category.label}
-                </span>
-              )}
-              {/*
-               * `min-w-48` is the title saying what it is worth: beside a
-               * badge and a clock that cannot shrink, `min-w-0` alone shrank
-               * the one thing that says WHICH errand this is to nothing. The
-               * line wraps, so the clock takes the next line instead.
-               * `relative`: a positioned link hit-tests above the pick box's
-               * thumb-floor overlay, which overhangs its 16 px box.
-               */}
-              <a
-                href={href}
-                onClick={open}
-                className="min-w-48 flex-1 truncate font-medium text-ink hover:underline relative"
-                title={item.title}
-              >
-                {item.title}
-              </a>
-              {/* An empty `since` is a fact with no clock (an account signed
+                  {item.title}
+                </a>
+                {/* An empty `since` is a fact with no clock (an account signed
                   out; nothing records WHEN), never "just now". */}
-              {Number.isFinite(since) && (
-                <RelativeTime at={since} className="shrink-0 text-meta text-ink-faint" />
-              )}
-              {/* A window ends in somebody else's answer, so it ticks. */}
-              {windowLeft !== null && (
-                <span data-testid="inbox-window" className="shrink-0 text-meta text-ink-muted tabular-nums">
-                  {windowLeft > 0 ? `${windowLeft} s to answer` : 'answering by rule'}
-                </span>
+                {Number.isFinite(since) && (
+                  <RelativeTime at={since} className="shrink-0 text-meta text-ink-faint" />
+                )}
+                {/* A window ends in somebody else's answer, so it ticks. */}
+                {windowLeft !== null && (
+                  <span data-testid="inbox-window" className="shrink-0 text-meta text-ink-muted tabular-nums">
+                    {windowLeft > 0 ? `${windowLeft} s to answer` : 'answering by rule'}
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 line-clamp-2 text-meta text-ink-muted md:line-clamp-none">{item.need}</p>
+              {/* Muted, not faint: which console, plan and phase is read before acting. */}
+              {!compact && where.length > 0 && (
+                <p data-testid="inbox-where" className="mt-0.5 text-meta text-ink-muted">
+                  {where.join(', ')}
+                </p>
               )}
             </div>
-            <p className="mt-0.5 line-clamp-2 text-meta text-ink-muted md:line-clamp-none">{item.need}</p>
-            {/* Muted, not faint: which console, plan and phase is read before acting. */}
-            {!compact && where.length > 0 && (
-              <p data-testid="inbox-where" className="mt-0.5 text-meta text-ink-muted">
-                {where.join(', ')}
-              </p>
-            )}
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       {!step && (item.how || item.tried?.length) && (

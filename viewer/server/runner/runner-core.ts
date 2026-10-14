@@ -11,6 +11,7 @@
  * outside this folder is affected by the split.
  */
 
+import { RUN_ACTS } from '../../shared/verb-model.js';
 import type { RecordedWall, TodayGrant } from '../permissions/walls.ts';
 import type { DeclareInput, HumanStep, TurnRefused } from '../human-steps.ts';
 import type { TreeHold } from './tree-state.ts';
@@ -1846,6 +1847,10 @@ export function unattendedDirective(
     // prompt already carries the manifest and the `--needs` duty, and the
     // script's own refusal names the whole vocabulary.
     `  (<key>: a ## Decisions key — --decisions ${phase} — or ${NEED_CLASSES.join('|')})`,
+    // A run-level act is the RUN's (turn-by-turn phase 6, #286): a session
+    // cannot press its own console, so a permission ask for one reaches nobody.
+    `- An act only the RUN can take (${RUN_ACTS.join(', ')})? It is never a permission — declare it and stop:`,
+    `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} blocked --needs run --run-act <act> --reason "<why the run must>"`,
     '- Must stop with WORK STILL LEFT (your budget or context is nearly spent)? Commit what is done,',
     '  write the handoff `in-progress`, then declare it so the supervisor RESUMES you instead of',
     '  reading a failed phase:',

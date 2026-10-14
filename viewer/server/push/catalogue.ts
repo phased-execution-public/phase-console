@@ -17,6 +17,7 @@
  */
 
 import { GRANT_SCOPE_WORDS } from '../../shared/turn-model.js';
+import { actTitle, composePush, scopeWords, type LedgerFacts } from '../turn/compose.ts';
 
 export type CategoryId =
   | 'approval' | 'session-ask' | 'needs-you' | 'gate' | 'qa' | 'halted' | 'parked' | 'stalled'
@@ -290,39 +291,30 @@ export type HumanStepPush = {
 };
 
 /**
- * One human step's announcement: the words (a title naming the kind and the
- * phase, a body saying what to do — with the device code, when the kind has
- * one) and the payload's `step` block. `detail`, which is what a webhook and
+ * One human step's announcement, in the composer's words (turn-by-turn phase
+ * 3, `turn/compose.ts`): a title that names the act — "Now: …" for an
+ * operator act, "Your turn: …" for any other — and a body that says where and
+ * how it is checked, with the device code when the kind has one. Never a
+ * command and never a proof ref on the lock screen; never "phase 0" — the
+ * plan's own act is "the plan <slug>". `detail`, which is what a webhook and
  * the out-of-band notice carry off the machine, never holds the code.
  * `actions` is the lock screen's list (`lockScreenOf`); an act's by default.
  */
-export function humanStepPush(step: {
-  id: string; kind: string; label: string; title: string; where: 'host' | 'any'; slug: string; phase: number; code?: string;
-  openCommand?: string; openUrl?: string; actions?: readonly StepPushAction[];
-}): { message: { title: string; body: string; detail: string }; step: HumanStepPush } {
-  const place = step.where === 'host' ? ' — at the machine the console runs on' : '';
-  // Phase 0 is the plan itself — its `## Operator errands` (control-tower phase 121).
-  const scope = step.phase > 0 ? `${step.slug} phase ${step.phase}` : `the plan ${step.slug}`;
-  // An operator act says what to do NOW, on the lock screen (#182): the exact
-  // command when it has one, else the act itself — a click path is its lines.
-  const title = step.kind === 'operator-act'
-    ? `NOW: ${step.openCommand ?? step.title}`
-    : `Your turn: ${step.label.toLowerCase()} — ${scope}`;
-  const body = step.kind === 'operator-act'
-    ? `${step.title} — ${scope}${step.openUrl ? `: ${step.openUrl}` : ''}${place}.`
-    : `${step.title}${step.code ? ` — code ${step.code}` : ''}${place}.`;
+export function humanStepPush(step: PushStep): { message: { title: string; body: string; detail: string }; step: HumanStepPush } {
   return {
-    message: {
-      title,
-      body,
-      detail: `${step.title}${place}.`,
-    },
+    message: composePush(step),
     step: {
       id: step.id, kind: step.kind, where: step.where, actions: step.actions ?? HUMAN_STEP_PUSH_ACTIONS,
       ...(step.code ? { code: step.code } : {}),
     },
   };
 }
+
+/** What a step's push is composed from — the ledger's step, its kind's label and its lock-screen buttons. */
+export type PushStep = LedgerFacts & {
+  id: string; kind: string; label: string; title: string; where: 'host' | 'any'; slug: string; phase: number; code?: string;
+  openCommand?: string; openUrl?: string; actions?: readonly StepPushAction[];
+};
 
 /**
  * A step's REMINDER (control-tower phase 43) — the same payload as its first
@@ -331,26 +323,17 @@ export function humanStepPush(step: {
  * rides the first push's tag, so a device shows one notification per step,
  * replaced, never a pile.
  */
-export function humanStepReminderPush(
-  step: Parameters<typeof humanStepPush>[0], n: number,
-): ReturnType<typeof humanStepPush> {
+export function humanStepReminderPush(step: PushStep, n: number): ReturnType<typeof humanStepPush> {
   const first = humanStepPush(step);
-  return {
-    message: {
-      title: `Still your turn: ${step.label.toLowerCase()} — ${step.slug} phase ${step.phase}`,
-      body: `${first.message.body} Reminder ${n}.`,
-      detail: `${first.message.detail} Reminder ${n}.`,
-    },
-    step: first.step,
-  };
+  return { message: composePush(step, { reminder: n }), step: first.step };
 }
 
 /** The words of a check's push — the one tag the item's pushes ride, so it replaces the first. */
 type TurnWords = { title: string; body: string; detail: string };
 
-/** The item's scope in words: a phase of a plan, or the plan itself (phase 0). */
+/** The item's scope in words: a phase of a plan, or the plan itself — the composer's. */
 function scopeOf(step: { slug: string; phase: number }): string {
-  return step.phase > 0 ? `${step.slug} phase ${step.phase}` : `the plan ${step.slug}`;
+  return scopeWords(step.slug, step.phase);
 }
 
 /**
@@ -366,7 +349,7 @@ export function humanStepReturnedPush(
   const redo = verdict.redo.length ? ` ${verdict.state === 'needs-info' ? 'Send' : 'Redo'}: ${verdict.redo.join('; ')}` : '';
   return {
     message: {
-      title: `${head}: ${step.label.toLowerCase()} — ${scopeOf(step)}`,
+      title: `${head}: ${actTitle(step.title)} — ${scopeOf(step)}`,
       body: `${step.title} — attempt ${verdict.attempt}: ${verdict.note}${redo}`,
       detail: `${step.title} — attempt ${verdict.attempt} came back ${verdict.state}.`,
     },
@@ -383,7 +366,7 @@ export function humanStepEscalationPush(
 ): { message: TurnWords } {
   return {
     message: {
-      title: `Stuck after ${rejections} checks: ${step.label.toLowerCase()} — ${scopeOf(step)}`,
+      title: `Stuck after ${rejections} checks: ${actTitle(step.title)} — ${scopeOf(step)}`,
       body: `${step.title} came back ${rejections} times. Rewrite the guide, say you can't, or accept it anyway — every attempt is on the item.`,
       detail: `${step.title} came back ${rejections} times and needs the owner.`,
     },

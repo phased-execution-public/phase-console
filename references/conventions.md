@@ -669,7 +669,8 @@ a ruling can be promoted to a standing answer (`scripts/decisions.sh <slug> prom
 `decisionKey` needs no `--key`), and a block is declared **by key** —
 `phase-outcome.sh <slug> <N> blocked|needs-human --needs <key>`, required there (exit 2 without),
 where `<key>` is a decision key or a blocker class as its short form (`credential`, `permission`,
-`gate`, `external`, `lock`). The runner reads the key BEFORE the prose, so what a session needs is
+`gate`, `external`, `lock`, and `run` with `--run-act <act>` for an act only the run can take —
+§A person's turn). The runner reads the key BEFORE the prose, so what a session needs is
 its own word rather than a regex's guess over its sentences; a key the manifest lacks is a defect
 report, not a routine ask. Never ask in prose: prose reaches nobody.
 
@@ -727,7 +728,11 @@ step**: `phase-outcome.sh <slug> <N> blocked --needs permission --rule "<rule>" 
 raises ONE `permission` item when it cites a wall the console recorded for your lane (else exit 4,
 G5: nothing refused this — run it); a person answers it with a grant at a scope (`call`, `phase`,
 `plan`, `repository`, `always`), *Deny* or *I'll do it myself*, and the never list has no grant.
-**The answer comes back as the console's sentence**, once per waiting session — "The operator answered
+**A run-level act is a run request, never a permission** (turn-by-turn phase 6, #286): relaunch
+isolated, switch account, raise the budget, stop or hold is declared `phase-outcome.sh <slug> <N>
+blocked --needs run --run-act <act>`; the supervisor takes it (Pro) or ONE approval per run and act asks
+a person (Free), and a `permission` declaration naming no rule or command on a shared checkout whose
+lane is not on `pe/<slug>` is read as `--run-act isolate`. **The answer comes back as the console's sentence**, once per waiting session — "The operator answered
 `<option>`: <note>", "The operator declined: <reason>. Do not ask again; …", a grant's "run it again"
 — and a decision declared with `--decision-key <key>` has its answer written to the plan's
 `## Decisions` table first. **What you handled is recorded**: `phase-outcome.sh <slug> <N> handled

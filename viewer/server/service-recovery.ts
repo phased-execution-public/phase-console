@@ -102,6 +102,10 @@ const MAX_WATCH_REJECTIONS = MAX_BOOT_RESUMES;
 import type { WatchLandingOutcome } from './watch-scheduler.ts';
 import type { ClassifiedBy, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
 import { asActor, doorActor, isAutomatic, pressActor, pressDoorOf, viaOfTrigger, type StartActor } from './actor.ts';
+import { isRunRequestOf, runRequestInstruction } from './turn/run-requests.ts';
+import { isRunAct, type RunAct } from '../shared/verb-model.js';
+import { stepGateOf } from './turn/compose.ts';
+import { stalePass } from './turn/stale.ts';
 import { ceilingSentence } from './start-ceiling.ts';
 import { consoleEnded } from './runner/session-record.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
@@ -132,7 +136,7 @@ import { SETTLED_WELL } from '../shared/run-lifecycle.js';
 import { EVIDENCE_DIR, EVIDENCE_PER_ATTEMPT, isEvidenceRefusal, readEvidence, screenEvidence, storeEvidence } from './turn/evidence.ts';
 import { checkRouteOf, returnedSentence, shapeVerdict, type StepVerdict } from './turn/verdict.ts';
 import { guideCommands } from '../shared/guide-grammar.js';
-import { REASON_META } from '../shared/turn-model.js';
+import { whyPersonWords } from '../shared/turn-model.js';
 import { CHECK_EVIDENCE_MAX, CHECK_TIMEOUT_MS, TurnChecker, type CheckResult } from './turn/checker.ts';
 import { spawnClaude, type SpawnFn } from './runner/spawn.ts';
 import { grantedPush, humanStepEscalationPush, humanStepReturnedPush } from './push/catalogue.ts';
@@ -234,6 +238,9 @@ export function consoleLockRef(
 
 /** The most a person's answer note or decline reason may say (control-tower phase 133). */
 const ANSWER_NOTE_MAX = 2_000;
+/** How long an answer waits for the lane that parked on it to leave before it is pressed again (turn-by-turn phase 11). */
+const ROAD_BACK_LANE_WAIT_MS = 30_000;
+
 /** The most one question may say, and the most questions one item holds. */
 const QUESTION_MAX = 1_000;
 const QUESTIONS_MAX = 20;
@@ -3014,6 +3021,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
     }
   }
 
+  /**
+   * The attempts a person took back (*Undo*, turn-by-turn phase 5), as
+   * `<id>:<attempt>`: a probe's or a terminal's verdict for one is dropped.
+   * In memory, like the checks in flight it answers — a restart ends both.
+   */
+  private readonly undoneChecks = new Set<string>();
+
   /** The checks being asked now (a probe's, a terminal's) — a judgement's stay in `checksInFlight` once it is started. */
   private readonly checksAsked = new Set<string>();
 
@@ -3023,7 +3037,9 @@ export abstract class ServiceRecovery extends ServiceRuns {
     opts: { by: string; terminalExit?: number; byPerson?: boolean; note?: string; actor?: StartActor; resumeVia?: 'errand' },
   ): Promise<StepVerbResult> {
     const ledger = this.humanStepsNow();
-    const begun = ledger.move(id, 'checking', { by: opts.by, verb: 'check' });
+    // The note rides the move that starts the attempt (turn-by-turn phase 5):
+    // kept for every proof type, where only a judgement once read it.
+    const begun = ledger.move(id, 'checking', { by: opts.by, verb: 'check', ...(opts.note ? { sent: opts.note } : {}) });
     if ('refused' in begun) return refusedMove(begun);
     const attempt = begun.attempts;
     const ref = step.proof
@@ -3235,6 +3251,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
     const ledger = this.humanStepsNow();
     const step = ledger.get(id);
     if (!step) return { ok: false, status: 404, error: 'no such step' };
+    // The check was taken back (*Undo*, turn-by-turn phase 5) or overtaken
+    // while its proof was read: a verdict for an attempt that is no longer the
+    // one being checked answers nothing, and is dropped by its attempt.
+    if (this.undoneChecks.has(`${id}:${verdict.attempt}`) || (step.state === 'checking' && step.attempts !== verdict.attempt)) {
+      this.stepJournal(step, 'phase.human-step-check-skipped', { attempt: verdict.attempt, why: 'superseded' });
+      return { ok: true, check: { state: 'superseded', attempt: verdict.attempt }, step: this.stepView(id) };
+    }
     count('turn_checks_total', [verdict.by, verdict.state]);
     if (cost && cost.costUsd > 0) count('turn_check_usd_total', [cost.model], cost.costUsd);
     const check = { landed: verdict.state === 'passed', read, state: verdict.state, by: verdict.by, attempt: verdict.attempt, ...(ref ? { ref } : {}) };
@@ -3359,6 +3382,38 @@ export abstract class ServiceRecovery extends ServiceRuns {
     this.stepJournal(moved, 'phase.human-step-rewrite', { by: opts.by, attempts: moved.attempts, verdicts: moved.verdicts?.length ?? 0 });
     const resumes = await this.roadBack(moved, 'dismissed', rewriteGuideInstruction(moved), opts, `${opts.by} asked for a new version of it`);
     return { ok: true, rewrite: { at: moved.at }, resumes, step: this.stepView(id) };
+  }
+
+  /**
+   * *Undo* (turn-by-turn phase 5, §Architecture 4) — a check taken back while
+   * it runs: the item goes back to where it stood, *Redo* when an earlier check
+   * sent it back, else *To do*, and a judgement still reading is stopped. A
+   * verdict that arrives after it is dropped by its attempt (`settleCheck`,
+   * `startJudgement`), so nothing is proven or sent back on a check the person
+   * took back. A settled item stays settled — undo is for `checking` only. A
+   * person's press: a session or the supervisor takes back no person's check.
+   */
+  undoHumanStep(id: string, _input: Record<string, unknown>, opts: { by: string; actor?: StartActor }): StepVerbResult {
+    const found = this.openStepOf(id);
+    if (found.refusal) return found.refusal;
+    const { step } = found;
+    // Fail closed, as Accept anyway and Rewrite do: no actor is no door, and
+    // only a person's door takes a person's check back.
+    const door = opts.actor ? pressDoorOf(opts.actor) : null;
+    if (!door || !isPersonDoor(door, ownerDoorMode())) {
+      return { ok: false, status: 403, error: `Undo takes back a person's check — ${door ? `the ${door} door` : 'a press with no door'} takes back none.`, door };
+    }
+    if (step.state !== 'checking') {
+      return { ok: false, status: 409, error: `Only a check that is still running can be taken back — this item is ${step.state}.`, state: step.state };
+    }
+    const to = step.verdict ? 'returned' : 'opened';
+    const moved = this.humanStepsNow().move(id, to, { by: opts.by, verb: 'undo', note: `${opts.by} took the check back` });
+    if ('refused' in moved) return refusedMove(moved);
+    // The attempt is spent: whatever its proof reads later is dropped (`settleCheck`).
+    this.undoneChecks.add(`${id}:${moved.attempts}`);
+    this.checkAborts.get(id)?.abort();
+    this.stepJournal(moved, 'phase.human-step-undone', { attempt: moved.attempts, to, by: opts.by });
+    return { ok: true, undo: { to, attempt: moved.attempts }, step: this.stepView(id) };
   }
 
   /**
@@ -3519,6 +3574,10 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (found.refusal) return found.refusal;
     const { step } = found;
     if (bodyCarriesSecret(input)) return this.secretRefusal(step);
+    // A gate-bound item is done when its gate opens (turn-by-turn phase 5): an
+    // answer or a note once proved it while the gate stayed shut.
+    const gate = stepGateOf(step);
+    if (gate) return { ok: false, status: 409, error: gateBoundRefusal(gate.phase) };
     const answerable = step.proofType === 'answer' || Boolean(step.options?.length) || step.kind === 'decision' || step.why === 'decision';
     if (!answerable) {
       return { ok: false, status: 409, error: "This item is not a decision — there is nothing to answer. Press I've done this — check, or I can't do this." };
@@ -3538,6 +3597,21 @@ export abstract class ServiceRecovery extends ServiceRuns {
       return { ok: false, status: 400, error: step.options?.length ? 'Choose one of its options, write a note, or both.' : 'Write your answer in the note.' };
     }
     const door = opts.actor ? pressDoorOf(opts.actor) : undefined;
+    // A run request (turn-by-turn phase 6, #286): Approve TAKES the act before
+    // anything is told — a refusal leaves the item open, its sentence the answer.
+    const runAct = isRunRequestOf(step);
+    if (runAct && option?.id === 'approve') {
+      // One answer at a time: the act is taken before the item settles, so a
+      // second press racing the first would take it twice.
+      if (this.runRequestsTaking.has(step.id)) return { ok: false, status: 409, error: 'This run request is being answered already.' };
+      this.runRequestsTaking.add(step.id);
+      try {
+        const taken = await this.takeRunAct(step, runAct, note, opts);
+        if (!taken.ok) return taken;
+      } finally {
+        this.runRequestsTaking.delete(step.id);
+      }
+    }
     if (step.decisionKey) {
       const written = await this.writeDecisionAnswer(step, option?.label ?? '', note, opts.by);
       if (!written.ok) return written;
@@ -3554,13 +3628,110 @@ export abstract class ServiceRecovery extends ServiceRuns {
     this.stepJournal(moved, 'phase.human-step-answered', {
       option: option?.id ?? null, noted: Boolean(note), by: opts.by, door: door ?? null, decisionKey: step.decisionKey ?? null,
     });
-    const resumes = await this.roadBack(moved, 'proven', answeredInstruction(moved, answer), opts,
+    if (runAct) {
+      this.stepJournal(moved, 'run.run-request-decided', {
+        act: runAct, answer: option?.id ?? null, by: opts.by, door: door ?? null,
+        phases: [step.phase, ...otherWaiters(step).filter((w) => w.slug === step.slug).map((w) => w.phase)],
+      });
+    }
+    const told = runAct && (option?.id === 'approve' || option?.id === 'deny')
+      ? runRequestInstruction(runAct, option.id, opts.by, note || undefined)
+      : answeredInstruction(moved, answer);
+    // An approved stop stopped the run the waiters belong to: resuming them
+    // would undo it. Every other answer goes back to the phases that asked.
+    const resumes = runAct === 'stop' && option?.id === 'approve' ? [] : await this.roadBack(moved, 'proven', told, opts,
       `${opts.by} answered ${option ? `"${option.label}"` : 'with a note'}${note ? ` — "${note.slice(0, 200)}"` : ''}`);
     return {
       ok: true, answered: answer, resumes,
       ...(step.decisionKey ? { decision: { key: step.decisionKey, written: true } } : {}),
       step: this.stepView(id),
     };
+  }
+
+  /**
+   * A phase's run request answered (turn-by-turn phase 6, #286) — `POST
+   * /api/run/:slug/run-request {phase, answer, note?}`, the ladder's errand
+   * option and the CLI's `run-request`: the ONE open approval the phase waits
+   * on, answered exactly as its item is (`answerHumanStep`).
+   */
+  async answerRunRequest(
+    slug: string, body: Record<string, unknown>, opts: { by: string; actor?: StartActor },
+  ): Promise<StepVerbResult> {
+    const phase = Number(body.phase);
+    if (!Number.isInteger(phase) || phase < 1) return { ok: false, status: 400, error: 'a phase number is required' };
+    const answer = body.answer === 'approve' || body.answer === 'deny' ? body.answer : null;
+    if (!answer) return { ok: false, status: 400, error: 'pass {"answer": "approve"} or {"answer": "deny"}' };
+    const act = isRunAct(body.act) ? body.act : undefined;
+    const run = await this.runFor(slug);
+    let item = run ? this.runRequestItemOf(slug, run.id, phase, act) : undefined;
+    // A request the phase declared whose item is not raised yet — the
+    // supervisor reads the journal line before the park announces its errand
+    // (turn-by-turn phase 11, the tower rehearsal's run-request trip) — is
+    // raised now, from the run's own record, and then answered.
+    if (!item && run && this.raiseRunRequest(slug, run.id, phase)) item = this.runRequestItemOf(slug, run.id, phase, act);
+    if (!item) return { ok: false, status: 404, error: `Phase ${phase} of ${slug} has no open run request${act ? ` to ${act}` : ''}.` };
+    return this.answerHumanStep(item.id, { option: answer, ...(body.note !== undefined ? { note: body.note } : {}) }, opts);
+  }
+
+  /** Run-request items whose act is being taken right now — one answer at a time. */
+  private readonly runRequestsTaking = new Set<string>();
+
+  /**
+   * The open run-request item phase `phase` of run `runId` waits on — its own,
+   * or one it joined as a waiter — for `act` when one is named (the
+   * supervisor's press always names the act it decided on).
+   */
+  protected runRequestItemOf(slug: string, runId: string, phase: number, act?: RunAct): HumanStep | undefined {
+    return this.humanStepsNow().open().find((step) => isRunRequestOf(step) && (!act || isRunRequestOf(step) === act) && step.slug === slug
+      && [step, ...otherWaiters(step)].some((w) => w.slug === slug && Number(w.phase) === phase && (w.runId ?? step.runId) === runId));
+  }
+
+  /**
+   * Take a run request's act (turn-by-turn phase 6) through the run verb of
+   * its name — each the operator's own verb, so the run journals it as it
+   * journals a press: isolate at the next boundary, hold, switch to the
+   * account with the most headroom at the boundary, raise the phase's dollar
+   * budget by the amount the note names, stop. A run that moved on, or a verb
+   * that refuses, answers 409 with its sentence and the item stays open.
+   */
+  protected async takeRunAct(
+    step: HumanStep, act: RunAct, note: string, opts: { by: string; actor?: StartActor },
+  ): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+    const actor = opts.actor ?? pressActor(asActor(opts.by, 'run-request'));
+    const run = await this.runFor(step.slug);
+    if (!run || run.id !== step.runId) {
+      return { ok: false, status: 409, error: `The run that asked (${step.runId ?? 'unknown'}) is no longer ${step.slug}'s run — nothing to take.` };
+    }
+    switch (act) {
+      case 'isolate': {
+        if (run.checkout === 'worktree') return { ok: true };
+        if (this.isolateRun(step.slug, actor.by)) return { ok: true };
+        return {
+          ok: false, status: 409,
+          error: `${step.slug}'s run commits on the branch its shared checkout stands on, so it cannot take a checkout of its own in place — `
+            + 'stop it and start it again isolated (Runs ▸ the run ▸ Start, with a checkout of its own).',
+        };
+      }
+      case 'hold':
+        return this.holdRun(step.slug, actor) ? { ok: true } : { ok: false, status: 409, error: `No run of ${step.slug} to hold.` };
+      case 'switch-account': {
+        const moved = this.switchAccountRun(step.slug, 'auto', actor, { when: 'boundary' });
+        return moved.ok ? { ok: true } : { ok: false, status: 409, error: moved.reason ?? 'The run could not be moved to another account.' };
+      }
+      case 'raise-budget': {
+        // Money: the note must BE the amount — "10", "$12.50" — never a number
+        // read out of a sentence. The raise's own ceiling refuses a typo.
+        const add = Number(/^\$?\s*(\d+(?:\.\d{1,2})?)$/.exec(note.trim())?.[1]);
+        if (!Number.isFinite(add) || add <= 0) {
+          return { ok: false, status: 400, error: "Write only how many dollars to add to the phase's budget in the note — for example \"10\" or \"$12.50\"." };
+        }
+        const raised = await this.raiseBudget(step.slug, { budget: 'phase-usd', phase: step.phase, add }, actor);
+        return raised.ok ? { ok: true } : { ok: false, status: raised.status, error: raised.error };
+      }
+      case 'stop':
+        await this.stopRun(step.slug, null, actor);
+        return { ok: true };
+    }
   }
 
   /**
@@ -4081,10 +4252,20 @@ export abstract class ServiceRecovery extends ServiceRuns {
         try { saveRun(state); } catch { /* the press re-reads the run; the ledger is the durable fact */ }
       }
       const held = this.automaticResumeHeld(actor, lane.slug);
-      const press: { ok: boolean; error?: string } = held ? { ok: false, error: held }
-        : errandOnIt && !parkedOnIt
-          ? await this.resumeAnsweredErrand(lane.slug, lane.phase, '', actor, undefined, told)
-          : await this.pressResume(lane.slug, lane.phase, 'resume', { instruction: told, actor });
+      const pressNow = () => (errandOnIt && !parkedOnIt
+        ? this.resumeAnsweredErrand(lane.slug, lane.phase, '', actor, undefined, told)
+        : this.pressResume(lane.slug, lane.phase, 'resume', { instruction: told, actor }));
+      let press: { ok: boolean; error?: string } = held ? { ok: false, error: held } : await pressNow();
+      // An answer that came while the lane that parked on it was still winding
+      // down — the supervisor answers within seconds of the park — waits for
+      // the lane to leave and is pressed once more, never lost to an errand
+      // (turn-by-turn phase 11, the tower rehearsal's run-request trip).
+      if (!press.ok && !held && this.liveRunner(lane.slug)?.laneHeld(lane.phase)) {
+        for (let waited = 0; waited < ROAD_BACK_LANE_WAIT_MS && this.liveRunner(lane.slug)?.laneHeld(lane.phase); waited += 250) {
+          await new Promise((resolve) => { setTimeout(resolve, 250); });
+        }
+        press = await pressNow();
+      }
       out.push({ slug: lane.slug, phase: lane.phase, launched: press.ok, ...(press.ok ? {} : { why: press.error }) });
       if (!press.ok) {
         // A lane that must not hear the item's words is not given them here
@@ -4228,6 +4409,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (step.birth === 'console' && (!step.source || step.source.kind === 'console' || step.source.kind === 'stall')) {
       return aged && run.record.status !== 'running' ? 'the session it was raised for is no longer running' : null;
     }
+    // A session's DECISION its phase moved past (#290, turn-by-turn phase 7):
+    // a new attempt began after it was declared and no longer declares it —
+    // the supervisor applied one of its options and resumed the phase, or a
+    // person Retried. That act settled it; it closes, saying so, and is never
+    // answered a second time (an answer would resume the phase again).
+    if (step.birth === 'session' && step.kind === 'decision') {
+      const attempt = run.record.attemptStartedAt ?? run.record.startedAt;
+      if (attempt && Date.parse(attempt) > Date.parse(step.declaredAt)) {
+        return `settled by the act that resumed phase ${step.phase} at ${attempt} — the phase moved past it`;
+      }
+    }
     // Nothing else is withdrawn while its phase is open (control-tower phase
     // 132, #209): a phase resumed PAST a step — the person answered its errand,
     // or Retried — is not a step nobody needs. A step the person did is proven
@@ -4270,6 +4462,86 @@ export abstract class ServiceRecovery extends ServiceRuns {
         by: 'console', verb: 'dismiss', note: `the item it was about is settled${subject ? ` — ${subject.state}` : ''}; nothing is left to do`,
       });
       if (!('refused' in moved)) out.push(step.id);
+    }
+    return out;
+  }
+
+  /**
+   * The stale pass (turn-by-turn phase 7, `turn/stale.ts`): every open item
+   * whose run was superseded, resolved or finished, whose phase the board reads
+   * done, or whose errand is gone closes — dismissed by the console, with its
+   * reason on the item, a row under *Handled by the AI* and `turn.closed-stale`
+   * — and a world act on a superseded run moves to the successor's lane
+   * (`turn.moved-to-successor`), still open. One board read and one run list
+   * per plan per pass; a plan held by the fleet is left alone, and a frozen
+   * console moves nothing.
+   */
+  protected async turnStalePass(now = Date.now()): Promise<{ closed: string[]; moved: string[] }> {
+    const out = { closed: [] as string[], moved: [] as string[] };
+    if (!this.root?.ok) return out;
+    let hold: ReturnType<ServiceRecovery['fleetHold']> | null;
+    try { hold = this.fleetHold(); } catch { hold = null; }
+    if (hold && !hold.plans) return out;
+    let ledger;
+    try { ledger = this.humanStepsNow(); } catch { return out; }
+    const open = ledger.open().filter((step) => !hold?.plans?.includes(step.slug));
+    if (!open.length) return out;
+    const root = this.root.path;
+    const live = this.liveRunIds();
+    const boards = new Map<string, Readonly<Record<number, string>> | null>();
+    for (const slug of new Set(open.flatMap((step) => [step.slug, ...step.waiters.map((w) => w.slug)]))) {
+      try {
+        const read = await this.board(slug);
+        boards.set(slug, read.error ? null : read.states);
+      } catch { boards.set(slug, null); }
+    }
+    const runLists = new Map<string, RunState[]>();
+    const runsOf = (slug: string) => {
+      if (!runLists.has(slug)) {
+        let runs: RunState[] = [];
+        try { runs = listRuns(root, slug, live); } catch { runs = []; }
+        runLists.set(slug, runs);
+      }
+      return runLists.get(slug)!;
+    };
+    const actions = stalePass(open, {
+      run: (slug, runId) => runsOf(slug).find((run) => run.id === runId) ?? null,
+      runs: runsOf,
+      board: (slug) => boards.get(slug) ?? null,
+      live,
+      errandStands: (run, phase, situation) => (run.recoveries?.[phase]?.errand?.situation === situation)
+        || (run.errand?.phase === phase && run.errand.situation === situation),
+      now, graceMs: STEP_WITHDRAW_GRACE_MS,
+    });
+    for (const action of actions) {
+      const step = ledger.get(action.id);
+      if (!step) continue;
+      if ('close' in action) {
+        const moved = ledger.move(step.id, 'dismissed', {
+          by: 'console', verb: 'dismiss', note: `Closed — nobody needs it any more: ${action.close}.`,
+        });
+        if ('refused' in moved) continue;
+        out.closed.push(step.id);
+        log.info('turn.closed-stale', { id: step.id, kind: step.kind, slug: step.slug, phase: step.phase, runId: step.runId ?? null, reason: action.close });
+        this.recordHandled({
+          source: 'console', slug: step.slug, phase: step.phase, ...(step.runId ? { runId: step.runId } : {}),
+          what: `Closed “${step.title}” — nobody needs it any more: ${action.close}`,
+        });
+        continue;
+      }
+      let moved = false;
+      for (const lane of action.move) {
+        const after = ledger.relane(step.id, { slug: step.slug, phase: lane.phase, from: lane.from, to: lane.to });
+        if (!('refused' in after)) moved = true;
+      }
+      if (!moved) continue;
+      out.moved.push(step.id);
+      const to = action.move.map((lane) => lane.to).filter((id, i, all) => all.indexOf(id) === i);
+      log.info('turn.moved-to-successor', { id: step.id, kind: step.kind, slug: step.slug, lanes: action.move, reason: action.reason });
+      this.recordHandled({
+        source: 'console', slug: step.slug, phase: step.phase, runId: to[0],
+        what: `Moved “${step.title}” to run ${to.join(', ')} — it is still owed: ${action.reason}`,
+      });
     }
     return out;
   }
@@ -4362,13 +4634,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
     let step: HumanStep | null = null;
     try { step = this.humanStepsNow().get(id) ?? null; } catch { step = null; }
     if (!step) return { ok: false, status: 404, error: 'no such item' };
-    const reason = REASON_META[step.why as keyof typeof REASON_META];
     return {
       ok: true,
       item: {
         id: step.id, kind: step.kind, title: step.title, state: step.state, birth: step.birth, slug: step.slug, phase: step.phase,
         why: step.why, whySource: step.whySource,
-        whyPerson: reason ? `${reason.label}: ${reason.sentence}.` : `its reason is ${step.why}`,
+        // The sentence alone (#332): the inspector's row labels it, so the label is not said again.
+        whyPerson: whyPersonWords(step.why),
         ...(step.guide ? { guide: step.guide, commands: guideCommands(step.guide) } : {}),
         ...(step.lines?.length ? { lines: step.lines } : {}),
         proofType: step.proofType, ...(step.proof ? { proof: step.proof } : {}), ...(step.proofWords ? { proofWords: step.proofWords } : {}),
@@ -4807,4 +5079,11 @@ export abstract class ServiceRecovery extends ServiceRuns {
     };
   }
 
+}
+
+/** Why a gate-bound item takes no answer or note (turn-by-turn phase 5) — the gate's Approve is its press. */
+function gateBoundRefusal(phase: number | null): string {
+  return phase != null
+    ? `This item is done when the gate on Phase ${phase} opens — approve the gate; an answer or a note does not open it.`
+    : 'This item is done when its gate opens — approve the gate on its phase; an answer or a note does not open it.';
 }

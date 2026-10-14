@@ -236,7 +236,7 @@ test('UD-2: the inbox raises one row once the bound has passed, with Retry — n
   const retry = one.actions.find((action) => action.verb === 'retry');
   assert.ok(retry);
   assert.equal(retry!.endpoint, '/api/run/demo/retry');
-  assert.deepEqual(retry!.body, { phase: 1 });
+  assert.deepEqual(retry!.body, { phase: 1, expectRunId: state.id }, 'bound to its run (turn-by-turn phase 5)');
 
   assert.deepEqual(rows({ ...state, status: 'parked' } as RunState, since + 31 * MINUTE), [], 'a stopped run asks through its halt, not here');
 });

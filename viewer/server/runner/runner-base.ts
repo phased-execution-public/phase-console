@@ -115,6 +115,7 @@ import type { AttemptOptions } from './runner-attempt.ts';
 import { dateOfRef } from '../watch-refs.ts';
 import { DEFAULT_MODEL_POLICY, RUN_PROGRESS_FIELDS, runResumable, type ModelPolicy } from '../../shared/run-lifecycle.js';
 import { taskSummary } from '../../shared/task-model.js';
+import { isolateCompat, runActOf } from '../turn/run-requests.ts';
 import {
   PHASE_WORK_MODES, closeAttemptWindow, clocksDigest, openSessionWindow, phaseClocks, type PhaseClocks,
 } from '../../shared/phase-clocks.js';
@@ -263,6 +264,38 @@ export abstract class RunnerBase {
   /** Withdraw the open rung a console re-brief superseded before its first turn (control-tower phase 86, #14). */
   protected abstract supersedeOpenRung(phase: number, why: string): void;
   protected abstract record(event: string, data?: Record<string, unknown>, phase?: number): number | null;
+
+  /**
+   * A run request (turn-by-turn phase 6, #286, §Architecture 5.1): called
+   * wherever a `blocked` declaration is written onto its record. A declaration
+   * naming its act (`--needs run --run-act <act>`) is recorded as it is; a
+   * `permission` one naming no rule or command, on a SHARED checkout whose
+   * lane's branch (its `PE_BRANCH`) is not `pe/<slug>`, is READ as an `isolate`
+   * request — the compatibility rule, from recorded facts, for plans that ask
+   * through `permission.policy` — keeping the session's word as `askedAs`.
+   * Either way ONE `run.run-requested` line; the classifier then reads
+   * `blocked-declared:run`, never a permission wall nobody can grant.
+   */
+  protected async noteRunRequest(phase: number, record: PhaseRecord): Promise<void> {
+    const declared = record.declared;
+    const state = this.state;
+    if (!declared || declared.status !== 'blocked' || !state) return;
+    if (!runActOf(declared)) {
+      const shared = state.checkout !== 'worktree' && !this.worktreeFor(phase);
+      const branch = shared ? this.qualificationFor(phase, await this.scopeFor(phase)).branch : undefined;
+      if (!isolateCompat({ slug: state.slug, declared, shared, branch })) return;
+      declared.askedAs = declared.needs;
+      declared.needs = 'run';
+      declared.runAct = 'isolate';
+      declared.compat = true;
+      delete declared.rule;
+      delete declared.command;
+    }
+    this.record('run.run-requested', {
+      act: declared.runAct ?? null, compat: declared.compat === true, askedAs: declared.askedAs ?? null,
+      reason: declared.reason ?? null, sessionId: record.sessionId ?? null,
+    }, phase);
+  }
   /**
    * This run's journal as a `DeclarationSink` — what the state helpers that
    * spend testimony (`resetForRetry`, `reconcileRecordsAgainstBoard`) write

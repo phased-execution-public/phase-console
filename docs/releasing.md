@@ -91,6 +91,70 @@ that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
 
+## Upgrading to 7.1.0
+
+The root `package.json` says 7.1.0, and `CHANGELOG.md` carries its section. 7.1.0 is a minor version:
+Your turn tells every item step by step (plan `turn-by-turn`, phases 1–12). Every item is one card of
+one of four types — an Approval, a Task, a Decision or a Heads-up — with numbered steps, NOW or NOT
+YET, a timing grid, where a press goes and who checks it. Every word on it comes from one composer.
+Nothing a 7.0 plan, session or script writes stops working, and `PE_API` stays 2. An item a 7.0 console
+raised keeps its id and its state, and gains the new words when it is read. What follows is what an
+operator, a script that reads the API or a plan author will notice.
+
+### The API: the card contract, two routes, and a press bound to its run
+
+- **`GET /api/turn` carries the card contract on every item**: `type`, `personStatus`, `readiness`,
+  `route`, `checkedBy`, `timing`, `steps`, `verdict` and `verdicts`, plus `options` or `approval` where
+  they apply. The answer gains `strip` (to do, checking, passed today, the next deadline) and `headsUp`.
+  Every field 7.0 sent is still there. The words are `viewer/shared/turn-model.js`'s, composed by
+  `viewer/server/turn/compose.ts`, and `viewer/test/turn-cards-coverage.test.ts` holds every card
+  whole in both editions.
+- **The page's groups are v2** (`TURN_GROUPS`): Approve · Do now · Decide · Being checked · Coming up ·
+  Done. A script that grouped items by 7.0's six names reads the new ones from the same constant. 7.0's
+  *Needs one detail from you* is gone: such an item is a Task on Redo, in Do now.
+- **Two new routes.** `POST /api/human-steps/:id/undo` takes a running check back. `POST
+  /api/run/:slug/run-request` answers a run request; it is an authority route, so `console-forge`
+  denies it to a supervised session and an owner key turns a press from another door into a request.
+- **A run verb pressed from a card carries `expectRunId`.** When the plan's run is another one by then,
+  the route answers 409 with a sentence and changes nothing (`turn.press-stale` in the log).
+- **Two new state files** sit under the instance's state directory: `turn-first-seen.json` (when a
+  projected item was first seen, the card's *Assigned*) and `turn-settled.json` (how a pressed
+  projected item ended, so Done shows it).
+
+### Plans and sessions: guides from the plan, the errands table, run requests
+
+- **A `Human step:` bullet takes three more keys**, `options:`, `recommended:` and `deadline:`. Both
+  parsers validate them and neither prints them, so `phase-graph.sh --human-steps` is byte-identical.
+  Its `guide:` key is now read as a file under the docs root, and **F42** (`guide-file-missing`) gates a
+  guide that is not there.
+- **A plan's `## Operator errands` table is read by its headers.** A bullet ending in `(E-N)` takes
+  that row's steps; a row no bullet names is a Heads-up. Two new advisories name what is missing: **F41**
+  (`human-step-no-guide`) a task or decision with no guide, no options and no bound row, and **F43**
+  (`errand-row-unbound`) a row no bullet names.
+- **A run request is a blocker class, `run`.** `phase-outcome.sh <slug> <N> blocked --needs run
+  --run-act <act>` asks the run to relaunch isolated, switch account, raise a phase's budget, stop or
+  hold (`RUN_ACTS` in `viewer/shared/verb-model.js`). It raises ONE Approval per run and act, and every
+  asking phase is a waiter. Approve takes the act through the run verb of its name and resumes them;
+  Deny resumes them told no. Isolate switches in place only on a new-branch shared run; on a run that
+  commits on its standing branch the press answers 409, and the item stays with the person.
+- **An item nobody needs any more closes itself.** A stopped run a later run of its plan supersedes is
+  resolved by itself (journal `run.superseded`, undone by `unresolve`). Each round closes the
+  run-specific items of a superseded, resolved or finished run, of a phase the board reads done, and
+  of an errand that is gone, each with a row under *Handled by the AI*. A sign-in, a secret or an
+  errand at the machine moves to the successor run instead.
+
+
+### Packaging: what the tarball gained
+
+- The root `package.json` `files` allowlist gained `viewer/shared/proof-words.js`, which the server
+  imports since turn-by-turn phase 3, and so did the free tree's own `package.json`.
+  `.github/scripts/assert-tarball.sh` asserts it and the new server files: `viewer/server/turn/`
+  `compose.ts`, `first-seen.ts`, `settled.ts`, `run-requests.ts`, `stale.ts`, `plan-items.ts` and
+  `guide-file.ts`, `viewer/server/parse/errands.ts` and `viewer/server/runner/supersede.ts`.
+- The tarball is 10.9 MB (10,867,090 B), 1273 entries, 29.4 MB of files unpacked, measured at 7.1.0
+  with `pack-and-assert.sh --keep`. First paint is 131.2 KB served of 170.
+
+
 ## Upgrading to 7.0.0
 
 The root `package.json` says 7.0.0, and `CHANGELOG.md` carries its section. 7.0.0 is a major version

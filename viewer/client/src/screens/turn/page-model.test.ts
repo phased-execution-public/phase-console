@@ -3,10 +3,11 @@
  * 137, #214) — pure, so the six sections, the filters, the search, the history
  * and the address an item is reached by are proven without a page.
  *
- *   PM-1 the six sections, in order, each with its count — the five groups the
- *        server folded, then what the AI handled;
- *   PM-2 the filters (plan, run, kind, reason, risk) and the search live in the
- *        address: read from it, written back to it, an unknown word ignored;
+ *   PM-1 the seven sections, in order, each with its count — the six groups v2
+ *        the server folded (turn-by-turn phase 9), then what the AI handled;
+ *   PM-2 the filters (status, time, plan, type, goes to; run, kind, reason,
+ *        risk) and the search live in the address: read from it, written back
+ *        to it, an unknown word ignored;
  *   PM-3 a filter narrows every group, and the search reads what a person
  *        reads — the title, the guide, the proof in words, the command;
  *   PM-4 the facets offer only what the turn holds, counted;
@@ -14,6 +15,9 @@
  *        the ledger's own list as history — never an open one twice;
  *   PM-6 `#/turn/<id>` finds its item in whatever group holds it;
  *   PM-7 the hold compares itself against every item the answer holds.
+ *   PM-v2 (turn-by-turn phase 9) the Time filter's windows, the five filters
+ *        narrowing by the card's words, Group · Sort · View in the address,
+ *        grouping by plan, and the strip counted when a 7.0 answer sent none.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -23,6 +27,12 @@ import {
   SECTIONS,
   SECTION_LABEL,
   activeFacets,
+  arrangeValue,
+  arrangementOf,
+  byPlan,
+  sortItems,
+  stripOf,
+  timeWindowsOf,
   facetsOf,
   filtersHref,
   filtersOf,
@@ -63,7 +73,14 @@ function item(over: Partial<TurnItem> & { item: string }): TurnItem {
 }
 
 function answer(items: TurnItem[], over: Partial<TurnAnswer> = {}): TurnAnswer {
-  const groups = { now: [], decide: [], upcoming: [], checking: [], done: [] } as TurnAnswer['groups'];
+  const groups = {
+    approve: [],
+    now: [],
+    decide: [],
+    checking: [],
+    upcoming: [],
+    done: [],
+  } as TurnAnswer['groups'];
   for (const it of items) groups[it.group].push(it);
   return {
     round: { at: ago(0), n: 14, ranAt: ago(1), changedAt: ago(2) },
@@ -92,6 +109,7 @@ function answer(items: TurnItem[], over: Partial<TurnAnswer> = {}): TurnAnswer {
       },
     ],
     counts: {
+      approve: groups.approve.length,
       now: groups.now.length,
       decide: groups.decide.length,
       upcoming: groups.upcoming.length,
@@ -112,6 +130,11 @@ const SIGN_IN = item({
   why: 'identity',
   proofType: 'probe',
   title: 'Sign the gh CLI in',
+  type: 'do',
+  personStatus: 'todo',
+  readiness: 'now',
+  route: 'phase',
+  timing: { assignedAt: ago(30), deadline: ago(-60) },
   step: {
     id: 's-signin',
     kind: 'browser-login',
@@ -141,9 +164,13 @@ const DECISION = item({
   why: 'decision',
   proofType: 'answer',
   group: 'decide',
+  type: 'decide',
+  personStatus: 'todo',
+  route: 'phase',
   slug: 'beta',
   phase: 2,
   runId: 'r2',
+  since: ago(3000),
   title: 'Which region ships first?',
 });
 const WALL = item({
@@ -151,19 +178,32 @@ const WALL = item({
   kind: 'permission',
   why: 'permission',
   proofType: 'grant',
+  group: 'approve',
+  type: 'approve',
+  personStatus: 'todo',
+  route: 'console',
+  since: ago(10),
+  timing: { assignedAt: ago(10), deadline: ago(15) },
   title: 'Allow npm publish',
   permission: { wall: 'deny', rule: 'Bash(npm publish:*)', command: 'npm publish', risk: 'high' },
 });
 const COMING = item({
   item: 's-later',
   group: 'upcoming',
+  readiness: 'not-yet',
   severity: 'fyi',
   title: 'Publish after the build',
 });
-const CHECKING = item({ item: 's-check', group: 'checking', title: 'Rotate the deploy key' });
+const CHECKING = item({
+  item: 's-check',
+  group: 'checking',
+  personStatus: 'checking',
+  title: 'Rotate the deploy key',
+});
 const DONE = item({
   item: 's-done',
   group: 'done',
+  personStatus: 'passed',
   severity: 'fyi',
   title: 'Enable the App',
   slug: 'beta',
@@ -172,23 +212,30 @@ const DONE = item({
 
 const ALL = answer([SIGN_IN, DECISION, WALL, COMING, CHECKING, DONE]);
 
-describe('PM-1 the six sections, in order', () => {
-  it('reads the five groups, then what the AI handled', () => {
-    expect([...SECTIONS]).toEqual(['now', 'decide', 'upcoming', 'checking', 'done', 'handled']);
+describe('PM-1 the seven sections, in order', () => {
+  it('reads the six groups v2, then what the AI handled', () => {
+    expect([...SECTIONS]).toEqual(['approve', 'now', 'decide', 'checking', 'upcoming', 'done', 'handled']);
     expect(SECTIONS.map((id) => SECTION_LABEL[id])).toEqual([
+      'Approve',
       'Do now',
-      'Needs one detail from you',
-      'Coming up',
+      'Decide',
       'Being checked',
+      'Coming up',
       'Done',
       'Handled by the AI',
     ]);
-    const sections = sectionsOf(ALL, {});
+    const sections = sectionsOf(ALL, {}, NOW);
     expect(sections.map((s) => s.id)).toEqual([...SECTIONS]);
-    expect(sections.map((s) => s.count)).toEqual([2, 1, 1, 1, 1, 2]);
+    expect(sections.map((s) => s.count)).toEqual([1, 1, 1, 1, 1, 1, 2]);
     expect(sections.find((s) => s.id === 'handled')!.handled!.map((h) => h.id)).toEqual(['h-1', 'hs-2']);
     // The open sections are what Export writes: never Done, never the handled log.
-    expect(openSections(sections).map((s) => s.id)).toEqual(['now', 'decide', 'upcoming', 'checking']);
+    expect(openSections(sections).map((s) => s.id)).toEqual([
+      'approve',
+      'now',
+      'decide',
+      'checking',
+      'upcoming',
+    ]);
   });
 });
 
@@ -205,6 +252,13 @@ describe('PM-2 the filters live in the address', () => {
       q: 'gh',
     });
     expect(filtersOf(route('#/turn?kind=nonsense&why=whim&risk=extreme').query)).toEqual({});
+    expect(filtersOf(route('#/turn?status=redo&time=overdue&type=approve&to=console').query)).toEqual({
+      status: 'redo',
+      time: 'overdue',
+      type: 'approve',
+      to: 'console',
+    });
+    expect(filtersOf(route('#/turn?status=late&time=soon&type=chore&to=moon').query)).toEqual({});
     expect(filtersOf(route('#/turn?q=%20%20').query)).toEqual({});
     expect(activeFacets({ plan: 'alpha', q: 'gh' })).toBe(1);
   });
@@ -315,7 +369,117 @@ describe('PM-6 an item’s own address', () => {
 
 describe('PM-7 the hold reads every item the answer holds (#270)', () => {
   it('names each, in every group, and nothing without an answer', () => {
-    expect([...itemIds(ALL)]).toEqual(['s-signin', 's-wall', 's-decide', 's-later', 's-check', 's-done']);
+    expect([...itemIds(ALL)]).toEqual(['s-wall', 's-signin', 's-decide', 's-check', 's-later', 's-done']);
     expect(itemIds(undefined).size).toBe(0);
+  });
+});
+
+describe('PM-v2 the five filters, Group · Sort · View, and the strip (turn-by-turn phase 9)', () => {
+  it('reads an item’s time windows off its deadline and its age', () => {
+    expect(timeWindowsOf(SIGN_IN, NOW)).toEqual(['due', 'today']);
+    expect(timeWindowsOf(WALL, NOW)).toEqual(['overdue', 'today']);
+    expect(timeWindowsOf(DECISION, NOW)).toEqual(['older']);
+    expect(timeWindowsOf({ since: 'never' }, NOW)).toEqual([]);
+  });
+
+  it('narrows by Status, Time, Type and Goes to — the card’s own words', () => {
+    const by = (filters: Parameters<typeof sectionsOf>[1]) =>
+      sectionsOf(ALL, filters, NOW)
+        .flatMap((s) => s.items)
+        .map((it) => it.item);
+    expect(by({ status: 'checking' })).toEqual(['s-check']);
+    expect(by({ status: 'passed' })).toEqual(['s-done']);
+    expect(by({ time: 'overdue' })).toEqual(['s-wall']);
+    expect(by({ time: 'older' })).toEqual(['s-decide']);
+    expect(by({ type: 'approve' })).toEqual(['s-wall']);
+    expect(by({ to: 'phase' })).toEqual(['s-signin', 's-decide']);
+    // A filter only an item answers leaves no handled row standing.
+    expect(sectionsOf(ALL, { type: 'approve' }, NOW).find((s) => s.id === 'handled')!.count).toBe(0);
+    expect(activeFacets({ status: 'todo', time: 'due', type: 'do', to: 'phase', q: 'x' })).toBe(4);
+  });
+
+  it('offers each filter only what the turn holds, in a person’s words', () => {
+    const facets = facetsOf(ALL, NOW);
+    expect(facets.type.map((f) => [f.value, f.label])).toEqual(
+      expect.arrayContaining([
+        ['approve', 'Approval'],
+        ['do', 'Task'],
+        ['decide', 'Decision'],
+      ]),
+    );
+    expect(facets.status.find((f) => f.value === 'checking')!.label).toBe('Checking');
+    expect(facets.time.find((f) => f.value === 'overdue')).toEqual({
+      value: 'overdue',
+      label: 'Past its deadline',
+      count: 1,
+    });
+    expect(facets.to.find((f) => f.value === 'phase')!.label).toBe('The phase');
+  });
+
+  it('keeps Group, Sort and View in the address, the defaults as no parameter at all', () => {
+    expect(arrangementOf({})).toEqual({ group: 'asked', sort: 'oldest', view: 'cards' });
+    expect(arrangementOf(route('#/turn?group=plan&sort=deadline&view=compact').query)).toEqual({
+      group: 'plan',
+      sort: 'deadline',
+      view: 'compact',
+    });
+    expect(arrangementOf({ group: 'whim', sort: 'random', view: 'grid' })).toEqual(arrangementOf({}));
+    expect(arrangeValue('sort', 'oldest')).toBe('');
+    expect(filtersHref(route('#/turn?plan=alpha'), { sort: arrangeValue('sort', 'newest') })).toBe(
+      '#/turn?plan=alpha&sort=newest',
+    );
+    expect(filtersHref(route('#/turn?sort=newest'), { sort: arrangeValue('sort', 'oldest') })).toBe('#/turn');
+  });
+
+  it('sorts oldest, newest or by the nearest deadline — none last', () => {
+    const items = [SIGN_IN, DECISION, WALL, CHECKING];
+    expect(sortItems(items, 'oldest').map((it) => it.item)).toEqual([
+      's-decide',
+      's-signin',
+      's-check',
+      's-wall',
+    ]);
+    expect(sortItems(items, 'newest').map((it) => it.item)).toEqual([
+      's-wall',
+      's-signin',
+      's-check',
+      's-decide',
+    ]);
+    expect(sortItems(items, 'deadline').map((it) => it.item)).toEqual([
+      's-wall',
+      's-signin',
+      's-decide',
+      's-check',
+    ]);
+  });
+
+  it('groups the open items by plan, leaving Done and the handled log as they are', () => {
+    const grouped = byPlan(sectionsOf(ALL, {}, NOW));
+    expect(grouped.map((s) => [s.id, s.label, s.count])).toEqual([
+      ['plan:alpha', 'alpha', 4],
+      ['plan:beta', 'beta', 1],
+      ['done', 'Done', 1],
+      ['handled', 'Handled by the AI', 2],
+    ]);
+    expect(grouped[0]!.items.map((it) => it.item)).toEqual(['s-wall', 's-signin', 's-check', 's-later']);
+  });
+
+  it('reads the server’s strip, and counts one when a 7.0 answer sent none', () => {
+    const strip = { todo: 9, checking: 0, passedToday: 0, nextDeadline: null };
+    expect(stripOf({ ...ALL, strip })).toBe(strip);
+    expect(stripOf(ALL)).toEqual({
+      todo: 3,
+      checking: 1,
+      passedToday: 1,
+      nextDeadline: { at: ago(15), item: 's-wall', title: 'Allow npm publish' },
+    });
+    const seventy = { ...ALL, groups: { ...ALL.groups } } as TurnAnswer;
+    delete (seventy.groups as Partial<TurnAnswer['groups']>).approve;
+    expect(stripOf(seventy).todo).toBe(2);
+  });
+
+  it('finds a heads-up by its address too', () => {
+    const know = item({ item: 'eref:E-1', type: 'know', group: 'upcoming' });
+    expect(itemOf({ ...ALL, headsUp: [know] }, 'eref:E-1')?.item).toBe('eref:E-1');
   });
 });

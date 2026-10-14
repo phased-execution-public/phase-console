@@ -1208,7 +1208,13 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // +1 from control-tower phase 139: the launch door's open that the machine
   // would not take (`phase.human-step-open-skipped`). Free; it reads as warn
   // through `skipped`.
-  assert.equal(kinds.length, 475 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
+  // +1 from turn-by-turn phase 5: a running check a person took back
+  // (`phase.human-step-undone`). Free.
+  // +2 from turn-by-turn phase 6: a phase asking the run for an act only it can
+  // take, and the answer (`run.run-requested`, `run.run-request-decided`). Free.
+  // +1 from turn-by-turn phase 7: a stopped run a later run of its plan replaced
+  // (`run.superseded`). Free.
+  assert.equal(kinds.length, 479 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]

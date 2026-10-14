@@ -11,7 +11,7 @@ allowed-tools:
   - Glob
   - Agent
 metadata:
-  version: 7.0.0
+  version: 7.1.0
 ---
 
 # Phased Execution
@@ -125,7 +125,11 @@ runs inside machinery it should not mistake for a malfunction. The short version
   a grant at a scope — this call, this phase, this plan, this repository, always — a denial, or *I'll do
   it myself*; you are resumed with the answer. The never list (a forced push, `sudo`, a protected path, a
   secret's value, …) has no grant: say what remains instead. `references/turn.md` §A permission
-  block. (Identical *across profiles* — not
+  block. **An act only the RUN can take is never a permission** — relaunch isolated, switch account,
+  raise the budget, stop, hold: declare `phase-outcome.sh <slug> <N> blocked --needs run --run-act
+  <act>` (`isolate` · `switch-account` · `raise-budget` · `stop` · `hold`) and stop. The supervisor takes
+  it (Pro) or ONE approval per run and act asks a person (Free); you are resumed with the answer
+  (`references/turn.md` §A run request). (Identical *across profiles* — not
   immutable: an operator can strike a built-in rule out of the wall, per plan or globally, and that
   strike then applies to every profile at once.)
 - **Never wait on somebody else's clock inside a turn — and never poll.** A supervised session's `Bash`
@@ -304,7 +308,10 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    and per phase `- **Waits on:** <ref> · <max>`) · `human-acts` (steps denied to an agent, each with
    the ref that proves it landed — `- **Human step:** <kind> · <what> · open: <url or command> · proof:
    <ref> · where: host|any · window: <duration>`, whose 5.1.0 `<who, what, proof ref>` spelling is
-   superseded and fails the lint, F37) · `ambiguity` (ruling, ask or halt when the
+   superseded and fails the lint, F37 — and the person's words beside it: `guide: <file>` (read by the
+   console, F42 if it is missing), a decision's `options: id=Label[::consequence] | …` and
+   `recommended: <id>`, a `deadline: <ISO 8601>` it must be done by, or a row of the plan's
+   `## Operator errands` table its text names as `(E-N)`) · `ambiguity` (ruling, ask or halt when the
    plan did not decide — `**When in doubt:**`) · `budgets` (run, phase and turn ceilings) ·
    `resume.on-restart` (continue, hold or ask — the RUN's answer) · `plan-health` (whether the advisory
    lints gate this plan) · `stop` (`autonomy`, and who is told on a halt) · `relay` (`off` or
@@ -750,8 +757,10 @@ refuses to start when the console's and the skill's do not meet, naming the half
   `human-step-superseded`, `human-step-kind-unknown` and `human-step-field-invalid` (**F37** — a
   `- **Human step:**` bullet the reader skips: the 5.1.0 `<who, what, proof ref>` spelling, named in the
   line with the grammar that replaced it; a kind that is not one of the eighteen; a field, `where`,
-  `window`, `auto-open`, `credential`, `due` or `open:` link the grammar cannot read).
-  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F40** on stderr, which
+  `window`, `auto-open`, `credential`, `due`, `options`, `recommended`, `deadline` or `open:` link the
+  grammar cannot read). **Since 7.1.0 a sixth:** `guide-file-missing` (**F42** — a `Human step:`'s
+  `guide:` names no file under the docs root).
+  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F41, F43** on stderr, which
   never changes the exit code: F15 an unregistered MCP server, credential or account ·
   F16 a verification that waits on an external clock · F17 a lead binary not installed here ·
   F18 a cwd-sensitive lead with no `**Verify in:**` · F19 a plan that cannot progress at all ·
@@ -775,7 +784,10 @@ refuses to start when the console's and the skill's do not meet, naming the half
   mounts it with no `node_modules`/`.venv`, so it goes red before it tests anything; Setup runs in
   the `Verify in:` directory, so spell the install's path from there (the lint names the line to add) ·
   **F40** a `Human step:` that names no `why:` (`human-step-no-why`) — it is given its kind's default
-  reason, marked inferred on the item.
+  reason, marked inferred on the item · **F41** a task or decision `Human step:` whose words are the
+  plan's own with no `guide:`, no `options:` and no bound `## Operator errands` row
+  (`human-step-no-guide`) — the person gets a title and no steps · **F43** a `## Operator errands`
+  table row no bullet names by its `(E-N)` (`errand-row-unbound`, ids only) — a heads-up nothing checks.
   `references/plan-format.md` has the full reasoning for each), **`--qa-mode [N]`** (the QA regime: `off` ·
   `on <reason>` · `waived <reason>` — with no argument the PLAN's, and with a phase number that phase's
   resolved answer naming which level decided it, since `- **QA:** on|off` in a §Phase section beats the
@@ -887,7 +899,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   the next number); `none` forces the final-phase closeout (which prints the `qa-full` brief only for
   QA-`on` plans).
 - `scripts/validate.sh <slug>` — deterministic validator: structural lint of the plan
-  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F40 on stderr) **plus**
+  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37/F42, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F41, F43 on stderr) **plus**
   handoff body/consistency checks (valid status, required sections, `depends_on` agreeing with the graph).
   Run before trusting a board or finishing a phase.
 - `scripts/phase-lock.sh <slug> <claim|release|status|list|conflicts|mirror> <N> [--owner ID] [--lease S]
@@ -984,7 +996,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   every word were legal everywhere.
 - `scripts/phase-outcome.sh <slug> <N> <complete|waiting-external|blocked|needs-human|partial|no-defect>
   [--reason TEXT] [--watch REF]… [--wait-minutes N | --until ISO8601] [--needs KEY] [--rule TEXT]
-  [--command TEXT] [--step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any]
+  [--command TEXT] [--run-act ACT] [--step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any]
   [--proof REF] [--step-line TEXT]… [--code CODE] [--credential ID] [--due-when REF | --due ISO]
   [--why REASON] [--guide FILE [--lang CODE]] [--effort MIN] [--unblocks PHASES] [--proof-type TYPE]
   [--proof-words TEXT] [--option ID=LABEL[::CONSEQUENCE]]… [--recommended ID] [--allow-decline] [--decision-key KEY]
@@ -996,10 +1008,15 @@ refuses to start when the console's and the skill's do not meet, naming the half
   **`--needs <key>` is REQUIRED on `blocked` and `needs-human`** (exit 2 without it) and refused on
   the rest: the decision the session is missing, as a key of the plan's `## Decisions` manifest
   (`scripts/decisions.env`) or a blocker class as its short form — `credential`, `permission`, `gate`,
-  `external`, `lock`. The runner reads it BEFORE the prose, so `blocked-declared:credential` is what a
+  `external`, `lock`, `run`. The runner reads it BEFORE the prose, so `blocked-declared:credential` is what a
   declaration `--needs credential` classifies as whatever its `--reason` says, and
   `blocked-declared:unknown` now means "a key the manifest lacks" — a defect report, not a routine.
   `--rule`/`--command` structure a permission block beside it (the rule that refused, the command).
+  **`--run-act ACT` makes a `blocked --needs run` a RUN REQUEST** (turn-by-turn phase 6, #286) — an act
+  only the run can take, one of `scripts/turn.env` `RUN_ACTS`; required with `--needs run`, refused
+  anywhere else, an unknown act exit 2. The runner journals `run.run-requested`; a `permission`
+  declaration naming no rule or command, on a shared checkout whose lane is not on `pe/<slug>`, is read
+  as `--run-act isolate` (the compatibility rule), never refused by G5.
   `--wait-minutes` and `--until` are the resume clock and belong to the three statuses that PARK —
   `waiting-external`, `blocked` and `needs-human` (mutually exclusive; absent means the runner's
   default window) — `--until` is the right one when you know the wall-clock moment rather than the
@@ -1060,7 +1077,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   a command to run (`--open-command`) or a click path (`--open-url`, `--step-line`). **`--due-when
   <ref>`** (any kind) says when it becomes due: until that watch ref lands the step is `upcoming` —
   listed under *Coming up*, unannounced, unreminded, its window not started — and the moment it lands
-  (or the console finds it never can) the step is due, with ONE push, `NOW: <command>`; its proof
+  (or the console finds it never can) the step is due, with ONE push, `Now: <the act>` (its command stays on the item); its proof
   landing clears it and resumes the phase that needed it. A plan declares the same act with a `due: <ref>` field on its `- **Human step:**`
   bullet — in a phase, or under `## Operator errands` for the plan itself.
   **Your turn's flags** (control-tower phase 130, #207): `--why REASON` — why only a person fits it,

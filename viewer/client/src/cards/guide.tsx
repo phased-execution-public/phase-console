@@ -13,9 +13,9 @@
  *     station, and the station IS its tick. A tick is the person's own mark of
  *     where they are, kept in this browser per item and never sent anywhere:
  *     the check, not the tick, says the item is done;
- *   - **each command copied two ways** — as it is, and behind `!` for the
- *     person's own Claude Code session, which runs a `!` line as a shell
- *     command. The page never runs one: copying is the whole act;
+ *   - **each command in the one command block** (`ui/code-block.tsx`, turn-by-turn
+ *     phase 8): copied as it is, or behind `!` for the person's own Claude Code
+ *     session; a template says what to fill in first. The page never runs one;
  *   - what to **expect**, a **warning**, and a **link** that shows its whole
  *     address before it opens;
  *   - **If it goes wrong**, symptom and fix.
@@ -29,16 +29,11 @@ import { useCallback, useState } from 'react';
 import { CircleCheck, ExternalLink, TriangleAlert } from 'lucide-react';
 import { parseGuide, type Guide } from '@shared/guide-grammar.js';
 import { cn } from '@/lib/cn';
-import { CopyButton } from '@/ui/copy-button';
+import { CodeBlock } from '@/ui/code-block';
 import { Markdown, MarkdownInline } from '@/ui/markdown';
 import { Station } from '@/ui/track/station';
 import { Track } from '@/ui/track/track';
 import './guide.css';
-
-/** A command, as a person's own Claude Code session runs it: behind `!`. */
-export function claudeCodeCommand(command: string): string {
-  return `!${command.trim()}`;
-}
 
 function isGuide(value: unknown): value is Guide {
   const guide = value as Partial<Guide> | null;
@@ -158,7 +153,7 @@ export function GuideView({
                   <p data-testid="guide-step-text" className="max-w-prose text-body font-medium text-ink">
                     <MarkdownInline text={step.text} lang={lang} dir={dir} />
                   </p>
-                  {step.code && <CommandBlock code={step.code} />}
+                  {step.code && <CodeBlock code={step.code} testId="guide-command" />}
                   {step.expect && (
                     <p data-testid="guide-expect" className="flex max-w-prose items-start gap-1.5 text-body">
                       <CircleCheck size={14} aria-hidden className="mt-1 shrink-0 text-done" />
@@ -224,32 +219,5 @@ export function GuideView({
         </section>
       )}
     </section>
-  );
-}
-
-/**
- * One command: left-to-right in any guide, scrolling inside its own block,
- * and two ways to take it — never a way to run it.
- */
-export function CommandBlock({ code, className }: { code: string; className?: string }) {
-  return (
-    <div className={cn('flex min-w-0 flex-col gap-1.5', className)}>
-      {/* Focusable and named: on a phone a long command scrolls sideways, and a
-          scroller a keyboard cannot enter is one nobody can read the end of. */}
-      <pre
-        data-testid="guide-command"
-        role="group"
-        aria-label="Command"
-        tabIndex={0}
-        dir="ltr"
-        className="max-w-full overflow-x-auto overscroll-x-contain rounded border border-rule bg-ground-deep px-3 py-2 font-mono text-meta leading-relaxed text-ink"
-      >
-        <code>{code}</code>
-      </pre>
-      <div className="flex flex-wrap gap-1.5">
-        <CopyButton text={code} label="Copy" />
-        <CopyButton text={claudeCodeCommand(code)} label="Copy for Claude Code" copiedLabel="Copied with !" />
-      </div>
-    </div>
   );
 }

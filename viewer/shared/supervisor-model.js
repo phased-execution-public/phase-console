@@ -250,7 +250,9 @@ export const REMEDIES = Object.freeze([
     remedy:
       'note it on the run; the replay sheds per phase, and the session’s own log still reads the live lane',
     verb: 'note',
-    autonomy: 'suggest',
+    // Reversible, so pressed (turn-by-turn phase 6, §Architecture 5.4): a note
+    // the person can unpin never needed their press first.
+    autonomy: 'press',
     cap: { perHour: 1 },
   }),
   remedy('approval-timed-out', {
@@ -277,7 +279,8 @@ export const REMEDIES = Object.freeze([
     evidence: 'the machine’s 5-minute load average is 1.5 × its cores or more',
     remedy: 'hold the run’s new admissions until the load falls — live lanes carry on',
     verb: 'hold',
-    autonomy: 'suggest',
+    // Reversible — Release undoes it — so pressed (turn-by-turn phase 6).
+    autonomy: 'press',
     cap: { perHour: 1 },
   }),
   remedy('streak-near-max', {
@@ -533,8 +536,9 @@ export const CHAT_CONTEXT_KINDS = Object.freeze(
  * A `detection` (control-tower phase 102) is one thing the supervisor saw, and
  * names its situation — the words the chat is told to read before it answers.
  * An `issues` context (control-tower phase 120) carries the repository's
- * estate key in `slug` and the numbers in `issues`.
- * @typedef {{ kind: ChatContextKind, slug: string, phase?: number, runId?: string, situation?: SupervisorSituation, issues?: number[] }} ChatContext
+ * estate key in `slug` and the numbers in `issues`. An `item` context
+ * (turn-by-turn phase 5) carries the Your-turn item's id in `item`.
+ * @typedef {{ kind: ChatContextKind, slug: string, phase?: number, runId?: string, situation?: SupervisorSituation, issues?: number[], item?: string }} ChatContext
  */
 
 const CONTEXT_SLUG_RE = /^[\w.-]{1,128}$/;

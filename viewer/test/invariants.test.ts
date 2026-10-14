@@ -1015,6 +1015,9 @@ test('SLF-1: every startRun( site names its door, and the doors named are the ce
       // One more since control-tower phase 14 (#40): a budget raise continues
       // the run its dollars halted, as the person's own Continue.
       'service-runs.ts → operator',
+      // One more since turn-by-turn phase 11: releasing a held run whose loop
+      // parked resumes the person's board it still holds, as the release's press.
+      'service-runs.ts → operator',
       'service-runs.ts → outcome-inbox',
       'service.ts → mcp-require-timeout',
     ].sort(),

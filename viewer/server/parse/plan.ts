@@ -25,11 +25,13 @@ import {
 import { MESSAGING_WORDS, DEFAULT_MESSAGING } from '../../shared/message-model.js';
 import { ISSUE_MODES, DEFAULT_ISSUES } from '../../shared/issues-model.js';
 import {
-  CREDENTIAL_ID_RE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BULLET_KEYS, HUMAN_STEP_WHERE, KIND_META, dueRefOk, humanStepKindOf,
+  CREDENTIAL_ID_RE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BULLET_KEYS, HUMAN_STEP_WHERE, KIND_META, deadlineOk, dueRefOk,
+  erefOf, humanStepKindOf, humanStepOptionsOf,
   type HumanStepKind, type HumanStepWhere,
 } from '../../shared/human-step-model.js';
 import { reasonAllowed, type WhyPerson } from '../../shared/turn-model.js';
 import { parseDecisionsTable } from '../../shared/decisions-model.js';
+import { parseErrandsTable, type ErrandsTable } from './errands.ts';
 import { inPlanReviewers, PERMISSION_MODES, withWindowNote } from '../../shared/run-settings.js';
 import { MODEL_POLICIES, type ModelPolicy } from '../../shared/run-lifecycle.js';
 import type { DecisionRow } from '../../shared/decisions-model.js';
@@ -402,6 +404,12 @@ export type Plan = {
    * Absent when the section declares none.
    */
   operatorErrands?: HumanStepDirective[];
+  /**
+   * The same section's TABLE (turn-by-turn phase 2) — one row per act, its exact
+   * steps, what to expect and how it is verified — each row bound to the bullet
+   * whose text ends "(E-N…)" (`parse/errands.ts`). Absent when there is none.
+   */
+  errandsTable?: ErrandsTable;
   body: string;
 };
 
@@ -1049,6 +1057,19 @@ export function parseHumanStepBody(body: string): HumanStepDirective | undefined
   }
   const guide = values.guide;
   if (guide && (/^\/|\.\.|\s/.test(guide) || !/^[A-Za-z0-9._/-]+\.md$/.test(guide))) return undefined;
+  // A decision's options, the recommended one and a deadline (turn-by-turn
+  // phase 2) — `_human_step_parse`'s rules, through the shared readers.
+  let options: StepOptionDirective[] | undefined;
+  if (values.options) {
+    if (kind !== 'decision') return undefined;
+    options = humanStepOptionsOf(values.options);
+    if (!options) return undefined;
+  }
+  const recommended = values.recommended?.toLowerCase();
+  if (recommended && !options?.some((option) => option.id === recommended)) return undefined;
+  const deadline = values.deadline;
+  if (deadline && !deadlineOk(deadline)) return undefined;
+  const eref = erefOf(what);
   return {
     kind, what, where,
     ...(open ? { open } : {}),
@@ -1061,8 +1082,13 @@ export function parseHumanStepBody(body: string): HumanStepDirective | undefined
     ...(effortMinutes !== undefined ? { effortMinutes } : {}),
     ...(unblocks ? { unblocks } : {}),
     ...(guide ? { guide } : {}),
+    ...(options ? { options } : {}),
+    ...(recommended ? { recommended } : {}),
+    ...(deadline ? { deadline } : {}),
+    ...(eref ? { eref } : {}),
   };
 }
+
 
 /** The phase's well-formed `- **Human step:**` bullets, or undefined when it has none. */
 function humanStepBullets(block: string): HumanStepDirective[] | undefined {
@@ -1187,7 +1213,16 @@ export type HumanStepDirective = {
   effortMinutes?: number;
   unblocks?: number[];
   guide?: string;
+  /** A decision's options, the one recommended, and when it must be done by (turn-by-turn phase 2). */
+  options?: StepOptionDirective[];
+  recommended?: string;
+  deadline?: string;
+  /** The `## Operator errands` row its text names — "(E-4…)" read as `E-4`. */
+  eref?: string;
 };
+
+/** One option a decision bullet offers — `id=Label[::consequence]`. */
+export type StepOptionDirective = { id: string; label: string; consequence?: string };
 
 /**
  * The steps phase N declares for a person — `human_steps_for_phase()`. Phase 0
@@ -1527,10 +1562,16 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
     callouts: calloutLines(body),
     reviewers: inPlanReviewers(body),
     phases,
-    // `human_step_bodies 0` (control-tower phase 121): the section's own bullets.
+    // `human_step_bodies 0` (control-tower phase 121): the section's own bullets,
+    // and its table (turn-by-turn phase 2), each row bound to the bullet whose
+    // text ends "(E-N…)" — in a phase or under the section itself.
     ...((() => {
-      const errands = humanStepBullets(findSection(secs, 'Operator errands')?.body ?? '');
-      return errands ? { operatorErrands: errands } : {};
+      const section = findSection(secs, 'Operator errands')?.body ?? '';
+      const errands = humanStepBullets(section);
+      const bound = [...(errands ?? []), ...Object.values(phases).flatMap((detail) => detail.humanSteps ?? [])]
+        .flatMap((step) => (step.eref ? [step.eref] : []));
+      const table = parseErrandsTable(section, bound);
+      return { ...(errands ? { operatorErrands: errands } : {}), ...(table ? { errandsTable: table } : {}) };
     })()),
     body,
   };

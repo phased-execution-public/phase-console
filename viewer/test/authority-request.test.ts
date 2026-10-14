@@ -149,7 +149,7 @@ test('AR-2: a request is shown on its item — or, about none, as a decision ite
     const own = items.find((item) => item.record === 'request');
     assert.ok(own, 'a decision item of its own');
     assert.equal(own!.kind, 'decision');
-    assert.equal(own!.group, 'decide');
+    assert.equal(own!.group, 'approve', 'the groups v2 (turn-by-turn phase 9): an owner request is a yes or no');
     assert.match(own!.title, /^Asked by .* — confirm\?$/);
     assert.deepEqual(own!.actions.map((action) => action.verb), ['confirm', 'refuse']);
   } finally {

@@ -9,7 +9,7 @@
 
 import { EVIDENCE_GIT, evidenceTreeOf, wallCommand } from './permissions/walls.ts';
 import { forcedPush, grantEndWords, type GrantRow } from './permissions/grants.ts';
-import { GRANT_SCOPE_WORDS } from '../shared/turn-model.js';
+import { GRANT_SCOPE_WORDS, TURN_OPEN_GROUPS } from '../shared/turn-model.js';
 import type { IncomingMessage } from 'node:http';
 import { basename, join, resolve as resolvePath } from 'node:path';
 import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, releasePhasesOf, sanitisePolicyPrefs } from '../shared/policy-model.js';
@@ -56,7 +56,8 @@ import { log } from './log.ts';
 import {
   CATEGORIES, Push, isPlanProgress, routeFor, sanitiseCategories, tagFor, type CategoryId,
 } from './push/index.ts';
-import { isPushActionVerb, LOCK_SCREEN_DOOR, lockScreenGrant } from './push/actions.ts';
+import { isPushActionVerb, LOCK_SCREEN_DOOR, lockScreenGrant, lockScreenMay } from './push/actions.ts';
+import { isRunRequestOf } from './turn/run-requests.ts';
 import type { DigestTurn } from './push/digest.ts';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
 import { repoInfo, lastCommit, commitsTouching, type GitRepoInfo, type GitFileInfo } from './git.ts';
@@ -231,8 +232,10 @@ import { managedRoots, stagingHome, stagingNames } from './runner/worktree.ts';
 import { CONFLICT_POLICIES, LAND_POLICIES } from '../shared/landing-model.js';
 import { MESSAGING_WORDS } from '../shared/message-model.js';
 import { ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
-import { TURN_DONE_MS, turnView, type TurnAnswer } from './turn/index.ts';
+import { TURN_DONE_MS, turnView, type TurnAnswer, type TurnItem } from './turn/index.ts';
 import type { HandledRow } from './turn/handled.ts';
+import { PlanItems } from './turn/plan-items.ts';
+import { FirstSeen, FIRST_SEEN_FILE } from './turn/first-seen.ts';
 import { bodyCarriesSecret, type HumanStep } from './human-steps.ts';
 
 export {
@@ -1935,6 +1938,25 @@ export class Service extends ServiceRecovery {
    * folded into one item per thing to do, with the ledger's detail and the
    * items settled in the last day.
    */
+  private planItemsMemo: PlanItems | null = null;
+  /** When each projected item was first seen (turn-by-turn phase 3): `<instance state>/turn-first-seen.json`. */
+  private firstSeenMemo: FirstSeen | null = null;
+
+  /**
+   * The read-time composer of plan items (turn-by-turn phase 2): a plan-born
+   * ledger item's words from its plan as the store holds it now, cached per
+   * plan revision; a bullet's guide file is read under the console's root.
+   */
+  private get planItems(): PlanItems {
+    return (this.planItemsMemo ??= new PlanItems({
+      plan: (slug) => {
+        const record = this.store?.get(slug);
+        return record?.plan ? { plan: record.plan, revision: record.revision } : undefined;
+      },
+      docsRoot: () => this.root?.path,
+    }));
+  }
+
   async turnAnswer(opts: { seen?: string | null } = {}): Promise<TurnAnswer> {
     const inbox = await this.attention(true);
     let steps: HumanStep[] = [];
@@ -1950,18 +1972,54 @@ export class Service extends ServiceRecovery {
       const ledger = this.handledNow();
       handled = { rows: ledger.recent(), since: ledger.since(seen ?? new Date(now - TURN_DONE_MS).toISOString()), seen };
     } catch { /* an unreadable log is an empty one */ }
-    return turnView(inbox, { steps, now, requests, handled, ...(this.turnRound ? { round: this.turnRound.state() } : {}) });
+    return turnView(inbox, {
+      steps, now, requests, handled, ...(this.turnRound ? { round: this.turnRound.state() } : {}),
+      // A plan item's words from its plan NOW (turn-by-turn phase 2).
+      planItem: (step) => this.planItems.wordsFor(step),
+      // The open plans' heads-ups — errands rows no bullet names (turn-by-turn phase 4).
+      headsUp: (this.store?.list() ?? []).filter((record) => !this.isClosedPlan(record.slug))
+        .flatMap((record) => { try { return this.planItems.headsUp(record.slug); } catch { return []; } }),
+      // What a person pressed on a projected item, for Done (turn-by-turn phase 5).
+      settled: (() => { try { return this.settledNow().recent(TURN_DONE_MS, now); } catch { return []; } })(),
+      // A projected item's assigned clock, kept across a restart (turn-by-turn phase 3).
+      firstSeen: (entries) => (this.firstSeenMemo ??= new FirstSeen(join(INSTANCE_STATE_DIR, FIRST_SEEN_FILE))).stamp(entries, now),
+    });
+  }
+
+  /**
+   * `GET /api/turn/:id` (turn-by-turn phase 3): one item explained — a
+   * ledger item's record (`turnExplain`), and for ANY item the turn shows, a
+   * projected one included, its card as `GET /api/turn` draws it, found by its
+   * item id or any of its rows' ids.
+   */
+  async turnItemExplain(id: string): Promise<{ ok: true; item: Record<string, unknown> } | { ok: false; status: number; error: string }> {
+    const own = this.turnExplain(id);
+    let card: TurnItem | undefined;
+    try {
+      const turn = await this.turnAnswer();
+      card = Object.values(turn.groups).flat().find((item) => item.item === id || item.rows.includes(id));
+    } catch { card = undefined; }
+    if (own.ok) return card ? { ok: true, item: { ...own.item, card } } : own;
+    if (!card) return own;
+    return {
+      ok: true,
+      item: {
+        id: card.item, record: card.record, source: card.source, kind: card.kind, title: card.title,
+        ...(card.slug ? { slug: card.slug } : {}), ...(card.phase != null ? { phase: card.phase } : {}),
+        why: card.why, proofType: card.proofType, check: card.check, timing: card.timing, card,
+      },
+    };
   }
 
   /**
    * Your turn, counted for the hourly digest (control-tower phase 138, #215) —
    * from the page's own answer, so the digest says what the page says: the
-   * items that need the person now (*Do now* and *Decide*), the ones a check
+   * items that need the person now (*Approve*, *Do now* and *Decide*), the ones a check
    * sent back among them, and what the AI handled since `since`.
    */
   protected override async digestTurn(since: string): Promise<Omit<DigestTurn, 'handledSince'> | null> {
     const turn = await this.turnAnswer({ seen: since });
-    const open = [...turn.groups.now, ...turn.groups.decide];
+    const open = TURN_OPEN_GROUPS.flatMap((group) => turn.groups[group]);
     return {
       needYou: open.length,
       cameBack: open.filter((item) => item.step?.state === 'returned').length,
@@ -2273,6 +2331,28 @@ export class Service extends ServiceRecovery {
   }
 
   /**
+   * An item's option bound to the ack, pressed (turn-by-turn phase 5): the row
+   * stays, seen, and a settled record moves its item to Done as Closed — the
+   * person answered it with that option ("I'll answer it in its terminal",
+   * "Leave them…"). An id the inbox no longer shows, or an option it does not
+   * carry, records nothing.
+   */
+  async settleAnsweredRow(id: string, answer: string, by: string): Promise<void> {
+    try {
+      const inbox = await this.attention(true);
+      const row = inbox.items.find((item) => item.id === id);
+      const option = row?.options?.find((one) => one.id === answer);
+      if (!row?.turn || !option) return;
+      this.recordSettled({
+        item: row.turn.item, at: new Date().toISOString(), source: row.turn.source, outcome: 'closed', by,
+        title: row.title, what: option.label,
+        ...(row.slug ? { slug: row.slug } : {}), ...(row.phase != null ? { phase: row.phase } : {}), ...(row.runId ? { runId: row.runId } : {}),
+      });
+      this.invalidateAll();
+    } catch { /* the ack is the press; its Done line is a convenience */ }
+  }
+
+  /**
    * Annotate an inbox item as seen. Never resolution — the ask still stands.
    * `by` names who saw it: the route derives it from the request, so a ruling's
    * ledger ack (which refuses an empty name) is always attributed.
@@ -2385,6 +2465,26 @@ export class Service extends ServiceRecovery {
     const item = view.items.find((candidate) => candidate.id === itemId);
     if (!item) {
       return { ok: false, status: 410, error: 'this is no longer waiting on you' };
+    }
+    // A run request's Approve and Deny from the lock screen (turn-by-turn phase
+    // 10): both are ANSWERS of the item (`answer-run-request`), read against
+    // the door table again here — the token said what was offered when the
+    // push went out, and the live item says what it is now.
+    if ((verb === 'approve' || verb === 'deny') && item.kind === 'human-step') {
+      const stepId = parseInboxItemId(itemId)?.subject;
+      const step = stepId ? this.humanStepsNow().get(stepId) : null;
+      if (stepId && step && isRunRequestOf(step)) {
+        // The route this answers (`POST /api/run/:slug/run-request`) is a run
+        // verb behind `--allow-run`; a lock screen takes no run act it could not.
+        if (!this.flags.allowRun) {
+          return { ok: false, status: 403, error: 'this console was started without --allow-run' };
+        }
+        if (pressDoorOf(actor) === LOCK_SCREEN_DOOR && !lockScreenMay('answer')) {
+          return { ok: false, status: 403, error: 'this answer is not a paired device’s to make — open the item' };
+        }
+        const answered = await this.answerHumanStep(stepId, { option: verb }, { by, actor: pressActor(actor) });
+        return answered.ok ? { ok: true, verb, item: itemId } : { ok: false, status: answered.status, error: answered.error };
+      }
     }
     const action = item.actions.find((candidate) => candidate.verb === verb);
     if (!action) {

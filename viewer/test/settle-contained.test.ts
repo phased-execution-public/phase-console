@@ -120,7 +120,7 @@ test('SL-1 — a root branch that conflicts with main parks the run `unlanded`: 
   const open = row!.actions?.[0];
   assert.equal(open?.verb, 'errand-tree');
   assert.equal(open?.label, 'Open a merge errand tree');
-  assert.deepEqual(open?.body, { phase: 2 });
+  assert.deepEqual(open?.body, { phase: 2, expectRunId: state.id }, 'bound to its run (turn-by-turn phase 5)');
   assert.ok(row!.actions?.some((action) => action.verb === 'recover'), 'and the re-check once it is landed');
 
   // The read path leaves it parked: the board reading every phase done is not

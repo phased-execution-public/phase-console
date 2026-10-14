@@ -755,6 +755,18 @@ test('the two engines agree about a phase\'s human steps, per phase and in the b
         ['browser-login', 'identity', 5, [2, 3], 'guides/gh-sign-in.md'], ['decision', 'money', 60, undefined, undefined],
       ]);
       assert.equal(humanStepsFor(turn, 2)[0]!.why, undefined, 'no why: — the console infers it (F40 advises)');
+      // A decision's options, the recommended one and a deadline (turn-by-turn
+      // phase 2): read by both engines, PRINTED by neither — every line of the
+      // guided fixture is the shape it was before the three keys existed.
+      const guided = store.get('guided')!.plan!;
+      for (const phase of [0, 1, 2, 3]) {
+        const line = await engine(corpus, ['guided', '--human-steps', String(phase)], `guided --human-steps ${phase}`);
+        assert.equal(norm(line), norm(humanStepsFor(guided, phase).map(humanStepLine).join('\n')), `guided phase ${phase}`);
+      }
+      assert.deepEqual(humanStepsFor(guided, 1).map((s) => [s.options?.map((o) => o.id), s.recommended, s.deadline, s.eref]),
+        [[['box', 'cloud', 'skip'], 'box', '2026-10-20T17:00Z', 'E-1']]);
+      assert.equal(humanStepLine(humanStepsFor(guided, 1)[0]!).split('\t').length, 13, 'why and effort make the thirteen; options add none');
+      assert.deepEqual(humanStepsFor(guided, 0).map((s) => s.eref), ['E-2', 'E-4']);
       assert.deepEqual(humanStepsFor(acts, 2).map((s) => [s.kind, s.where, s.due]), [['operator-act', 'any', 'date:2026-10-06T09:00:00Z']]);
       assert.equal(humanStepsFor(acts, 3)[0]!.due, undefined, 'a step with no due: is due at once');
       assert.deepEqual([waitCountFor(acts), waitCountFor(acts, 1), waitCountFor(acts, 2)],

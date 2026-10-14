@@ -133,6 +133,7 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
 | `stop` | | operator | outstanding | no | plan | |
 | `relay` | | operator | outstanding | yes | plan | |
 | `announce` | | operator | outstanding | no | plan | |
+| `plan-approval` | hold | policy | answered | no | default | the shipped default |
 
 ## Phase graph
 <!-- Make blocking vs parallel obvious. This table is MACHINE-READ: scripts/phase-graph.sh
@@ -179,12 +180,15 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
                                       inherits the RUN, which is a different fact from `shared`.
      - **Issues:** draft          <-- off | draft | file — OVERRIDES the plan-wide Issues
      - **Waits on:** gh:<repo>#run · 45m <-- an expected external wait: the ref, and its maximum
-     - **Human step:** browser-login · <what> · open: <url or command> · proof: <ref> · where: host · window: 2d · why: identity · effort: 5m · unblocks: 12 · guide: docs/guides/sign-in.md
-                                  <-- an act only a person can do: one of eighteen kinds (scripts/human-steps.env),
+     `- **Human step:** browser-login · <what> · open: <url or command> · proof: <ref> · where: host · window: 2d · why: identity · effort: 5m · unblocks: 12 · guide: docs/guides/sign-in.md`
+                                  <-- (quoted here so the engine does not read the example as a step)
+                                      an act only a person can do: one of eighteen kinds (scripts/human-steps.env),
                                       what proves it, where; why only a person fits it (a reason the kind allows,
                                       scripts/turn.env), how long it takes, what it unblocks, and a guide file in
                                       the grammar of references/turn.md; `auto-open: host` lets it open by itself;
-                                      `due: <ref>` keeps it Coming up until the ref lands. --human-steps N
+                                      `due: <ref>` keeps it Coming up until the ref lands; a decision's
+                                      `options: id=Label[::consequence] | …` and `recommended: <id>`, and
+                                      `deadline: <ISO 8601>`, when it must be done by. --human-steps N
      - **Person-check:** halt     <-- allow | halt | <owner> when a §Verification fragment is prose
      Read back with phase-graph.sh --size/--qa-mode/--mcp/--mcp-policy/--credentials/--credential-policy/--decisions <N>. -->
   <!-- Externally gated? mark *(GATED)* in the heading, write the conditions (numbered operator steps
@@ -224,6 +228,25 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
 - **Verification:** the runnable command/test that proves each exit criterion (run green at phase-finish).
   - `echo "TODO: the commands that prove phase 2's exit criteria" && false`
 - **Handoff must record:**
+
+<!-- ## Operator errands — OPTIONAL: the plan's OWN acts, which no phase owns (phase 0, asked at
+     every launch). Write the heading for real, then one `- **Human step:**` bullet per act; its steps
+     live in a guide file (`guide:`) or in a row of the section's table, bound by the "(E-N)" the
+     bullet's text ends with. The console reads the table by its column NAMES: in "Exact steps" a
+     backticked `! cmd` is a command step and the prose around it stays as written; a `<placeholder>`
+     command is shown as a template. A row no bullet names is a heads-up (F43); a task or decision with
+     no guide, no options and no row is advised about (F41); a guide: file that does not exist fails
+     the lint (F42). For example (the bullets without their quotes):
+
+     Every `!` line runs from `<repo root>`.
+
+     | Id | Phase · why | What only the owner can do | Exact steps | Expected | How the agent verifies |
+     |---|---|---|---|---|---|
+     | E-1 | after 3 · reach | restart the staging box | `! bash ops/box.sh restart` then comment `restarted` on the tracking issue | the box answers | `! bash ops/box.sh --check` |
+
+     `- **Human step:** operator-act · restart the staging box once phase 3 lands (E-1) · open: bash ops/box.sh restart · proof: cmd:"bash ops/box.sh --check" · why: reach · effort: 5m · due: phase:my-plan/3 · deadline: 2026-12-31`
+     `- **Human step:** decision · choose where the nightly build runs · options: box=The build box::it runs all night | cloud=The cloud runner::it bills by the minute · recommended: box · why: decision · guide: docs/handoffs/my-plan/guides/build-host.md`
+-->
 
 ## End-to-end verification
 <!-- How to test the whole feature once all phases land (run it, MCP checks, tests). -->

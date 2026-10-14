@@ -21,10 +21,11 @@ import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { MANIFEST_BLOCKING } from '../shared/policy-model.js';
 import {
   PreludeRefusal, manifestRows, preludeFor, probeAccounts, probeCredentials, probeDelivery, probeMcp, probeTrees, resolvedManifest,
-  gitStrategyLines, probeGitStrategy, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps, doorOpens, doorSteps, itemOf,
+  gitStrategyLines, probeGitStrategy, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps, doorOpens, doorSteps, itemOf, planStepInput,
   type AccountFacts, type PreludeDeps, type PreludeStep,
 } from '../server/prelude.ts';
 import { HumanStepLedger, sanitiseStep } from '../server/human-steps.ts';
+import { parseHumanStepBody } from '../server/parse/plan.ts';
 import {
   credentialsHeld, forgetCredentialProbes, heldIdsCached, knownCredentialId, probeCredential,
 } from '../server/credentials-probe.ts';
@@ -810,4 +811,64 @@ test('the prelude names, on each owed step, the item that already asks for it �
   assert.equal(thrown.humanSteps.length, 3);
   assert.deepEqual(thrown.humanSteps.map((step) => step.item), [undefined, undefined, undefined]);
   assert.equal(thrown.probes['human-steps'].status, 'ok');
+});
+
+// ---- turn-by-turn phase 2: the door carries every field --------------------
+
+const GUIDED = 'decision · choose where the nightly build runs (E-1) · options: box=The build box::it runs all night | cloud=The cloud runner · '
+  + 'recommended: box · deadline: 2026-10-20T17:00Z · why: decision · effort: 5m · unblocks: 3,4 · guide: docs/guides/build.md';
+
+test('turn-by-turn 2: a plan bullet\'s why, effort, unblocks, guide, options, recommended and deadline reach the ledger item, declared', async () => {
+  const bullet = parseHumanStepBody(GUIDED)!;
+  assert.ok(bullet, 'the bullet parses');
+  const [step] = await doorSteps([{ phase: 2, step: bullet }], undefined);
+  assert.deepEqual(
+    [step!.why, step!.effortMin, step!.unblocks, step!.guide, step!.options, step!.recommended, step!.deadline, step!.eref],
+    ['decision', 5, [3, 4], 'docs/guides/build.md',
+      [{ id: 'box', label: 'The build box', consequence: 'it runs all night' }, { id: 'cloud', label: 'The cloud runner' }],
+      'box', '2026-10-20T17:00Z', 'E-1'],
+  );
+  const guide = 'The build needs a home.\n\n## Steps\n1. Read the cost note.\n2. Pick one.\n';
+  const dir = mkdtempSync(join(tmpdir(), 'pc-door-fields-'));
+  try {
+    const ledger = new HumanStepLedger(join(dir, 'human-steps.ndjson'));
+    const clean = sanitiseStep(planStepInput(step!, guide), 'plan')!;
+    assert.deepEqual(clean.dropped, [], 'nothing the bullet said is dropped');
+    const item = ledger.declare({ slug: 'demo', phase: 2, birth: 'plan', clean: clean.step });
+    assert.equal(item.why, 'decision');
+    assert.equal(item.whySource, 'declared');
+    assert.equal(item.effortMin, 5);
+    assert.deepEqual(item.unblocks, [{ slug: 'demo', phase: 3 }, { slug: 'demo', phase: 4 }]);
+    assert.deepEqual(item.guide?.steps.map((s) => s.text), ['Read the cost note.', 'Pick one.']);
+    assert.deepEqual(item.options, [
+      { id: 'box', label: 'The build box', consequence: 'it runs all night', recommended: true }, { id: 'cloud', label: 'The cloud runner' },
+    ]);
+    assert.equal(item.deadline, '2026-10-20T17:00Z');
+    // …and it reads back from the file the same.
+    const again = new HumanStepLedger(join(dir, 'human-steps.ndjson')).all().find((s) => s.id === item.id)!;
+    assert.deepEqual([again.deadline, again.whySource, again.options?.length], ['2026-10-20T17:00Z', 'declared', 2]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // A bullet with none of them asks exactly as 7.0 did.
+  const [bare] = await doorSteps([{ phase: 2, step: parseHumanStepBody('physical · plug the phone in')! }], undefined);
+  assert.deepEqual(Object.keys(planStepInput(bare!)).sort(), ['kind', 'title', 'where']);
+  // A deadline the ledger cannot read is dropped by name, never kept.
+  assert.ok(sanitiseStep({ kind: 'physical', title: 'x', deadline: 'next week' }, 'plan')!.dropped.includes('deadline'));
+});
+
+test('turn-by-turn 2: itemOf matches by the (E-N…) ref first — a 7.0 item titled with the bullet\'s old words is not asked again', () => {
+  const held = (over: Record<string, unknown> = {}) => ({
+    id: 'hs-70', slug: 'demo', birth: 'plan', phase: 0, kind: 'operator-act',
+    title: 'create the tunnel, hostnames and service token (E-4, hub #105)', ...over,
+  });
+  // The bullet was reworded since the 7.0 door raised the item; its ref did not move.
+  const step = doorStep({ phase: 0, kind: 'operator-act', what: 'Create the tunnel for the data host (E-4)', eref: 'E-4' });
+  assert.equal(itemOf(step, [held()], 'demo'), 'hs-70', 'matched by its trailing (E-4…)');
+  // The ref is read off the step's own text when the door did not carry one.
+  assert.equal(itemOf({ ...step, eref: undefined }, [held()], 'demo'), 'hs-70');
+  assert.equal(itemOf(step, [held({ title: 'create the tunnel (E-5)' })], 'demo'), undefined, 'another ref is another act');
+  assert.equal(itemOf(step, [held({ kind: 'decision' })], 'demo'), undefined, 'the kind still has to agree');
+  // No ref on either side: the exact title, as before.
+  assert.equal(itemOf(doorStep(), [{ id: 'hs-t', slug: 'demo', birth: 'plan', phase: 2, kind: 'browser-login', title: 'Sign in to Vercel' }], 'demo'), 'hs-t');
 });

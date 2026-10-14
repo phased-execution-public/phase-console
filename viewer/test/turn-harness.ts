@@ -60,6 +60,8 @@ export function harness(over: Record<string, unknown> = {}): Harness {
   // …and from an empty handled log (control-tower phase 136).
   rmSync(join(INSTANCE_STATE_DIR, 'handled.ndjson'), { force: true });
   rmSync(join(INSTANCE_STATE_DIR, 'handled-sessions.ndjson'), { force: true });
+  // …and from no settled records (turn-by-turn phase 5).
+  rmSync(join(INSTANCE_STATE_DIR, 'turn-settled.json'), { force: true });
   const root = mkdtempSync(join(tmpdir(), 'pc-turn-moves-'));
   writePlan(root);
   const svc = new Service({

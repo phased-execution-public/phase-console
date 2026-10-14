@@ -70,7 +70,7 @@ import { log } from '../log.ts';
 import { PUSH_DIR } from './vapid.ts';
 import { HUMAN_STEP_PUSH_ACTIONS, type StepPushAction } from './catalogue.ts';
 import { doorMay, OWNER_DOOR_MODES, pressRiskOf, type AuthorityVerb, type PressDoor } from '../../shared/door-model.js';
-import { groupOf, riskOf } from '../../shared/turn-model.js';
+import { riskOf, typeOf, type ItemType } from '../../shared/turn-model.js';
 
 /**
  * How long a notification's buttons stay live.
@@ -91,8 +91,10 @@ export const PUSH_ACTION_VERBS = Object.freeze({
   // may press it (`lockScreenGrant`). Declared beside `allow` so it, too, is
   // always left of Deny.
   grant: 'Allow',
-  deny: 'Deny',
+  // Declared before Deny too (turn-by-turn phase 10): a run request's lock
+  // screen is *Approve* then *Deny*, the yes always on the left.
   approve: 'Approve',
+  deny: 'Deny',
   // An approval card's expiry warning (control-tower phase 97, #140): the
   // long Extend, the one someone away from the console reaches for.
   extend: 'Extend 2 h',
@@ -333,25 +335,46 @@ export function lockScreenGrant(permission: LockScreenPermission | null | undefi
 }
 
 /** What `lockScreenOf` reads of an item. */
-export type LockScreenItem = { kind: string; proofType?: string; permission?: LockScreenPermission | null };
+export type LockScreenItem = {
+  kind: string;
+  proofType?: string;
+  permission?: LockScreenPermission | null;
+  /** The item's type (turn-by-turn phase 10) — derived from its kind and proof when absent. */
+  type?: ItemType;
+  /** A run request's act (turn-by-turn phase 6): its Approve takes it, its Deny tells the phases no. */
+  runAct?: string | null;
+  options?: readonly unknown[];
+};
+
+/**
+ * The lock screen per TYPE (turn-by-turn phase 10, §Architecture 2) — the
+ * card's own type, so the phone offers what the card offers.
+ */
+export function lockScreenTypeOf(item: LockScreenItem): ItemType {
+  return item.type ?? typeOf({
+    kind: item.kind, record: 'ledger', proofType: item.proofType,
+    hasOptions: Boolean(item.options?.length), hasApproval: Boolean(item.runAct),
+  });
+}
 
 /**
  * One item's lock screen: the buttons its push NAMES, in order (the step
  * block's `actions` — `open` is the worker's own, every other one a verb the
- * token signs), and the verbs signed. Two at most, the platform cap.
+ * token signs), and the verbs signed. Two at most, the platform cap. By type
+ * (turn-by-turn phase 10):
  *
- *   - a permission item a device may grant — *Allow* (`grant`, its narrowest
- *     scope) and *Deny* (`deny`, a decline);
- *   - a high or never one — *Open* (the item's page) and *Deny*;
- *   - a decision — *Open* alone: its answer is one of its options, on the page,
- *     and a check of an unanswered one would only send it back;
- *   - an act — *Open* and *I did it* (`check`, run the proof now).
+ *   - an Approval that is a permission item — *Allow* (`grant`, its narrowest
+ *     scope) where a device may grant it, else *Open*; and *Deny* (a decline);
+ *   - an Approval that is a run request — *Approve* and *Deny*, each an answer
+ *     the `device` door may press; where it may not, *Open* alone;
+ *   - a Decision — *Open* alone: its answer is one of its options, on the
+ *     card, and a check of an unanswered one would only send it back;
+ *   - a Task — *Open* and *I did it* (`check`, run the proof now).
  *
- * A grant and a decline are read from the door table, at their own risk; a
- * grant the device may not make is never signed. *I did it* only asks the
- * console to run the item's proof — the verdict is the probe's or the
- * checker's, and a person's word only where the item names no proof
- * (`runCheck`, which asks the door again) — so it stays an act's, as it was.
+ * Every press is read from the door table at its own risk, as written for an
+ * enrolled console (`lockScreenMay`): a verb the device may not make is never
+ * signed. *I did it* only asks the console to run the item's proof — the
+ * verdict is the probe's or the checker's — so it stays a Task's, as it was.
  */
 export function lockScreenOf(item: LockScreenItem): { buttons: StepPushAction[]; verbs: PushActionVerb[] } {
   const open = HUMAN_STEP_PUSH_ACTIONS[0];
@@ -363,9 +386,14 @@ export function lockScreenOf(item: LockScreenItem): { buttons: StepPushAction[];
     const buttons = [...(grant ? [] : [open]), ...verbs.map(button)].slice(0, MAX_NOTIFICATION_ACTIONS);
     return { buttons, verbs };
   }
-  // A decision by what it IS, whatever state it is in now (`groupOf` without one).
-  if (groupOf({ kind: item.kind, ...(item.proofType ? { proofType: item.proofType } : {}) }) === 'decide') {
-    return { buttons: [open], verbs: [] };
+  const type = lockScreenTypeOf(item);
+  if (type === 'approve') {
+    // A run request's Approve and Deny are both ANSWERS (`answer-run-request`).
+    const answers = Boolean(item.runAct) && lockScreenMay('answer');
+    if (!answers) return { buttons: [open], verbs: [] };
+    const verbs: PushActionVerb[] = ['approve', 'deny'];
+    return { buttons: verbs.map(button), verbs };
   }
+  if (type === 'decide' || type === 'know') return { buttons: [open], verbs: [] };
   return { buttons: [...HUMAN_STEP_PUSH_ACTIONS], verbs: ['check'] };
 }

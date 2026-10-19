@@ -80,16 +80,17 @@ quietly not sent.
 
 ## What it shows
 
-The console is **seven places in three bands** — the work (**Runs**, the home, then **Plans** and
-**Sessions**), the record (**Repo**, **Insights** and **Logs**) and the console (**Settings**) — the
-same seven in both editions (`DESTINATIONS`, `shared/route-meta.js`). Beside them sit the heads the
-navigation does not list — **Your turn** (`#/turn`, which lights Runs; *Your turn*, below), a phase's
-and a handoff's own pages under their plan, and a chromeless source picker — and three overlays that
+The console is **eight destinations in three bands** — the work (**Runs**, the home, then **Your turn**,
+**Plans** and **Sessions**), the record (**Repo**, **Insights** and **Logs**) and the console (**Settings**) —
+the same eight in both editions (`DESTINATIONS`, `shared/route-meta.js`; seven until 8.0, when Your turn,
+`#/turn`, stopped lighting Runs and became a destination of its own). Beside them sit the heads the
+navigation does not list — a phase's and a handoff's own pages under their plan, and a chromeless source
+picker — and three overlays that
 ride the query string: the palette, the bell and Help. Every address an earlier version minted still
 resolves — a bookmark, a handoff link or a push payload from an older server lands where its page
 went, in one hop, keeping whichever half of the address still means something (`#/now` → `#/runs`,
-`#/now?focus=inbox` → `#/runs?group=needs-you`, `#/ready` → `#/runs?group=ready`, `#/queue` →
-`#/runs?group=queued`, `#/approve?step=<id>` → `#/turn/<id>`, `#/plan/x/route` →
+`#/now?focus=inbox` → `#/runs?group=needs-you`, `#/ready` → `#/runs?group=ready`, in the free edition
+`#/queue` → `#/runs?group=queued`, `#/approve?step=<id>` → `#/turn/<id>`, `#/plan/x/route` →
 `#/plan/x/phases?view=map`, `#/plan/x/raw` → `#/plan/x/source?view=raw`, `#/terminal/abc` →
 `#/sessions/abc`, `#/debug/health?since=1` → `#/logs/health?since=1`). The 6.x `?bay=` is still read
 as `?group=`, and `#/plan/<slug>/run` is the plan's **Run** view.
@@ -97,12 +98,13 @@ as `?group=`, and `#/plan/<slug>/run` is the plan's **Run** view.
 | Place | Answers |
 |---|---|
 | **Runs** | *Does anything need me?* The home, `#/runs` (`DEFAULT_HEAD`). Its heading is the situation in one sentence — *2 need you, Your turn (1), checkout-rewrite is running — phase 3, 1 waiting, 4 phases ready, $41 today*, every zero left out — and above the groups the console puts only what is wrong with itself (*Claude Code is signed out*, *Nothing is driving this phase*, a repository whose GitHub jobs are not starting). Then six groups, most urgent first, each an address (`?group=`): **Your turn** (every item waiting on you, one line each with its first move, pressed exactly as the server spelled it — `{endpoint, method, body}`, so a new kind ships working against a console nobody rebuilt), **Running**, **Waiting**, **Queued** (whom each run waits on, and the verbs that move it), **Ready to start** (the ready phases of every open plan, each with up to two reasons and **Start**) and **Settled today**, folded. One rule table decides a run's group, so the page and the header cannot disagree. A run is one line — its status as a dot and a word, its name, its phases as a short track, one clock, the phases done (`2/9`) and what it has cost — with exactly one action: the halt card's recommended way forward, its oldest item's button, **Thaw**, **Pause**, **Hold** or **Open run**. Expanded in place it shows the halt card, the lanes and when each was last heard, **Phase N now** and every verb the run takes. **All runs** (`?view=all`) is every run as one table; **Filter** holds nine lamps that count the stopped runs of each halt family, and **⋯** holds **Freeze everything** and **Thaw everything**. What nobody owes — a policy answer, the console's own health, a lock, a ruling — stays in the bell. |
-| **Plans** | *Where does each plan stand?* The library: every open plan one line — its status, its name, its line of phases, the sessions left and when it last moved — as a **List** or as **Cards**, with closed plans and documents in folds that give their counts. **New plan** writes one with AI (`--allow-agent`), scaffolds one from the template (`--allow-writes`), or opens the Issues desk at the issues that need a plan. A plan, `#/plan/<slug>`, opens on its glance — status, line, what is left and what it costs, and the one act that fits (**Start phase 1** while it has no run) — over three views, each an address. **Phases** is one table of every phase with its gate, lock, QA verdict and evidence; `?view=map` draws the plan as a route (stations and track), and `qa` and `handoffs` bring those columns forward. A phase's **Details** opens in place — the runner's words on its record, its QA, its clocks and *Why is this not done?* — and the phase has a page of its own, `#/plan/<slug>/phase/<n>`, with its Gate card and its review. **Run** (`#/plan/<slug>/run`) is the plan's run: its glance — the halt card and the one recommended move, the lanes and their clocks — over folds: **Sessions and their consoles** (a pane per lane, `?lane=p<N>`, and the phases still waiting, `?lane=waiting`), **Phases** with this run's record of each (evidence, liveness, rulings), **Ways forward** (the one renderer a remedy has — there is no second place one can appear), **Why it started and what it cost** (every start and refusal from the run's ledger, and each session with who ended it, its cost, turns, time and caps, reconciled against the run's spend — red, naming the gap, when they disagree), **Where the time went** (the timeline, with a mark for each session, ask, policy answer and start), **What the ladder tried**, **Checkout** (the Git card) and the **Journal**; `?view=history` is every earlier run of the plan. **Source** is the plan as written — its context, session budget, `## Decisions` manifest as it holds and phase graph as the engine parsed it — or byte for byte with `?view=raw`. |
-| **Sessions** | *What is running, and can I get at it?* One list for autopilot lanes, agent sessions, shells and the Claude sessions the presence hook reports, grouped by kind; **Locks**, beside it at `#/sessions/locks`, is every phase claim and who holds it. A session opens full height at `#/sessions/<id>` — the phone-first browser terminal for the two kinds this console holds a pty for, with a key bar and a composer on a phone — and a session this console only knows about opens a page from which its conversation can be resumed. Agent sessions need `--allow-agent`, shells `--allow-terminal`; with neither, Sessions leaves the rail and the lanes still show on Runs. A presence the probe saw end reads `ended · inferred`, a run's session shows the door it came through and who ended it at what cost, and the console's own MCP probe sessions are never listed. |
+| **Your turn** | *What can only I do?* `#/turn`: every act only a person can do, one item each, on tabs (`?tab=open|done|handled|all`) and in four views (`?view=list|board|cards|timeline`) — the whole section *Your turn*, below. |
+| **Plans** | *Where does each plan stand?* The library: every open plan one line — its status, its name, its line of phases, the sessions left and when it last moved — as a **List** or as **Cards**, with closed plans and documents in folds that give their counts. **New plan** writes one with AI (`--allow-agent`), scaffolds one from the template (`--allow-writes`), or opens the Issues desk at the issues that need a plan. A plan, `#/plan/<slug>`, opens on its glance — status, line, what is left and what it costs, and the one act that fits (**Start phase 1** while it has no run) — over four views, each an address. **Phases** is one table of every phase with its gate, lock, QA verdict and evidence; `?view=map` draws the plan as a route (stations and track), and `qa` and `handoffs` bring those columns forward; `schedule` and `burnup` read the same phases as a **Schedule** and a **Burn-up**. The map's tools live in its address — `status=`, `repo=` and `size=` filter chips that dim a station and never remove it, `color=repo|size|cost|time`, `layer=names|short|batches|critical|waves|done|none`, `layout=tb|repo` and `sel=<phase>`, the station a trace ("waits on 34 · unblocks 6") runs through — and the map exports as SVG or PNG; below 9 px on screen a station shows only its number (hover, tap or zoom to read its name). A phase's **Details** opens in place — the runner's words on its record, its QA, its clocks and *Why is this not done?* — and the phase has a page of its own, `#/plan/<slug>/phase/<n>`, with its Gate card and its review. **Run** (`#/plan/<slug>/run`) is the plan's run: its glance — the halt card and the one recommended move, the lanes and their clocks — over folds: **Sessions and their consoles** (a pane per lane, `?lane=p<N>`, and the phases still waiting, `?lane=waiting`), **Phases** with this run's record of each (evidence, liveness, rulings), **Ways forward** (the one renderer a remedy has — there is no second place one can appear), **Why it started and what it cost** (every start and refusal from the run's ledger, and each session with who ended it, its cost, turns, time and caps, reconciled against the run's spend — red, naming the gap, when they disagree), **Where the time went** (the timeline, with a mark for each session, ask, policy answer and start), **What the ladder tried**, **Checkout** (the Git card) and the **Journal**; `?view=history` is every earlier run of the plan. **Your turn** (`#/plan/<slug>/turn`) is the Your turn page scoped to the plan. **Source** is the plan as written — its context, session budget, `## Decisions` manifest as it holds and phase graph as the engine parsed it — or byte for byte with `?view=raw`. |
+| **Sessions** | *What is running, and can I get at it?* One list for autopilot lanes, agent sessions, shells and the Claude sessions the presence hook reports, grouped by kind; **Locks**, beside it at `#/sessions/locks`, is every phase claim and who holds it, and `?view=map` draws the claims on their leases (hatched a lapsed one, ◌ a phase waiting on it). A session opens full height at `#/sessions/<id>` — the phone-first browser terminal for the two kinds this console holds a pty for, with a key bar and a composer on a phone — and a session this console only knows about opens a page from which its conversation can be resumed. Agent sessions need `--allow-agent`, shells `--allow-terminal`; with neither, Sessions leaves the rail and the lanes still show on Runs. A presence the probe saw end reads `ended · inferred`, a run's session shows the door it came through and who ended it at what cost, and the console's own MCP probe sessions are never listed. |
 | **Repo** | *What did the work do to the tree — and which of several trees?* Six sections over the read-only git and issue surfaces, each an address (`#/repo/<section>`, with `?repo=<key>` naming the repository): **History** (`#/repo`: a commit graph with the run and lane branches decorated), **Branches** (divergence, what claims each one, which working trees hold it), **Working trees** (where the parallel work is, and what no surviving run record claims — the reclaim surface), **Changes** (any range, one file's patch at a time), **Settles** (how each run's work reached the trunk, or why it did not) and **Issues** (the Issues desk: each repository's WHOLE GitHub issue list — up to 2,000, and `truncated` said beyond — in one table, with each issue's category, severity and plan status derived from its labels and the local plans' `Fixes:` lines, every column sortable, seven filters and the sort in the address, any `owner/name` added with **Add a repository** and marked outside this console, and a pick that **Author a plan from N issues** hands to the plan wizard — freshness per repository is `fresh` · `stale` with its age · `unknown` with the reason, and a probe that cannot answer leaves the last good rows rather than emptying the list). Above them, the glance `/api/state` has always reported: the branch, its tracking counts, and what is uncommitted **under `docs/`** — the only corner that read covers (`repoInfo` scopes its `git status` there), which is why it says so. A row inspects in the panel, carrying the server's record verbatim. |
 | **Insights** | *How long, how much, how fast, on what?* Eleven questions, each answered once, top to bottom: **How long is left** (the estimate with the basis under it — `plan`, `portfolio` or `heuristic`; the same "≈ 3 days" means three different things), **What it costs** (settled spend against the day cap, and each run against its budget), **What each session cost** (per plan and per account), **What this plan cost** and **This plan's record** (on a scoped page: per-phase money and a finish date; its QA verdicts and their reports), **What a session may spend** (the caps measured from this console's own sessions beside the shipped ones, `GET /api/sizing`), **How fast** (the velocity trend), **This week** (the week's report, `GET /api/report`), **Who was asked** (the cards raised for a person, what auto-grant answered, what waits now), **What shape the work is in** (states, sizes, locks, health, stalled plans) and **On what** (the repositories, skills and models the work runs on). Portfolio-wide, or one plan with `?plan=`. |
 | **Logs** | *What did the console see?* Debug until 7.0; every `#/debug…` address lands on its section with its query. Five sections, each an address (`#/logs/<section>`, `screens/logs/`): **Logs** (`#/logs`) — every log this console writes, on one time axis: the run journals, the watch scheduler's decisions, the health record and every refused tool call, filterable by source, level, time, plan, run, phase and trace in the address, readable here rather than only in a terminal, with a live tail (*Follow*) and the log level card (the level, the debug channels and how long the change stands; *Revert now* ends it early); **Journal** (one run as it happened, on the run view's own Gantt, and why a phase is not done); **Delivery** (what became of each announcement on each device); **Health** (the runtime, the doctor on a press, this process, retired credentials, the automatic starts this hour against the start ceiling — `GET /api/ceiling` — the stray consoles whose code is gone — `GET /api/doctor/strays` — the metrics, and the bundle); **Access** (who this console has served). The bundle is `GET /api/debug/bundle`: one redacted JSON snapshot sized for a context window, so diagnosing a run means handing over a bundle rather than describing a screen. |
-| **Settings** | *What may this console do, and as whom?* Nine sections at their own `#/settings/<section>`, ordered minimal → advanced: **Essentials** (the source and **Change source**, what the console is allowed to do, the start command, the engine, the keys), **Appearance** (theme, density, the terminal's switches, the plans library's order), **Automation** (the launch defaults — the launch form itself, inline — the checkouts, the check's three controls — whether a judgement proof gets a checking session, what that session runs as and after how many rejections an item goes to the owner — the ladder and its caps, the stall thresholds, **The start ceiling**, **Policy answers** with its **Relay rules**, the boarding schedule, the queue, **Session presence**, and **Asking less**, the posture read-out), **Notifications** (every kind and where it lands — console, this device, each channel — plus per-device quiet hours), **Accounts** (each account one line that opens in place, and what this machine holds: every credential a plan names, held or not, `GET /api/credentials`), **MCP servers** (registry and catalog), **Permissions** (**Grants** and **Owner keys**, then the rule editor), **This instance** (what is serving this page, restart, how it is reached, **Logs and retention**, the machine profile, shut down, and the banner of a console whose automation is held) and **Everything** — every key `GET /api/prefs/schema` describes, with its value, its default, where the value came from, a control where a page may write it, and **Reset** (a key sent as `null` goes back to its shipped default). **Find a setting**, at the top of every Settings page, answers with sections and single settings alike, so `quiet hours` finds the switch. `general`, `alerts` and `process` are the pre-4.0 ids and still redirect. |
+| **Settings** | *What may this console do, and as whom?* Nine sections at their own `#/settings/<section>`, ordered minimal → advanced: **Essentials** (the source and **Change source**, what the console is allowed to do, the start command, the engine, the keys), **Appearance** (theme, density, the **Palette** — `quiet`, 7.0's room, or `departures`, the 6.x one, in either light — the terminal's switches, the plans library's order), **Automation** (the launch defaults — the launch form itself, inline — the checkouts, the check's three controls — whether a judgement proof gets a checking session, what that session runs as and after how many rejections an item goes to the owner — the ladder and its caps, the stall thresholds, **The start ceiling**, **Policy answers** with its **Relay rules**, the boarding schedule, the queue, **Session presence**, and **Asking less**, the posture read-out), **Notifications** (every kind and where it lands — console, this device, each channel — plus per-device quiet hours), **Accounts** (each account one line that opens in place, and what this machine holds: every credential a plan names, held or not, `GET /api/credentials`), **MCP servers** (registry and catalog), **Permissions** (**Grants** and **Owner keys**, then the rule editor), **This instance** (what is serving this page, restart, how it is reached, **Logs and retention**, the machine profile — `GET /api/fleet/profile`, which serves no secret: a secret's value is withheld, and `secrets.<key>.hasValue` says whether it is set — shut down, and the banner of a console whose automation is held) and **Everything** — every key `GET /api/prefs/schema` describes, with its value, its default, where the value came from, a control where a page may write it, and **Reset** (a key sent as `null` goes back to its shipped default). **Find a setting**, at the top of every Settings page, answers with sections and single settings alike, so `quiet hours` finds the switch. `general`, `alerts` and `process` are the pre-4.0 ids and still redirect. |
 
 **Three doors on every page.** Every place is a column of one-line rows, and every row opens the same
 three doors to what it leaves out — nothing the console knows is left off, and each fact is within two
@@ -117,12 +119,12 @@ drawing the slots it has — and on a phone the search stays and the rest fold i
 
 | The shell | What |
 |---|---|
-| **Rail** | 900 px and wider: the switcher at its top; the seven places, a glyph over a word, the bands parted by a hairline, with what needs you counted on **Runs**, the ready phases on **Plans** and the live sessions on **Sessions**; and at its foot **Help** and the account meter — the worst 5-hour window of any account and one small bar per account, which opens Settings ▸ Accounts. |
+| **Rail** | 900 px and wider: the switcher at its top; the eight places, a glyph over a word, the bands parted by a hairline, with what needs you counted on **Runs**, the ready phases on **Plans** and the live sessions on **Sessions**; and at its foot **Help** and the account meter — the worst 5-hour window of any account and one small bar per account, which opens Settings ▸ Accounts. |
 | **Header** | Every page: its title, the situation in short — each figure a link to its group, to `#/turn` or to **Insights** — **Search or jump to…** (⌘K) and the bell. On a phone the switcher sits at its start and the situation words take a row of their own. |
-| **Tab bar** | Below 900 px the rail becomes a tab bar: **Runs**, **Plans**, **Sessions**, **Insights** and **More**, which holds the other places, **Help**, the account meter and whether this console may write. |
+| **Tab bar** | Below 900 px the rail becomes a tab bar: **Runs**, **Your turn**, **Plans**, **Sessions** and **More**, which holds the other places, **Help**, the account meter and whether this console may write. |
 | **Panel** | Where **Inspect** puts a record (**Details**): from 1200 px a column beside the page that stays open as you move between pages (⌘I or its × closes it; its edge sets a width from 320 to 640 px), from 900 to 1200 px a sheet over the page, on a phone a sheet from the bottom. This browser remembers whether it is open, how wide, and in which mode. |
 | **⌘ K palette** | `?k=`. One box to **go to** any place or plan, **find** the runs, the ready phases, the settings and the text of every plan and handoff, and **do** every operator verb the console has for what the address names — a verb this console lacks the switch for is drawn dim with the switch it needs, and an act takes a second press to confirm. `/` opens it when nothing has your typing. |
-| **Bell** | `?bell=1`. A sheet titled **Inbox**, with two panels: **Needs you** (the sessions asking you, then the rest — answered here, a row clears everywhere) and **Announcements**, the log of everything the console has said, including what arrived while nothing was open to hear it, each row with what became of it. |
+| **Bell** | `?bell=1`. A sheet titled **Inbox**, with two panels: **Needs you** (the sessions asking you, then the rest — answered here, a row clears everywhere) and **Announcements**, the log of everything the console has said, including what arrived while nothing was open to hear it, each row with what became of it. Its Your turn part is a five-row preview under **Open Your turn**, and **Put back** makes the ticked announcements unread again (`POST /api/notifications/unread`) rather than clearing them. |
 | **Help** | `?help=<section>`: the guide, over the page you are on and at that page's own part — over Runs the **Runs home** section (`tower`), over a plan **A run** (`run`) — one section per `GUIDE_SECTIONS` id (sixteen free, eighteen with Pro), each card linkable on its own, with **What this page reads and presses** under its first line. Each section's English body has a Persian twin beside it, `client/src/content/guide/<id>.fa.md`, for readers of the repository; the console renders the English. |
 | **Switcher** | The top of the rail (the start of the header on a phone): this console and the directory it reads, the other consoles on this machine, and **Open another source here**. |
 | **Source picker** | `#/source`, chromeless and full-screen: until a root is open there is nothing to navigate to. Settings ▸ Essentials is the door back to it. |
@@ -146,7 +148,12 @@ written by an agent session appears without a reload. It is also an installable 
 than showing a stale board — live data is never cached). A new build is taken where nothing can be
 lost — at page load and when you come back to the tab, never over a live session, a terminal or a
 run view, never while you type — and offered as an update toast everywhere else;
-when the server restarts onto a new build, an open tab asks for it at once (`lib/pwa.ts`).
+when the server restarts onto a new build, an open tab asks for it at once (`lib/pwa.ts`). A page
+checks its own build against the server's before it mounts ("Updating to the new version of the
+console…"), and every request it makes carries that build as `x-build-rev`: a press from a page an
+earlier release served is refused **409** before any route reads it — "This page is from a previous
+release of the console — reload it, then press again." — with nothing done (`server/api/build-check.ts`).
+The CLI, the hooks and a session's scripts send no such header and are never judged by it.
 
 **Every clock says what it measures** (#28). A phase has five stamps, and a surface that subtracted
 the pair of its choosing disagreed with its neighbour by 47 seconds on a finished phase and by 11.7
@@ -195,7 +202,10 @@ amber and holds the start button while a blocking row is open, shows the same re
 answers every run must give (resume-on-restart, relay,
 accounts), and lists each such verification command to **approve** — bound to its exact text, with
 every other check still applied, and only where an approval can make it run — or to **waive for this
-run**; a recorded override starts anyway and journals who overrode what. Mid-run, an intervention the policy table can answer —
+run**; a recorded override starts anyway and journals who overrode what. A red line that is not the
+phase's to fix is yours to waive mid-run: **Waive this line** on the run view's verification card, then
+**Waive it for phase N** with a reason (`POST /api/run/:slug/verify-waive`), writes a ruling on the plan's
+ledger that the phase's next verification honours, listed under *Waived by the operator*. Mid-run, an intervention the policy table can answer —
 QA exhausted with `qa.exhausted: waive`, a console restart with `resumeOnRestart` — is answered and
 journalled as `phase.policy-answered` rather than raised as a card; `blocked-declared:unknown` is
 always a card. `phase-console doctor [instance]` runs the same probes by hand, plus the hooks, the
@@ -216,6 +226,16 @@ $250 (Settings ▸ Automation ▸ **The start ceiling**; 0 turns either off; Log
 counters, `GET /api/ceiling`) — past which a start is refused
 (`run.start-refused`) and one *Start ceiling reached* health announcement goes out per window. A
 press is never counted and never refused.
+
+**The machine's load holds new work, never live work.** The guard reads CPU busy over the last 30 s
+across every core — every process on the machine, not only this console's — and holds a new lane at
+85 % at the shipped factor of 1.5 (the limit scales with the factor); the 5-minute load average, which
+counts every short-lived process on macOS, is only a ceiling, at factor × cores × 2. A held admission
+says both figures in one sentence. A **heavy** §Verification or baseline line — a suite, a build, a gate
+— also takes a seat in a machine-wide budget, one per seven cores and at least one, shared by every
+console through `<stateHome>/fleet/jobs/`; a line waiting for a seat is queued, never hung
+(`phase.verify-queued`, `phase.verify-dequeued`). A session's orphaned test runners are reaped when it
+ends, unless it parked.
 
 **The outcome protocol.** A session can declare how it ended instead of leaving the runner to guess
 from a clean exit: `scripts/phase-outcome.sh <slug> <N> <status>` writes one atomic JSON file to the
@@ -476,7 +496,9 @@ is journalled `run.failure-streak-reset` with what it was.
 **What a phase runs as** is resolved from three places, in this order: what you chose for this run,
 then the plan's own `**Model:**` / `**Effort:**` bullets for that phase, then the run's defaults —
 per field, so choosing a model does not discard an effort the plan asked for. The journal records
-which source answered each one.
+which source answered each one. A pinned model is checked on every assistant frame, not only at the
+start, so a session the CLI fell back to another model mid-run parks its phase rather than spending on
+the wrong one.
 
 **The launch shows that answer before you press Start.** Every row of its per-phase table (the
 **Engine** row's per-phase overrides) reads
@@ -657,7 +679,13 @@ waited on less. The deny list is untouched, a wrapper hiding something deny woul
 person, and verification sign-offs and gates are never auto-granted. **Publishing is never
 auto-granted either**: `git push` and `gh pr create` (`OPEN_PR_ASK`) wait for a person unless the
 plan's or the run's `permission.destructive` row names that rule as an exception — a grant under one
-is announced, *Published under a plan exception*, and its journal line carries the exception. Three scopes, most specific wins: per phase (the launch
+is announced, *Published under a plan exception*, and its journal line carries the exception. A
+trunk — `main`, `master`, `trunk` or the run's base — is answered from that row only by a clause that
+names it with its phases (`` `main` by phase 34 ``); a rule written `` `Bash(git push:*)` of `pe/x` `` covers
+that ref alone; a negated phase list (`never`, `not`, `no`, `except`, `!`) excludes those phases, and a
+clause of negated phases only grants nothing. A bare `git push` is denied, naming the push to run
+instead (`git push origin <branch>`), and a forced or deleting push,
+`--no-verify` or another remote needs a person's card even under a whole `Bash(git push:*)` rule. Three scopes, most specific wins: per phase (the launch
 dialog's per-phase **More** panel) → per plan → everywhere (Settings ▸ Permissions), default ON.
 Turn it off at any scope and those cards wait for a person exactly as before. Insights' **Who was
 asked** counts both sides since a date — raised for a person, answered by auto-grant, waiting now,
@@ -773,7 +801,10 @@ picks a remedy from the halt kind alone. Every open phase is **classified** from
 already exists — the board line, the handoff's status and Outstanding text, the run's record and
 halt, the lock, the working tree of the repos the phase names, the gate, QA, MCP and health — into
 one **situation** (`viewer/shared/situation-model.js`: `never-started`, `work-in-progress`,
-`done-unrecorded`, `verify-red`, `blocked-declared:<lock|permission|credential|gate|external|unknown>`,
+`done-unrecorded`, `verify-red`,
+`blocked-declared:<lock|permission|protected-path|credential|gate|external|human-acts|run|issues|unknown>`
+(a session's `--needs issues` — what the run may file, label or comment outward — is read as itself,
+`blocked-declared:issues`, an errand that names the manifest's `issues` row, since 8.0),
 `waiting-external`, `gated-manual`, `plan-broken` (`lint`, `unreadable`, `verification`, `issue`),
 `mcp-unavailable`,
 `resource-wall:<usage|auth|budget|model>`, `foreign-live`, `foreign-stale`, `qa-pending`,
@@ -798,8 +829,9 @@ specification — situations, rungs, convergence triggers, presence, what is sti
 
 ## Your turn — every act only a person can do
 
-Everything a run asks of a person arrives as one **item** on one page: `#/turn`, titled *Your turn* and
-lighting Runs (`client/src/screens/turn/`, a lazy chunk `check-dist` finds by `data-turn-page`). The server
+Everything a run asks of a person arrives as one **item** on one page: `#/turn`, *Your turn*, the eighth
+destination since 8.0 and every plan's fourth view (`#/plan/<slug>/turn[/<id>]`, the page scoped to that
+plan; `client/src/screens/turn/`, a lazy chunk `check-dist` finds by `data-turn-page`). The server
 half is `server/turn/`; its words are `shared/turn-model.js` (bash twin `scripts/turn.env`) and
 `shared/guide-grammar.js`, the one guide parser the server and the page share. `references/turn.md` is the
 session's side of it.
@@ -1012,6 +1044,23 @@ gate no run is asked about keeps the plan's own Approve (`gate-status.md`). The 
 items, and a plan step marked `auto-open: host` opens at launch, on the machine, behind `--allow-terminal` or
 `--allow-agent`, an `http`/`https` link only, once the door has shown it whole.
 
+**A page you work from** (8.0). Tabs — *Open*, *Done*, *Handled by the AI*, *All* (`?tab=open|done|handled|all`);
+four views (`?view=list|board|cards|timeline`; the list by default, one line per item with its whole card in
+the panel when selected); five groupings (`?group=asked|plan|type|deadline|status`) and three orders
+(`?sort=oldest|newest|deadline`); empty groups folded into one line; filter chips with counts on a desk; and
+bulk *Not doing*, *Hand back* and *Snooze*. The words are `TURN_VIEWS`, `TURN_TABS` and `TURN_GROUPINGS` in
+`shared/turn-model.js`. A title is held to 80 characters, and every status word says what it means on hover,
+focus or tap (`shared/status-meanings.js`). The headline reads "1 to do now · 5 coming up · 6 done today". Four
+behaviours changed with it. *Send my decision* sends the answer and then checks it against the item's proof,
+so a decision with options has no separate check button. An item bound to a gate says "Approve the gate on
+Phase N — the item closes when the gate opens." and closes when it does. A reminder leaves a returned item on
+*Redo*. And a proof whose own script is missing reads **Cannot run** (watch word `unrunnable`: "the proof
+itself cannot run — <script> does not exist on the console's checkout; exit 127") instead of failing you. A
+`Human step:` bullet inside an HTML comment is not read. Two advisories guard a plan's proofs at lint time:
+F45 `proof-unparsable` (a proof the check reader would refuse) and F46 `proof-script-run-branch-only` (a
+`cmd:` proof whose script is not on its repository's trunk), both through `scripts/cmd-ref.sh`, the bash twin
+of the one `cmd:` reader in `shared/proof-words.js`.
+
 
 ## Sessions, and the two the console starts for you
 
@@ -1173,7 +1222,7 @@ gates, a press-twice confirm) that shows the exact command first:
 | Approve or revoke a phase gate | `gate-approve.sh` — the phase page's **Gate card**; an approval clears a gate of any kind, and can continue a run the gate parked |
 | Claim or release a phase | `phase-lock.sh` |
 | Turn QA on for a plan | `new-handoff.sh … --qa` (it backfills finished phases as waived) |
-| Close or reopen a plan | `close-plan.sh` (a status and a one-line reason; reopening needs neither) |
+| Close or reopen a plan | `close-plan.sh` (a status and a one-line reason; reopening needs neither). `complete` is refused while the work is not landed — "refusing to close <slug> complete — <n> item(s) of its work are not done:", each item `unlanded:`, `landing:`, `open:` or `issues:` — and `--force` closes it anyway, recorded "closed complete with <n> item(s) open (--force)" |
 
 `--git` is never passed, so these verbs never commit or push — a commit stays a deliberate act in a
 terminal, and the one push the console can make is `--allow-publish`'s, below. Editing plan or
@@ -1187,6 +1236,13 @@ instead of queueing behind each other. Turn it on with *Give this run its own ch
 launch's **Git** row; it needs the **new-branch** strategy (a run with no branch has nothing to check out),
 and on a live run it can only be turned off — the run's commits are on the branch in the checkout it
 started in.
+
+A plan's own `**Branch:**` line names a branch only in backticks — `` `pe/<slug>` `` — and a line of
+bare prose names none, so the launch reads it exactly as the engine does, and a shared launch over a
+plan whose line names a branch asks about it first (#235, #322). Two more of the runner's reads
+changed in 8.0: a sibling's half-written handoff no longer fails your phase's lint
+(`phase.lint-sibling-skipped`), and a resume re-reads the plan's `## Decisions` and journals what
+changed (`run.decisions-reread`) — applying it only when a person pressed the resume.
 
 What the operator **asked for** and what the run **got** are two different facts, deliberately.
 Isolation is refused on a superproject, when the disk cannot take another tree, and when the
@@ -1239,6 +1295,14 @@ run (`worktree-merge`) naming both lanes and the conflicted files; nothing is lo
 commit is still on the lane branch with its checkout still there. At run end the console removes the
 lanes that landed and leaves any that did not — and never deletes a branch.
 
+**A lane is kept while it holds work in the shared tree.** A phase that stops at `partial` with its own
+work uncommitted in a tree it shares, or waits on its own detached job, keeps its lane, and its siblings in
+that tree are held behind it (`run.lane-held`) rather than boarding over its work. Where each phase's work
+stands is the landing ledger, `landing.md`, and a position there only moves forward — held → integrated →
+pushed → pr-open → pr-merged · landed; a write that would take a row back is kept out and said on stderr,
+and `phase-landing.sh --allow-backward` is the deliberate move. The landing proof fetches first and knows a
+squash or pull-request merge for the merge it is.
+
 It needs the **new-branch** git strategy (lanes land on the run branch) and it **refuses on a
 superproject**: `git worktree add` on a repo with submodules gives EMPTY submodule directories, so a
 scoped phase would board a session into nothing. Every refusal is journalled by name and the run
@@ -1262,6 +1326,19 @@ not — one whose cwd already is the root gets the value its own fallback would 
 This is the one place the server mutates a repository, and it is deliberately one FILE —
 `server/runner/worktree.ts`, holding the only exemption `test/never-push.test.ts` grants. The
 remote-talking verbs stay banned even there: the console still never publishes.
+
+**The console's own git is out of a session's reach** (`server/git-guard.ts`). A session edits a run tree
+for hours, and a tree's `.git/config` could make the console run a command on its next git call there. So
+every git the console runs drops the system config (`GIT_CONFIG_NOSYSTEM=1`) and pins the keys that run a
+program — `core.hooksPath=/dev/null` among them, so no hook runs for the console's own git — with the
+credential helper reset to the ones in your global config. A helper set only in the system config, as
+macOS's `osxkeychain` often is, is therefore not used: set `credential.helper` in `~/.gitconfig`. What no
+override can undo — a diff, merge or filter driver, a URL rewrite, an include — is read from each lane's
+trees before its session spawns and again when it exits, and a key that is new halts the lane
+`run-tree-config`: "A session changed its tree's git configuration in a way the console will not run."
+(`phase.run-tree-config`, naming the key). Its neighbour `run-tree-locked` — "A git lock file nothing is
+writing blocks the run's tree." — is an `index.lock` older than two minutes, found before a session boards
+or before §Verification runs (`phase.run-tree-locked`).
 
 The server binds to `127.0.0.1`, and every write requires an `x-phase-console` header plus a
 same-origin `Origin`, which a browser will not send cross-origin without a CORS preflight the server
@@ -1336,7 +1413,8 @@ inside an hour (`LIMIT_NONE_MAX` in `LIMIT_NONE_WINDOW_MS`) hands the phase to t
 reset is further off than `LIMIT_ACTION_COOLDOWN_MS` (10 min) — the window's reported reset, or the
 CLI's own retry delay — no retry can get through, so the FIRST rate-limit burst waits on the window.
 Before the wall, a session's warning past `ALERT_PCT` (95 %) that no account switch can answer engages
-the account's **usage brake**: no new lane boards on that account while one is live on it — the only
+the account's **usage brake** — the account that session spends, never the one a boundary switch has
+already moved the run to: no new lane boards on that account while one is live on it — the only
 lane is never refused — until a reading of that window under `WARN_PCT` (80 %) or its reset
 (`run.usage-brake` / `run.usage-brake-released`). The decision line (`run.usage-decision`) says what was
 done, and counts the live sessions no run spawned on each account by the config dir their presence hook
@@ -1428,6 +1506,19 @@ second writer is how two processes corrupt one login. **A header token** is ours
 a 0600 file elsewhere, never in `servers.json`, never in the browser. **`${VAR}`** is not a secret
 but the name of one, passed through unexpanded so the CLI resolves it in the child's environment. A
 URL carrying its own credential is refused on add.
+
+**Any server, not only the catalog's.** Settings ▸ MCP servers ▸ **Add by hand** registers one from its
+name, id, transport (`stdio`, `http`, `sse` or `ws`), command and arguments or address, headers, environment
+and secrets. A server whose configuration names a `${VAR}` nothing supplies shows **Fill it in**, which
+holds each value the way a secret is held (`PATCH /api/mcp/:id` with `vars`). **Sign in** walks its steps on
+the card — starting, approve (or paste, from a phone), checking — and ends connected, failed or timed out,
+counting down "m:ss left — the Claude CLI gives up five minutes after it starts" (`GET /api/mcp/:id/login`,
+`POST /api/mcp/:id/login/paste`). The official registry is cached for a day at
+`<instance state>/mcp/registry.json`. From a terminal, behind the same `--allow-mcp`:
+`phase-console mcp list`, `phase-console mcp add --manual <json|file|->` and
+`phase-console mcp fill <id> (NAME=<value>… | --from-file <json> | --stdin)`; inline JSON carrying `secrets`
+or `vars`, and a `NAME=<value>` shaped like a token, are refused, because every process on the machine can
+read argv — a file only you can read, or a pipe, carries those.
 
 ### Signing in a server the CLI has never heard of
 

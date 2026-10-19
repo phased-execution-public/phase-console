@@ -40,7 +40,7 @@ import { join } from 'node:path';
 import { KIND_META, redactSecrets } from '../../shared/human-step-model.js';
 import { VERDICTS } from '../../shared/turn-model.js';
 import { quoteLines } from '../issues/prompt.ts';
-import type { SpawnFn, SpawnRequest } from '../runner/spawn.ts';
+import type { SessionMeterHandle, SpawnFn, SpawnOutcome, SpawnRequest } from '../runner/spawn.ts';
 import type { SessionCaps } from '../runner/session-record.ts';
 import { READ_ONLY_LEADS } from '../runner/verify.ts';
 import type { TokenCounters } from '../runner/usage.ts';
@@ -132,6 +132,8 @@ export type CheckerHost = {
   charge: (slug: string) => void;
   /** What it cost: the ceiling's dollars. */
   spent: (usd: number) => void;
+  /** The ledger's meter for the check's session (one-pool phase 6, Pro); absent, nothing is metered. */
+  meter?: (facts: { account: string; model: string; plan: string; phase: number; env?: NodeJS.ProcessEnv }) => SessionMeterHandle;
   /** One piece of evidence's bytes, by its ref — the store's reader. */
   evidence: (ref: string) => Buffer | null;
   tmp?: string;
@@ -274,13 +276,21 @@ export class TurnChecker {
         },
         signal: controller.signal,
       };
+      let meter: SessionMeterHandle | null = null;
+      try {
+        meter = this.host.meter?.({
+          account: accountId, model: input.model, plan: input.step.slug, phase: input.step.phase, ...(request.env ? { env: request.env } : {}),
+        }) ?? null;
+      } catch { meter = null; }
+      if (meter) request.onEvent = (event) => { try { meter?.onEvent(event); } catch { /* the ledger never costs the check */ } };
       this.host.charge(input.step.slug);
-      let outcome;
+      let outcome: SpawnOutcome | undefined;
       try {
         outcome = await this.host.spawn(request);
       } finally {
         clearTimeout(clock);
         input.signal?.removeEventListener('abort', settled);
+        try { meter?.end(outcome ?? null); } catch { /* the ledger never costs the check */ }
       }
       if (outcome.costUsd > 0) this.host.spent(outcome.bookedUsd ?? outcome.costUsd);
       const at = (this.host.now?.() ?? new Date()).toISOString();

@@ -48,6 +48,9 @@
 #   phase-graph.sh <slug> --waits-on N    # the refs phase N's `- **Waits on:**` bullet names, one per line
 #   phase-graph.sh <slug> --human-steps [N] # the `- **Human step:**` bullets as TSV: kind, what, open, proof, where,
 #                                         # window minutes, auto-open, credential (no N: every phase, led by `N<TAB>`)
+#   phase-graph.sh <slug> --model [N]     # the model phase N runs: its `- **Model:**` bullet (a prose
+#                                         # "(1M window)" read as [1m]), else the plan's target model;
+#                                         # nothing when neither names one (the run's model answers)
 #   phase-graph.sh <slug> --checkout N    # the phase's `- **Checkout:**` branch, verbatim
 #   phase-graph.sh <slug> --verify-in N   # the phase's `**Verify in:**` directory, one line (empty: the root)
 #   phase-graph.sh <slug> --floor [N]     # phase N's `- **Wall-clock floor:**` bullet in MINUTES,
@@ -76,7 +79,7 @@
 # Run from the repo root that owns docs/, or set DOCS_ROOT.
 set -euo pipefail
 
-slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--verified|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--permission-mode [N]|--model-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--verify-timeout [N]|--waits-on N|--human-steps [N]|--checkout N|--verify-in N|--floor [N]|--land [N]|--landing N|--base-branch|--gitlink [N]|--conflict-policy|--isolation [N]|--clash-zones|--issues [N]|--messaging|--notes N|--boot-prompt N|--boot-fanout "N M …"|--session-plan [model|budget]]}"
+slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--verified|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--permission-mode [N]|--model-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--verify-timeout [N]|--waits-on N|--human-steps [N]|--model [N]|--checkout N|--verify-in N|--floor [N]|--land [N]|--landing N|--base-branch|--gitlink [N]|--conflict-policy|--isolation [N]|--clash-zones|--issues [N]|--messaging|--notes N|--boot-prompt N|--boot-fanout "N M …"|--session-plan [model|budget]]}"
 mode="${2:-board}"
 arg="${3:-}"
 
@@ -105,6 +108,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # One bash reading of the Repos column, shared with phase-lock.sh.
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/scope.sh"
+# How a `cmd:` ref reads — the one bash reader, shared with phase-outcome.sh
+# (F45, F46; one-pool phase 13).
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/cmd-ref.sh"
 
 # F5: single source of truth for sizing + budgets. Canonical values live in
 # scripts/sizing.env (also documented in references/sizing.md); these defaults are
@@ -1147,6 +1154,24 @@ table_cell_issues() {
   return 0
 }
 
+# F21, section side (#228): two `### Phase N` headings for one phase. The
+# index files both sections under N, so every per-phase directive answers the
+# FIRST section's bullet and a second section's is a directive nobody reads —
+# and the console's parser used to keep the LAST, so the two readers answered
+# about different phases with the lint saying OK. The heading rule is the
+# index's own (`_load_phase_index`), so what this counts is what it files.
+repeated_section_issues() {
+  awk '
+    /^###[[:space:]]+[Pp]hase[[:space:]]+[0-9]+/ {
+      h = $0; sub(/^###[[:space:]]+[Pp]hase[[:space:]]+/, "", h); sub(/[^0-9].*/, "", h)
+      if (!(h in n)) order[++k] = h
+      n[h]++
+    }
+    END { for (i = 1; i <= k; i++) { h = order[i]; if (n[h] > 1)
+      printf "phase %s: phase-section-repeated — \"### Phase %s\" heads %d sections; every reader takes the first section'"'"'s directives and ignores the rest — merge them into one\n", h, h, n[h] } }
+  ' "$plan_file" 2>/dev/null || true
+}
+
 # F21, handoff side: a phase with more than one handoff file. The board reads
 # ONE status per phase, so the second file is a status nobody sees — and which
 # of the two won used to be decided by alphabetical order.
@@ -1190,6 +1215,7 @@ scaffold_handoff_issues() {
 compute_issues() {
   table_shape_issues
   table_cell_issues
+  repeated_section_issues
   duplicate_handoff_issues
   scaffold_handoff_issues
   find_malformed | while IFS= read -r c; do
@@ -1951,6 +1977,7 @@ credential_advisories() {
   return 0
 }
 
+
 # --- the advisory pass cannot take the gate down ----------------------------
 #
 # An advisory proves nothing about a plan by design: it rides stderr and the
@@ -2478,6 +2505,19 @@ plan_model() {
   printf '\n'
 }
 
+# The model phase $1 runs (one-pool phase 4): its `- **Model:**` bullet's first
+# word, a prose "(1M window)" after it read as [1m], else the plan's target
+# model; nothing when neither names one. What the boot prompt shows and `--model`
+# prints — the JS twin is `phaseModelFor` in parse/plan.ts.
+phase_model() {
+  local model_raw model
+  model_raw="$(_phase_directive "$1" 'Model' | head -1)"
+  model="$(printf '%s\n' "$model_raw" | tr -d '`' | awk 'NF { print $1; exit }')"
+  [ -z "$model" ] || model="$(_model_window "$model" "${model_raw#*"$model"}")"
+  [ -n "$model" ] || model="$(plan_model 2>/dev/null | tr -d '`' | awk 'NF { print $1; exit }')"
+  printf '%s' "$model"
+}
+
 # A 1M window written as PROSE right after a model name — `claude-opus-5-5
 # (1M window)` — is the window the plan asked for (control-tower phase 13,
 # #91): read it as the `[1m]` suffix every reader acts on, never as decoration
@@ -2828,8 +2868,29 @@ HUMAN_STEP_GRAMMAR='- **Human step:** <kind> · <what> · open: <url or command>
 # under `## Operator errands`, which no phase owns — an act the operator owes the
 # run, like restarting a console once a release is out. Every other phase reads
 # its `### Phase N` block.
+#
+# An HTML comment is stripped before any bullet is read (one-pool phase 14,
+# #346): templates/plan.md teaches the grammar with an example bullet inside
+# `<!-- … -->`, and read as a step it had the launch door ask a person to sign
+# in to "<what>". Every Human step lint (F37, F38, F40, F41, F42, F45, F46)
+# reads through this one reader, so none of them sees a commented bullet. A
+# comment may span lines; one never closed runs to the end of the block. Lines
+# are kept (an emptied line stays a line) so the JS twin,
+# `stripHtmlComments` in parse/plan.ts, cuts exactly the same text.
+_strip_html_comments() {  # stdin → stdin with every <!-- … --> cut out, line for line
+  awk '{
+    s = $0; out = ""
+    while (length(s) > 0) {
+      if (incom) { i = index(s, "-->"); if (i == 0) { s = "" } else { s = substr(s, i + 3); incom = 0 } }
+      else { i = index(s, "<!--"); if (i == 0) { out = out s; s = "" } else { out = out substr(s, 1, i - 1); s = substr(s, i + 4); incom = 1 } }
+    }
+    print out
+  }'
+}
+
 human_step_bodies() {  # human_step_bodies <phase> → each bullet's body after its label, one per line
   if [ "$1" = 0 ]; then _section 2 "operator errands"; else phase_block "$1"; fi \
+    | _strip_html_comments \
     | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}human[[:space:]]+step\*{0,2}[[:space:]]*:' \
     | sed -E 's/^[^:]*:[[:space:]]*//; s/^\*{1,2}[[:space:]]*//; s/[[:space:]]+$//' || true
 }
@@ -3106,8 +3167,20 @@ errand_refs() {
       gsub(/[ \t*`]/, "", id)
       if (id ~ /^E-[0-9]+$/) print "row\t" id
     }
-    tolower($0) ~ /^[ \t]*[-*][ \t]*\*{0,2}human[ \t]+step/ {
-      s = $0
+    # A bullet inside an HTML comment binds nothing (#346): the text the
+    # bullet branch reads is the line with its comments cut, tracked across
+    # lines exactly as `_strip_html_comments` does — and, as there, within
+    # one block: a heading ends a comment never closed above it.
+    {
+      if ($0 ~ /^##+[ \t]/) incom = 0
+      s = $0; t = ""
+      while (length(s) > 0) {
+        if (incom) { i = index(s, "-->"); if (i == 0) { s = "" } else { s = substr(s, i + 3); incom = 0 } }
+        else { i = index(s, "<!--"); if (i == 0) { t = t s; s = "" } else { t = t substr(s, 1, i - 1); s = substr(s, i + 4); incom = 1 } }
+      }
+    }
+    tolower(t) ~ /^[ \t]*[-*][ \t]*\*{0,2}human[ \t]+step/ {
+      s = t
       while (match(s, /\(E-[0-9]+([^0-9A-Za-z_)][^)]*)?\)/)) {
         ref = substr(s, RSTART + 1, RLENGTH - 2); sub(/[^0-9E-].*$/, "", ref)
         print "bound\t" ref
@@ -3155,6 +3228,86 @@ errand_row_advisories() {
     $1 == "bound" { bound[$2] = 1 }
     END { for (i = 1; i <= n; i++) if (!(order[i] in bound)) print order[i] }'); do
     printf 'F43 errand-row-unbound — the ## Operator errands row %s has no Human step bullet ending its text with (%s), so nothing checks it or waits on it; it is shown as a heads-up\n' "$id" "$id"
+  done
+  return 0
+}
+
+# F45 `proof-unparsable` (one-pool phase 13, #345) — ADVISORY. A Human step's
+# `proof:` the console's check reader would refuse at every check: a `cmd:`
+# ref it could not run as written (a shell variable, a substitution, quoting
+# that never closes, a path relative to a session's cwd — `cmd-ref.sh`
+# `_cmd_ref_problem`, the reader `phase-outcome.sh` refuses with), one that
+# names no command, or a proof with no watch scheme at all. The step could
+# never pass its own check; only *Accept anyway* would close it.
+proof_unparsable_advisories() {
+  local p body problem
+  for p in $(human_step_phases); do
+    while IFS= read -r body; do
+      [ -z "$body" ] && continue
+      _human_step_parse "$body" || continue
+      [ -z "$HS_PROOF" ] && continue
+      case "$HS_PROOF" in
+        cmd:*)
+          problem="$(_cmd_ref_problem "$HS_PROOF")"
+          [ -z "$(_cmd_body "$HS_PROOF")" ] && problem='it names no command'
+          ;;
+        gh:*|date:*|until:*|lock:*|phase:*|verify:*|unit:*|credential:*) problem="" ;;
+        *) problem='it names no watch scheme the console reads (cmd:, gh:, date:, lock:, phase:, verify:, unit:, credential:)' ;;
+      esac
+      [ -z "$problem" ] && continue
+      printf 'F45 phase %s: proof-unparsable — the %s step "%s" has a proof the console cannot read as written: %s; its check would refuse it every time\n' \
+        "$p" "$HS_KIND" "$(printf '%s' "$HS_WHAT" | cut -c1-60)" "$problem"
+    done <<EOF
+$(human_step_bodies "$p")
+EOF
+  done
+  return 0
+}
+
+# F46 `proof-script-run-branch-only` (one-pool phase 13, #374) — ADVISORY. A
+# Human step whose `cmd:` proof runs a script (the first absolute path after
+# bash/sh/python3/node…, or the command itself) that is not on its
+# repository's trunk — `origin/HEAD`, else `main`, else `master` — or is
+# nowhere at all. The console checks a proof from its own checkout, which
+# stands on the trunk, so until the script lands the check exits 127 and reads
+# `unrunnable`, never passing however done the act is.
+proof_script_advisories() {
+  local p body script dir prefix top base rel where
+  for p in $(human_step_phases); do
+    while IFS= read -r body; do
+      [ -z "$body" ] && continue
+      _human_step_parse "$body" || continue
+      case "$HS_PROOF" in cmd:*) ;; *) continue ;; esac
+      script="$(_cmd_script "$(_cmd_body "$HS_PROOF")")"
+      [ -z "$script" ] && continue
+      dir="$(dirname "$script")"
+      while [ ! -d "$dir" ] && [ "$dir" != / ]; do dir="$(dirname "$dir")"; done
+      top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || top=""
+      where=""
+      if [ -z "$top" ]; then
+        [ -e "$script" ] && continue
+        where="exists nowhere on this machine"
+      else
+        base="$(git -C "$top" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || base=""
+        if [ -z "$base" ]; then
+          if git -C "$top" rev-parse -q --verify main >/dev/null 2>&1; then base=main
+          elif git -C "$top" rev-parse -q --verify master >/dev/null 2>&1; then base=master
+          else continue
+          fi
+        fi
+        # The script's path inside its repository, from the deepest directory
+        # of it that exists — never by cutting the toplevel off, which a
+        # symlinked temp root (/var → /private/var) would not match.
+        prefix="$(git -C "$dir" rev-parse --show-prefix 2>/dev/null)" || prefix=""
+        rel="${prefix}${script#"$dir"/}"
+        git -C "$top" cat-file -e "$base:$rel" 2>/dev/null && continue
+        if [ -e "$script" ]; then where="is not on $base (it exists only on another branch)"; else where="is on neither this checkout nor $base"; fi
+      fi
+      printf 'F46 phase %s: proof-script-run-branch-only — the %s step "%s" proves itself with %s, which %s; the console checks a proof from its own checkout, so until the script lands there its check exits 127 and reads unrunnable — land the script first, or prove the step another way\n' \
+        "$p" "$HS_KIND" "$(printf '%s' "$HS_WHAT" | cut -c1-60)" "$script" "$where"
+    done <<EOF
+$(human_step_bodies "$p")
+EOF
   done
   return 0
 }
@@ -3796,6 +3949,7 @@ model_policy_for_phase() {  # model_policy_for_phase [phase]
   return 0
 }
 
+
 land_for_phase() {  # land_for_phase [phase] -> hold|integrate|pr|trunk<TAB>source
   _resolve_directive "${1:-}" 'Landing' 'Land' "$LAND_POLICIES" "$DEFAULT_LAND"
 }
@@ -4010,6 +4164,17 @@ _note_rows_of() {  # _note_rows_of <handoff-file>
     # F26. Tracked across lines because the block spans them.
     /<!--/ { comment = 1 }
     comment { if ($0 ~ /-->/) comment = 0; next }
+    # An INDENTED bullet under an addressed note is that note'"'"'s continuation
+    # (#378), folded in behind " - " (ASCII, so the bash and JS 500-character cuts agree) as a wrapped line is behind a space: read as
+    # a bullet of its own it flushed the note and was dropped (its label is no
+    # address), so a note whose detail sat in sub-bullets arrived as its first
+    # line alone. Under no address it stays a bullet, as it always was.
+    inside && target != "" && /^[[:space:]]+[-*][[:space:]]/ {
+      line = $0; sub(/^[[:space:]]+[-*][[:space:]]*/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line != "") text = text " - " line
+      next
+    }
     # A new bullet. The label runs to the first colon, and the colon sits INSIDE
     # the emphasis (`- **Phase 7:** …`), so the closing `**` has to be stripped
     # off both halves — off the label to read it, off the note so it does not
@@ -4388,10 +4553,17 @@ missing_deps_annotated() {  # missing_deps_annotated <phase>
 # The `blocked:` line: every waiting phase, its unmet deps, and why each is
 # unmet. Emitted only when something is actually waiting, so the common case
 # costs nothing and old parsers see no new line.
+#
+# A STUCK or IN-PROGRESS phase with an unmet dependency is named too (one-pool
+# phase 23, #288): its handoff word puts it in its bucket whatever its deps
+# say — a `blocked` handoff on a phase a later amendment gave a new dependency
+# — and the console admits nothing this line holds back. The bucket stays the
+# handoff's (the five words are the engine's truth); the pair says what it
+# still waits on.
 blocked_pairs() {
   local p d out="" deps
   for p in "${PHASES[@]}"; do
-    [ "$(phase_state "$p")" = waiting ] || continue
+    case "$(phase_state "$p")" in waiting|stuck|in-progress) ;; *) continue ;; esac
     deps=""
     for d in ${DEPS[$p]:-}; do
       _is_verified "$d" && continue
@@ -4673,7 +4845,9 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   printf '  3. You need your own shell job and nothing else is left → wait in ONE foreground call\n'
   printf '     bounded by the Bash timeout: `until <probe>; do sleep 10; done` with\n'
   printf '     `timeout: 600000`, at most once per ten minutes. The console allows a wait on your\n'
-  printf '     own job; it refuses one on somebody else'\''s clock.\n'
+  printf '     own job; it refuses one on somebody else'\''s clock. Never wait on `pgrep -f` text that\n'
+  printf '     is in your own command — the loop'\''s shell matches it and the wait never ends; wait on\n'
+  printf '     the job'\''s pid (`while kill -0 <pid>`) or a sentinel it writes (`until [ -f x.exit ]`).\n'
   printf '  4. Only subagents or monitors running in the background are left → end your turn; the\n'
   printf '     session stays alive and their notification wakes you. They are stopped ten minutes\n'
   printf '     after your turn ends — dispatch a subagent that may take longer in the FOREGROUND.\n'
@@ -4915,9 +5089,10 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   printf 'paths, no $, no cd) and exits 0 only once the thing has happened; exit 2 means fix the ref.\n'
 }
 
-# `boot_fanout "<phase> <phase> …"` — what a handoff that unblocks several
-# phases writes under `▶ Start next phase(s)`, and what next-phase-prompt.sh
-# prints for them (control-tower phase 85, #115). Each whole prompt used to be
+# `boot_fanout "<phase> <phase> …"` — what next-phase-prompt.sh prints for
+# several phases a finished one has unblocked (control-tower phase 85, #115) —
+# and what a handoff spliced under `▶ Start next phase(s)` until one-pool phase
+# 25 (#338), which made that section a pointer to this composer. Each whole prompt used to be
 # written out per phase: a handoff unblocking eight carried the same ~110 lines
 # of boot eight times, and every session told to read it read them all.
 #
@@ -5000,10 +5175,7 @@ boot_fanout() {  # boot_fanout "<phase> <phase> …" (commas also accepted)
         *)    gmark=' — 🔒 GATED·human (operator must approve first)' ;;
       esac
     fi
-    model_raw="$(_phase_directive "$q" 'Model' | head -1)"
-    model="$(printf '%s\n' "$model_raw" | tr -d '`' | awk 'NF { print $1; exit }')"
-    [ -z "$model" ] || model="$(_model_window "$model" "${model_raw#*"$model"}")"
-    [ -n "$model" ] || model="$(plan_model 2>/dev/null | tr -d '`' | awk 'NF { print $1; exit }')"
+    model="$(phase_model "$q")"
     printf '\n### Phase %s — %s%s\n\n' "$q" "${TITLE[$q]:-}" "$gmark"
     if [ -n "$model" ]; then
       printf -- '- **Size:** %s · **Model:** `%s` · **Scope:** `%s`\n' "${SIZE[$q]:-M}" "$model" "${REPOS[$q]:-all}"
@@ -5076,6 +5248,8 @@ case "$mode" in
       _advise F38 human_step_advisories
       _advise F41 human_step_guide_advisories
       _advise F43 errand_row_advisories
+      _advise F45 proof_unparsable_advisories
+      _advise F46 proof_script_advisories
     fi
     if [ -n "$issues" ]; then
       # A closed plan still gets its problems named — they just stop being a gate.
@@ -5174,6 +5348,19 @@ case "$mode" in
       case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
     fi
     permission_mode_for_phase "$arg"
+    exit 0
+    ;;
+  --model)
+    # The model a phase runs (one-pool phase 4): its bullet, else the plan's
+    # target model, one line; nothing when neither names one. With no argument,
+    # the plan's target model alone.
+    if [ -n "$arg" ]; then
+      case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+      m="$(phase_model "$arg")"
+    else
+      m="$(plan_model 2>/dev/null | tr -d '`' | awk 'NF { print $1; exit }')"
+    fi
+    [ -z "$m" ] || printf '%s\n' "$m"
     exit 0
     ;;
   --model-policy)

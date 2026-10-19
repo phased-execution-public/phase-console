@@ -76,3 +76,58 @@ test('a timed-out verification kills the whole group, not just the bash (autopil
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * one-pool phase 26 (#222) — a `node --test` a SESSION started does not
+ * outlive it. Claude Code runs each Bash command in a process group of its own,
+ * so the session's group cannot reach a background suite: the reaper records
+ * the session's descendants while it lives and ends the orphaned test runners
+ * when it ends — with their group — and whatever stayed in the session's own
+ * group. Real processes, for the reason this file gives at its top.
+ */
+test('RG-1: a session\'s orphaned `node --test` and its own group are ended with it (#222)', async () => {
+  const { SessionReaper } = await import('../server/runner/reap.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'pc-reap-'));
+  const runnerPid = join(dir, 'runner.pid');
+  const memberPid = join(dir, 'member.pid');
+  writeFileSync(join(dir, 'hang.test.mjs'), "import test from 'node:test';\ntest('hangs', () => new Promise(() => { setInterval(() => {}, 1000); }));\n");
+  // The "session": a group leader whose one command starts a suite in a group
+  // of its own (`set -m`, as Claude Code's Bash tool does) and leaves a
+  // `sleep` in the leader's group.
+  const { spawn } = await import('node:child_process');
+  const leader = spawn('bash', ['-c', [
+    `sleep 120 & echo $! > ${JSON.stringify(memberPid)}`,
+    'set -m',
+    `node --test ${JSON.stringify(join(dir, 'hang.test.mjs'))} >${JSON.stringify(join(dir, 'runner.out'))} 2>&1 & echo $! > ${JSON.stringify(runnerPid)}`,
+    'sleep 120',
+  ].join('\n')], { detached: true, stdio: 'ignore', env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NODE_TEST'))) });
+  const strays: number[] = [];
+  try {
+    const reaper = new SessionReaper();
+    reaper.begin(leader.pid!, { sessionId: 'rg-1' });
+    for (let i = 0; i < 100 && !(existsSync(runnerPid) && existsSync(memberPid)); i++) await settle(50);
+    const runner = Number(readFileSync(runnerPid, 'utf8'));
+    const member = Number(readFileSync(memberPid, 'utf8'));
+    strays.push(runner, member);
+    await settle(400);
+    await reaper.observe();
+    assert.ok(reaper.tracked(leader.pid!)?.has(runner), 'the suite was recorded while the session lived');
+
+    // The session ends — its leader alone; the suite is orphaned to launchd.
+    const exited = new Promise((done) => leader.once('exit', done));
+    process.kill(leader.pid!, 'SIGKILL');
+    await exited;
+    await settle(200);
+    assert.equal(alive(runner), true, `before the reap the suite outlives its session — the bug (${existsSync(join(dir, 'runner.out')) ? readFileSync(join(dir, 'runner.out'), 'utf8').slice(0, 400) : 'no output'})`);
+
+    const reaped = await reaper.ended(leader.pid!);
+    await settle(300);
+    assert.equal(alive(runner), false, `the orphaned suite (pid ${runner}) was ended with its session`);
+    assert.equal(alive(member), false, `what stayed in the session's own group (pid ${member}) too`);
+    assert.ok(reaped.some((row) => row.pid === runner && /node --test/.test(row.command)), `named: ${JSON.stringify(reaped)}`);
+  } finally {
+    for (const pid of strays) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+    try { process.kill(-leader.pid!, 'SIGKILL'); } catch { /* gone */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

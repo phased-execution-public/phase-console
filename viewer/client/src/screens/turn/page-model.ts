@@ -25,15 +25,27 @@ import {
   RISK_TIERS,
   ROUTE_META,
   ROUTE_TO,
+  TURN_BOARD_COLUMNS,
+  TURN_DEADLINE_BANDS,
+  TURN_DEADLINE_LABEL,
+  TURN_GROUPINGS,
   TURN_GROUPS,
   TURN_GROUP_LABEL,
+  TURN_TABS,
+  TURN_TAB_LABEL,
+  TURN_VIEWS,
+  TURN_VIEW_ALIASES,
   TYPE_META,
   WHY_PERSON,
   type ItemType,
   type PersonStatus,
   type RiskTier,
   type RouteTo,
+  type TurnDeadlineBand,
   type TurnGroup,
+  type TurnGrouping,
+  type TurnTab,
+  type TurnPageView,
 } from '@shared/turn-model.js';
 import type { HumanStepRecord } from '@/data/human-steps';
 import type { HandledRow, TurnAnswer, TurnItem, TurnStrip } from '@/data/turn';
@@ -72,8 +84,8 @@ export const EMPTY_WORDS: Readonly<Record<SectionId, string>> = Object.freeze({
 
 /** A section as the page draws it: its items (or handled rows) after the filters, and how many there were before. */
 export type TurnSection = {
-  /** A group, the handled log — or, grouped by plan, `plan:<slug>`. */
-  id: SectionId | `plan:${string}`;
+  /** A group, the handled log — or, grouped, `<grouping>:<key>` (`plan:<slug>`, `type:do`…). */
+  id: SectionId | `${Exclude<Grouping, 'asked'>}:${string}`;
   label: string;
   items: TurnItem[];
   /** The handled rows — only on `handled`. */
@@ -231,35 +243,60 @@ export function filtersHref(route: Route, patch: Partial<TurnFilters & Record<Ar
  * The arrangement — Group, Sort and View, in the address too
  * ------------------------------------------------------------------ */
 
-/** By what is asked (the six groups) — the default — or by plan. */
-export const GROUPINGS = Object.freeze([
-  { id: 'asked', label: 'What is asked', blurb: 'The six groups: approve, do now, decide and the rest.' },
-  { id: 'plan', label: 'Plan', blurb: 'One section per plan for the open items; Done stays last.' },
-] as const);
+/** What each grouping does, in the Group slot's words — the ids are `TURN_GROUPINGS`'. */
+const GROUPING_WORDS: Readonly<Record<TurnGrouping, { label: string; blurb: string }>> = Object.freeze({
+  asked: { label: 'What is asked', blurb: 'Approve, do now, decide, being checked, coming up, done.' },
+  plan: { label: 'Plan', blurb: 'One section per plan.' },
+  type: { label: 'Type', blurb: 'Approvals, tasks, decisions and heads-ups apart.' },
+  deadline: { label: 'Deadline', blurb: 'Past its deadline, due within a day, due later, none set.' },
+  status: { label: 'Status', blurb: 'To do, checking, redo and the rest, by the person’s status.' },
+});
+
+/** What each view draws — the ids are `TURN_VIEWS`'. */
+const VIEW_WORDS: Readonly<Record<TurnPageView, { label: string; blurb: string }>> = Object.freeze({
+  list: { label: 'List', blurb: 'One line per item; the selected card opens beside the list.' },
+  board: { label: 'Board', blurb: 'Columns by status: to do, checking, redo, waiting for the owner, done.' },
+  cards: { label: 'Cards', blurb: 'Every item drawn whole.' },
+  timeline: { label: 'Timeline', blurb: 'Every item on one clock, from when it was raised to its deadline.' },
+});
+
+/** The Group slot's choices, in `TURN_GROUPINGS` order. */
+export const GROUPINGS: readonly { id: TurnGrouping; label: string; blurb: string }[] = Object.freeze(
+  TURN_GROUPINGS.map((id) => ({ id, ...GROUPING_WORDS[id] })),
+);
 export const SORTS = Object.freeze([
   { id: 'oldest', label: 'Oldest first', blurb: 'What has waited longest leads each section.' },
   { id: 'newest', label: 'Newest first', blurb: 'What arrived last leads.' },
   { id: 'deadline', label: 'Deadline first', blurb: 'The nearest deadline leads; items with none follow.' },
 ] as const);
-export const VIEWS = Object.freeze([
-  { id: 'cards', label: 'Cards', blurb: 'Every open item drawn whole.' },
-  { id: 'compact', label: 'Compact', blurb: 'Every item folded to its head; open one to act.' },
-] as const);
+/** The View slot's choices, in `TURN_VIEWS` order. */
+export const VIEWS: readonly { id: TurnPageView; label: string; blurb: string }[] = Object.freeze(
+  TURN_VIEWS.map((id) => ({ id, ...VIEW_WORDS[id] })),
+);
+/** The tabs, in `TURN_TABS` order. */
+export const TABS: readonly { id: TurnTab; label: string }[] = Object.freeze(
+  TURN_TABS.map((id) => ({ id, label: TURN_TAB_LABEL[id] })),
+);
 
-export type Grouping = (typeof GROUPINGS)[number]['id'];
+export type Grouping = TurnGrouping;
 export type SortOrder = (typeof SORTS)[number]['id'];
-export type ViewMode = (typeof VIEWS)[number]['id'];
-export type ArrangeKey = 'group' | 'sort' | 'view';
-export type Arrangement = { group: Grouping; sort: SortOrder; view: ViewMode };
+export type ViewMode = TurnPageView;
+export type ArrangeKey = 'group' | 'sort' | 'view' | 'tab';
+export type Arrangement = { group: Grouping; sort: SortOrder; view: ViewMode; tab: TurnTab };
 
-/** The arrangement an address carries; a word none of the three holds reads as the default. */
+/**
+ * The arrangement an address carries; a word none of them holds reads as the
+ * default, and 7.1's `?view=compact` as the list (`TURN_VIEW_ALIASES`).
+ */
 export function arrangementOf(query: Readonly<Record<string, string>>): Arrangement {
   const pick = <T extends string>(list: readonly { id: T }[], value: string | undefined): T =>
     list.find((one) => one.id === value)?.id ?? list[0]!.id;
+  const view = (TURN_VIEW_ALIASES as Readonly<Record<string, TurnPageView>>)[query.view ?? ''] ?? query.view;
   return {
     group: pick(GROUPINGS, query.group),
     sort: pick(SORTS, query.sort),
-    view: pick(VIEWS, query.view),
+    view: pick(VIEWS, view),
+    tab: pick(TABS, query.tab),
   };
 }
 
@@ -403,35 +440,259 @@ export function sectionsOf(
   });
 }
 
-/**
- * Grouped by plan: one section per plan the open items name (in the order
- * their first item stands), each holding its items in the groups' order, then
- * *Done* and the handled log as they are — what is over is not regrouped.
- */
-export function byPlan(sections: readonly TurnSection[]): TurnSection[] {
-  const open = sections.filter((section) => section.id !== 'done' && section.id !== 'handled');
-  const plans = new Map<string, { items: TurnItem[]; total: number }>();
-  for (const section of open) {
-    for (const item of section.items) {
-      const slug = item.slug ?? '';
-      const held = plans.get(slug) ?? { items: [], total: 0 };
-      held.items.push(item);
-      plans.set(slug, held);
-    }
-  }
-  const grouped: TurnSection[] = [...plans.entries()].map(([slug, held]) => ({
-    id: `plan:${slug}`,
-    label: slug || 'No plan',
-    items: held.items,
-    count: held.items.length,
-    total: held.items.length,
-  }));
-  return [...grouped, ...sections.filter((section) => section.id === 'done' || section.id === 'handled')];
-}
-
 /** The open sections — every one but *Done* and the handled log; what *Export* writes. */
 export function openSections(sections: readonly TurnSection[]): TurnSection[] {
   return sections.filter((section) => section.id !== 'done' && section.id !== 'handled');
+}
+
+/* ------------------------------------------------------------------ *
+ * The tabs, the groupings, the board and the timeline (one-pool phase 14)
+ * ------------------------------------------------------------------ */
+
+/** The sections a tab shows: Open the five open groups, Done and Handled their own, All every one. */
+export function tabSections(sections: readonly TurnSection[], tab: TurnTab): TurnSection[] {
+  if (tab === 'all') return [...sections];
+  if (tab === 'done') return sections.filter((section) => section.id === 'done');
+  if (tab === 'handled') return sections.filter((section) => section.id === 'handled');
+  return openSections(sections);
+}
+
+/** How many items (or handled rows) a tab holds after the filters — its count on the tab bar. */
+export function tabCount(sections: readonly TurnSection[], tab: TurnTab, headsUp = 0): number {
+  const shown = tabSections(sections, tab).reduce((n, section) => n + section.count, 0);
+  return tab === 'open' || tab === 'all' ? shown + headsUp : shown;
+}
+
+/** The deadline band an item stands in at `now`. */
+export function deadlineBandOf(item: Pick<TurnItem, 'timing'>, now: number): TurnDeadlineBand {
+  const at = item.timing?.deadline ? Date.parse(item.timing.deadline) : NaN;
+  if (!Number.isFinite(at)) return 'none';
+  if (at < now) return 'overdue';
+  return at - now <= DAY_MS ? 'today' : 'later';
+}
+
+/** The key and words one item is grouped under, for a grouping other than *What is asked*. */
+function groupKeyOf(
+  item: TurnItem,
+  group: Exclude<Grouping, 'asked'>,
+  now: number,
+): { key: string; label: string } {
+  switch (group) {
+    case 'plan':
+      return { key: item.slug ?? '', label: item.slug || 'No plan' };
+    case 'type': {
+      const type = item.type ?? 'do';
+      return { key: type, label: TYPE_META[type]?.label ?? type };
+    }
+    case 'deadline': {
+      const band = deadlineBandOf(item, now);
+      return { key: band, label: TURN_DEADLINE_LABEL[band] };
+    }
+    case 'status': {
+      const status = item.personStatus ?? 'todo';
+      return { key: status, label: PERSON_STATUS_LABEL[status] ?? status };
+    }
+  }
+}
+
+/** The order a grouping's sections are drawn in: a vocabulary's own, or (plans) first seen. */
+const GROUP_ORDER: Readonly<Record<Exclude<Grouping, 'asked' | 'plan'>, readonly string[]>> = Object.freeze({
+  type: ITEM_TYPES,
+  deadline: TURN_DEADLINE_BANDS,
+  status: PERSON_STATUSES,
+});
+
+/**
+ * The tab's sections, regrouped. *What is asked* is the server's groups as
+ * they are. Any other grouping puts the tab's items under one section per
+ * plan, type, deadline band or status — only the ones that hold something, in
+ * the vocabulary's order (plans as first seen) — and leaves what is over as it
+ * is: *Done* and the handled log follow, never mixed into the open work. On
+ * the Done tab the settled items are themselves what is regrouped.
+ */
+export function groupSections(
+  sections: readonly TurnSection[],
+  group: Grouping,
+  now = Date.now(),
+): TurnSection[] {
+  if (group === 'asked') return [...sections];
+  const onlyDone = sections.every((section) => section.id === 'done' || section.id === 'handled');
+  const regrouped = sections.filter((section) =>
+    onlyDone ? section.id === 'done' : section.id !== 'done' && section.id !== 'handled',
+  );
+  const kept = sections.filter((section) => !regrouped.includes(section));
+  const buckets = new Map<string, { label: string; items: TurnItem[] }>();
+  for (const section of regrouped) {
+    for (const item of section.items) {
+      const { key, label } = groupKeyOf(item, group, now);
+      const held = buckets.get(key) ?? { label, items: [] };
+      held.items.push(item);
+      buckets.set(key, held);
+    }
+  }
+  const order = group === 'plan' ? [...buckets.keys()] : GROUP_ORDER[group].filter((key) => buckets.has(key));
+  const grouped: TurnSection[] = order.map((key) => {
+    const held = buckets.get(key)!;
+    return {
+      id: `${group}:${key}`,
+      label: held.label,
+      items: held.items,
+      count: held.items.length,
+      total: held.items.length,
+    };
+  });
+  return [...grouped, ...kept];
+}
+
+/** Grouped by plan — `groupSections(…, 'plan')`, kept by its 7.1 name. */
+export function byPlan(sections: readonly TurnSection[]): TurnSection[] {
+  return groupSections(sections, 'plan');
+}
+
+/** What an empty open group is, as a phrase the one shared line lists. */
+const EMPTY_PHRASE: Readonly<Record<TurnGroup, string>> = Object.freeze({
+  approve: 'to approve',
+  now: 'to do now',
+  decide: 'to decide',
+  checking: 'being checked',
+  upcoming: 'coming up',
+  done: 'settled today',
+});
+
+/** "a, b or c" — the shared line's list. */
+function orList(words: readonly string[]): string {
+  if (words.length <= 1) return words.join('');
+  return `${words.slice(0, -1).join(', ')} or ${words.at(-1)}`;
+}
+
+/**
+ * The sections a page draws, and the one line that stands for every empty
+ * group (#377): three empty groups no longer take three headings, they read
+ * "Nothing to approve, to do now or to decide." — and a filter that hid every
+ * item of a group still says so, under its heading. Only the groups of *What
+ * is asked* fold; the handled log keeps its own line.
+ */
+export function foldEmpty(
+  sections: readonly TurnSection[],
+  /** Groups that hold an item pressed a moment ago (#270): they keep their heading, to hold it under. */
+  keep: ReadonlySet<string> = new Set(),
+): { sections: TurnSection[]; empty: string | null } {
+  const folded = sections.filter(
+    (section) =>
+      section.total === 0 &&
+      !keep.has(section.id) &&
+      section.id !== 'handled' &&
+      (TURN_GROUPS as readonly string[]).includes(section.id),
+  );
+  if (!folded.length) return { sections: [...sections], empty: null };
+  return {
+    sections: sections.filter((section) => !folded.includes(section)),
+    empty: `Nothing ${orList(folded.map((section) => EMPTY_PHRASE[section.id as TurnGroup]))}.`,
+  };
+}
+
+/** Every item the sections hold, in order — the list's rows, the board's and the timeline's. */
+export function itemsOf(sections: readonly TurnSection[]): TurnItem[] {
+  return sections.flatMap((section) => section.items);
+}
+
+/** One lane of the board: its column cells, in `TURN_BOARD_COLUMNS` order. */
+export type BoardLane = {
+  id: string;
+  label: string;
+  columns: { id: string; label: string; items: TurnItem[] }[];
+};
+
+/**
+ * The board (#377): columns by the person's status, the Owner To-Do Board's
+ * shape, in one lane — or, grouped, one lane per section (a plan, a type…), so
+ * `?view=board&group=plan` is the board with a lane per plan.
+ */
+export function boardOf(sections: readonly TurnSection[], group: Grouping): BoardLane[] {
+  const lanes =
+    group === 'asked'
+      ? [{ id: 'all', label: '', items: itemsOf(sections) }]
+      : sections
+          .filter((section) => section.id !== 'handled' && section.items.length > 0)
+          .map((section) => ({ id: section.id, label: section.label, items: section.items }));
+  return lanes.map((lane) => ({
+    id: lane.id,
+    label: lane.label,
+    columns: TURN_BOARD_COLUMNS.map((column) => ({
+      id: column.id,
+      label: column.label,
+      items: lane.items.filter((item) => column.statuses.includes(item.personStatus ?? 'todo')),
+    })),
+  }));
+}
+
+/** One item on the timeline: where its bar starts and ends, and its marks, as fractions of the span. */
+export type TimelineRow = {
+  item: TurnItem;
+  /** When it was raised (assigned), 0–1. */
+  from: number;
+  /** Its deadline, else now, 0–1. */
+  to: number;
+  /** When it is due to be done (NOT YET's *when*), 0–1, if it has one. */
+  start?: number;
+  /** Its deadline is set (the bar's end is a deadline, not now). */
+  deadline: boolean;
+  overdue: boolean;
+};
+
+/**
+ * The timeline (#377): every item placed on ONE clock, now in the middle —
+ * the past from the earliest raised item to now on the left, the future from
+ * now to the latest deadline on the right, each side on a square-root scale,
+ * so an item raised an hour ago stays readable beside a deadline weeks away.
+ * An item with no deadline runs to now, its end left open.
+ */
+export function timelineOf(
+  items: readonly TurnItem[],
+  now: number,
+): { start: number; end: number; now: number; nowAt: number; rows: TimelineRow[] } {
+  const at = (iso: string | undefined): number => (iso ? Date.parse(iso) : NaN);
+  let start = now;
+  let end = now;
+  for (const item of items) {
+    for (const t of [
+      at(item.timing?.assignedAt ?? item.since),
+      at(item.timing?.deadline),
+      at(item.timing?.startAt),
+    ]) {
+      if (!Number.isFinite(t)) continue;
+      start = Math.min(start, t);
+      end = Math.max(end, t);
+    }
+  }
+  const past = now - start;
+  const ahead = end - now;
+  // With nothing ahead the past takes the whole line, and the other way round.
+  const nowAt = past > 0 && ahead > 0 ? 0.5 : past > 0 ? 1 : 0;
+  const frac = (t: number) =>
+    t <= now
+      ? past > 0
+        ? nowAt * (1 - Math.sqrt((now - t) / past))
+        : nowAt
+      : ahead > 0
+        ? nowAt + (1 - nowAt) * Math.sqrt(Math.min(1, (t - now) / ahead))
+        : nowAt;
+  const rows = items.map((item) => {
+    const raised = at(item.timing?.assignedAt ?? item.since);
+    const deadline = at(item.timing?.deadline);
+    const due = at(item.timing?.startAt);
+    const from = frac(Number.isFinite(raised) ? raised : now);
+    const has = Number.isFinite(deadline);
+    return {
+      item,
+      from,
+      to: Math.max(from, frac(has ? deadline : now)),
+      ...(Number.isFinite(due) ? { start: frac(due) } : {}),
+      deadline: has,
+      overdue: has && deadline < now,
+    };
+  });
+  return { start, end, now, nowAt, rows };
 }
 
 /* ------------------------------------------------------------------ *

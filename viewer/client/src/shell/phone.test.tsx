@@ -67,18 +67,19 @@ const SESSIONS_ON: ConsoleState = {
 const SESSIONS_OFF: ConsoleState = { ...SESSIONS_ON, allowTerminal: false, allowAgent: false };
 
 /**
- * The tab bar's fourth slot: Insights in the free tree, the Supervisor's in
- * Pro (control-tower phase 28) — the first of these DECLARED, as `TAB_BAR` is.
+ * The tab bar's fourth slot (after Runs, Your turn and Plans — one-pool phase
+ * 14): Sessions in the free tree, the Supervisor's in Pro (control-tower phase
+ * 28) — the first of these DECLARED, as `TAB_BAR` is.
  */
 const FOURTH = [
-  'Insights',
+  'Sessions',
 ][0]!;
 
-/** The record band of the sheet: Insights is in it wherever the Supervisor took its tab. */
-const RECORD_IN_SHEET = [
-  'Repo',
-  'Logs',
-];
+/** The work band of the sheet: Sessions is in it wherever the Supervisor took its tab. */
+const WORK_IN_SHEET = FOURTH === 'Sessions' ? [] : ['Sessions'];
+
+/** The record band of the sheet: all of it, in both editions. */
+const RECORD_IN_SHEET = ['Repo', 'Insights', 'Logs'];
 
 const COUNTS: ShellCounts = {
   plans: 0,
@@ -250,10 +251,10 @@ describe('the tab bar', () => {
       </MemoryRouterProvider>,
     );
 
-  it('offers Runs, Plans, Sessions, the fourth and More — and marks where you are', () => {
+  it('offers Runs, Your turn, Plans, the fourth and More — and marks where you are', () => {
     bar();
     const tabs = within(screen.getByRole('navigation', { name: 'Main' })).getAllByRole('button');
-    expect(tabs.map((tab) => tab.textContent)).toEqual(['Runs', 'Plans', 'Sessions', FOURTH, 'More']);
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['Runs', 'Your turn', 'Plans', FOURTH, 'More']);
     expect(screen.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page');
     expect(screen.getByRole('button', { name: 'More' })).toHaveAttribute('aria-expanded', 'false');
   });
@@ -262,8 +263,13 @@ describe('the tab bar', () => {
     // The 2.x bar had no Sessions entry, so `#/terminal/abc` lit nothing and the
     // app read as though you had left it.
     bar({}, 'terminal');
-    expect(screen.getByRole('button', { name: 'Sessions' })).toHaveAttribute('aria-current', 'page');
     expect(screen.getByRole('button', { name: 'Runs' })).not.toHaveAttribute('aria-current');
+    if (FOURTH === 'Sessions') {
+      expect(screen.getByRole('button', { name: 'Sessions' })).toHaveAttribute('aria-current', 'page');
+    } else {
+      // Pro: Sessions waits in More, and a place in the sheet lights no tab — Insights' rule since 7.0.
+      expect(screen.queryByRole('button', { name: 'Sessions' })).toBeNull();
+    }
   });
 
   it('marks More, and nothing under it, while the sheet is open', () => {
@@ -291,8 +297,11 @@ describe('the tab bar', () => {
 
   it('wears the summons hue on the one count that is a summons — needs you — and on no other', () => {
     bar({ needsYou: 2, ready: 3, sessions: 1 });
+    // On Your turn since one-pool phase 14: the summons wears its hue where it is acted on.
+    expect(screen.getByRole('button', { name: 'Your turn, 2' })).toBeInTheDocument();
     expect(screen.getByText('2').className).toMatch(/\bbg-accent\b/);
-    for (const quiet of ['3', '1']) expect(screen.getByText(quiet).className).not.toMatch(/accent/);
+    for (const quiet of FOURTH === 'Sessions' ? ['3', '1'] : ['3'])
+      expect(screen.getByText(quiet).className).not.toMatch(/accent/);
   });
 });
 
@@ -306,9 +315,14 @@ describe('the More sheet', () => {
         .map((row) => row.textContent);
     expect(labels('The record')).toEqual(startsWith(RECORD_IN_SHEET));
     expect(labels('The console')).toEqual(startsWith(['Settings']));
-    // Every place of the work is a tab, and a heading over nothing is a lie.
-    expect(within(sheet).queryByRole('group', { name: 'The work' })).toBeNull();
-    expect(within(sheet).queryByRole('heading', { name: 'The work' })).toBeNull();
+    if (WORK_IN_SHEET.length) {
+      // Pro: Sessions yielded its tab to the Supervisor and waits here.
+      expect(labels('The work')).toEqual(startsWith(WORK_IN_SHEET));
+    } else {
+      // Every place of the work is a tab, and a heading over nothing is a lie.
+      expect(within(sheet).queryByRole('group', { name: 'The work' })).toBeNull();
+      expect(within(sheet).queryByRole('heading', { name: 'The work' })).toBeNull();
+    }
   });
 
   it('goes where a row says, and closes behind it', async () => {

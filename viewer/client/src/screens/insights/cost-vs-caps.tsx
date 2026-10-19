@@ -153,7 +153,7 @@ export function CostVsCapsPanel({
 
       {reading.days.length > 0 && (
         <FigureBlock caption="Spend per day, settled and ladder together" className="max-w-(--measure)">
-          <BarList items={reading.days} format={money} label="days" />
+          <BarList items={reading.days} format={money} label="days" heads={{ name: 'Day', value: 'Spend' }} />
           <FigureNumbers
             label="days, settled and ladder apart"
             caption="Each day's settled spend and ladder spend, as the server summed them"

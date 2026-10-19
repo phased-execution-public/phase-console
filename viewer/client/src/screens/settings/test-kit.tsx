@@ -18,7 +18,8 @@
  * the one being built, and the test waits on itself with no output.
  *
  * `server.reads` answers by `GET` path (`/api/state`) or `METHOD path`
- * (`POST /api/prefs`): a value, a function of the body, or an Error to throw.
+ * (`POST /api/prefs`): a value, a function of the body (and the full path, its
+ * query included), or an Error to throw.
  * `server.calls` records every request, so a test asserts what was SENT — the
  * wire is the contract a setting keeps with the server.
  */
@@ -48,7 +49,7 @@ export function fixtureHttp(actual: typeof Http, server: FixtureServer): typeof 
     const bare = path.split('?')[0]!;
     const read = server.reads[method === 'GET' ? bare : `${method} ${bare}`];
     if (read instanceof Error) throw read;
-    if (typeof read === 'function') return (read as (body?: unknown) => unknown)(body);
+    if (typeof read === 'function') return (read as (body?: unknown, path?: string) => unknown)(body, path);
     if (read !== undefined) return read;
     throw new actual.ApiError(`Nothing is fixtured for ${method} ${path}`, 404, path);
   };

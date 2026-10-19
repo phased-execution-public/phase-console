@@ -680,7 +680,7 @@ describe('keys.after* — the named invalidation bundles', () => {
 describe('Your turn is read with the inbox it is projected from (control-tower phase 137)', () => {
   const answer = (state: string, attempts = 0) => ({
     round: { at: '2026-10-07T12:00:00.000Z', n: 3, ranAt: null, changedAt: null },
-    headline: '1 needs you now.',
+    headline: '1 to do now.',
     groups: {
       now: [{ item: 's1', record: 'ledger', group: 'now', rows: [], step: { id: 's1', state, attempts } }],
       decide: [],

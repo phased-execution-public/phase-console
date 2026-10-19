@@ -100,6 +100,17 @@ than what is on disk — restart it*, **Restart the console** just below it rest
 server that started before the autopilot existed. The page says so rather than showing a stack of
 failed requests, and this sheet's first line reads *This console predates the autopilot.*
 
+**A press says the page is from a previous release.** The console was updated while this page was open, so
+the page still runs the earlier release's code. Nothing was done: the press is refused with *This page is
+from a previous release of the console — reload it, then press again.*, and a toast, *This page is from a
+previous release of the console.*, offers **Reload**. Reload, then press again. A page opened just after an
+update reads *Updating to the new version of the console…* for a moment while it swaps to the new release.
+
+**A verification line has been waiting a long time.** A heavy line, a full test suite or a build, waits
+for a seat in the machine's one budget of heavy jobs, which every console shares (about one seat for every
+seven cores, at least one). The journal's `phase.verify-queued` names who holds the seats, and the line runs
+as soon as one frees. It is queued, not hung.
+
 **A card I answered on my phone is still on the laptop.** It is not — press it and you get a 404 for a
 decision already made, and the queue re-reads itself at that point.
 

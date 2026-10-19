@@ -26,7 +26,8 @@
  *   skill        the skill copy each config dir's sessions load (the plugin's
  *                path and commit) against the console's own commit (#151)
  *   unit         the instance's launchd unit: present, enabled, RunAtLoad,
- *                and no stopped-by-console marker                          (Pro)
+ *                and no stopped-by-console marker; a disabled unit nothing
+ *                on record accounts for names its `launchctl enable` (#343) (Pro)
  *   node         the node arguments the console runs with (`execArgv`), and
  *                the ones its unit gives node against `nodeArgsFor(profile)` (#71)
  *   pty          node-pty's spawn helper is executable — `npm ci` leaves it
@@ -124,7 +125,8 @@ export type DoctorDeps = {
   git: () => Promise<GitFacts | null>;
   environment: () => EnvIssue[];
   /** A console on the instance's port: reachable, healthy, and whether its dist is stale. `null` = nothing answered. */
-  console: () => Promise<{ healthy: boolean; serverStale?: boolean; version?: string } | null>;
+  /** `liveMissed`: the console answered `/api/state` but its doctor did not answer (#279). */
+  console: () => Promise<{ healthy: boolean; serverStale?: boolean; version?: string; liveMissed?: string } | null>;
   /**
    * `process.execArgv` of the console the report is about (#71). Absent means
    * THIS process's own in `console` mode — the running console builds those
@@ -139,7 +141,11 @@ export type DoctorDeps = {
 export type UnitFacts = {
   /** The unit file exists. */
   installed: boolean;
-  /** `launchctl print-disabled` names it disabled (a deliberate off switch, E1). */
+  /**
+   * `launchctl print-disabled` names it disabled. A login does not load a
+   * disabled job, so the console will not come back at the next login — which
+   * is a deliberate off switch only when something on record says so (#343).
+   */
   disabled: boolean | null;
   /** The plist's RunAtLoad key. */
   runAtLoad: boolean | null;
@@ -148,6 +154,15 @@ export type UnitFacts = {
   label: string;
   /** Its ProgramArguments, judged against the node arguments an install renders (#71). */
   args?: UnitArgsView | null;
+  /** The user whose launchd domain holds it — the `gui/<uid>` of the fix line. */
+  uid?: number;
+  /**
+   * The machine profile's `autostart` for this instance (`readAutostart`):
+   * `false` is the operator's own record that the console stays off, and so
+   * accounts for a disabled unit; `true`/`'once'` say a login should start it.
+   * Absent when the caller did not read the profile.
+   */
+  autostart?: boolean | 'once' | null;
 };
 
 /**
@@ -457,9 +472,19 @@ export function environmentVerdict(issues: EnvIssue[]): ProbeVerdict {
 }
 
 export function consoleVerdict(
-  state: { healthy: boolean; serverStale?: boolean; version?: string } | null, port: number | undefined,
+  state: { healthy: boolean; serverStale?: boolean; version?: string; liveMissed?: string } | null, port: number | undefined,
 ): ProbeVerdict {
   if (!state) return skipped(`no console is answering on :${port ?? '?'} — the machine rows above were read from disk`);
+  // The console is up and its doctor did not answer: its live rows — the ones
+  // only the running process can know, a broken push key among them — are
+  // unknown, so the disk rows above must not pass for them (#279).
+  if (state.liveMissed) {
+    return {
+      status: 'fail', ok: false,
+      reason: `the console on :${port} answers, but ${state.liveMissed} — its live rows are unknown and the rows above `
+        + 'were read from disk; ask again, or read Logs ▸ Health on the console',
+    };
+  }
   if (!state.healthy) return { status: 'fail', ok: false, reason: `the console on :${port} reports itself degraded` };
   return {
     status: 'ok', ok: true,

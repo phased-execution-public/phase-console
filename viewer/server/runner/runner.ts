@@ -52,7 +52,7 @@ import {
 } from './freeze.ts';
 import { extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './verify.ts';
 import { loadVerifyEnv, type VerifyEnv } from './verify-env.ts';
-import { knownEndOf, localNudgeAfterMs, mintWatchRef, ownBackgroundWork, probeSignature, unmintedReason } from './liveness.ts';
+import { knownEndOf, localNudgeAfterMs, mintWatchRef, ownBackgroundWork, probeSignature, unmintedReason, watchesDetachedJob } from './liveness.ts';
 import {
   failureContext, resumeBrief, resumeInstruction, unblockBrief, type BriefFacts,
 } from './failure-context.ts';
@@ -116,6 +116,7 @@ import { contextCheckpointInstruction, contextWrapupNotice, resumePolicyInstruct
 import { loadModelsEnv, sameModel } from './models.ts';
 import { CONTEXT_CHECKPOINT_FRACTION, CONTEXT_WRAPUP_FRACTION, contextStage, contextWindowOf, tokensLabel } from './usage.ts';
 import { RunnerAttempt } from './runner-attempt.ts';
+import type { HaltExtra } from './runner-base.ts';
 import {
   pairKey, probeMirrorGit, probeRunGit, sameGitFacts, type RunGitView,
 } from './worktree.ts';
@@ -214,6 +215,13 @@ function handoffStamp(handoff: { exists?: boolean; status?: string; outstanding?
   }
   return `${handoff.status ?? ''}:${text.length}:${hash.toString(16)}`;
 }
+
+/**
+ * How long a fresh boarding hint counts as driven before the candidate pass has
+ * placed it (#219) — a minute: the drive loop ticks well inside it, so a hint no
+ * pass takes is still named undriven a minute later, never lost.
+ */
+export const UNDRIVEN_HINT_GRACE_MS = 60_000;
 
 export class Runner extends RunnerAttempt {
   /* ---------------------------------------------------------------- *
@@ -523,8 +531,15 @@ export class Runner extends RunnerAttempt {
       // a request, and a request no candidate pass takes is exactly the phase
       // that sat "in progress" for hours. Driven means boarded, a candidate of
       // this tick (queued, serial or waiting for a lane), parked or asked.
+      // Serial behind a live lane of this run IS a candidate placement, and a
+      // hint younger than the grace has not yet met the candidate pass that
+      // places it (one-pool phase 24, #219: undriven fired 1–3 s before
+      // `phase.serial-behind` on every wrap-up of two siblings sharing a scope).
+      const serial = record.serialBehind != null && this.lanes.has(record.serialBehind);
+      const hintFresh = Boolean(record.boardingHint)
+        && this.now().getTime() - (Date.parse(record.boardingHint!.at) || 0) < UNDRIVEN_HINT_GRACE_MS;
       const driven = !(UNDRIVEN_STATUSES as readonly string[]).includes(record.status) || this.lanes.has(phase)
-        || boarding.has(phase) || owesVerification(record)
+        || boarding.has(phase) || owesVerification(record) || serial || hintFresh
         || Boolean(state.recoveries?.[String(phase)]?.errand) || Boolean(asked && !asked.has(phase));
       const onBoard = (word === 'in-progress' || word === 'stuck') && (record.status === 'pending' || record.status === 'queued');
       const deferred = Boolean(stamp?.deferred) && Boolean(word) && !['done', 'waiting', 'unknown'].includes(word);
@@ -1272,6 +1287,10 @@ export class Runner extends RunnerAttempt {
       if (asked && !asked.has(phase)) continue;
       const heldByQa = qaHeld.has(phase);
       if (wordOf(phase) === 'waiting') continue;
+      // A stuck or in-progress phase ahead of its own unmet dependency is not
+      // climbed (one-pool phase 23, #288): a rung would only hint a boarding
+      // the fill pass refuses — the dependency boards first.
+      if (this.dependencyHeld(board, phase) && !heldByQa) continue;
       // The second deliberate exception to the done-skip (control-tower phase
       // 62, #68): a phase this run RE-OPENED on a red final verdict. The board
       // reads the handoff the verdict was about; `verify-red:reopened` is
@@ -3837,7 +3856,12 @@ export class Runner extends RunnerAttempt {
     // and a ref on its output would wait for a file nothing will ever write
     // (vca P11: an Android sweep at route 27 of 68, killed, its marker watched
     // for 30 minutes). No ref is armed; the record owes the job a re-run.
-    const ownJob = stall.scope === 'local';
+    // …unless the session DETACHED it (one-pool phase 24, #292): a `setsid` /
+    // `nohup` job is out of the group, outlives the checkpoint, and writes its
+    // sentinel on its own clock — so the watch on that file resumes the phase
+    // the moment it lands, never a fixed window after a job that is still alive.
+    const detached = stall.scope === 'local' ? watchesDetachedJob(minted, lane.signals) : null;
+    const ownJob = stall.scope === 'local' && !detached;
     const cmdRef = held || ownJob ? null : minted;
     // …and a loop whose condition could not be minted says WHY (control-tower
     // phase 89, #52 ask 3 via #121): vca P10's `"$L"` is the session's variable.
@@ -3847,7 +3871,7 @@ export class Runner extends RunnerAttempt {
     // command itself as the watch — a ref the scheduler already knew it could
     // never poll, journalled as unpollable on the same second.
     const parked = cmdRef
-      ? said
+      ? detached ? `${said} — the job was started detached (${detached}), so it outlives the checkpoint and the watch on it resumes the phase the moment it lands` : said
       : ownJob
         ? `${said} — the checkpoint ends that job with the session (the whole process group), so no watch is armed on its output; the next session re-runs it`
         : held
@@ -4285,7 +4309,10 @@ export class Runner extends RunnerAttempt {
       }
       if (event.model && record.actualModel !== event.model) {
         record.actualModel = event.model;
-        if (record.model && !event.model.includes(record.model)) {
+        // One reading of "the same model" for the init frame and every
+        // assistant frame (#281): an alias, its canonical id and the window
+        // suffix are one model, so `opus[1m]` on claude-opus-5-5[1m] differs from nothing.
+        if (record.model && !this.ranAsAsked(phase, record.model, event.model, loadModelsEnv(this.deps.scriptsDir))) {
           this.record('phase.model-differs', { asked: record.model, running: event.model }, phase);
         }
         changed = true;
@@ -4295,6 +4322,25 @@ export class Runner extends RunnerAttempt {
       // A PINNED phase whose session the CLI started on another model is ended
       // here, at its init frame, before it spends (#91).
       if (event.model) this.holdPinnedModel(phase, record, event.model);
+    }
+
+    // …and what each turn RAN on (#281): a fallback mid-session changes the
+    // assistant frames' `message.model` and opens no new init frame, so the
+    // init frame's rule is applied here too — recorded under `ladder`, the
+    // session checkpointed and the phase parked under `pinned`, the frame quoted.
+    if (event.kind === 'model' && this.state) {
+      const record = phaseRecord(this.state, phase);
+      const env = loadModelsEnv(this.deps.scriptsDir);
+      if (!record.actualModel || !sameModel(record.actualModel, event.model, env)) {
+        const frame = { kind: 'assistant' as const, model: event.model, ...(event.messageId ? { messageId: event.messageId } : {}) };
+        const asked = record.model ?? this.state.model;
+        record.actualModel = event.model;
+        if (asked && !this.ranAsAsked(phase, asked, event.model, env)) {
+          this.record('phase.model-differs', { asked, running: event.model, frame }, phase);
+        }
+        this.persist();
+        this.holdPinnedModel(phase, record, event.model, frame);
+      }
     }
 
     // The account this reading is about: the one the lane's session spends
@@ -4335,7 +4381,7 @@ export class Runner extends RunnerAttempt {
       // Worth a journal line only when the account is being warned, not on
       // every routine "you are fine" heartbeat.
       if (event.status !== 'allowed') this.record('run.usage-window', { ...event });
-      this.decideOnUsageWarning(event, carried ? spendsOn ?? 'default' : null);
+      this.decideOnUsageWarning(event, carried ? spendsOn ?? 'default' : null, spendsOn);
       this.persist();
     }
 
@@ -4378,8 +4424,10 @@ export class Runner extends RunnerAttempt {
       }
     }
 
+
     this.emit('stream', { phase, ...event });
   }
+
 
   /** The `run:window:reset` warnings this runner has already decided about. */
   private usageDecided = new Set<string>();
@@ -4408,11 +4456,16 @@ export class Runner extends RunnerAttempt {
    * `brake` whether the account is braked, `headroom` which account a `switch`
    * could move to (null: none), and `nonRunSessions` who else is spending it.
    */
-  private decideOnUsageWarning(event: Extract<StreamEvent, { kind: 'limits' }>, carriedOn: string | null = null): void {
+  private decideOnUsageWarning(
+    event: Extract<StreamEvent, { kind: 'limits' }>, carriedOn: string | null = null,
+    // The account the reading is ABOUT — the reporting session's (#287), which a pending
+    // boundary switch has already moved `state.accountId` away from.
+    spendsOn: string | undefined = this.state?.accountId,
+  ): void {
     const state = this.state;
     if (!state) return;
     // Every reading may end a brake; only a warning past the threshold decides.
-    this.noteUsageReading(event);
+    this.noteUsageReading(event, spendsOn);
     if (event.status !== 'allowed_warning') return;
     const pct = event.utilizationPct;
     if (typeof pct !== 'number' || pct < ALERT_PCT) return;
@@ -4480,7 +4533,7 @@ export class Runner extends RunnerAttempt {
         if (!moved.ok) why = moved.reason;
       }
     }
-    const brake = action === 'switch' && enacted ? false : this.engageUsageBrake(event, pct);
+    const brake = action === 'switch' && enacted ? false : this.engageUsageBrake(event, pct, spendsOn);
     // Who else is on the window: counted where a hook named the account, and
     // `unknown` — never zero — when this runner cannot see sessions at all.
     let nonRunSessions: AccountSessions | 'unknown' = 'unknown';
@@ -4505,20 +4558,21 @@ export class Runner extends RunnerAttempt {
    * another run of this console — and false when there is no scheduler to hold
    * anything. `run.usage-brake` is written only by the reading that engaged it.
    */
-  private engageUsageBrake(event: Extract<StreamEvent, { kind: 'limits' }>, pct: number): boolean {
-    const state = this.state!;
+  private engageUsageBrake(event: Extract<StreamEvent, { kind: 'limits' }>, pct: number, account: string | undefined): boolean {
     const scheduler = this.deps.scheduler;
     if (!scheduler) return false;
     const untilMs = typeof event.resetsAt === 'number' && Number.isFinite(event.resetsAt) ? event.resetsAt * 1000 : null;
-    const engaged = scheduler.brake(state.accountId, { untilMs, pct, ...(event.window ? { window: event.window } : {}) });
+    // The SESSION's account, never the run's (#287): a boundary switch moves the run first,
+    // and a reading from a session still live on the old account braked the new one for days.
+    const engaged = scheduler.brake(account, { untilMs, pct, ...(event.window ? { window: event.window } : {}) });
     if (engaged) {
       this.record('run.usage-brake', {
-        accountId: state.accountId ?? 'default',
+        accountId: account ?? 'default',
         utilizationPct: pct,
         thresholdPct: ALERT_PCT,
         ...(event.window ? { window: event.window } : {}),
         until: untilMs === null ? null : new Date(untilMs).toISOString(),
-        live: scheduler.liveOn(state.accountId),
+        live: scheduler.liveOn(account),
       });
     }
     return true;
@@ -4532,21 +4586,22 @@ export class Runner extends RunnerAttempt {
    * this is where the run's journal learns so). A reading of ANOTHER window
    * says nothing about this one and releases nothing.
    */
-  private noteUsageReading(event: Extract<StreamEvent, { kind: 'limits' }>): void {
+  private noteUsageReading(event: Extract<StreamEvent, { kind: 'limits' }>, account: string | undefined): void {
     const state = this.state;
     const scheduler = this.deps.scheduler;
     if (!state || !scheduler) return;
-    const accountId = state.accountId ?? 'default';
+    // The reading speaks for the session's account (#287), so only that account's brake ends.
+    const accountId = account ?? 'default';
     const now = this.now().getTime();
-    const engaged = scheduler.brakeOf(state.accountId);
+    const engaged = scheduler.brakeOf(account);
     if (!engaged) {
-      const lapsed = scheduler.releaseBrake(state.accountId);
+      const lapsed = scheduler.releaseBrake(account);
       if (lapsed) this.record('run.usage-brake-released', { accountId, reason: 'reset', heldMs: now - lapsed.since });
       return;
     }
     if (engaged.window && event.window && engaged.window !== event.window) return;
     if (typeof event.utilizationPct !== 'number' || event.utilizationPct >= WARN_PCT) return;
-    scheduler.releaseBrake(state.accountId);
+    scheduler.releaseBrake(account);
     this.record('run.usage-brake-released', {
       accountId, reason: 'below-warn', utilizationPct: event.utilizationPct, heldMs: now - engaged.since,
     });
@@ -4756,27 +4811,39 @@ export class Runner extends RunnerAttempt {
    * and parks the phase with the one errand, instead of spending on a model
    * nobody chose. Under `ladder` the fact is recorded and nothing more.
    */
-  private holdPinnedModel(phase: number, record: PhaseRecord, resolved: string): void {
+  private holdPinnedModel(
+    phase: number, record: PhaseRecord, resolved: string,
+    frame?: { kind: 'assistant'; messageId?: string; model: string },
+  ): void {
     const state = this.state!;
     const requested = record.model ?? state.model;
     if (!requested || this.modelPolicyOf(phase) !== 'pinned') return;
-    if (sameModel(requested, resolved, loadModelsEnv(this.deps.scriptsDir))) return;
+    // The model the door SENT counts as the one asked (one-pool phase 5): `opus` on a
+    // DeepSeek key runs as deepseek-v4-pro, and that is no mismatch.
+    if (this.ranAsAsked(phase, requested, resolved, loadModelsEnv(this.deps.scriptsDir))) return;
     const lane = this.lanes.get(phase);
     if (!lane || lane.checkpointed) return;
     const at = this.now().toISOString();
-    const reason = `the phase is pinned to ${requested}, and the CLI started its session on ${resolved}`;
-    this.record('phase.model-mismatch', { requested, resolved, sessionId: record.sessionId ?? null }, phase);
+    // The frame quoted (#281): which assistant message ran on what, so the park
+    // says where in the session the model moved, not only that it did.
+    const quoted = frame ? `assistant message ${frame.messageId ?? '(no id)'} ran on "${frame.model}"` : null;
+    const reason = quoted
+      ? `the phase is pinned to ${requested}, and mid-session ${quoted}`
+      : `the phase is pinned to ${requested}, and the CLI started its session on ${resolved}`;
+    this.record('phase.model-mismatch', { requested, resolved, sessionId: record.sessionId ?? null, ...(frame ? { frame } : {}) }, phase);
     const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: at });
     const errand: Errand = {
       ...errandFor('blocked-declared', slot.rungs ?? [], phase, at),
-      need: `A model this run may pin: it asked for ${requested} and the CLI resolved it to ${resolved}.`,
+      need: quoted
+        ? `A model this run may pin: it asked for ${requested}, and ${quoted} — a fallback inside the session.`
+        : `A model this run may pin: it asked for ${requested} and the CLI resolved it to ${resolved}.`,
       how: `Name the model the CLI now serves in the plan's - **Model:** bullet (or scripts/models.env for an alias), `
         + "or set the run's model policy to ladder to accept whatever it resolves to — then Retry the phase.",
     };
     slot.errand = errand;
     this.checkpointLane(lane, reason, { carryOn: false, endedBy: 'checkpoint' });
     record.status = 'parked';
-    record.modelMismatch = { requested, resolved, at };
+    record.modelMismatch = { requested, resolved, at, ...(frame ? { frame } : {}) };
     record.note = `Model mismatch — ${reason}. ${errand.need}`;
     record.endedAt ??= at;
     this.record('phase.errand', { ...errand, label: 'Model mismatch', reason, by: 'drive' }, phase);
@@ -4997,7 +5064,7 @@ export class Runner extends RunnerAttempt {
     log.warn('runner.phase-halted', { slug: state.slug, runId: state.id, reason, phase, kind });
   }
 
-  protected halt(reason: string, phase: number | undefined, kind: HaltKind, extra: { evidence?: RetirementEvidence } = {}): void {
+  protected halt(reason: string, phase: number | undefined, kind: HaltKind, extra: HaltExtra = {}): void {
     const state = this.state!;
     // A phase-level kind settles the phase and returns the run to its other
     // candidates. Every existing call site keeps its shape: what changed is
@@ -5027,7 +5094,9 @@ export class Runner extends RunnerAttempt {
     // The budget a budget-shaped halt spent (control-tower phase 14, #40): the
     // run's dollars, or the failure streak — its arithmetic and what spent it
     // ride the halt for the card's raise, and it announces under `budget`.
-    const budget = kind === 'budget' ? runBudgetFact(state)
+    // A reached spend cap is the ACCOUNT's, not the run's dollars (one-pool phase 11): no run fact.
+    const capWall = { reached: false };
+    const budget = kind === 'budget' && !capWall.reached ? runBudgetFact(state)
       : kind === 'failure-streak' ? streakFact(state, phase ?? null)
         : undefined;
     state.halt = {

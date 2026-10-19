@@ -45,9 +45,15 @@ Ten principles; each is held by a guard named in §12.
    columns, all facts, all sections, all keys (`useEverything(page)` in `ui/everything.ts`, kept
    in `prefs.everything` by page id; the toolbar's last slot draws it, `EverythingSwitch`).
    *No datum removed; every datum within two interactions* stays law, proven by the datum ledgers.
-4. **Status is a dot and a word** (§3.1). The eight hues at one OKLCH weight paint a 6 px dot, a
-   track segment or a row's leading edge — never a filled chip behind text. Settled things wear a
-   hollow dot and lose their hue; a bad ending keeps its red. Amber is the one summons.
+4. **Status is a dot and a word, or a badge** (§3.1). The eight hues at one OKLCH weight paint a
+   6 px dot, a track segment, a row's leading edge or a badge's outline — never a filled chip
+   behind text. The **badge** (`chrome="badge"`, one-pool phase 17, #361 — the owner's ruling of
+   2026-10-14 reverses 7.0's "never a chip" for this one shape) is the same view as an OUTLINED
+   pill: the status's icon and word in its hue on the page's own ground, a border at 60 % of the
+   hue, no fill. It draws the status of a plan or a phase where that status is the row's headline
+   (Plans cards and list, the plan header, the Phases table, the Run view's phase rows, Sessions).
+   A settled dot is hollow and loses its hue; a settled badge keeps its hue at a 30 % border so
+   Done and Complete do not read as grey text; a bad ending keeps its red. Amber is the one summons.
 5. **Mono for machine values only** — shas, paths, commands, keys, ids (`Mono`). Money, durations,
    counts and percentages are the sans with tabular numerals (`Money`, `Duration`, `RelativeTime`).
 6. **Four sizes on a page.** Title 22/600 · section 15/600 · body 14/400 · meta 12.5/400; the 12 px
@@ -191,7 +197,13 @@ room; every other word stays ink, which is what keeps the page calm. A view's fa
 thin rule, in its own paint (`Finished, 1 failed`). `live` on a member breathes the dot only for a
 live view painted `running` — the one continuing motion on a page. `statusIcon(name)` and
 `STATUS_ICONS` resolve the model's icon names for the places a glyph is wanted beside the word (an
-inspector's title, a kind mark); the family itself draws none. `ui/status/family.test.tsx` holds
+inspector's title, a kind mark); the dot chrome draws none.
+**The badge.** Every member takes `chrome="badge"` (`Chrome` in `ui/status/view.tsx`): the same view,
+drawn by the same `DotWord`, as an outlined pill carrying `data-chrome="badge"` and the same `data-*`
+facts — the view's icon (`statusIcon(view.icon)`) and word in `text-state`, a `border-state/60` outline
+(`/30` when settled and quiet, dashed `--ink-faint` when Unknown), no fill. The hue as text clears AA on
+every surface in both lights (`contrast.test.ts`), which is why the word may wear it here and not in
+the dot chrome, where ink keeps the page calm. `ui/status/family.test.tsx` holds
 every member, the icon map, Unknown, the quiet rule and the family's axe.
 
 **The ratchet holds at zero.** `ui/status/ratchet.test.ts` counts every legacy status site per
@@ -332,6 +344,20 @@ the only carrier. The grammar:
 - The motif may appear small (a run row's track, the rail's mark), never as decoration on a surface
   with no structure: restraint is what keeps it a signature.
 
+**A plan's line is drawn in proportion** (one-pool phase 17, #360; `screens/plans/track-bar.tsx`,
+`PlanTrack`). On Plans' cards and list, the panel, the plan's glance and Your turn's *Where the plans
+stand*, a plan is one 6 px bar on the track's ground: each board bucket a segment whose length is
+its share of the phases, painted `.state-<paint>` from `BOARD_STATE_UI`, in one order — done, held
+by QA, in progress, stuck, next up, waiting, then what no bucket accounts for as the bare track. Under
+it, one worded legend names every non-zero count in that order and the percentage (`41 done · 1 held
+by QA · 1 in progress · 2 stuck · 3 waiting · 25 left · 56 %`); the whole is one `role="img"` whose
+name reads the same counts, so colour is never the only carrier. The counts are `countsOf` over the
+`/api/plans` row, no fetch of its own, and the segments always sum to the phase count. The two
+overlays never double-count: a phase QA failed is carved out of done as its own segment (QA's fail
+paint), and a gated phase stays in its bucket, the gate a needs-you hatch drawn over next up and
+waiting. A closed plan draws what got done and what never ran (`skipped`); an unread board its last
+good reading and the rest hatched, its legend the shared reading (#96) — never a bar at 0 %.
+
 `ui/track/track.test.tsx` holds the paint through `.state-*`, the pulse, the ring, the
 reduced-motion rule and the legs. **The route map** (`screens/plan/map/`: `dag.tsx`, `map-view.tsx`,
 `route-map.css`) is the line at plan scale, ported with its own grammar kept — each state a drawn
@@ -340,7 +366,14 @@ station search of a crowded plan; one tab stop and the arrow keys — on these t
 sentence case, numbers in the sans, `pulse-soft` over a live running station, the gate's amber
 through `--accent`, a keyboard focus in the focus ring's ink. Its stylesheet rides the map's lazy
 chunk and styles only `route-` names (or names under one); loaded, it is global for the visit, so
-the kit's classes are `ui-` names and the test holds the kit to none of the map's.
+the kit's classes are `ui-` names and the test holds the kit to none of the map's. Its tools (one-pool
+phase 16, #376, `map/tools.tsx`) are the address, never state: filter chips with counts dim what they
+leave out and remove nothing; a selection traces the whole chain both ways; a colour by repository,
+size, cost or time paints `--state` from the status tokens and keeps the glyph saying the state; the
+layers, the three layouts (left to right, top to bottom, one lane per repository) and *Hide done*
+are held to the same collision guard as the default drawing; a click inspects, a second click or
+Enter opens; on a desk the hover card (`map/hover-card.tsx`) replaces the native tooltip; export
+writes the current view as an SVG painted inline, and a PNG of it (`map/export.ts`).
 
 ## 8. Components — the kit contract
 
@@ -413,9 +446,12 @@ is also where the library line runs.
 | What | Drawn by | Why |
 |---|---|---|
 | The mark — `LoadMeter` | hand-rolled, in `ui/track/meter.tsx`, on the line's own tokens | One datum of a row, a real `role="meter"`. No axis, no zoom, no readout: the words beside a mark ARE its table, and any library behind it is first-paint weight for a 6 px bar. `RouteStrip` and `RunStrip` retired into the line in phase 19: a run's route is the kit `Track`, which the run row's glance already draws. |
-| The figures — `Bars`, `Calendar`, `BarList`, `StackBar` | visx, in `ui/figures/bars.tsx` | A crosshair, a zoom and keyboard reach are axis work. The drawing is lazy behind `ui/figures/lazy.tsx`, its only importer; the figure's name, its numbers table (`FigureNumbers`, `ui/figures/numbers.tsx`) and its paint stay at the door. A `StackBar`'s key is the kit's `ui/legend.tsx`, the route map's own key. |
+| The figures — `Bars`, `Calendar`, `BarList`, `StackBar`, `Series` | visx, in `ui/figures/bars.tsx` | A crosshair, a zoom and keyboard reach are axis work. The drawing is lazy behind `ui/figures/lazy.tsx`, its only importer; the figure's name, its numbers table (`FigureNumbers`, `ui/figures/numbers.tsx`) and its paint stay at the door. A `StackBar`'s key is the kit's `ui/legend.tsx`, the route map's own key. A `Series` (one-pool phase 10) is small multiples: a strip per row on one shared time axis, one scale and one crosshair — the row named in words, never a hue — so "spend over time by account" needs no categorical palette. |
 | The run's time axis — the Gantt's lanes and each phase's clock split | hand-rolled `ui/figures/swimlane.tsx` on `ui/figures/scales.ts` | The lanes' geometry, hatch and `.state-*` bridge were already right; they take a shared axis, a present and a zoom from the figures. |
 | The run's cost strip | visx, in `ui/figures/run-chart.tsx` | A second reading on the lanes' own axis, with a dollar scale of its own. Lazy behind the same door (`RunCostFigure`). |
+| The plan's schedule and the lock map (one-pool phase 16, #376 #364) | the swimlane, in `ui/figures/schedule.tsx` and `screens/sessions/lock-map.tsx` | Rows of bars on one time axis is the swimlane's job: what ran (the run record) and what is expected (estimates over dependencies, the chain that sets the finish outlined), and a claim's lease per repository lane, a lapsed one hatched. Both read their arithmetic from a pure function (`scheduleOf`, `lockLanes`). |
+| The plan's burn-up (one-pool phase 16, #376) | hand-rolled, in `ui/figures/burnup.tsx` | Two step lines (phases and weight done, as a share of the whole) and the forecast's band: a dozen SVG elements on `linear`, state tokens only. Its arithmetic is `burnupOf`. |
+| The time figures' zoom (one-pool phase 16, #376) | `ui/figures/zoom-controls.tsx` over `useFigure`'s `zoomBy`/`zoomTo` | − / + said on the figure, and on a run's axis the quick ranges (last hour, 6 h, 24 h, all) — kept in the address as `?zoom=` (a token, or `<from>~<to>` seconds from the axis's start); a wheel or a pinch writes no history. |
 
 **What moved to visx:** `@visx/scale` (the linear map and 1-2-5 ticks behind `ui/figures/scales.ts`),
 `@visx/axis` (tick layout and labels), `@visx/shape` (bars and rules) and `@visx/event` (a pointer
@@ -466,7 +502,8 @@ of the screen.
 3. No amber that is not a summons: nothing within 40° of the accent hue, no amber button, no amber
    focus mark, no amber selection, and a pulse on nothing but an observed live `running`.
 4. No status outside the typed family: no legacy site (the ratchet is zero), no `dot-word` import
-   outside `ui/status/**`, no filled chip behind a status word, no status in colour alone.
+   outside `ui/status/**`, no filled chip behind a status word (the outlined badge is the family's
+   own `chrome="badge"`, never a page's), no status in colour alone.
 5. No second face, no width clamp on the sans, no `--font-display`; no second shadow, no card
    shadow; no new animation, easing, radius step, z-index or font file without amending this file
    AND the guards in the same change.
@@ -590,16 +627,63 @@ The clock ticks every second while a timing grid is on screen (an IntersectionOb
 `prefers-reduced-motion: reduce` it never takes the one-second tick: a second-by-second countdown
 is motion, and the figures say minutes.
 
-**The page** (turn-by-turn phase 9, `client/src/screens/turn/`). The headline is the heading. The
-strip under it is words with figures on one line, never tiles: *to do*, *checking* and *passed
-today*, then the round as the live line and *Next deadline*, which reads the page clock. One
-toolbar row follows: search, Filter (Status, Time, Plan, Type, Goes to), Group, Sort, View, ⋯
-(Export, Print), Everything. Every choice lives in the address. The six groups come next, in
-`TURN_GROUPS` order, each with its count and one plain line when empty. *Handled by the AI*, the
-heads-ups and *Where the plans stand* (one line per plan) follow them. `#/turn/<id>` marks its
-card and opens the panel on it only where the panel stands beside the page. Below 1200 a sheet
-would cover the card the push landed on. Guards: `screens/turn/page.test.tsx` (TP-v2),
-`page-model.test.ts` (PM-v2), `e2e/turn.spec.ts`.
+**The page** (turn-by-turn phase 9; organised as a page a person works FROM by one-pool phase 14,
+#377 #366, `client/src/screens/turn/`). The headline is the heading, and it counts rather than
+quotes ("1 to do now · 5 coming up · 6 done today"). The strip under it is words with figures on
+one line, never tiles: *to do*, *checking* and *passed today*, then the round as the live line and
+*Next deadline*, which reads the page clock. Then the tabs — *Open* · *Done* · *Handled by the AI*
+· *All*, each with its count — so what is over stops lengthening the open list. One toolbar row
+follows: search, Filter (Status, Time, Plan, Type, Goes to), Group, Sort, View, ⋯ (Export, Print),
+Everything. On a desk every filter is also a row of chips with counts under the toolbar
+(`FilterChips`): a filter in sight is a filter used. The address is the page's whole state:
+
+```
+#/turn[/<id>]?tab=open|done|handled|all
+             &view=list|board|cards|timeline
+             &group=asked|plan|type|deadline|status
+             &sort=oldest|newest|deadline
+             &status=…&time=…&plan=…&type=…&to=…  (run, kind, why, risk under Everything; q)
+```
+
+Each default is no parameter at all, the words are `shared/turn-model.js`'s (`TURN_TABS`,
+`TURN_VIEWS`, `TURN_GROUPINGS`, `TURN_BOARD_COLUMNS`), and 7.1's `?view=compact` reads as the list.
+
+- **The list** (the default) is principle 2 kept: one line per item — NOW or NOT YET, the type's
+  mark, the short title, then the person's status, the plan and the phase as two facts, and one
+  clock (the deadline, overdue in the failed hue, else how long it has waited). Pressing a line
+  SELECTS it: the address names it and its whole card opens in the panel (`panel-card.tsx`, which
+  reads the turn itself, so a press there redraws it in place) — the column at 1200 and up, the end
+  sheet from 900, the bottom sheet, which is the card's own page, on a phone. ↑/↓ and j/k move the
+  selection. A row's checkbox picks it for the bulk bar: *Not doing* (one reason, held in the undo
+  window like the card's own terminal press), *Hand back*, *Snooze*; only ledger items take them,
+  and the bar names what it skips.
+- **The board** is the Owner To-Do Board's shape: five columns by the person's status, To do ·
+  Checking · Redo · Waiting for the owner · Done; grouped, one lane per group. A tile is the line
+  folded into a box; it is a view a person asks for, never the glance (principle 1).
+- **The cards** are 7.1's page: every item drawn whole.
+- **The timeline** is the line again: a bar per item from when it was raised to its deadline (to
+  now, dashed and open, when none is set), a ring at when it is due, a rule at now, on one clock.
+- **Empty groups fold into one line** ("Nothing to approve, to do now or to decide."); a group the
+  filters emptied keeps its heading and says how many they hid.
+- **Titles** are the composer's (`shortTitle`, `server/turn/compose.ts`): at most 80 characters,
+  sentence case unless they lead with a name, never a path list; the long form is the card's
+  muted `headline`, an errand's ref a chip, a landing's files a folded list by repository.
+
+*Handled by the AI*, the heads-ups and *Where the plans stand* (one line per plan) follow on Open
+and All. In the cards view `#/turn/<id>` marks its card and opens the panel only where the panel
+stands beside the page: below 1200 a sheet would cover the card the push landed on. In every
+other view the card is not on the page, so the panel opens wherever it stands.
+
+**Its place.** Your turn is the eighth destination, second in the work band (Runs · Your turn ·
+Plans · Sessions), and wears the one summons count (`needsYou`). On a phone it holds the second
+tab: Runs · Your turn · Plans · Sessions · More in Free; in Pro the Supervisor takes the fourth
+slot and Sessions — a terminal, the least of a phone's jobs — waits in More (`TAB_BAR`). Every plan
+has the same page as a fourth view, `#/plan/<slug>/turn` (`PLAN_TABS`), scoped to the plan, with
+its open count: one source (`GET /api/turn`), no second model. The bell's drawer is a preview of
+it — *Open Your turn*, at most five one-line rows, "N more on Your turn".
+
+Guards: `screens/turn/page.test.tsx` (TP-v2, TP-14), `page-model.test.ts` (PM-v2, PM-14),
+`shell/nav.test.ts`, `screens/plan/tabs.test.ts`, `shell/bell/drawer.test.tsx`, `e2e/turn.spec.ts`.
 
 **Every other surface speaks the card's words** (turn-by-turn phase 10). An inbox row carries the
 card's type, readiness and NOT YET's *when*, and sits in the group its card sits in (`withRowWords`,
@@ -626,6 +710,8 @@ type × status in both lights, the mirror under `dir="rtl"`, and the thumb floor
 names `client/src/cards/turn/` in the family that may draw a person's ask. In the browser,
 `e2e/register.spec.ts`, `e2e/rtl.spec.ts` and `e2e/doors.spec.ts` measure the card at 360, 768, 1024
 and 1280.
+
+
 
 ## 12. The guards — what holds each rule
 
@@ -655,6 +741,7 @@ Paths are from `viewer/`; `tests/unit/gates.bats` is the repository root's.
 | `client/src/ui/figures/figures.test.tsx` | the closed figure/mark split against the door's exports; no literal colour in a figure, its key or its numbers; every figure's numbers table, and the drawing equal to it; the crosshair a slider, the zoom's way back outside it, the page's own scroll |
 | `client/src/ui/track/meter.test.tsx` | the mark: a real meter read as words, its fill clamped to the track, paint through a state, a reading and no bar when there is no whole |
 | `screens/plan/map/dag.test.tsx`, `screens/plan/map/map.test.tsx` | the route map: the zoom floor's derivation, windowed drawing, the minimap, the station search, every station by the arrow keys, no state told by hue, the Phases view's joins; its sheet on the tokens — no hue outside `.state-*` but the machine's own marks, amber through `--accent`, four sizes, one pulse, `--app-height`, no bare 6.x name |
+| `screens/plan/map/tools.test.tsx` · `ui/figures/collide.test.tsx` · `ui/figures/{schedule,burnup}.test.tsx` · `screens/sessions/locks.test.tsx` | the map's tools in the address and back after a reload, the trace's chain, click inspects and a second click opens, the hover card's facts, SVG and PNG export; every layout and layer free of text over text; the schedule's and the burn-up's arithmetic and their numbers; the lock map's lanes, stacks and lease bars |
 | `scripts/check-dist.mjs` · `scripts/gates.sh` (`verify-free`) | first paint ≤ 170 KB served, in this build and the free tree's own; the table engine, the figures, the status word tables and every other lazy chunk off first paint; `sw.js` at the root |
 | `test/surface-parity.test.ts` · `test/route-coverage.test.ts` | the surface registry (`client/src/data/surface.ts`) against the server both ways: every route, server event, settings key and operator verb has a row, every row a door a page reaches or an exemption naming its caller, nothing unassigned; every route has a caller under `client/src/data/` or a true reason |
 | `e2e/register.spec.ts` · `e2e/baseline.json` | the seven finding classes at every stop in four viewports, held to `[]` |

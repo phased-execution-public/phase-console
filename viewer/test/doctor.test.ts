@@ -526,3 +526,57 @@ test('PTY-2 — spawnHelperFacts reads the helper node-pty would execute, beside
   }
 });
 
+
+
+test('a console whose doctor does not answer fails the Console row instead of passing on disk rows (#279)', () => {
+  const missed = consoleVerdict({ healthy: true, liveMissed: 'did not answer GET /api/doctor within 30 s' }, 4123);
+  assert.equal(missed.status, 'fail');
+  assert.match(missed.reason, /the console on :4123 answers, but did not answer GET \/api\/doctor within 30 s — its live rows are unknown and the rows above were read from disk/);
+  assert.doesNotMatch(missed.reason, /before doctor existed/);
+});
+
+test('askConsole: a slow /api/doctor is reported as slow, a 404 alone is a pre-doctor build (#279)', async () => {
+  const { createServer } = await import('node:http');
+  const { askConsole, DOCTOR_ROUTE_TIMEOUT_MS } = await import('../../bin/doctor-verb.mjs');
+  assert.ok(DOCTOR_ROUTE_TIMEOUT_MS >= 20_000, 'the doctor route must outlast the slowest probe it runs');
+  let doctorMode: 'slow' | '404' | 'ok' = 'slow';
+  const held: import('node:http').ServerResponse[] = [];
+  const server = createServer((req, res) => {
+    if (req.url === '/api/state') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ health: { healthy: true }, serverStale: false, execArgv: ['--max-old-space-size=6144'] }));
+      return;
+    }
+    if (req.url === '/api/doctor') {
+      if (doctorMode === 'slow') { held.push(res); return; }
+      if (doctorMode === '404') { res.statusCode = 404; res.end('{}'); return; }
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ rows: [], ok: true }));
+      return;
+    }
+    res.statusCode = 404; res.end();
+  });
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', () => done()));
+  const port = (server.address() as import('node:net').AddressInfo).port;
+  try {
+    const slow = await askConsole(port, 300);
+    assert.equal(slow.report, undefined);
+    assert.equal(slow.state.liveMissed, 'did not answer GET /api/doctor within 0.3 s');
+    assert.equal(slow.state.version, undefined);
+    assert.deepEqual(slow.execArgv, ['--max-old-space-size=6144']);
+    assert.equal(consoleVerdict(slow.state, port).status, 'fail');
+
+    doctorMode = '404';
+    const old = await askConsole(port, 300);
+    assert.equal(old.state.liveMissed, undefined);
+    assert.match(old.state.version, /a build from before doctor existed/);
+    assert.equal(consoleVerdict(old.state, port).status, 'ok');
+
+    doctorMode = 'ok';
+    assert.deepEqual((await askConsole(port, 300)).report, { rows: [], ok: true });
+  } finally {
+    for (const res of held) res.destroy();
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+  }
+});

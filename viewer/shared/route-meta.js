@@ -36,6 +36,10 @@
 // 6.0 (control-tower phase 21) made `runs` the home and `now` a redirect onto
 // it — the eighth head to become one — and again dropped nothing.
 //
+// 8.0 (one-pool phase 14, #366) made `turn` — Your turn — the eighth
+// destination, in the work band after Runs, and every plan gained a `turn`
+// view; nothing was dropped.
+//
 // 7.0 (quiet-console phase 3) renamed Debug to Logs: `logs` is the head and the
 // destination, `debug` the ninth redirect (`#/debug/health?since=1` lands on
 // `#/logs/health?since=1`, section and query carried). The Pro heads `chat`
@@ -47,8 +51,9 @@
  * Top-level route heads — `route.segments[0]`. The empty hash (`#/`) and any
  * unknown head resolve to `DEFAULT_HEAD` below.
  *
- * The first seven are the 7.0 DESTINATIONS — what the rail and the phone tab
- * bar offer, the same seven in both editions. Everything after them is a head
+ * The first eight are the DESTINATIONS — what the rail and the phone tab
+ * bar offer, the same eight in both editions (seven in 7.0; Your turn joined
+ * them in 8.0). Everything after them is a head
  * that still resolves (a page a later phase has not rebuilt yet, or a redirect
  * onto its new home) but is not a place the navigation sends you.
  *
@@ -78,8 +83,13 @@
  * @type {readonly string[]}
  */
 export const ROUTE_HEADS = Object.freeze([
-  // the seven destinations
+  // the eight destinations
   'runs',
+  // Your turn (control-tower phase 137, #214; a destination since one-pool
+  // phase 14, #366): every act only a person can do, each with its guide, its
+  // check and its moves — `#/turn`, and `#/turn/<id>` for one item, which is
+  // where every step push lands.
+  'turn',
   'plans',
   'sessions',
   'repo',
@@ -90,12 +100,6 @@ export const ROUTE_HEADS = Object.freeze([
   'settings',
   // pages a destination has not absorbed yet, plus the deep-link heads
   'plan',
-  // Your turn (control-tower phase 137, #214): every act only a person can do,
-  // each with its guide, its check and its moves — `#/turn`, and `#/turn/<id>`
-  // for one item, which is where every step push lands. A HEAD that lights
-  // Runs, never an eighth destination (§Architecture 19): "does anything need
-  // me?" already has its home, and the phone's four tab slots are spoken for.
-  'turn',
   // The whole queue of one console (control-tower phase 99, #135): every entry,
   // why it sits where it does, who holds what, and the verbs that move it. A
   // HEAD, not a destination — the Tower's queued bay links to it.
@@ -138,12 +142,12 @@ export const ROUTE_HEADS = Object.freeze([
 export const DEFAULT_HEAD = 'runs';
 
 /**
- * The seven destinations, in nav order — the rail, the phone tab bar and the
+ * The eight destinations, in nav order — the rail, the phone tab bar and the
  * palette's navigation group all read this.
  *
  * Read as three bands, which is what the rail draws a rule between and what the
- * order encodes: **the work** (`runs`, `plans`, `sessions`) is what is moving
- * right now; **the record** (`repo`, `insights`, `logs`) is what it did — the
+ * order encodes: **the work** (`runs`, `turn`, `plans`, `sessions`) is what is
+ * moving right now — and what is waiting on you; **the record** (`repo`, `insights`, `logs`) is what it did — the
  * tree it changed, the numbers it made, the trace it left; **`settings`** is
  * the console itself, and stays last because it always has been.
  *
@@ -152,7 +156,12 @@ export const DEFAULT_HEAD = 'runs';
  * 7.0) are 4.0's two additions; they sit in the middle band rather than at the
  * end because the band is the meaning: both answer *what happened*.
  *
- * The SAME seven in both editions since 7.0 (quiet-console phase 3). Pro's two
+ * `turn` joined in 8.0 (one-pool phase 14, #366): Your turn was a head that
+ * lit Runs, reached through the situation line, the bell or a push — and a
+ * person's own tasks deserve a place of their own, second in the work band,
+ * with its open count.
+ *
+ * The SAME eight in both editions (seven since 7.0, quiet-console phase 3). Pro's two
  * places are reached from the shell rather than listed: the Supervisor is the
  * right panel's second mode (and the phone tab bar's fourth slot, `#/chat`),
  * and Fleet opens from the instance switcher at the top of the rail. A list
@@ -162,6 +171,7 @@ export const DEFAULT_HEAD = 'runs';
  */
 export const DESTINATIONS = Object.freeze([
   'runs',
+  'turn',
   'plans',
   'sessions',
   'repo',
@@ -187,9 +197,13 @@ export const DESTINATIONS = Object.freeze([
  * their facts, so every question about one phase was a tour of four tabs. They
  * are one table now, and the four readings are its views (`PLAN_PHASE_VIEWS`).
  * `phases` leads because it is what a plan opens on.
+ *
+ * Four in 8.0 (one-pool phase 14, #366): `turn`, the plan's Your turn —
+ * the same page as `#/turn`, scoped to this plan (`#/plan/:slug/turn`, and
+ * `#/plan/:slug/turn/<id>` for one item).
  * @type {readonly string[]}
  */
-export const PLAN_TABS = Object.freeze(['phases', 'run', 'source']);
+export const PLAN_TABS = Object.freeze(['phases', 'run', 'turn', 'source']);
 
 /**
  * The views of the `phases` tab — the `?view=` of `#/plan/:slug/phases`.
@@ -198,13 +212,30 @@ export const PLAN_TABS = Object.freeze(['phases', 'run', 'source']);
  * need), `map` (the route drawn as a network — phase 30 decides its engine),
  * `qa` (the same rows with the QA columns forward) and `handoffs` (the same
  * rows with the handoff columns forward). `table` is the default, so it is the
- * one view whose address carries no `?view=`.
+ * one view whose address carries no `?view=`. Six since one-pool phase 16
+ * (#376): `schedule` (the plan as a Gantt — what ran, from the run record, and
+ * when what is left is expected to start and end) and `burnup` (phases and
+ * weight done over time, against the forecast).
  *
  * Shared for the same reason `LEGACY_PLAN_TABS` is: three retired tabs redirect
  * INTO these views, and the server's `#/plan/:slug/route` lands on `map`.
  * @type {readonly string[]}
  */
-export const PLAN_PHASE_VIEWS = Object.freeze(['table', 'map', 'qa', 'handoffs']);
+export const PLAN_PHASE_VIEWS = Object.freeze(['table', 'map', 'qa', 'handoffs', 'schedule', 'burnup']);
+
+/**
+ * Short addresses for two readings of the phases (one-pool phase 16, #376):
+ * `#/plan/:slug/schedule` and `#/plan/:slug/burnup` land, in one hop, on
+ * `#/plan/:slug/phases?view=schedule` and `?view=burnup` — the plan's
+ * schedule (a Gantt of what ran and what is expected) and its burn-up. Not
+ * retired tabs (`LEGACY_PLAN_TABS` is the list of tabs that LEFT); names for a
+ * reading somebody types or a handoff prints.
+ * @type {Readonly<Record<string, {tab: string, view: string}>>}
+ */
+export const PLAN_VIEW_ALIASES = Object.freeze({
+  schedule: Object.freeze({ tab: 'phases', view: 'schedule' }),
+  burnup: Object.freeze({ tab: 'phases', view: 'burnup' }),
+});
 
 /**
  * The views of the `run` tab — the `?view=` of `#/plan/:slug/run` (7.0,
@@ -290,7 +321,8 @@ export const LEGACY_SETTINGS_SECTIONS = Object.freeze({
  * 6.0 (control-tower phase 32) adds a section per thing a person meets that no
  * section explained: `quick-start` (the one screen that starts a run),
  * `destinations` (every page on the rail and every overlay), `tower` (the Runs home), `halts` (a run that stopped itself, and the one press back),
- * and — Pro — `supervisor` and `license`. Every id has a Persian twin beside its
+ * and — Pro — `supervisor` and `license`; 8.0 (one-pool phase 32) adds — Pro — `accounts` (the
+ * kinds, the keys, the pool and its policies, the caps, the picker and Insights ▸ Accounts). Every id has a Persian twin beside its
  * English file (`<id>.fa.md`); `test/guide-coverage.test.ts` holds both.
  * @type {readonly string[]}
  */

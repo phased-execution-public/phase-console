@@ -463,6 +463,10 @@ export const RUNGS_BY_SITUATION = Object.freeze({
   // spends: the request is recorded once per run and act, the supervisor takes
   // it (Pro) or ONE approval asks a person (Free), and the phase waits.
   'blocked-declared:run': Object.freeze([]),
+  // What the run may write outward — file, label, comment on an issue
+  // (`--needs issues`, one-pool phase 14, #349): empty on purpose. The answer
+  // is the manifest's `issues` row, a person's; no session can give it.
+  'blocked-declared:issues': Object.freeze([]),
   'blocked-declared:external': Object.freeze([
     R(
       'poll-park',

@@ -35,13 +35,14 @@ import {
 } from './nav';
 
 /**
- * The fourth tab slot. Insights in the Free tree, for good. In the Pro tree it
- * is the Supervisor's (`chat`, declared ahead of Insights in `TAB_BAR`): taken
- * when the server offers the chat (`state.chat`), and left EMPTY when it does
- * not — a gated item takes its slot with it rather than promoting Insights.
+ * The fourth tab slot (one-pool phase 14: Runs, Your turn and Plans hold the
+ * first three). Sessions in the Free tree. In the Pro tree it is the
+ * Supervisor's (`chat`, declared ahead of Sessions in `TAB_BAR`): taken when
+ * the server offers the chat (`state.chat`), and left EMPTY when it does not —
+ * a gated item takes its slot with it rather than promoting Sessions.
  */
-const FOURTH: string[] = ['insights'];
-const FOURTH_WITHOUT_CHAT: string[] = ['insights'];
+const FOURTH: string[] = ['sessions'];
+const FOURTH_WITHOUT_CHAT: string[] = ['sessions'];
 /** What a server that offers the Supervisor adds to `/api/state` — nothing in the Free tree. */
 const CHAT: Partial<ConsoleState> = {};
 /** Heads the tab bar may draw that are not destinations — the Supervisor's page, in Pro. */
@@ -69,10 +70,11 @@ const ids = (state?: ConsoleState) => visibleNav(state).map((item) => item.id);
 const idsOf = (items: readonly { id: string }[]) => items.map((item) => item.id);
 const isDestination = (id: string) => (DESTINATIONS as readonly string[]).includes(id);
 
-describe('the seven destinations', () => {
-  it('is exactly seven, in the documented order — Runs first, the home — in both editions', () => {
+describe('the eight destinations', () => {
+  it('is exactly eight, in the documented order — Runs first, the home, then Your turn — in both editions', () => {
     expect(NAV.map((item) => item.id)).toEqual([
       'runs',
+      'turn',
       'plans',
       'sessions',
       'repo',
@@ -128,12 +130,13 @@ describe('the seven destinations', () => {
 
   it('badges only what a person can act on, and never the same number twice', () => {
     const badges = NAV.map((item) => item.badge).filter(Boolean);
-    // `needsYou` answers "does anything need me?", which is the Runs home's
-    // question since 6.0 — and it is still ONE entry's number, never two. The
-    // record stays unbadged: none of it has a number that is a call to action,
-    // and a count that is never zero stops being read.
+    // `needsYou` answers "does anything need me?" — on Your turn since 8.0,
+    // where it is acted on (one-pool phase 14) — and it is still ONE entry's
+    // number, never two. The record stays unbadged: none of it has a number
+    // that is a call to action, and a count that is never zero stops being read.
     expect(badges).toEqual(['needsYou', 'ready', 'sessions']);
-    expect(navItem('runs')?.badge).toBe('needsYou');
+    expect(navItem('turn')?.badge).toBe('needsYou');
+    expect(navItem('runs')?.badge).toBeUndefined();
     for (const id of ['repo', 'insights', 'logs', 'settings']) {
       expect(navItem(id)?.badge, id).toBeUndefined();
     }
@@ -168,11 +171,19 @@ describe('the one gate', () => {
   });
 
   it('gates nothing else', () => {
-    expect(ids({ ...BASE, ...NEITHER })).toEqual(['runs', 'plans', 'repo', 'insights', 'logs', 'settings']);
+    expect(ids({ ...BASE, ...NEITHER })).toEqual([
+      'runs',
+      'turn',
+      'plans',
+      'repo',
+      'insights',
+      'logs',
+      'settings',
+    ]);
   });
 
-  it('lists the seven whatever else the server offers — the Supervisor is never a destination', () => {
-    // 7.0: the rail is the same seven in both editions. A server with the chat
+  it('lists the eight whatever else the server offers — the Supervisor is never a destination', () => {
+    // The rail is the same eight in both editions. A server with the chat
     // changes the tab bar's fourth slot, never the list of places.
     expect(ids({ ...BASE, ...CHAT, ...BOTH })).toEqual([...DESTINATIONS]);
   });
@@ -200,26 +211,24 @@ describe('a phone can reach everything', () => {
     }
   });
 
-  it('keeps the tab bar to four slots plus More — Runs, Plans, Sessions, then the fourth', () => {
+  it('keeps the tab bar to four slots plus More — Runs, Your turn, Plans, then the fourth', () => {
     // Five buttons is what a 360 px bar fits with a thumb-sized target each.
-    expect(TAB_BAR.slice(0, 3)).toEqual(['runs', 'plans', 'sessions']);
-    expect(idsOf(tabItems({ ...BASE, ...CHAT, ...BOTH }))).toEqual(['runs', 'plans', 'sessions', ...FOURTH]);
+    // Your turn is second: a push lands there (one-pool phase 14, #366).
+    expect(TAB_BAR.slice(0, 3)).toEqual(['runs', 'turn', 'plans']);
+    expect(idsOf(tabItems({ ...BASE, ...CHAT, ...BOTH }))).toEqual(['runs', 'turn', 'plans', ...FOURTH]);
     // The gated one takes its slot with it rather than promoting a sheet item —
     // a bar whose contents change between machines is worse than a shorter bar.
-    expect(idsOf(tabItems({ ...BASE, ...CHAT, ...NEITHER }))).toEqual(['runs', 'plans', ...FOURTH]);
+    expect(idsOf(tabItems({ ...BASE, ...CHAT, ...NEITHER }))).toEqual(
+      ['runs', 'turn', 'plans', ...FOURTH].filter((id) => id !== 'sessions'),
+    );
   });
 
   it('takes the first four DECLARED, so an entry the server does not offer leaves a gap', () => {
     // The rule the Supervisor's slot rides on: in the Pro tree a server without
-    // the chat shows three tabs and More, and Insights stays in the sheet.
-    expect(idsOf(tabItems({ ...BASE, ...BOTH }))).toEqual([
-      'runs',
-      'plans',
-      'sessions',
-      ...FOURTH_WITHOUT_CHAT,
-    ]);
+    // the chat shows three tabs and More, and Sessions stays in the sheet.
+    expect(idsOf(tabItems({ ...BASE, ...BOTH }))).toEqual(['runs', 'turn', 'plans', ...FOURTH_WITHOUT_CHAT]);
     expect(idsOf(sheetItems({ ...BASE, ...BOTH }))).toEqual(
-      ['repo', 'insights', 'logs', 'settings'].filter((id) => !FOURTH_WITHOUT_CHAT.includes(id)),
+      ['sessions', 'repo', 'insights', 'logs', 'settings'].filter((id) => !FOURTH_WITHOUT_CHAT.includes(id)),
     );
   });
 
@@ -232,9 +241,8 @@ describe('a phone can reach everything', () => {
   });
 
   it('puts the rest of the record and the console in the sheet, where 2.x lost them', () => {
-    expect(idsOf(sheetItems({ ...BASE, ...CHAT }))).toEqual(
-      ['repo', 'insights', 'logs', 'settings'].filter((id) => !FOURTH.includes(id)),
-    );
+    // Sessions is gated off here (no terminal, no agent), so it is in neither list.
+    expect(idsOf(sheetItems({ ...BASE, ...CHAT }))).toEqual(['repo', 'insights', 'logs', 'settings']);
   });
 });
 
@@ -256,7 +264,7 @@ describe('the three bands', () => {
 
   it('reads as the meaning: what is moving, what it did, the machine itself', () => {
     const band = (id: string) => NAV.filter((item) => item.band === id).map((item) => item.id);
-    expect(band('work')).toEqual(['runs', 'plans', 'sessions']);
+    expect(band('work')).toEqual(['runs', 'turn', 'plans', 'sessions']);
     // Logs sits in the record with Repo and Insights: all three answer *what happened*.
     expect(band('record')).toEqual(['repo', 'insights', 'logs']);
     expect(band('console')).toEqual(['settings']);
@@ -278,15 +286,17 @@ describe('the three bands', () => {
     expect(navBands([])).toEqual([]);
   });
 
-  it('puts the whole work band on the phone tab bar, and at most one of the record', () => {
+  it('puts the work band on the phone tab bar — Sessions yields its slot to the Supervisor — and none of the record', () => {
     // The bar is its own list (`TAB_BAR`), so the work band is asserted to be
-    // IN it rather than to BE it. The fourth slot is the record's Insights in
-    // the Free tree; in the Pro tree the Supervisor holds it.
+    // IN it rather than to BE it. Four places of work and four slots: in the
+    // Pro tree the Supervisor holds the fourth, and Sessions — a terminal, the
+    // least of a phone's jobs — waits in More.
     const tabs = idsOf(tabItems({ ...BASE, ...CHAT, ...BOTH }));
-    for (const item of NAV.filter((entry) => entry.band === 'work')) expect(tabs, item.id).toContain(item.id);
-    expect(tabs.filter((id) => navItem(id)?.band === 'record' && isDestination(id))).toEqual(
-      FOURTH.filter((id) => id === 'insights'),
-    );
+    for (const item of NAV.filter(
+      (entry) => entry.band === 'work' && (entry.id !== 'sessions' || FOURTH.includes('sessions')),
+    ))
+      expect(tabs, item.id).toContain(item.id);
+    expect(tabs.filter((id) => navItem(id)?.band === 'record' && isDestination(id))).toEqual([]);
   });
 });
 

@@ -215,3 +215,68 @@ test('RW-4: a wall whose declaration names no ref is said, not re-judged', async
     assert.match(String(rechecks[0].data?.why ?? ''), /names no ref/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+/* ------------------------------------------------------------------ *
+ * #264 — a `waiting-external` wall is rechecked the same way (one-pool phase 23)
+ * ------------------------------------------------------------------ */
+
+/** A run whose phase 1 WAITS (`waiting-external`) on a deploy, watching `flag`. */
+function waitRun(root: string, flag: string, settled = false) {
+  const state = newRun({ slug: 'alpha', root });
+  state.status = 'paused';
+  const at = new Date(Date.now() - 10 * 60_000).toISOString();
+  const record = phaseRecord(state, 1);
+  record.status = settled ? 'pending' : 'waiting';
+  record.attempts = 1;
+  record.sessionId = 'sess-wait-1';
+  record.endedAt = at;
+  if (!settled) record.parkedUntil = new Date(Date.now() + 3_600_000).toISOString();
+  record.declared = {
+    status: 'waiting-external', reason: 'the deploy run', watch: [`cmd:"test -f ${flag}"`], at,
+  } as never;
+  saveRun(state);
+  return state;
+}
+
+for (const settled of [false, true]) {
+  const shape = settled ? 'a settled (pending) waiting-external wall' : 'a waiting-external wall';
+  test(`RW-5 (#264): Recheck on ${shape} whose ref landed resumes the session — no halt, no done-checks`, async () => {
+    const root = scratch();
+    try {
+      const flag = join(root, 'deployed');
+      const { svc, drives } = service(root);
+      const state = waitRun(root, flag, settled);
+      writeFileSync(flag, 'ok\n', 'utf8');
+      await svc.recoverPhase('alpha', 1, 'recheck', { by: 'operator', settled: true });
+      const journal = journalOf(root, state.id);
+      assert.equal(journal.filter((e) => e.event === 'phase.halted').length, 0, 'never halted');
+      assert.equal(journal.filter((e) => e.event === 'run.failure-streak-held').length, 0, 'no done-checks path');
+      const rechecks = journal.filter((e) => e.event === 'run.recheck');
+      assert.equal(rechecks.length, 1);
+      assert.equal(rechecks[0].data?.verdict, 'landed', `not "changed": ${JSON.stringify(rechecks[0].data)}`);
+      assert.equal(rechecks[0].data?.resumed, true);
+      assert.equal(drives.length, 1);
+      assert.equal(drives[0].mode, 'resume');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test(`RW-6 (#264): Recheck on ${shape} whose ref has not landed writes one waiting line and changes nothing`, async () => {
+    const root = scratch();
+    try {
+      const flag = join(root, 'deployed');
+      const { svc, drives } = service(root);
+      const state = waitRun(root, flag, settled);
+      const before = loadRun(root, 'alpha', state.id, null)!.phases['1'];
+      await svc.recoverPhase('alpha', 1, 'recheck', { by: 'operator', settled: true });
+      const journal = journalOf(root, state.id);
+      assert.deepEqual(drives, []);
+      assert.equal(journal.filter((e) => e.event === 'phase.halted').length, 0);
+      const rechecks = journal.filter((e) => e.event === 'run.recheck');
+      assert.equal(rechecks.length, 1);
+      assert.equal(rechecks[0].data?.verdict, 'waiting');
+      const after = loadRun(root, 'alpha', state.id, null)!.phases['1'];
+      assert.equal(after.status, before.status);
+      assert.deepEqual(after.declared, before.declared);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}

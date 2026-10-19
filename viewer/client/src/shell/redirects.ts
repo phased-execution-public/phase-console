@@ -14,7 +14,12 @@
  * Nothing here spells `#/`: every address comes from a builder in `./routes`.
  */
 
-import { DEFAULT_HEAD, LEGACY_PLAN_TABS, LEGACY_SETTINGS_SECTIONS } from '@shared/route-meta.js';
+import {
+  DEFAULT_HEAD,
+  LEGACY_PLAN_TABS,
+  LEGACY_SETTINGS_SECTIONS,
+  PLAN_VIEW_ALIASES,
+} from '@shared/route-meta.js';
 import {
   PANEL_KEYS,
   bellHref,
@@ -78,9 +83,11 @@ function nowRedirect(route: Route, focus: FocusKey | undefined = focusOf(route))
  * `#/queue` (control-tower phase 99) is the Queued group of the Runs home since
  * 7.0 (quiet-console phase 7): every run waiting for a scope or a slot, with
  * the queue's own facts on each row. The head stays in the vocabulary — the
- * server and the palette still spell it — and lands here in one hop.
+ * server and the palette still spell it — and lands here in one hop. That is
+ * the FREE answer: in Pro the Queue is a page again (one-pool phase 40), so the
+ * table below loses the row and the router draws the page.
  */
-function queueRedirect(route: Route): string {
+export function queueRedirect(route: Route): string {
   return hrefOf(DEFAULT_HEAD, { group: 'queued', ...route.query });
 }
 
@@ -110,7 +117,7 @@ export const REDIRECTS: Record<string, (route: Route) => string> = {
   // things, and whatever else rode on the address rides on.
   now: (route) => nowRedirect(route),
   // 7.0 (quiet-console phase 7): the queue page is the Queued group of the home.
-  queue: (route) => queueRedirect(route),
+  queue: queueRedirect,
   // `dashboard` is what Now was called before 3.0, so it goes where Now goes.
   dashboard: (route) => nowRedirect(route),
   // The search page is the palette now. `?q=` was its term; `?k=` is the
@@ -138,12 +145,19 @@ export const REDIRECTS: Record<string, (route: Route) => string> = {
   // Phase 11: the MCP page's second SEGMENT becomes a query value —
   // `#/settings/:section` is the address space, and `?tab=` keeps the half of
   // the old address that meant something.
-  mcp: (route) => hrefOf(settingsHref('mcp'), route.segments[1] === 'catalog' ? { tab: 'catalog' } : {}),
+  // Its query rides along (one-pool phase 19, #363: `#/mcp?tab=catalog` used
+  // to land on Registered).
+  mcp: (route) =>
+    hrefOf(settingsHref('mcp'), {
+      ...route.query,
+      ...(route.segments[1] === 'catalog' ? { tab: 'catalog' } : {}),
+    }),
   // 7.0 (quiet-console phase 3): Debug became Logs. The section and every
   // filter ride along — `#/debug/health?since=1` is `#/logs/health?since=1`,
   // and bare `#/debug?source=console` is `#/logs?source=console`.
   debug: (route) => logsHref(route.segments[1], route.query),
 };
+
 
 /**
  * A retired settings section's address today, or `null` if this is not one.
@@ -181,7 +195,9 @@ export function planTabRedirect(route: Route): string | null {
   if (route.segments[0] !== 'plan') return null;
   const [, slug, tab] = route.segments;
   if (!slug || !tab) return null;
-  const to = (LEGACY_PLAN_TABS as Record<string, LegacyPlanTab | undefined>)[tab];
+  const to =
+    (LEGACY_PLAN_TABS as Record<string, LegacyPlanTab | undefined>)[tab] ??
+    (PLAN_VIEW_ALIASES as Record<string, LegacyPlanTab | undefined>)[tab];
   if (!to) return null;
   if (to.head === 'insights') return insightsHref(slug);
   if (!to.tab) return null;

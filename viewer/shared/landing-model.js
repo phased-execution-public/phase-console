@@ -159,6 +159,46 @@ export const LANDED_BY_POLICY = Object.freeze({
   trunk: 'landed',
 });
 
+/**
+ * The order a ledger row MOVES in (one-pool phase 21, #249 #240): a row only
+ * moves forward along this path. The console's `hold` settle once wrote `held`
+ * over a session's `pr-merged` and `landed` rows — seven true rows on hub then
+ * read "held on the run branch", their SHA and PR gone — because the upsert
+ * replaced whatever stood. `pr-merged` and `landed` rank alike — the `pr` and
+ * `trunk` policies' end states — so either replaces the other. `conflict` and `failed` are off the path: either
+ * may replace a row that has not merged, and neither replaces one in
+ * `LANDING_SETTLED`, whose work is on its target whatever happens next.
+ * `scripts/phase-landing.sh` and the engine's `landLocal` both refuse a move
+ * back, through `landingMovesBack`; a deliberate one is `--allow-backward`.
+ */
+export const LANDING_ORDER = Object.freeze(
+  /** @type {const} */ (['held', 'integrated', 'pushed', 'pr-open', 'pr-merged', 'landed']),
+);
+
+/** The states whose work is on its target: nothing but a deliberate move takes a row out of one. */
+export const LANDING_SETTLED = Object.freeze(/** @type {const} */ (['pr-merged', 'landed']));
+
+/**
+ * Would writing `to` over a row that reads `from` move it BACK? Unknown words
+ * never block (a row the ledger cannot read is not a position to defend).
+ * @param {string | null | undefined} from
+ * @param {string} to
+ * @returns {boolean}
+ */
+export function landingMovesBack(from, to) {
+  if (!from || from === to) return false;
+  const order = /** @type {readonly string[]} */ (LANDING_ORDER);
+  const settled = /** @type {readonly string[]} */ (LANDING_SETTLED);
+  const at = order.indexOf(from);
+  if (at < 0) return false;
+  const next = order.indexOf(to);
+  if (next < 0) return settled.includes(from);
+  // `pr-merged` and `landed` end different policies' paths; neither is a
+  // step on the other's, so either may replace the other.
+  if (settled.includes(from) && settled.includes(to)) return false;
+  return next < at;
+}
+
 /** The states a `pr-merged N` gate accepts — the question `gh pr view` answers. */
 export const PR_MERGED_STATES = Object.freeze(/** @type {const} */ (['pr-merged']));
 
@@ -183,6 +223,25 @@ export const PR_MERGED_STATES = Object.freeze(/** @type {const} */ (['pr-merged'
  * the scan stays a scan for the thing it is looking for.
  */
 export const PUSH_ARGV = Object.freeze(/** @type {const} */ (['push', '--porcelain', '--no-follow-tags']));
+
+/**
+ * The head of the ONE fetch the console runs (one-pool phase 21, #370): the
+ * landing proof refreshes `origin/<trunk>` before it compares a run branch
+ * with it, because a mirror nobody fetched called a merged branch unlanded.
+ * One remote (`origin`), one refspec (`+refs/heads/<trunk>:refs/remotes/origin/<trunk>`
+ * — only the remote-tracking ref of the trunk moves), no tags, no FETCH_HEAD,
+ * no submodules. Here and not beside its caller for `PUSH_ARGV`'s reason: the
+ * scanner in `test/never-push.test.ts` holds the one argv to this head.
+ */
+export const PROOF_FETCH_ARGV = Object.freeze(
+  /** @type {const} */ ([
+    'fetch',
+    '--quiet',
+    '--no-tags',
+    '--no-write-fetch-head',
+    '--no-recurse-submodules',
+  ]),
+);
 
 /** The columns of `landing.md`, in order — the ledger's shape, stated once. */
 export const LANDING_COLUMNS = Object.freeze(

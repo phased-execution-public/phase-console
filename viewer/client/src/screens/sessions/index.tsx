@@ -6,6 +6,7 @@
  * Sessions                                          [ New session ]  New shell
  * 1 needs you, 3 running and 2 ended.
  * Sessions 6   Locks 2
+ * 2 live lanes   1 shell   0 agents   1 other session   1 waiting on you   1 account in use
  * [Find a session…]  Filter  Group Kind  Sort Activity           ⋯  Everything
  * Autopilot lanes  2
  * ● Running                          quiet-console P15   Sessions and the terminal   4 minutes ago
@@ -49,6 +50,7 @@ import {
 } from './model';
 import { SessionsSections, capWords, useSessionRows } from './sections';
 import SessionPage from './session-page';
+import { SessionsStrip } from './strip';
 import { SessionsToolbar } from './toolbar';
 
 /** `?new=` — the only two things a person can start from here. */
@@ -147,6 +149,8 @@ function SessionsList() {
         </div>
       ) : (
         <>
+          {/* The machine at a glance (#369) — over every row, never what a filter left. */}
+          {rows.length > 0 && <SessionsStrip rows={rows} />}
           {/* Controls only where there is something to control: one shell and
               nothing else is a list no search, filter, group or order can
               improve — but its line still folds facts away, so the third door

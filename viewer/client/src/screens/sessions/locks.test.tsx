@@ -20,6 +20,7 @@
  * server's own words. No claims, no table.
  */
 
+import type { ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -31,6 +32,8 @@ import { parseHash, type Route } from '@/shell/routes';
 import { expectNoAxeViolations } from '@/test/axe';
 import { Toaster, dismissToast, useToasts } from '@/ui';
 import { TooltipProvider } from '@/ui/tooltip';
+import { __resetInspectorForTests, useInspected } from '@/shell/panel/inspector-host';
+import { EVERY_REPO, claimState, lockLanes } from './lock-map';
 import LocksSection, { lockScopes, lockSituation, lockStateText } from './locks';
 
 vi.setConfig({ testTimeout: 20_000 });
@@ -192,7 +195,7 @@ afterEach(() => {
   unmount();
 });
 
-function mount(address = '#/sessions/locks') {
+function mount(address = '#/sessions/locks', extra?: ReactNode) {
   const client = new QueryClient({
     ...queryClientConfig,
     defaultOptions: { queries: { ...queryClientConfig.defaultOptions?.queries, retry: false } },
@@ -205,6 +208,7 @@ function mount(address = '#/sessions/locks') {
       <MemoryRouterProvider initial={address}>
         <TooltipProvider>
           <LocksSection route={parseHash(address) as Route} />
+          {extra}
           <Toaster />
         </TooltipProvider>
       </MemoryRouterProvider>
@@ -633,3 +637,78 @@ describe('the words', () => {
   });
 });
 
+
+/**
+ * The lock map (one-pool phase 16, #364): one lane per repository, each claim a
+ * lease bar, a claim with no scope on every lane, overlaps stacked, and a bar
+ * that opens the claim in the panel with its Release.
+ */
+describe('the lock map', () => {
+  afterEach(() => __resetInspectorForTests());
+
+  it('lays one lane per repository, a claim with no scope on every one, overlaps stacked', () => {
+    const lanes = lockLanes(ROWS, NOW);
+    expect(lanes.map((lane) => lane.repo)).toEqual(['app', 'web']);
+    // blog P1 names no scope: it is on both lanes, and on each it overlaps the other claim.
+    for (const lane of lanes) {
+      expect(lane.claims.map((c) => `${c.row.slug}/${c.row.phase}`)).toContain('blog/1');
+    }
+    const app = lanes.find((lane) => lane.repo === 'app')!;
+    expect(app.depth).toBe(2);
+    expect(app.claims.map((c) => c.stack).sort()).toEqual([0, 1]);
+    // A lease bar: claimed to the end of its lease.
+    const shop5 = app.claims.find((c) => c.row.phase === 5)!;
+    expect([shop5.start, shop5.end]).toEqual([ROWS[1]!.claimedAt, ROWS[1]!.leaseUntil]);
+    // With nothing but unscoped claims, there is one lane for every repository.
+    expect(lockLanes([ROWS[2]!], NOW).map((lane) => lane.repo)).toEqual([EVERY_REPO]);
+    expect(lockLanes([], NOW)).toEqual([]);
+  });
+
+  it('paints a claim by what it does to the machine', () => {
+    expect(claimState(ROWS[0]!)).toBe('state-skipped');
+    expect(claimState(ROWS[1]!)).toBe('state-waiting');
+    expect(claimState(ROWS[2]!)).toBe('state-running');
+  });
+
+  it('is the section’s map view, at its own address, with the lanes and the lease bars', async () => {
+    mount();
+    await findRow('shop/2');
+    const views = screen.getByRole('navigation', { name: 'What the locks show' });
+    expect(within(views).getByRole('link', { name: 'Map' })).toHaveAttribute(
+      'href',
+      '#/sessions/locks?view=map',
+    );
+  });
+
+  it('draws the lanes, the lapsed claim hatched, and inspects a bar with its Release', async () => {
+    function Probe() {
+      const record = useInspected();
+      return record ? <div data-testid="panel">{record.actions}</div> : null;
+    }
+    mount('#/sessions/locks?view=map', <Probe />);
+    const map = await screen.findByTestId('lock-map');
+    expect(within(map).getByText('app')).toBeInTheDocument();
+    expect(within(map).getByText('web')).toBeInTheDocument();
+    expect(screen.getByTestId('lock-map-lead')).toHaveTextContent(
+      // On web, shop P2's lease ended the minute blog P1 was claimed: one after the other, not at once.
+      '2 repositories under 3 claims; app is held by more than one at once',
+    );
+    const svg = map.querySelector('svg')!;
+    // Four bars: shop P2 on web, shop P5 on app, and blog P1 on both.
+    const bars = [...svg.querySelectorAll('[role="button"]')];
+    expect(bars).toHaveLength(4);
+    expect(svg.querySelectorAll('rect.state-skipped').length).toBeGreaterThan(0);
+    expect(svg.innerHTML).toContain('url(#pe-lock-map-lapsed)');
+    // The two entries shop P5 holds up are ghosts at its lease's end.
+    expect(
+      [...svg.querySelectorAll('text')].filter((t) => t.textContent?.startsWith('◌')).length,
+    ).toBeGreaterThan(0);
+    const shop5 = bars.find((bar) => bar.getAttribute('aria-label')?.startsWith('shop P5'))!;
+    expect(shop5.getAttribute('aria-label')).toMatch(
+      /a person, 1h 19m left|a person, 1h 20m left|holding up 2 entries/,
+    );
+    fireEvent.click(shop5);
+    expect(await screen.findByTestId('panel')).toHaveTextContent('Release');
+    expect(screen.queryByRole('table', { name: 'Phase claims' })).toBeNull();
+  });
+});

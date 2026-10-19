@@ -135,9 +135,12 @@ describe('a run:progress frame patches the run’s row, with no refetch', () => 
     // Nothing asked for the run again — the only requests a row may make are its lane's activity
     // line and its why line's sources (control-tower phase 102): the phase's own report and, in
     // the Pro tree, the supervisor's read. None of them is the run.
+    // The accounts list (one-pool phase 11) is the console's, cached once for every row — the
+    // row's "account · provider · model" reads it — and is no read of the run either.
     const allowed = (url: string) =>
       url.includes('/activity') ||
       url.endsWith('/report') ||
+      url === '/api/accounts' ||
       false;
     const asked = fetch.mock.calls.map(([url]) => String(url)).filter((url) => !allowed(url));
     expect(asked).toEqual([]);

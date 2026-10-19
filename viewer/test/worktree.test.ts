@@ -17,7 +17,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +40,7 @@ import {
   stagingHome,
   worktreeHome,
   worktreesRoot,
+  indexDirOf, orphanIndexLocks, INDEX_LOCK_ORPHAN_MS,
 } from '../server/runner/worktree.ts';
 
 /** `git`, throwing on failure — a broken FIXTURE must not read as a finding. */
@@ -2994,4 +2995,91 @@ test('P7 include: no `.worktreeinclude` is not an error — it is every reposito
   const to = join(root, '..', 'fresh-none');
   mkdirSync(to, { recursive: true });
   assert.deepEqual(await copyIncluded(root, to), { copied: [], refused: [] });
+});
+
+
+/* ------------------------------------------------------------------ *
+ * An orphaned index.lock is named, never waited out (one-pool phase 20, #328)
+ * ------------------------------------------------------------------ */
+
+test('#328 WL-1: an index.lock older than any git command\'s is found in a linked worktree and a plain one; a fresh one is a git at work', () => {
+  const { root, stateDir } = fixture();
+  const tree = join(stateDir, 'integration');
+  git(root, 'worktree', 'add', '-q', '-b', 'pe/demo', tree);
+  // Both shapes of `.git`: a directory, and a linked worktree's `gitdir:` file.
+  assert.equal(indexDirOf(root), join(root, '.git'));
+  assert.equal(realish(indexDirOf(tree)!), realish(join(root, '.git', 'worktrees', 'integration')));
+  assert.equal(indexDirOf(stateDir), null, 'not a working tree');
+  const now = Date.now();
+  // The measured shape: a 0-byte lock, hours old, nothing writing it.
+  const lock = join(indexDirOf(tree)!, 'index.lock');
+  writeFileSync(lock, '');
+  utimesSync(lock, new Date(now - 5 * 3_600_000), new Date(now - 5 * 3_600_000));
+  const fresh = join(root, '.git', 'index.lock');
+  writeFileSync(fresh, '');
+  const found = orphanIndexLocks([root, tree, tree], { now });
+  assert.equal(found.length, 1, JSON.stringify(found));
+  assert.equal(found[0]!.tree, tree);
+  assert.equal(found[0]!.path, lock);
+  assert.ok(found[0]!.ageMs >= 5 * 3_600_000 - 1000);
+  // A lock younger than the floor is a git command at work — never named.
+  assert.ok(INDEX_LOCK_ORPHAN_MS >= 60_000 && INDEX_LOCK_ORPHAN_MS <= 10 * 60_000);
+  utimesSync(fresh, new Date(now - INDEX_LOCK_ORPHAN_MS - 1000), new Date(now - INDEX_LOCK_ORPHAN_MS - 1000));
+  assert.equal(orphanIndexLocks([root], { now }).length, 1, 'past the floor it is an orphan too');
+  // And nothing here removes it: whether a person's git is mid-write is theirs to say.
+  assert.equal(existsSync(lock), true);
+  assert.equal(existsSync(fresh), true);
+});
+
+test('#328 WL-2: a lane whose tree holds an orphaned index.lock halts run-tree-locked at boarding, naming the path — no session, no verification', async () => {
+  const { PHASE_HALT_KINDS } = await import('../shared/recovery-model.js');
+  const { Runner } = await import('../server/runner/runner.ts');
+  const { journalFile } = await import('../server/runner/run-paths.ts');
+  assert.ok((PHASE_HALT_KINDS as readonly string[]).includes('run-tree-locked'), 'a phase-level halt');
+  const { root } = fixture();
+  const scriptsDir = join(root, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
+  writeFileSync(join(scriptsDir, 'phase-graph.sh'), `#!/bin/bash
+case "$2" in
+  --memory-block) echo "done: "; echo "ready: 1"; echo "in-progress: "; echo "stuck: "; echo "waiting: " ;;
+  --gate-status) echo "clear (no gate)" ;;
+  --boot-prompt) echo "BOOT phase $3 of $1" ;;
+  --size) echo M ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  writeFileSync(join(scriptsDir, 'phase-lock.sh'), '#!/bin/bash\necho free\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(scriptsDir, 'validate.sh'), '#!/bin/bash\necho ok\nexit 0\n', { mode: 0o755 });
+  const lock = join(root, '.git', 'index.lock');
+  writeFileSync(lock, '');
+  const old = new Date(Date.now() - 3 * 3_600_000);
+  utimesSync(lock, old, old);
+  let spawned = 0;
+  let verified = 0;
+  const runner = new Runner({
+    scriptsDir,
+    spawn: async () => {
+      spawned += 1;
+      return { signal: { subtype: 'success' as const, code: 0, text: 'done' }, sessionId: 's', costUsd: 0, turns: 1, resultText: 'done', durationMs: 1, argv: [] };
+    },
+    verify: async () => { verified += 1; return { ok: true, reason: 'green', notRun: [], ran: [] }; },
+    verificationText: () => '`true`',
+  } as never);
+  const state = await runner.start({ slug: 'demo', root, autonomy: 'keep-going' });
+  await runner.wait();
+  const halt = state.phases['1']?.halt ?? state.halt;
+  assert.equal(halt?.kind, 'run-tree-locked', JSON.stringify({ halt: state.halt, record: state.phases['1'] }));
+  assert.ok((halt?.reason ?? '').includes(lock), halt?.reason);
+  assert.match(halt?.reason ?? '', /remove the lock, then Retry/);
+  assert.equal(spawned, 0, 'no session boarded a tree whose every index write would fail');
+  assert.equal(verified, 0);
+  const lines = readFileSync(journalFile(root, state.slug, state.id), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const line = lines.find((l) => l.event === 'phase.run-tree-locked');
+  assert.ok(line, 'journalled');
+  assert.equal(line.data.stage, 'boarding');
+  assert.equal(line.data.locks[0].path, lock);
+  assert.ok(line.data.locks[0].ageMinutes >= 179);
+  assert.equal(existsSync(lock), true, 'the console never removes it');
 });

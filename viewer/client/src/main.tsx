@@ -9,7 +9,8 @@ import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client
 import { App } from './App';
 import { createQueryClient } from './data/keys';
 import { persistOptions, revalidateRestored } from './lib/persist';
-import { applyDensity, applyTheme, getPrefs } from './lib/prefs';
+import { staleShellCheck } from './lib/pwa';
+import { applyDensity, applyPalette, applyTheme, getPrefs } from './lib/prefs';
 import { installErrorReporting } from './lib/report-error';
 import './styles/theme.css';
 
@@ -19,6 +20,7 @@ import './styles/theme.css';
 // switch and it costs one DOM write.
 applyTheme(getPrefs().theme);
 applyDensity(getPrefs().density);
+applyPalette(getPrefs().palette);
 
 // Before React renders, so a throw during the very first mount is reported
 // rather than lost: a throw from an event handler or a timer, and a promise
@@ -44,24 +46,40 @@ const queryClient = createQueryClient();
 // `null` — a private window, storage refused — runs the app from the network.
 const persistence = persistOptions();
 
-createRoot(root).render(
-  <StrictMode>
-    {persistence ? (
-      <PersistQueryClientProvider
-        client={queryClient}
-        persistOptions={persistence}
-        onSuccess={() => revalidateRestored(queryClient)}
-      >
-        <Suspense fallback={null}>
-          <Root />
-        </Suspense>
-      </PersistQueryClientProvider>
-    ) : (
-      <QueryClientProvider client={queryClient}>
-        <Suspense fallback={null}>
-          <Root />
-        </Suspense>
-      </QueryClientProvider>
-    )}
-  </StrictMode>,
+function mount(into: HTMLElement): void {
+  createRoot(into).render(
+    <StrictMode>
+      {persistence ? (
+        <PersistQueryClientProvider
+          client={queryClient}
+          persistOptions={persistence}
+          onSuccess={() => revalidateRestored(queryClient)}
+        >
+          <Suspense fallback={null}>
+            <Root />
+          </Suspense>
+        </PersistQueryClientProvider>
+      ) : (
+        <QueryClientProvider client={queryClient}>
+          <Suspense fallback={null}>
+            <Root />
+          </Suspense>
+        </QueryClientProvider>
+      )}
+    </StrictMode>,
+  );
+}
+
+// A page the service worker served may be the release before an update (#373):
+// asked BEFORE mounting, so the old app is never drawn and never pressed. On a
+// mismatch the page reloads once onto the new build and this one never mounts.
+void staleShellCheck({
+  announce: () => {
+    root.textContent = 'Updating to the new version of the console…';
+  },
+}).then(
+  (verdict) => {
+    if (verdict !== 'reloading') mount(root);
+  },
+  () => mount(root),
 );

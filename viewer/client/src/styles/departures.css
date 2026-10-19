@@ -1,0 +1,30 @@
+/* ------------------------------------------------------------------ *
+ * Departures — the 6.x room, as a palette a person may choose (#362)
+ *
+ * `prefs.palette` (`quiet` | `departures`, Settings ▸ Appearance, listed in
+ * Settings ▸ Everything) sets `data-palette` on the root; `quiet` — the 7.0
+ * room in `theme.css` — is the absence of the attribute. This block
+ * re-declares ONLY the room: the grounds, the surfaces, the rules, the three
+ * inks and the track, with 6.2.1's values (`git show
+ * v6.2.1:viewer/client/src/styles/theme.css`). The eight status hues, the
+ * accent, the hatch, the type and the spacing are the same in both palettes,
+ * so a status reads the same in either room.
+ *
+ * Paper: a cool grey-blue page under white cards, with drawn, opaque rules.
+ * Night: a blue slate. `theme.test.ts` holds this block to the room tokens and
+ * to the 6.x family (hues 204–233, chroma ≤ 0.045); `contrast.test.ts`
+ * measures every status and ink against its surfaces, in both lights.
+ * ------------------------------------------------------------------ */
+
+:root[data-palette='departures'] {
+  --ground: light-dark(oklch(93.19% 0.0069 220), oklch(21.36% 0.0229 232.86));
+  --ground-deep: light-dark(oklch(90% 0.009 221), oklch(18.83% 0.0201 233.18));
+  --surface: light-dark(oklch(100% 0 0), oklch(26.14% 0.0292 231.11));
+  --surface-raised: light-dark(oklch(97.58% 0.0044 218), oklch(29.22% 0.0325 229.87));
+  --rule: light-dark(oklch(84.71% 0.0144 222), oklch(33.14% 0.0373 223.89));
+  --rule-strong: light-dark(oklch(74.22% 0.0212 224), oklch(39.95% 0.0444 222.75));
+  --ink: light-dark(oklch(21.36% 0.0229 232.86), oklch(95.17% 0.0097 204.91));
+  --ink-muted: light-dark(oklch(43% 0.0283 227.06), oklch(74.72% 0.0244 220.82));
+  --ink-faint: light-dark(oklch(49% 0.0264 223.97), oklch(68% 0.0298 223.53));
+  --track: light-dark(oklch(82.37% 0.0175 223), oklch(36.05% 0.0405 223.66));
+}

@@ -10,10 +10,11 @@
 # A scaffold that quietly stopped emitting it would cost nothing today and
 # every forward note from then on.
 #
-# The generated boot prompts are `phase-graph.sh --boot-prompt`'s and are
-# covered where that lives; what is asserted here is that they are SPLICED —
-# a handoff whose paste block is the literal `{{NEXT_PROMPTS}}` placeholder is
-# the failure this script exists to prevent.
+# The boot prompts are `phase-graph.sh --boot-prompt`'s and are composed when
+# they are READ (`next-phase-prompt.sh`, Phase Console), never frozen into the
+# handoff (#338): what is asserted here is that the section holds the pointer
+# to that composer — a handoff whose section is the literal `{{NEXT_PROMPTS}}`
+# placeholder, or a prompt that was true only at scaffold time, is the failure.
 
 load ../helpers/test_helper
 
@@ -113,27 +114,35 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
   assert_contains "$output" "the parser is the left half"
 }
 
-@test "new-handoff: the boot prompts are spliced, one per phase this one unblocks" {
+@test "new-handoff: the section is a pointer the readers compose at read time — no prompt is frozen (#338)" {
   pe_newho demo 1 root complete >/dev/null
   local body; body="$(handoff phase-01-root.md)"
-  # Phase 1 unblocks 2 and 3 — both, and neither collapsed into "the next one".
-  # A fan-out writes the shared boot ONCE and a block per phase (#115); the
-  # composition itself is pinned in handoff-fanout.bats.
-  assert_contains "$body" "### Phase 2 — Left"
-  assert_contains "$body" "### Phase 3 — Right"
-  assert_contains "$body" "start Phase <N> in this fresh session"
-  [ "$(printf '%s\n' "$body" | grep -c '^Waiting without polling')" -eq 1 ]
+  # The composer, named runnable, with this plan and this phase …
+  assert_contains "$body" 'next-phase-prompt.sh demo 1'
+  assert_contains "$body" '--phase <M>'
+  # … and no prompt, no phase set, no fence a reader could mistake for one.
+  refute_contains "$body" "### Phase 2"
+  refute_contains "$body" "start Phase"
+  refute_contains "$body" "boot-shared"
+  refute_contains "$body" "/phased-execution"
   refute_contains "$body" "{{NEXT_PROMPTS}}"
 }
 
-@test "new-handoff: one unblocked phase still gets its whole prompt, and names this handoff to read" {
+@test "new-handoff: a note left after the scaffold reaches the composed prompt — the handoff froze nothing (#338)" {
   cp "$PE_DIR/tests/fixtures/plans/linear.md" "$DOCS_ROOT/docs/plans/demo.md"
-  pe_newho demo 1 alpha complete >/dev/null
-  local body; body="$(handoff phase-01-alpha.md)"
-  assert_contains "$body" "start Phase 2 in this fresh session"
-  # The file lands last, but it is the first thing phase 2 reads (#115).
-  assert_contains "$body" "- docs/handoffs/demo/phase-01-alpha.md"
-  refute_contains "$body" "boot-shared"
+  pe_newho demo 1 alpha in-progress >/dev/null
+  # The phase finishes later, and leaves a note for phase 2 in the meantime.
+  local f="$DOCS_ROOT/docs/handoffs/demo/phase-01-alpha.md"
+  awk '{ print } /^## What this phase did/ { print "Alpha built." }' "$f" > "$f.new" && mv "$f.new" "$f"
+  sed -i.bak 's/^status: in-progress/status: complete/' "$f" && rm -f "$f.bak"
+  printf '\n## Notes for later phases\n- **Phase 2:** the late note arrives whole.\n' >> "$f"
+  run pe_nextp demo 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "start Phase 2 in this fresh session"
+  assert_contains "$output" "the late note arrives whole"
+  # The prompt the reader composes names this handoff to read first.
+  assert_contains "$output" "- docs/handoffs/demo/phase-01-alpha.md"
+  refute_contains "$(cat "$f")" "start Phase 2"
 }
 
 @test "new-handoff: the final phase gets the closeout, not a boot prompt" {
@@ -193,6 +202,33 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
   assert_contains "$(handoff phase-01-root.md)" "status: in-progress"
   # One INDEX row, not two: the repair replaces a handoff, it does not add one.
   [ "$(grep -c 'phase-01-root.md' "$DOCS_ROOT/docs/handoffs/demo/INDEX.md")" -eq 1 ]
+}
+
+@test "new-handoff: --force rewrites the existing INDEX row's status, and says updated only when it did (#265)" {
+  local index="$DOCS_ROOT/docs/handoffs/demo/INDEX.md"
+  pe_newho demo 1 root in-progress >/dev/null
+  assert_contains "$(grep 'phase-01-root.md' "$index")" "| in-progress |"
+  run pe_newho demo 1 root complete --force
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'phase-01-root.md' "$index")" -eq 1 ]
+  assert_contains "$(grep 'phase-01-root.md' "$index")" "| complete |"
+  refute_contains "$(grep 'phase-01-root.md' "$index")" "in-progress"
+  assert_contains "$output" "updated $index"
+  # The same status again changes nothing, and the script does not claim it did.
+  run pe_newho demo 1 root complete --force
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "updated $index"
+  assert_contains "$output" "INDEX.md already reads complete"
+}
+
+@test "new-handoff: --force keeps every other cell of a hand-written INDEX row (#265)" {
+  local dir="$DOCS_ROOT/docs/handoffs/demo"
+  pe_newho demo 2 left blocked >/dev/null
+  # A person's row: a wider title, a trailing note column.
+  grep -v 'phase-02-left.md' "$dir/INDEX.md" > "$dir/INDEX.tmp" && mv "$dir/INDEX.tmp" "$dir/INDEX.md"
+  printf '| 02 | Left — the long title | blocked | [phase-02-left.md](phase-02-left.md) | see #9 |\n' >> "$dir/INDEX.md"
+  pe_newho demo 2 left in-progress --force >/dev/null
+  [ "$(grep 'phase-02-left.md' "$dir/INDEX.md")" = '| 02 | Left — the long title | in-progress | [phase-02-left.md](phase-02-left.md) | see #9 |' ]
 }
 
 @test "new-handoff: status defaults to complete — and the board waits for the body before it reads it back" {

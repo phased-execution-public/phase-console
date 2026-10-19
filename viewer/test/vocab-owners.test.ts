@@ -44,6 +44,7 @@ import {
   HANDOFF_WORDS,
   QA_WORDS,
   RULING_KINDS,
+  VERIFICATION_LINE_WORDS,
   VERIFICATION_WORDS,
 } from '../shared/evidence-model.js';
 import {
@@ -142,7 +143,7 @@ import { RESUME_AT_BOOT_MODES } from '../shared/automation-model.js';
 import { SCHEDULING_POLICIES } from '../shared/orchestration-model.js';
 import { EFFORT_LEVELS } from '../shared/run-settings.js';
 import { MESSAGING_WORDS } from '../shared/message-model.js';
-import { AUTOSTART_WORDS, DENSITIES, PREF_META, PROFILE_META, THEMES } from '../shared/prefs-model.js';
+import { AUTOSTART_WORDS, DENSITIES, PALETTES, PREF_META, PROFILE_META, THEMES } from '../shared/prefs-model.js';
 import { DECISION_KEYS, DECISION_STATES, DECISION_SOURCES, NEED_CLASSES } from '../shared/decisions-model.js';
 import { REFUSAL_CAUSES, SITUATIONS, parseSituationKey } from '../shared/situation-model.js';
 import { RUNG_DRIVERS, RUNG_FAILURE_CAUSES, RUNG_VEHICLES } from '../shared/ladder-model.js';
@@ -508,6 +509,7 @@ test('the settings schema takes each key\'s words from their owner — the same 
   const owners = new Map<string, readonly string[]>([
     ['theme', THEMES],
     ['density', DENSITIES],
+    ['palette', PALETTES],
     ['gitMode', GIT_MODES],
     ['reviewerPolicy', REVIEWER_POLICIES],
     ['isolation', ISOLATION_MODES],
@@ -647,6 +649,7 @@ const VOCABULARIES: {
     ],
   },
   { name: 'verification words', members: VERIFICATION_WORDS, owner: 'shared/evidence-model.js' },
+  { name: 'verification line words', members: VERIFICATION_LINE_WORDS, owner: 'shared/evidence-model.js' },
   { name: 'health severities', members: HEALTH_SEVERITIES, owner: 'shared/ops-vocab.js' },
   { name: 'MCP statuses', members: MCP_STATUSES, owner: 'shared/ops-vocab.js' },
   { name: 'MCP transports', members: MCP_TRANSPORTS, owner: 'shared/ops-vocab.js' },
@@ -1022,6 +1025,7 @@ const VOCABULARIES: {
    * the preference derives its type from the same arrays (`lib/prefs.ts`). */
   { name: 'themes', members: THEMES, owner: 'shared/prefs-model.js' },
   { name: 'densities', members: DENSITIES, owner: 'shared/prefs-model.js' },
+  { name: 'palettes', members: PALETTES, owner: 'shared/prefs-model.js' },
 ];
 
 /** Every source file the scan covers — tests excluded; they may say anything. */

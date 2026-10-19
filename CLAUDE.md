@@ -25,7 +25,11 @@ bats -f "gated" tests/unit    # a single test by name filter
 ```
 
 `bats-core` is required (`brew install bats-core`). Tests are hermetic: each creates its own
-`DOCS_ROOT` in `$BATS_TEST_TMPDIR` and copies a fixture plan in.
+`DOCS_ROOT` in `$BATS_TEST_TMPDIR` and copies a fixture plan in. `tests/run-tests.sh` unsets every
+`PE_*` variable and `DOCS_ROOT` before bats runs (it prints `== environment: scrubbed … ==`), so a
+session's own `PE_OWNER` or `DOCS_ROOT` cannot leak into a test (one-pool phase 30); a bats test that
+needs one sets it itself. A bare `bats tests/unit/<file>.bats` gets no such scrub — run it under
+`env -u DOCS_ROOT -u PE_OWNER …` (every `PE_*` your shell carries) from inside a session.
 
 ```bash
 cd viewer
@@ -41,6 +45,7 @@ npm run dev                   # Vite on :5173, proxying the live console on :412
 npm run verify:dist           # build into client/.dist-verify + the gate — leaves the LIVE dist untouched
 npm run test:e2e              # the real-browser tour (Playwright, four viewports) — e2e/baseline.json is [], so any finding fails
 npm run test:e2e:dist         # the same tour against a production build under the real CSP (what scripts/gates.sh runs)
+PHASE_CONSOLE_E2E_REAL_MACHINE=1 npm run test:e2e   # tour this machine's own login, meter, unit and tailnet, not the fixture's
 npm run build                 # emit client/dist and stamp .build-rev
 npm run check:dist            # the build gate — run it after every build
 ```
@@ -64,6 +69,13 @@ The default instance keeps port 4123, the bare
 `com.phase-console` unit name and the top-level state paths.
 Identity **must** resolve at module load — log, notification, push and approval paths
 are module-level consts, so a late resolution writes global state while reporting a private id.
+
+The tour runs on a scratch HOME by default — a fixture login, a usage endpoint of its own, no launch
+unit, an example tailnet — so no picture carries the operator's email or live meter;
+`PHASE_CONSOLE_E2E_REAL_MACHINE=1` opts out and says so on stderr. `scripts/gates.sh` runs the server
+suite under `PHASE_CONSOLE_GATE_STAGE=server-suite`, which lets `test/dist-dir.test.ts` skip, naming
+why, on pictures from a tour of another route table, because the gate's e2e stage re-shoots the tour
+afterwards and asks again (#353).
 
 The Node suite must keep passing **without** a client build — a fresh clone verifies the server before
 `dist` exists (`test/static.test.ts` holds the not-built answers, including the `/sw.js` fallback).
@@ -95,24 +107,27 @@ velocity). `server/service.ts` is the model, `engine.ts` the script wrapper, `st
 artifact, `api/routes.ts` the surface. `shared/` is dependency-free ESM imported by both the Node
 tests and the client.
 
-### The client — seven destinations, and the vocabularies they share
+### The client — eight destinations, and the vocabularies they share
 
 7.0 (the quiet-console plan) rebuilt the client from zero: the 6.x tree under `client/src/` (app/,
 features/, components/, lib/api/) is gone, and every address it ever answered still lands, in one hop,
 with its query (`client/src/shell/redirects.ts`). The design law is `viewer/docs/design.md` ("Quiet"):
 every rule in it names the guard that holds it.
 
-**The map.** Seven destinations in three bands, the same seven in both editions (`DESTINATIONS` in
-`shared/route-meta.js`, `NAV` in `client/src/shell/nav.ts`): **the work** — Runs (`#/runs`, the home,
-`DEFAULT_HEAD`), Plans (`#/plans`; a plan is `#/plan/<slug>`), Sessions (`#/sessions`); **the record** —
+**The map.** Eight destinations in three bands, the same eight in both editions (`DESTINATIONS` in
+`shared/route-meta.js`, `NAV` in `client/src/shell/nav.ts`; seven until one-pool phase 14 made Your
+turn the eighth): **the work** — Runs (`#/runs`, the home, `DEFAULT_HEAD`), Your turn (`#/turn`),
+Plans (`#/plans`; a plan is `#/plan/<slug>`), Sessions (`#/sessions`); **the record** —
 Repo (`#/repo/<section>`), Insights (`#/insights`), Logs (`#/logs/<section>`); **the console** —
 Settings (`#/settings/<section>`). The Runs home's heading is the situation sentence; under it six
 groups — Your turn · Running · Waiting · Queued · Ready to start · Settled today (`?group=`, and 6.x's
 `?bay=` still read) — hold one line per run with exactly ONE action, and All runs (`?view=all`) is the
 same set as a table; `#/now…` lands on Runs (a `?focus=` on its group), `#/queue` on Queued. A plan
 opens on its glance over
-three views, each an address: Phases (Table · Map · QA · Handoffs), Run (`#/plan/<slug>/run`;
-`?view=history` for its earlier runs) and Source. Repo is six sections — History, Branches, Working
+four views, each an address: Phases (Table · Map · QA · Handoffs · Schedule · Burn-up; the map's tools —
+filters, a trace, colour, layers, layouts, export — live in its address, one-pool phase 16), Run (`#/plan/<slug>/run`;
+`?view=history` for its earlier runs), Your turn (`#/plan/<slug>/turn`, the page scoped to the plan,
+one-pool phase 14) and Source. Repo is six sections — History, Branches, Working
 trees, Changes, Settles and the Issues desk (`screens/repo/issues-section.tsx`: a repository's WHOLE
 issue list, each issue's category, severity and plan status derived once in `shared/issues-model.js`,
 plus any GitHub `owner/name` an operator adds, read-only). Logs (Debug until 7.0;
@@ -120,7 +135,7 @@ plus any GitHub `owner/name` an operator adds, read-only). Logs (Debug until 7.0
 and Access — every log this console writes on one time axis, plus the redacted bundle. Settings is
 nine, Everything last: every key `GET /api/prefs/schema` describes, with its value, where it came from
 and its reset. **Your turn** (`#/turn`, `screens/turn/`; control-tower phases 130–139, 148 and 149) is
-a head that lights Runs: every act only a person can do as one item — why only they fit it, a guide, a
+a destination of its own since one-pool phase 14 (it was a head that lit Runs): every act only a person can do as one item — why only they fit it, a guide, a
 proof the console checks — in six groups plus *Handled by the AI*, read from `GET /api/turn`, which
 the server's `turn/` folds from every source through one door (`raiseTurn`); `#/approve` lands there,
 and the approval, gate, question and errand cards elsewhere draw the item and link to it. A permission
@@ -128,10 +143,10 @@ item is answered by a scoped grant (`server/permissions/grants.ts`, `grants.ndjs
 (`server/owner/`, a passkey) is what lets a console tell its owner's press from any other door's.
 
 **The shell** (`client/src/shell/`). From 900 px a slim 80 px rail: the instance switcher at its top,
-the seven places as a glyph over a word, banded by hairlines, and Help and the account meter at its
+the eight places as a glyph over a word, banded by hairlines, and Help and the account meter at its
 foot. The header carries the page title, the situation words (each a link on a desk), search (⌘K) and
-the bell. Below 900 a tab bar — `TAB_BAR` in `shell/nav.ts`: Runs · Plans · Sessions · Insights ·
-More — and the More sheet holds the rest. The palette (`?k=`: go to · find · do), the help sheet
+the bell. Below 900 a tab bar — `TAB_BAR` in `shell/nav.ts`: Runs · Your turn · Plans · Sessions ·
+More (in Pro the Supervisor takes Sessions' slot) — and the More sheet holds the rest. The palette (`?k=`: go to · find · do), the help sheet
 (`?help=`) and the bell (`?bell=`) are query params, never routes: open ⟺ the URL says so, so
 navigating anywhere closes them. **Three doors to depth, on every page** (design.md §1): **expand** a
 row in place, remembered per person; **inspect** it in the panel, on four tabs — Overview · Actions ·
@@ -293,6 +308,15 @@ establish — a vocabulary lives in `shared/` and is imported by identity by ser
   can raise — every kind × ledger state × birth and every projected source, in both editions — and
   fails one missing its type, status, readiness, route, *Checked by*, check or (while open) steps,
   options or approval block, or showing a machine word.
+  Since one-pool phase 14 (#377 #366 #365) the page is one a person works FROM: tabs (Open · Done ·
+  Handled by the AI · All), four views (`?view=list|board|cards|timeline`, the list by default: one
+  line per item, its whole card in the panel on selection, `screens/turn/panel-card.tsx`), five
+  groupings (`?group=asked|plan|type|deadline|status`), empty groups folded into one line, filter
+  chips with counts on a desk, and bulk *Not doing* · *Hand back* · *Snooze* — the words in
+  `shared/turn-model.js` (`TURN_VIEWS`, `TURN_TABS`, `TURN_GROUPINGS`, `TURN_BOARD_COLUMNS`), the
+  grammar in `viewer/docs/design.md` §Your turn. The composer's `shortTitle` holds every title to 80
+  characters (the long form is `headline`), every status word explains itself on hover, focus and
+  tap (`shared/status-meanings.js`), and the bell's drawer is a five-row preview of the page.
   The person-facing account of all
   of it is the help guide's *Your turn* (`client/src/content/guide/your-turn.md` and its `.fa.md`
   twin), `references/turn.md` for a session, and `viewer/README.md` §Your turn.
@@ -363,6 +387,7 @@ meter, rendered by name; a per-model wall files under its own bucket so `auto` s
 for that model. And **the poller is telemetry, never the detector** — the runner's own limit
 classifier works with the meters unavailable, so a 429 or a vanished endpoint degrades to stale
 numbers with their age attached, never an error page.
+
 
 At a wall the run's `onLimit` policy decides: `wait` sleeps on the window (restart-safe — the run
 reconciles to `paused` with its clock intact and the service re-arms the resume at boot), `switch`
@@ -460,7 +485,10 @@ rather than refusing.
   the package manager's own directory flag; Setup is resolved from the SAME directory, because the
   runner hands both one cwd, and an install counts only for its own ecosystem. Its word lists stay in
   `phase-graph.sh`, not `verify.env`: no runtime reader asks them. The advisory family is therefore
-  F15–F19, F22–F23, F28, F30, F32–F36, F38–F41 and F43 — nineteen ids (F40, `human-step-no-why`,
+  F15–F19, F22–F23, F28, F30, F32–F36, F38–F41, F43 and F45–F46 — twenty-one ids (F45,
+  `proof-unparsable`, and F46, `proof-script-run-branch-only`, one-pool phase 13: a `Human step:`
+  proof the check reader would refuse, and a `cmd:` proof whose script is not on its repository's
+  trunk — both read through `scripts/cmd-ref.sh`, the bash twin of the one `cmd:` reader; F40, `human-step-no-why`,
   control-tower phase 130: a `Human step:` with no `why:`, given its kind's default reason; F41,
   `human-step-no-guide`, and F43, `errand-row-unbound`, turn-by-turn phase 2: a task or decision with
   no guide file, no options and no bound `## Operator errands` row, and a table row no bullet names —
@@ -549,7 +577,7 @@ rather than refusing.
   backstop, **awaited** rather than armed on a `setTimeout` that dies with the console that set it.
   The MCP probe takes the same ladder with the interrupt rung off — it has no turn to close — so its
   ending is SIGTERM to its group, `PROBE_TERM_GRACE_MS` (3 s), then the SIGKILL its `npx` shims
-  need. The lint allows six other `.kill(` files, each by name and reason (`KILL_ALLOWED` in the
+  need. The lint allows seven other `.kill(` files, each by name and reason (`KILL_ALLOWED` in the
   test), and fails when that set changes in EITHER direction, so a reason cannot rot. **The handle outlives the console that made it:** `syncMirror` MERGES `state.children`
   and never rebuilds it, so a ChildRef for a phase this console holds no lane for survives
   byte-for-byte and only the probe may drop it; identity is the `(pid, procStartedAt)` tuple, never
@@ -641,7 +669,11 @@ rather than refusing.
   imports `./state-sandbox.ts` first (or redirects `XDG_STATE_HOME` inline before that import — static
   imports evaluate in source order), and a console is spawned only through `test/spawn-console.ts`.
   `test/state-isolation.test.ts` enforces both, and belongs in every verification batch that runs node
-  tests.
+  tests. The usage belt is the same idea for the network (one-pool phase 30, #241): a `UsagePoller` in
+  a test process with nothing injected reads no meters at all (`usageSealed` in
+  `server/accounts/usage.ts` — it records "a test process reads no usage endpoint" instead of asking).
+  A test that wants a reading gives the poller `fetchFn` or `base`, or names an endpoint with
+  `PHASE_CONSOLE_USAGE_BASE`.
 
 ### MCP servers
 
@@ -697,8 +729,9 @@ bash 3.2. An unfilled `${VAR}` in a server's own command (the catalog's `${MCP_F
 `--allow-writes` (scaffold plans/handoffs, record QA, take locks — never commits or pushes, `--git` is
 never passed), `--allow-run` (spawn unattended `claude -p` sessions that edit a repo for hours),
 `--allow-terminal` (a real shell), `--allow-agent` (interactive sessions and the plan wizard),
-`--allow-accounts` (register Claude accounts for this instance, pick one per run, switch mid-run —
-*reading* the usage meters needs no flag), `--allow-mcp` (register MCP servers, hold their
+`--allow-accounts` (register Claude accounts for this instance and pick one per run —
+*reading* the usage meters needs no flag; moving a running run to another account is a run act, so
+`--allow-run` gates it, one-pool phase 7's ruling on #323), `--allow-mcp` (register MCP servers, hold their
 credentials, attach them to plans and phases — *reading* the registry, the statuses and the catalog
 needs no flag), `--allow-webhooks` (POST every announcement to the URLs you register — Slack, Discord,
 Telegram, your own relay; one of the two that send anything off the machine, and *reading* the

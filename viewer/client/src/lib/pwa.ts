@@ -33,11 +33,21 @@
  * build makes, which the shell reports through `useServiceWorker(serverRev)`
  * — and `controllerchange` still reloads only a change we asked for: the
  * first-install reload loop stays dead.
+ *
+ * **And the previous release never mounts** (one-pool phase 18, #373). Even
+ * auto-applied, the swap came AFTER the cached shell had painted — a first
+ * visit after an update drew the release before, live and pressable, until the
+ * worker took over. So a page a worker served asks the server which build it
+ * serves before it mounts (`staleShellCheck`), and on a mismatch it reloads
+ * ONCE onto the new build (`reloadFresh`) instead of mounting the old app; a
+ * press that still slips past — a tab left open across the update — is
+ * refused by the server with a 409 and offered a reload here.
  */
 
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { dismissToast, toast } from '@/ui';
 import { MOUNTED } from './base';
+import { BUILD_REV, OUTDATED_EVENT, isRev, sameBuild } from './build';
 
 /**
  * ⚠️ Both halves of this pair are a contract with every device already
@@ -189,6 +199,192 @@ export async function applyUpdateNow(
   return 'reloading';
 }
 
+/** The worker's caches — `CACHE_PREFIX` in `sw.ts`. */
+const SHELL_CACHE_PREFIX = 'phase-shell-';
+
+/** The one-shot that keeps a stale-shell reload from looping: `{rev, at}` of the build it reloaded for. */
+export const STALE_RELOAD_KEY = 'pc-stale-shell-reload';
+
+const within = <T>(work: Promise<T>, ms: number): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+
+/** A worker reaching `installed` — what an update installs before it can take over — or null at the deadline. */
+function installedWorker(
+  worker: ServiceWorker | null | undefined,
+  ms: number,
+): Promise<ServiceWorker | null> {
+  if (!worker) return Promise.resolve(null);
+  if (worker.state === 'installed') return Promise.resolve(worker);
+  return new Promise((resolve) => {
+    const done = (value: ServiceWorker | null) => {
+      clearTimeout(timer);
+      worker.removeEventListener('statechange', onState);
+      resolve(value);
+    };
+    const onState = () => {
+      if (worker.state === 'installed') done(worker);
+      else if (worker.state === 'redundant') done(null);
+    };
+    const timer = setTimeout(() => done(null), ms);
+    worker.addEventListener('statechange', onState);
+  });
+}
+
+/** Ask a waiting worker to take over; true once it controls this page, false at the deadline. */
+function takeOver(worker: ServiceWorker, ms: number): Promise<boolean> {
+  const container = navigator.serviceWorker;
+  return new Promise((resolve) => {
+    const done = (value: boolean) => {
+      clearTimeout(timer);
+      container.removeEventListener('controllerchange', onChange);
+      resolve(value);
+    };
+    const onChange = () => done(true);
+    const timer = setTimeout(() => done(false), ms);
+    container.addEventListener('controllerchange', onChange);
+    worker.postMessage({ type: 'SKIP_WAITING' });
+  });
+}
+
+export interface FreshReloadOptions {
+  /** How long each step — the update check, the install, the takeover — may take. */
+  waitMs?: number;
+  /** The navigation; a test seam, because jsdom cannot navigate. */
+  reload?: () => void;
+  /** The cache store the shell lives in; `globalThis.caches` unless a test says otherwise. */
+  cacheStorage?: Pick<CacheStorage, 'keys' | 'delete'> | null;
+}
+
+/**
+ * Reload onto the build the server serves NOW, never the cached shell.
+ *
+ * A plain `location.reload()` under the old worker is answered from the old
+ * worker's cache — the very release being left. So: ask the server for its
+ * worker, let it install, and have it take over (its `activate` drops the old
+ * caches and serves its own precache); when no new worker takes over in time,
+ * drop the shell caches instead, so the old worker answers the reload from
+ * the network. Never `unregister()`: a push subscription belongs to the
+ * registration, and unregistering would silently unsubscribe this device.
+ */
+export async function reloadFresh(options: FreshReloadOptions = {}): Promise<'took-over' | 'dropped'> {
+  const waitMs = options.waitMs ?? 3_000;
+  const reload = options.reload ?? (() => window.location.reload());
+  let tookOver = false;
+  try {
+    const container = typeof navigator === 'undefined' ? undefined : navigator.serviceWorker;
+    const reg = container ? await within(container.getRegistration(), waitMs) : undefined;
+    if (reg) {
+      await within(reg.update(), waitMs).catch(() => undefined);
+      const worker = reg.waiting ?? (await installedWorker(reg.installing, waitMs));
+      if (worker) tookOver = await takeOver(worker, waitMs);
+    }
+  } catch {
+    /* no worker to ask — the caches below are the whole answer */
+  }
+  if (!tookOver) {
+    const store = options.cacheStorage !== undefined ? options.cacheStorage : (globalThis.caches ?? null);
+    try {
+      const names = (await store?.keys()) ?? [];
+      await Promise.all(
+        names.filter((name) => name.startsWith(SHELL_CACHE_PREFIX)).map((name) => store?.delete(name)),
+      );
+    } catch {
+      /* a cache the browser will not let go of is the browser's to evict */
+    }
+  }
+  reload();
+  return tookOver ? 'took-over' : 'dropped';
+}
+
+export interface StaleShellOptions extends FreshReloadOptions {
+  /** This bundle's build; `__BUILD_REV__` unless a test says otherwise. */
+  mine?: string;
+  /** Whether a worker served this page — only then can it be an old one. */
+  controlled?: boolean;
+  /** The build the server serves now: `/.build-rev`, the stamp `npm run build` writes. */
+  served?: () => Promise<string | null>;
+  /** How long the question may delay the mount before the page mounts anyway. */
+  askMs?: number;
+  /** Said on the page while the reload runs. */
+  announce?: () => void;
+  now?: () => number;
+}
+
+/** What the stale-shell check came to: mount (`current`, `skipped`, `declined`) or not (`reloading`). */
+export type StaleShellVerdict = 'current' | 'skipped' | 'declined' | 'reloading';
+
+async function servedBuild(): Promise<string | null> {
+  const res = await fetch('/.build-rev', { cache: 'no-store', headers: { 'x-phase-console': '1' } });
+  // An unstamped `dist` answers the SPA's index.html for this path, which is no build.
+  return res.ok ? (await res.text()).trim() : null;
+}
+
+/**
+ * Before mounting: is this page the build the server serves (#373)?
+ *
+ * Only a page a worker served can be stale — one the network served is the
+ * server's own — so an uncontrolled page, a mounted one (it registers no
+ * worker), dev, and a build either side cannot name mount at once. A server
+ * that does not answer within `askMs` is no answer, and the page mounts. On a
+ * mismatch the page reloads once onto the new build; a second mismatch for the
+ * same build within a minute is `declined` — the page mounts, and the server's
+ * 409 and the reload prompt guard its presses — so a worker that cannot take
+ * over never becomes a loop.
+ */
+export async function staleShellCheck(options: StaleShellOptions = {}): Promise<StaleShellVerdict> {
+  const controlled =
+    options.controlled ??
+    (!MOUNTED &&
+      !import.meta.env.DEV &&
+      typeof navigator !== 'undefined' &&
+      Boolean(navigator.serviceWorker?.controller));
+  const mine = options.mine ?? BUILD_REV;
+  if (!controlled || !isRev(mine)) return 'skipped';
+  let served: string | null;
+  try {
+    served = await within((options.served ?? servedBuild)(), options.askMs ?? 1_500);
+  } catch {
+    return 'skipped';
+  }
+  if (!isRev(served)) return 'skipped';
+  const now = (options.now ?? Date.now)();
+  if (sameBuild(mine, served)) {
+    try {
+      sessionStorage.removeItem(STALE_RELOAD_KEY);
+    } catch {
+      /* private mode */
+    }
+    return 'current';
+  }
+  let last: { rev?: string; at?: number } = {};
+  try {
+    last = JSON.parse(sessionStorage.getItem(STALE_RELOAD_KEY) ?? '{}') as typeof last;
+  } catch {
+    /* an unreadable marker is no marker */
+  }
+  if (last.rev === served && typeof last.at === 'number' && now - last.at < 60_000) return 'declined';
+  try {
+    sessionStorage.setItem(STALE_RELOAD_KEY, JSON.stringify({ rev: served, at: now }));
+  } catch {
+    /* private mode — without the marker, a second mismatch reloads again, at the browser's pace */
+  }
+  options.announce?.();
+  await reloadFresh(options);
+  return 'reloading';
+}
+
 /**
  * The addresses an auto-apply never reloads: a live pty or stream whose
  * scrollback a reload would lose — a session's page and the two addresses it
@@ -298,6 +494,22 @@ export function useServiceWorker(serverRev?: string | null): void {
 
     navigator.serviceWorker?.addEventListener('controllerchange', onControllerChange);
 
+    // A press the server refused because this page is an earlier release's
+    // (#373, `data/http.ts`): nothing was done. One pinned prompt, whose
+    // Reload lands on the build the server serves, never the cached shell.
+    let outdated: number | null = null;
+    const onOutdated = () => {
+      if (cancelled || outdated !== null) return;
+      outdated = toast('This page is from a previous release of the console.', 'warn', 0, {
+        label: 'Reload',
+        onSelect: () => {
+          applying = true;
+          void reloadFresh();
+        },
+      });
+    };
+    window.addEventListener(OUTDATED_EVENT, onOutdated);
+
     // AFTER first paint, never during it — see `afterLoadIdle`. The worker is
     // what makes the NEXT visit fast; fetching its 1.5 MB precache alongside
     // the first plan open makes this one slower to buy that.
@@ -355,6 +567,8 @@ export function useServiceWorker(serverRev?: string | null): void {
       cancelled = true;
       stopWaiting();
       if (offered !== null) dismissToast(offered);
+      if (outdated !== null) dismissToast(outdated);
+      window.removeEventListener(OUTDATED_EVENT, onOutdated);
       if (registration && onUpdateFound) registration.removeEventListener('updatefound', onUpdateFound);
       document.removeEventListener('visibilitychange', onVisible);
       navigator.serviceWorker?.removeEventListener('controllerchange', onControllerChange);

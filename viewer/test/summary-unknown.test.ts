@@ -282,8 +282,13 @@ test('SU-3 (#96): progressReading — the one reading the header and the row dra
   assert.equal(legacy.known, false, 'a null count is not a reading');
 
   const client = join(HERE, '..', 'client', 'src');
-  for (const file of [join('screens', 'plan', 'header.tsx'), join('screens', 'plans', 'row.tsx')]) {
+  // The row draws its progress as the plan's track (`PlanTrack`), and the
+  // track is what reads it — so the track is held to the shared reading.
+  for (const file of [join('screens', 'plan', 'header.tsx'), join('screens', 'plans', 'track-bar.tsx')]) {
     const source = readFileSync(join(client, file), 'utf8');
     assert.match(source, /progressReading\(/, `${file} draws the shared reading, not its own 0 %`);
   }
+  const row = readFileSync(join(client, 'screens', 'plans', 'row.tsx'), 'utf8');
+  assert.match(row, /import \{ PlanTrack \} from '\.\/track-bar'/, 'the row draws its progress through the track');
+  assert.match(row, /<PlanTrack\b/);
 });

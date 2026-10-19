@@ -32,9 +32,10 @@ import { requestView, type AuthorityRequest, type AuthorityRequestView } from '.
 import type { HandledRow } from './handled.ts';
 import type { RoundState } from './round.ts';
 import type { HeadsUp, PlanGuideFrom, PlanItemWords } from './plan-items.ts';
-import { headlineOf, type HeadlineFacts } from './headline.ts';
+import { headlineOf } from './headline.ts';
 import {
-  approvalOf, boundToRun, composeItem, type ApprovalBlock, type AskFacts, type ComposedStep, type StepFacts, type StepsFrom, type TurnOption, type TurnTiming,
+  approvalOf, boundToRun, composeItem, type ApprovalBlock, type AskFacts, type ComposedStep, type LandingFiles, type StepFacts, type StepsFrom, type TurnOption,
+  type TurnTiming,
 } from './compose.ts';
 import type { SeenEntry } from './first-seen.ts';
 import type { SettledOutcome, SettledRecord } from './settled.ts';
@@ -252,6 +253,16 @@ export type TurnItem = TurnView & CardWords & Words & {
   request?: AuthorityRequestView;
   /** The situation's ASK words, on an errand's item (turn-by-turn phase 4) — read by the composer. */
   ask?: AskFacts;
+  /**
+   * The act's whole words when `title` had to be cut to the title rule (#377,
+   * `turn/compose.ts` `shortTitle`): the title is sentence case and at most 80
+   * characters; this is what it shortened, which the card shows beneath it.
+   */
+  headline?: string;
+  /** The plan's errands-table ref the act carries — "E-4" — a chip beside the title, never in it (#377). */
+  errandRef?: string;
+  /** The landing errand's files, grouped by repository — the card's folded *Details* (#377). */
+  files?: LandingFiles;
 };
 
 /**
@@ -399,18 +410,6 @@ function ownDetailOf(step: HumanStep): TurnStepDetail {
   };
 }
 
-/** The oldest item that needs the person now, with the lanes it holds. */
-function oldestOf(groups: Record<TurnGroup, TurnItem[]>): HeadlineFacts['oldest'] {
-  const open = TURN_OPEN_GROUPS.flatMap((group) => groups[group]).filter((item) => Number.isFinite(Date.parse(item.since)));
-  if (!open.length) return null;
-  const oldest = open.reduce((a, b) => (Date.parse(b.since) < Date.parse(a.since) ? b : a));
-  const lanes = oldest.step?.waiters?.length
-    ? oldest.step.waiters.map((waiter) => ({ slug: waiter.slug, phase: waiter.phase }))
-    : oldest.slug && oldest.phase != null ? [{ slug: oldest.slug, phase: oldest.phase }] : [];
-  // The item's own words when the ledger holds it — "sign gh in", not the inbox row's frame.
-  return { title: oldest.step?.title ?? oldest.title, since: oldest.since, holds: lanes.filter((lane) => lane.phase > 0) };
-}
-
 /**
  * The turn, projected from the inbox (every person-facing row, acknowledged
  * or not — an ack is "seen", never "done") and the ledger (each ledger item's
@@ -543,7 +542,7 @@ export function turnView(
     },
     headline: headlineOf({
       open: TURN_OPEN_GROUPS.reduce((n, group) => n + counts[group], 0), checking: counts.checking, upcoming: counts.upcoming,
-      handled: counts.handled, handledSince: seen ? 'seen' : 'day', oldest: oldestOf(groups), now,
+      done: counts.done, handled: counts.handled, handledSince: seen ? 'seen' : 'day',
     }),
     groups,
     handled: [...(ledger.handled?.rows ?? [])],
@@ -600,6 +599,8 @@ function headsUpItem(row: HeadsUp, edition: 'free' | 'pro', now: number): TurnIt
     ...draft, ...words,
     // A table row is written as the plan wrote it; the title is the act, raised.
     title: composed.title.charAt(0).toUpperCase() + composed.title.slice(1),
+    ...(composed.headline ? { headline: composed.headline } : {}),
+    ...(composed.errandRef ? { errandRef: composed.errandRef } : {}),
     need: `A heads-up from the plan ${row.slug}.`,
     how: HEADS_UP_CHECK,
     meta: composed.meta, steps: composed.steps, stepsFrom: composed.stepsFrom, check: HEADS_UP_CHECK, trouble: composed.trouble,
@@ -646,12 +647,14 @@ function withCardWords(item: Draft, step: HumanStep | undefined, edition: 'free'
  */
 function withWords(item: Omit<TurnItem, keyof Words> & Pick<Draft, 'options' | 'approval'>, step: HumanStep | undefined, firstSeen: string | null, now: number): TurnItem {
   const facts: StepFacts | undefined = step ? { ...step, ...item.step, title: step.title } as StepFacts : undefined;
+  // The row's whole words, when its title was cut to the rule (#377) — the composer cuts them once more, the same way.
+  const { headline: rowHeadline, ...rest } = item;
   const composed = composeItem({
     source: item.source, record: item.record, kind: item.kind, proofType: item.proofType, why: item.why,
     ...(item.slug ? { slug: item.slug } : {}), phase: item.phase ?? null,
     ...(facts ? { step: facts } : {
       row: {
-        title: item.title, need: item.need, how: item.how, since: item.since,
+        title: rowHeadline ?? item.title, need: item.need, how: item.how, since: item.since,
         ...(item.expiresAt ? { expiresAt: item.expiresAt } : {}),
         ...(item.openUntil ? { openUntil: item.openUntil } : {}),
         humanStep: item.humanStep,
@@ -664,8 +667,10 @@ function withWords(item: Omit<TurnItem, keyof Words> & Pick<Draft, 'options' | '
     firstSeen, now,
   });
   return {
-    ...item,
+    ...rest,
     title: composed.title,
+    ...(composed.headline ? { headline: composed.headline } : {}),
+    ...(composed.errandRef ? { errandRef: composed.errandRef } : {}),
     need: composed.need,
     how: composed.how,
     meta: composed.meta,
@@ -730,5 +735,7 @@ function leadOf(row: InboxItem, turn: TurnView): Draft {
     ...(row.ask ? { ask: row.ask } : {}),
     ...(row.options?.length ? { options: row.options } : {}),
     ...(row.approval ? { approval: row.approval } : {}),
+    ...(row.headline ? { headline: row.headline } : {}),
+    ...(row.files?.length ? { files: row.files } : {}),
   };
 }

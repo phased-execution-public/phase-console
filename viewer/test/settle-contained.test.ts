@@ -98,8 +98,12 @@ test('SL-1 — a root branch that conflicts with main parks the run `unlanded`: 
   const webProof = proofs.find((p) => p.mount === 'web');
   assert.equal(webProof?.state, 'contained', 'a branch with nothing of its own is held by its trunk');
 
-  // One errand, in the words the card shows.
-  assert.match(String(state.errand?.need), /pe\/demo conflicts with main in docs\/closeout\.md/);
+  // One errand, in the composer's words (#377): a short title that names the
+  // act, the need that adds the branch and how many files, the files grouped
+  // by repository — never a path list in the title.
+  assert.equal(state.errand?.title, 'Land demo on main: the root repository conflicts with main');
+  assert.match(String(state.errand?.need), /The run branch pe\/demo differs in 1 file in the root repository\./);
+  assert.deepEqual(state.errand?.files, [{ repo: 'the root repository', paths: ['docs/closeout.md'] }]);
   assert.match(String(state.halt?.reason), /conflicts with main/);
   assert.equal(journal(root, 'run.errand').length, 1);
   const parked = journal(root, 'run.parked').at(-1)!;
@@ -116,7 +120,8 @@ test('SL-1 — a root branch that conflicts with main parks the run `unlanded`: 
   const row = inbox.items.find((item) => item.kind === 'errand' && item.slug === 'demo');
   assert.ok(row, `an errand row: ${JSON.stringify(inbox.items.map((item) => item.kind))}`);
   assert.equal(row!.category?.word, 'conflict');
-  assert.match(String(row!.title), /pe\/demo conflicts with main in docs\/closeout\.md/);
+  assert.equal(row!.title, 'Land demo on main: the root repository conflicts with main');
+  assert.deepEqual(row!.files, [{ repo: 'the root repository', paths: ['docs/closeout.md'] }], 'the files ride the row, for the card\'s Details');
   const open = row!.actions?.[0];
   assert.equal(open?.verb, 'errand-tree');
   assert.equal(open?.label, 'Open a merge errand tree');
@@ -233,7 +238,9 @@ test('SL-2 — a squash-landed run finishes clean, its branch re-seated on what 
     assert.equal(rootProof?.state, 'ahead');
     assert.equal(rootProof?.into, 'origin/main');
     assert.deepEqual(rootProof?.files, ['docs/closeout.md']);
-    assert.match(String(state.errand?.need), /origin\/main does not hold/);
+    // The composer's words (#377): the act, what differs, the files as Details.
+    assert.equal(state.errand?.title, 'Land demo on main: the root repository differs from origin/main');
+    assert.deepEqual(state.errand?.files, [{ repo: 'the root repository', paths: ['docs/closeout.md'] }]);
   }
 });
 

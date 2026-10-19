@@ -86,7 +86,7 @@ test('ES-2 — Rewrite the guide: withdrawn, and its raiser resumed once with ev
     assert.equal(h.resumed.length, 1, 'its raiser, once');
     const said = String(h.resumed[0].instruction);
     assert.match(said, /could not get "Sign gh in" .* past its check: it came back 3 times/);
-    assert.match(said, /Attempt 1 — rejected by the probe: The proof did not hold — cmd:"gh auth status" read: pending — exit 1 — read 1/);
+    assert.match(said, /Attempt 1 — rejected by the probe: The proof did not hold: the gh CLI reads signed in — not yet \(the check exited 1: read 1\)/);
     assert.match(said, /Attempt 3 — rejected by the probe/);
     assert.match(said, /Raise a NEW version of the item with phase-outcome\.sh/);
     assert.match(said, /Do not raise the same item again unchanged/);

@@ -29,7 +29,14 @@ import {
   activeFacets,
   arrangeValue,
   arrangementOf,
+  boardOf,
   byPlan,
+  deadlineBandOf,
+  foldEmpty,
+  groupSections,
+  tabCount,
+  tabSections,
+  timelineOf,
   sortItems,
   stripOf,
   timeWindowsOf,
@@ -416,14 +423,19 @@ describe('PM-v2 the five filters, Group · Sort · View, and the strip (turn-by-
     expect(facets.to.find((f) => f.value === 'phase')!.label).toBe('The phase');
   });
 
-  it('keeps Group, Sort and View in the address, the defaults as no parameter at all', () => {
-    expect(arrangementOf({})).toEqual({ group: 'asked', sort: 'oldest', view: 'cards' });
-    expect(arrangementOf(route('#/turn?group=plan&sort=deadline&view=compact').query)).toEqual({
+  it('keeps Group, Sort, View and the tab in the address, the defaults as no parameter at all', () => {
+    expect(arrangementOf({})).toEqual({ group: 'asked', sort: 'oldest', view: 'list', tab: 'open' });
+    expect(arrangementOf(route('#/turn?group=plan&sort=deadline&view=board&tab=done').query)).toEqual({
       group: 'plan',
       sort: 'deadline',
-      view: 'compact',
+      view: 'board',
+      tab: 'done',
     });
-    expect(arrangementOf({ group: 'whim', sort: 'random', view: 'grid' })).toEqual(arrangementOf({}));
+    // 7.1's Compact reads as the list (one-pool phase 14).
+    expect(arrangementOf({ view: 'compact' }).view).toBe('list');
+    expect(arrangementOf({ group: 'whim', sort: 'random', view: 'grid', tab: 'later' })).toEqual(
+      arrangementOf({}),
+    );
     expect(arrangeValue('sort', 'oldest')).toBe('');
     expect(filtersHref(route('#/turn?plan=alpha'), { sort: arrangeValue('sort', 'newest') })).toBe(
       '#/turn?plan=alpha&sort=newest',
@@ -481,5 +493,95 @@ describe('PM-v2 the five filters, Group · Sort · View, and the strip (turn-by-
   it('finds a heads-up by its address too', () => {
     const know = item({ item: 'eref:E-1', type: 'know', group: 'upcoming' });
     expect(itemOf({ ...ALL, headsUp: [know] }, 'eref:E-1')?.item).toBe('eref:E-1');
+  });
+});
+
+describe('PM-14 the tabs, the groupings, the folded line, the board and the timeline (one-pool phase 14, #377)', () => {
+  const sections = sectionsOf(ALL, {}, NOW);
+  const ids = (list: readonly { id: string }[]) => list.map((one) => one.id);
+
+  it('shows the open groups on Open, Done and Handled on their own, every one on All', () => {
+    expect(ids(tabSections(sections, 'open'))).toEqual(['approve', 'now', 'decide', 'checking', 'upcoming']);
+    expect(ids(tabSections(sections, 'done'))).toEqual(['done']);
+    expect(ids(tabSections(sections, 'handled'))).toEqual(['handled']);
+    expect(ids(tabSections(sections, 'all'))).toEqual([...SECTIONS]);
+    // The tab bar's counts: the open five (and the heads-ups), the settled, the handled rows.
+    expect(tabCount(sections, 'open', 1)).toBe(6);
+    expect(tabCount(sections, 'done')).toBe(1);
+    expect(tabCount(sections, 'handled')).toBe(2);
+  });
+
+  it('groups the open items by plan, type, deadline or status — what is over stays as it is', () => {
+    const open = tabSections(sections, 'all');
+    expect(ids(groupSections(open, 'plan', NOW))).toEqual(['plan:alpha', 'plan:beta', 'done', 'handled']);
+    expect(ids(groupSections(open, 'type', NOW)).slice(0, 3)).toEqual([
+      'type:approve',
+      'type:do',
+      'type:decide',
+    ]);
+    const byDeadline = groupSections(tabSections(sections, 'open'), 'deadline', NOW);
+    expect(ids(byDeadline)).toEqual(['deadline:overdue', 'deadline:today', 'deadline:none']);
+    expect(byDeadline[0]!.items.map((it) => it.item)).toEqual(['s-wall']);
+    expect(byDeadline[0]!.label).toBe('Past its deadline');
+    const byStatus = groupSections(tabSections(sections, 'open'), 'status', NOW);
+    expect(ids(byStatus)).toEqual(['status:todo', 'status:checking']);
+    // On the Done tab the settled items are themselves regrouped.
+    expect(ids(groupSections(tabSections(sections, 'done'), 'plan', NOW))).toEqual(['plan:beta']);
+    // byPlan is the plan grouping under its 7.1 name.
+    expect(byPlan(open)).toEqual(groupSections(open, 'plan', NOW));
+  });
+
+  it('reads an item’s deadline band at the answer’s clock', () => {
+    expect(deadlineBandOf({ timing: undefined }, NOW)).toBe('none');
+    expect(deadlineBandOf({ timing: { assignedAt: ago(1), deadline: ago(5) } }, NOW)).toBe('overdue');
+    expect(deadlineBandOf({ timing: { assignedAt: ago(1), deadline: ago(-60) } }, NOW)).toBe('today');
+    expect(deadlineBandOf({ timing: { assignedAt: ago(1), deadline: ago(-3000) } }, NOW)).toBe('later');
+  });
+
+  it('folds every empty group into ONE line, and keeps a group that holds a pressed item', () => {
+    const only = sectionsOf(answer([SIGN_IN]), {}, NOW);
+    const open = tabSections(only, 'open');
+    const folded = foldEmpty(open);
+    expect(ids(folded.sections)).toEqual(['now']);
+    expect(folded.empty).toBe('Nothing to approve, to decide, being checked or coming up.');
+    expect(foldEmpty(open, new Set(['decide'])).empty).toBe(
+      'Nothing to approve, being checked or coming up.',
+    );
+    // A group the filters emptied is NOT folded: it says what the filters hid.
+    const filtered = tabSections(sectionsOf(ALL, { plan: 'beta' }, NOW), 'open');
+    expect(ids(foldEmpty(filtered).sections)).toContain('now');
+    expect(foldEmpty(tabSections(sections, 'handled')).empty).toBeNull();
+  });
+
+  it('puts the board in columns by the person’s status, one lane per group when grouped', () => {
+    const [lane] = boardOf(tabSections(sections, 'all'), 'asked');
+    expect(lane!.columns.map((column) => column.id)).toEqual(['todo', 'checking', 'redo', 'owner', 'done']);
+    const cells = Object.fromEntries(
+      lane!.columns.map((column) => [column.id, column.items.map((it) => it.item)]),
+    );
+    expect(cells.checking).toEqual(['s-check']);
+    expect(cells.done).toEqual(['s-done']);
+    expect(cells.todo).toContain('s-signin');
+    const lanes = boardOf(groupSections(tabSections(sections, 'open'), 'plan', NOW), 'plan');
+    expect(lanes.map((one) => one.label)).toEqual(['alpha', 'beta']);
+  });
+
+  it('places every item on one clock: raised to deadline, or to now with no deadline', () => {
+    const line = timelineOf([SIGN_IN, WALL, COMING], NOW);
+    expect(line.start).toBeLessThanOrEqual(NOW);
+    expect(line.end).toBeGreaterThanOrEqual(NOW);
+    // Now in the middle when there is a past and a future; the past alone takes the whole line.
+    expect(line.nowAt).toBe(0.5);
+    expect(timelineOf([COMING], NOW).nowAt).toBe(1);
+    const at = Object.fromEntries(line.rows.map((row) => [row.item.item, row]));
+    expect(at['s-signin']!.deadline).toBe(true);
+    expect(at['s-signin']!.overdue).toBe(false);
+    expect(at['s-wall']!.overdue).toBe(true);
+    expect(at['s-later']!.deadline).toBe(false);
+    for (const row of line.rows) {
+      expect(row.from).toBeGreaterThanOrEqual(0);
+      expect(row.to).toBeLessThanOrEqual(1);
+      expect(row.to).toBeGreaterThanOrEqual(row.from);
+    }
   });
 });

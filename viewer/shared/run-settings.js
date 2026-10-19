@@ -697,6 +697,7 @@ export function planModelOf(text) {
   return withWindowNote(match[0].toLowerCase(), source.slice(match.index + match[0].length));
 }
 
+
 /**
  * A 1M window written as PROSE right after the model name — `claude-opus-5-5
  * (1M window)`, `` `opus` (Opus 5.5, 1M context) `` — opening the text that

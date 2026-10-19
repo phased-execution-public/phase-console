@@ -9,10 +9,11 @@
  */
 
 import { useMemo } from 'react';
+import { useAccounts } from '@/data/accounts';
 import type { ConsoleState, TerminalState } from '@/data/api';
 import { lanesOf } from '@/data/lanes';
-import { useLocks } from '@/data/plans';
-import { useApprovals, useRunList } from '@/data/runs';
+import { useLocks, usePlanDetails } from '@/data/plans';
+import { useApprovals, useRunList, useRunRecords } from '@/data/runs';
 import { useSessionRegistry, useTerminals } from '@/data/sessions';
 import { SectionNav } from '@/shell/section-nav';
 import { sessionsHref, sessionsLocksHref } from '@/shell/routes';
@@ -48,7 +49,10 @@ export interface SessionRows extends SessionCap {
 /**
  * Every process, folded once: the run lanes (the SLIM list, #234), this
  * console's ptys, the sessions the presence hook reported, and the pending
- * permission cards that mark a lane as waiting on a person.
+ * permission cards that mark a lane as waiting on a person — and, for the
+ * lanes, what the run record holds about each session (#369): the whole
+ * record of each LIVE run, the plan detail (a phase's title and estimate) and
+ * the registry's accounts (an account id's name).
  *
  * The runs are asked only once `/api/state` has answered and says there is
  * an autopilot — a server that predates it has no run endpoints — and the
@@ -61,8 +65,15 @@ export function useSessionRows(state: ConsoleState | undefined): SessionRows {
   const approvals = useApprovals(runsEnabled);
   const registry = useSessionRegistry();
   const terminals = useTerminals(ptys);
+  const accounts = useAccounts(runsEnabled);
 
   const lanes = useMemo(() => lanesOf(runs.data ?? []), [runs.data]);
+  // The plans with a lane on the page, in a stable order — a handful, never the run list.
+  const liveKey = useMemo(() => [...new Set(lanes.map((lane) => lane.slug))].sort().join('\n'), [lanes]);
+  const live = useMemo(() => (liveKey ? liveKey.split('\n') : []), [liveKey]);
+  const { bySlug: records } = useRunRecords(live, runsEnabled);
+  const { bySlug: details } = usePlanDetails(live, runsEnabled);
+
   const rows = useMemo(
     () =>
       sessionRows({
@@ -70,8 +81,11 @@ export function useSessionRows(state: ConsoleState | undefined): SessionRows {
         lanes,
         foreign: registry.data?.sessions,
         approvals: approvals.data,
+        records,
+        details,
+        accounts: accounts.data?.accounts,
       }),
-    [terminals.data, lanes, registry.data, approvals.data],
+    [terminals.data, lanes, registry.data, approvals.data, records, details, accounts.data],
   );
   return {
     rows,

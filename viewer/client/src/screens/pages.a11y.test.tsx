@@ -355,6 +355,20 @@ const ACCOUNTS = {
 
 /** path → body. A miss is an explicit 404, never an accidental empty object. */
 const ROUTES: [RegExp, unknown][] = [
+  // Your turn (a destination in both editions since one-pool phase 14): nothing owed on
+  // this console. Outside the Pro region, because the free edition draws the page too.
+  [
+    /^\/api\/turn(\?|$)/,
+    {
+      round: { at: '2026-08-22T12:00:00Z', n: 1, ranAt: '2026-08-22T12:00:00Z', changedAt: null },
+      headline: 'Nothing needs you now.',
+      groups: { approve: [], now: [], decide: [], checking: [], upcoming: [], done: [] },
+      handled: [],
+      counts: { approve: 0, now: 0, decide: 0, checking: 0, upcoming: 0, done: 0, total: 0, handled: 0 },
+      seen: null,
+      issues: null,
+    },
+  ],
   [/^\/api\/state/, STATE],
   [/^\/api\/plans\/[^/]+\/verify-preflight/, { warnings: [] }],
   [/^\/api\/plans\/[^/]+/, null],
@@ -560,6 +574,8 @@ afterEach(() => {
 const DESTINATIONS: { id: string; route: string[]; query?: Record<string, string>; settled: RegExp }[] = [
   { id: 'plans', route: ['plans'], settled: /demo/i },
   { id: 'runs', route: ['runs'], settled: /run|nothing/i },
+  // Your turn, a destination since one-pool phase 14: its headline is drawn by the loaded answer only.
+  { id: 'turn', route: ['turn'], settled: /Nothing needs you now/ },
   { id: 'sessions', route: ['sessions'], settled: /session|nothing|new/i },
   // The two 4.0 stubs. Settle on content ONLY THE LOADED BRANCH renders — the
   // subtitle is drawn by the pending branch too, so settling on it let axe walk
@@ -666,7 +682,7 @@ describe('axe — every destination', () => {
    * their vocabulary this way; this is the same promise for the eight.
    */
   it('covers exactly the destinations the shell actually has', () => {
-    // 7.0 (quiet-console phase 3): the seven destinations are the same in both
+    // 7.0 (quiet-console phase 3): the destinations are the same in both (eight since one-pool phase 14)
     // editions, and the Pro pages here that are not destinations (the
     // Supervisor's page, Fleet behind the switcher) are still route heads.
     const ids = DESTINATIONS.map((d) => d.id);

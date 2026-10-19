@@ -102,7 +102,36 @@ stage_server_suite() {
       *) files+=("test/$(basename "$f")") ;;
     esac
   done
-  (cd "$VIEWER" && node --test "${NODE_TEST_BOUND[@]}" --test-concurrency=1 "${files[@]}")
+  # The ledger (#339): `node --test` reads a file that stopped part way as
+  # green, so a reporter beside the spec one writes what each file enqueued and
+  # finished (`viewer/test/suite-ledger.mjs`), and the stage fails on a gap
+  # between the files planned and the files that reported in full.
+  local ledger rc=0
+  ledger="$(mktemp "${TMPDIR:-/tmp}/phase-console-suite-ledger.XXXXXX")"
+  # PHASE_CONSOLE_GATE_STAGE: the suite runs long before the e2e stage re-shoots
+  # the tour, so `dist-dir.test.ts` may skip — naming why — on pictures from a
+  # tour of another route table; stage_e2e asks it again on its own (#353).
+  (cd "$VIEWER" && PHASE_CONSOLE_GATE_STAGE=server-suite node --test "${NODE_TEST_BOUND[@]}" --test-concurrency=1 \
+    --test-reporter=spec --test-reporter-destination=stdout \
+    --test-reporter=./test/suite-ledger.mjs --test-reporter-destination="$ledger" \
+    "${files[@]}") || rc=$?
+  suite_gaps "$ledger" "${files[@]}" || { [ "$rc" -ne 0 ] || rc=1; }
+  rm -f "$ledger"
+  return "$rc"
+}
+# suite_gaps <ledger> <file>… — every planned file must have reported, every
+# test it enqueued must have finished, and it must have reported a test of its
+# own. Prints one line per gap; exit 1 on any.
+suite_gaps() {
+  local ledger=$1; shift
+  printf '%s\n' "$@" | awk -F '\t' -v ledger="$ledger" '
+    BEGIN { while ((getline line < ledger) > 0) { split(line, f, "\t"); enq[f[1]] = f[2]; fin[f[1]] = f[3]; seen[f[1]] = 1 } }
+    {
+      if (!($0 in seen)) { print "suite gap: " $0 " never reported"; gaps++; next }
+      if (enq[$0] == 0) { print "suite gap: " $0 " reported none of its own tests — it stopped before it began"; gaps++; next }
+      if (fin[$0] < enq[$0]) { print "suite gap: " $0 " stopped part way — " fin[$0] " of " enq[$0] " tests reported"; gaps++ }
+    }
+    END { if (gaps) { print gaps " file(s) did not report in full: the suite is NOT green"; exit 1 } }'
 }
 retry_once() {
   (cd "$VIEWER" && node --test "${NODE_TEST_BOUND[@]}" "$1") \
@@ -141,7 +170,9 @@ stage_e2e() {
     echo "gates.sh: the e2e stage tours a production build and $dist holds none — the build stage runs first" >&2
     return 1
   fi
-  (cd "$VIEWER" && npm run typecheck:e2e && PHASE_CONSOLE_DIST_DIR="$dist" npm run test:e2e)
+  # Then the tour's own promise, on the pictures it has just left (#353).
+  (cd "$VIEWER" && npm run typecheck:e2e && PHASE_CONSOLE_DIST_DIR="$dist" npm run test:e2e \
+    && node --test "${NODE_TEST_BOUND[@]}" test/dist-dir.test.ts)
   rc=$?
   [ "$BUILD" -eq 1 ] || rm -rf "$VIEWER/client/.dist-verify"
   return "$rc"
@@ -222,6 +253,10 @@ run_stage() { # <name>
     return 1
   fi
 }
+
+# Sourced (a test of one stage, `tests/unit/gates-suite.bats`): the stages are
+# defined, and nothing runs.
+(return 0 2>/dev/null) && return 0
 
 if [ "$INSTALL_HOOK" -eq 1 ]; then
   chmod +x "$HERE/git-hooks/pre-push"

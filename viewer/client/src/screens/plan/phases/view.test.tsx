@@ -1,5 +1,5 @@
 /**
- * The Phases view — one grid, four readings (7.0, quiet-console phase 10;
+ * The Phases view — one grid, its readings (7.0, quiet-console phase 10;
  * ported from `features/plans/phases-tab.test.tsx`, control-tower phase 23,
  * #26 #27).
  *
@@ -7,7 +7,7 @@
  * `table.test.tsx`, and every datum of the tabs this one replaced is walked in
  * `../detail.datums.test.tsx`:
  *
- *   - the four readings are ADDRESSES — links, with the current one marked;
+ *   - the six readings are ADDRESSES — links, with the current one marked;
  *   - `table`, `qa` and `handoffs` are three readings of the ONE grid, and
  *     `map` draws the route and no grid;
  *   - Inspect opens a row's phase in the panel, and its prose is asked for
@@ -129,7 +129,7 @@ function mount(view: PhasesViewId = 'table', extra: { report?: string; everythin
 const costly = () => sent.filter((path) => /\?include=|\/prompt\/|\/next-prompt\/|\/qa-prompt\//.test(path));
 
 describe('the Phases view', () => {
-  it('opens on the grid, and offers its four readings as addresses', async () => {
+  it('opens on the grid, and offers its six readings as addresses', async () => {
     mount();
     expect(await screen.findByRole('table', { name: 'Phases' })).toBeInTheDocument();
     const nav = screen.getByRole('navigation', { name: 'Readings of the phases' });
@@ -139,6 +139,8 @@ describe('the Phases view', () => {
       ['Map', '#/plan/alpha/phases?view=map'],
       ['QA', '#/plan/alpha/phases?view=qa'],
       ['Handoffs', '#/plan/alpha/phases?view=handoffs'],
+      ['Schedule', '#/plan/alpha/phases?view=schedule'],
+      ['Burn-up', '#/plan/alpha/phases?view=burnup'],
     ]);
     expect(within(nav).getByRole('link', { name: 'Table' })).toHaveAttribute('aria-current', 'page');
     // The plan's own folds are under the grid: what is left and the landing.

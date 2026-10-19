@@ -21,7 +21,7 @@
  *    failures back off exponentially and 429s back off harder.
  */
 
-import { realExec, type Exec } from './credentials.ts';
+import { keychainRefused, realExec, type Exec } from './credentials.ts';
 import {
   FORECAST_FLAT_PCT_PER_HOUR, FORECAST_MIN_SPAN_MS, FORECAST_WINDOW_MS, WALL_PCT,
 } from '../../shared/ops-vocab.js';
@@ -234,9 +234,36 @@ const EXHAUSTED_PCT = WALL_PCT;
 export const USAGE_ACTIVE_MS = ACTIVE_MS;
 export const USAGE_IDLE_MS = IDLE_MS;
 
+/**
+ * Whether a poller asks the real usage endpoint nothing (one-pool phase 30, #241).
+ *
+ * Every real `Service` a test builds makes a poller with no `fetchFn` and no
+ * `base`, so it read the machine login's own meters from the live endpoint: a
+ * weekly meter at 100 % announced `usage-climbing` inside a test that asserts
+ * nothing was announced (scope-fence SF-5). The markers the keychain belt reads
+ * — a test process, or the sandbox's `PHASE_CONSOLE_KEYCHAIN=0`, which every
+ * console a test spawns inherits — seal it. A test that wants an answer injects
+ * a `fetchFn` or names an endpoint (`base`, `PHASE_CONSOLE_USAGE_BASE`), and
+ * either unseals it. The connectivity probe keeps its own base and fetch: the
+ * runner's outage reading is not a meter. Production carries none of these.
+ */
+export function usageSealed(
+  opts: Pick<UsagePollerOptions, 'fetchFn' | 'base'>,
+  env: NodeJS.ProcessEnv = process.env,
+  argv: string[] = process.argv,
+): boolean {
+  return !opts.fetchFn && !opts.base && !env.PHASE_CONSOLE_USAGE_BASE && keychainRefused(env, argv);
+}
+
+/** What a sealed poller records instead of a read: no request was made. */
+export const USAGE_SEALED_DETAIL =
+  'a test process reads no usage endpoint — inject fetchFn, or name one with PHASE_CONSOLE_USAGE_BASE';
+
 export class UsagePoller {
   private readonly opts: Required<Pick<UsagePollerOptions, 'resolveToken'>> & UsagePollerOptions;
   private readonly base: string;
+  /** No request leaves this poller — `usageSealed`, decided once at construction. */
+  private readonly sealed: boolean;
   private readonly cache = new Map<string, AccountUsage>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly inFlight = new Map<string, Promise<void>>();
@@ -255,6 +282,7 @@ export class UsagePoller {
     this.opts = opts;
     this.base = (opts.base ?? process.env.PHASE_CONSOLE_USAGE_BASE ?? 'https://api.anthropic.com')
       .replace(/\/+$/, '');
+    this.sealed = usageSealed(opts);
     this.ownsConnectivity = !opts.connectivity;
     this.connectivity = opts.connectivity
       ?? new ConnectivityProbe({ base: this.base, ...(opts.fetchFn ? { fetchFn: opts.fetchFn } : {}) });
@@ -555,6 +583,7 @@ export class UsagePoller {
     | { kind: 'failed'; detail: string }
     | { kind: 'unreachable'; detail: string }
   > {
+    if (this.sealed) return { kind: 'failed', detail: USAGE_SEALED_DETAIL };
     const doFetch = this.opts.fetchFn ?? fetch;
     const headers = {
       authorization: `Bearer ${token}`,

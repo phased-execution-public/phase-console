@@ -2,16 +2,19 @@
  * The plans as cards — the browsing view (7.0, quiet-console phase 9).
  *
  * ```
- * ▌● Running                                     2h ago
+ * ▌● Running (Active)                            2h ago
  * ▌storefront redesign
- * ▌○ 41 done ─ ● P42 in progress ─ ◌ P43 next up ─ ○ 25 left
+ * ▌████████████████▌█▐▒▒▒▒░░░░░░░░░░░
+ * ▌41 done · 1 in progress · 1 next up · 4 waiting · 25 left · 56 %
  * ▌5 sessions  ~2–3 h of work left (estimate)
  * ▌P43 next up
  * ```
  *
- * One plan at a time, with room the list does not have: the line at its own
- * width, the estimate in full, the phases next up as their own ways in, and
- * what is wrong said in a sentence. The same row, the same pieces
+ * One plan at a time, with room the list does not have: the plan's own
+ * status badge beside the run's word (#361), the phases in proportion at
+ * their own width with every count in words (#360), the estimate in full,
+ * the phases next up as their own ways in, and what is wrong said in a
+ * sentence. The same row, the same pieces
  * (`row.tsx`) — only the room differs. A card is a tone, never a shadow; its
  * leading edge wears the mark's hue, the edge a run row wears on Runs.
  */

@@ -263,6 +263,27 @@ export class Notifications {
   }
 
   /**
+   * Put records back: mark them unread again (#334). The bell's *Put back*
+   * press — the undo of reading, never a delete. Unlike `markRead()`, `ids`
+   * is required and an empty list changes nothing: nobody asks to un-read the
+   * whole history at once, and a list that arrived empty must not be read as
+   * "everything". Returns how many changed.
+   */
+  markUnread(ids: readonly string[]): number {
+    if (!ids.length) return 0;
+    const wanted = new Set(ids);
+    let changed = 0;
+    for (const item of this.items) {
+      if (!item.read) continue;
+      if (!wanted.has(item.id)) continue;
+      item.read = false;
+      changed++;
+    }
+    if (changed) this.touch();
+    return changed;
+  }
+
+  /**
    * Mark read everything a scope actually matches. Returns how many changed.
    *
    * This is what makes "opening the page counts as reading it" safe. Every

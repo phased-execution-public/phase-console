@@ -221,7 +221,10 @@ const MANIFEST_DOORS = new Set(['owner', 'device', 'local', 'session', 'supervis
 /**
  * The verbs no manifest carries out (control-tower phase 134, #211): an
  * `override` writes a verdict — the owner's *Accept anyway* — and no agent
- * marks an item passed, whatever a plan's `permission.destructive` row says;
+ * marks an item passed, whatever a plan's `permission.destructive` row says
+ * (the same class fences the owner's other words over the machine's — a
+ * §Verification line waived, the Queue's order and its revert — none of which
+ * writes a verdict);
  * and the owner keys are the owner door itself (phase 148), which no plan
  * hands to anybody; and a `grant` is a person's decision by definition
  * (phase 149) — a plan's own answer is its manifest row, which the hook
@@ -369,6 +372,15 @@ export const AUTHORITY_ROUTES = Object.freeze([
     authority: 'trust',
     declare: HUMAN,
     summary: "hand a person's act to the session that asked for it",
+  }),
+  press('waive-verify-line', 'POST /api/run/:slug/verify-waive', {
+    authority: 'override',
+    declare: Object.freeze({
+      status: /** @type {const} */ ('needs-human'),
+      needs: 'verification.person-check',
+    }),
+    summary:
+      "waive one §Verification line for one phase, mid-run — the owner's word that its red is not the phase's",
   }),
   press('remember-ruling', 'POST /api/run/:slug/rulings/:id/remember', {
     authority: 'policy-widen',
@@ -579,17 +591,31 @@ export function authorityRouteOf(method, path) {
 export function cliFormOf(args) {
   const [group, ...rest] = args;
   if (group === 'run') {
+    // The global flags come out first, wherever they stand — as
+    // `extractGlobalFlags` takes them — so a flag between `queue` and its
+    // sub-verb (`run queue --json revert`) hides no press. A help asked
+    // before the verb presses nothing; one after it is read as before — the
+    // line still names the press.
+    /** @type {string[]} */
+    const words = [];
     for (let i = 0; i < rest.length; i += 1) {
       const word = rest[i];
-      if (word === '--help' || word === '-h') return null;
+      if (word === '--help' || word === '-h') {
+        if (!words.length) return null;
+        continue;
+      }
       if (word === '--json') continue;
       if (word === '--console') {
         i += 1;
         continue;
       }
-      return `run ${word}`;
+      words.push(word);
     }
-    return null;
+    const [verb, sub] = words;
+    if (!verb) return null;
+    // The Queue's three (one-pool phase 39): `run queue` reads, `run queue order` presses.
+    if (verb === 'queue' && ['check', 'order', 'revert'].includes(sub ?? '')) return `run queue ${sub}`;
+    return `run ${verb}`;
   }
   if (group === 'supervisor') {
     if (rest.includes('--replay') || rest.includes('--help') || rest.includes('-h') || !rest[0]) return null;

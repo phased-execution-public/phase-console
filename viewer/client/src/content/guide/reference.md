@@ -176,7 +176,11 @@ A **hatched** bar is still open. Ticks along a lane mark `board`, `verify`, `run
 question or a card was raised or answered) and `policy` (the console answered something by itself);
 `start` ticks sit on the axis itself, one per start of the run, naming its door. A `note` tick is a
 person's note on the run — on its phase's lane when it names a phase that ran, else on the axis — and
-reads `pinned` while it is a standing decision. The **critical path** highlighted here is the longest dependency chain
+reads `pinned` while it is a standing decision. Ticks that would cover each other are drawn as one counted
+mark: `✎×4` when they are one kind, `●+3` when they are mixed, and its hover lists each. **Zoom** narrows
+the axis with **−** and **+**, or with ⌃ or ⌘ and the wheel, and the quick ranges *Last hour*, *6 h*, *24 h*
+and *All* jump to the last stretch of the run or back to the whole of it. The zoom is in the address
+(`?zoom=`), so a reload keeps it. The **critical path** highlighted here is the longest dependency chain
 weighted by each phase's MEASURED session and verification time, never by a bar still open — not
 the plan page's estimate, which answers what is left rather than what happened.
 
@@ -321,6 +325,34 @@ big to show whole never draws its stations smaller than they can be read. Instea
 - The stations are one tab stop: focus the map, then the **arrow keys** walk from station to station, and
   Enter opens the phase. On a touch screen the first tap shows the station's facts with **Open phase**.
 
+A station's name is drawn only while it is at least 9 px tall on screen. Smaller, the map shows the phase
+numbers alone, and you hover, tap or zoom to read a name. The station a pointer, a finger or the keyboard
+is on keeps its name, and so do its neighbours and the one a search or the page selected. The track line runs behind the labels, never through them.
+
+The tools above the map change what it shows, and each is a part of the address
+(`#/plan/<slug>/phases?view=map`), so a reload keeps the picture and a link opens the same one:
+
+- **Filter** chips by state (`status=`), repository (`repo=`) and size (`size=`). A station that fails a
+  filter is dimmed, never removed, so the map keeps its shape.
+- **Trace** (`sel=`) lights the chains through one station and says *waits on 34 · unblocks 6*.
+- **Colour by** (`color=`) — **State** (the default), **Repository**, **Size**, **Cost spent** or **Time
+  taken**.
+- **Layers** (`layer=`) — **Names** or **Short names**, **Batches**, **Critical path**, **Wave headings** and
+  **Done waves**; turned off, the finished waves fold into one column (*Waves 1–8 done*). `layer=none` draws
+  numbers only.
+- **Layout** (`layout=`) — **Left to right** (the default), **Top to bottom**, or **One lane per
+  repository**.
+- **Export** the picture as **SVG** or **PNG**, and **Clear the tools** puts every tool back.
+
+On a desk, a station's hover card gives its state, size, estimate, cost, attempts, claim and gate, with
+**Open phase**, **Inspect** and **Trace**.
+
+Two more readings sit beside **Table** and **Map**. **Schedule** (`?view=schedule`) draws when each phase
+still to run is expected to start and end, *if nothing waits for a seat*: each starts once everything it
+waits on is expected to end, and takes its estimate. **Burn-up** (`?view=burnup`) draws the phases done, and
+their weight done, over time against the plan's whole, with the forecast's band from now to its earliest
+and latest finish.
+
 A station's paint is its status (the eight states below). A **Stuck** phase is drawn in the waiting
 paint with an alert glyph; only a summons — something a person must do — wears the amber ring.
 
@@ -384,17 +416,22 @@ available, so closing is a cheap, reversible call.
 | Word | Reads as | What it means | What to do |
 |---|---|---|---|
 | `running` | Running | The autopilot is driving: sessions spawn, verify and hand off by themselves. | Nothing — watch its lanes. Pause, Freeze and Stop all apply. |
-| `pausing` | Waiting | A pause is armed: whatever is running finishes, and nothing new boards. | Wait for the boundary, or Cancel pause to keep going. |
+| `pausing` | Running | A pause is armed: whatever is running finishes, and nothing new boards. | Wait for the boundary, or Cancel pause to keep going. |
 | `paused` | Waiting | Stopped between phases at your request; nothing is running. | Press Continue when ready — it picks up exactly where it left off. |
 | `waiting` | Waiting | Asleep on a clock: an account's usage window reopening, an external wait a session declared, or — while a verification or permission card stands — a person, with the run's clock at the soonest card's expiry. A card that runs out its clock unanswered parks its phase as `awaiting-person`. | Nothing, unless it is waiting on you: then answer the card. |
 | `frozen` | Waiting | Every session is stopped where it stands (mid-token), warm and losing nothing. A freeze on ONE session of several is recorded on that session's tab instead, and the run stays `running`. | Continue the frozen session to resume instantly, or Stop it. |
-| `parked` | Needs you | Every remaining phase needs a person first — a gate, an approval, a decision. | Read **Ways forward** on its page: each blocker is named with its remedy. |
+| `parked` | Waiting | The run stopped driving at a point it can name, and nothing new boards; its reason says why — often a gate, an approval or a decision a phase waits on. | Read its reason and **Ways forward** on its page, answer any item it has in Your turn, then press Continue. |
 | `queued` | Queued | In line behind another plan holding the same repos; starts itself when the scope frees. | Nothing — its line on Runs names the holder. |
-| `halting` | Needs you | A halt was recorded; live sessions are finishing before the run fully stops. | Read the halt card. The run reads halted once the last session settles. |
-| `halted` | Needs you | Stopped on something that must not be automated past — usually a red verification. | 'Finish in its own session' or 'Fix with a new agent' on the halt card, or fix the cause yourself and Retry the phase. |
-| `stopping` | Waiting | A stop was requested; sessions are being wound down. | Wait a moment. |
+| `halting` | Running | A halt was recorded; live sessions are finishing before the run fully stops. | Read the halt card. The run reads halted once the last session settles. |
+| `halted` | Waiting | Stopped on something that must not be automated past — usually a red verification. | 'Finish in its own session' or 'Fix with a new agent' on the halt card, or fix the cause yourself and Retry the phase. |
+| `stopping` | Running | A stop was requested; sessions are being wound down. | Wait a moment. |
 | `finished` | Done | Nothing left to run on this plan. | Nothing. |
-| `interrupted` | Needs you | Nothing is driving it and nothing recorded why — a console or session died mid-flight. | **Pick up with a new agent**, or press Continue — work already on disk is kept. |
+| `interrupted` | Waiting | Nothing is driving it and nothing recorded why — a console or session died mid-flight. | **Pick up with a new agent**, or press Continue — work already on disk is kept. |
+
+**Reads as** is the word's own paint, and no run word is amber by itself. A stopped run — halted,
+parked, interrupted, or paused by the console — reads **Needs you** while an item for it stands open
+in Your turn or the bell (red when that item is urgent), and goes quiet once nobody has touched it
+for a week. Hover, focus or tap any status in the console for what it means and what comes next.
 
 ## Phase record
 
@@ -404,17 +441,21 @@ disk.
 | Word | Reads as | What it means | What to do |
 |---|---|---|---|
 | `pending` | Queued | This run has not started the phase yet. | Nothing — the loop reaches it when its dependencies are done. |
-| `gated` | Needs you | Held at the plan's gate — a human or automatic condition the run cannot clear itself (ai gates never park: their session is booted to clear them). | Do the gate's steps and press **Approve the gate** on the phase page's Gate card (it can continue the run in the same action), or Retry to re-check. |
+| `gated` | Waiting | Held at the plan's gate — a human or automatic condition the run cannot clear itself (ai gates never park: their session is booted to clear them). | Do the gate's steps and press **Approve the gate** on the phase page's Gate card (it can continue the run in the same action), or Retry to re-check. |
 | `running` | Running | A session is working this phase right now. | Watch its pane; **Ask** reaches the session mid-flight. |
 | `verifying` | Verifying | The session finished; the console runs the plan's verification commands itself. | Nothing — green marks it done, red halts with the evidence. |
 | `awaiting-verification` | Needs you | The machine checks passed; steps only a person can confirm remain. | Answer the verification card — it lists exactly what needs your eyes. |
 | `done` | Done | Finished and independently verified in this run. | Nothing. |
 | `failed` | Failed | The attempt failed — a red verification, or a session that produced nothing. | **Why is this not done?** shows the evidence; **Fix with a new agent** repairs it, or **Retry from scratch** restarts it. |
-| `interrupted` | Needs you | The session or console died mid-phase — or the operator stopped this one session from its pane; the working tree is wherever it stopped. | **Pick up with a new agent** or **Retry from scratch** — the session id is kept, and uncommitted work is preserved, never redone blindly. |
+| `interrupted` | Waiting | The session or console died mid-phase — or the operator stopped this one session from its pane; the working tree is wherever it stopped. | **Pick up with a new agent** or **Retry from scratch** — the session id is kept, and uncommitted work is preserved, never redone blindly. |
 | `skipped` | Skipped | Taken off this run's list by the operator. | Retry it later if it should still happen. |
-| `parked` | Needs you | Needs a person before the loop will touch it again — the note says exactly why. | Read the note (gate, foreign lock, decision), act on it, then Retry. |
+| `parked` | Waiting | Set aside by the run, and the note says exactly why — a gate, a foreign lock, a decision, a spent ladder; a park behind another lane's scope or an MCP server asks nobody anything. | Read the note (gate, foreign lock, decision), act on it, then Retry. |
 | `waiting` | Waiting | Parked on an external clock the session declared — a CI build, a PR auto-merge, a deploy window. | Nothing — the runner resumes the phase's own session when the window elapses. |
 | `queued` | Queued | Waiting for repos another phase or plan is holding; starts itself when they free. | Nothing — its line names what it waits on. |
+
+As with a run, **Reads as** is the word's own paint: only `awaiting-verification` is amber by itself.
+A gated, parked or interrupted phase reads **Needs you** while an item for it stands open in Your
+turn or the bell.
 
 A `failed` record under a phase the **board** calls done means: this run's attempt stopped, and the
 work was finished and verified outside it. The row says "nothing to fix — done elsewhere".
@@ -440,6 +481,8 @@ phase, and the phases already queued or in flight keep their places. A run-level
 | `orphaned-session` | phase | A live session from an earlier console was found still working. |
 | `worktree-merge` | phase | A lane's commits would not merge into the run branch; every commit survives on its lane branch. |
 | `landing-conflict` | phase | The same collision, parked by the plan's `Conflicts: park` (or after a rebase session conflicted again): the phase is done, the run drove on, and the errand names both lanes and the files. |
+| `run-tree-locked` | phase | A git `index.lock` older than two minutes, which no git command is writing, blocks every index write in the phase's tree. The halt names the path and its age; check that no git of yours runs there, remove it, then Retry. |
+| `run-tree-config` | phase | A session planted git configuration the console will not run in its tree — a hook path, an fsmonitor, a driver, a credential helper. The halt names the key; remove it, or confirm it is yours, then Retry. |
 | `budget` | run | The run's budget is spent. |
 | `plan-unreadable` · `plan-lint` | run | The plan could not be read, or stopped linting. |
 | `failure-streak` | run | Too many phases failed in a row. Only a person's press relaunches it. |
@@ -455,13 +498,13 @@ phase, and the phases already queued or in flight keep their places. A run-level
 ## Board state
 
 The "Status" column — what is true of a phase on disk, as `phase-graph.sh` computes it. The badge
-shows the UI state's word (`ready` reads **Next up**).
+wears the word's own label (`ready` reads **Next up**) in its UI state's paint.
 
 | State | Reads as | What it means | What to do |
 |---|---|---|---|
 | `done` | Done | The handoff is complete; the work is finished and verified. | Nothing. |
 | `ready` | Next up | Every dependency is met; this phase can start now. | Start it (or the autopilot will), or copy its boot prompt from the phase page. |
-| `in-progress` | Running | A session is on this phase right now. | Watch its lane. The board catches up when the handoff lands. |
+| `in-progress` | In progress | A session is on this phase right now. | Watch its lane. The board catches up when the handoff lands. |
 | `waiting` | Waiting | An earlier phase it depends on is not done yet. | Nothing here; finish what it waits on. |
 | `stuck` / `blocked` | Stuck · Blocked | Its handoff is marked blocked — the Outstanding section says exactly why. Drawn in the waiting paint with an alert glyph; it turns amber only when an errand asks you for something. | Read the excerpt on the phase page, or use Ways forward on the run page. |
 | `gated` | Gated | The plan gates this phase — on a person (`manual`), a session's own check (`ai`), or an automatic condition. | The phase page's Gate card shows the steps and **Approve the gate**; ai gates clear themselves when their session boots. |

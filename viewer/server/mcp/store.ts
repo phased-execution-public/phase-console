@@ -66,8 +66,15 @@ export function normaliseTransport(value: unknown): McpTransport | undefined {
  * (`env.GITHUB_TOKEN`). The registry stores the location and never the value.
  */
 export type McpSecretRef = {
-  kind: 'header' | 'env';
-  /** The header name or environment variable this server needs a value for. */
+  /**
+   * `header` and `env` put the value into a header or the server's
+   * environment; `var` (one-pool phase 19, #363) splices it wherever the
+   * server's own configuration writes `${NAME}` — the catalog's
+   * `server-filesystem ${MCP_FS_ROOT}` — so a registration with an unfilled
+   * variable can be finished from the page and the verb.
+   */
+  kind: 'header' | 'env' | 'var';
+  /** The header name, environment variable or `${VAR}` this server needs a value for. */
   name: string;
   /**
    * A template for the value, with `{}` where the secret goes — `Bearer {}` is

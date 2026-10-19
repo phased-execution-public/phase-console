@@ -1,36 +1,43 @@
 /**
  * The sessions as a list — one line per process on the grid (7.0,
- * quiet-console phase 15).
+ * quiet-console phase 15; the rich row since one-pool phase 17, #369).
  *
  * ```
- * Status                              Session              Working on                      Last heard
- * ● Running                           quiet-console P15    Sessions and the terminal       12 minutes ago
- * ● Live │ ⏳ needs your permission    pe-hub P9            ~/work/shop           2 minutes ago
- * ○ Exited                            zsh                  /repo                           1 minute ago
+ * Status        Session            Working on                 Account  Model and effort     Progress  Spend  Context   Elapsed        Last heard
+ * (● Running)   quiet-console P15  (Lane) Sessions, terminal  Work     claude-opus-5-5 high ▮▮▮▯ 4/7  $1.75  ▮▯▯ 30 %  ▮▮▯ 12m of 40m  12 minutes ago
+ * (○ Exited)    zsh                (Shell) /repo              —        —                    —         —      —         —              1 minute ago
  * ```
  *
- * Four facts at the glance — the mark, the name, what it is working on, when
- * it was last heard — and Everything draws the rest as columns: its kind, its
- * note, when it began, how long it has run, both ids, its task list. A row
- * goes where the session lives (a pty's terminal, a lane's run, a foreign
- * session's phase or its own page), expands in place to its verbs, and
- * inspects in the panel. On a phone the same columns are records.
+ * The glance is what a session is doing and costing: its status as a badge,
+ * its name, its kind (a quiet outlined word) beside what it works on, the
+ * account it runs on, its model and effort, its task progress and its context
+ * as meters, its spend, its worked clock against the estimate and when it was
+ * last heard. Everything draws the heavy facts as columns: its kind word, its
+ * note, when it began, attempts, turns, its run's worktree, both ids and its
+ * task list. Every fact is the row's (`model.ts` folds them once), so the
+ * inspector and the phone read the same. A row goes where the session lives
+ * (a pty's terminal, a lane's run, a foreign session's phase or its own page),
+ * expands in place to its verbs, and inspects in the panel. On a phone the
+ * same columns are records, the meters kept.
  */
 
 import { useMemo, type ReactNode } from 'react';
 import type { RunState, TerminalSession } from '@/data/api';
 import { useRun } from '@/data/runs';
+import { duration, weight } from '@/lib/format';
 import { usePhone } from '@/lib/media';
-import { Button, Duration, Mono, RelativeTime, SectionHeading, type Everything } from '@/ui';
+import { Button, Duration, Money, Mono, RelativeTime, SectionHeading, type Everything } from '@/ui';
 import { Grid } from '@/ui/grid/grid';
 import type { Column } from '@/ui/grid/column';
 import { SessionStatus } from '@/ui/status';
+import { LoadMeter } from '@/ui/track/meter';
 import { useInspected } from '@/shell/panel/inspector-host';
 import { sessionsHref, turnHref } from '@/shell/routes';
 import { SessionControls } from './controls';
 import { inspectRow, TaskList, taskWords } from './inspector';
 import {
   KIND_LABEL,
+  SESSION_BADGES,
   attentionWords,
   groupSessionRows,
   type SessionGroupBy,
@@ -44,6 +51,84 @@ const none = <span className="text-ink-faint">—</span>;
 const isPath = (row: SessionRow): boolean => row.kind !== 'lane';
 
 /**
+ * What a session is, as a quiet outlined word — never a status: no hue, no
+ * `data-status`, so a row still carries exactly ONE status mark (#369).
+ */
+export function SessionKindBadge({ row }: { row: Pick<SessionRow, 'badge'> }) {
+  const badge = SESSION_BADGES[row.badge];
+  return (
+    <span
+      data-session-badge={row.badge}
+      title={badge.blurb}
+      className="inline-flex shrink-0 items-center rounded-full border border-rule-strong px-2 text-meta text-ink-muted"
+    >
+      {badge.label}
+    </span>
+  );
+}
+
+/** "4 of 7" as a meter — the doing task in the meter's title, through its label. */
+function ProgressCell({ progress }: { progress: SessionRow['progress'] }) {
+  if (!progress) return none;
+  return (
+    <LoadMeter
+      value={progress.done}
+      max={progress.total}
+      label="Tasks done"
+      valueText={`${progress.done} of ${progress.total} tasks done`}
+      reading={`${progress.done} of ${progress.total}`}
+    />
+  );
+}
+
+/** The context against the model's window, as a meter; the figure alone where no window is known. */
+function ContextCell({ context }: { context: SessionRow['context'] }) {
+  if (!context) return none;
+  const share = context.window ? Math.round((context.tokens / context.window) * 100) : null;
+  const stage =
+    context.stage === 'checkpoint'
+      ? ', checkpointing'
+      : context.stage === 'wrap-up'
+        ? ', told to wrap up'
+        : '';
+  return (
+    <LoadMeter
+      value={context.tokens}
+      max={context.window}
+      label="Context used"
+      valueText={`${weight(context.tokens)}${context.window ? ` of ${weight(context.window)}` : ''}${stage}`}
+      reading={share != null ? `${share} %` : `${weight(context.tokens)} context`}
+    />
+  );
+}
+
+/**
+ * The worked clock against the estimate, as a meter, when the record says
+ * both; the worked clock alone without an estimate; and on a live row the
+ * record has not reached, how long it has run, ticking.
+ */
+function ElapsedCell({ row }: { row: SessionRow }) {
+  if (row.workedMs != null) {
+    if (row.estimateMs != null && row.estimateMs > 0) {
+      return (
+        <LoadMeter
+          value={row.workedMs}
+          max={row.estimateMs}
+          label="Worked against the estimate"
+          valueText={`${duration(row.workedMs)} of about ${duration(row.estimateMs)}`}
+          reading={`${duration(row.workedMs)} of ${duration(row.estimateMs)}`}
+        />
+      );
+    }
+    return <Duration ms={row.workedMs} />;
+  }
+  if (row.live && row.createdAt != null && Number.isFinite(row.createdAt)) {
+    return <Duration since={row.createdAt} live />;
+  }
+  return none;
+}
+
+/**
  * Every column a session has. The first four are the glance; the kind joins
  * them when the list is one list, because no heading says it then.
  */
@@ -53,12 +138,13 @@ export function sessionColumns(by: SessionGroupBy): Column<SessionRow>[] {
       id: 'status',
       head: 'Status',
       priority: 1,
-      // "Live │ needs your permission" on one line: the summons rides beside the word.
-      min: 232,
+      // "Live │ needs your permission" on one line, in its outlined pill: the summons rides beside the word.
+      min: 264,
       card: 'meta',
       value: (row) => row.view.label,
       cell: (row) => (
         <SessionStatus
+          chrome="badge"
           vocab={row.vocab}
           word={row.view.word}
           summons={row.attention ? attentionWords(row.attention) : undefined}
@@ -83,16 +169,87 @@ export function sessionColumns(by: SessionGroupBy): Column<SessionRow>[] {
       priority: 2,
       min: 220,
       value: (row) => row.detail ?? null,
+      cell: (row) => (
+        <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+          <SessionKindBadge row={row} />
+          {row.detail ? (
+            isPath(row) ? (
+              <Mono value={row.detail} className="min-w-0 wrap-anywhere" />
+            ) : (
+              <span className="min-w-0 break-words">{row.detail}</span>
+            )
+          ) : null}
+        </span>
+      ),
+    },
+    {
+      id: 'account',
+      head: 'Account',
+      priority: 3,
+      min: 132,
+      value: (row) => row.account?.name ?? null,
       cell: (row) =>
-        row.detail ? (
-          isPath(row) ? (
-            <Mono value={row.detail} className="wrap-anywhere" />
+        row.account ? (
+          row.account.name === row.account.id ? (
+            <Mono value={row.account.id} className="wrap-anywhere" />
           ) : (
-            <span className="break-words">{row.detail}</span>
+            <span className="break-words" title={row.account.id}>
+              {row.account.name}
+            </span>
           )
         ) : (
           none
         ),
+    },
+    {
+      id: 'model',
+      head: 'Model and effort',
+      priority: 3,
+      min: 168,
+      value: (row) => (row.model ? `${row.model}${row.effort ? ` ${row.effort}` : ''}` : null),
+      cell: (row) =>
+        row.model || row.effort ? (
+          <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+            {row.model ? <Mono value={row.model} className="min-w-0 wrap-anywhere" /> : null}
+            {row.effort ? <span className="text-meta text-ink-muted">{row.effort}</span> : null}
+          </span>
+        ) : (
+          none
+        ),
+    },
+    {
+      id: 'progress',
+      head: 'Progress',
+      priority: 2,
+      min: 144,
+      value: (row) => (row.progress ? row.progress.done / row.progress.total : null),
+      cell: (row) => <ProgressCell progress={row.progress} />,
+    },
+    {
+      id: 'spend',
+      head: 'Spend',
+      priority: 3,
+      min: 88,
+      align: 'end',
+      value: (row) => row.spendUsd ?? null,
+      cell: (row) => (row.spendUsd != null ? <Money usd={row.spendUsd} /> : none),
+    },
+    {
+      id: 'context',
+      head: 'Context',
+      priority: 3,
+      min: 144,
+      value: (row) => row.context?.tokens ?? null,
+      cell: (row) => <ContextCell context={row.context} />,
+    },
+    {
+      id: 'elapsed',
+      head: 'Elapsed',
+      priority: 3,
+      // "12m 03s of 1h 04m" beside its bar.
+      min: 176,
+      value: (row) => row.workedMs ?? null,
+      cell: (row) => <ElapsedCell row={row} />,
     },
     {
       id: 'heard',
@@ -145,17 +302,30 @@ export function sessionColumns(by: SessionGroupBy): Column<SessionRow>[] {
         ),
     },
     {
-      id: 'for',
-      head: 'Running for',
-      min: 120,
+      id: 'attempts',
+      head: 'Attempts',
+      min: 96,
+      align: 'end',
       everything: true,
-      value: (row) => (row.live ? (row.createdAt ?? null) : null),
-      cell: (row) =>
-        row.live && row.createdAt != null && Number.isFinite(row.createdAt) ? (
-          <Duration since={row.createdAt} live />
-        ) : (
-          none
-        ),
+      value: (row) => row.attempts ?? null,
+      cell: (row) => (row.attempts != null ? String(row.attempts) : none),
+    },
+    {
+      id: 'turns',
+      head: 'Turns',
+      min: 88,
+      align: 'end',
+      everything: true,
+      value: (row) => row.turns ?? null,
+      cell: (row) => (row.turns != null ? String(row.turns) : none),
+    },
+    {
+      id: 'worktree',
+      head: 'Worktree',
+      min: 200,
+      everything: true,
+      value: (row) => row.worktree ?? null,
+      cell: (row) => (row.worktree ? <Mono value={row.worktree} className="wrap-anywhere" /> : none),
     },
     {
       id: 'terminal',
@@ -170,8 +340,8 @@ export function sessionColumns(by: SessionGroupBy): Column<SessionRow>[] {
       head: 'Conversation',
       min: 140,
       everything: true,
-      value: (row) => row.sessionId ?? null,
-      cell: (row) => (row.sessionId ? <Mono value={row.sessionId} chars={12} copyable /> : none),
+      value: (row) => row.conversation ?? null,
+      cell: (row) => (row.conversation ? <Mono value={row.conversation} chars={12} copyable /> : none),
     },
     {
       id: 'tasks',

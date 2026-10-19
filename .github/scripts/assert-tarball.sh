@@ -31,6 +31,8 @@ for p in \
   "viewer/server/watch-scheduler.ts" \
   "viewer/server/watch-unit.ts" \
   "viewer/server/declared-probe.ts" \
+  "viewer/server/load-reading.ts" \
+  "viewer/server/runner/reap.ts" \
   "viewer/server/turn/guard.ts" \
   "viewer/server/permissions/walls.ts" \
   "viewer/server/turn/fold.ts" \
@@ -127,6 +129,7 @@ for p in \
   "viewer/shared/bays.js" \
   "viewer/shared/budget-model.js" \
   "viewer/shared/status-notes.js" \
+  "viewer/shared/status-meanings.js" \
   "viewer/shared/plan-vocab.js" \
   "viewer/shared/ops-vocab.js" \
   "viewer/shared/task-model.js" \
@@ -149,15 +152,18 @@ for p in \
   "viewer/server/runner/session-record.ts" \
   "viewer/server/runner/wait-budget.ts" \
   "viewer/server/runner/queue-episodes.ts" \
+  "viewer/server/runner/boarding-order.ts" \
   "viewer/server/runner/run-paths.ts" \
   "viewer/server/runner/supersede.ts" \
   "viewer/server/runner/tree-state.ts" \
   "viewer/server/runner/scope-drift.ts" \
   "viewer/server/actor.ts" \
   "viewer/server/api/actor.ts" \
+  "viewer/server/api/build-check.ts" \
   "viewer/server/start-ceiling.ts" \
   "viewer/server/runner/rulings.ts" \
   "viewer/server/runner/proofs.ts" \
+  "viewer/server/runner/artefacts.ts" \
   "viewer/server/runner/verify-ledger.ts" \
   "viewer/server/runner/ultrareview.ts" \
   "viewer/shared/policy-model.js" \
@@ -167,6 +173,7 @@ for p in \
   "viewer/server/trace.ts" \
   "viewer/server/shell.ts" \
   "viewer/server/git-trace.ts" \
+  "viewer/server/git-guard.ts" \
   "viewer/server/counters.ts" \
   "viewer/shared/message-model.js" \
   "viewer/server/doctor.ts" \
@@ -193,6 +200,7 @@ for p in \
   "bin/run-verb.mjs" \
   "bin/owner-verb.mjs" \
   "bin/grants-verb.mjs" \
+  "bin/mcp-verb.mjs" \
   "bin/stray-consoles.mjs" \
   "viewer/server/retention.ts" \
   "viewer/server/retention-policy.ts" \
@@ -221,6 +229,7 @@ for p in \
   "scripts/handoff-status.sh" \
   "scripts/phase-landing.sh" \
   "scripts/scope.sh" \
+  "scripts/cmd-ref.sh" \
   "scripts/instance.sh" \
   "scripts/session-hook.sh" \
   "scripts/sizing.env" \

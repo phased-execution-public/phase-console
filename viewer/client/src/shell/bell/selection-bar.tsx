@@ -50,8 +50,13 @@ export interface SelectionBarProps {
   verbs: { verb: string; label: string }[];
   onVerb: (verb: string) => void;
   onAcknowledge: () => void;
-  /** All of them are already acknowledged, so the button says the other thing. */
-  allAcked?: boolean;
+  /**
+   * The word on the button `onAcknowledge` answers — the caller's, because only
+   * the caller knows what its press does (#334: a bar that said *Put back* over
+   * a press that deleted). "Acknowledge" by default; *Put back* only where the
+   * press really puts something back.
+   */
+  acknowledgeLabel?: string;
   busy?: boolean;
   /** What the count is OF, already agreeing with it: "selected", "unread". */
   noun?: string;
@@ -92,7 +97,7 @@ export function SelectionBar({
   verbs,
   onVerb,
   onAcknowledge,
-  allAcked = false,
+  acknowledgeLabel = 'Acknowledge',
   busy = false,
   noun = 'selected',
   dock = false,
@@ -153,7 +158,7 @@ export function SelectionBar({
               </Button>
             ))}
             <Button size="sm" variant="ghost" disabled={busy} onClick={onAcknowledge}>
-              {allAcked ? 'Put back' : 'Acknowledge'}
+              {acknowledgeLabel}
             </Button>
             <Button size="sm" variant="ghost" disabled={busy} onClick={onClear}>
               Clear

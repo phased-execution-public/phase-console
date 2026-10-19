@@ -124,8 +124,10 @@ const PLACES: readonly Place[] = [
   },
   {
     name: 'turn',
-    expand: { hash: '#/turn', control: fold(/^The history: who raised it/) },
-    inspect: { hash: '#/turn', control: inspectButton },
+    // The cards view holds the card's own folds and Inspect; the list (the
+    // default since one-pool phase 14) opens the card in the panel instead.
+    expand: { hash: '#/turn?view=cards&tab=all', control: fold(/^The history: who raised it/) },
+    inspect: { hash: '#/turn?view=cards&tab=all', control: inspectButton },
     everything: '#/turn',
   },
   {

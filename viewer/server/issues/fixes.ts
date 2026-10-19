@@ -17,14 +17,20 @@ import { fixesNumbers } from '../../shared/issues-model.js';
 /** A phase as the plan parser keeps it — only its labelled bullets are read here. */
 export type PhaseBullets = { bullets: readonly { label: string; body: string }[] };
 
-/** Issue number → the phases whose `Fixes:` line names it, in phase order. */
-export function fixesIndexOf(phases: Readonly<Record<number, PhaseBullets>>): Map<number, number[]> {
+/**
+ * Issue number → the phases whose `Fixes:` line names it, in phase order.
+ * `nameWithOwner` — the repository the issues are on — makes that
+ * repository's issue URLs count and another's references not (#321).
+ */
+export function fixesIndexOf(
+  phases: Readonly<Record<number, PhaseBullets>>, nameWithOwner?: string | null,
+): Map<number, number[]> {
   const index = new Map<number, number[]>();
   const order = Object.keys(phases).map(Number).filter(Number.isSafeInteger).sort((a, b) => a - b);
   for (const phase of order) {
     const line = phases[phase]?.bullets.find((bullet) => /^fixes$/i.test(bullet.label.trim()));
     if (!line) continue;
-    for (const number of fixesNumbers(line.body)) {
+    for (const number of fixesNumbers(line.body, nameWithOwner ?? null)) {
       const list = index.get(number) ?? [];
       if (!list.includes(phase)) list.push(phase);
       index.set(number, list);

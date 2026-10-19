@@ -3,10 +3,14 @@
  * phase 9).
  *
  * ```
- * Status        Plan                  Phases                                       Left         Moved
- * ● Running     storefront redesign   ○ 41 done ─ ● P42 in progress ─ ○ 26 left    5 sessions   2h ago
- * ● Needs you   cart api              ○ 3 done ─ ◌ P4 next up ─ ○ 5 left           2 sessions   3d ago
+ * Status                 Plan                  Phases                                  Left         Moved
+ * ● Running (Active)     storefront redesign   ████████████▌▐▒▒▒▒░░░░░░                5 sessions   2h ago
+ *                                              41 done · 1 in progress · 3 waiting · 56 %
+ * ● Needs you (Active)   cart api              ███▐░░░░░  3 done · 1 next up · 5 waiting  2 sessions   3d ago
  * ```
+ *
+ * `(Active)` is the plan's own status badge (#361); the Phases column is the
+ * plan's phases in proportion with its legend (#360, `track-bar.tsx`).
  *
  * The five facts at the glance; Everything draws the rest as columns — the
  * slug, the reading, the phases next up, the estimate, the run, who waits,
@@ -40,7 +44,8 @@ export function libraryColumns(): Column<PlanRow>[] {
       id: 'status',
       head: 'Status',
       priority: 1,
-      min: 132,
+      // The plan's badge, and a run's word beside it when one leads (#361).
+      min: 168,
       card: 'meta',
       value: markLabel,
       sort: { id: 'attention', dir: 'descending' },
@@ -198,7 +203,16 @@ export function libraryColumns(): Column<PlanRow>[] {
       everything: true,
       value: (row) => row.status,
       cell: (row) =>
-        row.isPlan ? <PlanStatus status={row.status as WordOf<'plan'>} withNote={false} /> : none,
+        row.isPlan ? (
+          <PlanStatus
+            status={row.status as WordOf<'plan'>}
+            chrome="badge"
+            withNote={false}
+            data-testid="plan-status"
+          />
+        ) : (
+          none
+        ),
     },
     {
       id: 'handoffs',

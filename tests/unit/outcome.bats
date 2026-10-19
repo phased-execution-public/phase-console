@@ -166,6 +166,15 @@ ledger_file() { # <slug>
   [ "$status" -eq 2 ]
 }
 
+@test "outcome: --needs issues (#349) is a decision key on blocked and needs-human alike, written as its own word" {
+  for word in blocked needs-human; do
+    run pe_outcome demo 8 "$word" --needs issues --reason "may this run file the bug it found upstream?"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -q '"needs": "issues"' "$PE_OUTCOME_FILE"
+    rm -f "$PE_OUTCOME_FILE"
+  done
+}
+
 @test "outcome: blocked --needs run --run-act writes ONE run request; an unknown act or a stray shape is exit 2" {
   # turn-by-turn phase 6 (#286): an act only the RUN can take is declared as a
   # run request, never as a permission ask nobody can grant.
@@ -890,6 +899,32 @@ proofs_file() { # <slug>
   [ "$status" -eq 0 ]
   [ "$(wc -l < "$PE_PROOFS_FILE" | tr -d ' ')" = "2" ]
   assert_contains "$(tail -1 "$PE_PROOFS_FILE")" '"command":"bash tests/run-tests.sh","code":1,'
+}
+
+@test "verified: a cd <sub> && … line into ANOTHER repository keys the proof by that repository's tree too (#301)" {
+  proof_repo
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson"
+  # The hub shape: a superproject mounting the line's repository.
+  hubdir="$BATS_TEST_TMPDIR/hub"
+  mkdir -p "$hubdir"
+  git -C "$hubdir" init -q
+  git -C "$hubdir" config user.email t@t
+  git -C "$hubdir" config user.name t
+  printf '# hub\n' > "$hubdir/README.md"
+  git -C "$hubdir" add -A && git -C "$hubdir" commit -qm init
+  git -C "$hubdir" -c protocol.file.allow=always submodule add -q "$REPO" sub
+  git -C "$hubdir" commit -qm mount
+  printf 'wip\n' > "$hubdir/sub/src/a.ts"
+  run pe_outcome demo 5 verified --command "cd sub && npm test" --exit 0 --in "$hubdir"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_PROOFS_FILE")" "\"tree\":\"$(working_tree "$hubdir")\",\"repo\":\"sub\",\"repo_tree\":\"$(working_tree "$hubdir/sub")\","
+  # A cd that stays inside the judged repository, or that the shell must expand, is no key.
+  run pe_outcome demo 5 verified --command "cd src && npm test" --exit 0 --in "$REPO"
+  [ "$status" -eq 0 ]
+  refute_contains "$(tail -1 "$PE_PROOFS_FILE")" '"repo":'
+  run pe_outcome demo 5 verified --command 'cd $SUB && npm test' --exit 0 --in "$hubdir"
+  [ "$status" -eq 0 ]
+  refute_contains "$(tail -1 "$PE_PROOFS_FILE")" '"repo":'
 }
 
 @test "verified: a file rewritten at the same size in the second it was checked out is named as it RAN" {

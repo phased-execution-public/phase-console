@@ -60,8 +60,15 @@ const finished = (phase: number, minutes: number, over: Partial<PhaseRecord> = {
     ...over,
   });
 
-/** P1: 5m working, 3m waiting, 2m frozen. P2: 40m working — the longest, so the scale. */
-const PHASES = [finished(1, 10, { frozenMs: 2 * MIN, parkedUntil: iso(T0 + 3 * MIN) }), finished(2, 40)];
+/**
+ * P1: 5m working, 3m waiting, 2m frozen, in a 10-minute wall clock — its
+ * `durationMs` is the WORKED time, as the wire has carried since #28. P2: 40m
+ * working — the longest, so the scale.
+ */
+const PHASES = [
+  finished(1, 10, { durationMs: 5 * MIN, frozenMs: 2 * MIN, parkedUntil: iso(T0 + 3 * MIN) }),
+  finished(2, 40),
+];
 
 function lane(over: Partial<TimelineLane> & { phase: number }): TimelineLane {
   return {
@@ -191,13 +198,14 @@ describe('T-2 both read the figures’ scales — never a ladder or a ratio of t
 
 describe('T-3 spansOf — the split is arithmetic over the runner’s own clocks', () => {
   it('splits a finished phase into working, waiting and frozen', () => {
+    // A modern record: `durationMs` is the worked time, frozen already taken out.
     const [span] = spansOf(
       [
         record({
           phase: 1,
           startedAt: iso(T0),
           endedAt: iso(T0 + 10 * MIN),
-          durationMs: 10 * MIN,
+          durationMs: 5 * MIN,
           frozenMs: 2 * MIN,
           parkedUntil: iso(T0 + 3 * MIN),
         }),
@@ -207,30 +215,50 @@ describe('T-3 spansOf — the split is arithmetic over the runner’s own clocks
     expect(span!.totalMs).toBe(10 * MIN);
     expect(span!.frozenMs).toBe(2 * MIN);
     expect(span!.waitingMs).toBe(3 * MIN);
-    // The remainder, never a fourth measured figure — the three must sum to
-    // the duration or the bar lies about its own width.
     expect(span!.workingMs).toBe(5 * MIN);
+    // The three must sum to the whole or the bar lies about its own width.
     expect(span!.workingMs + span!.frozenMs + span!.waitingMs).toBe(span!.totalMs);
     expect(span!.live).toBe(false);
   });
 
+  it('counts a frozen phase’s frozen time once — the worked clock already left it out (#306)', () => {
+    // One 20-minute window, 6 of it frozen: phaseClocks() works 14, and the
+    // wire's durationMs says the same. The old split took the 6 out of the 14
+    // a second time and drew 8 minutes of work.
+    const windowed = record({
+      phase: 6,
+      startedAt: iso(T0),
+      attemptStartedAt: iso(T0),
+      endedAt: iso(T0 + 20 * MIN),
+      attemptWindows: [{ attempt: 1, startedAt: iso(T0), endedAt: iso(T0 + 20 * MIN) }],
+      durationMs: 14 * MIN,
+      frozenMs: 6 * MIN,
+    } as Partial<PhaseRecord> & { phase: number });
+    const [span] = spansOf([windowed], T0 + 30 * MIN);
+    expect(span!.workingMs).toBe(14 * MIN);
+    expect(span!.frozenMs).toBe(6 * MIN);
+    expect(span!.waitingMs).toBe(0);
+    expect(span!.totalMs).toBe(20 * MIN);
+  });
+
   it('clamps a frozen clock that outran the phase', () => {
-    // `frozenMs` is the runner's and the duration the closeout's; a restart
-    // between them can leave the first larger. The bar must not outgrow the phase.
+    // `frozenMs` is the runner's and the end the closeout's; a restart between
+    // them can leave the first larger. The bar must not outgrow the wall clock.
     const [span] = spansOf(
       [
         record({
           phase: 2,
           startedAt: iso(T0),
-          durationMs: 5 * MIN,
+          durationMs: 3 * MIN,
           frozenMs: 99 * MIN,
           endedAt: iso(T0 + 5 * MIN),
         }),
       ],
       T0 + 10 * MIN,
     );
-    expect(span!.frozenMs).toBe(5 * MIN);
-    expect(span!.workingMs).toBe(0);
+    expect(span!.workingMs).toBe(3 * MIN);
+    expect(span!.frozenMs).toBe(2 * MIN);
+    expect(span!.totalMs).toBe(5 * MIN);
   });
 
   it('counts a park that is still running only up to now', () => {
@@ -266,7 +294,12 @@ describe('T-3 spansOf — the split is arithmetic over the runner’s own clocks
 
 describe('T-4 <RunClockSplit>', () => {
   it('draws a row per phase, with its parts in its accessible name', () => {
-    render(<RunClockSplit now={T0 + 30 * MIN} phases={[finished(1, 10, { frozenMs: 2 * MIN })]} />);
+    render(
+      <RunClockSplit
+        now={T0 + 30 * MIN}
+        phases={[finished(1, 10, { durationMs: 8 * MIN, frozenMs: 2 * MIN })]}
+      />,
+    );
     const row = screen.getByRole('img', { name: /^phase 1:/ });
     expect(row).toHaveAccessibleName(/8m.* working/);
     expect(row).toHaveAccessibleName(/2m.* frozen/);
@@ -354,5 +387,36 @@ describe('T-4 <RunClockSplit>', () => {
   it('is clean to axe', async () => {
     const { container } = render(<RunClockSplit now={T0 + 60 * MIN} phases={PHASES} />);
     await expectNoAxeViolations(container);
+  });
+});
+
+describe('T-5 the split’s zoom is on the figure (#376)', () => {
+  it('draws − / + beside the split, and + zooms it', () => {
+    const records = [
+      {
+        phase: 1,
+        status: 'done',
+        attempts: 1,
+        costUsd: 0,
+        startedAt: '2026-08-24T10:00:00.000Z',
+        endedAt: '2026-08-24T11:00:00.000Z',
+        durationMs: 3_600_000,
+      },
+      {
+        phase: 2,
+        status: 'done',
+        attempts: 1,
+        costUsd: 0,
+        startedAt: '2026-08-24T10:00:00.000Z',
+        endedAt: '2026-08-24T10:05:00.000Z',
+        durationMs: 300_000,
+      },
+    ] as unknown as PhaseRecord[];
+    render(<RunClockSplit phases={records} now={Date.parse('2026-08-24T12:00:00.000Z')} />);
+    const controls = screen.getByTestId('zoom-controls');
+    // No quick ranges here: a split's axis is a duration, not the run's clock.
+    expect(within(controls).queryByRole('button', { name: 'Last hour' })).toBeNull();
+    fireEvent.click(within(controls).getByRole('button', { name: 'Zoom in' }));
+    expect(screen.getByRole('button', { name: /Reset zoom \(×2\.0\)/ })).toBeInTheDocument();
   });
 });

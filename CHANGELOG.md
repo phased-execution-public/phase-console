@@ -20,6 +20,134 @@ into a web form at the moment of release.
 
 ## [Unreleased]
 
+## [8.0.0] - 2026-10-19
+
+**Every open issue, fixed.** 8.0 fixes every issue that was open on 2026-10-17: Your turn becomes a
+page you work from and the eighth destination, the phase graphs become instruments, any MCP server
+signs in on the page, the runner's mirrors, lanes, landing, watches and gates stop losing work, the
+load guard reads the machine's real CPU, and the console's own git is hardened. The free tree stays
+MIT. `PE_API` stays 2: nothing a 7.1 plan, session or script says changes meaning, except where
+*Migration* says so.
+
+### Migration
+- **The accounts registry is v2 in both editions.** A v1 `accounts.json` is upgraded in place on its
+  first read and copied once to `accounts.json.v1.bak`.
+- **A push is read by its clause.** A bare `git push` is now `deny`. A trunk (`main`, `master`,
+  `trunk`, the run's base) is pushed only where a `permission.destructive` row names it with its
+  phases (`` `main` by phase 34 ``); a negated phase list (`never`, `not`, `no`, `except`, `!`)
+  excludes those phases, and a clause with only negated phases grants nothing. A forced or deleting
+  push, `--no-verify` or another remote asks a person even under a whole `Bash(git push:*)` rule.
+- **The console's own git ignores the system config** (`GIT_CONFIG_NOSYSTEM=1`) and runs no hooks
+  (`core.hooksPath=/dev/null`). A credential helper set only in the system config (macOS
+  `osxkeychain`) is no longer seen: set `credential.helper` in `~/.gitconfig`.
+- **A plan's `**Branch:**` line names a branch only in backticks** (`` `pe/<slug>` ``); bare prose
+  names none. A repeated `### Phase N` section fails the lint (F21 `phase-section-repeated`), and the
+  JS parser joins it under the first.
+- **`decisions.sh` refuses** a `--value` over 500 characters, an `--evidence` over 200 and a `--by`
+  over 64 (exit 2) instead of cutting them.
+- **The landing ledger moves forward only:** `phase-landing.sh` keeps a row that is further along and
+  says so on stderr, unless `--allow-backward`.
+- **`close-plan.sh --status complete` refuses** while the plan's work is unlanded, open or unfiled,
+  naming each item; `--force` closes it anyway and records how many were open.
+- **A press from a page of an older release is refused** with a 409 and a sentence asking for a
+  reload (`x-build-rev`). The CLI, the scripts and the hooks send no such header and are never
+  refused.
+- **The load guard's `loadGuardFactor` keeps its name and changes its meaning:** it now scales a CPU
+  reading (85 % busy over 30 s at factor 1.5), and the 5-minute load average is only a ceiling at
+  factor × cores × 2.
+- **Your turn is the eighth destination.** The phone's tab bar reads Runs · Your turn · Plans ·
+  Sessions · More; 7.1's `?view=compact` on Your turn reads as the list.
+- **`phase-outcome.sh verified`** writes `repo` and `repo_tree`, so a proof is keyed to its own
+  repository.
+- **New state:** `mcp/registry.json` under the instance's state directory (the MCP registry's
+  24-hour cache).
+
+### Added
+- **Your turn is a page you work from** (#377, #366, #365, #334): the eighth destination and every
+  plan's fourth view (`#/turn`, `#/plan/<slug>/turn`), with tabs (Open · Done · Handled by the AI ·
+  All), four views (list, board, cards, timeline), five groupings and three sorts in the address; every
+  status word explains itself on hover, focus and tap; the bell's drawer is a five-row preview with
+  *Put back* (`POST /api/notifications/unread`).
+- **The phase graphs are instruments** (#376, #364): the map's filter chips, trace, colour, layers,
+  layouts, hover card and SVG or PNG export, each in its address; two new readings, **Schedule** and
+  **Burn-up**; the timeline's zoom and quick ranges; and a lock map on Sessions ▸ Locks.
+- **Tables and cards that say more** (#361, #360, #369, #362, #305): an outlined status badge, a plan
+  track drawn to proportion with its legend, Sessions rows with what each runs on, its account, model,
+  spend and context, a summary strip, the 6.x palette back as Settings ▸ Appearance ▸ **Palette**
+  (`quiet` or `departures`), and the halt card on the Runs home.
+- **Any MCP server, signed in on the page** (#363, #372): the open catalog searched here and cached,
+  **Add by hand** for any server, **Fill it in** for a `${VAR}`, and **Sign in** told step by step;
+  `phase-console mcp list | add --manual | fill`.
+- **Waive this line** (#267): an operator waives one red verification line for one phase
+  (`POST /api/run/<slug>/verify-waive`), listed under *Waived by the operator*.
+- **Verification lines read *Timed out* and *Skipped*** as well as green and red (#331).
+- **Two proof lints**, both advisories: F45 `proof-unparsable` (a `Human step:` proof the check
+  cannot read) and F46 `proof-script-run-branch-only` (a `cmd:` proof whose script is not on its
+  repository's trunk).
+- **Two halts that name the tree:** `run-tree-config` (a session changed its tree's git
+  configuration) and `run-tree-locked` (a git lock file nothing is writing blocks the tree).
+- **The doctor says more** (#343, #279): a deliberately disabled launchd unit is told from a broken one
+  with the line that enables it, and a check it cannot see is said, not passed.
+
+### Changed
+- **The console's own git is hardened** (#272), and a push is read by its clause (#276, #275) — see
+  *Migration*.
+- **The load guard reads the machine's real CPU** (#243, #223): busy over 30 seconds, every console's
+  work and in-turn bursts counted. A heavy verification line waits for a seat in one machine-wide
+  budget, journalled `phase.verify-queued` (#327), and a session's orphaned test runners are reaped at
+  its end (#222).
+- **`close-plan.sh` closes `complete` only once the work has landed** (#320).
+- **A handoff's ▶ Start next phase(s) section is a pointer** to `next-phase-prompt.sh`, composed when
+  read (#338); `new-handoff.sh --force` rewrites the INDEX row it supersedes (#265); a note keeps its
+  indented sub-bullets (#378); and every watch scheme is documented (#233).
+- **Switching a run's account is a run act**, under `--allow-run` alone (#323).
+- **Every CLI verb reaches the CLI** (#359), and a release packs the client it names (#358).
+- **The boot prompt's wait procedure names the `pgrep -f` trap** (#260): a wait on text in its own
+  command never ends; wait on the job's pid or a file it writes.
+
+### Fixed
+- **Your turn's presses and proofs** (#368, #367, #371, #351, #374, #345, #350): *Send my decision*
+  sends once and then checks the proof; an item bound to a gate closes when the gate opens; a reminder
+  keeps a returned item on Redo; a proof whose script is missing reads **Cannot run** instead of
+  failing you; and one reader reads every `cmd:` proof.
+- **Your turn's inputs** (#346, #349, #393): a `Human step:` inside an HTML comment is ignored,
+  `--needs issues` is classified as itself, and the page's touch targets are full size.
+- **The graphs draw no text over text** (#375, #299, #342, #306): below 9 px only numbers show, marks
+  that share a spot read `✎×4` or `●+3`, the track sits behind its labels, a Runs row keeps its count
+  on one line, and the run clock counts frozen time once.
+- **Small things on screen** (#339, #335, #315): a chart's heading is named, short code tokens do not
+  break, and a dropdown fits the screen.
+- **An update never paints the old release** (#373), this browser is found by its push endpoint
+  (#325), a placeholder delivery counts as no device and no failure (#314, #324), and a repaired push
+  clears its health row (#280).
+- **Mirrors and verification** (#356, #357, #311, #301, #328, #333, #262, #283): a run's mirror grows
+  when its plan adds a repository, a docs-only line runs where the docs are, `Verify in: .` means the
+  plan's tree, a proof is keyed to its repository, an orphaned `index.lock` is named, a resolved run's
+  trees are swept, the artefacts register credits only a phase's own trees, and an unexpanded `$VAR`
+  is never taken for a path.
+- **Lanes and landing** (#354, #295, #370, #336, #249, #240): a phase keeps its lane while it holds
+  work in the shared tree (`run.lane-held`), the landing proof fetches and recognises a squash or
+  pull-request merge, and the landing ledger never moves backward.
+- **The lint and the decisions** (#225, #228, #226, #235, #322, #253): a sibling's half-written
+  handoff no longer fails your lint, a repeated phase section does, a person's resume re-reads the
+  decisions, the Branch line is read right and a shared launch asks about it, and an over-long
+  decision is refused rather than cut.
+- **Watches and gates** (#337, #303, #245, #264, #239, #288): a watch beside a long `cmd:` row is
+  asked, Resume re-asks a settled wait, Recheck works on a waiting ref, a live run re-reads its held
+  gates, and a phase whose dependency is not done is held, never boarded (`phase.dependency-held`).
+- **Detectors and in-turn waits** (#219, #220, #259, #260, #292, #274): a phase serial behind a live
+  lane is not undriven, the watchdog holds while a tool card stands, a turn ends without a ten-minute
+  idle wait, a wait loop whose `pgrep -f` matches itself is refused, a wait on a detached job's file
+  arms its own `cmd:` ref, and a git ref after "held by" is not read as a lock.
+- **The inbox answers without lag** (#237).
+- **Accounts** (#238, #287, #281): a run's start goes to the first account with room, the usage brake
+  keys to the account a session really spends, and a pinned model is checked on every frame, so a
+  fallback mid-session parks the phase.
+- **The tests are hermetic and say why they fail** (#353, #352, #344, #294, #291, #297, #329, #326,
+  #316, #394, #289, #302, #313, #241, #318, #246, #256, #230): `tests/run-tests.sh` scrubs every
+  `PE_*` and `DOCS_ROOT` before bats, a test process's usage poller reads no meters unless given one,
+  and a test file that stops mid-run fails the gate.
+
 ## [7.1.0] - 2026-10-13
 
 **Your turn, told step by step.** 7.1 makes every item on Your turn a card a person can act on without

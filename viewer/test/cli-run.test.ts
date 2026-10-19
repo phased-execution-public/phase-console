@@ -43,7 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, test } from 'node:test';
 
 import { scratch, service } from './verb-harness.ts';
-import { OPERATOR_VERBS, verbNamed } from '../shared/verb-model.js';
+import { OPERATOR_VERBS, PRO_READS, verbNamed } from '../shared/verb-model.js';
 import { runStatusWord } from '../shared/status-vocab.js';
 import { buildRequest, exitCodeFor, parseRowArgs, renderAnswer } from '../../bin/run-verb.mjs';
 
@@ -350,8 +350,9 @@ describe('CL-3 — the free CLI refuses acts by edition; Pro asks the license ga
   test('every read row is free in both editions — the table itself says so, which is what the CLI’s gate reads', () => {
     const reads = OPERATOR_VERBS.filter((row) => row.cli !== null && row.kind === 'read');
     for (const row of reads) {
-      if (row.name === 'wait') { assert.equal(row.edition, 'pro', 'wait is the one read the table marks Pro'); continue; }
+      if (PRO_READS.includes(row.name)) { assert.equal(row.edition, 'pro', `${row.name} is a read the table marks Pro`); continue; }
       assert.equal(row.edition, 'free', row.name);
     }
   });
 });
+

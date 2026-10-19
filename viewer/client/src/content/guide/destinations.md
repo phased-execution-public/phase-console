@@ -15,12 +15,25 @@ The header carries the same counts on every page, and leaves out what is zero: *
 (1)*, *checkout-rewrite is running — phase 3*, *1 waiting*, *4 phases ready*, *$41 today*. On a desk each is a
 link to its group, the page or **Insights**; on a phone they are plain words on a row of their own.
 
-On a desk the rail down the side holds the seven places in three groups — **Runs**, **Plans**, **Sessions**;
-**Repo**, **Insights**, **Logs**; **Settings** — with the **Switcher** above them and **Help** and the usage
-meter at its foot. On a phone the rail becomes a tab bar: **Runs**, **Plans**, **Sessions**, **Insights** and
-**More**. **More** holds the rest: **Repo** and **Logs**, then **Settings**, then **Help** for the page you
-are on, the usage limits, and whether this console may write.
+On a desk the rail down the side holds the eight places in three groups — **Runs**, **Your turn**,
+**Plans**, **Sessions**; **Repo**, **Insights**, **Logs**; **Settings** — with the **Switcher** above them and
+**Help** and the usage meter at its foot. On a phone the rail becomes a tab bar: **Runs**, **Your turn**,
+**Plans**, **Sessions** and **More**. **More** holds the rest: **Repo**, **Insights** and **Logs**, then
+**Settings**, then **Help** for the page you are on, the usage limits, and whether this console may write.
 
+
+## Your turn — what only you can do
+
+**Your turn**, `#/turn`, is every act only you can do: a sign-in, a code, a secret, a payment, an
+approval, a decision, an errand at the machine. It is second in the rail, after **Runs**, and its badge
+counts what needs you now; **Runs** carries no count of its own. The page opens on what is open, one line
+per item, and its tabs hold what is done and what the AI handled on its own. Press a line and its whole
+card opens in the panel, with its steps, its check and its one button. **View** draws the items as a
+**List**, a **Board**, **Cards** or a **Timeline**; **Group**, **Sort** and the filters narrow them, and
+every choice is part of the address.
+
+A plan has the same page as one of its views, **Your turn**, at `#/plan/<slug>/turn`, narrowed to that
+plan. The **Your turn** guide walks through the page and every item on it.
 
 ## Plans — where does each plan stand?
 
@@ -32,11 +45,19 @@ counts. **New plan** offers three ways to begin one: **Write it with AI** (needs
 desk at the issues that need a plan.
 
 A plan opens on its glance: the title, its status, its line, what is left and what it costs, and the one
-act that fits, such as **Start phase 1** when nothing is running. Under it, three views, each an address:
-**Phases** (as a **Table**, a **Map**, **QA** or **Handoffs**), **Run** (this plan's run, `#/plan/<slug>/run`:
-start it, watch it and steer it — the console needs `--allow-run` — and **History**, its earlier runs) and
+act that fits, such as **Start phase 1** when nothing is running. Under it, four views, each an address:
+**Phases** (as a **Table**, a **Map**, **QA**, **Handoffs**, a **Schedule** or a **Burn-up**), **Run** (this plan's run, `#/plan/<slug>/run`:
+start it, watch it and steer it — the console needs `--allow-run` — and **History**, its earlier runs),
+**Your turn** (this plan's acts only you can do, `#/plan/<slug>/turn`, with how many are open) and
 **Source** (the plan file and its handoffs). A phase's **Details** opens it in place, **Inspect phase N** puts it in the panel, and
 **Everything** shows every column of the table.
+
+A plan's line is drawn to scale, each stretch as wide as its share of the plan, and its legend counts it:
+*12 done · 1 held by QA · 2 in progress · 1 stuck · 3 next up · 9 waiting · 2 gated · 4 left · 35 %*. A
+closed plan's line says what never ran instead: *30 done · 4 never ran*. Where a plan's or a phase's status
+is a row's headline — the Plans list and cards, the plan's header, the Phases table, the Run view's phase
+rows and Sessions — it is drawn as a badge: the status's icon and word in its colour, inside an outline,
+with no fill.
 
 ## Sessions — what is running, and can I get at it?
 
@@ -46,8 +67,9 @@ or id; open one and it takes the whole page, `#/sessions/<id>`, terminal and all
 knows about offers to resume it. **New session** starts an agent and **New shell** a plain shell; they need
 `--allow-agent` and `--allow-terminal`, and with neither flag **Sessions** leaves the rail and the lanes
 still show on **Runs**. **Locks**, beside **Sessions** at the top, is every phase claim and who holds it,
-at `#/sessions/locks`. A session's **Details** opens it in place, **Inspect** puts it in the panel, and
-**Everything** adds every column.
+at `#/sessions/locks`, and its **Map** (`#/sessions/locks?view=map`) draws each claim as a bar on its
+repository's lane, from when it was claimed to the end of its lease. A session's **Details** opens it in
+place, **Inspect** puts it in the panel, and **Everything** adds every column.
 
 ## Repo — what did the work do to the tree?
 
@@ -83,6 +105,7 @@ was asked, what shape the work is in, and on what. It reads every plan until you
 the plan's own cost and record join the page. **Everything** opens every fold; under **What it costs**, a
 run's line opens its **Details**, and **Inspect** there puts its spend against its budget in the panel.
 
+
 ## Logs — what did the console see?
 
 **Logs** is every log this console writes, with the journal, delivery and health beside them. It is where you
@@ -108,7 +131,9 @@ setting**, at the top of every Settings page, answers with sections and single s
 with its control: `quiet hours` finds the place and the switch.
 
 - **Essentials** — what this console reads, what it may do, and the line that starts it.
-- **Appearance** — how the console looks in this browser, and what the lists show.
+- **Appearance** — how the console looks in this browser, and what the lists show. Its **Palette** is
+  **Quiet**, 7.0's room, or **Departures**, the 6.x room: a grey-blue page under white cards, with drawn
+  rules. The status colours are the same in both.
 - **Automation** — what every launch opens on, how far the console repairs by itself, and when work may start.
 - **Notifications** — what the console announces, where each kind lands, and when your turns are said again.
 - **Accounts** — which account a session runs as, its usage, and what happens at a wall.
@@ -172,7 +197,7 @@ anywhere, even while you type, or `/` when nothing has your typing. On a desk **
 header opens it; on a phone it is the magnifier in the header. `?k=<text>` in the address opens it with that
 text typed in.
 
-Rows come in groups: **Go to** (every place, **Your turn** and **Help**), **Plans**, **Runs**, **Settings**
+Rows come in groups: **Go to** (every place, **Your turn** among them, and **Help**), **Plans**, **Runs**, **Settings**
 (**Everything** among them), **Do** and **In the documents**. **Do** lists every verb the console has for what
 the address names — the plan, the phase, the lane — and a verb this console lacks the switch for is drawn
 dim with the switch it needs. An act on the record takes a second press to confirm; a verb that needs more
@@ -184,12 +209,14 @@ row; Esc, or ⌘K again, closes the palette.
 The bell in the header opens a sheet titled **Inbox**, with two panels. The number beside the bell counts
 unread announcements.
 
-**Needs you** holds the asks the inbox carries — the sessions asking you, then the rest — so an answer
-given here clears the row everywhere. **Announcements** is the log of what the console has said, newest
-first, and each row says what became of it: *sent to 2*, *held by quiet hours*, *no device*. **Unread only**
-and the category chips narrow it; opening a row takes you to its subject and marks it read; a row that
-carries buttons answers in place. **Mark all read** zeroes the count, and **Clear read** and **Clear all**
-delete records. `?bell=1` opens it. On a phone the bell is in the header too.
+**Needs you** is a preview of **Your turn**. **Open Your turn** sits at its top, then at most five of the
+asks, one line each — the sessions asking you first, then the rest — and *N more on Your turn* when more
+wait. An answer given here clears the row everywhere. **Announcements** is the log of what the console has
+said, newest first, and each row says what became of it: *sent to 2*, *held by quiet hours*, *no device*.
+**Unread only** and the category chips narrow it; opening a row takes you to its subject and marks it read;
+a row that carries buttons answers in place. Tick records, then **Mark read**, **Put back**, which marks
+them unread again, or **Delete**, which deletes them. **Mark all read** zeroes the count, and **Clear
+read** and **Clear all** delete records. `?bell=1` opens it. On a phone the bell is in the header too.
 
 ## Help — this guide, over any page
 

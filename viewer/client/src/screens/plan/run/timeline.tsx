@@ -22,12 +22,15 @@
  * wall). Three parts, so the shape of a bar is the diagnosis: a run that was
  * mostly waiting was not slow, it was blocked — a different fix.
  *
- * Every figure comes off the record. `frozenMs` and `durationMs` are the
- * runner's; the waiting part is what the park clocks account for, CLAMPED to
- * the duration rather than trusted — a park that outlived its phase (a console
- * restart across a park, most often) would otherwise paint a bar wider than
- * the phase. Where the two disagree the duration wins: it is the one measured
- * end to end.
+ * Every figure comes off the record, through the one reader of a phase's
+ * clocks, `phaseClocks()` (#28). Its `workedMs` — the attempt windows less the
+ * frozen time, which IS the wire's `durationMs` — is the working part, so the
+ * frozen part is counted once, beside it, never inside it as well (#306). The
+ * whole is the phase's wall clock since it first boarded; frozen is clamped to
+ * what that clock leaves after the work, and the waiting part is what the park
+ * clocks account for, CLAMPED to what is left after both rather than trusted —
+ * a park that outlived its phase (a console restart across a park, most often)
+ * would otherwise paint a bar wider than the phase.
  *
  * Every bar starts at the same edge, on ONE scale shared by every row and set
  * by the longest phase: the useful comparison is phase against phase, and a
@@ -48,6 +51,8 @@ import { FigureNumbers } from '@/ui/figures/numbers';
 import { linear } from '@/ui/figures/scales';
 import { AXIS, ROW, Swimlane, type SwimlaneRow } from '@/ui/figures/swimlane';
 import { useFigure } from '@/ui/figures/use-figure';
+import { ZoomControls } from '@/ui/figures/zoom-controls';
+import { phaseClocks } from '@shared/phase-clocks.js';
 import { BAR_STYLE, BarKindKey } from './gantt';
 
 /** One phase's wall clock, split into the three things it can be spent on. */
@@ -84,23 +89,40 @@ export function spansOf(records: readonly PhaseRecord[], now: number): ClockSpan
       const started = record.startedAt ? Date.parse(record.startedAt) : Number.NaN;
       const ended = record.endedAt ? Date.parse(record.endedAt) : Number.NaN;
       const live = Number.isFinite(started) && !Number.isFinite(ended);
-      // The runner's own figure first; the clock for a phase still open, which
-      // has no `durationMs` yet by definition.
-      const totalMs = Number.isFinite(record.durationMs as number)
-        ? Math.max(0, record.durationMs as number)
-        : Number.isFinite(started)
-          ? Math.max(0, (Number.isFinite(ended) ? ended : now) - started)
-          : 0;
-      const frozenMs = Math.min(totalMs, Math.max(0, record.frozenMs ?? 0));
-      const waitingMs = Math.min(totalMs - frozenMs, waitingOf(record, now));
+      const clocks = phaseClocks(record, now);
+      // The wall clock: from the first boarding to the end, or to now while
+      // the phase is open. Unknown only for a record with no start at all.
+      const wallMs = clocks.sinceFirstBoardedMs;
+      // The worked figure ALREADY excludes the frozen time (#306): adding the
+      // frozen part to it is the whole, subtracting it again counted it twice.
+      const workedMs = clocks.workedMs;
+      const frozenRaw = Math.max(0, record.frozenMs ?? 0);
+      const frozenMs =
+        wallMs === null ? frozenRaw : Math.min(frozenRaw, Math.max(0, wallMs - (workedMs ?? 0)));
+      const parked = waitingOf(record, now);
+      if (workedMs === null) {
+        // A phase with no window and no worked figure yet: the wall clock is all
+        // that was measured, and working is what the parts leave of it.
+        const totalMs = wallMs ?? 0;
+        const waitingMs = Math.min(Math.max(0, totalMs - frozenMs), parked);
+        return {
+          phase: record.phase,
+          totalMs,
+          frozenMs,
+          waitingMs,
+          workingMs: Math.max(0, totalMs - frozenMs - waitingMs),
+          live,
+        };
+      }
+      const workingMs = Math.max(0, workedMs);
+      const waitingMs = wallMs === null ? 0 : Math.min(Math.max(0, wallMs - workingMs - frozenMs), parked);
       return {
         phase: record.phase,
-        totalMs,
+        // The three parts sum to the whole, or the bar would lie about its own width.
+        totalMs: workingMs + frozenMs + waitingMs,
         frozenMs,
         waitingMs,
-        // The remainder, never a fourth measured figure: the three parts sum to
-        // the duration, or the bar would lie about its own width.
-        workingMs: Math.max(0, totalMs - frozenMs - waitingMs),
+        workingMs,
         live,
       };
     })
@@ -223,6 +245,7 @@ export function RunClockSplit({
         />
       ) : (
         <>
+          <ZoomControls figure={figure} spanMs={longest} />
           <Swimlane
             rows={rows}
             spanMs={longest}

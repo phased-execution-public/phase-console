@@ -36,7 +36,8 @@ import { join } from 'node:path';
 
 import type { Exec } from '../server/accounts/credentials.ts';
 import {
-  bridgeDefinition, consoleConfigDir, isLoginBlock, loginEnv, planMcpLogin, unbridgeDefinition,
+  authUrlOf, bridgeDefinition, consoleConfigDir, endingOf, isLoginBlock, lastLineOf, liveStep, loginEnv,
+  pastedCallbackError, planMcpLogin, unbridgeDefinition,
   type McpLoginPlan,
 } from '../server/mcp/login.ts';
 import { Mcp } from '../server/mcp/index.ts';
@@ -86,8 +87,20 @@ test('the plan bridges the definition, signs in, and puts the registry back', ()
   assert.deepEqual(made.add, [
     'mcp', 'add', '--transport', 'http', '--scope', 'user', 'grafana', 'https://mcp.grafana.com/mcp',
   ]);
-  assert.deepEqual(made.login, ['mcp', 'login', 'grafana', '--no-browser']);
+  // At this machine the CLI opens the browser and takes the callback itself:
+  // no `--no-browser`, so nobody is asked to paste (one-pool phase 19, #372).
+  assert.deepEqual(made.login, ['mcp', 'login', 'grafana']);
+  assert.equal(made.remote, false);
   assert.deepEqual(made.remove, ['mcp', 'remove', 'grafana', '--scope', 'user']);
+});
+
+test('`--no-browser` only for a person who is not at this machine (#372)', () => {
+  const made = planMcpLogin(HTTP, { remote: true });
+  assert.equal(isLoginBlock(made), false);
+  const ok = made as Exclude<typeof made, { reason: string }>;
+  assert.deepEqual(ok.login, ['mcp', 'login', 'grafana', '--no-browser']);
+  assert.equal(ok.remote, true);
+  assert.match(ok.loginCommand, /'--no-browser'$/);
 });
 
 test('a named config dir rides every step, so the token lands where runs look', () => {
@@ -445,4 +458,161 @@ test('an unknown account is refused before anything is written', async () => {
     () => svc.beginMcpLogin('noaccount', { accountId: 'nobody' }),
     /no account called nobody/,
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * The guided sign-in (one-pool phase 19, #372)
+ * ------------------------------------------------------------------ */
+
+const AUTH = 'https://mcp.grafana.com/authorize?response_type=code&client_id=abc&redirect_uri=http%3A%2F%2Flocalhost%3A51234%2Fcallback&code_challenge=xyz';
+
+test('the sign-in page is read from the terminal, colour taken out — and nothing else is mistaken for it', () => {
+  assert.equal(authUrlOf('Starting…\r\n'), undefined);
+  assert.equal(authUrlOf('See https://docs.example.com/mcp for help\r\n'), undefined, 'a docs link is not the page');
+  assert.equal(authUrlOf(`\u001b[1mOpen this URL:\u001b[0m \u001b[36m${AUTH}\u001b[39m\r\nPaste the redirect URL: `), AUTH);
+});
+
+test('a pasted address must be one the browser landed on — with a code', () => {
+  assert.match(pastedCallbackError('') ?? '', /paste the address/);
+  assert.match(pastedCallbackError('not a url') ?? '', /not an address/);
+  assert.match(pastedCallbackError('http://localhost:51234/callback') ?? '', /carries no code/);
+  assert.match(pastedCallbackError('ftp://localhost/callback?code=1') ?? '', /starts with http/);
+  assert.equal(pastedCallbackError('http://localhost:51234/callback?code=abc&state=s'), null);
+  assert.equal(pastedCallbackError('http://localhost:51234/callback?error=access_denied'), null, 'a refusal is the CLI\'s to report');
+});
+
+test('a flow walks starting → approve (here) or paste (elsewhere) → checking', () => {
+  assert.equal(liveStep({ remote: false }), 'starting');
+  assert.equal(liveStep({ remote: false, authUrl: AUTH }), 'approve');
+  assert.equal(liveStep({ remote: true, authUrl: AUTH }), 'paste');
+  assert.equal(liveStep({ remote: true, authUrl: AUTH, pastedAt: '2026-10-18T00:00:00Z' }), 'checking');
+});
+
+test('a CLI that gave up on its own clock is timed out, and the words name the step', () => {
+  const deadline = '2026-10-18T00:05:00.000Z';
+  const late = endingOf({ remote: true, authUrl: AUTH, deadline }, { code: 1, at: Date.parse(deadline), lastLine: 'Timed out' });
+  assert.equal(late.step, 'timed-out');
+  assert.match(late.detail, /after five minutes, waiting for the address the browser landed on to be pasted back/);
+  assert.match(late.detail, /“Timed out”/);
+  const early = endingOf({ remote: false, deadline }, { code: 2, at: Date.parse(deadline) - 120_000 });
+  assert.equal(early.step, 'failed');
+  assert.match(early.detail, /exit 2.*waiting for the Claude CLI to print the sign-in page/);
+  assert.equal(lastLineOf('one\r\n\u001b[31mError: bad code\u001b[0m\r\n\r\n'), 'Error: bad code');
+});
+
+/** A service whose terminals are a stub that records what was minted, typed and dismissed. */
+function guidedService(output: { text: string }, opts: { status?: string } = {}) {
+  const svc = mcpService();
+  const faked = fakeExec((_file, args) => (args[1] === 'get' ? new Error('absent') : ''));
+  svc.mcpExec = faked.exec;
+  const minted: { args: string[] }[] = [];
+  const typed: string[] = [];
+  const dismissed: string[] = [];
+  const killed: string[] = [];
+  let live = true;
+  const terminals = {
+    mint: async (_id: unknown, _size: unknown, launch: { args: string[] }) => {
+      minted.push({ args: launch.args });
+      live = true;
+      return { ok: true, sessionId: `s${minted.length}`, token: 't', expiresAt: 0 };
+    },
+    outputTail: () => output.text,
+    isLive: () => live,
+    input: (_id: string, data: string) => { typed.push(data); return live; },
+    dismiss: (id: string) => { dismissed.push(id); live = false; return { ok: true }; },
+    kill: (id: string) => { killed.push(id); live = false; return true; },
+  };
+  Object.defineProperty(svc, 'terminals', { value: terminals });
+  let clock = Date.parse('2026-10-18T00:00:00.000Z');
+  svc.mcpLoginNow = () => clock;
+  const status = opts.status ?? 'connected';
+  svc.refreshMcp = (async () => svc.mcp.enabledIds().map((id) => ({ id, label: 'Guided', status }))) as never;
+  return {
+    svc, minted, typed, dismissed, killed, calls: faked.calls,
+    tick: (ms: number) => { clock += ms; },
+    end: () => { live = false; },
+  };
+}
+
+test('at the machine: no --no-browser, the page is read, and an exit 0 that connects ends Connected', async () => {
+  const output = { text: '' };
+  const t = guidedService(output);
+  await t.svc.mcp.add({ id: 'guided1', label: 'Guided', transport: 'http', url: 'https://mcp.grafana.com/mcp' });
+  const started = await t.svc.beginMcpLogin('guided1', { remote: false });
+  assert.equal(started.mode, 'embedded');
+  assert.deepEqual(t.minted[0]!.args, ['mcp', 'login', 'guided1'], 'the CLI opens the browser itself');
+  assert.equal(started.flow.step, 'starting');
+  assert.equal(started.flow.remote, false);
+  assert.equal(Date.parse(started.flow.deadline) - Date.parse(started.flow.startedAt), 5 * 60_000);
+
+  output.text = `Opening ${AUTH}\r\n`;
+  const reading = t.svc.mcpLoginFlow('guided1')!;
+  assert.equal(reading.step, 'approve');
+  assert.equal(reading.authUrl, AUTH);
+  assert.throws(() => t.svc.pasteMcpLogin('guided1', 'http://localhost:1/callback?code=x'), /approve in the browser/);
+
+  t.end();
+  await t.svc.finishMcpLogin('guided1', { id: 's1', code: 0, bridged: true });
+  const ended = t.svc.mcpLoginFlow('guided1')!;
+  assert.equal(ended.step, 'connected');
+  assert.deepEqual(t.dismissed, ['s1'], 'the exited sign-in terminal is cleared');
+});
+
+test('from elsewhere: --no-browser, the paste-back is checked and typed into the CLI', async () => {
+  const output = { text: '' };
+  const t = guidedService(output);
+  await t.svc.mcp.add({ id: 'guided2', label: 'Guided', transport: 'http', url: 'https://mcp.grafana.com/mcp' });
+  await t.svc.beginMcpLogin('guided2', { remote: true });
+  assert.deepEqual(t.minted[0]!.args, ['mcp', 'login', 'guided2', '--no-browser']);
+  assert.throws(() => t.svc.pasteMcpLogin('guided2', 'http://localhost:1/callback'), /carries no code/);
+  assert.deepEqual(t.typed, [], 'nothing refused reaches the terminal');
+
+  output.text = `Open this URL to sign in:\r\n${AUTH}\r\nPaste the redirect URL here: `;
+  assert.equal(t.svc.mcpLoginFlow('guided2')!.step, 'paste');
+  const pasted = t.svc.pasteMcpLogin('guided2', ' http://localhost:51234/callback?code=abc&state=s ');
+  assert.deepEqual(t.typed, ['http://localhost:51234/callback?code=abc&state=s\r']);
+  assert.equal(pasted.step, 'checking');
+});
+
+test('a sign-in left waiting runs out of time, and the sheet is told which step it stopped on', async () => {
+  const output = { text: `Open this URL:\r\n${AUTH}\r\n` };
+  const t = guidedService(output, { status: 'needs-auth' });
+  await t.svc.mcp.add({ id: 'guided3', label: 'Guided', transport: 'http', url: 'https://mcp.grafana.com/mcp' });
+  await t.svc.beginMcpLogin('guided3', { remote: true });
+  t.tick(5 * 60_000 + 1_000);
+  output.text += 'Error: timed out waiting for the redirect URL\r\n';
+  t.end();
+  await t.svc.finishMcpLogin('guided3', { id: 's1', code: 1, bridged: false });
+  const ended = t.svc.mcpLoginFlow('guided3')!;
+  assert.equal(ended.step, 'timed-out');
+  assert.match(ended.detail ?? '', /five minutes, waiting for the address the browser landed on to be pasted back/);
+  assert.match(ended.detail ?? '', /timed out waiting for the redirect URL/);
+});
+
+test('an exit 0 that does not connect is a failure with the server\'s own answer, and Try again ends the old terminal', async () => {
+  const output = { text: '' };
+  const t = guidedService(output, { status: 'needs-auth' });
+  await t.svc.mcp.add({ id: 'guided4', label: 'Guided', transport: 'http', url: 'https://mcp.grafana.com/mcp' });
+  await t.svc.beginMcpLogin('guided4', { remote: false });
+  const removes = () => t.calls.filter((call) => call.args[1] === 'remove').length;
+  assert.equal(removes(), 0);
+  await t.svc.beginMcpLogin('guided4', { remote: false });
+  assert.deepEqual(t.killed, ['s1'], 'two terminals never wait on one sign-in');
+  assert.equal(removes(), 1, 'the closed terminal\'s bridged definition is taken back before the new one');
+  t.end();
+  await t.svc.finishMcpLogin('guided4', { id: 's2', code: 0, bridged: false });
+  const ended = t.svc.mcpLoginFlow('guided4')!;
+  assert.equal(ended.step, 'failed');
+  assert.match(ended.detail ?? '', /still answers needs-auth/);
+});
+
+test('a flow nobody finished reads timed out a minute past the deadline, whatever the terminal does', async () => {
+  const output = { text: '' };
+  const t = guidedService(output);
+  await t.svc.mcp.add({ id: 'guided5', label: 'Guided', transport: 'http', url: 'https://mcp.grafana.com/mcp' });
+  await t.svc.beginMcpLogin('guided5', { remote: false });
+  t.tick(6 * 60_000 + 1_000);
+  const stale = t.svc.mcpLoginFlow('guided5')!;
+  assert.equal(stale.step, 'timed-out');
+  assert.match(stale.detail ?? '', /waiting for the Claude CLI to print the sign-in page/);
 });

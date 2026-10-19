@@ -717,6 +717,82 @@ function endsDeniedWait(denied: NonNullable<LaneSignals['waitDenied']>, event: S
  * thrown — a throw here reaches the CLI as a failed hook, and a failed hook
  * is fail-open.
  */
+/** How many detached-job paths a lane keeps (`LaneSignals.detachedPaths`). */
+const DETACHED_PATHS_KEPT = 32;
+/** A command that takes its job out of the session's process group. */
+const DETACHES = /(?:^|[\s;&|(])(?:setsid|nohup|disown)(?:\s|$)/;
+
+/**
+ * The absolute paths a DETACHING command names (#292) — its log, its exit
+ * sentinel, its pid file — or none when it detaches nothing.
+ */
+export function detachedPathsOf(command: string): string[] {
+  if (!DETACHES.test(command)) return [];
+  return [...new Set([...command.matchAll(/(?:^|[\s'"=>(])(\/[^\s'";&|)<>]+)/g)].map((m) => m[1]!))]
+    .filter((path) => !path.startsWith('/dev/'));
+}
+
+/**
+ * Does a minted `cmd:` ref read a file a detached job of this session names?
+ * Then the job outlives a checkpoint, and the ref can land (#292).
+ */
+export function watchesDetachedJob(ref: string | null | undefined, signals: Pick<LaneSignals, 'detachedPaths'>): string | null {
+  if (!ref?.startsWith('cmd:') || !signals.detachedPaths?.length) return null;
+  return signals.detachedPaths.find((path) => ref.includes(path)) ?? null;
+}
+
+/** `pgrep`/`pkill` flags that take an argument — the pattern is never the word after one. */
+const PROC_FLAG_ARGS = new Set(['-u', '-U', '-g', '-G', '-P', '-s', '-t', '-F', '-J', '-M', '-N', '--signal']);
+
+/**
+ * A wait loop whose `pgrep -f` / `pkill -f` pattern matches its OWN command line
+ * (one-pool phase 24, #260) — the pattern, as `pgrep` reads it, or `null`.
+ *
+ * `-f` matches against every process's full argument list, and the loop runs
+ * inside a shell whose argument list IS this command: `zsh -c 'until ! pgrep -f
+ * "validate.sh plan" …'` carries the pattern's own text, so the probe can never
+ * see zero matches and the loop never ends (control-tower P131 and P134, both
+ * stalled the same night until a steer). Only a LOOP is read — a one-shot
+ * `pgrep -f` answers once and moves on — and the pattern is read as literal
+ * text, never compiled (see below): `[v]alidate.sh` is the classic spelling
+ * that does not match itself, and it passes.
+ */
+export function selfMatchingProbe(command: string): string | null {
+  const folded = foldWhitespace(command);
+  if (!/(?:^|[\s;&|({!])(?:until|while)\s/.test(folded)) return null;
+  const tokens = [...folded.matchAll(/"([^"]*)"|'([^']*)'|([^\s;&|()]+)|([;&|()]+)/g)]
+    .map((m) => ({ text: m[1] ?? m[2] ?? m[3] ?? '', separator: m[4] !== undefined }));
+  for (let i = 0; i < tokens.length; i++) {
+    const lead = tokens[i]!;
+    if (lead.separator || !/^(?:.*\/)?(?:pgrep|pkill)$/.test(lead.text)) continue;
+    let full = false;
+    let pattern: string | null = null;
+    for (let j = i + 1; j < tokens.length && !tokens[j]!.separator; j++) {
+      const word = tokens[j]!.text;
+      if (/^-[A-Za-z]+$/.test(word)) {
+        if (word.includes('f')) full = true;
+        if (PROC_FLAG_ARGS.has(word)) j++;
+        continue;
+      }
+      if (word === '--full') { full = true; continue; }
+      if (/^(?:>|<|[0-9]>)/.test(word)) continue;
+      pattern = word;
+      break;
+    }
+    if (!full || !pattern) continue;
+    // Never compiled: the pattern is a session's text, and a regex built from
+    // it in the console's own process is a pattern that can stall the hook.
+    // Read literally instead — the pattern's own text sits in the command, so
+    // it matches itself — except for the two spellings that cannot: a bracket
+    // expression (`[v]alidate.sh`, the classic fix) and a `^` anchor, which
+    // the loop's shell, `zsh -c …`, never starts with.
+    if (/[[\]]/.test(pattern) || pattern.startsWith('^')) continue;
+    const literal = pattern.replace(/\\(.)/g, '$1').replace(/\$$/, '');
+    if (command.includes(pattern) || (literal && command.includes(literal))) return pattern;
+  }
+  return null;
+}
+
 export function inTurnWait(command: string, env: VerifyEnv | undefined): string | null {
   if (!env || !command.trim()) return null;
   try {
@@ -2072,6 +2148,14 @@ export type LaneSignals = {
    */
   ownPids?: number[];
   /**
+   * The paths named by a Bash call that DETACHED a job (`setsid`, `nohup`,
+   * `disown`) — newest last, at most `DETACHED_PATHS_KEPT` (one-pool phase 24,
+   * #292). A detached job is out of the session's process group, so it OUTLIVES
+   * the checkpoint that parks a long own-job wait: a sentinel it writes is worth
+   * a watch, where a plain `&` job's is not (#121). Absent until one.
+   */
+  detachedPaths?: string[];
+  /**
    * The loopback ports this session SERVED on — read off its Bash calls that
    * start a server (`--port 8151`, `-p 8151` beside a serve verb, `PORT=8151`,
    * `http.server 8000`), newest last (control-tower phase 89, #41): a refused
@@ -2455,6 +2539,10 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number,
           ...(call.id ? { id: call.id } : {}),
         });
         if (calls.length > LOOP_WINDOW) calls.splice(0, calls.length - LOOP_WINDOW);
+        if (call.name === 'Bash' && call.summary) {
+          const paths = detachedPathsOf(call.summary);
+          if (paths.length) signals.detachedPaths = [...new Set([...(signals.detachedPaths ?? []), ...paths])].slice(-DETACHED_PATHS_KEPT);
+        }
         if (call.name === 'Bash' && call.summary?.includes('$!') && event.detail) {
           const pids = announcedPids(event.detail);
           if (pids.length) signals.ownPids = [...new Set([...(signals.ownPids ?? []), ...pids])].slice(-OWN_PIDS_KEPT);

@@ -112,12 +112,12 @@
  * written before this still name it — and is no longer produced.
  */
 
-import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { copyFile, cp, lstat, mkdir, mkdtemp as mkdtempAsync, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { availableParallelism, loadavg, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
-import { DEFAULT_BASE_BRANCH, PUSH_ARGV } from '../../shared/landing-model.js';
+import { DEFAULT_BASE_BRANCH, PROOF_FETCH_ARGV, PUSH_ARGV } from '../../shared/landing-model.js';
 import { normalizeToken, SHARED_CHECKOUT_TOKEN } from '../../shared/scope.js';
 import {
   pairKey, qualifiedRef,
@@ -157,12 +157,12 @@ const GIT_TIMEOUT_MS = 120_000;
  */
 export type GitRun = { ok: boolean; stdout: string; stderr: string };
 
-async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<GitRun> {
+async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv, timeout = GIT_TIMEOUT_MS): Promise<GitRun> {
   const run = await shell('git', args, {
     channel: 'git',
     intent: 'worktree',
     cwd,
-    timeout: GIT_TIMEOUT_MS,
+    timeout,
     // Nothing below parses git's prose, and pinning the locale keeps it that
     // way — the same reasoning as `server/git.ts`.
     //
@@ -2135,6 +2135,61 @@ export type LandResult =
   | { kind: 'failed'; detail: string };
 
 /**
+ * How old an `index.lock` must be before nothing could be holding it (one-pool
+ * phase 20, #328). A git command holds the lock for the seconds it writes the
+ * index; two minutes is a hundred times that, and still far short of the five
+ * hours one sat in a run's mirror while nothing said so.
+ */
+export const INDEX_LOCK_ORPHAN_MS = 2 * 60_000;
+
+/** An `index.lock` no git command is writing: the tree it blocks, its path and its age. */
+export type OrphanIndexLock = { tree: string; path: string; mtime: string; ageMs: number };
+
+/**
+ * The git directory a working tree's index lives in — `.git` itself, or the
+ * linked worktree's `gitdir:` — read from disk, never shelled. Null when the
+ * directory is not a git working tree.
+ */
+export function indexDirOf(tree: string): string | null {
+  const dotGit = join(tree, '.git');
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'))?.[1]?.trim();
+    return pointer ? resolve(tree, pointer) : null;
+  } catch { return null; }
+}
+
+/**
+ * Every `index.lock` in `trees` older than `olderThanMs` (#328). Measured: a
+ * 0-byte lock in a run's integration mirror, no process holding it, blocked
+ * every index write there for ~5 h, and the merge that met it came back
+ * `failed` — a kind nothing halts on. A lock this old outlived the command
+ * that took it; the caller names it and halts the lane rather than wedge.
+ * Never removed here: whether a person's git is mid-write is theirs to say.
+ */
+export function orphanIndexLocks(
+  trees: readonly string[], opts: { now?: number; olderThanMs?: number } = {},
+): OrphanIndexLock[] {
+  const now = opts.now ?? Date.now();
+  const floor = opts.olderThanMs ?? INDEX_LOCK_ORPHAN_MS;
+  const out: OrphanIndexLock[] = [];
+  const seen = new Set<string>();
+  for (const tree of trees) {
+    const dir = indexDirOf(tree);
+    if (!dir) continue;
+    const path = join(dir, 'index.lock');
+    if (seen.has(path)) continue;
+    seen.add(path);
+    let mtimeMs: number;
+    try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
+    const ageMs = Math.max(0, now - mtimeMs);
+    if (ageMs < floor) continue;
+    out.push({ tree, path, mtime: new Date(mtimeMs).toISOString(), ageMs });
+  }
+  return out;
+}
+
+/**
  * Fold a settled lane's commits into the run branch.
  *
  * Fast-forward first, because the common case — one lane at a time, or two
@@ -3494,8 +3549,16 @@ export type LandingProof = {
    * `unknown` — git could not answer (`detail`). Only `contained` is landed.
    */
   state: 'contained' | 'ahead' | 'conflicted' | 'unknown';
-  /** How a `contained` branch is held: reachable from the target, or merging into it changes nothing. */
-  by?: 'ancestry' | 'content';
+  /**
+   * How a `contained` branch is held: reachable from the target, merging into
+   * it changes nothing, or merging into one of the target's own commits
+   * changed nothing there — a squash the trunk has moved past (`at`).
+   */
+  by?: 'ancestry' | 'content' | 'merge-commit';
+  /** The trunk commit a `merge-commit` proof found holding the branch — its squash, or its pull request's merge. */
+  at?: string;
+  /** Whether `origin/<trunk>` was fetched before the proof (#370); absent for a repository with no remote copy. */
+  fetched?: 'fetched' | 'failed';
   /** The paths behind an `ahead` or `conflicted` verdict, capped at `LANDING_FILE_CAP`. */
   files: string[];
   /** The tree `merge-tree --write-tree` wrote, when the merge was clean. */
@@ -3511,17 +3574,53 @@ const LANDING_FILE_CAP = 20;
  * branch merged into a local `main` nobody pushed has landed nowhere anyone
  * else can see — and the fleet's own hygiene judges a branch by
  * `origin/<trunk>` too. The local trunk only for a repository that has no
- * remote copy of it at all. No `fetch`: the console never talks to a remote
- * (`never-push.test.ts`), so the proof is as fresh as the last fetch a session,
- * a person or a landing made.
+ * remote copy of it at all.
+ *
+ * FETCHED first (one-pool phase 21, #370): a run mirror nobody had fetched
+ * since its start held `origin/main` two days old, and called a branch the
+ * supervisor had squash-merged that morning unlanded. `fetchTrunk` moves the
+ * remote-tracking ref of the trunk alone and nothing else; a fetch that fails
+ * (offline, a remote that refuses) leaves the proof as fresh as the last fetch
+ * and says so (`fetched`).
  */
-async function landingTarget(repo: string): Promise<{ ref: string; into: string } | null> {
+async function landingTarget(repo: string, opts: { fetch?: boolean } = {}): Promise<{
+  ref: string; into: string; fetched?: 'fetched' | 'failed'; fetchDetail?: string;
+} | null> {
   const trunk = await defaultBranchOf(repo);
   if (!trunk) return null;
-  return await refExists(repo, `refs/remotes/origin/${trunk}`)
-    ? { ref: `refs/remotes/origin/${trunk}`, into: `origin/${trunk}` }
-    : { ref: `refs/heads/${trunk}`, into: trunk };
+  if (!(await refExists(repo, `refs/remotes/origin/${trunk}`))) return { ref: `refs/heads/${trunk}`, into: trunk };
+  const target = { ref: `refs/remotes/origin/${trunk}`, into: `origin/${trunk}` };
+  if (opts.fetch === false) return target;
+  const fetched = await fetchTrunk(repo, trunk);
+  return { ...target, fetched: fetched.ok ? 'fetched' : 'failed', ...(fetched.ok ? {} : { fetchDetail: fetched.detail }) };
 }
+
+/** How long the landing proof's fetch may take before the proof goes on with what it has. */
+const FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * The ONE fetch this console runs (one-pool phase 21, #370): `origin`'s
+ * `refs/heads/<trunk>` into `refs/remotes/origin/<trunk>`, and nothing else —
+ * no tags, no FETCH_HEAD, no submodules, no other ref. The literal opens with
+ * `PROOF_FETCH_ARGV`, and `never-push.test.ts` holds it to that shape and to
+ * this file.
+ */
+async function fetchTrunk(repo: string, trunk: string): Promise<{ ok: boolean; detail?: string }> {
+  if (!/^[A-Za-z0-9._/-]+$/.test(trunk) || trunk.startsWith('-') || trunk.includes('..')) {
+    return { ok: false, detail: `${JSON.stringify(trunk)} is not a branch name the proof fetches` };
+  }
+  const refspec = `+refs/heads/${trunk}:refs/remotes/origin/${trunk}`;
+  const argv = ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', 'origin', refspec];
+  // Written out rather than spread, for `pushRef`'s reason: the scanner sees a literal.
+  if (argv.slice(0, PROOF_FETCH_ARGV.length).join('\u0000') !== PROOF_FETCH_ARGV.join('\u0000')) {
+    throw new Error('fetchTrunk: the fetch argv drifted from PROOF_FETCH_ARGV (shared/landing-model.js)');
+  }
+  const run = await git(repo, argv, undefined, FETCH_TIMEOUT_MS);
+  return run.ok ? { ok: true } : { ok: false, detail: firstLine(run.stderr) || 'git fetch failed' };
+}
+
+/** How many of the trunk's own commits the merge-commit proof reads back, newest first. */
+const MERGE_COMMIT_SCAN = 100;
 
 /**
  * Prove one commit against a landing target — TREE containment, never `git
@@ -3538,9 +3637,50 @@ async function landingTarget(repo: string): Promise<{ ref: string; into: string 
  * no ref (its entry at the top of this file).
  */
 async function proveLanding(
-  repo: string, tip: string, target: { ref: string; into: string },
+  repo: string, tip: string, target: { ref: string; into: string; fetched?: 'fetched' | 'failed'; fetchDetail?: string },
 ): Promise<Omit<LandingProof, 'mount' | 'branch'>> {
-  const base = { tip, into: target.into, files: [] as string[] };
+  const base = {
+    tip, into: target.into, files: [] as string[],
+    ...(target.fetched ? { fetched: target.fetched } : {}),
+    ...(target.fetchDetail ? { detail: `the fetch failed (${target.fetchDetail}); proved against the last fetch` } : {}),
+  };
+  const verdict = await proveContent(repo, tip, target, base);
+  if (verdict.state !== 'ahead' && verdict.state !== 'conflicted') return verdict;
+  // A squash the trunk has moved past (one-pool phase 21, #336): the squash
+  // commit held every change of the branch the moment it landed, and later
+  // commits on the trunk — another merge, an edit to the same file — make
+  // merging the branch into the trunk's HEAD change something again.
+  const held = await mergeCommitHolding(repo, tip, target.ref);
+  return held ? { ...base, state: 'contained', by: 'merge-commit', at: held.at, tree: held.tree } : verdict;
+}
+
+/**
+ * The newest of the trunk's own first-parent commits since the branch forked
+ * (at most `MERGE_COMMIT_SCAN`) into which merging the branch changes nothing
+ * — the squash, or the pull request's merge commit — or null. The same
+ * `merge-tree` equality as the content proof, asked of a commit the trunk
+ * holds rather than of its head.
+ */
+async function mergeCommitHolding(repo: string, tip: string, ref: string): Promise<{ at: string; tree: string } | null> {
+  // The trunk's commits the branch does not reach: everything since the fork.
+  const listed = await git(repo, ['rev-list', '--first-parent', `--max-count=${MERGE_COMMIT_SCAN}`, ref, `^${tip}`]);
+  if (!listed.ok) return null;
+  for (const commit of listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean)) {
+    const [merged, own] = await Promise.all([
+      git(repo, ['merge-tree', '--write-tree', '--name-only', commit, tip]),
+      git(repo, ['rev-parse', '--verify', '--quiet', `${commit}^{tree}`]),
+    ]);
+    const tree = (merged.stdout.split('\n')[0] ?? '').trim();
+    if (merged.ok && own.ok && tree && tree === own.stdout.trim()) return { at: commit, tree };
+  }
+  return null;
+}
+
+/** The ancestry and content halves of `proveLanding`, against the target's head. */
+async function proveContent(
+  repo: string, tip: string, target: { ref: string; into: string },
+  base: { tip: string; into: string; files: string[]; fetched?: 'fetched' | 'failed'; detail?: string },
+): Promise<Omit<LandingProof, 'mount' | 'branch'>> {
   const ahead = await git(repo, ['rev-list', '--count', `${target.ref}..${tip}`]);
   if (ahead.ok && ahead.stdout.trim() === '0') return { ...base, state: 'contained', by: 'ancestry' };
   const [merged, own] = await Promise.all([
@@ -3569,7 +3709,7 @@ async function proveLanding(
   }
   return {
     ...base, state: 'unknown',
-    detail: firstLine(merged.stderr) || firstLine(ahead.stderr) || 'git could not merge the two trees in memory',
+    detail: firstLine(merged.stderr) || firstLine(ahead.stderr) || base.detail || 'git could not merge the two trees in memory',
   };
 }
 
@@ -3591,6 +3731,8 @@ export async function landingProofs(opts: {
   integration?: string;
   /** Mounts the idle settle detached (`RunState.mirrorSettled.mounts`). */
   settled?: readonly string[];
+  /** `false` proves against the remote-tracking ref as it stands, fetching nothing (#370's fetch is the default). */
+  fetch?: boolean;
 }): Promise<LandingProof[]> {
   const out: LandingProof[] = [];
   for (const rel of opts.mounts?.length ? opts.mounts : ['']) {
@@ -3601,7 +3743,7 @@ export async function landingProofs(opts: {
       if (existsSync(dir)) tip = await commitOf(dir, 'HEAD');
     }
     if (!tip) continue;
-    const target = await landingTarget(source);
+    const target = await landingTarget(source, { fetch: opts.fetch !== false });
     out.push(target
       ? { mount: rel, branch: opts.runBranch, ...(await proveLanding(source, tip, target)) }
       : { mount: rel, branch: opts.runBranch, tip, into: '', state: 'unknown', files: [], detail: 'the repository names no trunk to land on' });
@@ -3634,9 +3776,12 @@ async function squashLanded(repo: string, runBranch: string): Promise<{
   tip: string; target: { ref: string; into: string }; landed: string; tree?: string;
 } | null> {
   const tip = await commitOf(repo, `refs/heads/${runBranch}`);
-  const target = tip ? await landingTarget(repo) : null;
+  // No fetch: a re-seat runs at every boundary, and reads the last fetch the proof made.
+  const target = tip ? await landingTarget(repo, { fetch: false }) : null;
   if (!tip || !target) return null;
-  const proof = await proveLanding(repo, tip, target);
+  // The content proof alone: a re-seat repairs only a `content` squash, so the
+  // merge-commit scan (`proveLanding`'s third half) would be spent for nothing.
+  const proof = await proveContent(repo, tip, target, { tip, into: target.into, files: [] });
   if (proof.state !== 'contained' || proof.by !== 'content') return null;
   const landed = await commitOf(repo, target.ref);
   return landed && landed !== tip ? { tip, target, landed, ...(proof.tree ? { tree: proof.tree } : {}) } : null;

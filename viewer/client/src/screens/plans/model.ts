@@ -19,8 +19,8 @@
 
 import { describeRun, describeWord, type RunCtx, type StatusView } from '@shared/status-model.js';
 import { countsTowardAttention } from '@shared/attention-model.js';
-import { PLAN_STATUS_ORDER } from '@shared/plan-vocab.js';
-import type { UiState } from '@shared/status-vocab.js';
+import { PLAN_STATUS_ORDER, progressReading } from '@shared/plan-vocab.js';
+import { BOARD_STATE_UI, type BOARD_BUCKETS, type UiState } from '@shared/status-vocab.js';
 import type { EtaEstimate, InboxItem, PlanSummaryFull } from '@/data/api';
 import { asRunLike, type RunLike } from '@/data/lanes';
 import { isClosed as readClosed } from '@/lib/closure';
@@ -71,6 +71,11 @@ export interface PlanRow {
   stuck: number[];
   waiting: number;
   qaFailures: number[];
+  /**
+   * The open GATED phases — an overlay on next up and waiting (#360), read
+   * off the `/api/plans` summary (`gated`, server `analysis/stats.ts`).
+   */
+  gated?: number[];
   remainingSessions: number;
   eta?: EtaEstimate;
 
@@ -101,6 +106,9 @@ export interface PlanRow {
 }
 
 const DAY = 86_400_000;
+
+const phaseNumbers = (value: unknown): number[] =>
+  Array.isArray(value) ? value.filter((n): n is number => typeof n === 'number') : [];
 
 const stamp = (iso: string | null | undefined): number => {
   const ms = iso ? Date.parse(iso) : NaN;
@@ -180,6 +188,7 @@ export function toRows(
       stuck: plan.stuck ?? [],
       waiting: plan.waiting ?? 0,
       qaFailures: plan.qaFailures ?? [],
+      gated: phaseNumbers(plan.gated),
       remainingSessions: plan.remainingSessions ?? 0,
       eta: plan.eta,
 
@@ -261,69 +270,209 @@ export function markLabel(row: PlanRow): string {
 }
 
 /* ------------------------------------------------------------------ *
- * The line — a plan folded to labelled stations
+ * The counts — every phase of a plan, in proportion (#360)
  * ------------------------------------------------------------------ */
 
-/** One station of a row's track: a count or a phase, its board word, its paint. */
-export interface LineStation {
-  key: string;
-  label: string;
-  paint: UiState;
-  settled: boolean;
-  /** The phase this station IS, when it is one phase rather than a count. */
-  phase?: number;
-  count?: number;
+/**
+ * A plan's phases counted for the track and its legend. Every number but
+ * `gated` and `percent` is a SHARE of the track — they add up to `phases`,
+ * always, whatever the board said — so a segment's length is its count over
+ * the phase count and nothing is drawn twice.
+ *
+ * The five board buckets are the engine's (`BOARD_BUCKETS`). Two words are
+ * overlays on them and are placed so they never double-count: a phase whose
+ * QA verdict is a fail is carved out of done (or, failing that, waiting) as
+ * its own share, `heldByQa` — the engine counts it done while its dependents
+ * wait on it — and a gated phase stays in its bucket (next up or waiting),
+ * `gated` a mark drawn over those two, never a share. `rest` is whatever no
+ * bucket accounts for (an older server, a board that disagrees with the
+ * table) — the bare track. A closed plan counts what got done and what
+ * `neverRan`; an unread board counts its last good reading's done and the
+ * rest `unread`.
+ */
+export interface PlanCounts {
+  phases: number;
+  /** False when the engine could not read the board (#96) — the legend says the reading. */
+  known: boolean;
+  closed: boolean;
+  done: number;
+  heldByQa: number;
+  inProgress: number;
+  stuck: number;
+  ready: number;
+  waiting: number;
+  /** An overlay inside `ready` + `waiting`, never a share of its own. */
+  gated: number;
+  /** What no bucket accounts for — the legend's "N left". */
+  rest: number;
+  neverRan: number;
+  unread: number;
+  percent: number;
 }
 
-const boardPaint = (word: string): UiState => describeWord('board', word).paint as UiState;
+/** What `countsOf` reads — a row, or anything shaped like one. */
+export type CountsSource = Pick<
+  PlanRow,
+  | 'phases'
+  | 'done'
+  | 'percent'
+  | 'progress'
+  | 'lastGood'
+  | 'readyPhases'
+  | 'inProgress'
+  | 'stuck'
+  | 'waiting'
+  | 'qaFailures'
+  | 'gated'
+  | 'isClosed'
+>;
 
-/** A run of phases as one station when there are several, each its own when there are few. */
-function standing(phases: readonly number[], word: string, said: string, limit: number): LineStation[] {
-  const paint = boardPaint(word);
-  if (phases.length <= limit) {
-    return phases.map((phase) => ({
-      key: `${word}-${phase}`,
-      label: `P${phase} ${said}`,
-      paint,
-      settled: false,
-      phase,
-    }));
+const NO_COUNTS = {
+  done: 0,
+  heldByQa: 0,
+  inProgress: 0,
+  stuck: 0,
+  ready: 0,
+  waiting: 0,
+  gated: 0,
+  rest: 0,
+  neverRan: 0,
+  unread: 0,
+};
+
+/** Count a plan's phases for the track. No fetch: everything is on the `/api/plans` row. */
+export function countsOf(row: CountsSource): PlanCounts {
+  const phases = Math.max(0, row.phases || 0);
+  let room = phases;
+  /** Each share takes at most what the shares before it left: the sum is `phases`, always. */
+  const take = (n: number): number => {
+    const got = Math.max(0, Math.min(room, Math.floor(n) || 0));
+    room -= got;
+    return got;
+  };
+  const base = { phases, closed: row.isClosed, percent: row.percent ?? 0 };
+
+  if (row.progress === 'unknown') {
+    const done = take(row.lastGood?.done ?? 0);
+    return { ...base, ...NO_COUNTS, known: false, done, unread: room };
   }
-  return [{ key: word, label: `${phases.length} ${said}`, paint, settled: false, count: phases.length }];
+  if (row.isClosed) {
+    const done = take(row.done);
+    return { ...base, ...NO_COUNTS, known: true, done, neverRan: room };
+  }
+
+  const standing = new Set([...row.inProgress, ...row.stuck, ...row.readyPhases]);
+  const held = new Set(row.qaFailures.filter((phase) => !standing.has(phase))).size;
+  const doneBucket = take(row.done);
+  const inProgress = take(row.inProgress.length);
+  const stuck = take(row.stuck.length);
+  const ready = take(row.readyPhases.length);
+  const waitingBucket = take(row.waiting);
+  const fromDone = Math.min(held, doneBucket);
+  const fromWaiting = Math.min(held - fromDone, waitingBucket);
+  const gatedPhases = new Set(row.gated ?? []).size;
+  return {
+    ...base,
+    known: true,
+    done: doneBucket - fromDone,
+    heldByQa: fromDone + fromWaiting,
+    inProgress,
+    stuck,
+    ready,
+    waiting: waitingBucket - fromWaiting,
+    gated: Math.min(gatedPhases, ready + waitingBucket - fromWaiting),
+    rest: room,
+    neverRan: 0,
+    unread: 0,
+  };
+}
+
+/** One share of the track: its count, its words and its paint (`null` is the bare track). */
+export interface TrackSegment {
+  /** A board bucket by its own word, or one of the shares the buckets do not name. */
+  key: BoardBucket | 'held-by-qa' | 'rest' | 'never' | 'unread';
+  count: number;
+  /** The count in words — "41 done", "1 held by QA". */
+  label: string;
+  paint: UiState | null;
+  /** Drawn hatched: a share whose state is not known. */
+  hatch?: boolean;
+}
+
+type BoardBucket = (typeof BOARD_BUCKETS)[number];
+
+const QA_HELD_PAINT = describeWord('qa-result', 'fail').paint as UiState;
+
+/**
+ * The shares in the order the track draws them and the legend names them —
+ * what is done, what QA holds back from it, what stands (in progress, stuck,
+ * next up), what waits, what is left. Zero shares are dropped. Every paint is
+ * the board's own table (`BOARD_STATE_UI`); QA's hold is painted as QA words a
+ * fail. A closed plan's never-ran share is `skipped`, an unread one hatched.
+ */
+export function segmentsOf(counts: PlanCounts): TrackSegment[] {
+  const all: TrackSegment[] = [
+    { key: 'done', count: counts.done, label: `${counts.done} done`, paint: BOARD_STATE_UI.done },
+    {
+      key: 'held-by-qa',
+      count: counts.heldByQa,
+      label: `${counts.heldByQa} held by QA`,
+      paint: QA_HELD_PAINT,
+    },
+    {
+      key: 'in-progress',
+      count: counts.inProgress,
+      label: `${counts.inProgress} in progress`,
+      paint: BOARD_STATE_UI['in-progress'],
+    },
+    { key: 'stuck', count: counts.stuck, label: `${counts.stuck} stuck`, paint: BOARD_STATE_UI.stuck },
+    { key: 'ready', count: counts.ready, label: `${counts.ready} next up`, paint: BOARD_STATE_UI.ready },
+    {
+      key: 'waiting',
+      count: counts.waiting,
+      label: `${counts.waiting} waiting`,
+      paint: BOARD_STATE_UI.waiting,
+    },
+    { key: 'rest', count: counts.rest, label: `${counts.rest} left`, paint: null },
+    { key: 'never', count: counts.neverRan, label: `${counts.neverRan} never ran`, paint: 'skipped' },
+    {
+      key: 'unread',
+      count: counts.unread,
+      label: `${counts.unread} not read`,
+      paint: 'skipped',
+      hatch: true,
+    },
+  ];
+  return all.filter((segment) => segment.count > 0);
+}
+
+/** The legend's words, in the track's order: every non-zero count, the gate mark, the percentage. */
+function legendWords(row: CountsSource, nowMs?: number): string[] {
+  const counts = countsOf(row);
+  if (!counts.known) return [progressReading(row, nowMs).text];
+  const segments = segmentsOf(counts);
+  const words = segments.map((segment) => segment.label);
+  if (counts.gated > 0) {
+    // Right after the shares it marks — next up and waiting — which it lies within.
+    const marked = segments.findLastIndex((s) => s.key === 'ready' || s.key === 'waiting');
+    words.splice(marked + 1, 0, `${counts.gated} gated`);
+  }
+  return [...words, `${counts.percent} %`];
 }
 
 /**
- * The plan as a line folded to the stations a glance can read — the same
- * grammar the run row draws: what is done as one hollow station, every phase
- * that stands (in progress, stuck, next up) by name while they are few, and
- * what is left as one more. A closed plan paints only what got done; the rest
- * never ran, and the line says so rather than calling it ready.
- *
- * Empty for a board the engine could not read — the row draws the shared
- * reading instead (`progressReading`), never a line at 0 %.
+ * The one line under the track — "41 done · 1 held by QA · 1 in progress · 2
+ * stuck · 3 waiting · 25 left · 56 %", in the track’s own order; colour
+ * is never the only carrier. An unread board's legend is the shared reading
+ * (#96), never a line at 0 %.
  */
-export function lineOf(row: PlanRow): LineStation[] {
-  if (!row.phases || row.progress === 'unknown') return [];
-  const out: LineStation[] = [];
-  if (row.done > 0) {
-    out.push({ key: 'done', label: `${row.done} done`, paint: 'done', settled: true, count: row.done });
-  }
-  if (row.isClosed) {
-    const never = Math.max(0, row.phases - row.done);
-    if (never > 0) {
-      out.push({ key: 'never', label: `${never} never ran`, paint: 'skipped', settled: true, count: never });
-    }
-    return out;
-  }
-  out.push(...standing(row.inProgress, 'in-progress', 'in progress', 2));
-  out.push(...standing(row.stuck, 'stuck', 'stuck', 1));
-  out.push(...standing(row.readyPhases, 'ready', 'next up', 1));
-  const left = Math.max(
-    0,
-    row.phases - row.done - row.inProgress.length - row.stuck.length - row.readyPhases.length,
-  );
-  if (left > 0) out.push({ key: 'left', label: `${left} left`, paint: 'queued', settled: true, count: left });
-  return out;
+export function legendOf(row: CountsSource, nowMs?: number): string {
+  return legendWords(row, nowMs).join(' · ');
+}
+
+/** The track's accessible name: the plan, its phase count and every count in words. */
+export function countsLabel(row: CountsSource & Pick<PlanRow, 'title'>, nowMs?: number): string {
+  return `${row.title}, ${plural(row.phases, 'phase')}: ${legendWords(row, nowMs).join(', ')}`;
 }
 
 /**

@@ -170,6 +170,26 @@ export const VERIFICATION_WORDS = Object.freeze(
 );
 
 /**
+ * What the console says of ONE run of ONE §Verification line — the Run view's
+ * Verification fold (#331). Not the phase's verdict above, which is held at its
+ * width on purpose: a line can also be cut by its clock, which proves only that
+ * it ran past its limit — neither red nor green, and not "skipped" either,
+ * because it did run.
+ */
+export const VERIFICATION_LINE_WORDS = Object.freeze(
+  /** @type {const} */ ([
+    /** It ran and exited 0. */
+    'green',
+    /** It ran and exited non-zero. */
+    'red',
+    /** It ran, and the console's clock cut it at its limit: not judged. */
+    'timed-out',
+    /** This machine could not run it (its lead is missing): not judged. */
+    'skipped',
+  ]),
+);
+
+/**
  * @typedef {(typeof QA_DISPLAY_WORDS)[number]} QaWord
  */
 

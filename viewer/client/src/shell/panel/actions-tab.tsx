@@ -316,14 +316,18 @@ function MoveRow({
   const act = useQueueAct();
   const [armed, setArmed] = useState(false);
   const [minutes, setMinutes] = useState(DEFER_FOR[1]!.minutes);
+  // Arming a move: in Free it only arms; in Pro it also asks the check (above).
+  const press = { arm: () => setArmed(true) };
+
+  const extraOf = (): QueueMoveBody =>
+    move.verb === 'defer'
+      ? { until: new Date(Date.now() + minutes * 60_000).toISOString() }
+      : move.verb === 'requeue'
+        ? { position: 'front' }
+        : {};
 
   const fire = async () => {
-    const extra: QueueMoveBody =
-      move.verb === 'defer'
-        ? { until: new Date(Date.now() + minutes * 60_000).toISOString() }
-        : move.verb === 'requeue'
-          ? { position: 'front' }
-          : {};
+    const extra = extraOf();
     try {
       const pressed = await act.mutateAsync({ verb: move.verb, slug, phase, ...extra });
       if (pressed.state === 'asked') toast(pressed.words, 'info');
@@ -340,13 +344,15 @@ function MoveRow({
     }
   };
 
-  const words = needs ? (
-    <span className="block text-meta text-ink-muted">Needs {needs} on this console.</span>
-  ) : (
-    <span className="block text-meta text-ink-muted">{move.summary}</span>
-  );
+  const said = {
+    words: needs ? (
+      <span className="block text-meta text-ink-muted">Needs {needs} on this console.</span>
+    ) : (
+      <span className="block text-meta text-ink-muted">{move.summary}</span>
+    ),
+  };
   return (
-    <Line name={move.label} mono={false} words={words}>
+    <Line name={move.label} mono={false} words={said.words}>
       <span className="flex shrink-0 items-center gap-2">
         {move.verb === 'defer' && (
           <NativeSelect
@@ -365,9 +371,13 @@ function MoveRow({
         <Button
           size="sm"
           variant={armed ? 'primary' : 'default'}
-          disabled={Boolean(needs) || act.isPending}
+          disabled={
+            Boolean(needs) ||
+            act.isPending ||
+            false
+          }
           aria-label={`${armed ? 'Confirm' : 'Press'} ${move.label.replace('…', '')}`}
-          onClick={() => (armed ? void fire() : setArmed(true))}
+          onClick={() => (armed ? void fire() : press.arm())}
           onBlur={() => setArmed(false)}
         >
           {act.isPending ? 'Pressing…' : armed ? 'Confirm' : 'Press'}

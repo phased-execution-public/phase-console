@@ -9,7 +9,11 @@
 # (hub, tfar phase 32), and every session told to read that handoff read all of
 # them. Two consecutive prompts differed in ~21 lines.
 #
-# So a fan-out handoff now writes the shared boot once, as a template (`<N>` is
+# Since #338 the handoff itself holds no prompt at all — a pointer to
+# next-phase-prompt.sh, which composes at READ time, so a board that moved after
+# the scaffold is read as it is. What follows pins what that composer prints.
+#
+# So a fan-out now writes the shared boot once, as a template (`<N>` is
 # the phase's number, each `⟨slot⟩` line is filled from the phase's own block),
 # and under `### Phase N — <title>` only what is that phase's: its size, model
 # and scope, and the parts of the prompt that differ — always its reading list,
@@ -70,9 +74,12 @@ same_or_diff() {  # same_or_diff <want> <got>
   return 1
 }
 
-@test "HF-1: a fan-out handoff writes the shared boot once and each phase only its own delta" {
+@test "HF-1: the fan-out writes the shared boot once and each phase only its own delta" {
+  # Composed at read time (#338) — the handoff holds a pointer to this, never a copy.
   pe_newho fanout 1 root complete >/dev/null
-  local body; body="$(handoff phase-01-root.md)"
+  run pe_nextp fanout 1
+  [ "$status" -eq 0 ] || false
+  local body="$output"
   # The boilerplate, once — not once per unblocked phase.
   [ "$(printf '%s\n' "$body" | grep -c '^/phased-execution$')" -eq 1 ]
   [ "$(printf '%s\n' "$body" | grep -c '^Waiting without polling')" -eq 1 ]
@@ -85,8 +92,7 @@ same_or_diff() {  # same_or_diff <want> <got>
   assert_contains "$body" '- **Size:** L · **Model:** `claude-opus-5-5[1m]` · **Scope:** `core`'
   assert_contains "$body" '- **Size:** M · **Model:** `claude-opus-5-5[1m]` · **Scope:** `core`'
   assert_contains "$body" '- **Size:** S · **Model:** `claude-sonnet-5` · **Scope:** `site`'
-  # … its reading list — the handoff being written is the first thing each
-  # unblocked phase reads, so it is named although the file lands last …
+  # … its reading list — the handoff is the first thing each unblocked phase reads …
   [ "$(printf '%s\n' "$body" | grep -c '^- docs/handoffs/fanout/phase-01-root.md$')" -eq 3 ]
   # … and its notes: phase 2's own note reaches phase 2's block alone.
   [ "$(printf '%s\n' "$body" | grep -c "the stack's cache must be warm")" -eq 1 ]
@@ -95,6 +101,15 @@ same_or_diff() {  # same_or_diff <want> <got>
   assert_contains "$body" "⟨setup⟩"
   assert_contains "$body" "⟨gate⟩"
   assert_contains "$body" "⟨scope⟩"
+}
+
+@test "HF-1: the fan-out handoff itself freezes none of it — it points at the composer (#338)" {
+  pe_newho fanout 1 root complete >/dev/null
+  local body; body="$(handoff phase-01-root.md)"
+  assert_contains "$body" "next-phase-prompt.sh fanout 1"
+  refute_contains "$body" "boot-shared"
+  refute_contains "$body" "### Phase 2"
+  refute_contains "$body" "the stack's cache must be warm"
 }
 
 @test "HF-2: the shared boot plus a phase's own block composes to exactly its --boot-prompt" {
@@ -107,9 +122,9 @@ same_or_diff() {  # same_or_diff <want> <got>
   done
 }
 
-@test "HF-2: the handoff new-handoff.sh writes composes to each unblocked phase's --boot-prompt" {
+@test "HF-2: what the handoff's pointer prints composes to each unblocked phase's --boot-prompt" {
   pe_newho fanout 1 root complete >/dev/null
-  local body p; body="$(handoff phase-01-root.md)"
+  local body p; body="$(pe_nextp fanout 1)"
   for p in 2 3 4; do
     same_or_diff "$(pg fanout --boot-prompt "$p")" "$(compose "$p" "$body")" || { echo "phase $p" >&2; false; }
   done
@@ -164,11 +179,11 @@ same_or_diff() {  # same_or_diff <want> <got>
   same_or_diff "$(pg fanout --boot-prompt 2)" "$(compose 2 "$output")"
 }
 
-@test "a single unblocked phase is not a fan-out: its handoff and its banner keep the whole prompt" {
+@test "a single unblocked phase is not a fan-out: its banner keeps the whole prompt" {
   setup_docs linear linear
   pe_newho linear 1 first complete >/dev/null
   local body; body="$(cat "$DOCS_ROOT/docs/handoffs/linear/phase-01-first.md")"
-  assert_contains "$body" "start Phase 2 in this fresh session"
+  assert_contains "$body" "next-phase-prompt.sh linear 1"
   refute_contains "$body" "boot-shared"
   run pe_nextp linear 1
   [ "$status" -eq 0 ] || false

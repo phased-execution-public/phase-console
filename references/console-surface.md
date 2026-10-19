@@ -368,7 +368,7 @@ much as an edit. Never make two status checks in a row (`ListAgents`, `TaskOutpu
 |---|---|
 | **Work remains** | keep working; a background result arrives by itself as a `<task-notification>`. |
 | **You need a subagent's answer** (a reviewer's verdict) | dispatch the `Agent` in the FOREGROUND; the call returns with the answer and costs nothing while it runs. |
-| **You need your own shell job and nothing else is left** | wait in ONE foreground call bounded by the Bash timeout: `until <probe>; do sleep 10; done` with `timeout: 600000`, at most once per ten minutes. The console allows a wait on your own job; it refuses one on somebody else's clock. |
+| **You need your own shell job and nothing else is left** | wait in ONE foreground call bounded by the Bash timeout: `until <probe>; do sleep 10; done` with `timeout: 600000`, at most once per ten minutes. The console allows a wait on your own job; it refuses one on somebody else's clock. Never wait on `pgrep -f` text that is in your own command — the loop's shell matches it and the wait never ends; wait on the job's pid (`while kill -0 <pid>`) or a sentinel it writes (`until [ -f x.exit ]`). The guard refuses such a loop with the two forms that end (#260). |
 | **Only subagents or monitors running in the background are left** | end your turn; the session stays alive and their notification wakes you. They are stopped ten minutes after your turn ends — dispatch a subagent that may take longer in the FOREGROUND. A background SHELL dies when your turn ends — never end it with one you still need. The Stop hook lets that turn end (`hook.stop-awaiting`), and liveness does not read the quiet as `silent` until `stallLocalJobMs`. |
 | **Somebody else's clock** (CI, a deploy, a person) | commit, hand off `in-progress`, `phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --watch <ref>`, stop. |
 
@@ -631,6 +631,28 @@ What that means for a session:
 - **`withdrawn`** is the rung outcome of a lane that never spawned — a sibling took the scope, or a park
   withdrew the queue entry it waited in. It costs nothing, counts toward no cap and leaves the rung
   climbable; a boot prompt that follows one is simply the next attempt.
+- **Your tree's git is the console's git too** (one-pool phases 2 and 20). The console runs its own git
+  in your tree — verification, the landing, the merge-back — with `GIT_CONFIG_NOSYSTEM=1` and
+  `core.hooksPath=/dev/null`, and it will not run there over a configuration a session planted: a hook
+  path, an fsmonitor, a driver or a credential helper in the tree's git config halts the phase
+  `run-tree-config` ("A session changed its tree's git configuration in a way the console will not
+  run.", journalled `phase.run-tree-config`), with the key named, before any verification or landing
+  git runs. An `index.lock` older than two minutes that no git command is writing halts it
+  `run-tree-locked` ("A git lock file nothing is writing blocks the run's tree."), with the path named,
+  rather than wedging every index write. Both are phase-level: the run boards its other candidates.
+  Never `git config` a hook or a helper into a run tree, and never leave a `git` running in the
+  background past your turn.
+- **A loaded machine holds new work, never yours** (one-pool phase 26, #243 #223 #327). The scheduler
+  admits no NEW lane while the share of CPU busy over the last 30 s is at or above its limit — 85 % at
+  the default `loadGuardFactor` of 1.5, scaled by the factor, held to 5–98 % — or the 5-minute load
+  average is above its ceiling, factor × cores × 2; `0` switches the guard off, and a running lane is
+  never touched. A held admission says which ("the machine is busy — CPU 91 % over the last 30 s, over
+  85 % …"). A HEAVY §Verification or baseline line — a suite, a build, a gate — also takes a seat in
+  one machine-wide budget (cores / 7, at least 1) that every console on the machine shares; while it
+  waits for one it is journalled `phase.verify-queued` and the lane's note reads "verification queued
+  — …", then `phase.verify-dequeued` when it runs. That is a queue, not a hang: the line runs exactly as
+  written once seated, and nothing you do in the session moves it. A session's own orphaned test
+  runners are reaped when it ends, unless it parked.
 
 ## Budgets that stop work — and the verb that raises one
 

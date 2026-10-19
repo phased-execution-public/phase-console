@@ -83,7 +83,12 @@
     background: var(--state);
     box-shadow: 0 0 0 2px var(--station-ground);
   }
+  /* The words sit ABOVE every line the track draws (#299): the line is drawn
+     beside or after them, never through them, and should a line ever reach
+     under a label it is painted behind it, not over it. */
   .ui-station-label {
+    position: relative;
+    z-index: 1;
     min-width: 0;
     overflow-wrap: anywhere;
   }

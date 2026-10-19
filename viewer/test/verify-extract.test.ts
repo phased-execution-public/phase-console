@@ -38,7 +38,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { extractCommands } from '../server/runner/verify.ts';
+import { VERIFY_LEADS, extractCommands } from '../server/runner/verify.ts';
 
 const only = (text: string) => extractCommands(text);
 const runs = (command: string) => only(`\`${command}\``).commands;
@@ -632,5 +632,23 @@ test('an approval relaxes only a real program the runner does not know — never
   for (const text of ['!grep x', '**Verification:**', 'docs/plans/demo.md', 'changed']) {
     const out = extractCommands(`\`${text}\``, 'verify', { approve: new Set([verifyModule.commandFingerprint(text)]) });
     assert.deepEqual(out.commands, [], text);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The leads a plan's author is told (one-pool phase 27, #310)
+ * ------------------------------------------------------------------ */
+
+test('VX-LEADS (#310): every lead the author\'s prompt names is one the runner recognises, and shasum/cmp are not', () => {
+  assert.ok(VERIFY_LEADS.length > 40, 'the whole table, not a sample');
+  assert.deepEqual([...VERIFY_LEADS], [...VERIFY_LEADS].sort(), 'sorted, as the prompt says them');
+  for (const lead of VERIFY_LEADS) {
+    const unknown = held(`${lead} x`).filter((one) => one.code === 'unknown-lead');
+    assert.deepEqual(unknown, [], `${lead} is recognised as a lead`);
+  }
+  // The two the Solve author reached for (job 4145220a5d71): refused by lead, so never named.
+  for (const lead of ['shasum', 'cmp']) {
+    assert.ok(!VERIFY_LEADS.includes(lead), `${lead} is not offered`);
+    assert.ok(held(`${lead} a b`).some((one) => one.code === 'unknown-lead'), `${lead} is refused as an unknown lead`);
   }
 });

@@ -20,6 +20,7 @@
 
 import { RefreshCw } from 'lucide-react';
 import { useAccountRefresh } from '@/data/accounts';
+import { apiKeyWords } from '@/lib/account-line';
 import type { AccountView } from '@/data/api';
 import { usePolicy } from '@/data/policy';
 import { cn } from '@/lib/cn';
@@ -42,6 +43,9 @@ import {
   SETTLE_STRATEGIES,
   WORKTREE_RETENTION,
 } from '@shared/worktree-model.js';
+import type { ReactNode } from 'react';
+import type { Source } from './model/seed';
+import type { FieldEffect } from './fields';
 import type { UltraReviewMode } from '@shared/run-lifecycle.js';
 import type { CategoryId } from './model/categories';
 import { NumberField, PressField, SelectField, SetupField, ToggleField } from './fields';
@@ -149,13 +153,39 @@ export function ModelSection() {
   );
 }
 
+/** What a model control is told — `SelectField`'s shape, with the form's own list. */
+type ModelChoiceProps = {
+  label: string;
+  hint?: string;
+  source?: Source;
+  effect?: FieldEffect | undefined;
+  value: string;
+  placeholder: string;
+  options: readonly (readonly [string, string])[];
+  onChange: (next: string) => void;
+};
+
+/**
+ * The form's model control, written once (one-pool phase 11). The free edition offers the
+ * server's own list in a select; Pro swaps in the catalog picker every other page uses (phase
+ * 9's `LazyModelPicker`) — the Claude aliases and every provider's live list in one place.
+ */
+const MODEL_CHOICE: { current: (props: ModelChoiceProps) => ReactNode } = {
+  current: (props) => <SelectField {...props} />,
+};
+
+/** The model control the mode's edition draws. */
+function ModelChoice(props: ModelChoiceProps) {
+  return <>{MODEL_CHOICE.current(props)}</>;
+}
+
 function ModelPair() {
   const f = useSetupForm();
   if (!f.on('model') && !f.on('effort') && !f.on('modelPolicy')) return null;
   return (
     <div className={PAIR}>
       {f.on('model') && (
-        <SelectField
+        <ModelChoice
           label="Model"
           source={f.src('model')}
           effect={f.fx('model')}
@@ -208,6 +238,7 @@ export function PerPhaseSection() {
       servers={f.mcpServers}
       runMcp={f.values.mcpServers}
       runMode={f.on('permissionMode') ? f.values.permissionMode : ''}
+      accounts={f.accounts}
       onChange={(next) => f.set('phaseOptions', next)}
     />
   );
@@ -664,6 +695,7 @@ function AccountPool() {
   );
 }
 
+
 /** Who an account is — a name, else its email, else its id; the machine login by that name. */
 export function accountWho(account: AccountView): string {
   if (account.builtIn) return account.name ?? 'machine login';
@@ -707,6 +739,8 @@ export function accountOption(account: AccountView, accounts: readonly AccountVi
   const twin = twinOf(account, accounts);
   if (twin) return `${accountWho(twin)} — the machine login`;
   const who = accountWho(account);
+  const api = apiKeyWords(account);
+  if (api) return `${who} — ${api}`;
   return account.email && account.email !== who ? `${who} — ${account.email}` : who;
 }
 
@@ -715,6 +749,8 @@ function identityLine(id: string, accounts: readonly AccountView[]): string {
   const account =
     accounts.find((a) => a.id === id) ?? (id === 'default' ? accounts.find((a) => a.builtIn) : undefined);
   if (!account) return 'is not registered on this console';
+  const api = apiKeyWords(account);
+  if (api) return `is a ${api}`;
   const twin =
     twinOf(account, accounts) ??
     accounts.find((o) => o.id !== account.id && o.builtIn && sameLogin(o, account));
@@ -1128,7 +1164,7 @@ export function QaSection() {
       {three && (
         <div className={PAIR}>
           {f.on('qaModel') && (
-            <SelectField
+            <ModelChoice
               label="QA model"
               hint="The reviewer's own tier. A review is a different job from the build and is often worth a different model in either direction."
               source={f.src('qaModel')}

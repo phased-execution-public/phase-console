@@ -102,7 +102,14 @@ describe('the record kinds', () => {
     expect(verbsOf('plan')).toEqual(['start']);
     expect(verbsOf('trigger')).toEqual(['cancel-trigger']);
     expect(verbsOf('approval')).toEqual(['approve', 'deny']);
-    expect(verbsOf('console')).toEqual(['runs', 'status', 'queue', 'accounts', 'approvals', 'queue-policy']);
+    expect(verbsOf('console')).toEqual([
+      'runs',
+      'status',
+      'queue',
+      'accounts',
+      'approvals',
+      'queue-policy',
+    ]);
     // A positional `phase`, a `:n` in the route, and the switch's rows that read `body.phase`.
     expect(verbsOf('phase')).toEqual(
       expect.arrayContaining([

@@ -261,6 +261,9 @@ export const AUTHORITY_METHODS: Readonly<Record<string, AuthorityVerb>> = Object
   answerQuestion: 'answer',
   decidePlan: 'plan-approve',
   delegatePhase: 'trust',
+  // One §Verification line waived for one phase, mid-run (one-pool phase 21,
+  // #267): the owner's word that its red is not the phase's.
+  waiveVerifyLine: 'override',
   approveGate: 'gate-approve',
   checkHumanStep: 'attest',
   dismissHumanStep: 'decline',

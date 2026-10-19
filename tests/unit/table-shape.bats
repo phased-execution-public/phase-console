@@ -180,3 +180,22 @@ load ../helpers/test_helper
   [ "$status" -eq 0 ]
   assert_contains "$output" "LINT OK"
 }
+
+@test "F21: two '### Phase N' sections fail the lint by name, and every reader takes the FIRST section (#228)" {
+  setup_docs duplicate-phase duplicate-phase
+  run pg duplicate-phase --lint
+  [ "$status" -eq 1 ]
+  assert_contains "$output" 'phase 1: phase-section-repeated — "### Phase 1" heads 2 sections'
+  # The per-phase reads answer the first section's bullets, never the second's.
+  run pg duplicate-phase --permission-mode 1
+  [ "$output" = "$(printf 'acceptEdits\tphase')" ]
+  run pg duplicate-phase --size 1
+  [ "$output" = "S" ]
+  run pg duplicate-phase --model 1
+  [ "$output" = "sonnet" ]
+  # A plan with one section per phase is untouched by the check.
+  setup_docs linear linear
+  run pg linear --lint
+  [ "$status" -eq 0 ]
+  ! printf "%s" "$output" | grep -q "phase-section-repeated"
+}

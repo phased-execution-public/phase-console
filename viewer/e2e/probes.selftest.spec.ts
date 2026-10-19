@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 import { axeFindings, focusFindings, layoutFindings, still, type Finding } from './lib/probes.ts';
+import { fixture, visit } from './lib/shots.ts';
 
 // The probes must FAIL on a page that is broken the ways this console has
 // actually been broken. A probe that reports nothing on a clean page proves
@@ -201,10 +202,20 @@ test.describe('the probes see the real console', () => {
   // start a frame later — up to 12 frames of them on the plan page. Read
   // mid-cascade, text is the old theme's ink on the new ground: gate 3 of
   // control-tower phase 34 failed on exactly that, gone a moment later.
+  //
+  // The page the switch is made on is held still first (#289, #302, #313): the
+  // red was never the switch, it was the Runs page's data landing — or its
+  // relative times ticking over — mid-reading, at a load of 4.5 as well as 70.
+  // So the clock is the fake one the tour fixes (`visit`: Date pinned ten
+  // minutes after the seed's anchor, every relative time reading the same), the
+  // first switch waits until nothing has been in flight for 400 ms, and the
+  // reading is polled, bounded: a frame on which nothing moves must come, and a
+  // page that animates for ever still fails.
   test('still: after a theme switch nothing is left running for a reading to catch mid-flight', async ({
     page,
   }) => {
-    await page.goto('/#/runs');
+    const fx = await fixture();
+    await visit(page, { name: 'probe-still', hash: '#/runs' }, fx.anchor);
     await expect(page.locator('main')).toBeVisible();
     await page.emulateMedia({ colorScheme: 'light' });
     await still(page);
@@ -212,6 +223,6 @@ test.describe('the probes see the real console', () => {
     // What `still()` itself found on its last frame: a count read in a second
     // evaluate raced the live page (a row re-rendered a moment later started its
     // own transitions — one run in ten), which says nothing about the switch.
-    expect(await still(page)).toBe(0);
+    await expect.poll(() => still(page), { timeout: 15_000, intervals: [0, 250, 500] }).toBe(0);
   });
 });

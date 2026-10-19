@@ -116,3 +116,23 @@ export function useWidth(ref: RefObject<Element | null>, fallback: number): numb
   }, [ref]);
   return width;
 }
+
+/**
+ * A `Series` strip's parts in the SVG's own units: the band its name is written
+ * in, the strip's columns, the air under it, and the band the times are written
+ * in once, under the last strip. Here rather than beside the drawing because the
+ * door (`./lazy`) reserves the drawing's height before its chunk arrives, and the
+ * door may not import the chunk.
+ */
+export const SERIES = Object.freeze({
+  name: FIGURE_BAND,
+  strip: 34,
+  gap: 8,
+  times: Math.ceil(AXIS_PAINT.tickLength + FIGURE_TYPE + FIGURE_DESCENT),
+  side: 2,
+});
+
+/** How tall a `Series` is with `rows` strips. */
+export function seriesHeight(rows: number): number {
+  return Math.max(1, rows) * (SERIES.name + SERIES.strip + SERIES.gap) - SERIES.gap + SERIES.times;
+}

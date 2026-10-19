@@ -1214,7 +1214,37 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // take, and the answer (`run.run-requested`, `run.run-request-decided`). Free.
   // +1 from turn-by-turn phase 7: a stopped run a later run of its plan replaced
   // (`run.superseded`). Free.
-  assert.equal(kinds.length, 479 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
+  // +1 from one-pool phase 2 (#272): a session's planted git configuration
+  // halting its lane (`phase.run-tree-config`). Free — its row landed without
+  // this tally, which one-pool phase 5 found and added.
+  // +3 from one-pool phase 5: the spawn door mapping a model to an id the
+  // account serves and refusing one nothing on it serves
+  // (`phase.model-mapped`, `phase.model-unserved`), and an account's
+  // environment refused rather than degraded to the machine login
+  // (`run.account-env-refused`). Free.
+  // +4 from one-pool phase 20: an orphaned index.lock halting its lane
+  // (`phase.run-tree-locked`, #328), `Verify in: .` moved to a mirror's one
+  // mount (`phase.verify-in-mount`, #311), and a mirror grown — or refused its
+  // growth — at a boundary (`run.mirror-grown`, `run.mirror-grow-refused`,
+  // #356). Free.
+  // +2 from one-pool phase 22: a failing post-finish lint that was wholly a
+  // live sibling's half-written handoff (`phase.lint-sibling-skipped`, #225),
+  // and a resume re-reading its decision manifest (`run.decisions-reread`,
+  // #226). Free. And +1 from one-pool phase 21: a candidate held behind a
+  // kept lane in its tree (`run.lane-held`) — its row landed without
+  // this tally, which phase 22 found and added (its Pro twin,
+  // `phase.landing-kept`, counts itself through `proRows`).
+  // +2 from one-pool phase 23: a candidate held ahead of its own unmet
+  // dependency (`phase.dependency-held`, #288), and a held gate a live run
+  // found open when it read it again (`phase.gate-cleared`, #239). Free.
+  // +2 from one-pool phase 26 (#327): a heavy §Verification or baseline line
+  // waiting for its seat in the machine's heavy-job budget, and taking it
+  // (`phase.verify-queued`, `phase.verify-dequeued`). Free — their rows landed
+  // without this tally (`c1b9769b`), which phase 33's gate found.
+  // +3 from one-pool phase 39 (#380): a person's Queue move on a phase, its
+  // revert and its lapse (`phase.queue-ordered`, `phase.queue-order-reverted`,
+  // `phase.queue-order-lapsed`). Free — landed without this tally too (`9a465b01`).
+  assert.equal(kinds.length, 497 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]
@@ -1303,7 +1333,15 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // 64 since control-tower phase 130 (#207): `phase.turn-refused` — the guard
   // at the door of Your turn refusing a declared step — a refusal, and so
   // error through `refused`. (Exclusive bound, so it moves to 65.)
-  assert.ok(tally.error > 0 && tally.error < 65, `${tally.error} kinds read as error — check the vocabulary`);
+  // 65 since one-pool phase 5: `run.account-env-refused` — the console refusing
+  // to compose a session's environment for its account rather than run it on
+  // the machine login — a refusal, and so error through `refused`. (Exclusive
+  // bound, so it moves to 66.)
+  // 66 since one-pool phase 20 (#356): `run.mirror-grow-refused` — a mirror
+  // that could not grow to mount what its plan now names, so the run parks —
+  // a refusal, and so error through `refused`. (Exclusive bound, so it moves
+  // to 67.)
+  assert.ok(tally.error > 0 && tally.error < 67, `${tally.error} kinds read as error — check the vocabulary`);
   assert.ok(tally.warn > 0 && tally.warn < 80, `${tally.warn} kinds read as warn — check the vocabulary`);
 });
 

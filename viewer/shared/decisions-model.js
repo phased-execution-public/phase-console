@@ -160,12 +160,13 @@ export function decisionKeyOfNeed(word) {
  * regexes in `server/runner/situation.ts` (ZTD-3): a blocker class is its own
  * sub-kind; a decision key answers through the class that points at it
  * (`credentials` → `credential`, either permission key → `permission`,
- * `gates` → `gate`, `waits` → `external`); `human-acts` is the one key with a
- * sub-kind of its own spelling, which only the classifier says; a key no class
+ * `gates` → `gate`, `waits` → `external`); `human-acts` and `issues` are the
+ * keys with a sub-kind of their own spelling, which only the classifier says
+ * (`issues` since one-pool phase 14, #349 — it journalled `unknown`); a key no class
  * points at (say `budgets`) returns `null` and the prose cascade decides, as it
  * always did.
  * @param {string | undefined | null} word
- * @returns {NeedClass | 'human-acts' | null}
+ * @returns {NeedClass | 'human-acts' | 'issues' | null}
  */
 export function subKindOfNeed(word) {
   if (typeof word !== 'string') return null;
@@ -180,6 +181,9 @@ export function subKindOfNeed(word) {
   // sub-kind, read off the KEY — it used to fall to the prose and land in
   // `unknown`, so the park card could not say what was being asked.
   if (word === 'human-acts') return 'human-acts';
+  // What the run may write outward (one-pool phase 14, #349): the `issues`
+  // key, read as its own sub-kind — `blocked-declared:issues`, not `unknown`.
+  if (word === 'issues') return 'issues';
   for (const cls of NEED_CLASSES) {
     if (DECISION_KEY_OF_NEED[cls] === word) return cls;
   }

@@ -64,6 +64,8 @@ const row = (over: Partial<SessionRow> = {}): SessionRow => ({
   createdAt: AT,
   startedAt: AT + 60_000,
   record: { id: 'sess-1', cwd: '/work/hub', pid: 4242, shell: '/bin/zsh' },
+  // Every group kind is a badge word of its own (#369).
+  badge: over.kind ?? 'agent',
   ...over,
 });
 

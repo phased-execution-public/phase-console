@@ -406,7 +406,13 @@ test('the advisory family the documents name is exactly the one the engine emits
   // assertion below is the load-bearing one: every id NAMED must be emitted, and
   // sweeping standalone ids out of the whole file would collect F14 and F24 from
   // the gating sentence beside it and fail on lints that correctly do not warn.
-  const span = /\*\*advisory family ([^*]+)\*\*/.exec(skill)?.[1] ?? '';
+  // In Pro a second span names the Pro tree's own advisories — `**Pro advisory F44**`
+  // (one-pool phase 4) — inside a `!pro:` region, so the free tree, whose engine
+  // does not emit them, does not name them either.
+  const span = [
+    /\*\*advisory family ([^*]+)\*\*/.exec(skill)?.[1] ?? '',
+    ...[...skill.matchAll(/\*\*Pro advisory ([^*]+)\*\*/g)].map((m) => m[1]),
+  ].join(', ');
   const named = new Set<string>();
   for (const m of span.matchAll(/F(\d+)\s*[–-]\s*F?(\d+)/g)) {
     for (let n = Number(m[1]); n <= Number(m[2]); n++) named.add(`F${n}`);

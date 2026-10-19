@@ -1,8 +1,9 @@
 import { LEGACY_PLAN_TABS, PLAN_PHASE_VIEWS, PLAN_RUN_VIEWS, PLAN_TABS } from '@shared/route-meta.js';
 
 /**
- * The plan page's vocabulary (7.0, quiet-console phase 10): its three views
- * — Phases, Run, Source — and the readings of each. The ids come from
+ * The plan page's vocabulary (7.0, quiet-console phase 10): its four views
+ * — Phases, Run, Your turn (one-pool phase 14, #366), Source — and the
+ * readings of each. The ids come from
  * `shared/route-meta.js` (the server builds notification deep links from the
  * same lists); only the WORDS live here, and an id with no label falls back to
  * itself, so a view can never exist in the address and nowhere on the page.
@@ -15,12 +16,16 @@ import { LEGACY_PLAN_TABS, PLAN_PHASE_VIEWS, PLAN_RUN_VIEWS, PLAN_TABS } from '@
 export const PLAN_VIEW_LABELS: Record<string, string> = {
   phases: 'Phases',
   run: 'Run',
+  turn: 'Your turn',
   source: 'Source',
   // Retired tab ids keep a word: a bookmarked `#/plan/x/raw` renders for the
   // instant before its redirect lands, and should name what it becomes.
   route: 'Map',
   qa: 'QA',
   handoffs: 'Handoffs',
+  // The two short addresses (`PLAN_VIEW_ALIASES`), for the render before their hop lands.
+  schedule: 'Schedule',
+  burnup: 'Burn-up',
   analysis: 'Analysis',
   overview: 'Overview',
   raw: 'Raw',
@@ -61,7 +66,7 @@ export function resolveTab(segment: string | undefined): string {
 
 /* ---------------- Phases: the one grid's readings, and the map ---------------- */
 
-export type PhasesViewId = 'table' | 'map' | 'qa' | 'handoffs';
+export type PhasesViewId = 'table' | 'map' | 'qa' | 'handoffs' | 'schedule' | 'burnup';
 
 export const PHASES_VIEW_IDS = PLAN_PHASE_VIEWS as readonly PhasesViewId[];
 
@@ -70,6 +75,8 @@ export const PHASES_VIEW_LABELS: Record<PhasesViewId, string> = {
   map: 'Map',
   qa: 'QA',
   handoffs: 'Handoffs',
+  schedule: 'Schedule',
+  burnup: 'Burn-up',
 };
 
 /** Which reading `?view=` asks for. Anything unknown is the table — it answers every question the others ask, a column away. */
@@ -123,6 +130,8 @@ export const TAB_INCLUDES: Record<string, readonly string[]> = {
   handoff: [],
   phase: ['prose', 'handoffs'],
   run: ['prose', 'handoffs'],
+  // Your turn reads `GET /api/turn`, never the plan's prose.
+  turn: [],
   source: ['document', 'memory'],
 };
 

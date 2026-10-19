@@ -330,6 +330,18 @@ async function answer(path: string): Promise<Response> {
   if (path === '/api/run/demo') return json({ run: null, history: [], eta: null });
   if (path === '/api/inbox') return json({ items: [], generatedAt: new Date(NOW).toISOString() });
   if (path === '/api/queue') return json({ entries: [], at: NOW });
+  // Your turn's one source (one-pool phase 14): nothing waits on this plan.
+  if (path.startsWith('/api/turn'))
+    return json({
+      round: { at: new Date(NOW).toISOString(), n: 1, ranAt: new Date(NOW).toISOString(), changedAt: null },
+      headline: 'Nothing needs you now.',
+      groups: { approve: [], now: [], decide: [], checking: [], upcoming: [], done: [] },
+      handled: [],
+      counts: { approve: 0, now: 0, decide: 0, checking: 0, upcoming: 0, done: 0, total: 0, handled: 0 },
+      seen: null,
+      issues: null,
+    });
+  if (path.startsWith('/api/human-steps')) return json({ steps: [] });
   if (path === '/api/terminal')
     return json({ allowed: false, agentAllowed: false, available: 'yes', sessions: [] });
   return json({});
@@ -424,6 +436,7 @@ describe('the views', () => {
     const BODY: Record<string, string> = {
       phases: 'phases-view',
       run: 'run-view-stub',
+      turn: 'turn-page-body',
       source: 'source-view',
     };
     for (const id of PLAN_TABS) {
@@ -552,8 +565,10 @@ describe('the plan page renders its parts', () => {
 
   it('names the ready phase at the top, and it is a real link where the plan opens', async () => {
     renderPlan(['demo']);
-    const line = await screen.findByRole('list', { name: /demo plan: 1 of 3 phases done/ });
-    expect(within(line).getByText('P2 next up')).toBeInTheDocument();
+    // The track carries the counts (#360); the ready phase is named by its link.
+    expect(
+      await screen.findByRole('img', { name: 'demo plan, 3 phases: 1 done, 1 next up, 1 waiting, 33 %' }),
+    ).toBeInTheDocument();
     expect(await screen.findByRole('link', { name: 'Surface' })).toHaveAttribute(
       'href',
       '#/plan/demo/phase/2',

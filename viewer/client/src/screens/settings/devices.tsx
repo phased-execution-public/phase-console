@@ -32,6 +32,7 @@
 
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { isDeliveryPlaceholder } from '@shared/ops-vocab.js';
 import {
   api,
   type DeliveryRecord,
@@ -454,7 +455,7 @@ export function DevicesGroup() {
  * is a handover that failed.
  */
 const handovers = (item: NotificationRecord): DeliveryRecord[] =>
-  (item.delivery ?? []).filter((one) => one.outcome !== 'no-device' && one.outcome !== 'skipped');
+  (item.delivery ?? []).filter((one) => !isDeliveryPlaceholder(one.outcome));
 
 /**
  * What became of the last announcements. The register answers "is a device

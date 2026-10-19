@@ -97,7 +97,7 @@ Install the phased-execution skill for me, and ask before each step.
                       for hours — the widest of the eight, say so plainly
      --allow-terminal a real shell in the browser, running as me
      --allow-agent    interactive claude sessions and the New-plan wizard
-     --allow-accounts register Claude accounts and switch between them mid-run
+     --allow-accounts register Claude accounts and pick one per run (a switch is --allow-run's)
      --allow-mcp      register MCP servers and attach them to plans and phases
      --allow-webhooks POST every announcement to a Slack/Discord/Telegram URL
      --allow-publish  push a finished phase's pe/* branch, never a trunk or forced
@@ -176,17 +176,10 @@ header is trustworthy only because nothing but the proxy can reach the port.
 [Phase Console](docs/console.md) · [متریک‌ها](docs/metrics.md) · [نصبِ دستی](docs/install.md) ·
 [نسخه‌بندی و انتشار](docs/releasing.md) · [مرجع](docs/reference.md)
 
-۷.۱ نوبتِ شما را گام‌به‌گام می‌گوید: هر مورد روی **Your turn** کارتی از یک نوع است (یک تأیید، یک کار، یک تصمیم یا
-یک خبر) با گام‌های شماره‌دار، NOW یا NOT YET، یک جدولِ زمان‌بندی، و اینکه فشارِ شما کجا می‌رود و چه کسی آن را بررسی
-می‌کند؛ یک طرح می‌تواند راهنماهایش را به‌شکلِ فایل یا یک جدولِ errandها بنویسد؛ کاری که فقط از خودِ اجرا برمی‌آید
-برای هر اجرا یک تأیید است؛ موردی که اجرا از آن گذشته خودش بسته می‌شود؛ و *Undo* و *Hand it back* روی هر کارت هستند.
-۶.۲ هر کاری را که فقط از شما برمی‌آید روی یک صفحه می‌گذارد، **Your turn** (نوبتِ شما؛ <span dir="ltr">`#/turn`</span>):
-چرا فقط از شما برمی‌آید، راهنمایی که گام‌به‌گام دنبالش می‌کنید، بررسی‌ای که با زدنِ
-<span dir="ltr">*I've done this — check*</span> انجام می‌شود، اجازه‌ای با گستره و پایان برای مجوزی که هوش مصنوعی ندارد (و
-فهرستِ «هرگز» که هیچ اجازه‌ای آن را نمی‌پوشاند)، یک **کلیدِ مالک** (owner key) اختیاری که ثابت می‌کند فشردنِ یک دکمه
-کارِ خودِ شماست، و *Handled by the AI* (آنچه هوش مصنوعی خودش رسیدگی کرد). ۶.۱ میزِ ایشوها را آورد، انتظار برای
-کاری روی ماشینی دیگر (<span dir="ltr">`unit:<host>/<unit>`</span>)، و کارهایی که موعدشان بعداً می‌رسد را زیرِ
-*Coming up* (در راه).
+۸.۰ **Your turn** (<span dir="ltr">`#/turn`</span>) را مقصدی از آنِ خودش و نمای چهارمِ هر طرح می‌کند، ابزارهای
+نقشه‌ی طرح، یک Schedule و یک Burn-up را به آن می‌دهد، و gitِ خودِ کنسول را از آنچه یک نشست در درختش می‌نویسد جدا
+می‌کند. آنچه ۷.۱ و ۶.۲ و ۶.۱ افزودند در **[docs/console.md](docs/console.md)** آمده است، در بخشِ
+<span dir="ltr">*What each release added*</span> (به انگلیسی).
 
 </div>
 

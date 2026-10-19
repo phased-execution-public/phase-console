@@ -174,6 +174,9 @@ const VERBS = new Set([
   'curl', 'dig', 'ssh', 'psql', 'redis-cli', 'jq',
   'grep', 'rg', 'diff', 'test', 'ls', 'cat', 'head', 'tail', 'wc', 'find', 'awk', 'sed',
   'echo', 'printf', 'true', 'false', 'pwd', 'env', 'which',
+  // `… && exit 1 || exit 0` is how a proof inverts a check (#350): an exit
+  // status, never work — like `true` and `false`.
+  'exit',
   // Read-only filters that appear mid-pipeline in real verification blocks.
   // `xargs` is here because the command it runs is judged separately, below.
   'xargs', 'sort', 'uniq', 'cut', 'tr', 'basename', 'dirname', 'realpath', 'stat', 'nl',
@@ -189,6 +192,15 @@ const VERBS = new Set([
   // docker — a lead alone would let `dump-keychain` through.
   'security',
 ]);
+
+/**
+ * Every lead the table above recognises, sorted — what a plan's author is told
+ * a §Verification line may start with (one-pool phase 27, #310), read from the
+ * table itself so the prompt and the runner cannot drift apart. A lead here is
+ * recognised, not unconditional: `ssh`, `curl`, `docker` and the rest are still
+ * judged by what they do (`REACHES_OUT`, `MUTATION_DENY`).
+ */
+export const VERIFY_LEADS: readonly string[] = Object.freeze([...VERBS].sort());
 
 /**
  * The checking session's Bash (control-tower phase 134, #211): the leads of the
@@ -650,7 +662,17 @@ export function extractCommands(
     const verdict = refuse(candidate, lane, approved);
     // Dropped from both lists — see `PREAMBLE`. Not run, and not reported.
     if (verdict === PREAMBLE) continue;
-    if (!verdict) { out.commands.push(candidate); continue; }
+    if (!verdict) {
+      // An operator's mid-run waiver of a line the console WOULD run (one-pool
+      // phase 21, #267): set aside, named, never run — the start door's own
+      // `waive` answers only fragments refused below, so it never lands here.
+      if (approvals?.waive?.has(fp)) {
+        out.waived.push({ text: condense(candidate), reason: 'waived by the operator mid-run', code: 'waived', fp, approvable: false });
+        continue;
+      }
+      out.commands.push(candidate);
+      continue;
+    }
     const item: VerifyNotRun = {
       text: condense(candidate),
       reason: verdict.reason,
@@ -1529,6 +1551,201 @@ function lineDir(command: string, cwd: string): { dir: string; rest: string } {
   return { dir, rest };
 }
 
+/* ------------------------------------------------------------------ *
+ * What a line READS (one-pool phase 20, #357 #311)
+ * ------------------------------------------------------------------ */
+
+/** The commands whose operands are files the line reads — what "the target is missing" can be asked of. */
+const FILE_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'cat', 'head', 'tail', 'wc', 'ls', 'diff', 'cmp', 'stat', 'test', '[', 'jq']);
+/** The grep family, whose first positional operand is the pattern. */
+const GREPS = new Set(['grep', 'egrep', 'fgrep', 'rg']);
+/**
+ * Per reader, the options that take the NEXT word as their value — one table
+ * per tool, because a letter means different things to each (`-n` is a count
+ * to `head` and a switch to `grep`; `-E` is a switch to `grep` and an encoding
+ * to `rg`). An option with two values (`jq --arg k v`) is listed in `VALUED_TWICE`.
+ */
+const VALUED: Record<string, ReadonlySet<string>> = {
+  grep: new Set(['-e', '-f', '-m', '-A', '-B', '-C', '-d', '-D', '--regexp', '--file', '--max-count', '--context',
+    '--after-context', '--before-context', '--include', '--exclude', '--exclude-dir', '--exclude-from',
+    '--directories', '--devices', '--label', '--binary-files', '--color', '--colour']),
+  rg: new Set(['-e', '-f', '-m', '-A', '-B', '-C', '-g', '-t', '-T', '-E', '-j', '-M', '--regexp', '--file',
+    '--max-count', '--context', '--after-context', '--before-context', '--glob', '--iglob', '--type', '--type-not',
+    '--encoding', '--threads', '--max-columns', '--max-depth', '--sort', '--sortr', '--color', '--colors']),
+  head: new Set(['-n', '-c', '--lines', '--bytes']),
+  tail: new Set(['-n', '-c', '--lines', '--bytes']),
+  jq: new Set(['-f', '--from-file', '--indent', '-L']),
+  diff: new Set(['-U', '-C', '-x', '-X', '--label', '--exclude', '--exclude-from']),
+};
+VALUED.egrep = VALUED.grep!;
+VALUED.fgrep = VALUED.grep!;
+const VALUED_TWICE = new Set(['--arg', '--argjson', '--slurpfile', '--rawfile']);
+/** `test` / `[` operators that take a FILE operand. */
+const FILE_TESTS = new Set(['-e', '-f', '-d', '-s', '-r', '-w', '-x', '-L', '-h', '-p', '-S', '-b', '-c', '-g', '-u', '-k', '-O', '-G', '-N']);
+
+/** A word that is a path the shell would pass as written — no flag, URL, expansion or glob. */
+function plainPath(word: string): boolean {
+  return Boolean(word) && !word.startsWith('-') && !/^[a-z][a-z0-9+.-]*:\/\//i.test(word)
+    && !/[$`*?[\]{}<>|;&()=~]/.test(word) && word !== '!' && word !== ']';
+}
+
+/**
+ * The parts of a line, each a lead and its arguments, whether it was negated
+ * with `!`, and the directory it runs in relative to the line's start — a `cd`
+ * part moves the parts after it. `at` is null after a `cd` the reader cannot
+ * follow (an expansion, an absolute or home path): nothing after it is judged.
+ * Null when the shell structure is not readable.
+ */
+function readParts(command: string): { negated: boolean; lead: string; args: string[]; at: string | null }[] | null {
+  const split = segments(unwrap(command));
+  if ('refusal' in split) return null;
+  const out: { negated: boolean; lead: string; args: string[]; at: string | null }[] = [];
+  let at: string | null = '.';
+  for (const part of split.parts) {
+    let tokens = tokenize(part);
+    const negated = tokens[0] === '!';
+    if (negated) tokens = tokens.slice(1);
+    tokens = headOf(tokens);
+    const lead = tokens[0] ?? '';
+    if (!lead) continue;
+    if (lead === 'cd') {
+      const to = tokens[1];
+      at = at !== null && to && plainPath(to) && !to.startsWith('/') ? join(at, to) : null;
+      continue;
+    }
+    out.push({ negated, lead, args: tokens.slice(1), at });
+  }
+  return out;
+}
+
+/** The FILE operands of one reader's arguments. */
+function readerOperands(lead: string, args: readonly string[]): string[] {
+  if (lead === 'test' || lead === '[') {
+    const out: string[] = [];
+    for (let i = 0; i < args.length - 1; i++) if (FILE_TESTS.has(args[i]!)) out.push(args[i + 1]!);
+    return out.filter(plainPath);
+  }
+  const valued = VALUED[lead] ?? new Set<string>();
+  const positional: string[] = [];
+  let patternGiven = false;
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i]!;
+    if (word === '--') { positional.push(...args.slice(i + 1)); break; }
+    if (word.startsWith('-') && word !== '-') {
+      if (GREPS.has(lead) && (word === '-e' || word === '-f' || word === '--regexp' || word === '--file'
+        || /^--(?:regexp|file)=/.test(word) || /^-[^-]*[ef]/.test(word))) patternGiven = true;
+      if (VALUED_TWICE.has(word)) i += 2;
+      else if (valued.has(word)) i += 1;
+      continue;
+    }
+    positional.push(word);
+  }
+  const files = (GREPS.has(lead) && !patternGiven) || lead === 'jq' ? positional.slice(1) : positional;
+  return files.filter(plainPath);
+}
+
+/**
+ * The files a line's readers name — `grep PAT <file>`, `test -f <file>`,
+ * `cat <file>` — each with the part's directory (relative to where the line
+ * starts; null past a `cd` nothing can follow) and whether it was negated.
+ * What "the target is missing" is asked of, and nothing else: a word another
+ * command takes (a repository slug, a test name) is never read as a path.
+ */
+export function namedFiles(command: string): { path: string; negated: boolean; lead: string; at: string | null }[] {
+  const parts = readParts(command);
+  if (!parts) return [];
+  return parts.flatMap((part) => FILE_READERS.has(part.lead)
+    ? readerOperands(part.lead, part.args).map((path) => ({ path, negated: part.negated, lead: part.lead, at: part.at }))
+    : []);
+}
+
+/**
+ * The files of each reader part that read NOTHING — every operand of that part
+ * absent where it runs (a part with one present operand still read something,
+ * and a misread pattern word is never all a part names). What a red line never
+ * reached; `negatedOnly` keeps the negated greps alone.
+ */
+function partsReadingNothing(command: string, cwd: string, negatedOnly: boolean): string[] {
+  const parts = readParts(command);
+  if (!parts) return [];
+  const out: string[] = [];
+  for (const part of parts) {
+    if (!FILE_READERS.has(part.lead) || part.at === null) continue;
+    if (negatedOnly && !(part.negated && GREPS.has(part.lead))) continue;
+    const files = readerOperands(part.lead, part.args);
+    if (!files.length) continue;
+    const dir = resolve(cwd, part.at);
+    if (files.every((file) => !existsSync(resolve(dir, file)))) out.push(...files.map((file) => (part.at === '.' ? file : join(part.at!, file))));
+  }
+  return [...new Set(out)];
+}
+
+/** The files a red line never reached: every operand of one of its reader parts missing where that part ran. */
+export function missingFiles(command: string, cwd: string): string[] {
+  return partsReadingNothing(command, cwd, false);
+}
+
+/**
+ * The paths a NEGATED grep names when none of them is there — `! grep -rn
+ * <name> apps/next` over a tree with no `apps/next` exits 2, the `!` turns that
+ * into 0, and the line passes having read nothing (#311: the phase's main
+ * proof, green on the UNFIXED tree, at a mirror root that held no `apps/`).
+ * Such a line is red, by name, before it runs.
+ */
+export function vacuousNegations(command: string, cwd: string): string[] {
+  return partsReadingNothing(command, cwd, true);
+}
+
+/**
+ * A line of read-only readers (`grep`, `test`, `cat`, …) whose every path is
+ * the docs root's own — `grep -q "Refs #334" docs/handoffs/<plan>/pr-body.md`
+ * — and that does not `cd` (#357). In
+ * a mirror it runs with cwd = DOCS_ROOT: a mirror holds no `docs/`, or only
+ * the run branch's copy, while the handoffs, the plans and the PR bodies a
+ * session writes live in the docs root.
+ */
+export function docsOnlyLine(command: string): boolean {
+  // The line moves from the run's isolated tree to the docs root, which is the
+  // operator's SHARED checkout, so only a line that can do nothing but read
+  // rides the move: no `$` or backtick anywhere, no redirection, and
+  // every part led — as written, before any env prefix or wrapper is peeled —
+  // by a reader that runs no program (`rg --pre` does, so `rg` stays).
+  // Fail closed on `$` of any kind — a substitution, an expansion, and the
+  // ANSI-C `$'…'` quoting whose escapes no reader here models.
+  if (/[`$]|[<>]\(/.test(command) || redirects(command)) return false;
+  const split = segments(unwrap(command));
+  if ('refusal' in split || split.inner.length) return false;
+  for (const part of split.parts) {
+    const tokens = tokenize(part);
+    const first = tokens[0] === '!' ? tokens[1] : tokens[0];
+    if (!first || !DOCS_READERS.has(first)) return false;
+  }
+  const parts = readParts(command);
+  if (!parts?.length || parts.some((part) => part.at !== '.')) return false;
+  const paths = parts.flatMap((part) => readerOperands(part.lead, part.args));
+  return paths.length > 0 && paths.every((path) => /^(?:\.\/)?docs\//.test(path));
+}
+
+/** The readers a docs-only line may be made of — `FILE_READERS` less `rg`, whose `--pre` runs a program. */
+const DOCS_READERS = new Set([...FILE_READERS].filter((lead) => lead !== 'rg'));
+
+/** Does the line redirect anything — a `<` or `>` outside quotes? */
+function redirects(command: string): boolean {
+  let quote: string | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote) {
+      if (quote === '"' && ch === '\\') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '\\') { i++; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '<' || ch === '>') return true;
+  }
+  return false;
+}
+
 /** Is there a `node_modules` where node would look for one — here or in any directory above? */
 function nodeModulesAbove(dir: string): boolean {
   let at = resolve(dir);
@@ -1629,6 +1846,12 @@ function siblingWords(siblings: readonly string[], ran: boolean): string {
 
 export type VerifyOptions = {
   cwd: string;
+  /**
+   * The docs root — where a line whose every path is `docs/…` runs when `cwd`
+   * is a run's MIRROR (one-pool phase 20, #357). Absent: every line runs in
+   * `cwd`, as before.
+   */
+  docsRoot?: string;
   /** Per-command ceiling. A full suite is slow; a wedged one must still end. */
   timeoutMs?: number;
   /**
@@ -1759,7 +1982,7 @@ const SETUP_TIMEOUT_MS = 10 * 60_000;
 /** Fallback when the caller passes no skip set (mirrors scripts/verify.env;
  * the drift test pins it against the file). */
 export const DEFAULT_PREFLIGHT_SKIP: ReadonlySet<string> = new Set([
-  'cd', 'true', 'false', 'echo', 'printf', 'test', 'pwd', 'env', 'which',
+  'cd', 'true', 'false', 'exit', 'echo', 'printf', 'test', 'pwd', 'env', 'which',
   'bash', 'sh', 'command', 'export', 'set', 'time',
   'if', 'then', 'fi', 'elif', 'else', 'for', 'while', 'until', 'do', 'done', 'case', 'esac',
 ]);
@@ -1980,9 +2203,29 @@ export async function verifyPhase(
     // runs (control-tower phase 106, #191): a sibling the working tree has and
     // a clean checkout does not would make it red by construction.
     const lacking = opts.inPlace && opts.inPlace !== opts.cwd ? unprovidedSiblings(command, opts.cwd, opts.inPlace) : [];
+    // Where THIS line runs (#357): the docs root for a docs-only line in a
+    // mirror, else the verification's cwd.
+    const at = opts.docsRoot && opts.docsRoot !== opts.cwd && docsOnlyLine(command) ? opts.docsRoot : opts.cwd;
+    const lineOpts: VerifyOptions = at === opts.cwd ? opts : { ...opts, cwd: at, inPlace: at };
+    // A negated grep over a path that is not there reads nothing (#311): red,
+    // by name, never run.
+    const vacuous = lacking.length ? [] : vacuousNegations(command, at);
     let result: VerifyRun = lacking.length
       ? { command, ok: false, code: 1, ms: 0, output: '', environment: siblingWords(lacking, false) }
-      : await runOne(command, { ...opts, timeoutMs: limit });
+      : vacuous.length
+        ? {
+          command, ok: false, code: 2, ms: 0, unreached: vacuous,
+          output: `not run: \`!\` over a grep of ${vacuous.join(', ')}, which ${vacuous.length === 1 ? 'does' : 'do'} not exist `
+            + `in ${at} — a negated search of nothing passes having read nothing`,
+        }
+        : await runOne(command, { ...lineOpts, timeoutMs: limit });
+    if (at !== opts.cwd) result = { ...result, ranIn: at };
+    // A red that never reached a file it names checked nothing (#357): marked,
+    // so the verdict never reads it as inherited from the base tree.
+    if (!result.ok && !result.unreached) {
+      const missing = missingFiles(command, at);
+      if (missing.length) result = { ...result, unreached: missing };
+    }
     // The machine, not the work (control-tower phase 89): said on the row, and
     // never retried — an unchanged precondition fails the same way twice, and
     // vca's verifier retried exactly that twice without changing anything.
@@ -2014,15 +2257,17 @@ export async function verifyPhase(
     // tree — and its retry was a second full suite (ai-builder-v7 P3's red
     // `task verify:local`, 702 s, run again before its session could board).
     // Its row stands as measured: red once, not retried.
-    if (!result.ok && !result.environment && !opts.signal?.aborted && opts.purpose !== 'baseline') {
+    // A vacuous negation is not retried either: the path will not appear between attempts.
+    if (!result.ok && !result.environment && !vacuous.length && !opts.signal?.aborted && opts.purpose !== 'baseline') {
       // Never past the ceiling — unless the plan's own word already was, and
       // then never below it.
       const again = result.timedOut
         ? Math.min(limit * TIMEOUT_RETRY_FACTOR, Math.max(VERIFY_TIMEOUT_CEILING_MS, limit))
         : limit;
-      const second = await runOne(command, { ...opts, timeoutMs: again });
-      ran.push({ ...second, retry: true });
-      result = second;
+      const second = await runOne(command, { ...lineOpts, timeoutMs: again });
+      const missing = second.ok ? [] : missingFiles(command, at);
+      result = { ...second, ...(at !== opts.cwd ? { ranIn: at } : {}), ...(missing.length ? { unreached: missing } : {}) };
+      ran.push({ ...result, retry: true });
     }
     // After the retry, so the stream reports the outcome the VERDICT is judged
     // on rather than a red that was about to be rescued a second later.

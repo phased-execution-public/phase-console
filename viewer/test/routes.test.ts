@@ -1954,3 +1954,48 @@ test('POST /api/restart hands the update choice to the service, and answers 202 
   assert.equal(refused.status, 409);
 });
 
+
+/* ------------------------------------------------------------------ *
+ * A press from an earlier release's page (one-pool phase 18, #373)
+ * ------------------------------------------------------------------ */
+
+test('#373: a write from a page of another build is a 409 that says reload — before any route runs, and nothing is done', async () => {
+  const served = 'e68f18adbee1aa0f0e2d3c4b5a69788776655443';
+  const old = '0598886e1234567890abcdef1234567890abcdef';
+  const acked: string[] = [];
+  const service = fakeService({
+    store: null,
+    servedRev: () => served,
+    ackInbox: (id: string) => { acked.push(id); return true; },
+    unackInbox: () => true,
+  });
+
+  const refused = await call(service, 'POST', '/api/inbox/ack', { body: { id: 'a' }, extraHeaders: { 'x-build-rev': old } });
+  assert.equal(refused.status, 409);
+  const body = refused.body as { error: string; outdated: boolean; build: { page: string; console: string } };
+  assert.equal(body.outdated, true);
+  assert.match(body.error, /previous release of the console — reload/);
+  assert.deepEqual(body.build, { page: old, console: served });
+  assert.deepEqual(acked, [], 'nothing was done');
+
+  // The same build — whole, or the prefix a page may send — presses as before.
+  assert.equal((await call(service, 'POST', '/api/inbox/ack', { body: { id: 'b' }, extraHeaders: { 'x-build-rev': served } })).status, 200);
+  assert.equal((await call(service, 'POST', '/api/inbox/ack', { body: { id: 'c' }, extraHeaders: { 'x-build-rev': served.slice(0, 12) } })).status, 200);
+  // No header (the CLI, a session's scripts) and a build nobody can name are never judged.
+  assert.equal((await call(service, 'POST', '/api/inbox/ack', { body: { id: 'd' } })).status, 200);
+  assert.equal((await call(service, 'POST', '/api/inbox/ack', { body: { id: 'e' }, extraHeaders: { 'x-build-rev': 'unknown' } })).status, 200);
+  assert.deepEqual(acked, ['b', 'c', 'd', 'e']);
+});
+
+test('#373: a read is never refused, and an unstamped console judges no page', async () => {
+  const { outdatedPress } = await import('../server/api/build-check.ts');
+  const a = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const b = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  assert.equal(outdatedPress('GET', a, b), null);
+  assert.equal(outdatedPress('HEAD', a, b), null);
+  assert.equal(outdatedPress('POST', a, null), null, 'an unstamped dist cannot tell');
+  assert.equal(outdatedPress('POST', a, 'unknown'), null);
+  assert.equal(outdatedPress('POST', [a], a), null, 'a repeated header reads its first value');
+  assert.equal(outdatedPress('DELETE', a, b)?.outdated, true);
+  assert.equal(outdatedPress('PATCH', b.slice(0, 7), a)?.build.page, b.slice(0, 7));
+});

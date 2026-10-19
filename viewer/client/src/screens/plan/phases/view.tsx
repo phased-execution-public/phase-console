@@ -1,6 +1,7 @@
 /**
  * The Phases view (7.0, quiet-console phase 10): the one grid in its three
- * readings — the table, QA by phase, handoffs by phase — or the route map,
+ * readings — the table, QA by phase, handoffs by phase — or the route map, or
+ * (one-pool phase 16, #376) the plan's schedule or its burn-up,
  * then the foot, where everything about the plan rather than one phase waits
  * folded with a count: the boot prompts, the end-of-phase banner, what is
  * left before the work boards, and the landing.
@@ -32,9 +33,11 @@ import { QaReportSheet } from './qa-report';
 import { PhaseTable } from './table';
 
 const MapView = lazy(() => import('../map/map-view').then((m) => ({ default: m.MapView })));
+const ScheduleView = lazy(() => import('./progress').then((m) => ({ default: m.ScheduleView })));
+const BurnupView = lazy(() => import('./progress').then((m) => ({ default: m.BurnupView })));
 
-/** Which reading of the one grid each view is. `map` draws no grid. */
-const READING: Record<Exclude<PhasesViewId, 'map'>, PhaseTableContext> = {
+/** Which reading of the one grid each view is. The map, the schedule and the burn-up draw no grid. */
+const READING: Record<Exclude<PhasesViewId, 'map' | 'schedule' | 'burnup'>, PhaseTableContext> = {
   table: 'plan',
   qa: 'plan-qa',
   handoffs: 'plan-handoffs',
@@ -45,9 +48,12 @@ export function PhasesView({
   view,
   report,
   everything,
+  query,
 }: {
   detail: PlanDetail;
   view: PhasesViewId;
+  /** The address's query — the map's tools live there (#376). */
+  query?: Readonly<Record<string, string | undefined>>;
   /** `?report=<phase>[:<round>]` — the QA report sheet, open ⟺ the address says so. */
   report?: string | undefined;
   everything: Everything;
@@ -83,9 +89,22 @@ export function PhasesView({
   return (
     <div className="flex min-w-0 flex-col gap-4" data-testid="phases-view">
       <SectionNav sections={sections} current={view} label="Readings of the phases" />
-      {view === 'map' ? (
+      {view === 'schedule' || view === 'burnup' ? (
         <Suspense fallback={<Skeleton className="h-96 w-full" />}>
-          <MapView detail={detail} run={run} />
+          {view === 'schedule' ? (
+            <ScheduleView detail={detail} run={run} />
+          ) : (
+            <BurnupView detail={detail} run={run} />
+          )}
+        </Suspense>
+      ) : view === 'map' ? (
+        <Suspense fallback={<Skeleton className="h-96 w-full" />}>
+          <MapView
+            detail={detail}
+            run={run}
+            {...(query ? { query } : {})}
+            allowRun={Boolean(state?.allowRun)}
+          />
         </Suspense>
       ) : (
         <PhaseTable

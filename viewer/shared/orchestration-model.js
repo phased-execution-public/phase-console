@@ -235,6 +235,8 @@ export const QUEUE_ORDER_KEYS = Object.freeze([
   'reserved',
   'class',
   'pinned',
+  // An operator's order (one-pool phase 39, #380): ranked at the bump key.
+  'order',
   'bumped',
   'policy',
   'share',
@@ -411,10 +413,29 @@ export function isSchedulingPolicy(value) {
 
 /**
  * The machine-load guard (#135 G.27): ON by default, holding NEW admissions
- * while the 5-minute load average is above `factor` × the machine's cores.
- * Live lanes are never touched. `loadGuardFactor: 0` switches it off.
+ * while the machine is busy. Live lanes are never touched. `loadGuardFactor: 0`
+ * switches it off.
+ *
+ * Since one-pool phase 26 (#243, #223) it gates on what the CPU is DOING, not
+ * on the 5-minute load average: macOS counts every runnable and short-lived
+ * process in the average, so it read 36 while two-thirds of a 14-core machine
+ * was idle, and it lags a burst by minutes. The reading is the share of every
+ * core's time spent busy over the last 30 s (`os.cpus()` deltas — macOS's
+ * `host_processor_info`), against `busyLimit`; the 5-minute average is kept
+ * only as a CEILING, `factor × cores × LOAD_CEILING_RATIO`, for the machine
+ * that is genuinely saturated. The one setting moves both: the busy limit is
+ * `CPU_BUSY_LIMIT × factor / DEFAULT_LOAD_FACTOR`, held to 5–98 %.
  */
 export const DEFAULT_LOAD_FACTOR = 1.5;
+
+/** The share of the CPU busy, over `CPU_WINDOW_MS`, above which new work waits at the default factor. */
+export const CPU_BUSY_LIMIT = 0.85;
+
+/** The window the CPU-busy share is read over. */
+export const CPU_WINDOW_MS = 30_000;
+
+/** The 5-minute average is a ceiling only: new work waits above `factor × cores ×` this. */
+export const LOAD_CEILING_RATIO = 2;
 
 /**
  * The guard's setting from the console's preferences: its factor, or null when off.
@@ -430,32 +451,82 @@ export function loadGuardFactor(prefs) {
 }
 
 /**
+ * The CPU-busy limit a factor sets (one-pool phase 26): the default factor is
+ * `CPU_BUSY_LIMIT`, and the factor scales it — 2.0 lets the machine run busier,
+ * 1.0 holds new work sooner. Null when the guard is off.
+ * @param {number|null} factor
+ * @returns {number|null}
+ */
+export function busyLimitOf(factor) {
+  if (!factor) return null;
+  return (
+    Math.round(Math.min(0.98, Math.max(0.05, (CPU_BUSY_LIMIT * factor) / DEFAULT_LOAD_FACTOR)) * 100) / 100
+  );
+}
+
+/**
  * One reading of the machine's load against the guard — what the scheduler
- * holds on and the queue page shows.
- * @param {{ avg5: number, cores: number, factor: number|null }} sample
- * @returns {{ avg5: number, cores: number, factor: number|null, threshold: number|null, holding: boolean }}
+ * holds on, the supervisor's `machine-load` detector reads (#224) and the
+ * queue page shows.
+ *
+ * `busy` is the CPU-busy share over the window (0–1), or null before two
+ * samples exist — the ceiling alone then decides. `threshold` is the 5-minute
+ * average's ceiling (its name kept for every reader written before phase 26).
+ * `cause` names what is holding: `cpu`, `ceiling`, or null.
+ * @param {{ avg5: number, cores: number, factor: number|null, busy?: number|null }} sample
+ * @returns {{ avg5: number, cores: number, factor: number|null, threshold: number|null, busy: number|null,
+ *   busyLimit: number|null, holding: boolean, cause: 'cpu'|'ceiling'|null }}
  */
 export function loadReading(sample) {
   const cores = Math.max(1, Math.round(sample.cores || 1));
   const avg5 = Math.round((Number(sample.avg5) || 0) * 100) / 100;
-  const threshold = sample.factor ? Math.round(sample.factor * cores * 100) / 100 : null;
-  return {
-    avg5,
-    cores,
-    factor: sample.factor ?? null,
-    threshold,
-    holding: threshold !== null && avg5 > threshold,
-  };
+  const factor = sample.factor ?? null;
+  const threshold = factor ? Math.round(factor * cores * LOAD_CEILING_RATIO * 100) / 100 : null;
+  const raw = sample.busy === null || sample.busy === undefined ? NaN : Number(sample.busy);
+  const busy = Number.isFinite(raw) ? Math.round(Math.min(1, Math.max(0, raw)) * 100) / 100 : null;
+  const busyLimit = busyLimitOf(factor);
+  const cause =
+    threshold === null
+      ? null
+      : busy !== null && busyLimit !== null && busy >= busyLimit
+        ? 'cpu'
+        : avg5 > threshold
+          ? 'ceiling'
+          : null;
+  return { avg5, cores, factor, threshold, busy, busyLimit, holding: cause !== null, cause };
+}
+
+/** A share as a whole percentage. @param {number} share */
+function percent(share) {
+  return `${Math.round(share * 100)} %`;
 }
 
 /**
- * The sentence every held admission shows while the machine is loaded.
- * @param {{ avg5: number, cores: number, factor: number|null, threshold: number|null }} reading
+ * The sentence every held admission shows while the machine is loaded — the
+ * real CPU beside the load figure, so a hold can be judged at a glance (#243).
+ * @param {{ avg5: number, cores: number, factor: number|null, threshold: number|null,
+ *   busy?: number|null, busyLimit?: number|null, cause?: 'cpu'|'ceiling'|null }} reading
  * @returns {string}
  */
 export function loadReason(reading) {
-  return (
-    `the machine is loaded — 5-min load ${reading.avg5} over ${reading.threshold} (${reading.factor} × ${reading.cores} cores); ` +
-    'new work boards when it drops, and live lanes carry on'
-  );
+  const cpu = reading.busy === null || reading.busy === undefined ? null : percent(reading.busy);
+  const head =
+    reading.cause === 'cpu' && cpu !== null && reading.busyLimit
+      ? `the machine is busy — CPU ${cpu} over the last 30 s, over ${percent(reading.busyLimit)} (5-min load ${reading.avg5} on ${reading.cores} cores)`
+      : `the machine is loaded — 5-min load ${reading.avg5} over its ceiling ${reading.threshold} ` +
+        `(${reading.factor} × ${reading.cores} cores × ${LOAD_CEILING_RATIO}${cpu !== null ? `; CPU ${cpu}` : ''})`;
+  return `${head}; new work boards when it drops, and live lanes carry on`;
+}
+
+/**
+ * How many heavy verification jobs — a full suite, a build, a `verify:local` —
+ * the MACHINE runs at once (one-pool phase 26, #327): every console's
+ * baselines and §Verification lines share it through `<stateHome>/fleet/jobs/`.
+ * One per seven cores, at least one: two on a 14-core laptop, the number the
+ * hub measured as the point where suites start slowing each other to an hour.
+ * @param {number} cores
+ * @returns {number}
+ */
+export function heavyJobBudget(cores) {
+  return Math.max(1, Math.floor(Math.max(1, Math.round(cores || 1)) / 7));
 }

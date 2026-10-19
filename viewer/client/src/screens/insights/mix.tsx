@@ -24,6 +24,7 @@ export function MixPanel({ stats }: { stats: Portfolio }) {
       <FigureBlock caption="Repositories touched, phases by scope">
         <BarList
           label="repos"
+          heads={{ name: 'Repository', value: 'Phases' }}
           items={stats.repos.map((row) => ({ name: row.repo, value: row.count }))}
           empty={
             <>
@@ -35,6 +36,7 @@ export function MixPanel({ stats }: { stats: Portfolio }) {
       <FigureBlock caption="Skills used, from the handoffs">
         <BarList
           label="skills"
+          heads={{ name: 'Skill', value: 'Uses' }}
           items={stats.skills.map((row) => ({ name: row.skill, value: row.count }))}
           empty="No handoff records a skill yet."
         />
@@ -42,6 +44,7 @@ export function MixPanel({ stats }: { stats: Portfolio }) {
       <FigureBlock caption="Target models, what each plan is sized for">
         <BarList
           label="models"
+          heads={{ name: 'Model', value: 'Plans' }}
           items={stats.models.map((row) => ({ name: row.model, value: row.count }))}
           empty="No plan names a target model in its session budget."
         />

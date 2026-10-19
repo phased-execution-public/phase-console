@@ -9,6 +9,7 @@
  * AP-1  the rank's outsider is never the target — the pool's member is
  * AP-2  the login probe is asked only of pool members, the ranked ones first
  * AP-3  a spent pool parks with an errand naming the pool, and the run stays put
+ *
  */
 
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
@@ -275,3 +276,4 @@ test('AP-4: at a mid-phase wall the headroom-aware picker is asked WITH the pool
     assert.equal(asked[0]?.until, reset * 1000 + RESET_MARGIN_MS, 'weighed against the wall\'s own reset (and its margin)');
   } finally { r.cleanup(); }
 });
+

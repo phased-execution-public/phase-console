@@ -21,18 +21,20 @@ and the engine answers for exactly one plan at a time. The console is the portfo
 ready **right now** across every plan, which lock is holding what, which plan has stalled, how much
 work is left, and whether a plan's graph even lints.
 
-The console is **seven places** in three bands, the same seven in both editions: **the work** —
-Runs (the home), Plans and Sessions; **the record** — Repo, Insights and Logs; and **the console** —
-Settings. Around them sit a palette, a bell, a help sheet and a panel beside the page, and under Runs
-sits **Your turn**, the page for every act only a person can do. Every older address still resolves —
+The console is **eight destinations** in three bands, the same eight in both editions: **the work** —
+Runs (the home), Your turn, Plans and Sessions; **the record** — Repo, Insights and Logs; and **the
+console** — Settings. Around them sit a palette, a bell, a help sheet and a panel beside the page.
+**Your turn**, the page for every act only a person can do, was a head under Runs until 8.0 (one-pool
+phase 14, #377) made it a destination of its own. Every older address still resolves —
 a bookmark, a handoff link or a push notification minted by an earlier version lands where its page
-went, in one hop, keeping whichever half of the address still means something: `#/now` and `#/queue`
-on Runs, `#/debug` on Logs, `#/approve` on Your turn.
+went, in one hop, keeping whichever half of the address still means something: `#/now` on Runs,
+`#/debug` on Logs, `#/approve` on Your turn — and, in the free edition, `#/queue` on the Runs home's
+**Queued** group.
 
 | Destination | Answers |
 |---|---|
 | **Runs** | *Does anything need me?* The home (`#/runs`, and any empty or unknown address). Its heading is the situation in one sentence — *2 need you, Your turn (1), checkout-rewrite is running — phase 3, 1 waiting, 4 phases ready, $41 today*, every zero left out — and the header carries the same words on every other page, each figure a link on a desk to its group, to Your turn or to Insights. Under it, everything sits in six groups, ordered by what it costs to ignore: **Your turn** (the items waiting on you, each with its first move), **Running**, **Waiting**, **Queued**, **Ready to start** (every open plan's ready phases, each with up to two reasons it matters — *frees 3 phases*, *on the critical path*) and **Settled today**, folded. Above the groups the console puts only what is wrong with itself: Claude Code signed out, a phase nothing is driving, a repository whose GitHub jobs are not starting. A run is one line — its status as a dot and a word, the plan, its phases as a short track, one clock, what it has cost — with exactly one action, chosen by where it sits: the halt card's recommended way forward, the button of its oldest item, **Thaw**, **Resume**, **Pause**, **Hold** or **Release**, else **Open run**. Its chevron opens the line in place — the halt card, the lanes and when each was last heard, the queue's facts, what **Phase N now** is doing and about how long is left, and every verb the run takes — and **Inspect** puts the run in the panel. **All runs** (`?view=all`) is every run as one table. `?group=` opens a group (`?bay=`, the 6.x word, still lands), and the **Filter** lamps narrow the groups to one family of stop. A run's own record is the plan's **Run** view. |
-| **Plans** | *Where does each plan stand?* Every plan in this source, one line each — its status, its name, its line of phases, the sessions left and when it last moved — drawn as a **List** or as **Cards**, with closed plans and documents in folds. **New plan** writes one with AI (`--allow-agent`), scaffolds one from the template (`--allow-writes`) or plans from issues. A plan (`#/plan/<slug>`) opens on its glance — its status, its line, what is left and what it cost, and the one act that fits — over three views, each an address, under whatever is wrong with the plan now (a stopped run, stuck phases, a failing lint). **Phases** is one table of every phase — its state, gate, claim, QA and handoff among its columns — as a **Table**, a **Map**, **QA** or **Handoffs**; a row opens in place onto why the phase is where it is and what moves it (its evidence, the notes earlier phases left, the issues its sessions filed, every way forward), and the view says what boarding will find wrong with each §Verification before a run exists. **Run** (`#/plan/<slug>/run`, the verbs behind `--allow-run`) is the run's glance — its row, the halt card, the one recommended move, the lanes with their clocks — over folds: the phases with this run's record, **Sessions and their consoles**, the journal, **What the ladder tried**, the §Verification runs, the triggers, **Where the time went**, **Why it started and what it cost** (every start's door, trigger, guard and who asked, beside what the start door resolved; one row per session with its caps and who ended it, reconciled against the run's own spend — reconciled means within $0.01 (`LEDGER_GAP_USD`) with every session's cost known; a session that never reported reads *unknown*, never $0; a rung's cost is its session's, shown beside the total and never added — over `GET /api/run/<slug>/ledger`), the notes, the checkout, the ways forward and the raw record; `?view=history` lists the plan's earlier runs. **Source** is the plan file and its handoffs. |
+| **Plans** | *Where does each plan stand?* Every plan in this source, one line each — its status, its name, its line of phases, the sessions left and when it last moved — drawn as a **List** or as **Cards**, with closed plans and documents in folds. **New plan** writes one with AI (`--allow-agent`), scaffolds one from the template (`--allow-writes`) or plans from issues. A plan (`#/plan/<slug>`) opens on its glance — its status, its line, what is left and what it cost, and the one act that fits — over four views, each an address, under whatever is wrong with the plan now (a stopped run, stuck phases, a failing lint). **Phases** is one table of every phase — its state, gate, claim, QA and handoff among its columns — as a **Table**, a **Map**, **QA** or **Handoffs**; a row opens in place onto why the phase is where it is and what moves it (its evidence, the notes earlier phases left, the issues its sessions filed, every way forward), and the view says what boarding will find wrong with each §Verification before a run exists. **Run** (`#/plan/<slug>/run`, the verbs behind `--allow-run`) is the run's glance — its row, the halt card, the one recommended move, the lanes with their clocks — over folds: the phases with this run's record, **Sessions and their consoles**, the journal, **What the ladder tried**, the §Verification runs, the triggers, **Where the time went**, **Why it started and what it cost** (every start's door, trigger, guard and who asked, beside what the start door resolved; one row per session with its caps and who ended it, reconciled against the run's own spend — reconciled means within $0.01 (`LEDGER_GAP_USD`) with every session's cost known; a session that never reported reads *unknown*, never $0; a rung's cost is its session's, shown beside the total and never added — over `GET /api/run/<slug>/ledger`), the notes, the checkout, the ways forward and the raw record; `?view=history` lists the plan's earlier runs. **Your turn** (`#/plan/<slug>/turn`) is the Your turn page scoped to the plan. **Source** is the plan file and its handoffs. |
 | **Sessions** | *What processes exist?* One list, by kind, for autopilot lanes, agent sessions, shells and the other Claude sessions the presence hook reports — and one page per session, `#/sessions/<id>`, with the phone-first browser terminal. A session this console holds a pty for opens straight into it; a session it merely *knows about* offers to **Resume** it, or to **Take over** while it is live, behind a confirm, and then it has a pty too. A hook-reported session that has ended reads `ended`, or `ended · inferred` when the probe concluded it from a process that was gone; a session a run started shows the door that started it and how it ended, read from the run's own ledger. **New session** and **New shell** need `--allow-agent` and `--allow-terminal`; with neither, Sessions leaves the rail and the lanes still show on Runs. **Locks** (`#/sessions/locks`) is every phase claim and who holds it. |
 | **Repo** | *What did the work do to the tree — and which of several trees?* Six sections, each an address: History (`#/repo`, the commit graph with the lanes the commits were made on), Branches, Working trees (the reclaim surface: a tree the console made that no surviving run record claims), Changes (any range, a file at a time), Settles (how each run's work reached the trunk, or why it did not) and Issues — the first five over `GET /api/repo/…`, the sixth over `GET /api/issues`: the Issues desk, a repository's whole issue list with each issue's category, severity and plan status, the filters and the order in the address, any GitHub `owner/name` added under **⋯** read-only beside your own, a pick that authors a plan from its issues (`--allow-agent`), and each repository's freshness (`fresh` · `stale` with its age · `unknown` with the reason) beside its rows. On a superproject every initialised submodule is a repository of its own here: the **Filter**'s **Repository** lists each by its root-relative path (the plan's scope token), and the working-trees registry spans them all, each row naming its repository. The sentence under the title is the glance `/api/state` reports: the branch, its ahead/behind counts, and what is uncommitted **under `docs/`** — the only corner that read covers (`server/git.ts` `repoInfo` scopes its `git status` there), which is why the sentence names it. |
 | **Insights** | *How long, how much, how fast?* One question under another: **How long is left** (the estimate and the basis under it), **What it costs** (settled spend against the caps), **What each session cost** (`LedgerSummaryPanel`: every open plan's newest runs per plan and per account, summed from each session's own line over `GET /api/ledger`, a session with no reported cost counted apart), **What a session may spend**, **How fast** (the velocity trend and the completions calendar), **This week**, **Who was asked** (the cards this console raised for a person, the asks auto-grant answered, and since when), **What shape the work is in** and **On what** (the repos, skills and models the work runs on). Portfolio-wide, or scoped to one plan with `?plan=` — which adds what that plan cost phase by phase, with **Copy as CSV**, its QA record, and a finish date with the basis under it. The same numbers are scrapeable at `/api/metrics` ([docs/metrics.md](metrics.md)). |
@@ -43,10 +45,16 @@ on Runs, `#/debug` on Logs, `#/approve` on Your turn.
 **Your turn** (`#/turn`, one item at `#/turn/<id>`) lists every act only a person can do — a sign-in,
 a code, a secret to put in place, a payment, a permission the AI lacks, a decision, an errand at the
 machine — each one item that says why only you fit it, which plan, phase and run waits on it, what it
-unblocks, the guide to follow and how it will be checked, in six sections: **Do now**, **Needs one
-detail from you**, **Coming up**, **Being checked**, **Done** and **Handled by the AI**. *I've done
-this — check* runs the item's proof and comes back passed, or sent back with exactly what to redo. The
-Runs badge, the situation line and the Runs home's **Your turn** group lead there.
+unblocks, the guide to follow and how it will be checked, in six groups: **Approve**, **Do now**,
+**Decide**, **Being checked**, **Coming up** and **Done**, with **Handled by the AI** and
+**Heads-up** as sections after them. Its tabs are **Open**, **Done**, **Handled by the AI** and
+**All** (`?tab=`), its views a list, a board, cards and a timeline (`?view=`), and it groups by when
+asked, plan, type, deadline or status (`?group=`). *I've done this — check* runs the item's proof and
+comes back passed, or sent back with exactly what to redo; *Send my decision* sends a decision's
+answer and then checks it against its proof; an item bound to a gate closes when the gate opens; and a
+proof whose script is missing reads **Cannot run** rather than failing you. The situation line, the
+bell and the Runs home's **Your turn** group lead there, and every plan has the same page as its
+fourth view.
 
 **Three doors to depth, on every page.** Each place is one column of one-line rows, and every row
 opens the same three doors to what the line leaves out: **expand** opens it where it stands, and Runs
@@ -58,10 +66,10 @@ The toolbar is one row in the same order on every page that lists things — the
 sheet holding the rest.
 
 **The shell.** On a desk a rail down the side holds the switcher (this console, the other consoles on
-this machine, and **Open another source here**), the seven places, and **Help** and the usage meter at
-its foot; the header holds the page's title, the situation words, search (⌘K) and the bell. On a phone
-the rail becomes a tab bar — **Runs**, **Plans**, **Sessions**, **Insights** and **More** — and **More**
-holds the rest. The panel, where **Inspect** puts a record, is a column beside the page at 1200 px and
+this machine, and **Open another source here**), the eight destinations, and **Help** and the usage
+meter at its foot; the header holds the page's title, the situation words, search (⌘K) and the bell.
+On a phone the rail becomes a tab bar — **Runs**, **Your turn**, **Plans**, **Sessions** and **More**
+— and **More** holds the rest. The panel, where **Inspect** puts a record, is a column beside the page at 1200 px and
 wider, a sheet over it from 900 to 1200 px and a sheet that rises from the bottom on a phone; ⌘I opens
 and closes it, and this browser remembers whether it was open, how wide and in which mode.
 
@@ -193,3 +201,22 @@ Details: [viewer/README.md](../viewer/README.md).
 
 ---
 
+## What each release added
+
+The README names the newest release in a line; here is each release's headline, newest first. Every
+version's whole account is its section of the [CHANGELOG](../CHANGELOG.md).
+
+**8.0** makes **Your turn** (`#/turn`) a destination of its own and every plan's fourth view, gives a
+plan's map its tools, a Schedule and a Burn-up, and walls the console's own git off from what a session
+writes in its tree.
+
+**7.1** tells your turn step by step. Every act only you can do is one card on **Your turn** — an
+approval, a task, a decision or a heads-up — with why only you, numbered steps, NOW or NOT YET, a
+timing grid, where your press goes and how it is checked, *Undo* and *Hand it back*; an act only the run
+can take is one approval per run, and an item the run moved past closes itself.
+
+**6.2** brought that page, a grant with a scope and an end for a permission the AI lacks, an optional
+**owner key** and *Handled by the AI*; **6.1** the Issues desk and waits on another machine's job.
+
+
+---

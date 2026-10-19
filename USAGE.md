@@ -23,6 +23,9 @@ itself and asks you only when it runs out.
 `abandoned` (or `superseded`, or `complete`) with a date and a reason; `--reopen` reverses it. A closed
 plan stops reporting ready phases, boot prompts, warnings and notifications, while its board, its
 history and its search results stay exactly where they were — closing quiets a plan, it never hides one.
+`complete` is checked first: while the plan's branch is not on its trunk, a landing row is in conflict or
+failed, or a `plan:<slug>` issue is open, the script refuses and lists each item; `--force` closes it anyway
+and records the exception.
 
 This file is a human-facing orientation. The executable procedure — the three modes, the helper scripts,
 and the guardrails — lives in `SKILL.md` + `references/`; that is what Claude loads and follows.
@@ -47,7 +50,8 @@ working tree), `--allow-agent` (interactive `claude` sessions in a browser termi
 **Sessions** page, plus a *New plan with AI* wizard that authors a plan from a brief),
 `--allow-accounts` (register several **Claude accounts** per instance — sign-ins or
 `claude setup-token` tokens — pick one per run, and let a run that hits its usage limit switch to
-the account with headroom; the usage meters themselves need no flag),
+the account with headroom; moving a live run to another account is a run act, so `--allow-run` gates
+that, and the usage meters themselves need no flag),
 `--allow-mcp` (register **MCP servers** — a browser, an issue tracker, a docs server — hold their
 credentials, and attach them to a plan, a run or one phase; a phase whose servers cannot connect
 runs without them and says so — or parks *before* it spends anything, if the plan or the run asks
@@ -169,8 +173,8 @@ or written into the plan (`due: <ref>` on a `Human step:` bullet, in a phase or 
 then it is due, with one notification — `NOW:` and its command, or its title for a click path — and
 its proof clears it and resumes the phase that needed it.
 
-**Your turn: every act only a person can do, on one page.** `#/turn`, titled *Your turn* and lighting Runs,
-lists them in six groups, always in this order: *Approve*, *Do now*, *Decide*, *Being checked*, *Coming up*
+**Your turn: every act only a person can do, on one page.** `#/turn`, *Your turn*, the eighth destination
+since 8.0 (and every plan's fourth view, `#/plan/<slug>/turn`), lists them in six groups, always in this order: *Approve*, *Do now*, *Decide*, *Being checked*, *Coming up*
 and *Done*, then the sections *Handled by the AI*, *Heads-up* and *Where the plans stand*; a strip above
 them counts what is to do, checking and passed today and names the next deadline. Each item is one card
 of one type — an *Approval* (Approve or Deny), a *Task* (*I've done this — check*), a *Decision* (its
@@ -190,7 +194,11 @@ time, plan, type and goes-to filters, the grouping, the order, the view and the 
 Markdown document and *Print* prints the same. `#/approve` and `#/approve?step=<id>` land on the page and a
 push opens `#/turn/<id>`. The approval queue, a question, a gate and an errand all draw the same item with
 *Open on Your turn*; the Runs home's Your turn group keeps runs and one line linking here, and *Your turn (n)* in the
-situation line counts items.
+situation line counts items. The page works as a desk: tabs (*Open*, *Done*, *Handled by the AI*, *All*), four
+views (a list, the default, whose selected line opens its whole card in the panel; a board; cards; a
+timeline), five groupings and three orders, and *Not doing*, *Hand back* and *Snooze* for several items at
+once. Every status word says what it means on hover, focus or tap. The bell shows the first five items under
+*Open Your turn*, and its *Put back* makes the ticked announcements unread again.
 
 **Every source feeds the one list.** A person errand is an item, so its *Done — continue* checks the same item
 and a step you did ends `proven`. A credential the preflight finds missing raises a `secret-entry` item,
@@ -216,9 +224,13 @@ otherwise (*Check what a command cannot*; switched off, the item is accepted on 
 unverified). A pass resumes every waiting session once, saying what was proven. After the third rejection
 (Settings ▸ Automation ▸ *Send to the owner after*) the item asks how it ends: rewrite the guide, *I can't*, or
 the owner's *Accept anyway*, recorded as unverified. No session and no agent can mark its own item passed.
+A proof whose own script is missing from the console's checkout reads **Cannot run** — the check could not
+run, which says nothing about your act — rather than sending you back. An item bound to a gate closes when the
+gate opens, and says so: *Approve the gate on Phase N — the item closes when the gate opens.*
 
 **Your moves.** Beside the check you can answer a decision — one of its options, a note, or both (*Send my
-answer*) — decline an item that allows it, with a reason (*Not doing this*, which ends `declined`), ask a
+decision*, which sends the answer and then checks it against the item's proof, so there is no second button
+to press) — decline an item that allows it, with a reason (*Not doing this*, which ends `declined`), ask a
 question about it (*Ask*) and attach evidence (*Attach*): a note, an image or a file, 160 KB a piece and six an
 attempt, screened for secrets and kept 0600 in `turn-evidence/`, never pushed. Each answer goes back to every
 waiting session once, in a sentence the console composes. The console never takes a secret: a `secret-entry`
@@ -271,6 +283,27 @@ auto-grants the rule table gave (one row per rule per phase, with a count), rela
 recoveries, and anything a session records with `phase-outcome.sh <slug> <N> handled --what …`, each linked
 to the journal line that says it. `phase_console_turn_rounds_total`, `phase_console_turn_handled_total`,
 `phase_console_turn_checks_total` and `phase_console_turn_check_usd_total` count them.
+
+**Reading a plan.** A plan opens on four views: Phases, Run, Your turn and Source. Phases reads as a table, a
+map, a **Schedule** or a **Burn-up**. The map has its tools in its address, so a link opens the same
+picture: filter chips that dim the stations they leave out rather than removing them, a trace through one
+station ("waits on 34 · unblocks 6"), colour by repository, size, cost or time, layers (names, batches, the
+critical path, waves) and two layouts, Inspect and a hover card, and an SVG or PNG export. Zoomed far out a
+station shows only its number; hover, tap or zoom to read its name. A run's timeline zooms with − and +, or to
+*Last hour*, *6 h*, *24 h* or *All*. Sessions ▸ Locks has a map too (`#/sessions/locks?view=map`): each claim on
+its lease, a lapsed one hatched, a phase waiting on it marked ◌. Settings ▸ Appearance ▸ **Palette** brings
+back the 6.x look, `departures`, beside 7.0's `quiet`.
+
+**When a red line is not the phase's.** On the run view's verification card, **Waive this line**, then
+**Waive it for phase N** with a reason, stops that phase from running that one line — recorded as a ruling on
+the plan's ledger and listed under *Waived by the operator*. A line that waits for a seat in the machine's
+budget for heavy checks — suites and builds share one per seven cores across every console — is queued, not
+hung, and a busy machine holds only new work, never a live session.
+
+**A page from before an update.** After the console updates, a tab still showing the old release reloads
+itself before it mounts ("Updating to the new version of the console…"). If one slips through, a press from
+it is refused with *This page is from a previous release of the console — reload it, then press again.* and
+nothing is done: reload and press once more.
 
 
 **Reading a run from a shell.** `phase-console run status <slug>` prints the latest run in a small

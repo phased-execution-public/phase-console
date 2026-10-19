@@ -33,6 +33,7 @@ import { reasonAllowed, type WhyPerson } from '../../shared/turn-model.js';
 import { parseDecisionsTable } from '../../shared/decisions-model.js';
 import { parseErrandsTable, type ErrandsTable } from './errands.ts';
 import { inPlanReviewers, PERMISSION_MODES, withWindowNote } from '../../shared/run-settings.js';
+import { MODELS_ENV_FALLBACK, type ModelsEnv } from '../runner/models.ts';
 import { MODEL_POLICIES, type ModelPolicy } from '../../shared/run-lifecycle.js';
 import type { DecisionRow } from '../../shared/decisions-model.js';
 import type { McpPolicy } from '../runner/state.ts';
@@ -373,6 +374,12 @@ export type Plan = {
   closedReason?: string;
   created?: string;
   declaredPhases?: number;
+  /**
+   * Phases headed by more than one `### Phase N` section (#228), ascending —
+   * what lint F21 names `phase-section-repeated`. Their sections are joined
+   * under the first (`phaseBlocks`), as the engine's index joins them.
+   */
+  repeatedSections?: number[];
   memoryKey: string;
   title: string;
   provenance?: string;
@@ -523,14 +530,38 @@ function parseGraph(text: string): PhaseRow[] {
   return out;
 }
 
+/**
+ * The phases more than one `### Phase N` heading heads — `repeated_section_issues`
+ * in `scripts/phase-graph.sh`, heading rule for heading rule (F21, #228).
+ */
+function repeatedSections(text: string): number[] {
+  const seen = new Map<number, number>();
+  for (const line of text.split('\n')) {
+    const heading = /^###[ \t]+[Pp]hase[ \t]+(\d+)/.exec(line);
+    if (heading) seen.set(Number(heading[1]), (seen.get(Number(heading[1])) ?? 0) + 1);
+  }
+  return [...seen].filter(([, n]) => n > 1).map(([phase]) => phase).sort((a, b) => a - b);
+}
+
 /** `### Phase N …` block, ending at the next `### Phase` or any `## ` heading. */
 function phaseBlocks(text: string): Map<number, { title: string; raw: string; headingLine: string }> {
   const lines = text.split('\n');
   const out = new Map<number, { title: string; raw: string; headingLine: string }>();
   let current: { phase: number; title: string; heading: string; buf: string[] } | null = null;
 
+  // A repeated `### Phase N` (#228) is filed UNDER the first section, as the
+  // engine's index files it: the blocks are joined in order and the first
+  // heading and title stand, so a per-phase directive answers the first
+  // section's bullet in both readers — and lint F21 (`phase-section-repeated`)
+  // fails the plan. This reader used to keep the LAST section.
   const flush = () => {
-    if (current) out.set(current.phase, { title: current.title, raw: current.buf.join('\n').trim(), headingLine: current.heading });
+    if (current) {
+      const raw = current.buf.join('\n').trim();
+      const earlier = out.get(current.phase);
+      out.set(current.phase, earlier
+        ? { ...earlier, raw: [earlier.raw, raw].filter(Boolean).join('\n') }
+        : { title: current.title, raw, headingLine: current.heading });
+    }
     current = null;
   };
 
@@ -766,6 +797,7 @@ const PERMISSION_MODE_LABEL = 'Permission[ \\t]+mode';
 
 /** `Model[[:space:]]+policy` in phase-graph.sh (control-tower phase 54). */
 const MODEL_POLICY_LABEL = 'Model[ \\t]+policy';
+
 
 /**
  * A permission mode, matched case-insensitively and returned the way the CLI
@@ -1090,10 +1122,40 @@ export function parseHumanStepBody(body: string): HumanStepDirective | undefined
 }
 
 
-/** The phase's well-formed `- **Human step:**` bullets, or undefined when it has none. */
+/**
+ * The text with every `<!-- … -->` cut out, line for line — `_strip_html_comments`
+ * in phase-graph.sh (one-pool phase 14, #346). A comment may span lines and one
+ * never closed runs to the end; an emptied line stays a line, so both engines
+ * cut exactly the same text.
+ */
+function stripHtmlComments(text: string): string {
+  let inComment = false;
+  return text.split('\n').map((line) => {
+    let s = line;
+    let out = '';
+    while (s.length > 0) {
+      if (inComment) {
+        const end = s.indexOf('-->');
+        if (end < 0) s = '';
+        else { s = s.slice(end + 3); inComment = false; }
+      } else {
+        const start = s.indexOf('<!--');
+        if (start < 0) { out += s; s = ''; }
+        else { out += s.slice(0, start); s = s.slice(start + 4); inComment = true; }
+      }
+    }
+    return out;
+  }).join('\n');
+}
+
+/**
+ * The phase's well-formed `- **Human step:**` bullets, or undefined when it has
+ * none. A bullet inside an HTML comment is no step (#346): templates/plan.md
+ * shows the grammar in one, and the operator-errands binding reads through here.
+ */
 function humanStepBullets(block: string): HumanStepDirective[] | undefined {
   const steps: HumanStepDirective[] = [];
-  for (const line of block.split('\n')) {
+  for (const line of stripHtmlComments(block).split('\n')) {
     if (!HUMAN_STEP_BULLET_RE.test(line)) continue;
     const body = line.replace(/^[^:]*:\s*/, '').replace(/^\*{1,2}\s*/, '').replace(/\s+$/, '');
     const step = parseHumanStepBody(body);
@@ -1337,6 +1399,37 @@ export function permissionModeFor(plan: Plan | undefined, phase?: number): Resol
 }
 
 /**
+ * The model a plan's §Session budget names — `plan_model()` in `scripts/phase-graph.sh`, line
+ * for line (one-pool phase 4): the first line that names a Claude model, its token kept whole
+ * and a prose "(1M window)" after it read as `[1m]`; in Pro, when no line does, the
+ * `**Target model:**` line's first token in the generic id grammar (`MODEL_ID_GRAMMAR`).
+ */
+export function planModelFor(plan: Plan | undefined, env: ModelsEnv = MODELS_ENV_FALLBACK): string | undefined {
+  const lines = (plan?.sessionBudget.raw ?? '').split('\n');
+  const alts = [...new Set([...env.aliases, ...env.big])].join('|');
+  const claude = new RegExp(`(claude-)?(${alts})(-[0-9a-z.]+)*(\\[1m\\])?`, 'i');
+  for (const line of lines) {
+    const m = claude.exec(line);
+    if (m) return withWindowNote(m[0].toLowerCase(), line.slice(m.index + m[0].length));
+  }
+  return undefined;
+}
+
+/**
+ * The model a phase runs — `phase_model()` (`--model N`; one-pool phase 4): its
+ * `- **Model:**` bullet's first word, a prose "(1M window)" after it read as `[1m]`, else the
+ * plan's (`planModelFor`); undefined when neither names one, and the run's model answers.
+ */
+export function phaseModelFor(plan: Plan | undefined, phase?: number, env: ModelsEnv = MODELS_ENV_FALLBACK): string | undefined {
+  if (phase !== undefined) {
+    const value = (plan?.phases[phase]?.model ?? '').split('\n')[0]!.replace(/[*`]/g, '').trim();
+    const first = value.split(/\s+/)[0];
+    if (first) return withWindowNote(first, value.slice(value.indexOf(first) + first.length));
+  }
+  return planModelFor(plan, env);
+}
+
+/**
  * What a run may do to a phase's model — `model_policy_for_phase()`
  * (control-tower phase 54, #91). Overrides, never unions: the phase's bullet
  * beats the plan's line. Undefined when both are silent, because the RUN's
@@ -1348,6 +1441,7 @@ export function modelPolicyFor(plan: Plan | undefined, phase?: number): Resolved
   const planWide = plan?.sessionBudget.modelPolicy;
   return planWide !== undefined ? { value: planWide, source: 'plan' } : undefined;
 }
+
 
 /** What the run branch is cut from — `plan_base_branch()`. Plan-wide: a base branch is a fact about the RUN. */
 export function baseBranchOf(plan: Plan | undefined): Resolved<string> {
@@ -1446,6 +1540,7 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
   const planSetup = sessionBudget.setup;
 
   const blocks = phaseBlocks(body);
+  const repeated = repeatedSections(body);
   const phases: Record<number, PhaseDetail> = {};
   for (const [phase, block] of blocks) {
     const bullets = labelledBullets(block.raw);
@@ -1456,7 +1551,10 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       gates: bullet(bullets, 'Gates'),
       gateCheck: firstBulletValue(block.raw, /gate-check[^:]*:\s*(.+)$/i),
       size: phaseSize(body, phase),
-      model: bullet(bullets, 'Model'),
+      // The label EXACTLY, as the engine's `_phase_directive … 'Model'` reads it:
+      // `bullet`'s prefix match took a `- **Model policy:**` bullet's word for the
+      // model (one-pool phase 4, found by the `--model` parity test).
+      model: bullets.find((b) => b.label.trim().toLowerCase() === 'model')?.body,
       effort: bullet(bullets, 'Effort'),
       goal: bullet(bullets, 'Goal'),
       readFirst: bullet(bullets, 'Read first'),
@@ -1546,6 +1644,7 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
     closedReason: fmString(frontMatter, 'closed_reason'),
     created: fmString(frontMatter, 'created'),
     declaredPhases: fmNumber(frontMatter, 'phases'),
+    ...(repeated.length ? { repeatedSections: repeated } : {}),
     memoryKey: fmString(frontMatter, 'memory') ?? `project_${slug}`,
     title: titleLine,
     provenance: provenance || undefined,

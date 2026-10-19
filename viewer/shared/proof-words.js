@@ -99,6 +99,46 @@ export function commandWords(command) {
 }
 
 /**
+ * The command a `cmd:` ref's body runs — the ONE reader of the ref's quoting
+ * (#345): the probe (`server/watch-refs.ts` `parseWatchRef`), these words and
+ * the plan lint (`scripts/cmd-ref.sh` `_cmd_body`, its bash twin) all read a
+ * ref through it. The ref's own quote pair is punctuation, never part of what
+ * runs. Inside a double-quoted body an escaped quote is the COMMAND's quote,
+ * read as the shell reads a double-quoted word: `cmd:"python3 -c \"import x\""`
+ * runs `python3 -c "import x"`. A body whose inner quotes are not escaped keeps
+ * the reading it always had — the outer pair dropped, the inside as written —
+ * so `cmd:"grep -q "x" /f"` still runs `grep -q "x" /f`.
+ * @param {string} body
+ * @returns {string}
+ */
+export function cmdOfRef(body) {
+  const command = String(body ?? '').trim();
+  if (command.length < 2) return command;
+  const quote = command[0];
+  if ((quote !== '"' && quote !== "'") || command[command.length - 1] !== quote) return command;
+  const inner = command.slice(1, -1);
+  if (quote === '"' && inner.includes('\\"')) {
+    let out = '';
+    let closes = true;
+    for (let i = 0; i < inner.length; i++) {
+      const c = inner[i];
+      if (c === '\\' && (inner[i + 1] === '"' || inner[i + 1] === '\\')) {
+        out += inner[i + 1];
+        i++;
+        continue;
+      }
+      if (c === '"') {
+        closes = false;
+        break;
+      }
+      out += c;
+    }
+    if (closes) return out.trim();
+  }
+  return inner.trim();
+}
+
+/**
  * A ref read into its scheme and parts, or null when no scheme reads it.
  * @param {string} ref
  * @returns {{ scheme: string, parts: Record<string, string> } | null}
@@ -125,8 +165,7 @@ export function proofPartsOf(ref) {
     return id ? { scheme: 'credential', parts: { words: credentialWords(id) } } : null;
   }
   if (text.startsWith('cmd:')) {
-    let command = text.slice(4).trim();
-    if (command.length >= 2 && /^(["']).*\1$/.test(command)) command = command.slice(1, -1).trim();
+    const command = cmdOfRef(text.slice(4));
     return command ? { scheme: 'cmd', parts: { words: commandWords(command) } } : null;
   }
   return null;

@@ -332,6 +332,20 @@ export interface QueueControl {
   hold?: QueueMark;
   defer?: QueueMark & { until: string };
   withdrawn?: QueueMark;
+  /** Pinned next in its plan (control-tower phase 100) — spent when it boards. */
+  pin?: QueueMark;
+  /** The next lane on its scope is kept for it (control-tower phase 100) — spent when it boards. */
+  reserve?: QueueMark & { lane?: { slug: string; phase: number }; via?: 'yield' };
+  /**
+   * An operator's order (one-pool phase 39): first, last, or before/after a
+   * phase of any open plan. Spent when it boards; it lapses when its anchor
+   * settles or is withdrawn.
+   */
+  order?: QueueMark & {
+    anchor: { slug: string; phase: number } | 'first' | 'last';
+    side: 'before' | 'after';
+    stamp: number;
+  };
 }
 
 /** A press the queue view carries — the route and body that act on a row. */
@@ -376,8 +390,15 @@ export interface QueueLoad {
   avg5: number;
   cores: number;
   factor: number | null;
+  /** The 5-minute average's ceiling (one-pool phase 26: `factor × cores × 2`). */
   threshold: number | null;
+  /** The share of the CPU busy over the last 30 s, 0–1, or null before two samples. */
+  busy?: number | null;
+  /** The CPU-busy share new work waits at. */
+  busyLimit?: number | null;
   holding: boolean;
+  /** What holds: the CPU, the 5-minute ceiling, or nothing. */
+  cause?: 'cpu' | 'ceiling' | null;
 }
 
 /** A lane kept for a phase (control-tower phase 100) — armed once the lane it waits for has ended. */
@@ -739,13 +760,14 @@ export interface ConsoleState {
   prefs?: {
     notify?: Record<string, boolean>;
     /**
-     * The four person-wide keys (`config.json`, every console of the person):
+     * The five person-wide keys (`config.json`, every console of the person):
      * the plans library's order and the model a session plan is sized for are
-     * read from here (quiet-console phase 21); the theme and the density stay
-     * this browser's own (`lib/prefs.ts`).
+     * read from here (quiet-console phase 21); the theme, the density and the
+     * palette (#362) stay this browser's own (`lib/prefs.ts`).
      */
     theme?: string;
     density?: string;
+    palette?: string;
     sort?: string;
     model?: string;
     /**

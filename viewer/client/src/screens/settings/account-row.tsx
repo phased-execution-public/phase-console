@@ -18,6 +18,7 @@
  * of the others read as "the console only knows one account".
  */
 
+import { apiKeyWords } from '@/lib/account-line';
 import { useState } from 'react';
 import { SWITCH_WHEN, type SwitchWhen } from '@shared/run-lifecycle.js';
 import type { RecoveryParts } from '@/cards/recovery-actions';
@@ -77,6 +78,8 @@ export function accountChoiceWords(account: AccountView, current: string): strin
   const five = account.usage?.buckets.five_hour?.utilization;
   return [
     account.email && account.email !== name ? `${name} (${account.email})` : name,
+    // An API key says its provider and its standing (one-pool phase 11): the switch offers keys too.
+    apiKeyWords(account),
     account.plan ?? null,
     typeof five === 'number' ? `5-hour ${Math.round(five)} %` : null,
     account.id === current ? 'now' : null,

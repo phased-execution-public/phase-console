@@ -24,6 +24,9 @@
 import { Suspense, lazy } from 'react';
 import { useAutoReadNotifications } from '@/data/inbox';
 import { useEngineQueue, usePlan } from '@/data/plans';
+import { useTurn, type TurnAnswer } from '@/data/turn';
+import { TURN_GROUPS } from '@shared/turn-model.js';
+import { readSeen } from '@/screens/turn/seen';
 import type { PlanDetail } from '@/data/api';
 import { Button, Empty, Skeleton, Spinner, useEverything, type Everything } from '@/ui';
 import { SectionNav } from '@/shell/section-nav';
@@ -53,6 +56,8 @@ const PhasePanel = lazy(() => import('./phases/panel').then((m) => ({ default: m
 const HandoffPanel = lazy(() => import('./phases/handoff-panel').then((m) => ({ default: m.HandoffPanel })));
 const SourceTab = lazy(() => import('./source/source-tab').then((m) => ({ default: m.SourceTab })));
 const RunView = lazy(() => import('./run'));
+// The plan's Your turn (one-pool phase 14, #366): the page's own body, scoped.
+const TurnBody = lazy(() => import('@/screens/turn').then((m) => ({ default: m.TurnBody })));
 
 const FRAME = 'mx-auto flex w-full min-w-0 max-w-(--content-max) flex-col gap-6 px-(--pad-x) py-(--pad-y)';
 
@@ -97,6 +102,7 @@ function ViewBody({
   view,
   report,
   everything,
+  route,
 }: {
   tab: string;
   arg?: string | undefined;
@@ -104,9 +110,12 @@ function ViewBody({
   view?: string | undefined;
   report?: string | undefined;
   everything: Everything;
+  route: Route;
 }) {
   const slug = detail.summary.slug;
   switch (tab) {
+    case 'turn':
+      return <TurnBody route={route} base={`plan/${slug}/turn`} focus={arg ?? null} plan={slug} />;
     case 'phase':
       return <PhasePanel detail={detail} phase={arg} />;
     case 'handoff':
@@ -123,8 +132,25 @@ function ViewBody({
     // body lands draws the grid rather than nothing.
     case 'phases':
     default:
-      return <PhasesView detail={detail} view={phasesViewOf(view)} report={report} everything={everything} />;
+      return (
+        <PhasesView
+          detail={detail}
+          view={phasesViewOf(view)}
+          report={report}
+          everything={everything}
+          query={route.query}
+        />
+      );
   }
+}
+
+/** How many of a plan's items are open on Your turn — every group but Done. */
+function openTurnOf(answer: TurnAnswer | undefined, slug: string): number {
+  if (!answer?.groups) return 0;
+  return TURN_GROUPS.filter((group) => group !== 'done').reduce(
+    (n, group) => n + (answer.groups[group] ?? []).filter((item) => item.slug === slug).length,
+    0,
+  );
 }
 
 export default function PlanPage({ route }: { route: Route }) {
@@ -133,6 +159,8 @@ export default function PlanPage({ route }: { route: Route }) {
   const detailKind = isDetailRoute(segment) ? segment : null;
   const everything = useEverything('plan');
   const { data, error, isPending, refetch } = usePlan(slug, includesForTab(detailKind ?? tabId));
+  // The Your turn view's count: what in this plan waits on a person, from the one source.
+  const turn = useTurn(Boolean(slug), readSeen());
 
   // Opening a plan — any view of it — counts as reading its notifications,
   // scoped to this slug.
@@ -161,6 +189,7 @@ export default function PlanPage({ route }: { route: Route }) {
     label: tabLabel(id),
     href: planHref(s.slug, id),
     ...(id === 'phases' && data.phases.length ? { count: data.phases.length } : {}),
+    ...(id === 'turn' ? { count: openTurnOf(turn.data, s.slug) } : {}),
   }));
 
   return (
@@ -200,6 +229,7 @@ export default function PlanPage({ route }: { route: Route }) {
             view={route.query.view}
             report={route.query.report}
             everything={everything}
+            route={route}
           />
         </Suspense>
       </div>

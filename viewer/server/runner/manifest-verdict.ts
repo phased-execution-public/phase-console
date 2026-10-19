@@ -25,8 +25,8 @@
  */
 
 import {
-  TRUNK_BRANCHES, destructiveCommandExceptions, destructivePushBranches, exceptionHolds, exceptionPhases,
-  type DestructiveException,
+  destructiveCommandExceptions, destructivePushBranches, destructiveTrunkPushes, exceptionHolds, exceptionPhases,
+  isTrunkBranch, type DestructiveException,
 } from '../../shared/policy-model.js';
 import { executedTexts, gitCanonical, readShell, type ShellCommand, type ShellReading } from './shell-reading.ts';
 
@@ -57,6 +57,12 @@ export type ManifestContext = {
    * phases` resolves to. Absent, those words name no phase — narrower, never wider.
    */
   releasePhases?: readonly number[] | null;
+  /**
+   * The branch the run was cut from (`run.base.ref`, as a branch name): a
+   * trunk like `main`, answered from a row only where a clause names it for
+   * the phase (#276). Absent, `TRUNK_BRANCHES` alone are trunks.
+   */
+  baseBranch?: string | null;
 };
 
 /**
@@ -205,8 +211,17 @@ type PushShape =
   | { kind: 'reshape'; why: string; bare: string }
   | { kind: 'uncovered'; why: string };
 
-/** One push judged on its own words, against the branches the row names. */
-function judgePush(command: ShellCommand, branches: readonly string[]): PushShape {
+/**
+ * What a push may reach (#276): the branches the row names for the phase, or —
+ * for a whole `Bash(git push:*)` rule in a row that names no branch — `any`
+ * branch that is not a trunk; and the trunks a clause names for the phase,
+ * the only way a trunk is ever answered from the row.
+ */
+type PushReach = { branches: readonly string[]; any: boolean; trunks: readonly string[]; baseBranch: string | null; runBranch: string | null };
+
+/** One push judged on its own words, against what the row lets it reach. */
+function judgePush(command: ShellCommand, reach: PushReach): PushShape {
+  const { branches } = reach;
   const words = fromVerb(command);
   const options: string[] = [];
   const positional: string[] = [];
@@ -232,7 +247,8 @@ function judgePush(command: ShellCommand, branches: readonly string[]): PushShap
     };
   }
   const remote = positional[0] && !computed(positional[0]) ? positional[0] : 'origin';
-  const named = branches.length === 1 ? branches[0] : `<one of: ${branches.join(', ')}>`;
+  const named = reach.any && !branches.length ? (reach.runBranch ?? '<branch>')
+    : branches.length === 1 ? branches[0] : `<one of: ${branches.join(', ')}>`;
   const bareFor = (branch: string) => quote([PUSH_VERB, ...upstream, remote, branch]);
   const refspecs = positional.slice(1);
   if (positional[0] && computed(positional[0])) {
@@ -262,10 +278,19 @@ function judgePush(command: ShellCommand, branches: readonly string[]): PushShap
     if (destination === 'HEAD' || !destination) {
       return { kind: 'reshape', bare: bareFor(named), why: 'the push names no branch — `HEAD` is whatever is checked out' };
     }
-    if ((TRUNK_BRANCHES as readonly string[]).includes(destination)) {
-      return { kind: 'uncovered', why: `it pushes to ${destination}, a trunk — always a person's call` };
+    // The trunk check runs on EVERY push the row answers, a whole rule's
+    // included (#276): a trunk only where a clause names it for this phase.
+    if (isTrunkBranch(destination, reach.baseBranch)) {
+      if (reach.trunks.includes(destination)) {
+        destinations.push(destination);
+        continue;
+      }
+      return {
+        kind: 'uncovered',
+        why: `it pushes to ${destination}, a trunk — a person's call unless a clause of the row names ${destination} for this phase`,
+      };
     }
-    if (!branches.includes(destination)) {
+    if (!reach.any && !branches.includes(destination)) {
       return { kind: 'uncovered', why: `it pushes to ${destination}, which the row does not name (it names ${branches.join(', ')})` };
     }
     destinations.push(destination);
@@ -279,12 +304,19 @@ function judgePush(command: ShellCommand, branches: readonly string[]): PushShap
  */
 function pushVerdict(
   reading: ShellReading, pushes: ShellCommand[], value: string, ctx: ManifestContext,
-  alsoCovered: readonly ShellCommand[] = [],
+  alsoCovered: readonly ShellCommand[] = [], whole = false,
 ): ManifestVerdict {
   const rule = 'Bash(git push:*)';
-  const branches = destructivePushBranches(value, ctx);
-  if (!branches.length) return { answer: null, rule, why: 'the row names no branch this plan may push to' };
-  const shapes = pushes.map((push) => ({ push, shape: judgePush(push, branches) }));
+  const baseBranch = branchOfRef(ctx.baseBranch);
+  const branches = destructivePushBranches(value, ctx).filter((b) => !isTrunkBranch(b, baseBranch));
+  // A whole rule answers any branch only in a row that names none: one that
+  // names its branches anywhere ("`Bash(git push:*)` of `pe/x`") is scoped to
+  // them (#276).
+  const any = whole && !destructivePushBranches(value, { runBranch: ctx.runBranch || RUN_BRANCH_PLACEHOLDER }).length;
+  const trunks = destructiveTrunkPushes(value, { ...ctx, baseBranch });
+  const reach: PushReach = { branches, any, trunks, baseBranch, runBranch: ctx.runBranch ?? null };
+  if (!branches.length && !any && !trunks.length) return { answer: null, rule, why: 'the row names no branch this plan may push to' };
+  const shapes = pushes.map((push) => ({ push, shape: judgePush(push, reach) }));
   const uncovered = shapes.find((s) => s.shape.kind === 'uncovered');
   if (uncovered && uncovered.shape.kind === 'uncovered') return { answer: null, rule, why: uncovered.shape.why };
 
@@ -313,6 +345,21 @@ function pushVerdict(
   if (reshape && reshape.shape.kind === 'reshape') return deny(reshape.shape.why);
   const refusal = lineRefusal(reading, reading.commands.filter((c) => !pushes.includes(c) && !alsoCovered.includes(c)));
   if (refusal) return deny(refusal);
+  const pushed = [...new Set(shapes.flatMap((s) => (s.shape.kind === 'covered' ? s.shape.destinations : [])))];
+  const trunk = pushed.find((b) => trunks.includes(b));
+  const allowed: ManifestVerdict = {
+    answer: 'allow', rule,
+    why: trunk ? `the row names ${trunk} for phase ${ctx.phase} as a trunk this plan may push`
+      : pushed.every((b) => branches.includes(b)) ? `the row names ${pushed.join(', ')} as a branch this plan may push`
+        : `the row allows ${rule} for ${pushed.join(', ')}, which is not a trunk`,
+    branch: pushed[0],
+  };
+  // A whole rule answers the push ALONE, as it always did: what else the line
+  // runs goes to the caller, judged under the run's own policy.
+  if (whole) {
+    const companions = companionsOf(reading, [...pushes, ...alsoCovered]);
+    return companions.length ? { ...allowed, companions, bareForm: bare } : allowed;
+  }
   // Everything else the line runs must only read — inside a `$( … )` too.
   for (const command of reading.commands) {
     if (pushes.includes(command) || alsoCovered.includes(command)) continue;
@@ -324,12 +371,17 @@ function pushVerdict(
       ? `a \`$( … )\` beside the push runs ${name}, which does not only read`
       : `a command beside the push the row does not cover: ${name}`);
   }
-  const pushed = [...new Set(shapes.flatMap((s) => (s.shape.kind === 'covered' ? s.shape.destinations : [])))];
-  return {
-    answer: 'allow', rule,
-    why: `the row names ${pushed.join(', ')} as a branch this plan may push`,
-    branch: pushed[0],
-  };
+  return allowed;
+}
+
+/** Stands for "the run branch" when asking only whether a row names ANY branch. */
+const RUN_BRANCH_PLACEHOLDER = 'pe/run-branch';
+
+/** A base ref as a branch name: `origin/main` and `refs/heads/main` are `main`; `HEAD` names none. */
+function branchOfRef(ref: string | null | undefined): string | null {
+  if (typeof ref !== 'string' || !ref.trim()) return null;
+  const name = ref.trim().replace(/^refs\/(?:heads|remotes\/[^/]+)\//, '').replace(/^origin\//, '');
+  return name && name !== 'HEAD' ? name : null;
 }
 
 /**
@@ -410,13 +462,15 @@ export function manifestVerdict(command: string, value: string | null | undefine
   for (const { command: c, verb } of publishing) {
     const refused = invocationRefusal(c);
     if (refused) return { answer: null, rule: verb.rule, why: refused };
+    // Every push goes to the push reader, a whole rule's included — the trunk
+    // check lives there, and a whole rule once skipped it (#276).
+    if (verb.rule === 'Bash(git push:*)') {
+      pushes.push(c);
+      continue;
+    }
     const whole = mine.some((e) => e.rule === verb.rule && !e.options.length);
     if (whole) {
       covered.push(c);
-      continue;
-    }
-    if (verb.rule === 'Bash(git push:*)') {
-      pushes.push(c);
       continue;
     }
     if (mine.some((e) => covers(e, c))) {
@@ -429,7 +483,9 @@ export function manifestVerdict(command: string, value: string | null | undefine
       // A set the plan resolves to nothing — `the release phases` with no phase
       // titled `Release …` — is named as such, so the card says what to fix.
       const sets = [...new Set(elsewhere.flatMap((e) => e.sets))];
-      const where = phases.length ? phaseList(phases) : `the ${sets.join(' and ')} phases, which this plan resolves to no phase number`;
+      const where = phases.length ? phaseList(phases)
+        : sets.length ? `the ${sets.join(' and ')} phases, which this plan resolves to no phase number`
+          : 'no phase (the clause names its phases only to refuse them)';
       return {
         answer: null, rule: verb.rule,
         why: `the row allows \`${quote(elsewhere[0]!.verb)}\` for ${where} — not ${phase === null ? 'this phase' : `phase ${phase}`}`,
@@ -448,7 +504,8 @@ export function manifestVerdict(command: string, value: string | null | undefine
     }
     return { answer: null, rule: verb.rule, why: `the row does not name ${verb.rule} as an exception` };
   }
-  if (pushes.length) return pushVerdict(reading, pushes, row, ctx, covered);
+  const wholePush = mine.some((e) => e.rule === 'Bash(git push:*)' && !e.options.length);
+  if (pushes.length) return pushVerdict(reading, pushes, row, ctx, covered, wholePush);
 
   const rules = [...new Set(publishing.map((p) => p.verb.rule))];
   const named = mine.filter((e) => publishing.some((p) => covers(e, p.command) || (e.rule === p.verb.rule && !e.options.length)));

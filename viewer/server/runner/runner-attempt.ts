@@ -8,6 +8,7 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
+import { handoffHalfWritten, siblingLintSkip, type SiblingLintSkip } from './lint-siblings.ts';
 import { parkOnStep, stepJournalFields } from '../human-steps.ts';
 import { refusalFields } from '../turn/guard.ts';
 import { composeStepErrand } from '../turn/compose.ts';
@@ -100,8 +101,9 @@ import {
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome, needsOf } from './outcome.ts';
 import { PLAN_APPROVAL_NEED } from './plan-approval.ts';
 import {
-  AdmissionAborted, autopilotOwner, errandFoldTarget, type Scheduler, type ScopeGrant,
+  AdmissionAborted, autopilotOwner, errandFoldTarget, type HeavyJobGrant, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
+import { heavyCommand } from '../load-reading.ts';
 import { formatScope } from '../../shared/scope.js';
 import { Journal } from './journal.ts';
 import { Transcript } from './transcript.ts';
@@ -793,6 +795,16 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // was waiting for any more. A call whose result never came is not open;
       // it is abandoned.
       lane.signals.openTools = [];
+
+      // A git configuration the session planted in its trees (#272): the spawn
+      // door has halted the lane `run-tree-config`; nothing more runs here.
+      if (outcome.plantedConfig?.length) return { carryOn: false, completed: false };
+      // A model nothing on the run's account serves (one-pool phase 5): the door
+      // refused it before any child existed and halted the run; nothing ran.
+      if (outcome.modelRefused) return { carryOn: false, completed: false };
+      // An orphaned index.lock in its trees (#328): the door halted the lane
+      // `run-tree-locked` before the session started; nothing ran.
+      if (outcome.treeLocked?.length) return { carryOn: false, completed: false };
 
       // Did this attempt change anything? The answer is the `stalemate`
       // counter, and this is the one moment it can be asked: the session has
@@ -1527,6 +1539,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
         command, tree: by.tree, at: by.at,
         ...(by.session ? { session: by.session } : {}),
         ...(by.paperwork.length ? { paperwork: by.paperwork.slice(0, 20) } : {}),
+        // Judged by the line's own repository (#301): which, and what changed outside it.
+        ...(by.repo ? { repo: by.repo } : {}),
+        ...(by.repoTree ? { repoTree: by.repoTree } : {}),
+        ...(by.outside?.length ? { outside: by.outside } : {}),
       })),
       refused: judged.refused,
     }, phase);
@@ -1820,7 +1836,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   private async runMembers(
     chain: string, purpose: 'baseline' | 'attribution',
-    opts: { cwd: string; inPlace?: string; approvals?: VerifyApprovals; timeoutFor?: (command: string) => number },
+    opts: { cwd: string; inPlace?: string; docsRoot?: string; approvals?: VerifyApprovals; timeoutFor?: (command: string) => number },
   ): Promise<VerifyRun[]> {
     const members = chainMembers(chain);
     if (!members || this.abort?.signal.aborted || this.stopRequested) return [];
@@ -1829,6 +1845,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const ran = await verify(members.map((member) => `- \`${member}\``).join('\n'), {
       cwd: opts.cwd, purpose, cascade: false,
       ...(opts.inPlace ? { inPlace: opts.inPlace } : {}),
+      ...(opts.docsRoot ? { docsRoot: opts.docsRoot } : {}),
       ...(opts.approvals ? { approvals: opts.approvals } : {}),
       preflightSkip: this.verifyEnv().preflightSkip,
       timeoutMs: limit, timeoutFor: () => limit,
@@ -1983,13 +2000,22 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // read as closely as a verdict's (control-tower phase 106, #195/#185).
           ...(!row.ok && row.output?.trim() ? { tail: outputTail(row.output) } : {}),
           ...(row.environment ? { environment: row.environment } : {}),
+          ...(!row.ok && row.unreached?.length ? { unreached: row.unreached } : {}),
           ...(!row.ok && !row.timedOut && !row.environment ? { once: true as const } : {}),
         });
       }
     };
+    // A docs-only line runs where the docs are when the lines are judged at a mirror's root (#357).
+    const { docsRoot } = await this.verifyDirOf(phase);
+    // A heavy line waits for a seat in the machine's heavy-job budget (one-pool
+    // phase 26, #327) — and runs; urgent once the verdict waits on it.
+    const heavy = this.heavySeat(phase, 'baseline', () => this.baselineAwaited.has(phase));
     const seat = {
+      ...(docsRoot ? { docsRoot } : {}),
       purpose: 'baseline' as const, cascade: false, nice: BASELINE_NICE,
-      gate: async () => { loadWaitMs += await this.baselineLoadGate(phase); },
+      gate: async (command: string) => {
+        loadWaitMs += (await heavy.gate(command)) ?? await this.baselineLoadGate(phase);
+      },
       onChild: (pid: number) => this.noteVerifyingChild(phase, pid),
       ...(job.inPlace ? { inPlace: job.inPlace } : {}),
       ...(job.approvals ? { approvals: job.approvals } : {}),
@@ -2028,7 +2054,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
         }
         await owning();
         const ran = await this.runMembers(chain, 'baseline', {
-          cwd: job.cwd, ...(job.inPlace ? { inPlace: job.inPlace } : {}),
+          cwd: job.cwd, ...(job.inPlace ? { inPlace: job.inPlace } : {}), ...(docsRoot ? { docsRoot } : {}),
           ...(job.approvals ? { approvals: job.approvals } : {}), timeoutFor: (await limitsFor()).timeoutFor,
         });
         if (this.abort?.signal.aborted || this.stopRequested) return;
@@ -2036,6 +2062,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
         appendLedger(file, this.ledgerRows(phase, 'baseline', ran, job.base, [], chain, where));
       }
     } finally {
+      heavy.done();
       delete record.baselineSince;
       if (!concurrent) await this.endVerifyPass(phase);
     }
@@ -2063,6 +2090,54 @@ export abstract class RunnerAttempt extends RunnerLoop {
       ...(concurrent ? { told } : {}),
     }, phase);
     this.persist();
+  }
+
+  /**
+   * A HEAVY command's seat in the machine's heavy-job budget (one-pool phase
+   * 26, #327): the scheduler queues it behind every console's running suites
+   * and builds, and behind the machine's load unless `urgent`, and it runs once
+   * a seat frees — never skipped. The seat is held until the next line's gate,
+   * `done()`, or a stop.
+   *
+   * `gate` answers how long the command waited, or null when it is not a heavy
+   * command or no scheduler is wired — the caller's own load wait answers then.
+   * A wait is journalled `phase.verify-queued` (and logged `verify.queued`),
+   * and the seat it then took `phase.verify-dequeued`.
+   */
+  private heavySeat(phase: number, purpose: 'baseline' | 'verify', urgent: () => boolean): {
+    gate: (command: string) => Promise<number | null>;
+    done: () => void;
+  } {
+    let held: HeavyJobGrant | null = null;
+    const done = (): void => {
+      held?.release();
+      held = null;
+    };
+    const gate = async (command: string): Promise<number | null> => {
+      done();
+      const scheduler = this.deps.scheduler;
+      const state = this.state;
+      if (!scheduler || !state || !heavyCommand(command)) return null;
+      const shown = foldCommand(command).slice(0, 200);
+      const grant = await scheduler.heavyJob({
+        slug: state.slug, phase, runId: state.id, purpose, command: shown, urgent,
+        ...(this.abort?.signal ? { signal: this.abort.signal } : {}),
+        onQueued: (wait) => {
+          this.record('phase.verify-queued', {
+            purpose, command: shown, reason: wait.reason, running: wait.running, budget: wait.budget,
+            holders: wait.holders, sentence: wait.sentence,
+          }, phase);
+          log.info('verify.queued', { slug: state.slug, phase, purpose, command: shown, reason: wait.reason, running: wait.running, budget: wait.budget });
+          this.emit('phase', { phase, status: phaseRecord(state, phase).status, note: `${purpose === 'baseline' ? 'baseline' : 'verification'} queued — ${wait.sentence}` });
+        },
+      });
+      if (grant.queued && grant.id) {
+        this.record('phase.verify-dequeued', { purpose, command: shown, waitedMs: grant.waitedMs, pastLoad: grant.pastLoad }, phase);
+      }
+      held = grant.id ? grant : null;
+      return grant.waitedMs;
+    };
+    return { gate, done };
   }
 
   /**
@@ -2298,6 +2373,18 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const setupText = await this.deps.setupText?.(state.slug, phase);
     const verify = this.deps.verify ?? verifyPhase;
     const cwd = await this.verifyCwd(phase);
+    // Where a docs-only line runs (#357): the docs root, when this phase's lines are judged at a mirror's root.
+    const { docsRoot } = await this.verifyDirOf(phase);
+    // An orphaned index.lock in the trees the commands read (#328): halted
+    // `run-tree-locked` with the path named — never a verdict over a wedged tree.
+    if (text?.trim()) {
+      const scope = this.lanes.get(phase)?.grant?.scope ?? await this.scopeFor(phase).catch(() => [] as string[]);
+      const locked = this.treeLocks(this.laneRoot(phase), scope);
+      if (locked.length) {
+        this.haltTreeLocked(phase, 'verify', locked, 'verification');
+        return false;
+      }
+    }
     // A phase that squash-merged the run branch (a release) is checked against
     // what LANDED, not the pre-squash tip its checkout still stands on
     // (control-tower phase 112, #183) — only with no other lane live, so no
@@ -2325,7 +2412,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // signed `launch` rather than by a preference.
     const setAside = !waived && approvals?.waive?.size ? extractCommands(text, 'verify', approvals) : null;
     const allWaived = Boolean(setAside && !setAside.commands.length && !setAside.notRun.length && setAside.waived.length);
-    if (allWaived) {
+    // The operator's mid-run waivers this verification honours (one-pool phase
+    // 21, #267) — named, with who waived each line and why, on every pass.
+    const midRun = (state.verifyWaivers ?? []).filter((entry) => entry.phase === phase
+      && setAside?.waived.some((item) => item.fp === entry.fp));
+    if (midRun.length) {
+      this.record('phase.verify-waived', {
+        stage: 'verify', by: 'operator', reason: 'waived by the operator mid-run',
+        lines: midRun.map((entry) => ({ line: entry.text, by: entry.by, reason: entry.reason, rulingId: entry.rulingId ?? null })),
+      }, phase);
+    }
+    if (allWaived && !midRun.length) {
       this.record('phase.verify-waived', {
         stage: 'verify', reason: 'every check was waived at the run\'s start', by: 'launch', notRun: setAside!.waived,
       }, phase);
@@ -2349,14 +2446,22 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const runCwd = exported?.cwd ?? cwd;
     const startedAt = this.now().toISOString();
     const verifiedTree = measuring ? await workingTreeOf(runCwd).catch(() => null) : null;
+    const finishSeat = this.heavySeat(phase, 'verify', () => true);
     const verification: VerifySummary = waived ? {
       ok: true, ran: [], notRun: [],
       reason: 'the plan states no verification for this phase — passed on the handoff (allowUnverifiedPhases)',
     } : allWaived ? {
       ok: true, ran: [], notRun: [], waived: setAside!.waived,
-      reason: 'every check in this phase\'s §Verification was waived at the run\'s start — passed on the handoff',
+      reason: midRun.length
+        ? 'every check in this phase\'s §Verification was waived — passed on the handoff'
+        : 'every check in this phase\'s §Verification was waived at the run\'s start — passed on the handoff',
     } : await verify(text, {
       cwd: runCwd,
+      ...(docsRoot ? { docsRoot } : {}),
+      // A heavy line takes an URGENT seat in the machine's heavy-job budget
+      // (one-pool phase 26, #327): ahead of every baseline, past the load —
+      // the lane is waiting on this verdict — but never past the budget.
+      gate: async (command: string) => { await finishSeat.gate(command); },
       // An export stands in for the working tree: what it cannot provide is
       // the machine's, never a red (control-tower phase 106, #191).
       ...(exported ? { inPlace: cwd } : {}),
@@ -2382,6 +2487,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // view), so before this a running suite was one `[1/2]` line and then
       // nothing: no exit code, no elapsed time, no `[2/2]`.
       onDone: (result, index, total) => {
+        finishSeat.done();
         this.emit('verify', {
           phase, command: result.command, index, total,
           ok: result.ok, code: result.code, ms: result.ms,
@@ -2395,7 +2501,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       onSkip: (skipped) => {
         this.emit('verify', { phase, skipped: skipped.map((s) => ({ ...s })) });
       },
-    });
+    }).finally(() => finishSeat.done());
     record.verification = withStamps(verification, stamps);
     if (exported) record.verification.export = exported.export;
     // The ONE verdict (control-tower phase 45) — and only the phase's OWN reds
@@ -2415,13 +2521,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
     for (const row of verdict.broke) {
       const ran = measuring && chainMembers(row.command)
         ? await this.runMembers(row.command, 'attribution', {
-          cwd: runCwd, ...(exported ? { inPlace: cwd } : {}),
+          cwd: runCwd, ...(exported ? { inPlace: cwd } : {}), ...(docsRoot ? { docsRoot } : {}),
           ...(approvals ? { approvals } : {}), ...(limits ? { timeoutFor: limits.timeoutFor } : {}),
         })
         : [];
       if (ran.length) members.push({ chain: row.command, ran });
       const red = ran.filter((entry) => !entry.ok && !entry.timedOut);
-      if (red.length) reds.push(...red.map((entry) => ({ command: entry.command, failures: entry.failures, chain: row.command })));
+      if (red.length) {
+        reds.push(...red.map((entry) => ({
+          command: entry.command, failures: entry.failures, chain: row.command, ...(entry.unreached ? { unreached: entry.unreached } : {}),
+        })));
+      }
       else reds.push(row);
     }
     const split = splitReds(reds, record.baseline?.commands);
@@ -2442,10 +2552,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const passed = verification.ok || inheritedOnly || unprovenOnly;
     // A partial set-aside rides the same line, so the record names the checks
     // the operator answered at the door rather than letting them vanish.
-    if (!allWaived && verification.waived?.length) {
+    const atDoor = (verification.waived ?? []).filter((item) => !midRun.some((entry) => entry.fp === item.fp));
+    if (!allWaived && atDoor.length) {
       this.record('phase.verify-waived', {
-        stage: 'verify', reason: `${verification.waived.length} check(s) waived at the run's start`,
-        by: 'launch', notRun: verification.waived,
+        stage: 'verify', reason: `${atDoor.length} check(s) waived at the run's start`,
+        by: 'launch', notRun: atDoor,
       }, phase);
     }
     // The verdict, on the same channel — so a reader who watched the checklist
@@ -2625,6 +2736,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
 
     /* 2. the plan still lints */
     const lint = readLint(await this.script('validate.sh', [state.slug]));
+    let skipped: SiblingLintSkip | null = null;
     record.lint = { ok: lint.ok, summary: lint.summary, ...(lint.crashed ? { crashed: true } : {}) };
     // A reading that PROVED NOTHING is not a verdict, and acting on one is how
     // a run with nothing wrong with it ended up parked (#17). The engine died
@@ -2638,6 +2750,12 @@ export abstract class RunnerAttempt extends RunnerLoop {
       this.record('phase.lint-unrun', {
         why: lint.crashed ? 'crashed' : 'timeout', summary: lint.summary,
       }, phase);
+    } else if (!lint.ok && (skipped = siblingLintSkip(lint, phase,
+      (sibling) => handoffHalfWritten(state.root, state.slug, sibling)))) {
+      // #225: every problem is a LIVE sibling's handoff still between its
+      // scaffold and its body — that lane's transient state, not this phase's
+      // work, and the sibling's own finish lints it again. Named, never charged.
+      this.record('phase.lint-sibling-skipped', { siblings: skipped.phases, issues: skipped.lines, summary: lint.summary }, phase);
     } else if (!lint.ok) {
       record.status = 'failed';
       this.chargeFailure(phase, 'plan-lint', 'the plan stopped linting');
@@ -3553,7 +3671,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   private tokenScoped(phase: number, ids: string[]): string[] {
     const state = this.state!;
-    if (!ids.length || this.deps.accountKind?.(state.accountId) !== 'token') return ids;
+    const kind = this.deps.accountKind?.(state.accountId);
+    if (!ids.length || kind !== 'token') return ids;
     const declared = new Set(this.deps.planMcp?.(state.slug, phase) ?? []);
     const transportOf = this.deps.mcp?.transportOf;
     const dropped = ids.filter((id) => !declared.has(id) && (transportOf?.(id) ?? 'stdio') === 'stdio');
@@ -3567,6 +3686,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     }
     return kept;
   }
+
 
   /**
    * The park sentence, under `require`. Three shapes, each naming the errand.
@@ -3740,8 +3860,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * This phase's answers from the start door (`RunState.verifyApprovals`), as
    * the extractor reads them — undefined when the run has none.
    */
+  /**
+   * The run's §Verification answers for one phase: the start door's, and the
+   * operator's mid-run waivers of single lines (one-pool phase 21, #267) —
+   * which, unlike the start door's `waive`, may set aside a line the console
+   * WOULD run.
+   */
   protected verifyApprovalsFor(phase: number): VerifyApprovals | undefined {
-    return approvalsForPhase(this.state?.verifyApprovals, phase);
+    const door = approvalsForPhase(this.state?.verifyApprovals, phase);
+    const mid = (this.state?.verifyWaivers ?? []).filter((entry) => entry.phase === phase).map((entry) => entry.fp);
+    if (!mid.length) return door;
+    return { ...(door?.approve ? { approve: door.approve } : {}), waive: new Set([...(door?.waive ?? []), ...mid]) };
   }
 
   /**
@@ -3767,6 +3896,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * Both journal `phase.verify-in-missing`, because a verification that ran
    * somewhere other than where the plan said must never be silent.
    */
+  /** Which mount each phase's `Verify in: .` was moved to, journalled once (#311). */
+  private readonly verifyInMounted = new Map<number, string>();
+
   private async verifyCwd(phase: number): Promise<string> {
     // The LANE's root, so a worktree phase verifies the tree it just wrote. A
     // verification that ran in the shared checkout would grade the run branch
@@ -3774,8 +3906,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // One resolution (`verifyDirOf`), shared with the session's `PE_VERIFY_DIR`
     // (control-tower phase 106), so where a proof is keyed and where it is
     // judged cannot drift apart.
-    const { dir, declared, refused } = await this.verifyDirOf(phase);
+    const { dir, declared, refused, mount } = await this.verifyDirOf(phase);
     if (refused) this.record('phase.verify-in-missing', { declared, reason: refused, usedRoot: true }, phase);
+    // `.` at a mirror root that is no tree, moved to its one mount (#311) —
+    // never silent, once per phase record.
+    if (mount && this.verifyInMounted.get(phase) !== mount) {
+      this.verifyInMounted.set(phase, mount);
+      this.record('phase.verify-in-mount', { declared: declared ?? null, mount, dir }, phase);
+    }
     return dir;
   }
 
@@ -4248,8 +4386,13 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // arm below re-stamps a fresh one, which is what "from zero" means.
     endLockWait(record);
     switch (declared.status) {
-      case 'waiting-external':
-        return this.parkWaiting(phase, declared, { budget }) ? 'waiting' : 'halted';
+      case 'waiting-external': {
+        if (!this.parkWaiting(phase, declared, { budget })) return 'halted';
+        // A wait on the session's own detached job — or over its own WIP —
+        // keeps the tree that job measures (#295).
+        if (record.status === 'waiting') await this.keepLaneIfOwed(phase, record, 'waiting-external', undefined, declared.watch);
+        return 'waiting';
+      }
       case 'blocked': {
         record.declared = {
           status: 'blocked',
@@ -4488,6 +4631,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
           situation: situationOf('work-in-progress', why),
           sessionId: record.sessionId,
         });
+        // Any partial keeps its lane while its WIP sits in a shared tree
+        // (#354), not only the wrap-up the console asked for.
+        if (climbed) await this.keepLaneIfOwed(phase, record, declared.reason ?? 'partial', record.boardingHint?.at);
         this.record('phase.outcome-partial', { reason: declared.reason ?? null, climbed }, phase);
         // Climbed: pending + hint, boards next tick. Not climbed: the ladder
         // parked it with an errand (or deferred it as failed); either way the
@@ -4795,6 +4941,32 @@ export abstract class RunnerAttempt extends RunnerLoop {
     return [...wipOwners(paths, this.sessionWindows(), phase).values()].filter((owner) => owner === 'self').length;
   }
 
+  /**
+   * The lane holder (one-pool phase 21, #354 #295): a phase that leaves the
+   * shared tree holding something of its own — its uncommitted WIP, or a
+   * detached job of its own measuring that tree (a `waiting-external` whose
+   * watch is a `cmd:` probe) — KEEPS its lane until it boards again. Every
+   * `partial`, not only the wrap-up the console asked for (#354: a context
+   * partial that climbed the ladder kept nothing, and a sibling of the same
+   * run boarded into its 16 uncommitted files), and every such wait (#295: a
+   * sibling edited the tree a detached verify was testing). A lane with its own
+   * worktree keeps nothing: no sibling boards into it. The drive loop holds a
+   * kept lane's scope against every sibling in the same tree while the phase
+   * is resumable (`run.lane-held`), and boarding spends it.
+   */
+  private async keepLaneIfOwed(
+    phase: number, record: PhaseRecord, reason: string, at = new Date().toISOString(), watch?: readonly string[],
+  ): Promise<boolean> {
+    if (this.lanes.get(phase)?.worktree) return false;
+    const paths = await this.ownUncommittedShared(phase).catch(() => 0);
+    const job = (watch ?? []).find((ref) => ref.startsWith('cmd:'));
+    if (!paths && !job) return false;
+    const sessionId = record.sessionId ?? null;
+    record.keepsLane = { at, reason: job && !paths ? 'detached-verify' : reason, sessionId, paths, ...(job ? { watch: job } : {}) };
+    this.record('phase.lane-kept', { reason: record.keepsLane.reason, paths, sessionId, ...(job ? { watch: job } : {}) }, phase);
+    return true;
+  }
+
   private wrapupAsked(record: PhaseRecord, reason: string | null | undefined): boolean {
     if (reason !== 'context' && reason !== 'budget') return false;
     const told = record.contextWrapup;
@@ -4833,11 +5005,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // Its lane is kept while its own WIP sits uncommitted in a shared tree
     // (control-tower phase 109, #192): it re-boards before any sibling whose
     // scope meets it, in the very pass that released it.
-    const paths = await this.ownUncommittedShared(phase).catch(() => 0);
-    if (paths) {
-      record.keepsLane = { at: hint.at, reason, sessionId, paths };
-      this.record('phase.lane-kept', { reason, paths, sessionId }, phase);
-    }
+    await this.keepLaneIfOwed(phase, record, reason, hint.at);
     this.record('phase.outcome-partial', { reason, climbed: false, wrapup: true }, phase);
     this.persist();
     this.emit('phase', { phase, status: record.status, note: record.note });

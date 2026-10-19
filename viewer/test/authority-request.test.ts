@@ -150,7 +150,11 @@ test('AR-2: a request is shown on its item — or, about none, as a decision ite
     assert.ok(own, 'a decision item of its own');
     assert.equal(own!.kind, 'decision');
     assert.equal(own!.group, 'approve', 'the groups v2 (turn-by-turn phase 9): an owner request is a yes or no');
-    assert.match(own!.title, /^Asked by .* — confirm\?$/);
+    // The title is held to 80 characters (one-pool phase 14, #365); the whole
+    // sentence is the item's long form, `headline`.
+    assert.match(own!.title, /^Asked by /);
+    assert.ok(own!.title.length <= 80, own!.title);
+    assert.match((own as { headline?: string }).headline ?? own!.title, /^Asked by .* — confirm\?$/);
     assert.deepEqual(own!.actions.map((action) => action.verb), ['confirm', 'refuse']);
   } finally {
     close();

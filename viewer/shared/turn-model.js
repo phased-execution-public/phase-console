@@ -365,13 +365,22 @@ function riskRow(wall, family, scope, tier) {
  */
 export function riskRowOf(grant) {
   const family = grant.family ?? 'any';
-  return GRANT_RISK.find(
-    (row) =>
-      (row.wall === '*' || row.wall === grant.wall) &&
-      (row.family === '*' || row.family === family) &&
-      (row.scope === '*' || row.scope === grant.scope),
+  // Memoised per cell (one-pool phase 26, #237): the inbox asks it of every
+  // permission item on every fold, and the table never changes.
+  const key = `${grant.wall}\u0000${family}\u0000${grant.scope}`;
+  if (riskRows.has(key)) return riskRows.get(key);
+  const row = GRANT_RISK.find(
+    (candidate) =>
+      (candidate.wall === '*' || candidate.wall === grant.wall) &&
+      (candidate.family === '*' || candidate.family === family) &&
+      (candidate.scope === '*' || candidate.scope === grant.scope),
   );
+  if (riskRows.size < 512) riskRows.set(key, row);
+  return row;
 }
+
+/** `riskRowOf`'s answers, by cell. @type {Map<string, ReturnType<typeof riskRowOf>>} */
+const riskRows = new Map();
 
 /**
  * The tier of granting `family` past `wall` at `scope`.
@@ -486,6 +495,87 @@ export const TURN_GROUP_LABEL = Object.freeze({
 
 /** The groups that are the person's to act on now — what the headline and the strip count as to do. */
 export const TURN_OPEN_GROUPS = Object.freeze(/** @type {const} */ (['approve', 'now', 'decide']));
+
+/* ------------------------------------------------------------------ *
+ * The page's address: views, tabs and groupings (one-pool phase 14, #377 #366)
+ * ------------------------------------------------------------------ */
+
+/**
+ * How the page draws what it shows — `?view=` (one-pool phase 14, #377).
+ * `list` (the default, so its address carries no `?view=`): one line per
+ * item with the selected item's card beside it in the panel; `board`: the
+ * items in columns by the person's status (`TURN_BOARD_COLUMNS`); `cards`:
+ * every item drawn whole, as 7.1 drew the page; `timeline`: every item placed
+ * by when it was raised, when it is due and its deadline on one clock. 7.1's
+ * `compact` still reads, as `list` (`TURN_VIEW_ALIASES`).
+ * @typedef {(typeof TURN_VIEWS)[number]} TurnPageView
+ */
+export const TURN_VIEWS = Object.freeze(/** @type {const} */ (['list', 'board', 'cards', 'timeline']));
+
+/** An old view word → the view that answers it now. @type {Readonly<Record<string, TurnPageView>>} */
+export const TURN_VIEW_ALIASES = Object.freeze({ compact: 'list' });
+
+/**
+ * Which items the page shows — `?tab=` (#377): `open` (the default) is every
+ * item still the person's or being checked, the heads-ups too; `done` what was
+ * settled, today's and the ledger's older; `handled` what the AI did instead
+ * of asking; `all` the four together. Done and Handled on tabs of their own
+ * stop lengthening the open list.
+ * @typedef {(typeof TURN_TABS)[number]} TurnTab
+ */
+export const TURN_TABS = Object.freeze(/** @type {const} */ (['open', 'done', 'handled', 'all']));
+
+/** What each tab is called. @type {Readonly<Record<TurnTab, string>>} */
+export const TURN_TAB_LABEL = Object.freeze({
+  open: 'Open',
+  done: 'Done',
+  handled: 'Handled by the AI',
+  all: 'All',
+});
+
+/**
+ * What the items are grouped by — `?group=` (#377): `asked` (the default),
+ * the groups v2 above; `plan`; `type` (`ITEM_TYPES`); `deadline`
+ * (`TURN_DEADLINE_BANDS`); `status`, the person's (`PERSON_STATUSES`).
+ * @typedef {(typeof TURN_GROUPINGS)[number]} TurnGrouping
+ */
+export const TURN_GROUPINGS = Object.freeze(
+  /** @type {const} */ (['asked', 'plan', 'type', 'deadline', 'status']),
+);
+
+/**
+ * Where an item's deadline stands — the `deadline` grouping's bands, in the
+ * order the page draws them.
+ * @typedef {(typeof TURN_DEADLINE_BANDS)[number]} TurnDeadlineBand
+ */
+export const TURN_DEADLINE_BANDS = Object.freeze(
+  /** @type {const} */ (['overdue', 'today', 'later', 'none']),
+);
+
+/** What each deadline band is called. @type {Readonly<Record<TurnDeadlineBand, string>>} */
+export const TURN_DEADLINE_LABEL = Object.freeze({
+  overdue: 'Past its deadline',
+  today: 'Due within a day',
+  later: 'Due later',
+  none: 'No deadline',
+});
+
+/**
+ * The board's columns, in order — the Owner To-Do Board's shape (#377): each
+ * a set of the person's statuses. *Done* holds every way an item ends.
+ * @type {ReadonlyArray<Readonly<{id: string, label: string, statuses: readonly string[]}>>}
+ */
+export const TURN_BOARD_COLUMNS = Object.freeze([
+  Object.freeze({ id: 'todo', label: 'To do', statuses: Object.freeze(['todo']) }),
+  Object.freeze({ id: 'checking', label: 'Checking', statuses: Object.freeze(['checking']) }),
+  Object.freeze({ id: 'redo', label: 'Redo', statuses: Object.freeze(['redo']) }),
+  Object.freeze({ id: 'owner', label: 'Waiting for the owner', statuses: Object.freeze(['owner']) }),
+  Object.freeze({
+    id: 'done',
+    label: 'Done',
+    statuses: Object.freeze(['passed', 'not-doing', 'closed']),
+  }),
+]);
 
 /**
  * The group an item is drawn in — total over the states, and by type and

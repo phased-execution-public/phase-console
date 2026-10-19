@@ -183,6 +183,16 @@ export type TurnItem = TurnView & {
   requests?: AuthorityRequest[];
   /** An owner request about no item the turn shows: it is the item (`record: 'request'`). */
   request?: AuthorityRequest;
+  /*
+   * The title rule (#377, `server/turn/compose.ts` `shortTitle`): `title` is
+   * sentence case and at most 80 characters; `headline` is the act's whole
+   * words when the title had to be cut, `errandRef` the plan's errands-table
+   * ref ("E-4") drawn as a chip, and `files` the landing errand's files
+   * grouped by repository — the card's folded *Details*.
+   */
+  headline?: string;
+  errandRef?: string;
+  files?: InboxItem['files'];
 };
 
 /**

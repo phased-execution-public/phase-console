@@ -281,3 +281,35 @@ test('issues-sweep-hub-tb-hz Phase 30 (2026-10-06): a row that allows a command 
   assert.deepEqual(destructivePushBranches('deny; in the release phases push to `rel/x`', { phase: 30, releasePhases: [30] }), ['rel/x']);
   assert.deepEqual(destructivePushBranches('deny; in the release phases push to `rel/x`', { phase: 30 }), []);
 });
+
+test('#275 (one-pool phase 2): a negated phase list in an allow clause EXCLUDES — a clause whose only phases are negated grants nothing', () => {
+  // The issue's two rows, verbatim: the negated list was read as a grant.
+  const create = 'deny by default; allow `Bash(gh pr create:*)` in Phases 13 and 15 — never in the release phases';
+  assert.deepEqual(destructiveExceptions(create, { phase: 30, releasePhases: [30, 31] }), []);
+  assert.deepEqual(destructiveExceptions(create, { phase: 13, releasePhases: [30, 31] }), ['Bash(gh pr create:*)']);
+  assert.deepEqual(destructiveExceptions(create, { phase: 13, releasePhases: [13] }), [], 'an excluded set wins over a number');
+  assert.deepEqual(destructiveExceptions(create, { phase: 13 }), [], 'an exclusion this context cannot resolve grants nothing');
+  const merge = 'deny by default; allow `gh pr merge --squash` in Phase 4 — never in phases 30 and 31';
+  assert.deepEqual(destructiveExceptions(merge, { phase: 30 }), []);
+  assert.deepEqual(destructiveExceptions(merge, { phase: 4 }), ['Bash(gh pr merge --squash:*)']);
+  // The older shapes the same reader got wrong.
+  assert.deepEqual(destructiveExceptions('deny; allow `gh pr create`, never `gh pr merge`'), ['Bash(gh pr create:*)'],
+    'a command after a refusal is not an exception');
+  for (const phase of [5, 30, 31]) {
+    assert.deepEqual(destructiveExceptions('deny; allow `gh pr create` except in phases 30, 31', { phase }), [], `except — phase ${phase}`);
+    assert.deepEqual(destructiveExceptions('deny; allow `gh pr create` phases !3', { phase }), [], `!3 — phase ${phase}`);
+  }
+  assert.deepEqual(destructiveExceptions('deny; allow `gh pr create` phases !3', { phase: 3 }), [], 'the plan\'s `!` list');
+  assert.deepEqual(destructiveCommandExceptions('deny; allow `gh pr create` phases !3')[0]?.phases, [], 'only negated: no phase');
+  assert.deepEqual(destructiveExceptions('deny; In Phase 4, allow `gh pr create`', { phase: 4 }), ['Bash(gh pr create:*)']);
+  assert.deepEqual(destructiveExceptions('deny; In Phase 4, allow `gh pr create`', { phase: 5 }), [], 'a qualifier before `allow` scopes it');
+  // A refusal word inside a rule is part of the rule, not a refusal.
+  assert.deepEqual(destructiveExceptions('deny; allow `gh pr create --no-maintainer-edit` in phase 4', { phase: 4 }),
+    ['Bash(gh pr create --no-maintainer-edit:*)']);
+  // The push branch reader reads the same way.
+  assert.deepEqual(destructivePushBranches('deny; push to `pe/x` in phase 4 — never in phase 5', { phase: 4 }), ['pe/x']);
+  assert.deepEqual(destructivePushBranches('deny; push to `pe/x` in phase 4 — never in phase 5', { phase: 5 }), []);
+  for (const phase of [3, 5]) {
+    assert.deepEqual(destructivePushBranches('deny; push to `pe/x` — except in phase 3', { phase }), [], `phase ${phase}`);
+  }
+});

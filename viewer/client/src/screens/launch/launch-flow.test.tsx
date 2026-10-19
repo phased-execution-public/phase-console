@@ -161,6 +161,23 @@ const GOLDEN_BEFORE =
 const GOLDEN =
   '{"model":"opus","effort":"max","onLimit":"switch","autonomy":"keep-going","phaseBudgetUsd":null,"runBudgetUsd":null,"permissionProfile":"trusted","skills":[],"mcpPolicy":"continue","gitMode":"default-branch","ultraReview":"off","priority":"normal","startAfter":"","landing":"hold","conflictPolicy":"halt","messaging":"on","issuesMode":"off","worktreeRetention":"keep-on-failure","qaRoundBudgetUsd":null,"autoRecover":true,"resumeOnRestart":true,"relay":"off","accounts":[{"id":"default","minHeadroomPct":0}]}';
 
+/**
+ * The form's model control, the way a person meets it in each edition (`MODEL_CHOICE` in
+ * `sections.tsx`): the free edition draws a select labelled Model; Pro swaps in the catalog
+ * picker (one-pool phase 11), whose trigger is a button that says the chosen id.
+ */
+const MODEL_CONTROL = {
+  find: async (scope: HTMLElement): Promise<HTMLElement> => within(scope).getByLabelText('Model'),
+  reads: (control: HTMLElement): string => (control as HTMLSelectElement).value,
+  choose: async (scope: HTMLElement, id: string) => {
+    fireEvent.change(within(scope).getByLabelText('Model'), { target: { value: id } });
+  },
+};
+
+function chooseModel(scope: HTMLElement, id: string) {
+  return MODEL_CONTROL.choose(scope, id);
+}
+
 async function mount(props: Record<string, unknown> = {}, consoleState: Record<string, unknown> = {}) {
   mocks.state.mockResolvedValue({
     prefs: {},
@@ -342,7 +359,7 @@ describe('the review, collapsed to what differs', () => {
   it('counts every value that differs, lists each with its source, and links back to its tile', async () => {
     await mount();
     await tile('Engine');
-    fireEvent.change(within(region('Engine')).getByLabelText('Model'), { target: { value: 'sonnet' } });
+    await chooseModel(region('Engine'), 'sonnet');
     await tile('Money and stops');
     fireEvent.change(within(region('Money and stops')).getByLabelText(/Budget for the run/), {
       target: { value: '40' },
@@ -362,7 +379,7 @@ describe('the review, collapsed to what differs', () => {
     ]);
     // A Change link opens the field's tile.
     fireEvent.click(within(differ).getByRole('button', { name: 'Change Model' }));
-    expect(within(region('Engine')).getByLabelText('Model')).toBeTruthy();
+    expect(await MODEL_CONTROL.find(region('Engine'))).toBeTruthy();
     expect(screen.queryByRole('region', { name: 'Money and stops' })).toBeNull();
   });
 
@@ -446,7 +463,7 @@ describe('the honest states', () => {
     await tile('Git');
     expect(await within(region('Git')).findAllByText('from Settings')).toBeTruthy();
     await tile('Engine');
-    fireEvent.change(within(region('Engine')).getByLabelText('Model'), { target: { value: 'sonnet' } });
+    await chooseModel(region('Engine'), 'sonnet');
     fireEvent.click(screen.getByRole('button', { name: 'Start' }));
     await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
 
@@ -454,8 +471,7 @@ describe('the honest states', () => {
     await mount({}, { prefs: { gitMode: 'new-branch' } });
     expect(screen.getAllByRole('button', { name: 'Last launch' }).length).toBeGreaterThan(0);
     await tile('Engine');
-    const model = within(region('Engine')).getByLabelText('Model') as HTMLSelectElement;
-    expect(model.value).toBe('sonnet');
+    expect(MODEL_CONTROL.reads(await MODEL_CONTROL.find(region('Engine')))).toContain('sonnet');
     expect(within(region('Engine')).getAllByText('from your last launch').length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole('button', { name: /value.* from a fresh console/ }));
     const row = within(screen.getByRole('region', { name: 'What differs' }))

@@ -37,6 +37,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { availableParallelism } from 'node:os';
 
 import {
   CHAIN_HOLDER,
@@ -52,6 +53,7 @@ import {
   deferReason,
   entryHoldReason,
   fleetFreezeReason,
+  heavyJobBudget,
   holdReason,
   loadReading,
   loadReason,
@@ -65,6 +67,7 @@ import { scheduleState, type SchedulePolicy } from '../../shared/schedule-policy
 import { DEFAULT_MAX_SESSIONS } from '../config.ts';
 import { log } from '../log.ts';
 import { holdBinds } from '../fleet-hold.ts';
+import { heavyJobId, type HeavyJobToken, type SchedulerJobs } from '../load-reading.ts';
 import type { Presence } from '../../shared/run-lifecycle.js';
 import type { FenceLiftReason, HolderClass, HolderKind, QueueKind } from '../../shared/run-lifecycle.js';
 import { subKindOfNeed } from '../../shared/decisions-model.js';
@@ -216,6 +219,14 @@ export type AdmitRequest = {
    */
   kind?: QueueKind;
   /**
+   * This phase was RUNNING moments ago and is resuming its own work — a
+   * context or budget wrap-up's resume (one-pool phase 26, #243 ask 2). The
+   * machine-load guard holds NEW work; a resume is not new work, and sweep P24
+   * sat six minutes behind the guard that way with its lane a minute warm.
+   * Every other holder governs it exactly as before.
+   */
+  resumed?: boolean;
+  /**
    * Which class this admission is scanned in. Absent reads as `normal`.
    *
    * The birth value only. An operator who changes a live run's class is served
@@ -311,6 +322,11 @@ export type EntryControl = {
   pin?: { at: string; by?: string; reason?: string };
   hold?: { at: string; by?: string; reason?: string };
   defer?: { until: string; at: string; by?: string; reason?: string };
+  /** An operator's order (one-pool phase 39, #380) — `QueueControl.order`, ranked at the bump key by `scanOrderOf`. */
+  order?: {
+    anchor: { slug: string; phase: number } | 'first' | 'last'; side: 'before' | 'after'; stamp: number;
+    at: string; by?: string; reason?: string;
+  };
 };
 
 /**
@@ -327,6 +343,18 @@ export type EntryControl = {
  * median, and for a sibling of the waiter's own run it counted the waiter
  * itself. A plan-level figure survives only where no phase is known, and says so.
  */
+/** The skip chain's own keys — `poll`'s bookkeeping, never a word a person reads. */
+export type SkipKey =
+  | 'fleet' | 'schedule' | 'load' | 'run-hold' | 'entry' | 'lead' | 'chain' | 'throttle' | 'brake'
+  | 'reservation' | 'repo' | 'branch' | 'after' | 'cap' | 'machine' | 'scope';
+
+/**
+ * One rule an admission fails (one-pool phase 39, #380): its code — a row of
+ * `shared/queue-rules.js` `QUEUE_RULES`, held there by `queue-check.test.ts` —
+ * the holder the page names, and the scheduler's own key for it.
+ */
+export type AdmissionRow = { code: string; holder: Holder; key: SkipKey };
+
 /** A scheduling policy's promotion of one entry (control-tower phase 100). */
 export type Promotion = { policy: string; rank: number; text: string; holdsSiblings?: boolean };
 
@@ -352,7 +380,7 @@ export type LaneReservation = {
 export type LaneReservationView = LaneReservation & { scope: string[]; at: string; armed: boolean };
 
 /** One reading of the machine's load and the guard's factor (null: the guard is off). */
-export type LoadSample = { avg5: number; cores: number; factor: number | null };
+export type LoadSample = { avg5: number; cores: number; factor: number | null; busy?: number | null };
 
 export type HolderEta = {
   /** Plan weight still to do — the raw number, for sorting and for a tooltip. Plan-level figures only. */
@@ -510,6 +538,8 @@ export type QueueEntry = {
   repoCap?: number;
   /** See `AdmitRequest.kind`. Absent reads as `phase`. */
   kind?: QueueKind;
+  /** See `AdmitRequest.resumed`: the machine-load guard does not hold it. */
+  resumed?: true;
   since: number;
   waitingOn: Holder[];
   /** Later intersecting entries admitted past this one. Bounded by `MAX_BYPASS`. */
@@ -779,6 +809,16 @@ export type SchedulerDeps = {
    * waits. Absent, or a null answer, is no guard.
    */
   load?: () => LoadSample | null;
+  /**
+   * The machine's heavy-job tokens (one-pool phase 26, #327): every console's
+   * running suites and builds, shared through `<stateHome>/fleet/jobs/`.
+   * Absent: this scheduler's own jobs are the only ones it counts.
+   */
+  jobs?: SchedulerJobs;
+  /** How often a waiting heavy job looks again for budget. Default `HEAVY_JOB_POLL_MS`. */
+  heavyPollMs?: number;
+  /** This console's id, stamped on its job tokens. */
+  instanceId?: string;
   /** Called whenever the queue or the grant set changed. Drives `run:queue`. */
   onChange?: (snapshot: SchedulerSnapshot) => void;
   /**
@@ -940,6 +980,75 @@ export type UsageBrake = {
   window?: string;
 };
 
+/**
+ * One heavy verification job asking for a seat (one-pool phase 26, #327): a
+ * §Verification or baseline line that runs a suite or a build
+ * (`heavyCommand`). It waits for the machine's budget and then RUNS — a job is
+ * scheduled, never skipped.
+ */
+export type HeavyJobRequest = {
+  slug: string;
+  phase: number | null;
+  runId: string;
+  purpose: string;
+  command: string;
+  /**
+   * A phase's verdict waits on it (its finishing §Verification, or a baseline
+   * the verdict now awaits): it goes ahead of every job that is not, and the
+   * CPU reading does not hold it — the budget still does.
+   */
+  urgent?: boolean | (() => boolean);
+  signal?: AbortSignal;
+  /** Told once, the first time the job has to wait, with why. */
+  onQueued?: (wait: HeavyJobWait) => void;
+};
+
+/** Why a heavy job is waiting. */
+export type HeavyJobWait = {
+  reason: 'budget' | 'load';
+  running: number;
+  budget: number;
+  /** What holds the seats, oldest first — any console's. */
+  holders: { instance: string; slug: string; phase: number | null; purpose: string; command: string; at: string }[];
+  sentence: string;
+};
+
+/** A seat held: give it back when the command ends. */
+export type HeavyJobGrant = {
+  id: string;
+  waitedMs: number;
+  /** It waited, and was told why (`onQueued`). */
+  queued: boolean;
+  /** It ran with the machine still loaded, its load wait spent (`HEAVY_LOAD_WAIT_MAX_MS`). */
+  pastLoad: boolean;
+  release(): void;
+};
+
+/** The heavy-job queue as the queue page reads it. */
+export type HeavyJobsView = {
+  budget: number;
+  running: { instance: string; slug: string; phase: number | null; purpose: string; command: string; at: string; own: boolean }[];
+  waiting: { slug: string; phase: number | null; purpose: string; command: string; since: number; urgent: boolean; reason: 'budget' | 'load' | null }[];
+};
+
+/** How often a waiting heavy job looks again for budget — a sibling console's release is heard only this way. */
+export const HEAVY_JOB_POLL_MS = 5_000;
+
+/**
+ * How long a heavy job waits on the machine's LOAD alone before it runs anyway.
+ * The budget is a hard wait (a seat always frees: every command has a clock);
+ * the load is a soft one, because a machine pinned by work no console started
+ * would otherwise never verify anything again.
+ */
+export const HEAVY_LOAD_WAIT_MAX_MS = 30 * 60_000;
+
+type HeavyWaiter = HeavyJobRequest & {
+  since: number;
+  reason: 'budget' | 'load' | null;
+  told: boolean;
+  resolve: (grant: HeavyJobGrant) => void;
+};
+
 export type SchedulerSnapshot = {
   max: number;
   live: number;
@@ -981,6 +1090,8 @@ export type SchedulerSnapshot = {
   reservations: LaneReservationView[];
   /** The machine-load guard's reading, or null when none is wired (control-tower phase 100). */
   load?: ReturnType<typeof loadReading> | null;
+  /** The heavy-job queue (one-pool phase 26, #327): the machine's budget, what runs and what waits. */
+  jobs?: HeavyJobsView;
 };
 
 /** Thrown into a pending `admit()` when the run it belonged to was stopped. */
@@ -1241,6 +1352,21 @@ export function isExternalWall(record: FenceRecord, errand?: Pick<Errand, 'situa
 }
 
 /**
+ * May a Recheck answer this wall by asking its refs (one-pool phase 23, #264)?
+ * Every declared EXTERNAL wall (`isExternalWall`), and every `waiting-external`
+ * declaration that names a ref — the usual way to wait on CI or a deploy,
+ * which `isExternalWall` deliberately leaves out: the scope fence reads that
+ * narrower meaning, and widening it would fence a scope behind every CI wait.
+ * Before this, Recheck on a landed `waiting-external` wall fell through to the
+ * three done-checks, asked "is the handoff complete?", and halted the phase.
+ */
+export function isRecheckableWall(record: FenceRecord, errand?: Pick<Errand, 'situation'> | null): boolean {
+  if (isExternalWall(record, errand)) return true;
+  const declared = record.declared;
+  return declared?.status === 'waiting-external' && pollableRefs(declared.watch ?? record.watch ?? []).length > 0;
+}
+
+/**
  * Does this phase fence its scope right now? Parked on a declared external
  * wall; not landed, not lifted by an operator since it was declared; inside
  * its wait budget; and holding a live ref or a standing errand. Everything
@@ -1460,6 +1586,138 @@ type Waiting = QueueEntry & {
   /** Set by a scan on a LEAD (a pin, a red WIP's owner) left waiting for a lane: what its siblings wait on. */
   leadHold?: Holder;
 };
+
+
+/** How far an operator's `first` or `last` sits beyond every bump stamp (stamps are clock milliseconds). */
+const ORDER_EDGE = 1e15;
+
+/** What `scanOrderOf` reads of a queue entry — `Waiting`'s ordering fields, so the forecast can hand it plain rows. */
+export type ScanEntry = Pick<QueueEntry, 'slug' | 'runId' | 'phase' | 'priority' | 'control' | 'reserving' | 'reserve'> & {
+  bumpedAt?: number;
+  awaiting?: () => readonly number[] | null | undefined;
+  promote?: () => Promotion | null;
+  promoted?: Promotion | null;
+  turn?: { round: number; lanes: number; moved?: boolean };
+};
+
+/** The world `scanOrderOf` ranks against: the live lanes by plan, and whether a lane is kept for an entry. */
+export type ScanWorld<T> = { lanes: ReadonlyMap<string, number>; kept?: (entry: T) => boolean };
+
+/**
+ * The order `poll` walks the queue in (extracted pure, one-pool phase 39,
+ * #380, so the queue forecast replays the same ranker the scheduler boards
+ * by — never a re-typed copy; `forecast-parity.test.ts`). Fills each entry's
+ * `promoted` and `turn`, as the scan always has.
+ *
+ * The keys, most significant first:
+ *
+ *   0. **a dependency before its dependants** (control-tower phase 86, #136);
+ *   1. **`reserving`** — an entry that has already aged out sorts ahead of
+ *      everything, class included: bounded bypass has to outrank a preference
+ *      or it is not a bound (and a `reserve` entry or a kept lane with it);
+ *   2. **class** (`priorityRank`) — an operator's order anchored on another
+ *      plan's entry takes that entry's class;
+ *   3. **a pin**, then **the bump** — most recent first, an operator's order
+ *      (`control.order`) ranked here beside it;
+ *   4. **the scheduling policy's promotion** (control-tower phase 100);
+ *   5. **the fair-share round** — inside a class the plans take turns
+ *      (#135 C.13);
+ *   6. **queue position** — FIFO, the tiebreak for every group above. With no
+ *      priorities, bumps or orders set anywhere the order is exactly the
+ *      insertion order; that equivalence is pinned by a test.
+ *
+ * A fresh array: `entries`' own order is arrival order, and stays so.
+ */
+export function scanOrderOf<T extends ScanEntry>(entries: readonly T[], world: ScanWorld<T>): T[] {
+  const position = new Map(entries.map((entry, index) => [entry, index]));
+  // The policy's word on each entry, asked once per scan (control-tower phase 100).
+  for (const entry of entries) {
+    let promoted: Promotion | null | undefined = null;
+    try { promoted = entry.promote?.(); } catch { promoted = null; }
+    entry.promoted = promoted ?? null;
+  }
+  // A `reserve` entry sorts with the aged ones from its first scan, and so
+  // does the phase a lane is kept for (control-tower phase 100).
+  const ahead = (entry: T): boolean => entry.reserving || entry.reserve === true || Boolean(world.kept?.(entry));
+  // What each entry's phase is still waiting on in its own plan (#136) —
+  // asked once per scan, so the sort below reads a map, not a probe.
+  const waitsFor = new Map<T, ReadonlySet<number>>();
+  for (const entry of entries) {
+    let deps: readonly number[] | null | undefined;
+    try { deps = entry.awaiting?.(); } catch { deps = null; }
+    if (deps?.length) waitsFor.set(entry, new Set(deps));
+  }
+  const dependsOn = (a: T, b: T): boolean =>
+    a.runId === b.runId && b.phase != null && Boolean(waitsFor.get(a)?.has(b.phase));
+  // An operator's ORDER (one-pool phase 39, #380): `first` and `last` at the
+  // bump key, beyond every bump; `before`/`after` an anchor take the
+  // anchor's bump key, half a step either side — and, where the anchor is
+  // another plan's, its class too, so a cross-plan move is ranked at the
+  // class key. An anchor not in the line now leaves the plain bump.
+  const byRef = new Map(entries.filter((entry) => entry.phase != null).map((entry) => [`${entry.slug}/${entry.phase}`, entry] as const));
+  const anchorOf = (entry: T): T | undefined => {
+    const anchor = entry.control?.order?.anchor;
+    return anchor && typeof anchor === 'object' ? byRef.get(`${anchor.slug}/${anchor.phase}`) : undefined;
+  };
+  const bumpOf = (entry: T, depth = 0): number => {
+    const order = entry.control?.order;
+    if (order?.anchor === 'first') return ORDER_EDGE + order.stamp;
+    if (order?.anchor === 'last') return -ORDER_EDGE + order.stamp;
+    const anchor = order && depth < 4 ? anchorOf(entry) : undefined;
+    if (anchor && anchor !== entry) return bumpOf(anchor, depth + 1) + (order!.side === 'after' ? -0.5 : 0.5);
+    return entry.bumpedAt ?? 0;
+  };
+  const classOf = (entry: T): RunPriority | undefined => {
+    const anchor = anchorOf(entry);
+    return anchor && anchor.slug !== entry.slug ? anchor.priority : entry.priority;
+  };
+  const keys = (a: T, b: T): number => {
+    // 0. A dependency before its dependants, whatever the two ages (control-
+    //    tower phase 86, #136): a re-opened dependency re-queues young, and
+    //    the phase waiting on it must never read as next in line.
+    if (dependsOn(a, b)) return 1;
+    if (dependsOn(b, a)) return -1;
+    if (ahead(a) !== ahead(b)) return ahead(a) ? -1 : 1;
+    const byClass = priorityRank(classOf(a)) - priorityRank(classOf(b));
+    if (byClass !== 0) return byClass;
+    // A pin: its plan's next lane (control-tower phase 100).
+    const pin = Number(Boolean(b.control?.pin)) - Number(Boolean(a.control?.pin));
+    if (pin !== 0) return pin;
+    // Most recently bumped first, so a second bump lands in front of the
+    // first — an operator correcting themselves means the correction.
+    const bump = bumpOf(b) - bumpOf(a);
+    if (bump !== 0) return bump;
+    // The scheduling policy (control-tower phase 100): promoted first, the
+    // higher rank first — behind every word an operator said.
+    if (Boolean(a.promoted) !== Boolean(b.promoted)) return a.promoted ? -1 : 1;
+    if (a.promoted && b.promoted && a.promoted.rank !== b.promoted.rank) return b.promoted.rank - a.promoted.rank;
+    return 0;
+  };
+  const byPosition = (a: T, b: T): number => (position.get(a) ?? 0) - (position.get(b) ?? 0);
+  // Fair share (control-tower phase 100, #135 C.13): inside a class the
+  // plans take TURNS. An entry's round is its plan's live lanes plus its
+  // plan's entries ahead of it in its plan's own order, so one run with many
+  // ready phases cannot fill every slot, and a plan already holding lanes has
+  // had its turns. Strict classes, an operator's words and the policy come
+  // first; with one plan in the queue the rounds follow its own order, so a
+  // console running one plan scans exactly as it did before.
+  const lanes = world.lanes;
+  const taken = new Map<string, number>();
+  for (const entry of [...entries].sort((a, b) => keys(a, b) || byPosition(a, b))) {
+    const held = lanes.get(entry.slug) ?? 0;
+    const round = taken.get(entry.slug) ?? held;
+    entry.turn = { round, lanes: held };
+    taken.set(entry.slug, round + 1);
+  }
+  // Did the turn MOVE it — behind a younger entry of another plan standing
+  // level with it? Only then is fair share its reason on the queue page.
+  for (const entry of entries) {
+    const turn = entry.turn!;
+    turn.moved = turn.round > 0 && entries.some((other) => other.slug !== entry.slug && keys(other, entry) === 0
+      && (other.turn?.round ?? 0) < turn.round && byPosition(other, entry) > 0);
+  }
+  return [...entries].sort((a, b) => keys(a, b) || (a.turn?.round ?? 0) - (b.turn?.round ?? 0) || byPosition(a, b));
+}
 
 export class Scheduler {
   private deps: SchedulerDeps;
@@ -1862,6 +2120,144 @@ export class Scheduler {
     };
   }
 
+  /* ---------------------------------------------------------------- *
+   * The heavy-job queue (one-pool phase 26, #327)
+   * ---------------------------------------------------------------- */
+
+  private readonly heavyWaiting: HeavyWaiter[] = [];
+  /** This scheduler's own jobs, by id — the count when no machine store is wired. */
+  private readonly heavyOwn = new Map<string, Omit<HeavyJobToken, 'file'>>();
+  private heavyTimer: NodeJS.Timeout | null = null;
+
+  /** The machine's heavy-job budget: one per seven cores, at least one. */
+  heavyBudget(): number {
+    return heavyJobBudget(this.loadNow()?.cores ?? availableParallelism());
+  }
+
+  /**
+   * A seat for one heavy job: resolves when the machine's budget has room
+   * (and, unless `urgent`, the machine is not loaded — or the job has waited
+   * `HEAVY_LOAD_WAIT_MAX_MS` on the load alone). First come, first seated,
+   * urgent ahead. A stop resolves it seatless; the caller's own signal check
+   * then skips the command, as it always did.
+   */
+  heavyJob(request: HeavyJobRequest): Promise<HeavyJobGrant> {
+    return new Promise((resolve) => {
+      const waiter: HeavyWaiter = { ...request, since: this.now(), reason: null, told: false, resolve };
+      this.heavyWaiting.push(waiter);
+      request.signal?.addEventListener('abort', () => this.heavyScan(), { once: true });
+      this.heavyScan();
+    });
+  }
+
+  /** Every heavy job running on the machine, this console's included. */
+  private heavyRunning(): Omit<HeavyJobToken, 'file'>[] {
+    if (!this.deps.jobs) return [...this.heavyOwn.values()];
+    try { return this.deps.jobs.running(); } catch { return [...this.heavyOwn.values()]; }
+  }
+
+  private heavyAcquire(token: Omit<HeavyJobToken, 'pid' | 'at' | 'file'>, budget: number): { ok: boolean; holders: Omit<HeavyJobToken, 'file'>[] } {
+    if (this.deps.jobs) {
+      try {
+        const out = this.deps.jobs.acquire(token, budget);
+        if (out.ok) this.heavyOwn.set(token.id, { ...token, pid: process.pid, at: new Date(this.now()).toISOString() });
+        return out;
+      } catch { /* a store that cannot be read admits: the console's own count still holds below */ }
+    }
+    const holders = [...this.heavyOwn.values()];
+    if (holders.length >= budget) return { ok: false, holders };
+    this.heavyOwn.set(token.id, { ...token, pid: process.pid, at: new Date(this.now()).toISOString() });
+    return { ok: true, holders };
+  }
+
+  private heavyRelease(id: string): void {
+    if (!this.heavyOwn.delete(id)) return;
+    try { this.deps.jobs?.release(id); } catch { /* the token lapses with this process */ }
+    this.heavyScan();
+  }
+
+  /** Seat whoever can be seated now, in order; arm the next look while anyone waits. */
+  private heavyScan(): void {
+    if (this.heavyTimer) { clearTimeout(this.heavyTimer); this.heavyTimer = null; }
+    const urgent = (waiter: HeavyWaiter): boolean => (typeof waiter.urgent === 'function' ? waiter.urgent() : Boolean(waiter.urgent));
+    const order = [...this.heavyWaiting].sort((a, b) => Number(urgent(b)) - Number(urgent(a)) || a.since - b.since);
+    const reading = this.loadNow();
+    const budget = this.heavyBudget();
+    const now = this.now();
+    for (const waiter of order) {
+      const seatless = (): HeavyJobGrant => ({ id: '', waitedMs: now - waiter.since, queued: waiter.told, pastLoad: false, release: () => {} });
+      if (this.closed || waiter.signal?.aborted) {
+        this.heavyDrop(waiter);
+        waiter.resolve(seatless());
+        continue;
+      }
+      const loadHeld = !urgent(waiter) && reading?.holding === true;
+      if (loadHeld && now - waiter.since < HEAVY_LOAD_WAIT_MAX_MS) {
+        this.heavyTell(waiter, 'load', budget, this.heavyRunning());
+        break;
+      }
+      const id = heavyJobId();
+      const token = {
+        id, instance: this.deps.instanceId ?? 'console', slug: waiter.slug, phase: waiter.phase, runId: waiter.runId,
+        purpose: waiter.purpose, command: waiter.command.slice(0, 400),
+      };
+      const seat = this.heavyAcquire(token, budget);
+      if (!seat.ok) {
+        this.heavyTell(waiter, 'budget', budget, seat.holders);
+        break;
+      }
+      this.heavyDrop(waiter);
+      let released = false;
+      waiter.resolve({
+        id, waitedMs: now - waiter.since, queued: waiter.told, pastLoad: loadHeld,
+        release: () => { if (released) return; released = true; this.heavyRelease(id); },
+      });
+    }
+    if (this.heavyWaiting.length && !this.closed) {
+      this.heavyTimer = setTimeout(() => this.heavyScan(), this.deps.heavyPollMs ?? HEAVY_JOB_POLL_MS);
+      this.heavyTimer.unref?.();
+    }
+  }
+
+  private heavyDrop(waiter: HeavyWaiter): void {
+    const at = this.heavyWaiting.indexOf(waiter);
+    if (at >= 0) this.heavyWaiting.splice(at, 1);
+  }
+
+  /** Label a waiting job, and tell its owner once — the `verify.queued` line. */
+  private heavyTell(waiter: HeavyWaiter, reason: 'budget' | 'load', budget: number, holders: readonly Omit<HeavyJobToken, 'file'>[]): void {
+    waiter.reason = reason;
+    if (waiter.told) return;
+    waiter.told = true;
+    const reading = this.loadNow();
+    const sentence = reason === 'load' && reading
+      ? `${loadReason(reading).replace(/; new work boards.*$/, '')} — the job runs when it drops`
+      : `${holders.length} of ${budget} heavy ${budget === 1 ? 'job' : 'jobs'} the machine runs at once ${holders.length === 1 ? 'is' : 'are'} running — it runs when one ends`;
+    try {
+      waiter.onQueued?.({
+        reason, running: holders.length, budget, sentence,
+        holders: holders.map((held) => ({
+          instance: held.instance, slug: held.slug, phase: held.phase, purpose: held.purpose, command: held.command, at: held.at,
+        })),
+      });
+    } catch { /* a listener never stops the queue */ }
+  }
+
+  private heavyView(): HeavyJobsView {
+    const own = new Set(this.heavyOwn.keys());
+    return {
+      budget: this.heavyBudget(),
+      running: this.heavyRunning().map((held) => ({
+        instance: held.instance, slug: held.slug, phase: held.phase, purpose: held.purpose, command: held.command, at: held.at,
+        own: own.has(held.id),
+      })),
+      waiting: this.heavyWaiting.map((waiter) => ({
+        slug: waiter.slug, phase: waiter.phase, purpose: waiter.purpose, command: waiter.command, since: waiter.since,
+        urgent: typeof waiter.urgent === 'function' ? waiter.urgent() : Boolean(waiter.urgent), reason: waiter.reason,
+      })),
+    };
+  }
+
   /** The reservation kept for this entry's phase, if there is one. */
   private reservationOf(entry: Pick<Waiting, 'slug' | 'phase'>): (LaneReservation & { scope: string[]; at: string }) | undefined {
     return entry.phase == null ? undefined : this.laneReservations.get(`${entry.slug}:${entry.phase}`);
@@ -1985,6 +2381,7 @@ export class Scheduler {
         ...(request.repo ? { repo: request.repo } : {}),
         ...(request.repoCap && request.repoCap > 0 ? { repoCap: request.repoCap } : {}),
         ...(request.kind ? { kind: request.kind } : {}),
+        ...(request.resumed ? { resumed: true as const } : {}),
         // `normal` is stored as an omission here too, so `scanOrder`'s class
         // key is constant across a queue nobody has prioritised and the sort
         // degenerates to the FIFO it has always been.
@@ -2046,49 +2443,137 @@ export class Scheduler {
    * whole wait reading `running` and the operator is left watching a phase
    * that never starts with nothing anywhere saying why.
    */
+  /**
+   * The SKIP chain (one-pool phase 39, #380): every reason an entry waits that
+   * is not scope contention, in the one order `poll`, `wouldBlock` and
+   * `admissible` all ask them — once each, so the three can never disagree.
+   * `first` stops at the first that holds (what `poll` and `wouldBlock` need);
+   * otherwise every one that holds is answered (what the queue's check reads).
+   * Each row carries its rule's code in `shared/queue-rules.js`, the holder
+   * the page names, and the chain's own key for `poll`'s bookkeeping.
+   *
+   * The order is load-bearing and unchanged from the chain it replaced: the
+   * fleet freeze leads everything (the only holder with no exemptions — the
+   * operator looking for the freeze they pressed must find it first); then the
+   * boarding schedule, the console's own statement about this hour; the
+   * machine's load, for every NEW admission (a resume is not new, one-pool
+   * phase 26, #243); a held run; an operator's word on this entry (a hold, a
+   * deferral whose clock is ahead); a lead of its run waiting for a lane (a
+   * pin, a red WIP's owner — never another run's); a chained run; an
+   * account's learned wall, then its usage brake (read against `this.grants`
+   * as the scan admits, so two entries on one braked account cannot both
+   * board past it); a lane kept for another phase; the repository cap (`poll`
+   * alone: `wouldBlock` never asked it); a branch another open run's work
+   * stands on (control-tower phase 40, #41); and a dependency the board took
+   * back from done while the entry waited (control-tower phase 86, #136).
+   */
+  private skipChain(
+    entry: Pick<Waiting, 'slug' | 'runId' | 'phase' | 'scope' | 'kind' | 'control' | 'accountId' | 'resumed'>
+      & Partial<Pick<Waiting, 'branchHold' | 'awaiting' | 'repo' | 'repoCap' | 'id'>>,
+    ctx: { fleet: (slug: string) => Holder | null; load: () => Holder | null; lead: Holder | undefined; now: number; first: boolean; repo?: boolean },
+  ): AdmissionRow[] {
+    const rows: AdmissionRow[] = [];
+    const scope = entry.scope.length ? entry.scope : ['all'];
+    const checks: { key: SkipKey; code: (h: Holder) => string; ask: () => Holder | null | undefined }[] = [
+      { key: 'fleet', code: () => 'hold', ask: () => ctx.fleet(entry.slug) },
+      { key: 'schedule', code: () => 'schedule', ask: () => this.scheduleHolder(entry) },
+      { key: 'load', code: () => 'load-guard', ask: () => (entry.resumed ? null : ctx.load()) },
+      { key: 'run-hold', code: () => 'hold', ask: () => this.holdHolder(entry) },
+      { key: 'entry', code: (h) => (h.slug === DEFER_HOLDER ? 'defer' : 'hold'), ask: () => this.entryHolder(entry, ctx.now) },
+      { key: 'lead', code: () => 'pin', ask: () => ctx.lead },
+      { key: 'chain', code: () => 'start-after', ask: () => this.chainHolder(entry) },
+      { key: 'throttle', code: () => 'account', ask: () => this.throttleFor(entry.accountId) },
+      { key: 'brake', code: () => 'account', ask: () => this.brakeFor(entry.accountId) },
+      { key: 'reservation', code: () => 'reservation', ask: () => this.reservationHolder({ slug: entry.slug, phase: entry.phase, scope }) },
+      { key: 'repo', code: () => 'capacity', ask: () => (ctx.repo === false ? null : this.repoHolder(entry as Waiting)) },
+      { key: 'branch', code: () => 'branch-hold', ask: () => this.branchHolder(entry) },
+      { key: 'after', code: () => 'dependency', ask: () => this.afterHolder({ ...entry, scope } as Waiting) },
+    ];
+    for (const { key, code, ask } of checks) {
+      const holder = ask();
+      if (!holder) continue;
+      rows.push({ key, code: code(holder), holder });
+      if (ctx.first) break;
+    }
+    return rows;
+  }
+
+  /**
+   * Every rule an admission fails right now (one-pool phase 39, #380) — the
+   * skips, then the lane cap, the machine's lanes and every scope holder —
+   * each by its code in `shared/queue-rules.js`. Empty means it would board on
+   * the next scan. A read: nothing is queued, labelled or announced. The
+   * queue's check asks this for the entries the scheduler holds, so what the
+   * check says and what `poll` does are one function.
+   */
+  admissible(request: AdmitRequest): AdmissionRow[] {
+    const lead = !request.control?.pin
+      ? this.queue.find((entry) => !entry.settled && entry.runId === request.runId && entry.phase !== request.phase && entry.leadHold)?.leadHold
+      : undefined;
+    const rows = this.skipChain(this.probeOf(request), {
+      fleet: (slug) => this.fleetHolder(slug), load: () => this.loadHolder(), lead, now: this.now(), first: false,
+    });
+    return [...rows, ...this.laneRows(request)];
+  }
+
+  /** The lane cap, the machine's lanes and the scope holders an admission meets — `wouldBlock`'s tail, as rows. */
+  private laneRows(request: AdmitRequest): AdmissionRow[] {
+    const rows: AdmissionRow[] = [];
+    if (this.grants.size >= this.maxLive()) {
+      rows.push({
+        key: 'cap', code: 'lane-cap', holder: {
+          kind: 'reserved', slug: 'session cap', phase: null,
+          owner: `${this.maxLive()} of ${this.maxLive()} lanes`, scope: ['all'], overlaps: ['all'],
+        },
+      });
+    }
+    let lanes: MachineLane[] = [];
+    try { lanes = this.deps.machine?.lanes() ?? []; } catch { lanes = []; }
+    const machine = this.machineHolder(lanes);
+    if (machine) rows.push({ key: 'machine', code: 'lane-cap', holder: machine });
+    const probe = this.probeOf(request);
+    for (const holder of this.blocking(probe, this.queue.filter((entry) => entry.reserving))) {
+      const whole = probe.scope.includes('all') || holder.scope?.includes('all');
+      rows.push({ key: 'scope', code: whole ? 'all-scope' : 'scope', holder });
+    }
+    return rows;
+  }
+
+  /** A request as a queue entry that never joins the queue — what the probes read. */
+  private probeOf(request: AdmitRequest): Waiting {
+    return {
+      id: '', slug: request.slug, phase: request.phase, runId: request.runId,
+      scope: request.scope.length ? request.scope : ['all'],
+      ...(request.branch ? { branch: request.branch } : {}),
+      ...(request.tree ? { tree: request.tree } : {}),
+      ...(request.accountId ? { accountId: request.accountId } : {}),
+      ...(request.kind ? { kind: request.kind } : {}),
+      ...(request.resumed ? { resumed: true as const } : {}),
+      ...(request.control ? { control: request.control } : {}),
+      ...(request.branchHold ? { branchHold: request.branchHold } : {}),
+      ...(request.awaiting ? { awaiting: request.awaiting } : {}),
+      ...(request.repo ? { repo: request.repo } : {}),
+      ...(request.repoCap ? { repoCap: request.repoCap } : {}),
+      since: this.now(), waitingOn: [], bypassed: 0, reserving: false,
+      resolve: () => {}, reject: () => {}, detach: () => {}, settled: false,
+    };
+  }
+
   wouldBlock(request: AdmitRequest): Holder[] {
-    // The fleet freeze leads everything, in both scans. It is the only holder
-    // with no exemptions at all, so anything ahead of it would be a way for
-    // some OTHER reason to be reported while the console is switched off — and
-    // the operator would read the queue page looking for the freeze they just
-    // pressed and not find it.
-    const fleet = this.fleetHolder(request.slug);
-    if (fleet) return [fleet];
-    // The schedule leads the rest, and does so in both scans for the same reason it
-    // leads in `poll`: it is the console's own statement about this hour, so
-    // when several clocks are against a phase at once, the one the operator set
-    // is the one worth reading first.
-    const schedule = this.scheduleHolder({ kind: request.kind });
-    if (schedule) return [schedule];
-    // The machine's load (control-tower phase 100): every NEW admission.
-    const load = this.loadHolder();
-    if (load) return [load];
-    // Both in the same order `poll` checks them, and for the reason the two
-    // scans share one `blocking()`: a `wouldBlock` that did not know about
+    // The skips first, in `poll`'s order (`skipChain`) — the first that holds
+    // is the whole answer, because a `wouldBlock` that did not know about
     // holds would tell the runner an admission was free, the runner would skip
     // the `phase.queued` journal line and the badge with it, and the phase
     // would then sit in `admit()` with nothing anywhere saying it was held.
-    const held = this.holdHolder({ slug: request.slug, runId: request.runId });
-    if (held) return [held];
-    const own = this.entryHolder({ ...(request.control ? { control: request.control } : {}) }, this.now());
-    if (own) return [own];
-    // A lead of this run waiting for a lane — a pin, a red WIP's owner — holds its siblings.
-    if (!request.control?.pin) {
-      const lead = this.queue.find((entry) => !entry.settled && entry.runId === request.runId && entry.phase !== request.phase && entry.leadHold);
-      if (lead?.leadHold) return [lead.leadHold];
-    }
-    const chained = this.chainHolder({ slug: request.slug, runId: request.runId });
-    if (chained) return [chained];
-    const throttle = this.throttleFor(request.accountId);
-    if (throttle) return [throttle];
-    const braked = this.brakeFor(request.accountId);
-    if (braked) return [braked];
-    const kept = this.reservationHolder({ slug: request.slug, phase: request.phase, scope: request.scope.length ? request.scope : ['all'] });
-    if (kept) return [kept];
-    const branched = this.branchHolder(request);
-    if (branched) return [branched];
-    const after = this.afterHolder({ ...request, scope: request.scope.length ? request.scope : ['all'] });
-    if (after) return [after];
+    // The repository cap was never `wouldBlock`'s question; it stays `poll`'s.
+    const lead = !request.control?.pin
+      ? this.queue.find((entry) => !entry.settled && entry.runId === request.runId && entry.phase !== request.phase && entry.leadHold)?.leadHold
+      : undefined;
+    const [skip] = this.skipChain(
+      { slug: request.slug, runId: request.runId, phase: request.phase, scope: request.scope, kind: request.kind, control: request.control, accountId: request.accountId, ...(request.resumed ? { resumed: true as const } : {}), branchHold: request.branchHold, awaiting: request.awaiting },
+      { fleet: (slug) => this.fleetHolder(slug), load: () => this.loadHolder(), lead, now: this.now(), first: true, repo: false },
+    );
+    if (skip) return [skip.holder];
     // D28: the session cap is NOT a clock, and it no longer short-circuits.
     //
     // Two defects in one early return. It was marked `clock: true` beside the
@@ -2106,27 +2591,7 @@ export class Scheduler {
     // line for a lane AND behind a foreign lock on your checkout are different
     // waits with different endings, and reporting only the first taught the
     // queue page to lose the second the moment the fleet got busy.
-    const cap: Holder | null = this.grants.size >= this.maxLive()
-      ? {
-        kind: 'reserved', slug: 'session cap', phase: null,
-        owner: `${this.maxLive()} of ${this.maxLive()} lanes`, scope: ['all'], overlaps: ['all'],
-      }
-      : null;
-    const probe: Waiting = {
-      id: '', slug: request.slug, phase: request.phase, runId: request.runId,
-      scope: request.scope.length ? request.scope : ['all'],
-      ...(request.branch ? { branch: request.branch } : {}),
-      ...(request.tree ? { tree: request.tree } : {}),
-      ...(request.accountId ? { accountId: request.accountId } : {}),
-      ...(request.kind ? { kind: request.kind } : {}),
-      since: this.now(), waitingOn: [], bypassed: 0, reserving: false,
-      resolve: () => {}, reject: () => {}, detach: () => {}, settled: false,
-    };
-    const holders = this.blocking(probe, this.queue.filter((entry) => entry.reserving));
-    let lanes: MachineLane[] = [];
-    try { lanes = this.deps.machine?.lanes() ?? []; } catch { lanes = []; }
-    const machine = this.machineHolder(lanes);
-    return [...(cap ? [cap] : []), ...(machine ? [machine] : []), ...holders];
+    return this.laneRows(request).map((row) => row.holder);
   }
 
   /**
@@ -2511,127 +2976,28 @@ export class Scheduler {
       // one. A skip rather than a `break`, so EVERY waiting entry is labelled
       // with the freeze: the operator who froze the console wants to see the
       // whole queue saying so, not the first line of it.
-      const fleet = this.fleetHolderOf(hold, entry.slug);
-      if (fleet) {
-        entry.waitingOn = [fleet];
-        continue;
-      }
-
-      // Outside the operator's boarding schedule: a skip for exactly the same
-      // reasons the throttle below is one — the entry waits on a clock rather
-      // than on scope, so it is labelled with why and never allowed to age into
-      // `reserving`. Checked FIRST among the clocks because when several are
-      // against a phase, the console's own policy is the more useful sentence.
-      const window = this.scheduleHolder(entry);
-      if (window) {
-        entry.waitingOn = [window];
-        continue;
-      }
-
-      // The machine is loaded (control-tower phase 100, #135 G.27): every NEW
-      // admission waits, labelled with the reading, and never ages into
-      // `reserving` — a clock, like the window above. Live lanes carry on.
-      if (load) {
-        if (entry.waitingOn[0]?.slug !== LOAD_HOLDER) changed = true;
-        entry.waitingOn = [load];
-        continue;
-      }
-
-      // A HELD run and a CHAINED one are skips for the same reasons the two
-      // clocks below and above are: the entry is blocked by a decision, not by
-      // scope contention, so it is labelled with why and never allowed to age
-      // into `reserving`. A held entry that reserved would hold its checkout
-      // against every run that could legitimately use it — the operator asked
-      // for their plan to stand aside, not to become an obstacle.
-      const held = this.holdHolder(entry);
-      if (held) {
-        entry.waitingOn = [held];
-        continue;
-      }
-
-      // …and an operator's word on THIS entry (control-tower phase 99, #135
-      // E.19–20): held, or deferred until a clock. A skip for the same reasons
-      // as the run's hold — it stays queued with its age, never admitted, and
-      // never reserves tokens against anybody.
-      const own = this.entryHolder(entry, now);
-      if (own) {
-        if (entry.waitingOn[0]?.slug !== own.slug) changed = true;
-        entry.waitingOn = [own];
-        continue;
-      }
-
-      // A LEAD of this run is waiting for a lane (control-tower phase 100):
-      // a pinned phase takes its plan's next lane, and a red WIP's owner under
-      // `blocker-first` is every sibling's gate — so its run's other entries
-      // wait for it, whatever their own scope. Another run is never held.
-      const leadHold = !entry.control?.pin ? leads.get(entry.runId) : undefined;
-      if (leadHold) {
-        if (entry.waitingOn[0]?.owner !== leadHold.owner) changed = true;
-        entry.waitingOn = [leadHold];
-        continue;
-      }
-
-      const chained = this.chainHolder(entry);
-      if (chained) {
-        entry.waitingOn = [chained];
-        continue;
-      }
-
-      const throttle = this.throttleFor(entry.accountId);
-      if (throttle) {
-        entry.waitingOn = [throttle];
-        continue;
-      }
-
-      // Read against `this.grants` as the scan admits, so two entries on one
-      // braked account in the same scan cannot both board past it.
-      const braked = this.brakeFor(entry.accountId);
-      if (braked) {
-        entry.waitingOn = [braked];
-        continue;
-      }
-
-      // A lane kept for another phase (control-tower phase 100, #135 D): its
-      // scope, or the last free slot. A skip, never aging — it is an
-      // operator's word, and the kept phase boards on it the moment it asks.
-      const kept = this.reservationHolder(entry);
-      if (kept) {
-        if (entry.waitingOn[0]?.owner !== kept.owner) changed = true;
-        entry.waitingOn = [kept];
-        lead(entry);
-        continue;
-      }
-
-      // A SKIP, like the throttle and the brake above and unlike a scope
-      // conflict: an entry the cap holds must not age into `reserving` and
-      // start blocking everything behind it. Nothing is being taken from it —
-      // the repository is simply busy, and a released lane lets it straight
-      // through on the next scan.
-      const repoFull = this.repoHolder(entry);
-      if (repoFull) {
-        entry.waitingOn = [repoFull];
-        lead(entry);
-        continue;
-      }
-
-      // Another SKIP: a repository of this scope stands on another open run's
-      // branch (control-tower phase 40, #41). Nothing is being taken from this
-      // entry and it takes nothing — it would board into somebody else's
-      // in-flight work, so it waits for the tree or the holder to move on.
-      const branched = this.branchHolder(entry);
-      if (branched) {
-        if (entry.waitingOn[0]?.kind !== 'branch') changed = true;
-        entry.waitingOn = [branched];
-        continue;
-      }
-
-      // …and a dependency the board took back from done while this entry
-      // waited (control-tower phase 86, #136): its own plan holds it. A skip,
-      // for the reason above — it takes nothing and must block nobody.
-      const after = this.afterHolder(entry);
-      if (after) {
-        if (entry.waitingOn[0]?.kind !== 'after' || entry.waitingOn[0]?.phase !== after.phase) changed = true;
-        entry.waitingOn = [after];
+      // The SKIPS (one-pool phase 39, #380): every reason an entry waits that
+      // is not scope contention, in the one order `skipChain` asks them — the
+      // same function `admissible()` and `wouldBlock()` read, so the queue's
+      // check never disagrees with what boards. A skip labels the entry with
+      // why and never lets it age into `reserving`: it waits on a clock or a
+      // decision, and takes nothing from anybody.
+      const [skip] = this.skipChain(entry, {
+        fleet: (slug) => this.fleetHolderOf(hold, slug), load: () => load, now, first: true,
+        lead: !entry.control?.pin ? leads.get(entry.runId) : undefined,
+      });
+      if (skip) {
+        const head = entry.waitingOn[0];
+        // A new head is news to the page only where the scan's own words can
+        // move under a standing entry (the load, a hold or deferral, a lead, a
+        // kept lane, a branch, a dependency); the clocks announce themselves.
+        if (skip.key === 'load' && head?.slug !== LOAD_HOLDER) changed = true;
+        if (skip.key === 'entry' && head?.slug !== skip.holder.slug) changed = true;
+        if ((skip.key === 'lead' || skip.key === 'reservation') && head?.owner !== skip.holder.owner) changed = true;
+        if (skip.key === 'branch' && head?.kind !== 'branch') changed = true;
+        if (skip.key === 'after' && (head?.kind !== 'after' || head?.phase !== skip.holder.phase)) changed = true;
+        entry.waitingOn = [skip.holder];
+        if (skip.key === 'reservation' || skip.key === 'repo') lead(entry);
         continue;
       }
 
@@ -2728,73 +3094,9 @@ export class Scheduler {
    * mean two things depending on when you looked.
    */
   private scanOrder(): Waiting[] {
-    const position = new Map(this.queue.map((entry, index) => [entry, index]));
-    // The policy's word on each entry, asked once per scan (control-tower phase 100).
-    for (const entry of this.queue) {
-      let promoted: Promotion | null | undefined = null;
-      try { promoted = entry.promote?.(); } catch { promoted = null; }
-      entry.promoted = promoted ?? null;
-    }
-    // A `reserve` entry sorts with the aged ones from its first scan, and so
-    // does the phase a lane is kept for (control-tower phase 100).
-    const ahead = (entry: Waiting): boolean => entry.reserving || entry.reserve === true || Boolean(this.reservationOf(entry));
-    // What each entry's phase is still waiting on in its own plan (#136) —
-    // asked once per scan, so the sort below reads a map, not a probe.
-    const waitsFor = new Map<Waiting, ReadonlySet<number>>();
-    for (const entry of this.queue) {
-      let deps: readonly number[] | null | undefined;
-      try { deps = entry.awaiting?.(); } catch { deps = null; }
-      if (deps?.length) waitsFor.set(entry, new Set(deps));
-    }
-    const dependsOn = (a: Waiting, b: Waiting): boolean =>
-      a.runId === b.runId && b.phase != null && Boolean(waitsFor.get(a)?.has(b.phase));
-    const keys = (a: Waiting, b: Waiting): number => {
-      // 0. A dependency before its dependants, whatever the two ages (control-
-      //    tower phase 86, #136): a re-opened dependency re-queues young, and
-      //    the phase waiting on it must never read as next in line.
-      if (dependsOn(a, b)) return 1;
-      if (dependsOn(b, a)) return -1;
-      if (ahead(a) !== ahead(b)) return ahead(a) ? -1 : 1;
-      const byClass = priorityRank(a.priority) - priorityRank(b.priority);
-      if (byClass !== 0) return byClass;
-      // A pin: its plan's next lane (control-tower phase 100).
-      const pin = Number(Boolean(b.control?.pin)) - Number(Boolean(a.control?.pin));
-      if (pin !== 0) return pin;
-      // Most recently bumped first, so a second bump lands in front of the
-      // first — an operator correcting themselves means the correction.
-      const bump = (b.bumpedAt ?? 0) - (a.bumpedAt ?? 0);
-      if (bump !== 0) return bump;
-      // The scheduling policy (control-tower phase 100): promoted first, the
-      // higher rank first — behind every word an operator said.
-      if (Boolean(a.promoted) !== Boolean(b.promoted)) return a.promoted ? -1 : 1;
-      if (a.promoted && b.promoted && a.promoted.rank !== b.promoted.rank) return b.promoted.rank - a.promoted.rank;
-      return 0;
-    };
-    const byPosition = (a: Waiting, b: Waiting): number => (position.get(a) ?? 0) - (position.get(b) ?? 0);
-    // Fair share (control-tower phase 100, #135 C.13): inside a class the
-    // plans take TURNS. An entry's round is its plan's live lanes plus its
-    // plan's entries ahead of it in its plan's own order, so one run with many
-    // ready phases cannot fill every slot, and a plan already holding lanes has
-    // had its turns. Strict classes, an operator's words and the policy come
-    // first; with one plan in the queue the rounds follow its own order, so a
-    // console running one plan scans exactly as it did before.
     const lanes = new Map<string, number>();
     for (const grant of this.grants.values()) lanes.set(grant.slug, (lanes.get(grant.slug) ?? 0) + 1);
-    const taken = new Map<string, number>();
-    for (const entry of [...this.queue].sort((a, b) => keys(a, b) || byPosition(a, b))) {
-      const held = lanes.get(entry.slug) ?? 0;
-      const round = taken.get(entry.slug) ?? held;
-      entry.turn = { round, lanes: held };
-      taken.set(entry.slug, round + 1);
-    }
-    // Did the turn MOVE it — behind a younger entry of another plan standing
-    // level with it? Only then is fair share its reason on the queue page.
-    for (const entry of this.queue) {
-      const turn = entry.turn!;
-      turn.moved = turn.round > 0 && this.queue.some((other) => other.slug !== entry.slug && keys(other, entry) === 0
-        && (other.turn?.round ?? 0) < turn.round && byPosition(other, entry) > 0);
-    }
-    return [...this.queue].sort((a, b) => keys(a, b) || (a.turn?.round ?? 0) - (b.turn?.round ?? 0) || byPosition(a, b));
+    return scanOrderOf(this.queue, { lanes, kept: (entry) => Boolean(this.reservationOf(entry)) });
   }
 
   /**
@@ -2871,11 +3173,13 @@ export class Scheduler {
     defer?: EntryControl['defer'] | null;
     bump?: null;
     pin?: EntryControl['pin'] | null;
+    /** An operator's order (one-pool phase 39). */
+    order?: EntryControl['order'] | null;
   }): boolean {
     const entry = this.queue.find((candidate) => candidate.id === entryId && !candidate.settled);
     if (!entry) return false;
     const control: EntryControl = { ...entry.control };
-    for (const key of ['hold', 'defer', 'bump', 'pin'] as const) {
+    for (const key of ['hold', 'defer', 'bump', 'pin', 'order'] as const) {
       if (!(key in patch)) continue;
       const value = patch[key];
       if (value) (control as Record<string, unknown>)[key] = { ...value };
@@ -3015,6 +3319,7 @@ export class Scheduler {
       byClass: this.byClass(),
       reservations: this.reservationsView(),
       load: this.loadNow(),
+      jobs: this.heavyView(),
     };
   }
 
@@ -3105,6 +3410,9 @@ export class Scheduler {
 
   close(): void {
     this.closed = true;
+    this.heavyScan();
+    if (this.heavyTimer) clearTimeout(this.heavyTimer);
+    this.heavyTimer = null;
     if (this.throttleTimer) clearTimeout(this.throttleTimer);
     if (this.idleTimer) clearInterval(this.idleTimer);
     if (this.lockTimer) clearTimeout(this.lockTimer);

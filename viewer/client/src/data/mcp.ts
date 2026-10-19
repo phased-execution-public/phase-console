@@ -1,6 +1,7 @@
 /** This console's MCP servers, their health, and the catalog to add from. */
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { MCP_LOGIN_ENDS } from '../../../shared/ops-vocab.js';
 import { api } from './api';
 import { keys } from './keys';
 
@@ -23,5 +24,29 @@ export function useMcpCatalog(query: string, enabled = true) {
     queryFn: () => api.mcpCatalog(query),
     enabled,
     placeholderData: keepPreviousData,
+    // The registry copy is read behind the answer when it is missing or old
+    // (#363): ask again every few seconds until the copy is in, so a search
+    // typed while it was being read finds what it holds.
+    refetchInterval: (query) => {
+      const state = query.state.data?.registry?.state;
+      return state === 'refreshing' || state === 'stale' ? 4_000 : false;
+    },
+  });
+}
+
+/**
+ * One server's guided sign-in (#372), read every second while it runs — the
+ * step, the sign-in page's address once the CLI printed it, the ending.
+ */
+export function useMcpLoginFlow(id: string, enabled = true) {
+  return useQuery({
+    queryKey: keys.mcpLogin(id),
+    queryFn: () => api.mcpLoginFlow(id),
+    enabled,
+    retry: false,
+    refetchInterval: (query) => {
+      const step = query.state.data?.flow.step;
+      return step && (MCP_LOGIN_ENDS as readonly string[]).includes(step) ? false : 1_000;
+    },
   });
 }

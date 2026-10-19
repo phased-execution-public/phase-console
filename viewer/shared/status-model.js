@@ -9,6 +9,11 @@
  * 2026-09-21 audit measured each of those on the operator's machine; the cases
  * are `test/fixtures/live-status-corpus.json`.
  *
+ * Every row also says, in a plain sentence each, what the word MEANS in its
+ * vocabulary and what comes NEXT (`meaning`, `next`; #365) — the words the
+ * status family's tooltip says. They live in `shared/status-meanings.js` and
+ * are copied onto each row here, so every view carries them.
+ *
  * This module answers three questions instead of one:
  *
  *   - TENSE — is it happening (`live`), standing still (`standing`), or over
@@ -41,11 +46,15 @@
  * @typedef {(typeof NOTE_SEVERITIES)[number]} NoteSeverity
  * @typedef {keyof typeof WORD_ROWS} StatusVocab
  * @typedef {{ label: string, icon: string, paint: UiState, tense: Tense,
- *             attention: AttentionLevel, outcome?: Outcome }} StatusRow
+ *             attention: AttentionLevel, outcome?: Outcome }} BareRow
+ * @typedef {BareRow & { meaning: string, next: string }} StatusRow
  * @typedef {{ kind: FactKind, text: string, count?: number, paint?: UiState }} StatusFact
  * @typedef {{ vocab: string, word: string|null, known: boolean, label: string,
  *             icon: string, paint: UiState, tense: Tense, attention: AttentionLevel,
- *             outcome?: Outcome, note?: StatusFact, staleSince?: string }} StatusView
+ *             outcome?: Outcome, note?: StatusFact, staleSince?: string,
+ *             meaning?: string, next?: string }} StatusView
+ *   (`meaning` and `next` are on every view the model builds; a view a page
+ *   builds by hand for a word of its own may go without.)
  * @typedef {{ kind?: string, severity?: string, runId?: string, slug?: string,
  *             phase?: number|string|null, ack?: unknown }} InboxLike
  */
@@ -53,6 +62,7 @@
 import { countsTowardAttention, INBOX_SEVERITIES } from './attention-model.js';
 import { phaseLifecycle, phaseSettledWell, runLifecycle, waitOnOf } from './run-lifecycle.js';
 import { NOTE_ROWS, NOTE_SEVERITIES } from './status-notes.js';
+import { STATUS_MEANINGS } from './status-meanings.js';
 import { BAYS } from './bays.js';
 
 /* ------------------------------------------------------------------ *
@@ -132,7 +142,7 @@ export const PERSON_WORDS = Object.freeze({
  * tense is `settled`.
  * @param {string} label @param {string} icon @param {UiState} paint @param {Tense} tense
  * @param {{ attention?: AttentionLevel, outcome?: Outcome }} [more]
- * @returns {StatusRow}
+ * @returns {BareRow}
  */
 function row(label, icon, paint, tense, more = {}) {
   return Object.freeze({
@@ -143,6 +153,27 @@ function row(label, icon, paint, tense, more = {}) {
     attention: more.attention ?? 'none',
     ...(more.outcome ? { outcome: more.outcome } : {}),
   });
+}
+/**
+ * One vocabulary's rows, each given its two sentences from `STATUS_MEANINGS`
+ * (#365). A row the table has no sentences for keeps none, and
+ * `status-model.test.ts` fails it.
+ * @template {Record<string, BareRow>} T
+ * @param {string} vocab @param {T} rows
+ * @returns {Readonly<{ [K in keyof T]: StatusRow }>}
+ */
+function said(vocab, rows) {
+  const words = Object.hasOwn(STATUS_MEANINGS, vocab) ? STATUS_MEANINGS[vocab] : {};
+  return /** @type {Readonly<{ [K in keyof T]: StatusRow }>} */ (
+    Object.freeze(
+      Object.fromEntries(
+        Object.entries(rows).map(([word, bare]) => [
+          word,
+          Object.freeze({ ...bare, ...(Object.hasOwn(words, word) ? words[word] : {}) }),
+        ]),
+      ),
+    )
+  );
 }
 const PERSON = /** @type {const} */ ({ attention: 'needs-you' });
 const FYI = /** @type {const} */ ({ attention: 'fyi' });
@@ -169,7 +200,7 @@ export { NOTE_ROWS, NOTE_SEVERITIES };
  * a live session) refines them.
  */
 export const WORD_ROWS = Object.freeze({
-  run: Object.freeze({
+  run: said('run', {
     running: row('Running', 'circle-play', 'running', 'live'),
     halting: row('Halting', 'octagon-pause', 'running', 'live'),
     halted: row('Halted', 'octagon-alert', 'waiting', 'standing', FYI),
@@ -183,7 +214,7 @@ export const WORD_ROWS = Object.freeze({
     queued: row('Queued', 'circle-dashed', 'queued', 'standing'),
     finished: row('Finished', 'flag', 'done', 'settled', OK),
   }),
-  phase: Object.freeze({
+  phase: said('phase', {
     running: row('Running', 'circle-play', 'running', 'live'),
     verifying: row('Verifying', 'search-check', 'verifying', 'live'),
     'awaiting-verification': row('Awaiting sign-off', 'clipboard-check', 'needs-you', 'standing', PERSON),
@@ -197,7 +228,7 @@ export const WORD_ROWS = Object.freeze({
     failed: row('Failed', 'circle-x', 'failed', 'settled', FAILED),
     done: row('Done', 'circle-check', 'done', 'settled', OK),
   }),
-  board: Object.freeze({
+  board: said('board', {
     done: row('Done', 'circle-check', 'done', 'settled', OK),
     'in-progress': row('In progress', 'circle-play', 'running', 'live'),
     stuck: row('Stuck', 'circle-alert', 'waiting', 'standing', FYI),
@@ -206,7 +237,7 @@ export const WORD_ROWS = Object.freeze({
     gated: row('Gated', 'lock', 'waiting', 'standing', FYI),
     blocked: row('Blocked', 'octagon-x', 'waiting', 'standing', FYI),
   }),
-  plan: Object.freeze({
+  plan: said('plan', {
     active: row('Active', 'circle-dot', 'running', 'standing'),
     approved: row('Approved', 'badge-check', 'queued', 'standing'),
     proposal: row('Proposal', 'scroll-text', 'queued', 'standing'),
@@ -215,7 +246,7 @@ export const WORD_ROWS = Object.freeze({
     abandoned: row('Abandoned', 'ban', 'skipped', 'settled', STOPPED),
     superseded: row('Superseded', 'fast-forward', 'skipped', 'settled', SUPERSEDED),
   }),
-  handoff: Object.freeze({
+  handoff: said('handoff', {
     absent: row('No handoff', 'file-minus', 'skipped', 'standing'),
     pending: row('Pending', 'file-clock', 'queued', 'standing'),
     'in-progress': row('In progress', 'file-pen-line', 'running', 'standing'),
@@ -223,33 +254,33 @@ export const WORD_ROWS = Object.freeze({
     complete: row('Complete', 'file-check', 'done', 'settled', OK),
     unknown: row('Unreadable', 'file-question', 'skipped', 'standing'),
   }),
-  'qa-result': Object.freeze({
+  'qa-result': said('qa-result', {
     pass: row('QA pass', 'badge-check', 'done', 'settled', OK),
     fail: row('QA fail', 'badge-x', 'failed', 'settled', FAILED),
     waived: row('QA waived', 'badge-minus', 'skipped', 'settled', STOPPED),
     pending: row('QA pending', 'clock', 'queued', 'standing'),
     unknown: row('QA unreadable', 'badge-question-mark', 'skipped', 'standing'),
   }),
-  'qa-mode': Object.freeze({
+  'qa-mode': said('qa-mode', {
     off: row('QA off', 'shield-off', 'skipped', 'standing'),
     on: row('QA on', 'shield-check', 'verifying', 'standing'),
     waived: row('QA released', 'shield-minus', 'skipped', 'standing'),
     unknown: row('QA unreadable', 'shield-question-mark', 'skipped', 'standing'),
   }),
-  gate: Object.freeze({
+  gate: said('gate', {
     human: row('Person', 'user-round', 'queued', 'standing'),
     ai: row('Session', 'bot', 'queued', 'standing'),
     auto: row('Automatic', 'zap', 'queued', 'standing'),
     none: row('No gate', 'minus', 'skipped', 'standing'),
   }),
-  mcp: Object.freeze({
+  mcp: said('mcp', {
     connected: row('Connected', 'plug', 'done', 'standing'),
     'needs-auth': row('Needs sign-in', 'key-round', 'needs-you', 'standing', PERSON),
     pending: row('Connecting', 'plug-zap', 'running', 'live'),
     failed: row('Failed', 'unplug', 'failed', 'standing'),
     unknown: row('Unchecked', 'circle-dashed', 'skipped', 'standing'),
   }),
-  auth: Object.freeze({
+  auth: said('auth', {
     ok: row('Signed in', 'shield-check', 'done', 'standing'),
     expiring: row('Expiring', 'timer', 'waiting', 'standing', FYI),
     refreshable: row('Idle, renews at next session', 'refresh-cw', 'done', 'standing'),
@@ -258,14 +289,14 @@ export const WORD_ROWS = Object.freeze({
     unknown: row('Not checked', 'circle-dashed', 'skipped', 'standing'),
     unusable: row('Unusable', 'shield-x', 'needs-you', 'standing', PERSON),
   }),
-  entitlement: Object.freeze({
+  entitlement: said('entitlement', {
     unknown: row('Not yet proven', 'circle-dashed', 'skipped', 'standing'),
     entitled: row('Entitled', 'badge-check', 'done', 'standing'),
     cooling: row('Cooling', 'thermometer-snowflake', 'waiting', 'standing'),
     suspect: row('Suspect', 'timer', 'waiting', 'standing', FYI),
     retired: row('Retired', 'archive-x', 'needs-you', 'standing', PERSON),
   }),
-  delivery: Object.freeze({
+  delivery: said('delivery', {
     sent: row('Sent', 'send', 'done', 'settled', OK),
     throttled: row('Throttled', 'timer', 'waiting', 'settled', STOPPED),
     failed: row('Failed', 'mail-x', 'failed', 'settled', FAILED),
@@ -274,37 +305,38 @@ export const WORD_ROWS = Object.freeze({
     skipped: row('Skipped', 'circle-slash', 'skipped', 'settled', STOPPED),
     'no-device': row('No device', 'smartphone', 'skipped', 'settled', STOPPED),
   }),
-  watch: Object.freeze({
+  watch: said('watch', {
     pending: row('Watching', 'eye', 'waiting', 'standing'),
     landed: row('Landed', 'plane-landing', 'done', 'settled', OK),
     unknown: row('Unreadable', 'eye-off', 'skipped', 'standing'),
     refused: row('Refused', 'ban', 'failed', 'settled', FAILED),
+    unrunnable: row('Cannot run', 'file-warning', 'failed', 'standing'),
   }),
-  decision: Object.freeze({
+  decision: said('decision', {
     answered: row('Answered', 'message-circle-check', 'done', 'settled', OK),
     outstanding: row('Outstanding', 'message-circle-question', 'needs-you', 'standing', PERSON),
     waived: row('Waived', 'message-circle-x', 'skipped', 'settled', STOPPED),
   }),
-  presence: Object.freeze({
+  presence: said('presence', {
     live: row('Live', 'radio', 'running', 'live'),
     ended: row('Ended', 'circle-stop', 'skipped', 'settled', OK),
     unknown: row('Unknown', 'radio-tower', 'skipped', 'standing'),
   }),
-  terminal: Object.freeze({
+  terminal: said('terminal', {
     running: row('Running', 'circle-play', 'running', 'live'),
     frozen: row('Frozen', 'snowflake', 'waiting', 'standing'),
     stopping: row('Stopping', 'square', 'running', 'live'),
     exited: row('Exited', 'circle-stop', 'skipped', 'settled', OK),
     failed: row('Exited with an error', 'circle-x', 'failed', 'settled', FAILED),
   }),
-  liveness: Object.freeze({
+  liveness: said('liveness', {
     running: row('Running', 'circle-play', 'running', 'live'),
     stopped: row('Stopped', 'power-off', 'skipped', 'standing'),
     orphaned: row('Directory gone', 'folder-x', 'failed', 'standing'),
     'port-taken': row('Port taken', 'ethernet-port', 'failed', 'standing'),
     unknown: row('No heartbeat', 'heart-off', 'skipped', 'standing'),
   }),
-  rung: Object.freeze({
+  rung: said('rung', {
     running: row('Running', 'circle-play', 'running', 'live'),
     fixed: row('Fixed', 'wrench', 'done', 'settled', OK),
     'no-defect': row('Nothing wrong', 'circle-check', 'done', 'settled', OK),
@@ -316,33 +348,33 @@ export const WORD_ROWS = Object.freeze({
   }),
   // Why a settled rung ended as it did (`RUNG_FAILURE_CAUSES`, control-tower
   // phases 5 and 24): a verdict about the remedy, the machine, or no run at all.
-  rungCause: Object.freeze({
+  rungCause: said('rungCause', {
     merit: row('On its merits', 'scale', 'queued', 'settled'),
     environment: row('The machine', 'cloud-off', 'skipped', 'settled'),
     'never-ran': row('Never ran', 'circle-dashed', 'skipped', 'settled'),
   }),
-  health: Object.freeze({
+  health: said('health', {
     error: row('Error', 'circle-x', 'failed', 'standing'),
     warning: row('Warning', 'triangle-alert', 'queued', 'standing'),
     info: row('Info', 'info', 'skipped', 'standing'),
   }),
-  probe: Object.freeze({
+  probe: said('probe', {
     ok: row('OK', 'circle-check', 'done', 'settled', OK),
     fail: row('Fail', 'circle-x', 'failed', 'settled', FAILED),
     skip: row('Not asked', 'circle-slash', 'skipped', 'settled', STOPPED),
   }),
-  restart: Object.freeze({
+  restart: said('restart', {
     waiting: row('Waiting for a quiet point', 'hourglass', 'waiting', 'standing'),
     running: row('Updating', 'download', 'running', 'live'),
     restarting: row('Restarting', 'refresh-cw', 'running', 'live'),
     stopped: row('Did not restart', 'circle-stop', 'skipped', 'settled', STOPPED),
   }),
-  checkout: Object.freeze({
+  checkout: said('checkout', {
     shared: row('Shared checkout', 'folder-git-2', 'queued', 'standing'),
     worktree: row('Own worktree', 'git-branch', 'done', 'standing'),
     refused: row('Isolation refused', 'git-branch-minus', 'skipped', 'standing', FYI),
   }),
-  radar: Object.freeze({
+  radar: said('radar', {
     clean: row('Clean', 'git-merge', 'done', 'standing'),
     overlap: row('Overlap', 'git-compare', 'queued', 'standing'),
     conflicted: row('Conflicted', 'git-pull-request-closed', 'failed', 'standing'),
@@ -351,7 +383,7 @@ export const WORD_ROWS = Object.freeze({
   // A settle-history row (control-tower phase 26): how a run's work reached, or
   // failed to reach, the trunk. `pending` and `unsupported` are not failures —
   // one has not happened yet, the other is a standing fact about the repository.
-  settle: Object.freeze({
+  settle: said('settle', {
     settled: row('Settled', 'git-merge', 'done', 'settled', OK),
     landed: row('Landed', 'plane-landing', 'done', 'settled', OK),
     pushed: row('Pushed', 'cloud-upload', 'done', 'settled', OK),
@@ -363,7 +395,7 @@ export const WORD_ROWS = Object.freeze({
   }),
   // What a working tree IS to the console (control-tower phase 26). A role, not
   // a health: debris asks to be read before anything is reclaimed, nothing more.
-  'checkout-role': Object.freeze({
+  'checkout-role': said('checkout-role', {
     root: row('Root', 'house', 'skipped', 'standing'),
     run: row('Run', 'folder-git-2', 'queued', 'standing'),
     lane: row('Lane', 'git-branch', 'queued', 'standing'),
@@ -374,7 +406,7 @@ export const WORD_ROWS = Object.freeze({
   // A phase's landing, one station of its journey (control-tower phase 26):
   // `pushed → pr-open → pr-merged` is travel, `held` is a settled choice and
   // never a failure, and a conflict waits for the person who resolves it.
-  landing: Object.freeze({
+  landing: said('landing', {
     held: row('Held', 'circle-pause', 'skipped', 'settled', STOPPED),
     integrated: row('Integrated', 'git-merge', 'done', 'settled', OK),
     pushed: row('Pushed', 'cloud-upload', 'running', 'standing'),
@@ -384,33 +416,42 @@ export const WORD_ROWS = Object.freeze({
     conflict: row('Conflict', 'git-pull-request-closed', 'needs-you', 'standing', PERSON),
     failed: row('Failed', 'circle-x', 'failed', 'settled', FAILED),
   }),
-  verification: Object.freeze({
+  verification: said('verification', {
     none: row('Not run', 'list', 'skipped', 'standing'),
     red: row('Red', 'list-x', 'failed', 'settled', FAILED),
     skipped: row('Skipped', 'list-minus', 'skipped', 'settled', STOPPED),
     human: row('Needs a person', 'user-round-check', 'needs-you', 'standing', PERSON),
     green: row('Green', 'list-checks', 'done', 'settled', OK),
   }),
+  // One run of one verification line (#331): a clock-cut line is its own word,
+  // settled with an unknown outcome and a neutral paint — never red, and never
+  // "skipped", which is a line this machine could not run at all.
+  'verification-line': said('verification-line', {
+    green: row('Green', 'list-checks', 'done', 'settled', OK),
+    red: row('Red', 'list-x', 'failed', 'settled', FAILED),
+    'timed-out': row('Timed out', 'timer-off', 'skipped', 'settled', { outcome: 'unknown' }),
+    skipped: row('Skipped', 'list-minus', 'skipped', 'settled', STOPPED),
+  }),
   // The Issues desk's three readings of an issue (control-tower phase 118;
   // `shared/issues-model.js` owns the words and derives them from labels).
   // A CATEGORY is a kind, not a condition, so it stays quiet — its icon tells
   // the kinds apart. SEVERITY is the loud one, a ramp from red to grey. And
   // the PLAN state is a journey: waiting for a plan, in one, set aside, fixed.
-  'issue-category': Object.freeze({
+  'issue-category': said('issue-category', {
     bug: row('Bug', 'bug', 'queued', 'standing'),
     enhancement: row('Enhancement', 'lightbulb', 'queued', 'standing'),
     documentation: row('Documentation', 'book-open', 'queued', 'standing'),
     question: row('Question', 'message-circle-question', 'queued', 'standing'),
     other: row('Other', 'circle-dashed', 'skipped', 'standing'),
   }),
-  'issue-severity': Object.freeze({
+  'issue-severity': said('issue-severity', {
     critical: row('Critical', 'siren', 'failed', 'standing', FYI),
     high: row('High', 'octagon-alert', 'waiting', 'standing'),
     medium: row('Medium', 'circle-alert', 'queued', 'standing'),
     low: row('Low', 'circle-dot', 'skipped', 'standing'),
     none: row('No severity', 'minus', 'skipped', 'standing'),
   }),
-  'issue-plan': Object.freeze({
+  'issue-plan': said('issue-plan', {
     'needs-plan': row('Needs a plan', 'list-todo', 'waiting', 'standing'),
     planned: row('Planned', 'scroll-text', 'queued', 'standing'),
     deferred: row('Deferred', 'pause', 'skipped', 'standing'),
@@ -422,7 +463,7 @@ export const WORD_ROWS = Object.freeze({
   // (`shared/human-step-model.js`) and `VERDICTS`, `RISK_TIERS`,
   // `GRANT_STATES` (`shared/turn-model.js`). The phases that draw an item, a
   // check, a risk or a grant add no vocabulary of their own.
-  step: Object.freeze({
+  step: said('step', {
     upcoming: row('Coming up', 'clock', 'queued', 'standing'),
     declared: row('Your turn', 'hand', 'needs-you', 'standing', PERSON),
     notified: row('Waiting on you', 'user-round', 'needs-you', 'standing', PERSON),
@@ -435,18 +476,18 @@ export const WORD_ROWS = Object.freeze({
     cannot: row('Can’t be done', 'ban', 'skipped', 'settled', STOPPED),
     dismissed: row('Withdrawn', 'archive-x', 'skipped', 'settled', SUPERSEDED),
   }),
-  verdict: Object.freeze({
+  verdict: said('verdict', {
     passed: row('Passed', 'circle-check', 'done', 'settled', OK),
     rejected: row('Rejected', 'circle-x', 'needs-you', 'standing', PERSON),
     'needs-info': row('Needs more', 'message-circle-question', 'needs-you', 'standing', PERSON),
   }),
-  risk: Object.freeze({
+  risk: said('risk', {
     low: row('Low risk', 'shield-check', 'skipped', 'standing'),
     medium: row('Medium risk', 'shield-minus', 'waiting', 'standing'),
     high: row('High risk', 'triangle-alert', 'failed', 'standing'),
     never: row('Never granted', 'shield-x', 'failed', 'standing'),
   }),
-  grant: Object.freeze({
+  grant: said('grant', {
     live: row('Live', 'key-round', 'running', 'live'),
     spent: row('Spent', 'check-check', 'done', 'settled', OK),
     expired: row('Expired', 'timer-off', 'skipped', 'settled', STOPPED),
@@ -456,7 +497,7 @@ export const WORD_ROWS = Object.freeze({
   // and `READINESS` (`shared/turn-model.js`), whose `PERSON_STATUS_LABEL` and
   // `READINESS_LABEL` these labels are (the test holds them equal; this file
   // imports no turn table, so the status chunk stays small).
-  turn: Object.freeze({
+  turn: said('turn', {
     todo: row('To do', 'hand', 'needs-you', 'standing', PERSON),
     checking: row('Checking', 'search-check', 'verifying', 'live'),
     passed: row('Passed', 'circle-check', 'done', 'settled', OK),
@@ -465,7 +506,7 @@ export const WORD_ROWS = Object.freeze({
     closed: row('Closed', 'archive-x', 'skipped', 'settled', SUPERSEDED),
     owner: row('Waiting for the owner', 'key-round', 'waiting', 'standing', FYI),
   }),
-  readiness: Object.freeze({
+  readiness: said('readiness', {
     now: row('Now', 'hand', 'needs-you', 'standing', PERSON),
     'not-yet': row('Not yet', 'clock', 'queued', 'standing'),
   }),
@@ -510,12 +551,32 @@ export const FACT_META = Object.freeze({
   'no-session': { icon: 'unplug', paint: 'skipped' },
 });
 
-/** What an attention level is called and drawn with — `AttentionMark`'s table. */
+/** What an attention level is called and drawn with — `AttentionMark`'s table — and what it means (#365). */
 export const ATTENTION_META = Object.freeze({
-  none: { label: 'Nothing to do', icon: 'minus' },
-  fyi: { label: 'Worth a look', icon: 'info' },
-  'needs-you': { label: 'Needs you', icon: 'hand' },
-  urgent: { label: 'Urgent', icon: 'siren' },
+  none: {
+    label: 'Nothing to do',
+    icon: 'minus',
+    meaning: 'Nothing here asks anything of a person.',
+    next: 'Nothing to do: it moves on by itself.',
+  },
+  fyi: {
+    label: 'Worth a look',
+    icon: 'info',
+    meaning: 'Something here is worth a look, though nothing waits on you.',
+    next: 'Look when it suits you.',
+  },
+  'needs-you': {
+    label: 'Needs you',
+    icon: 'hand',
+    meaning: 'Something here waits on a person, and nothing else moves it.',
+    next: 'Open the item that asks for you, in Your turn or the bell.',
+  },
+  urgent: {
+    label: 'Urgent',
+    icon: 'siren',
+    meaning: 'Something here waits on a person, and it cannot wait long.',
+    next: 'Open the item that asks for you now, in Your turn or the bell.',
+  },
 });
 
 /**
@@ -625,6 +686,11 @@ function unknownView(vocab, word) {
     paint: 'skipped',
     tense: 'standing',
     attention: 'none',
+    meaning:
+      word == null || word === ''
+        ? 'No status was given here.'
+        : `“${word}” is not a word this console knows here.`,
+    next: 'Nothing to do: if it stays, whatever wrote it may be newer than this console.',
   };
 }
 
@@ -691,6 +757,10 @@ function summoned(view, level) {
     paint: level === 'urgent' ? 'failed' : 'needs-you',
     tense: 'standing',
     attention: level,
+    next:
+      level === 'urgent'
+        ? 'Open the item that asks for you, in Your turn or the bell: it is urgent.'
+        : 'Open the item that asks for you, in Your turn or the bell.',
   };
   delete next.outcome;
   return next;
@@ -702,8 +772,25 @@ function summoned(view, level) {
  * @param {StatusView} view @param {StatusFact} note @returns {StatusView}
  */
 function superseded(view, note) {
-  return { ...view, paint: 'skipped', tense: 'settled', attention: 'none', outcome: 'superseded', note };
+  return {
+    ...view,
+    paint: 'skipped',
+    tense: 'settled',
+    attention: 'none',
+    outcome: 'superseded',
+    note,
+    next: OVERTAKEN_NEXT[note.kind] ?? 'Nothing to do: something else overtook it.',
+  };
 }
+
+/** What comes next for a thing something else overtook, by the fact that says what. */
+const OVERTAKEN_NEXT = Object.freeze(
+  /** @type {Partial<Record<FactKind, string>>} */ ({
+    'plan-closed': 'Nothing to do: its plan is closed. Reopen the plan to pick it up again.',
+    resolved: 'Nothing to do: it was resolved, and nothing waits on it.',
+    overtaken: 'Nothing to do: a newer run of the plan carries the work.',
+  }),
+);
 
 /* ------------------------------------------------------------------ *
  * describeRun — the first-match table (§Architecture 3)
@@ -796,6 +883,7 @@ export function describeRun(run, ctx = {}) {
       attention: 'none',
       outcome: 'partial',
       note: count,
+      next: 'Open the run to see the phases that did not settle well, and retry or recover them.',
     };
   }
 
@@ -807,6 +895,7 @@ export function describeRun(run, ctx = {}) {
       paint: 'queued',
       tense: 'standing',
       attention: 'none',
+      next: 'Nothing moves until you press Continue.',
     };
   }
 
@@ -832,7 +921,14 @@ export function describeRun(run, ctx = {}) {
     /** @type {StatusFact} */
     const note = { kind: 'waiting-on', text: waitWords(run, life.wait, kind, ctx.now ?? Date.now()) };
     if (kind === 'person')
-      return { ...view, paint: 'needs-you', tense: 'standing', attention: 'needs-you', note };
+      return {
+        ...view,
+        paint: 'needs-you',
+        tense: 'standing',
+        attention: 'needs-you',
+        note,
+        next: 'Answer the card it waits on: the run resumes when you do.',
+      };
     // …and while it waits on something else: the step is the wait a person can end.
     if (stepSummons(ctx.inbox, run)) return summoned({ ...view, note }, 'needs-you');
     if (kind === 'scope') return { ...view, paint: 'queued', tense: 'standing', attention: 'none' };
@@ -849,12 +945,17 @@ export function describeRun(run, ctx = {}) {
         ? {
             ...base,
             label: 'Paused by its limit rule',
+            next: 'Press Continue once the usage window resets, or move the run to another account.',
             note: {
               kind: 'waiting-on',
               text: waitWords(run, life.wait, 'usage-limit', ctx.now ?? Date.now()),
             },
           }
-        : { ...base, label: 'Paused by the console' };
+        : {
+            ...base,
+            label: 'Paused by the console',
+            next: 'Read why it paused on the run page, then press Continue.',
+          };
   }
   const level = summonsFor(ctx.inbox, (item) =>
     item.runId ? item.runId === run.id : Boolean(run.slug) && item.slug === run.slug,
@@ -869,6 +970,7 @@ export function describeRun(run, ctx = {}) {
       tense: 'live',
       attention: 'none',
       note: { kind: 'recovering', text: 'recovering' },
+      next: 'Nothing to do: the console is trying its recovery steps.',
     };
   }
 
@@ -884,6 +986,7 @@ export function describeRun(run, ctx = {}) {
       outcome: 'unknown',
       note: { kind: 'dormant', text: 'dormant' },
       staleSince: /** @type {string} */ (run.updatedAt),
+      next: 'Nothing to do: nobody has touched it for a week. Continue it if it is still wanted.',
     };
   }
   return { ...stopped, paint: 'waiting', tense: 'standing', attention: 'fyi' };
@@ -971,6 +1074,7 @@ export function describePhase(record, ctx = {}) {
         tense: 'standing',
         attention: 'fyi',
         note: { kind: 'no-session', text: 'no session' },
+        next: 'No session is on it any more: retry the phase or recover the run.',
       };
     }
     return view;

@@ -23,4 +23,4 @@ export { SeverityMark } from './severity';
 export { SessionStatus, type SessionVocab } from './session';
 export { TurnReadiness, TurnStatus } from './turn';
 export { NOTE_ICONS, STATUS_ICONS, statusIcon } from './status-icons';
-export { isQuiet, viewTitle, type Chrome, type WordOf } from './view';
+export { isQuiet, viewHeadline, viewTitle, type Chrome, type WordOf } from './view';

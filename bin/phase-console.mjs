@@ -318,6 +318,16 @@ if (args[0] === 'grants') {
   process.exit(await grantsVerb(args.slice(1), { root }));
 }
 
+// ---- the MCP registry (one-pool phase 19, #363) ---------------------------
+// `phase-console mcp list | add --manual <json|file|-> | fill <id> …` — any
+// server registered by hand, and a `${VAR}` registration finished, from a
+// terminal. `bin/mcp-verb.mjs` is shared by both editions as the MCP section
+// is; its writes are behind the console's `--allow-mcp`.
+if (args[0] === 'mcp') {
+  const { mcpVerb } = await import(pathToFileURL(join(root, 'bin', 'mcp-verb.mjs')).href);
+  process.exit(await mcpVerb(args.slice(1), { root }));
+}
+
 // ---- the fleet verbs, named rather than mistaken for a directory -----------
 // Without this, a bare `list` reached the block below, which turns a bare first
 // argument into `--root list` — so a verb that manages consoles would BOOT one,
@@ -335,13 +345,15 @@ if (args[0] === 'grants') {
 // runs this predicate against every agent flag and every capability flag.
 const FLEET_VERBS = new Set([
   'list', 'open', 'stop', 'restart', 'status', 'log', 'logs', 'update', 'remove',
-  'autostart', 'profile', 'fleet', 'capability',
+  'autostart', 'profile', 'fleet', 'capability', 'accounts',
 ]);
 const isAgentFlag = (arg) => /^--(?:un)?install-agent$|^--agent-[a-z][a-z-]*$/.test(arg ?? '');
 if (args[0] === 'start') args.shift();
 if (FLEET_VERBS.has(args[0]) || isAgentFlag(args[0])) {
   process.stderr.write(
-    `phase-console: '${args[0]}' manages a fleet of consoles, which is Phase Console Pro.\n`
+    (args[0] === 'accounts'
+      ? `phase-console: '${args[0]}' registers API-key accounts and their settings, which is Phase Console Pro.\n`
+      : `phase-console: '${args[0]}' manages a fleet of consoles, which is Phase Console Pro.\n`)
     + 'This build runs one console for one repository:  phase-console [<repo>]\n',
   );
   process.exit(2);

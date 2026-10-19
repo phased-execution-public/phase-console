@@ -71,7 +71,10 @@ import type {
   SessionPlanView,
 } from '@/data/api';
 import { Legend } from '@/ui/legend';
+import { meets, segmentBox, textBox, type Rect } from '@/ui/figures/collide';
 import { ACTOR_ICON } from './actor-icon';
+import { HoverCard, type HoverFacts } from './hover-card';
+import { DEFAULT_LAYERS, traceOf, type MapLayer, type MapLayout } from './tools';
 import './route-map.css';
 
 /* ------------------------------------------------------------------ *
@@ -84,6 +87,36 @@ const PAD = 58;
 const R = 15;
 /** A station label's second line, below its first: the meta size at a reading line height. */
 const LABEL_LINE = 15;
+/** The map's type size in plan units — `--text-meta`, which every word on it is set in. */
+const MAP_TYPE = 12.5;
+
+/**
+ * The band the wave headings and the first row's batch captions share (#375).
+ * The heading and its count stood on two lines, y 18 and 31, and a top-row
+ * station's caption hangs `halo + 6` above it and reaches an ascent higher —
+ * at a top of `PAD` (58) it ran from y 16 to 29, written over *Wave 6* and its
+ * count. Now the heading and its count share ONE line (`HEADING_Y`, reaching
+ * ~20), and the first row starts `HEAD` lower, so a caption's top clears it by
+ * air — and a plan's rows still fit a desk's frame at the zoom floor.
+ */
+const HEAD = 8;
+/** The wave heading's baseline, its count on the same line. */
+const HEADING_Y = 17;
+/** The air between a heading's last letter and its count. */
+const HEADING_GAP = 5;
+/** Where the first row of stations stands. */
+const TOP = PAD + HEAD;
+
+/**
+ * Where a long edge may run between two rows: the strip between one row's
+ * names (their second line's descender, `label + LABEL_LINE + 3` under its
+ * stations) and the next row's batch captions (`halo + 6` plus an ascent
+ * above its stations). Measured from the LOWER row's stations.
+ */
+const CORRIDOR = 49;
+
+/** Below this many CSS pixels a name is a smudge: the map draws numbers, and names only where it is asked. */
+const LEGIBLE_PX = 9;
 
 /** A finger's worth of station, in CSS pixels. */
 const TAP = 44;
@@ -132,6 +165,12 @@ export const MAP_CONSTANTS = {
   COL_W,
   ROW_H,
   PAD,
+  HEAD,
+  HEADING_Y,
+  TOP,
+  CORRIDOR,
+  MAP_TYPE,
+  LEGIBLE_PX,
   R,
   LABEL_LINE,
   TAP,
@@ -161,23 +200,37 @@ export interface Layout {
   height: number;
 }
 
-/** Layer → column, row → row, both in plan coordinates. */
-export function positions(route: RouteView): Layout {
+/**
+ * Layer → column, row → row, both in plan coordinates.
+ *
+ * Every station stands on the ROW GRID (#375). A short column was centred by
+ * half rows, so its stations fell at a neighbour's label height and a track
+ * running along one column's row ran through the next column's names; snapped,
+ * every row's names hang in the same strip, and the strip between two strips
+ * is a corridor a long edge can run in. A short column still sits as near the
+ * middle as the grid allows. The first row stands `TOP` down, under the band
+ * the wave headings and the first row's batch captions share.
+ */
+export function positions(route: RouteView, options: { grid?: boolean; inset?: number } = {}): Layout {
+  const inset = options.inset ?? 0;
   const byLayer = new Map<number, RouteNode[]>();
   for (const node of route.nodes) {
     if (!byLayer.has(node.layer)) byLayer.set(node.layer, []);
     byLayer.get(node.layer)!.push(node);
   }
-  const maxRows = Math.max(1, ...[...byLayer.values()].map((list) => list.length));
+  // On a grid (the lanes layout) a row IS its place: nothing is centred.
+  const maxRows = options.grid
+    ? Math.max(1, route.rows, ...route.nodes.map((node) => node.row + 1))
+    : Math.max(1, ...[...byLayer.values()].map((list) => list.length));
 
   const points = new Map<number, PlacedNode>();
   for (const [layer, list] of byLayer) {
-    const offset = (maxRows - list.length) / 2;
+    const offset = options.grid ? 0 : Math.floor((maxRows - list.length) / 2);
     for (const node of list) {
       points.set(node.phase, {
         ...node,
-        x: PAD + layer * COL_W,
-        y: PAD + (offset + node.row) * ROW_H,
+        x: PAD + inset + layer * COL_W,
+        y: TOP + (offset + node.row) * ROW_H,
       });
     }
   }
@@ -185,14 +238,152 @@ export function positions(route: RouteView): Layout {
     points,
     // Labels are centred under their station, so the last column needs room
     // for half a label past the node itself.
-    width: PAD * 2 + Math.max(0, route.layers - 1) * COL_W + 60,
-    /* The last row's stations sit at `PAD + (maxRows-1) * ROW_H`, so this box
-       already carries a whole PAD below them — 58 units against the ~52 a
-       two-line label drops. The content box needs no further allowance: a
-       second one for the labels makes every fit 15-26% too small and pushes
-       the centring 20 units off. */
-    height: PAD * 2 + Math.max(0, maxRows - 1) * ROW_H,
+    width: PAD * 2 + inset + Math.max(0, route.layers - 1) * COL_W + 60,
+    /* The last row's stations sit at `TOP + (maxRows-1) * ROW_H`, so this box
+       carries a whole PAD below them — 58 units against the ~52 a two-line
+       label drops. The content box needs no further allowance: a second one
+       for the labels makes every fit 15-26% too small. */
+    height: TOP + PAD + Math.max(0, maxRows - 1) * ROW_H,
   };
+}
+
+/* ---- The other layouts (one-pool phase 16, #376) ---- */
+
+/** The room a lane's repository name takes at the map's left, in the lanes layout. */
+const LANE_INSET = 150;
+/** Top to bottom: where the first column of stations stands, past the wave headings. */
+const TB_LEFT = 180;
+/** Top to bottom: one wave's pitch — a station, its two-line name, the caption over the next and the corridor between. */
+const TB_PITCH = 150;
+
+/** What folding the finished waves took off the front of the map. */
+export interface Fold {
+  /** How many leading waves were done and folded into the first column. */
+  waves: number;
+  phases: number;
+}
+
+/**
+ * *Hide done*: every leading wave whose stations are all done folds into ONE
+ * column, the map's first, which draws no station — only its heading,
+ * "Waves 1–8 done", and how many phases it holds. The rest keep their layers,
+ * moved left, and an edge out of a folded phase is dropped: it is satisfied.
+ */
+export function foldDoneWaves(route: RouteView): { route: RouteView; fold: Fold | null } {
+  const inLayer = (layer: number) => route.nodes.filter((node) => node.layer === layer);
+  let waves = 0;
+  while (waves < route.layers) {
+    const nodes = inLayer(waves);
+    if (!nodes.length || !nodes.every((node) => node.state === 'done')) break;
+    waves += 1;
+  }
+  if (!waves) return { route, fold: null };
+  const kept = route.nodes.filter((node) => node.layer >= waves);
+  const keptSet = new Set(kept.map((node) => node.phase));
+  return {
+    route: {
+      ...route,
+      nodes: kept.map((node) => ({ ...node, layer: node.layer - waves + 1 })),
+      edges: route.edges.filter((edge) => keptSet.has(edge.from) && keptSet.has(edge.to)),
+      layers: route.layers - waves + 1,
+    },
+    fold: { waves, phases: route.nodes.length - kept.length },
+  };
+}
+
+/** One repository's lane: where it starts, in rows, and how many rows it holds. */
+export interface MapLane {
+  repo: string;
+  row0: number;
+  rows: number;
+}
+
+/**
+ * *One lane per repository*: each phase stands in the lane of the first
+ * repository its Repos cell names (a phase naming none in a lane of its own,
+ * last), its wave still its column. Within a lane and a wave the engine's own
+ * row order holds. The rows are renumbered lane by lane, so `positions` with
+ * `grid` draws them as they are.
+ */
+export function laneRoute(
+  route: RouteView,
+  repoOf: (phase: number) => string | undefined,
+): { route: RouteView; lanes: MapLane[] } {
+  const repoOfNode = (node: RouteNode) => repoOf(node.phase) || '';
+  const repos = [...new Set(route.nodes.map(repoOfNode))].sort((a, b) =>
+    a === '' ? 1 : b === '' ? -1 : a.localeCompare(b),
+  );
+  const lanes: MapLane[] = [];
+  const rowOf = new Map<number, number>();
+  let row0 = 0;
+  for (const repo of repos) {
+    const mine = route.nodes.filter((node) => repoOfNode(node) === repo);
+    let rows = 1;
+    for (let layer = 0; layer < route.layers; layer++) {
+      const here = mine.filter((node) => node.layer === layer).sort((a, b) => a.row - b.row);
+      here.forEach((node, i) => rowOf.set(node.phase, row0 + i));
+      rows = Math.max(rows, here.length);
+    }
+    lanes.push({ repo, row0, rows });
+    row0 += rows;
+  }
+  return {
+    route: {
+      ...route,
+      nodes: route.nodes.map((node) => ({ ...node, row: rowOf.get(node.phase) ?? node.row })),
+      rows: row0,
+    },
+    lanes,
+  };
+}
+
+/**
+ * *Top to bottom* — the left-to-right layout turned: a wave is a ROW, a row a
+ * column, which is the shape a phone's tall frame fits. The wave headings
+ * stand at the left of their row.
+ */
+export function transposed(layout: Layout, layers: number): Layout {
+  const points = new Map<number, PlacedNode>();
+  let maxRow = 0;
+  for (const node of layout.points.values()) {
+    const row = Math.round((node.y - TOP) / ROW_H);
+    maxRow = Math.max(maxRow, row);
+    points.set(node.phase, { ...node, x: TB_LEFT + row * COL_W, y: TOP + node.layer * TB_PITCH });
+  }
+  return {
+    points,
+    width: TB_LEFT + maxRow * COL_W + PAD + 60,
+    height: TOP + PAD + Math.max(0, layers - 1) * TB_PITCH,
+  };
+}
+
+/**
+ * A track on the turned map. It leaves its station sideways into the gutter
+ * beside its column (never down, through its own name), drops to the corridor
+ * above its target's wave, crosses to the gutter before the target's column,
+ * and arrives from the side — the same arrival the left-to-right map draws.
+ */
+export function trackPathTB(from: PlacedNode, to: PlacedNode): string {
+  const x1 = from.x + R + 4;
+  const x2 = to.x - R - 8;
+  const out = from.x + COL_W / 2;
+  const back = to.x - COL_W / 2;
+  const corridor = to.y - TB_PITCH / 2;
+  return roundedPath([
+    [x1, from.y],
+    [out, from.y],
+    [out, corridor],
+    [back, corridor],
+    [back, to.y],
+    [x2, to.y],
+  ]);
+}
+
+/** A wave's heading in words, with the fold's first column said as what it holds. */
+export function waveHeading(layer: number, fold: Fold | null): string {
+  if (!fold) return `Wave ${layer + 1}`;
+  if (layer === 0) return fold.waves === 1 ? 'Wave 1 done' : `Waves 1–${fold.waves} done`;
+  return `Wave ${layer + fold.waves}`;
 }
 
 /**
@@ -214,18 +405,6 @@ interface DrawnEdge {
   /** Its bounding box in plan units — what the window test asks. */
   box: PlanRect;
 }
-
-/**
- * Is this edge outside the neighbourhood the pointer is asking about?
- *
- * `related` is the highlighted station plus its DIRECT neighbours, so every
- * edge touching it already has both ends inside; what this dims is the edges
- * between two other stations, which is the whole point of highlighting. Both
- * ends must be in, and the expression says so — it is the previous inline one,
- * moved out unchanged.
- */
-const dimEdge = (related: Set<number> | null, edge: DrawnEdge): boolean =>
-  Boolean(related) && !(related!.has(edge.from) && related!.has(edge.to));
 
 /** One column of the board — a layer of the engine's layering, ruled. */
 export interface Platform {
@@ -266,8 +445,8 @@ export interface Platform {
  * Pure, and exported, for the same reason `positions` is: jsdom computes no
  * styles, so a geometry promise is asserted as arithmetic or not at all.
  */
-export function platforms(route: RouteView, width: number): Platform[] {
-  if (!route.nodes.length) return [];
+export function platforms(route: RouteView, width: number, inset = 0): Platform[] {
+  if (!route.nodes.length && route.layers <= 1) return [];
   const counts = new Map<number, number>();
   for (const node of route.nodes) counts.set(node.layer, (counts.get(node.layer) ?? 0) + 1);
   const last = Math.max(0, route.layers - 1);
@@ -275,31 +454,210 @@ export function platforms(route: RouteView, width: number): Platform[] {
   for (let layer = 0; layer <= last; layer++) {
     bands.push({
       layer,
-      x0: layer === 0 ? 0 : PAD + layer * COL_W - COL_W / 2,
-      x1: layer === last ? width : PAD + layer * COL_W + COL_W / 2,
+      x0: layer === 0 ? 0 : PAD + inset + layer * COL_W - COL_W / 2,
+      x1: layer === last ? width : PAD + inset + layer * COL_W + COL_W / 2,
       count: counts.get(layer) ?? 0,
     });
   }
   return bands;
 }
 
-/** Orthogonal track with rounded corners, drawn from one station to the next. */
-export function trackPath(from: PlacedNode, to: PlacedNode): string {
+/**
+ * Orthogonal track with rounded corners, drawn from one station to the next.
+ *
+ * It leaves its station along its row, turns in the GUTTER after the station's
+ * column — never at mid-span, where a long edge's drop crossed every name of
+ * the column standing there (#375) — and, when the stations are more than a
+ * column apart, runs at `lane` (a row or a corridor between two rows, which
+ * `routeLanes` chooses clear of every name and caption), turns again in the
+ * gutter before its target's column and arrives along the target's row. With
+ * no lane it runs along the target's row.
+ */
+export function trackPath(from: PlacedNode, to: PlacedNode, lane?: number): string {
   const x1 = from.x + R + 4;
   const x2 = to.x - R - 8;
-  if (Math.abs(from.y - to.y) < 1) return `M${x1},${from.y} L${x2},${to.y}`;
+  if (Math.abs(from.y - to.y) < 1 && (lane === undefined || Math.abs(lane - from.y) < 1)) {
+    return `M${n2(x1)},${n2(from.y)} L${n2(x2)},${n2(to.y)}`;
+  }
+  const { out, back } = gutters(from, to);
+  const h = lane ?? to.y;
+  return roundedPath([
+    [x1, from.y],
+    [out, from.y],
+    [out, h],
+    [back, h],
+    [back, to.y],
+    [x2, to.y],
+  ]);
+}
 
+/**
+ * The two x's an edge turns at: the gutter after its source's column and the
+ * gutter before its target's — one gutter when the columns are neighbours.
+ * Held between the edge's own ends, so two stations closer than a column
+ * (a test's, never the map's) still draw a track that goes forward.
+ */
+function gutters(from: { x: number }, to: { x: number }): { out: number; back: number } {
+  const x1 = from.x + R + 4;
+  const x2 = to.x - R - 8;
   const mid = x1 + Math.max(22, (x2 - x1) / 2);
-  const down = to.y > from.y ? 1 : -1;
-  const curve = Math.min(14, Math.abs(to.y - from.y) / 2);
-  return [
-    `M${x1},${from.y}`,
-    `L${mid - curve},${from.y}`,
-    `Q${mid},${from.y} ${mid},${from.y + curve * down}`,
-    `L${mid},${to.y - curve * down}`,
-    `Q${mid},${to.y} ${mid + curve},${to.y}`,
-    `L${x2},${to.y}`,
-  ].join(' ');
+  const out = Math.min(from.x + COL_W / 2, mid);
+  const back = Math.max(out, to.x - COL_W / 2);
+  return { out, back };
+}
+
+/**
+ * An orthogonal polyline as a path with a rounded corner at every turn: each
+ * corner's radius is 14 units, or half the shorter leg it joins. Points that
+ * repeat, and points that do not turn, are dropped first.
+ */
+function roundedPath(raw: readonly (readonly [number, number])[]): string {
+  const points: [number, number][] = [];
+  for (const [x, y] of raw) {
+    const last = points.at(-1);
+    if (last && Math.abs(last[0] - x) < 0.5 && Math.abs(last[1] - y) < 0.5) continue;
+    const before = points.at(-2);
+    // A point on the line through the two before it is no corner.
+    if (
+      before &&
+      last &&
+      ((Math.abs(before[0] - last[0]) < 0.5 && Math.abs(last[0] - x) < 0.5) ||
+        (Math.abs(before[1] - last[1]) < 0.5 && Math.abs(last[1] - y) < 0.5))
+    ) {
+      points[points.length - 1] = [x, y];
+      continue;
+    }
+    points.push([x, y]);
+  }
+  const parts = [`M${n2(points[0]![0])},${n2(points[0]![1])}`];
+  for (let i = 1; i < points.length - 1; i++) {
+    const [ax, ay] = points[i - 1]!;
+    const [px, py] = points[i]!;
+    const [bx, by] = points[i + 1]!;
+    const inLen = Math.hypot(px - ax, py - ay);
+    const outLen = Math.hypot(bx - px, by - py);
+    const r = Math.min(14, inLen / 2, outLen / 2);
+    const ix = px - ((px - ax) / inLen) * r;
+    const iy = py - ((py - ay) / inLen) * r;
+    const ox = px + ((bx - px) / outLen) * r;
+    const oy = py + ((by - py) / outLen) * r;
+    parts.push(`L${n2(ix)},${n2(iy)}`, `Q${n2(px)},${n2(py)} ${n2(ox)},${n2(oy)}`);
+  }
+  const end = points.at(-1)!;
+  parts.push(`L${n2(end[0])},${n2(end[1])}`);
+  return parts.join(' ');
+}
+
+/** A batch caption's words, as the map writes them — what its box is measured from. */
+export function captionText(train: Pick<BatchGroup, 'index' | 'weight' | 'gated'>, budget?: number): string {
+  const load = train.weight ? ` ${train.weight}${budget ? `/${weight(budget)}` : ''}` : '';
+  return `S${train.index}${load}${train.gated ? ' gated' : ''}`;
+}
+
+/**
+ * Every box on the map a track must not cross (#375): each station's disc out
+ * to its batch ring, each station's name, and each batch's caption. In plan
+ * units, keyed by the phase they belong to so an edge may leave and reach its
+ * own two stations.
+ */
+export function mapObstacles(
+  layout: Layout,
+  trains: readonly { head: PlacedNode; caption: string }[] = [],
+): { phase: number; box: Rect }[] {
+  const geo = markGeometry(R);
+  const ring = geo.halo + 3;
+  const out: { phase: number; box: Rect }[] = [];
+  for (const node of layout.points.values()) {
+    out.push({
+      phase: node.phase,
+      box: { x0: node.x - ring, y0: node.y - ring, x1: node.x + ring, y1: node.y + ring },
+    });
+    wrapLabel(node.title).forEach((line, i) =>
+      out.push({
+        phase: node.phase,
+        box: textBox({
+          x: node.x,
+          y: node.y + geo.label + i * LABEL_LINE,
+          text: line,
+          anchor: 'middle',
+          size: MAP_TYPE,
+        }),
+      }),
+    );
+  }
+  for (const train of trains) {
+    const words = textBox({
+      x: train.head.x,
+      y: train.head.y - geo.halo - 6,
+      text: train.caption,
+      anchor: 'middle',
+      size: MAP_TYPE,
+    });
+    // The words are tspans set `TRAIN_GAP` further apart than their spaces.
+    const slack = TRAIN_GAP * (train.caption.split(' ').length - 1);
+    // No edge owns a caption, not even its head station's.
+    out.push({ phase: -1, box: { ...words, x0: words.x0 - slack / 2, x1: words.x1 + slack / 2 } });
+  }
+  return out;
+}
+
+/** A track's half-width, with air: the critical path's casing is the widest stroke on the map. */
+const TRACK_HALF = 5;
+
+/**
+ * The height each long edge runs at between its two gutters — a row or a
+ * corridor between two rows — chosen so that no part of it crosses a name, a
+ * caption or a station that is not its own (#375). Of the clear heights, the
+ * one with the least climbing; failing any clear one, the one crossing least.
+ * Long edges that share a height share it exactly, which draws them as one
+ * bundle rather than a fan. An edge between neighbouring columns needs no
+ * lane: it turns in the one gutter between them, where nothing is written.
+ */
+export function routeLanes(
+  layout: Layout,
+  edges: readonly { from: number; to: number }[],
+  obstacles: readonly { phase: number; box: Rect }[],
+): Map<string, number> {
+  const rows = [...new Set([...layout.points.values()].map((node) => node.y))].sort((a, b) => a - b);
+  // Between every two rows, and under the last — never over the first, where
+  // the wave headings are written.
+  const corridors = rows.slice(1).map((y) => y - CORRIDOR);
+  if (rows.length) corridors.push(rows.at(-1)! + ROW_H - CORRIDOR);
+  const lanes = new Map<string, number>();
+  for (const edge of edges) {
+    const from = layout.points.get(edge.from);
+    const to = layout.points.get(edge.to);
+    if (!from || !to || to.x - from.x < COL_W * 1.5) continue;
+    const { out, back } = gutters(from, to);
+    const mine = (phase: number) => phase === from.phase || phase === to.phase;
+    const crossings = (h: number) => {
+      const strokes = [
+        segmentBox(out, from.y, out, h, TRACK_HALF),
+        segmentBox(out, h, back, h, TRACK_HALF),
+        segmentBox(back, h, back, to.y, TRACK_HALF),
+      ];
+      let hits = 0;
+      for (const { phase, box } of obstacles) {
+        if (mine(phase)) continue;
+        for (const stroke of strokes) if (meets(stroke, box)) hits += 1;
+      }
+      return hits;
+    };
+    let best = to.y;
+    let bestHits = Infinity;
+    let bestClimb = Infinity;
+    for (const h of [to.y, from.y, ...corridors]) {
+      const hits = crossings(h);
+      const climb = Math.abs(h - from.y) + Math.abs(h - to.y);
+      if (hits < bestHits || (hits === bestHits && climb < bestClimb)) {
+        best = h;
+        bestHits = hits;
+        bestClimb = climb;
+      }
+    }
+    lanes.set(`${edge.from}-${edge.to}`, best);
+  }
+  return lanes;
 }
 
 /**
@@ -1062,8 +1420,12 @@ function ActorChip({ actor, cx, cy, chip }: { actor: PhaseActor; cx: number; cy:
  * Drawing
  * ------------------------------------------------------------------ */
 
-function StationLabel({ node, drop }: { node: PlacedNode; drop: number }) {
-  const lines = useMemo(() => wrapLabel(node.title), [node.title]);
+function StationLabel({ node, drop, short = false }: { node: PlacedNode; drop: number; short?: boolean }) {
+  const lines = useMemo(() => {
+    const all = wrapLabel(node.title);
+    if (!short || all.length < 2) return all;
+    return [`${all[0]!.slice(0, 16)}…`];
+  }, [node.title, short]);
   return (
     <text className="route-station-label" x={node.x} y={node.y + drop} textAnchor="middle">
       {lines.map((line, i) => (
@@ -1075,20 +1437,28 @@ function StationLabel({ node, drop }: { node: PlacedNode; drop: number }) {
   );
 }
 
+/** A lane's heading: its repository, elided like a name, or what a phase naming none is. */
+export const laneName = (repo: string): string =>
+  !repo ? 'No repository' : repo.length > 17 ? `${repo.slice(0, 16)}…` : repo;
+
 /** Two lines of at most ~17 characters, the second elided — a name is a signpost, not the card. */
 export function wrapLabel(title: string): string[] {
   const words = title.split(/\s+/);
   const lines = [''];
   for (const word of words) {
     const line = lines.at(-1)!;
-    if ((line + ' ' + word).trim().length > 17 && lines.length < 2) lines.push(word);
+    if (line && (line + ' ' + word).length > 17 && lines.length < 2) lines.push(word);
     else lines[lines.length - 1] = (line ? `${line} ` : '') + word;
   }
   if (lines.length === 2 && lines[1].length > 17) lines[1] = `${lines[1].slice(0, 16)}…`;
+  // One word longer than a line is elided too: unbroken, it ran into the next column's names.
+  if (lines[0].length > 17) lines[0] = `${lines[0].slice(0, 16)}…`;
   return lines;
 }
 
 interface Train extends BatchGroup {
+  /** Its caption's words — `captionText`, which the layout pass measures. */
+  caption: string;
   nodes: PlacedNode[];
   path: string;
   head: PlacedNode;
@@ -1457,25 +1827,122 @@ export interface RouteMapProps {
   critical?: ReadonlySet<number> | null;
   /** Who is working each phase right now, and who claims it. */
   drivers?: ReadonlyMap<number, PhaseDriver> | null;
+  /* ---- The tools (one-pool phase 16, #376) — each optional, the map as before without them ---- */
+  /** How the stations are laid out; `lr` when absent. */
+  layout?: MapLayout;
+  /** The layers drawn; every default layer when absent. */
+  layers?: ReadonlySet<MapLayer>;
+  /** A station's first repository — what the lanes layout groups by. */
+  repoOf?: (phase: number) => string | undefined;
+  /** A station's paint when the map is coloured by something other than its state. */
+  paintOf?: (phase: number) => string | undefined;
+  /** Stations a filter leaves out: dimmed, never removed. */
+  dimmed?: ReadonlySet<number> | null;
+  /** The station the trace runs through: everything it waits on and unblocks stays lit. */
+  trace?: number | null;
+  /** A click puts the phase in the panel; a second click (or Enter) opens it. Absent: a click opens. */
+  onInspect?: (phase: number) => void;
+  /** A station's hover card; given, it replaces the native tooltip on a desk. */
+  cardFor?: (phase: number) => HoverFacts | null;
+  /** Trace from the hover card. */
+  onTrace?: (phase: number) => void;
+  /** Drawn between the map's header and its frame — the page's tool row. */
+  tools?: React.ReactNode;
+  /** Handed the drawing, for an export of the current view. */
+  exportRef?: React.MutableRefObject<SVGSVGElement | null>;
   className?: string;
 }
 
+/** The layers a map draws when nobody said. */
+const ALL_LAYERS: ReadonlySet<MapLayer> = new Set(DEFAULT_LAYERS);
+
 export function RouteMap({
-  route,
+  route: fullRoute,
   batches,
   budget,
   onSelect,
   hrefFor,
   selected,
   focus,
-  critical,
+  critical: criticalIn,
   drivers,
+  layout = 'lr',
+  layers = ALL_LAYERS,
+  repoOf,
+  paintOf: paintFor,
+  dimmed,
+  trace,
+  onInspect,
+  cardFor,
+  onTrace,
+  tools,
+  exportRef,
   className,
 }: RouteMapProps) {
-  const { points, width, height } = useMemo(() => positions(route), [route]);
+  const foldDone = !layers.has('done');
+  /* The route as this layout draws it: the done waves folded when asked, the
+     rows renumbered lane by lane in the lanes layout, turned for top to bottom. */
+  const { drawnRoute, fold, lanes, layoutBox } = useMemo(() => {
+    const folded = foldDone ? foldDoneWaves(fullRoute) : { route: fullRoute, fold: null };
+    if (layout === 'repo') {
+      const laned = laneRoute(folded.route, repoOf ?? (() => undefined));
+      return {
+        drawnRoute: laned.route,
+        fold: folded.fold,
+        lanes: laned.lanes,
+        layoutBox: positions(laned.route, { grid: true, inset: LANE_INSET }),
+      };
+    }
+    const flat = positions(folded.route);
+    return {
+      drawnRoute: folded.route,
+      fold: folded.fold,
+      lanes: [] as MapLane[],
+      layoutBox: layout === 'tb' ? transposed(flat, folded.route.layers) : flat,
+    };
+  }, [fullRoute, foldDone, layout, repoOf]);
+  const route = drawnRoute;
+  const { points, width, height } = layoutBox;
+  const turned = layout === 'tb';
+  const critical = layers.has('critical') ? criticalIn : null;
   const stations = useMemo(() => [...points.values()], [points]);
   const geo = useMemo(() => markGeometry(R), []);
-  const bands = useMemo(() => platforms(route, width), [route, width]);
+  const bands = useMemo(
+    () => platforms(route, width, layout === 'repo' ? LANE_INSET : 0),
+    [route, width, layout],
+  );
+
+  /**
+   * A train is drawn as a dashed line threading the stations it carries, not
+   * as a box around them — a bounding box would enclose bystanders that are
+   * not in the batch at all, which is exactly the wrong thing to imply.
+   */
+  const trains = useMemo<Train[]>(
+    () =>
+      (layers.has('batches') ? (batches?.groups ?? []) : [])
+        .map((group) => {
+          const nodes = group.phases
+            .map((phase) => points.get(phase))
+            .filter((n): n is PlacedNode => Boolean(n));
+          if (!nodes.length) return null;
+          const ordered = [...nodes].sort((a, b) => a.layer - b.layer || a.row - b.row);
+          return {
+            ...group,
+            caption: captionText(group, budget),
+            nodes: ordered,
+            path: ordered.map((node, i) => `${i === 0 ? 'M' : 'L'}${node.x},${node.y}`).join(' '),
+            head: ordered[0],
+            box: {
+              x0: Math.min(...ordered.map((node) => node.x)),
+              y0: Math.min(...ordered.map((node) => node.y)),
+              x1: Math.max(...ordered.map((node) => node.x)),
+              y1: Math.max(...ordered.map((node) => node.y)),
+            },
+          };
+        })
+        .filter((t): t is Train => Boolean(t)),
+    [batches, points, budget, layers],
+  );
 
   /**
    * The edges, split into the trunk and everything else.
@@ -1494,29 +1961,37 @@ export function RouteMap({
   const drawn = useMemo(() => {
     const plain: DrawnEdge[] = [];
     const trunk: DrawnEdge[] = [];
+    // The layout pass (#375): every name, caption and station is a box, and a
+    // long edge runs at the height that crosses none of them.
+    // The turned map routes by its own gutters and corridors, never by lanes.
+    const lanes = turned
+      ? new Map<string, number>()
+      : routeLanes({ points, width, height }, route.edges, mapObstacles({ points, width, height }, trains));
     for (const edge of route.edges) {
       const from = points.get(edge.from);
       const to = points.get(edge.to);
       if (!from || !to) continue;
+      const key = `${edge.from}-${edge.to}`;
+      const lane = lanes.get(key);
       const drawnEdge: DrawnEdge = {
-        key: `${edge.from}-${edge.to}`,
+        key,
         from: edge.from,
         to: edge.to,
         done: from.state === 'done',
-        d: trackPath(from, to),
+        d: turned ? trackPathTB(from, to) : trackPath(from, to, lane),
         i: Math.min(from.layer, STAGGER_CAP),
         box: {
           x0: Math.min(from.x, to.x),
-          y0: Math.min(from.y, to.y),
+          y0: Math.min(from.y, to.y, lane ?? from.y),
           x1: Math.max(from.x, to.x),
-          y1: Math.max(from.y, to.y),
+          y1: Math.max(from.y, to.y, lane ?? from.y),
         },
       };
       if (critical?.has(edge.from) && critical.has(edge.to)) trunk.push(drawnEdge);
       else plain.push(drawnEdge);
     }
     return { plain, trunk };
-  }, [route.edges, points, critical]);
+  }, [route.edges, points, width, height, trains, critical, turned]);
   const allEdges = useMemo(() => drawn.plain.concat(drawn.trunk), [drawn]);
 
   const [hover, setHover] = useState<number | null>(null);
@@ -1611,7 +2086,8 @@ export function RouteMap({
      moment it opened would be answering a question nobody asked. A search's
      answer is rung the same way and dims nothing either. */
   const highlight = hover ?? peek ?? null;
-  const ringed = peek ?? found ?? selected ?? null;
+  const traced = trace != null && points.has(trace) ? trace : null;
+  const ringed = peek ?? found ?? traced ?? selected ?? null;
   const related = useMemo(() => {
     if (highlight == null) return null;
     const set = new Set<number>([highlight]);
@@ -1621,37 +2097,21 @@ export function RouteMap({
     }
     return set;
   }, [highlight, route]);
-
-  /**
-   * A train is drawn as a dashed line threading the stations it carries, not
-   * as a box around them — a bounding box would enclose bystanders that are
-   * not in the batch at all, which is exactly the wrong thing to imply.
-   */
-  const trains = useMemo<Train[]>(
-    () =>
-      (batches?.groups ?? [])
-        .map((group) => {
-          const nodes = group.phases
-            .map((phase) => points.get(phase))
-            .filter((n): n is PlacedNode => Boolean(n));
-          if (!nodes.length) return null;
-          const ordered = [...nodes].sort((a, b) => a.layer - b.layer || a.row - b.row);
-          return {
-            ...group,
-            nodes: ordered,
-            path: ordered.map((node, i) => `${i === 0 ? 'M' : 'L'}${node.x},${node.y}`).join(' '),
-            head: ordered[0],
-            box: {
-              x0: Math.min(...ordered.map((node) => node.x)),
-              y0: Math.min(...ordered.map((node) => node.y)),
-              x1: Math.max(...ordered.map((node) => node.x)),
-              y1: Math.max(...ordered.map((node) => node.y)),
-            },
-          };
-        })
-        .filter((t): t is Train => Boolean(t)),
-    [batches, points],
-  );
+  /* The trace (#376): the selected station's whole upstream chain and its
+     whole downstream one, transitively — where hover lights only the direct
+     neighbours. Hover still wins while it lasts: it is the question asked now. */
+  const traceLit = useMemo(() => {
+    if (traced == null) return null;
+    const { up, down } = traceOf(route.edges, traced);
+    return new Set<number>([traced, ...up, ...down]);
+  }, [traced, route]);
+  /** Lit stations, in the order of who is asking: the pointer, the trace, the filter. */
+  const lit = related ?? traceLit;
+  const stationDim = (phase: number): boolean => (lit ? !lit.has(phase) : Boolean(dimmed?.has(phase)));
+  const edgeDim = (edge: DrawnEdge): boolean =>
+    lit
+      ? !(lit.has(edge.from) && lit.has(edge.to))
+      : Boolean(dimmed && (dimmed.has(edge.from) || dimmed.has(edge.to)));
 
   /* The window, in plan units. Falls back to the content box until the frame
      has been measured, so the first paint draws the whole map rather than a
@@ -1683,13 +2143,27 @@ export function RouteMap({
 
   /* What the minimap's caption says: the waves the frame shows, of how many. */
   const lastLayer = Math.max(0, route.layers - 1);
-  const waveAt = (x: number) => clamp(Math.round((x - PAD) / COL_W), 0, lastLayer) + 1;
-  const wavesSeen = `Waves ${waveAt(view.x + COL_W / 2)}–${waveAt(view.x + boxW - COL_W / 2)} of ${route.layers}`;
+  const waveAt = (x: number) =>
+    clamp(Math.round((x - PAD - (layout === 'repo' ? LANE_INSET : 0)) / COL_W), 0, lastLayer) + 1;
+  const wavesSeen = turned
+    ? `${route.layers} waves, top to bottom`
+    : `Waves ${waveAt(view.x + COL_W / 2)}–${waveAt(view.x + boxW - COL_W / 2)} of ${route.layers}`;
 
   /* A station's hit area, in plan units, so it lands at 44 CSS px whatever the
      zoom. Capped at the row pitch: a target that overlaps its neighbour is
      worse than a small one, and below MIN_K the cap would be doing that. */
   const hitR = Math.min(TAP / view.k, ROW_H - 6) / 2;
+
+  /* A name smaller than `LEGIBLE_PX` on screen is a smudge that covers the
+     map (at a 73-phase plan's opening zoom a name was 6.5 px). Below it the
+     map draws numbers, and a name only where it is asked for: the station a
+     pointer, a finger or the keyboard is on, its neighbours, and the one a
+     search or the page selected. Unmeasured — the first paint, and jsdom —
+     every name is drawn. */
+  const nameMode = layers.has('names') ? 'full' : layers.has('short') ? 'short' : 'numbers';
+  const legible = nameMode !== 'numbers' && (!size.w || view.k * MAP_TYPE >= LEGIBLE_PX);
+  const named = (phase: number) =>
+    legible || phase === ringed || phase === current || Boolean(related?.has(phase));
 
   const peekNode = peek == null ? null : points.get(peek);
   const peekFacts = peekNode
@@ -1711,8 +2185,36 @@ export function RouteMap({
       setPeek(phase);
       return;
     }
+    /* Click inspects; a second click opens (#376) — the Inspect door every
+       other list has, so the map stays in view. Only where the page has a
+       panel to put the phase in. */
+    if (onInspect && !touch && traced !== phase) {
+      onInspect(phase);
+      return;
+    }
     onSelect?.(phase);
   };
+
+  /* The hover card (#376), on a desk only: it follows the pointer and the
+     keyboard, and stays while the pointer crosses onto it to press. */
+  const [card, setCard] = useState<number | null>(null);
+  const cardTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const holdCard = () => {
+    if (cardTimer.current) clearTimeout(cardTimer.current);
+    cardTimer.current = null;
+  };
+  const showCard = (phase: number) => {
+    holdCard();
+    if (cardFor && !touch) setCard(phase);
+  };
+  const hideCard = () => {
+    holdCard();
+    cardTimer.current = setTimeout(() => setCard(null), 220);
+  };
+  useEffect(() => holdCard, []);
+  const carded = card == null ? null : (points.get(card) ?? null);
+  const cardFacts = carded && cardFor ? cardFor(carded.phase) : null;
+  const tooltips = !cardFor || touch;
 
   /* The station search — a plan long enough to lose a station in. Enter goes
      to the next match, Shift+Enter to the one before; the window moves to it
@@ -1785,7 +2287,7 @@ export function RouteMap({
             {prefs.mapPanZoom ? <Unlock size={13} aria-hidden /> : <Lock size={13} aria-hidden />}
             {!narrow && <span>Pan and zoom</span>}
           </Button>
-          <span className="text-meta text-ink-faint tnum" aria-live="off">
+          <span className="text-meta text-ink-faint tnum" aria-live="off" data-testid="map-zoom">
             {Math.round(view.k * 100)}%
           </span>
           <ButtonGroup>
@@ -1811,6 +2313,8 @@ export function RouteMap({
         </div>
       </div>
 
+      {tools}
+
       {peekNode && peekFacts && (
         <div
           className="flex flex-wrap items-start gap-2 border-b border-rule px-(--tile-pad-x) py-(--tile-pad-y)"
@@ -1835,6 +2339,11 @@ export function RouteMap({
                 Open phase
               </Button>
             )}
+            {onInspect && (
+              <Button size="sm" variant="ghost" onClick={() => onInspect(peekNode.phase)}>
+                Inspect
+              </Button>
+            )}
             <Button size="sm" variant="ghost" aria-label="Close facts" onClick={() => setPeek(null)}>
               <X size={13} aria-hidden />
             </Button>
@@ -1842,67 +2351,71 @@ export function RouteMap({
         </div>
       )}
 
-      <div
-        className="route-frame"
-        ref={frame}
-        data-interactive={prefs.mapPanZoom || undefined}
-        onDoubleClick={(event) => {
-          if ((event.target as Element).closest?.('.route-station')) return;
-          fit();
-        }}
-        {...handlers}
-      >
-        <svg
-          ref={svg}
-          className="route-svg"
-          width="100%"
-          height="100%"
-          viewBox={`${n2(view.x)} ${n2(view.y)} ${n2(boxW)} ${n2(boxH)}`}
-          preserveAspectRatio="xMidYMid meet"
-          /* `group`, not `img`: an image has no interactive content, so a
-             screen reader would be told to ignore every station button on it. */
-          role="group"
-          aria-label={`Phase dependency map, ${route.nodes.length} stations. The arrow keys move between them.`}
+      <div className="relative">
+        <div
+          className="route-frame"
+          ref={frame}
+          data-interactive={prefs.mapPanZoom || undefined}
+          onDoubleClick={(event) => {
+            if ((event.target as Element).closest?.('.route-station')) return;
+            fit();
+          }}
+          {...handlers}
         >
-          <defs>
-            <pattern
-              id="gate-hatch"
-              width="6"
-              height="6"
-              patternTransform="rotate(45)"
-              patternUnits="userSpaceOnUse"
-            >
-              <line x1="0" y1="0" x2="0" y2="6" stroke="var(--accent)" strokeWidth="3" opacity="0.5" />
-            </pattern>
-            {/* Marker contents inherit from the `<defs>`, never from the path
+          <svg
+            ref={(el) => {
+              svg.current = el;
+              if (exportRef) exportRef.current = el;
+            }}
+            className="route-svg"
+            width="100%"
+            height="100%"
+            viewBox={`${n2(view.x)} ${n2(view.y)} ${n2(boxW)} ${n2(boxH)}`}
+            preserveAspectRatio="xMidYMid meet"
+            /* `group`, not `img`: an image has no interactive content, so a
+             screen reader would be told to ignore every station button on it. */
+            role="group"
+            aria-label={`Phase dependency map, ${route.nodes.length} stations. The arrow keys move between them.`}
+          >
+            <defs>
+              <pattern
+                id="gate-hatch"
+                width="6"
+                height="6"
+                patternTransform="rotate(45)"
+                patternUnits="userSpaceOnUse"
+              >
+                <line x1="0" y1="0" x2="0" y2="6" stroke="var(--accent)" strokeWidth="3" opacity="0.5" />
+              </pattern>
+              {/* Marker contents inherit from the `<defs>`, never from the path
                 that references them, so a marker cannot read the track's own
                 `--state`: the critical path gets its own. `userSpaceOnUse`
                 keeps the head one size whatever the stroke does. */}
-            <marker
-              id="route-track-arrow"
-              markerUnits="userSpaceOnUse"
-              markerWidth="8"
-              markerHeight="7"
-              refX="7.5"
-              refY="3.5"
-              orient="auto"
-            >
-              <path d="M0,0 L8,3.5 L0,7 Z" fill="var(--track)" />
-            </marker>
-            <marker
-              id="route-track-arrow-critical"
-              markerUnits="userSpaceOnUse"
-              markerWidth="9"
-              markerHeight="8"
-              refX="8.5"
-              refY="4"
-              orient="auto"
-            >
-              <path d="M0,0 L9,4 L0,8 Z" fill="var(--action)" />
-            </marker>
-          </defs>
+              <marker
+                id="route-track-arrow"
+                markerUnits="userSpaceOnUse"
+                markerWidth="8"
+                markerHeight="7"
+                refX="7.5"
+                refY="3.5"
+                orient="auto"
+              >
+                <path d="M0,0 L8,3.5 L0,7 Z" fill="var(--track)" />
+              </marker>
+              <marker
+                id="route-track-arrow-critical"
+                markerUnits="userSpaceOnUse"
+                markerWidth="9"
+                markerHeight="8"
+                refX="8.5"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M0,0 L9,4 L0,8 Z" fill="var(--action)" />
+              </marker>
+            </defs>
 
-          {/* The board, ruled — under everything and deaf to the pointer.
+            {/* The board, ruled — under everything and deaf to the pointer.
               A hairline and a heading per wave, and no fill: a fill is a
               table's device rather than a map's, and it would break the
               trunk's casing (a casing is the PAPER's colour, and a paper that
@@ -1911,238 +2424,321 @@ export function RouteMap({
               Skipped on a one-wave plan: ruling a single column compares it
               with nothing. `aria-hidden` because the wave is structure, not a
               record — the key teaches what a column means, in words, once. */}
-          {bands.length > 1 && (
-            <g className="platforms" aria-hidden="true">
-              {bandsShown.map((band) => (
-                <g key={band.layer}>
-                  {band.layer > 0 && (
-                    <line
-                      className="platform-rule"
-                      x1={n2(band.x0)}
-                      y1={0}
-                      x2={n2(band.x0)}
-                      y2={n2(height)}
-                    />
-                  )}
-                  <text className="platform-label" x={n2((band.x0 + band.x1) / 2)} y={18} textAnchor="middle">
-                    Wave {band.layer + 1}
+            {bands.length > 1 && layers.has('waves') && !turned && (
+              <g className="platforms" aria-hidden="true">
+                {bandsShown.map((band) => (
+                  <g key={band.layer}>
+                    {band.layer > 0 && (
+                      <line
+                        className="platform-rule"
+                        x1={n2(band.x0)}
+                        y1={0}
+                        x2={n2(band.x0)}
+                        y2={n2(height)}
+                      />
+                    )}
+                    {/* The heading and its count on ONE line (#375), set either
+                      side of a gap at the column's middle: two lines left no
+                      band for the first row's captions under them. */}
+                    <text
+                      className="platform-label"
+                      x={n2((band.x0 + band.x1) / 2 + HEADING_GAP / 2)}
+                      y={HEADING_Y}
+                      textAnchor="end"
+                    >
+                      {waveHeading(band.layer, fold)}
+                    </text>
+                    <text
+                      className="platform-count"
+                      x={n2((band.x0 + band.x1) / 2 + HEADING_GAP * 1.5)}
+                      y={HEADING_Y}
+                      textAnchor="start"
+                    >
+                      {fold && band.layer === 0 ? fold.phases : band.count}
+                    </text>
+                  </g>
+                ))}
+              </g>
+            )}
+            {/* Top to bottom: a wave is a row, headed at its left, its count under the heading. */}
+            {bands.length > 1 && layers.has('waves') && turned && (
+              <g className="platforms" aria-hidden="true">
+                {bands.map((band) => {
+                  const y = TOP + band.layer * TB_PITCH;
+                  return (
+                    <g key={band.layer}>
+                      <text className="platform-label" x={8} y={y - 2} textAnchor="start">
+                        {waveHeading(band.layer, fold)}
+                      </text>
+                      <text className="platform-count" x={8} y={y + 14} textAnchor="start">
+                        {fold && band.layer === 0 ? fold.phases : band.count}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            )}
+            {/* One lane per repository: its name at the lane's first row, in the room the layout keeps for it. */}
+            {lanes.length > 0 && (
+              <g className="route-lanes" aria-hidden="true">
+                {lanes.map((lane) => (
+                  <text
+                    key={lane.repo || '-'}
+                    className="route-lane-label"
+                    x={8}
+                    y={TOP + lane.row0 * ROW_H + 4}
+                    textAnchor="start"
+                  >
+                    {laneName(lane.repo)}
                   </text>
-                  <text className="platform-count" x={n2((band.x0 + band.x1) / 2)} y={31} textAnchor="middle">
-                    {band.count}
-                  </text>
-                </g>
-              ))}
-            </g>
-          )}
+                ))}
+              </g>
+            )}
 
-          <g>
-            {trainsShown.map((train) => (
-              <g className="train" key={`train-${train.index}`}>
-                {train.nodes.length > 1 && <path className="train-line" d={train.path} />}
-                {/* Outside every ring the station itself wears, or the batch's
+            <g>
+              {trainsShown.map((train) => (
+                <g className="train" key={`train-${train.index}`}>
+                  {train.nodes.length > 1 && <path className="train-line" d={train.path} />}
+                  {/* Outside every ring the station itself wears, or the batch's
                     cordon reads as one more thing the phase is in. */}
-                {train.nodes
-                  .filter((node) => shownSet.has(node.phase))
-                  .map((node) => (
-                    <circle
-                      key={node.phase}
-                      className="train-ring"
-                      cx={node.x}
-                      cy={node.y}
-                      r={geo.halo + 3}
-                    />
-                  ))}
-                {/* The batch, its weight against the budget, and whether it
+                  {train.nodes
+                    .filter((node) => shownSet.has(node.phase))
+                    .map((node) => (
+                      <circle
+                        key={node.phase}
+                        className="train-ring"
+                        cx={node.x}
+                        cy={node.y}
+                        r={geo.halo + 3}
+                      />
+                    ))}
+                  {/* The batch, its weight against the budget, and whether it
                     waits on a gate: separate words with a gap between them,
                     never one string glued with dots. */}
-                {shownSet.has(train.head.phase) && (
-                  <text
-                    x={train.head.x}
-                    y={train.head.y - geo.halo - 6}
-                    className="band-label"
-                    textAnchor="middle"
-                  >
-                    S{train.index}
-                    {train.weight ? (
-                      <tspan dx={TRAIN_GAP}>
-                        {' '}
-                        {train.weight}
-                        {budget ? `/${weight(budget)}` : ''}
-                      </tspan>
-                    ) : null}
-                    {train.gated ? <tspan dx={TRAIN_GAP}> gated</tspan> : null}
-                  </text>
-                )}
-              </g>
-            ))}
+                  {shownSet.has(train.head.phase) && (
+                    <text
+                      x={train.head.x}
+                      y={train.head.y - geo.halo - 6}
+                      className="band-label"
+                      textAnchor="middle"
+                    >
+                      S{train.index}
+                      {train.weight ? (
+                        <tspan dx={TRAIN_GAP}>
+                          {' '}
+                          {train.weight}
+                          {budget ? `/${weight(budget)}` : ''}
+                        </tspan>
+                      ) : null}
+                      {train.gated ? <tspan dx={TRAIN_GAP}> gated</tspan> : null}
+                    </text>
+                  )}
+                </g>
+              ))}
 
-            {plainShown.map((edge) => (
-              <path
-                key={edge.key}
-                className={cn(
-                  'route-track',
-                  // `state-done` rather than a second name for the done hue:
-                  // the class is what puts `--state` on the path, and the
-                  // stroke below is the only thing that reads it.
-                  edge.done && 'route-track-done state-done',
-                  dimEdge(related, edge) && 'dim',
-                )}
-                /* `pathLength` normalises the geometry to 100 units, which is
+              {plainShown.map((edge) => (
+                <path
+                  key={edge.key}
+                  className={cn(
+                    'route-track',
+                    // `state-done` rather than a second name for the done hue:
+                    // the class is what puts `--state` on the path, and the
+                    // stroke below is the only thing that reads it.
+                    edge.done && 'route-track-done state-done',
+                    edgeDim(edge) && 'dim',
+                  )}
+                  /* `pathLength` normalises the geometry to 100 units, which is
                    what lets one `stroke-dasharray` draw every edge in exactly,
                    short or long. */
-                pathLength={100}
-                style={{ '--i': edge.i } as React.CSSProperties}
-                d={edge.d}
-              />
-            ))}
+                  pathLength={100}
+                  style={{ '--i': edge.i } as React.CSSProperties}
+                  d={edge.d}
+                />
+              ))}
 
-            {/* The trunk, last, so it passes OVER every line it crosses.
+              {/* The trunk, last, so it passes OVER every line it crosses.
                 Casings first inside the group for the same reason — see
                 `.route-track-casing` in route-map.css for why a transit line
                 needs one at all. Nothing here is a second copy of an edge
                 above: `drawn` partitions, it does not duplicate, so the map
                 still draws exactly one `.route-track` per edge. */}
-            {trunkShown.length > 0 && (
-              <g className="trunk">
-                {trunkShown.map((edge) => (
-                  <path
-                    key={`casing-${edge.key}`}
-                    className={cn('route-track-casing', dimEdge(related, edge) && 'dim')}
-                    aria-hidden="true"
-                    pathLength={100}
-                    style={{ '--i': edge.i } as React.CSSProperties}
-                    d={edge.d}
-                  />
-                ))}
-                {trunkShown.map((edge) => (
-                  <path
-                    key={edge.key}
-                    className={cn(
-                      'route-track',
-                      'route-track-critical',
-                      edge.done && 'route-track-done state-done',
-                      dimEdge(related, edge) && 'dim',
-                    )}
-                    pathLength={100}
-                    style={{ '--i': edge.i } as React.CSSProperties}
-                    d={edge.d}
-                  />
-                ))}
-              </g>
-            )}
+              {trunkShown.length > 0 && (
+                <g className="trunk">
+                  {trunkShown.map((edge) => (
+                    <path
+                      key={`casing-${edge.key}`}
+                      className={cn('route-track-casing', edgeDim(edge) && 'dim')}
+                      aria-hidden="true"
+                      pathLength={100}
+                      style={{ '--i': edge.i } as React.CSSProperties}
+                      d={edge.d}
+                    />
+                  ))}
+                  {trunkShown.map((edge) => (
+                    <path
+                      key={edge.key}
+                      className={cn(
+                        'route-track',
+                        'route-track-critical',
+                        edge.done && 'route-track-done state-done',
+                        edgeDim(edge) && 'dim',
+                      )}
+                      pathLength={100}
+                      style={{ '--i': edge.i } as React.CSSProperties}
+                      d={edge.d}
+                    />
+                  ))}
+                </g>
+              )}
 
-            {/* Each station carries an invisible `route-station-hit` circle sized in
+              {/* Each station carries an invisible `route-station-hit` circle sized in
                 plan units to land at 44 CSS px. The 15-unit dot it sits under
                 is a 13px circle at the fit zoom of a phone — a mark, not a
                 target. Transparent rather than `fill: none`, because `none`
                 does not receive pointer events at all. */}
-            {shown.map((node) => {
-              const dim = related && !related.has(node.phase);
-              const view = viewOf(node);
-              const driver = drivers?.get(node.phase);
-              const live = Boolean(driver?.live);
-              const actor = driver?.live?.actor;
-              // A claim is somebody standing on the platform; a live fact is a
-              // process. Draw the cordon only when there is no process to draw.
-              const claim = live
-                ? null
-                : driver?.lock
-                  ? driver.lock.expired
-                    ? 'stale'
-                    : 'live'
-                  : node.locked;
-              return (
-                <g
-                  key={node.phase}
-                  className={cn(
-                    'route-station route-mark',
-                    // The station wears its view's paint; the CSS paints by it.
-                    stateClass(view.paint),
-                    live && 'live',
-                    dim && 'dim',
-                    ringed === node.phase && 'selected',
-                  )}
-                  data-phase={node.phase}
-                  tabIndex={node.phase === tabStop ? 0 : -1}
-                  role="button"
-                  aria-label={`Phase ${node.phase}: ${node.title}, ${view.label}`}
-                  onClick={() => choose(node.phase)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault();
-                      onSelect?.(node.phase);
-                    } else if (STATION_MOVES.has(event.key)) {
-                      event.preventDefault();
-                      walk(node.phase, event.key);
-                    }
-                  }}
-                  onMouseEnter={() => setHover(node.phase)}
-                  onMouseLeave={() => setHover(null)}
-                  /* Focus has to light the same neighbours hover does, or the
+              {shown.map((node) => {
+                const dim = stationDim(node.phase);
+                const paint = paintFor?.(node.phase);
+                const view = viewOf(node);
+                const driver = drivers?.get(node.phase);
+                const live = Boolean(driver?.live);
+                const actor = driver?.live?.actor;
+                // A claim is somebody standing on the platform; a live fact is a
+                // process. Draw the cordon only when there is no process to draw.
+                const claim = live
+                  ? null
+                  : driver?.lock
+                    ? driver.lock.expired
+                      ? 'stale'
+                      : 'live'
+                    : node.locked;
+                return (
+                  <g
+                    key={node.phase}
+                    className={cn(
+                      'route-station route-mark',
+                      // The station wears its view's paint; the CSS paints by it.
+                      stateClass(view.paint),
+                      live && 'live',
+                      dim && 'dim',
+                      ringed === node.phase && 'selected',
+                    )}
+                    data-phase={node.phase}
+                    /* Colour by (#376): the chosen measure's paint on `--state`,
+                     which every part of the mark reads; the glyph still says
+                     the state, so nothing is lost to the colour. */
+                    style={paint ? ({ '--state': paint } as React.CSSProperties) : undefined}
+                    data-paint={paint ? '' : undefined}
+                    tabIndex={node.phase === tabStop ? 0 : -1}
+                    role="button"
+                    aria-label={`Phase ${node.phase}: ${node.title}, ${view.label}`}
+                    onClick={() => choose(node.phase)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        onSelect?.(node.phase);
+                      } else if (STATION_MOVES.has(event.key)) {
+                        event.preventDefault();
+                        walk(node.phase, event.key);
+                      }
+                    }}
+                    onMouseEnter={() => {
+                      setHover(node.phase);
+                      showCard(node.phase);
+                    }}
+                    onMouseLeave={() => {
+                      setHover(null);
+                      hideCard();
+                    }}
+                    /* Focus has to light the same neighbours hover does, or the
                      keyboard walks the map with the one affordance the mouse
                      gets for free switched off. A keyboard focus also brings
                      the station into the window — Tab can land on the tab
                      stop after the reader has panned away from it. A click
                      does not move the map: it would move it under the finger
                      between a phone's two taps. */
-                  onFocus={(event) => {
-                    setHover(node.phase);
-                    setCurrent(node.phase);
-                    if (focusVisible(event.currentTarget)) reveal(node);
-                  }}
-                  onBlur={() => setHover(null)}
-                >
-                  <circle className="route-station-hit" cx={node.x} cy={node.y} r={hitR} />
-                  {node.gated && (
-                    <circle
-                      className="gate-ring"
-                      cx={node.x}
-                      cy={node.y}
-                      r={geo.gate}
-                      fill="url(#gate-hatch)"
-                    />
-                  )}
-                  {claim && (
-                    <circle className={cn('claim-ring', claim)} cx={node.x} cy={node.y} r={geo.claim} />
-                  )}
-                  <circle className="halo" cx={node.x} cy={node.y} r={geo.halo} />
-                  <StationMark view={view} x={node.x} y={node.y} r={R} />
-                  <text className="route-station-number" x={node.x} y={node.y + 4} textAnchor="middle">
-                    {node.phase}
-                  </text>
-                  {node.gated && (
-                    <MarkChip
-                      kind="gate"
-                      cx={node.x - geo.offset}
-                      cy={node.y + geo.offset}
-                      chip={geo.chip}
-                      g={geo.glyph}
-                      className="gate-chip"
-                    />
-                  )}
-                  {actor && (
-                    <ActorChip
-                      actor={actor}
-                      cx={node.x + geo.offset}
-                      cy={node.y + geo.offset}
-                      chip={geo.chip}
-                    />
-                  )}
-                  <StationLabel node={node} drop={geo.label} />
-                  <title>
-                    {stationTitle(
-                      node,
-                      node.state,
-                      incoming.get(node.phase),
-                      driver,
-                      critical?.has(node.phase),
+                    onFocus={(event) => {
+                      setHover(node.phase);
+                      setCurrent(node.phase);
+                      if (focusVisible(event.currentTarget)) {
+                        reveal(node);
+                        showCard(node.phase);
+                      }
+                    }}
+                    onBlur={() => {
+                      setHover(null);
+                      hideCard();
+                    }}
+                  >
+                    <circle className="route-station-hit" cx={node.x} cy={node.y} r={hitR} />
+                    {node.gated && (
+                      <circle
+                        className="gate-ring"
+                        cx={node.x}
+                        cy={node.y}
+                        r={geo.gate}
+                        fill="url(#gate-hatch)"
+                      />
                     )}
-                  </title>
-                </g>
-              );
-            })}
-          </g>
-        </svg>
+                    {claim && (
+                      <circle className={cn('claim-ring', claim)} cx={node.x} cy={node.y} r={geo.claim} />
+                    )}
+                    <circle className="halo" cx={node.x} cy={node.y} r={geo.halo} />
+                    <StationMark view={view} x={node.x} y={node.y} r={R} />
+                    <text className="route-station-number" x={node.x} y={node.y + 4} textAnchor="middle">
+                      {node.phase}
+                    </text>
+                    {node.gated && (
+                      <MarkChip
+                        kind="gate"
+                        cx={node.x - geo.offset}
+                        cy={node.y + geo.offset}
+                        chip={geo.chip}
+                        g={geo.glyph}
+                        className="gate-chip"
+                      />
+                    )}
+                    {actor && (
+                      <ActorChip
+                        actor={actor}
+                        cx={node.x + geo.offset}
+                        cy={node.y + geo.offset}
+                        chip={geo.chip}
+                      />
+                    )}
+                    {named(node.phase) && (
+                      <StationLabel node={node} drop={geo.label} short={nameMode === 'short'} />
+                    )}
+                    {tooltips && (
+                      <title>
+                        {stationTitle(
+                          node,
+                          node.state,
+                          incoming.get(node.phase),
+                          driver,
+                          critical?.has(node.phase),
+                        )}
+                      </title>
+                    )}
+                  </g>
+                );
+              })}
+            </g>
+          </svg>
+        </div>
+        {carded && cardFacts && (
+          <HoverCard
+            facts={cardFacts}
+            x={(carded.x - view.x) * view.k}
+            y={(carded.y - view.y) * view.k}
+            flip={size.w > 0 && (carded.x - view.x) * view.k > size.w - 320}
+            {...(hrefFor ? { href: hrefFor(carded.phase) } : {})}
+            {...(onInspect ? { onInspect: () => onInspect(carded.phase) } : {})}
+            {...(onTrace ? { onTrace: () => onTrace(carded.phase) } : {})}
+            onEnter={holdCard}
+            onLeave={hideCard}
+          />
+        )}
       </div>
 
       {/* The whole plan and the window's place on it — a crowded plan only,

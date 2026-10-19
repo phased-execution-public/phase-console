@@ -35,6 +35,7 @@ const api = vi.hoisted(() => ({
   runRetry: vi.fn(async () => ({ run: null })),
   runRecover: vi.fn(async () => ({ outcome: 'resumed', detail: 'ok', steps: [], run: null })),
   runMcpContinue: vi.fn(async () => ({ run: null })),
+  runHold: vi.fn(async () => ({ run: null })),
 }));
 vi.mock('@/data/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/data/api')>();
@@ -684,3 +685,4 @@ describe('the cards that had no criterion, each through the family (criterion 8)
     await waitFor(() => expect(api.releaseBootHold).toHaveBeenCalled());
   });
 });
+

@@ -112,6 +112,29 @@ reverses it); ask for it with `phase-graph.sh <slug> --closed`. The two ideas mu
 plan can have unfinished phases, and an open plan with every phase done is still open until someone
 says otherwise.
 
+**`complete` is a claim about the work, so the script checks it** (one-pool phase 27, #320; the
+regression of #184, where a plan was closed `complete` ten minutes after its run settled with its branch
+off the trunk and its own acceptance defects open). `close-plan.sh <slug> --status complete` refuses —
+exit 1, one line per item — while any repository of the docs root (the root and each submodule) carries
+the plan's run branch `pe/<slug>` that its origin trunk does not hold (an ancestor, or a squash whose
+content is already there; read as the clone last fetched it, so fetch first), while `landing.md` has a
+row in `conflict` or `failed`, or while an issue labelled `plan:<slug>` is open on one of those
+repositories (asked of `gh`; a repository it cannot read is an item too). The words, as a person reads
+them:
+
+```
+refusing to close <slug> complete — <n> item(s) of its work are not done:
+  unlanded: pe/<slug> in <repo> is not on origin/main (as this clone last fetched it)
+  landing: phase <N> in <repo> is conflict (docs/handoffs/<slug>/landing.md)
+  open: <owner>/<name> #<n> <title>
+land the branches and close or move the issues first; --force closes it complete anyway and records the exception
+```
+
+`--force` closes it `complete` regardless, prints `--force: closed complete over what is still open:`
+with the same items, and appends `closed complete with <n> item(s) open (--force)` to `closed_reason`,
+so the exception is on the plan for every later reader. `abandoned` and `superseded` are never held to
+the landing: they claim nothing about the work.
+
 Three boundaries the console draws around that, all deliberate:
 
 - **Search still finds a closed plan.** Closing quiets a plan; it never hides one. Every attention
@@ -753,6 +776,16 @@ command and proof filled in; declare it and stop. A plan's `- **Human step:**` b
 at the launch door, their proofs run first, so a step already true never reaches the phase. A lane
 that falls silent after printing a sign-in link is offered to a person as a suspected step; nothing
 converts it by itself.
+
+**A proof that could never pass is advised about at plan time** (one-pool phase 13). A plan bullet's
+`proof:` is read the way the console's check reads it (`scripts/cmd-ref.sh`, the twin of
+`viewer/shared/proof-words.js`): **F45** `proof-unparsable` names a `cmd:` ref with a shell variable,
+a substitution, an unclosed quote or a path relative to a session's cwd, or a proof with no watch
+scheme; **F46** `proof-script-run-branch-only` names a `cmd:` proof whose script is not on its
+repository's trunk. Both are advisories. At check time a proof whose script is missing reads
+`unrunnable` — **Cannot run** on the card, exit 127 named — never *Redo*: the person did nothing
+wrong. *Send my decision* sends a decision's answer and then runs its proof, and an item whose proof
+reads a gate's row closes when that gate opens (`references/turn.md`).
 
 ## Issues — the label lifecycle (control-tower phase 90, #154)
 

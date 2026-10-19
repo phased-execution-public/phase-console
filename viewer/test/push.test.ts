@@ -994,3 +994,53 @@ test('LS-14: a run request’s lock screen is Approve and Deny only where --allo
     assert.deepEqual(token.verbs, ['approve', 'deny']);
   } finally { w.cleanup(); }
 });
+
+/* ------------------------------------------------------------------ *
+ * Which row is this browser, and a repair that lands (one-pool phase 18)
+ * ------------------------------------------------------------------ */
+
+test('#325: two browsers behind one push service are two devices, each named by its endpoint’s tag — never the endpoint', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'phase-push-tag-'));
+  try {
+    const register = new push.Push([], { dir, console: { id: 'tag', name: 'tag' } });
+    const one = makeBrowser();
+    const two = makeBrowser();
+    const fcm = 'https://fcm.googleapis.com/fcm/send/';
+    const a = register.subscribe({ ...one.subscription, endpoint: `${fcm}aaa` }, undefined, 'Mac · Chrome');
+    const b = register.subscribe({ ...two.subscription, endpoint: `${fcm}bbb` }, undefined, 'Windows · Chrome');
+    assert.ok(!('error' in a) && !('error' in b));
+    const rows = register.list();
+    assert.equal(rows.length, 2, 'two devices, not one');
+    assert.equal(rows[0]!.service, rows[1]!.service, 'one push service');
+    assert.notEqual(rows[0]!.endpointTag, rows[1]!.endpointTag, 'told apart by the tag');
+    assert.equal(rows[0]!.endpointTag, push.endpointTag(`${fcm}aaa`));
+    assert.match(rows[0]!.endpointTag, /^[0-9a-f]{16}$/);
+    for (const row of rows) assert.ok(!('endpoint' in row) && !('keys' in row), 'the endpoint never leaves');
+    assert.equal((a as { endpointTag: string }).endpointTag, push.endpointTag(`${fcm}aaa`), 'subscribe answers it too');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#280: a push a service accepts — a test or an announcement — is reported, so a push-broken row can be withdrawn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'phase-push-delivered-'));
+  try {
+    let status = 201;
+    const impl = (async () => new Response(null, { status })) as unknown as typeof fetch;
+    const register = new push.Push([], { dir, console: { id: 'd', name: 'd' }, fetchImpl: impl });
+    const delivered: { device: string; service: string }[] = [];
+    register.onDelivered = (info) => delivered.push(info);
+    const browser = makeBrowser();
+    const device = register.subscribe(browser.subscription, undefined, 'phone');
+    assert.ok(!('error' in device));
+    const sent = await register.test((device as { id: string }).id);
+    assert.equal(sent.ok, true);
+    assert.deepEqual(delivered, [{ device: (device as { id: string }).id, service: 'https://push.example.com' }]);
+
+    status = 500;
+    await register.test((device as { id: string }).id);
+    assert.equal(delivered.length, 1, 'a refused push reports nothing');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -230,7 +230,21 @@ const OLDER: HumanStepRecord = {
   opened: 1,
 };
 
-function mount(hash = '#/turn', onNavigate = vi.fn()) {
+/**
+ * 7.1's page was the cards with every section on one page: these tests read
+ * it at that address (`?view=cards&tab=all`, one-pool phase 14) unless the
+ * hash names its own view or tab. TP-14 below reads the 8.0 defaults.
+ */
+function cardsAddress(hash: string): string {
+  const [path, query = ''] = hash.split('?');
+  const params = new URLSearchParams(query);
+  if (!params.has('view')) params.set('view', 'cards');
+  if (!params.has('tab')) params.set('tab', 'all');
+  return `${path}?${params.toString()}`;
+}
+
+function mount(hash = '#/turn', onNavigate = vi.fn(), { legacy = true }: { legacy?: boolean } = {}) {
+  hash = legacy ? cardsAddress(hash) : hash;
   const client = new QueryClient({
     ...queryClientConfig,
     defaultOptions: { queries: { ...queryClientConfig.defaultOptions?.queries, retry: false } },
@@ -288,13 +302,14 @@ describe('TP-1 the headline, the round and the sections', () => {
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(ANSWER.headline);
     expect(screen.getByTestId('turn-round').textContent).toContain('Round 14');
     const sections = screen.getAllByTestId('turn-section').map((s) => s.getAttribute('data-section'));
-    expect(sections).toEqual(['approve', 'now', 'decide', 'checking', 'upcoming', 'done', 'handled']);
+    // An empty group folds into the one shared line (one-pool phase 14, #377): Approve is empty here.
+    expect(sections).toEqual(['now', 'decide', 'checking', 'upcoming', 'done', 'handled']);
+    expect(screen.getByTestId('turn-empty-groups').textContent).toBe('Nothing to approve.');
     const headings = screen
       .getAllByRole('heading', { level: 2 })
       .map((h) => h.textContent?.replace(/\d+$/, ''));
     // The groups v2 (turn-by-turn phase 9), then the handled log, then where the plans stand.
     expect(headings).toEqual([
-      'Approve',
       'Do now',
       'Decide',
       'Being checked',
@@ -327,7 +342,7 @@ describe('TP-2 the filters live in the address', () => {
     await screen.findByTestId('turn-headline');
     const panel = await openFilter();
     fireEvent.change(within(panel).getByTestId('turn-filter-plan'), { target: { value: 'beta' } });
-    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('#/turn/now-1?plan=beta'));
+    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringMatching(/^#\/turn\/now-1\?.*plan=beta/));
   });
 
   it('the search is a filter too', () => {
@@ -634,10 +649,10 @@ describe('TP-v2 the page in 7.0’s grammar (turn-by-turn phase 9)', () => {
       'Handled by the AI',
     ]);
     expect(within(section('approve')).getByTestId('turn-item').getAttribute('data-item')).toBe('gate-1');
-    // An empty group stays, saying so in one plain line.
+    // An empty group folds into one plain line shared by every empty group (#377).
     read.mockResolvedValue({ ...v2(), groups: { ...v2().groups, decide: [] } });
     mount();
-    await waitFor(() => expect(screen.getAllByText('No decision waits on you.').length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText('Nothing to decide.').length).toBeGreaterThan(0));
   });
 
   it('draws the heads-ups after the handled log, and where the plans stand last', async () => {
@@ -653,7 +668,7 @@ describe('TP-v2 the page in 7.0’s grammar (turn-by-turn phase 9)', () => {
     ).toEqual(['alpha', 'beta']);
     const waiting = within(plans).getAllByTestId('turn-plan-waiting')[0]!;
     expect(waiting.textContent).toBe('2 wait on you');
-    expect(waiting.getAttribute('href')).toBe('#/turn?plan=alpha');
+    expect(waiting.getAttribute('href')).toMatch(/^#\/turn\?.*plan=alpha/);
     // The order on the page: the handled log, then the heads-ups, then the plans.
     const handled = section('handled');
     expect(handled.compareDocumentPosition(heads) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -671,7 +686,7 @@ describe('TP-v2 the page in 7.0’s grammar (turn-by-turn phase 9)', () => {
     // The 7.0 four wait under Everything.
     expect(within(panel).queryByTestId('turn-filter-kind')).toBeNull();
     fireEvent.change(within(panel).getByTestId('turn-filter-type'), { target: { value: 'approve' } });
-    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('#/turn?type=approve'));
+    expect(onNavigate).toHaveBeenLastCalledWith(expect.stringMatching(/^#\/turn\?.*type=approve/));
     fireEvent.change(within(panel).getByTestId('turn-filter-to'), { target: { value: 'gate' } });
     expect(onNavigate).toHaveBeenLastCalledWith(expect.stringContaining('to=gate'));
   });
@@ -688,14 +703,12 @@ describe('TP-v2 the page in 7.0’s grammar (turn-by-turn phase 9)', () => {
     ).toEqual(['gate-1']);
   });
 
-  it('groups by plan and folds every card under View ▸ Compact, from the address', async () => {
+  it('groups the cards by plan from the address; what is over is not regrouped', async () => {
     read.mockResolvedValue(v2());
-    mount('#/turn?group=plan&view=compact');
+    mount('#/turn?group=plan&view=cards');
     await screen.findByTestId('turn-headline');
     const ids = screen.getAllByTestId('turn-section').map((s) => s.getAttribute('data-section'));
     expect(ids).toEqual(['plan:alpha', 'plan:beta', 'done', 'handled']);
-    const gate = screen.getAllByTestId('turn-item').find((el) => el.getAttribute('data-item') === 'gate-1')!;
-    expect(within(gate).getByTestId('turn-item-toggle')).toBeTruthy();
   });
 
   it('#/turn/<id> focuses a ledger item and opens the panel on it', async () => {
@@ -749,5 +762,193 @@ describe('TP-v2 the page in 7.0’s grammar (turn-by-turn phase 9)', () => {
     expect(text).toContain('#### The options');
     expect(text).toContain('- Approve (recommended): phase 4 boards');
     expect(text).toContain('- Deny');
+  });
+});
+
+/*
+ * TP-14 (one-pool phase 14, #377 #366) — the page a person works FROM: the
+ * list by default with the card in the panel on selection, the board grouped
+ * by plan, the tabs, the chips with counts, a plan's own view, and a bulk
+ * *Not doing* that settles every picked item.
+ */
+function v14(): TurnAnswer {
+  const typed = (
+    it: TurnItem,
+    type: TurnItem['type'],
+    status: TurnItem['personStatus'] = 'todo',
+  ): TurnItem => ({
+    ...it,
+    type,
+    personStatus: status,
+    readiness: 'now',
+    step: it.step ? ({ ...it.step, allowDecline: true } as TurnItem['step']) : it.step,
+  });
+  return answer({
+    now: [
+      typed(item('now-1', 'browser-login', 'notified', 'now'), 'do'),
+      typed(item('now-2', 'operator-act', 'notified', 'now', { slug: 'beta', phase: 5 }), 'do'),
+    ],
+    decide: [typed(item('decide-1', 'decision', 'notified', 'decide', { slug: 'beta', phase: 2 }), 'decide')],
+    checking: [typed(item('check-1', 'physical', 'checking', 'checking'), 'do', 'checking')],
+    upcoming: [],
+    done: [typed(item('done-1', 'secret-entry', 'proven', 'done'), 'do', 'passed')],
+  });
+}
+
+describe('TP-14 the list, the board, the tabs and the chips (one-pool phase 14)', () => {
+  it('opens on the list: one line per open item, Done and Handled on their own tabs, empty groups in one line', async () => {
+    read.mockResolvedValue(v14());
+    mount('#/turn', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    expect(screen.getByTestId('turn-page-body').getAttribute('data-view')).toBe('list');
+    const rows = screen.getAllByTestId('turn-row').map((el) => el.getAttribute('data-item'));
+    expect(rows).toEqual(['now-1', 'now-2', 'decide-1', 'check-1']);
+    expect(screen.queryByTestId('turn-item')).toBeNull();
+    expect(screen.getByTestId('turn-empty-groups').textContent).toBe('Nothing to approve or coming up.');
+    const tabs = screen.getByRole('navigation', { name: 'Which items' });
+    const open = within(tabs).getByRole('link', { name: /^Open/ });
+    expect(open.getAttribute('aria-current')).toBe('page');
+    expect(open.textContent).toContain('4');
+    expect(within(tabs).getByRole('link', { name: /^Done/ }).getAttribute('href')).toBe('#/turn?tab=done');
+  });
+
+  it('selecting a line names it in the address and opens its whole card in the panel', async () => {
+    read.mockResolvedValue(v14());
+    const { onNavigate } = mount('#/turn', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    const row = screen.getAllByTestId('turn-row').find((el) => el.getAttribute('data-item') === 'decide-1')!;
+    fireEvent.click(within(row).getByRole('button'));
+    expect(onNavigate).toHaveBeenLastCalledWith('#/turn/decide-1');
+  });
+
+  it('#/turn/<id> on the list marks the line and hands the panel the card', async () => {
+    read.mockResolvedValue(v14());
+    mount('#/turn/now-2', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    const row = screen.getAllByTestId('turn-row').find((el) => el.getAttribute('data-item') === 'now-2')!;
+    expect(row.hasAttribute('data-selected')).toBe(true);
+    await waitFor(() => expect(inspected).toHaveBeenCalled());
+    const record = inspected.mock.calls.at(-1)![0] as { key: string; overview: { type: { name: string } } };
+    expect(record.key).toBe('turn:now-2');
+    expect(record.overview.type.name).toBe('PanelCard');
+  });
+
+  it('?view=board&group=plan draws a lane per plan, in columns by the person’s status', async () => {
+    read.mockResolvedValue(v14());
+    mount('#/turn?view=board&group=plan&tab=open', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    const board = screen.getByTestId('turn-board');
+    const lanes = within(board).getAllByTestId('turn-board-lane');
+    expect(lanes.map((lane) => lane.getAttribute('data-lane'))).toEqual(['plan:alpha', 'plan:beta']);
+    const columns = within(lanes[0]!).getAllByTestId('turn-board-column');
+    expect(columns.map((c) => c.getAttribute('data-column'))).toEqual([
+      'todo',
+      'checking',
+      'redo',
+      'owner',
+      'done',
+    ]);
+    const todo = columns[0]!;
+    expect(
+      within(todo)
+        .getAllByTestId('turn-tile')
+        .map((t) => t.getAttribute('data-item')),
+    ).toEqual(['now-1']);
+    expect(
+      within(columns[1]!)
+        .getAllByTestId('turn-tile')
+        .map((t) => t.getAttribute('data-item')),
+    ).toEqual(['check-1']);
+  });
+
+  it('draws the timeline, one bar per item', async () => {
+    read.mockResolvedValue(v14());
+    mount('#/turn?view=timeline', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    expect(screen.getAllByTestId('turn-timeline-row')).toHaveLength(4);
+  });
+
+  it('shows the Done tab alone, with the ledger’s older steps', async () => {
+    read.mockResolvedValue(v14());
+    mount('#/turn?tab=done', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    expect(screen.getAllByTestId('turn-section').map((el) => el.getAttribute('data-section'))).toEqual([
+      'done',
+    ]);
+    expect(screen.getAllByTestId('turn-row').map((el) => el.getAttribute('data-item'))).toEqual(['done-1']);
+  });
+
+  it('draws every filter as chips with counts, and a chip writes its word into the address', async () => {
+    read.mockResolvedValue(v14());
+    const { onNavigate } = mount('#/turn', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    const chips = screen.getByTestId('turn-chips');
+    const plan = within(chips).getByRole('group', { name: 'Plan' });
+    const beta = within(plan)
+      .getAllByRole('button')
+      .find((b) => b.getAttribute('data-value') === 'beta')!;
+    expect(beta.textContent).toBe('beta2');
+    expect(beta.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(beta);
+    expect(onNavigate).toHaveBeenLastCalledWith('#/turn?plan=beta');
+  });
+
+  it('a bulk Not doing settles every picked item, once the undo window ends', async () => {
+    read.mockResolvedValue(v14());
+    post.mockImplementation((path: string) =>
+      Promise.resolve({ ok: true, step: { id: path.split('/')[3], state: 'declined' } }),
+    );
+    mount('#/turn', vi.fn(), { legacy: false });
+    await screen.findByTestId('turn-headline');
+    for (const id of ['now-1', 'now-2']) {
+      const row = screen.getAllByTestId('turn-row').find((el) => el.getAttribute('data-item') === id)!;
+      fireEvent.click(within(row).getByTestId('turn-row-pick'));
+    }
+    const bar = screen.getByTestId('turn-bulk');
+    expect(bar.textContent).toContain('2 picked');
+    fireEvent.click(within(bar).getByTestId('turn-bulk-decline'));
+    fireEvent.change(within(bar).getByTestId('turn-bulk-reason'), { target: { value: 'Not this week' } });
+    fireEvent.click(within(bar).getByTestId('turn-bulk-decline-send'));
+    expect(screen.getByTestId('turn-bulk-held').textContent).toContain('Not doing 2 items');
+    // Nothing is sent inside the undo window…
+    expect(post).not.toHaveBeenCalled();
+    // …and both are sent when it ends.
+    await waitFor(
+      () =>
+        expect(post.mock.calls.map((call) => call[0])).toEqual([
+          '/api/human-steps/now-1/decline',
+          '/api/human-steps/now-2/decline',
+        ]),
+      { timeout: 8000 },
+    );
+    expect(post.mock.calls[0]![1]).toEqual({ reason: 'Not this week' });
+  }, 15_000);
+});
+
+describe('TP-14 a plan’s own Your turn (#366)', () => {
+  it('renders only that plan’s items, with no Plan chips and no plans strip', async () => {
+    const { TurnBody } = await import('./index');
+    read.mockResolvedValue(v14());
+    const client = new QueryClient({
+      ...queryClientConfig,
+      defaultOptions: { queries: { ...queryClientConfig.defaultOptions?.queries, retry: false } },
+    });
+    const hash = '#/plan/beta/turn';
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouterProvider initial={hash} onNavigate={vi.fn()}>
+          <TurnBody route={parseHash(hash) as Route} base="plan/beta/turn" focus={null} plan="beta" />
+        </MemoryRouterProvider>
+      </QueryClientProvider>,
+    );
+    await screen.findByTestId('turn-page-body');
+    expect(screen.getAllByTestId('turn-row').map((el) => el.getAttribute('data-item'))).toEqual([
+      'now-2',
+      'decide-1',
+    ]);
+    expect(within(screen.getByTestId('turn-chips')).queryByRole('group', { name: 'Plan' })).toBeNull();
+    expect(screen.queryByTestId('turn-plans')).toBeNull();
+    // The plan scope is the page's own, never a filter to clear.
+    expect(screen.queryByTestId('turn-narrowed')).toBeNull();
   });
 });

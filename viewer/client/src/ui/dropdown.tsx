@@ -25,7 +25,7 @@ export const DropdownMenuSub = DropdownMenuPrimitive.Sub;
 export const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup;
 
 const panel =
-  'z-(--z-scrim) max-w-[calc(100%-1rem)] rounded-lg border border-rule bg-surface p-1 text-body text-ink shadow-overlay ' +
+  'z-(--z-scrim) max-w-(--radix-dropdown-menu-content-available-width) rounded-lg border border-rule bg-surface p-1 text-body text-ink shadow-overlay ' +
   'max-h-[min(24rem,calc(var(--app-height,100%)-2rem))] overflow-y-auto overscroll-contain';
 
 export function DropdownMenuContent({

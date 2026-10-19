@@ -26,6 +26,8 @@ export function AttentionMark({
     paint: SEVERITY_UI[level] as UiState,
     tense: 'standing',
     attention: level,
+    meaning: meta.meaning,
+    next: meta.next,
   };
   return <DotWord view={view} {...chrome} />;
 }

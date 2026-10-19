@@ -29,7 +29,7 @@ import { basename, join } from 'node:path';
 
 import { testProcess } from '../../shared/instances.mjs';
 import { log } from '../log.ts';
-import { ACCOUNTS_DIR, profileConfigDir, type AccountMeta } from './store.ts';
+import { ACCOUNTS_DIR, holdsSecret, profileConfigDir, type AccountMeta } from './store.ts';
 
 export type Exec = (
   file: string,
@@ -182,7 +182,7 @@ export function claudeKeychainService(configDir: string | null): string {
   return `Claude Code-credentials-${hash}`;
 }
 
-/** Our own keychain service for a token account's secret. */
+/** Our own keychain service for a token account's secret — and, in Pro, an API-key account's key. */
 export function consoleKeychainService(accountId: string): string {
   return `phase-console-account-${accountId}`;
 }
@@ -317,7 +317,10 @@ export class Credentials {
    * service (or its 0600 file), which is what the secret is stored under.
    */
   credentialLocator(account: AccountMeta | null): string {
-    if (account?.kind === 'token') {
+    // A secret this console holds — a token, and in Pro an API key — is named
+    // by our own item. Never the CLI's: two API keys must not fingerprint as
+    // the machine login and share its walls.
+    if (account && holdsSecret(account.kind)) {
       return this.platform === 'darwin'
         ? `keychain:${consoleKeychainService(account.id)}`
         : `file:${tokenFile(account.id, this.accountsDir)}`;

@@ -495,6 +495,54 @@ describe('Swimlane', () => {
     expect(glyph('✖')).toHaveAttribute('role', 'button');
   });
 
+  it('folds marks that would cover each other into ONE counted mark whose title lists them all (#375)', () => {
+    // Four notes pinned at one instant drew one ✎ over three others, and a
+    // hover read only the top one.
+    const note = (key: string, title: string) => ({ key, atMs: 30 * MIN, glyph: '✎', title });
+    const { container } = render(
+      <Swimlane
+        spanMs={60 * MIN}
+        ariaLabel="one"
+        rows={[
+          row({
+            key: 'a',
+            marks: [note('a', 'one'), note('b', 'two'), note('c', 'three'), note('d', 'four')],
+          }),
+        ]}
+      />,
+    );
+    const marks = [...container.querySelectorAll('text:not([data-tick])')];
+    expect(marks).toHaveLength(1);
+    expect(marks[0]).toHaveAttribute('data-mark-count', '4');
+    expect(marks[0]!.firstChild?.textContent).toBe('✎×4');
+    expect(marks[0]!.querySelector('title')?.textContent).toBe('one\ntwo\nthree\nfour');
+  });
+
+  it('says how many more when the kinds differ, keeps a failure red, and lets marks a glyph apart stand alone', () => {
+    const { container } = render(
+      <Swimlane
+        spanMs={60 * MIN}
+        ariaLabel="one"
+        rows={[
+          row({
+            key: 'a',
+            marks: [
+              { key: 'b', atMs: 10 * MIN, glyph: '▏', title: 'board' },
+              { key: 'w', atMs: 10 * MIN + 1000, glyph: '✖', title: 'wall', state: 'state-failed' },
+              { key: 'o', atMs: 40 * MIN, glyph: '●', title: 'outcome' },
+            ],
+          }),
+        ]}
+      />,
+    );
+    const marks = [...container.querySelectorAll('text:not([data-tick])')];
+    expect(marks.map((mark) => mark.firstChild?.textContent)).toEqual(['▏+1', '●']);
+    expect(marks[0]!.getAttribute('class')).toContain('state-failed');
+    // A lone mark is drawn exactly as before: its glyph, centred on its instant.
+    expect(marks[1]).toHaveAttribute('text-anchor', 'middle');
+    expect(marks[1]).not.toHaveAttribute('data-mark-count');
+  });
+
   it('draws nothing but says so when there are no rows', () => {
     const { container } = render(<Swimlane spanMs={0} ariaLabel="empty" rows={[]} />);
     expect(container.querySelector('svg')).toBeNull();

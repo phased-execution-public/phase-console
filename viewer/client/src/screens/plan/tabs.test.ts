@@ -78,8 +78,9 @@ describe('the plan view vocabulary', () => {
     }
   });
 
-  it('is three views since 6.0 — phases, run, source (control-tower phase 23, #26)', () => {
-    expect([...PLAN_TABS]).toEqual(['phases', 'run', 'source']);
+  it('is four views since 8.0 — phases, run, your turn, source (one-pool phase 14, #366)', () => {
+    expect([...PLAN_TABS]).toEqual(['phases', 'run', 'turn', 'source']);
+    expect(tabLabel('turn')).toBe('Your turn');
   });
 
   it('keeps `run` — every in-flight notification is routed to it', () => {
@@ -144,8 +145,8 @@ describe('the retired tabs', () => {
 });
 
 describe('the readings of each view', () => {
-  it('Phases: the shared four, each with a word of its own', () => {
-    expect([...PHASES_VIEW_IDS]).toEqual(['table', 'map', 'qa', 'handoffs']);
+  it('Phases: the shared six, each with a word of its own', () => {
+    expect([...PHASES_VIEW_IDS]).toEqual(['table', 'map', 'qa', 'handoffs', 'schedule', 'burnup']);
     expect([...PHASES_VIEW_IDS]).toEqual([...PLAN_PHASE_VIEWS]);
     for (const id of PHASES_VIEW_IDS) expect(PHASES_VIEW_LABELS[id], id).toBeTruthy();
   });

@@ -176,7 +176,7 @@ export const VERIFY_ENV_FALLBACK: VerifyEnv = {
     'pytest', 'go', 'cargo', 'alembic', 'vitest', 'jest', 'tsc', 'node',
   ]),
   preflightSkip: new Set([
-    'cd', 'true', 'false', 'echo', 'printf', 'test', 'pwd', 'env', 'which',
+    'cd', 'true', 'false', 'exit', 'echo', 'printf', 'test', 'pwd', 'env', 'which',
     'bash', 'sh', 'command', 'export', 'set', 'time',
     'if', 'then', 'fi', 'elif', 'else', 'for', 'while', 'until', 'do', 'done', 'case', 'esac',
   ]),

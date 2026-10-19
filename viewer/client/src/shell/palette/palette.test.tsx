@@ -190,12 +190,13 @@ describe('go · find · do', () => {
     // remembering to add one. Logs is 7.0's name for Debug.
     expect(labelsIn('Go to')).toEqual([
       'Runs',
+      // A place of its own since one-pool phase 14 — read off the nav, never added twice.
+      'Your turn',
       'Plans',
       'Repo',
       'Insights',
       'Logs',
       'Settings',
-      'Your turn',
       'Help',
     ]);
   });

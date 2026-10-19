@@ -168,14 +168,18 @@ const MECHANISMS: {
     what: 'the admission scan — the one door every lane passes through',
     where: 'server/runner/scheduler.ts',
     // Per entry since control-tower phase 48 (#70): a restart waiting for its
-    // lanes binds only the plans whose scope meets theirs.
-    guard: 'const fleet = this.fleetHolderOf(hold, entry.slug);',
+    // lanes binds only the plans whose scope meets theirs. Since one-pool
+    // phase 39 (#380) the gate is the FIRST check of `skipChain` (pinned by
+    // the "skip chain asks the freeze first" test below), handed this hold.
+    guard: 'fleet: (slug) => this.fleetHolderOf(hold, slug), load: () => load, now, first: true,',
   },
   {
     id: 'scheduler:would-block',
     what: 'the probe that tells the runner whether an admission is free',
     where: 'server/runner/scheduler.ts',
-    guard: 'const fleet = this.fleetHolder(request.slug);\n    if (fleet) return [fleet];',
+    // Through the same `skipChain` as `poll` (one-pool phase 39): the freeze
+    // leads it, and the first skip that holds is the whole answer.
+    guard: '{ fleet: (slug) => this.fleetHolder(slug), load: () => this.loadHolder(), lead, now: this.now(), first: true, repo: false },\n    );\n    if (skip) return [skip.holder];',
   },
   {
     id: 'scheduler:release',
@@ -342,6 +346,16 @@ for (const mechanism of MECHANISMS) {
   });
 }
 
+test('inventory: the skip chain asks the freeze first — poll and would-block reach the gate through it', () => {
+  // Both scheduler rows above name the `fleet:` they hand `skipChain`; this
+  // pins that the chain asks it before anything else (one-pool phase 39).
+  const text = source('server/runner/scheduler.ts');
+  const body = text.slice(text.indexOf('private skipChain('));
+  const first = /const checks:[^\n]*\n\s*(\{ key: '[a-z-]+'[^\n]*)/.exec(body)?.[1];
+  assert.equal(first, "{ key: 'fleet', code: () => 'hold', ask: () => ctx.fleet(entry.slug) },",
+    'skipChain no longer opens its checks with the fleet freeze');
+});
+
 /**
  * The other direction: nothing may begin work from a site nobody counted.
  *
@@ -506,8 +520,31 @@ test('census: every place a claude session is MINTED is accounted for', () => {
   }
 });
 
+/**
+ * …and the bare spawns outside the runner that are OPERATOR doors, each by
+ * name, reason and count — the "say why it is an operator door" the census
+ * below asks for. A row here is no MECHANISMS row: nothing on a clock or a
+ * loop reaches it, so there is no auto-start for a freeze to hold. Its test
+ * pins the whole chain from the route, so a second caller (a timer, a
+ * converge rung, a boot probe) fails here and must be ruled on.
+ */
+const OPERATOR_SPAWN_SITES: { file: string; count: number; note: string; chain: { file: string; call: RegExp; count: number }[] }[] = [];
+
+test('census: every bare claude outside the runner is an operator door, reached only from its route', () => {
+  for (const site of OPERATOR_SPAWN_SITES) {
+    const found = source(site.file).match(/(\?\?\s*spawnClaude|spawnClaude\s*\()/g)?.length ?? 0;
+    assert.equal(found, site.count, `${site.file} spawns ${found} bare sessions, this census expects ${site.count} (${site.note})`);
+    for (const link of site.chain) {
+      const calls = source(link.file).match(link.call)?.length ?? 0;
+      assert.equal(calls, link.count,
+        `${link.file} calls ${link.call.source} ${calls} times, expected ${link.count} — a new caller of an `
+        + `operator door's spawn is a new way to start it: gate it with \`fleetFrozen()\` and add a MECHANISMS row`);
+    }
+  }
+});
+
 test('census: the runner is the only thing in server/ that spawns a bare claude', () => {
-  const files = new Set(RUNNER_SPAWN_SITES.map((s) => s.file));
+  const files = new Set([...RUNNER_SPAWN_SITES, ...OPERATOR_SPAWN_SITES].map((s) => s.file));
   const stray: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of readdirSync(join(VIEWER, dir))) {

@@ -103,3 +103,22 @@ test('a done record over a not-done board is a record-ahead-of-board warning —
   // And no runs at all is no issue, never a throw.
   assert.equal(healthIssues(ctx('active', [])).filter((issue) => issue.kind === 'record-ahead-of-board').length, 0);
 });
+
+test('the plans summary names its open GATED phases, the plan track’s gate mark (#360)', async () => {
+  const { planStats } = await import('../server/analysis/stats.ts');
+  const { loadSizing } = await import('../server/analysis/graph.ts');
+  const gatedText = PLAN_TEXT('active').replace('### Phase 3 — bare', '### Phase 3 — bare *(GATED)*\n- **Gate-check:** ai the release is cut');
+  const plan = parsePlan(gatedText, 'hv', '/tmp/hv.md');
+  const record = {
+    slug: 'hv', kind: 'plan', plan, handoffs: [], index: [], qa: [], locks: [],
+    handoffDir: '/tmp/hv-handoffs', revision: 1,
+  } as never;
+  const board = (done: number[]) => ({
+    phased: true, states: {}, done, inProgress: [], stuck: [], ready: [], waiting: [3],
+  }) as never;
+  const sizing = loadSizing(new URL('../../scripts', import.meta.url).pathname);
+  const open = planStats({ record, board: board([1]), qaMode: { mode: 'off' } } as never, sizing);
+  assert.deepEqual(open.gated, [3]);
+  const finished = planStats({ record, board: board([1, 2, 3]), qaMode: { mode: 'off' } } as never, sizing);
+  assert.deepEqual(finished.gated, [], 'a gated phase that is done carries no mark');
+});

@@ -45,15 +45,23 @@ _to_mjs() {
   exec "$node_bin" "$here/phase-console.mjs" "$@"
 }
 
+# Every verb phase-console.mjs takes is listed here, in one of the two arms
+# below — `viewer/test/cli-dispatch.test.ts` reads the verbs out of the .mjs (both
+# editions') and runs this file against each, so a verb the .mjs learns and this
+# list does not is a red test, not a console booted on a directory named after it.
+# That is how `phase-console fleet status` came to start a console called `fleet`
+# (#359): the documented fleet verbs were never on this list.
+#
 
 # The skill and hook verbs are free — all five of them. `uninstall-skill`,
 # `uninstall-hooks` and `hooks-status` were missing from the list above, so each
 # fell through to ./start, which read the verb as a --root path and BOOTED a
 # console: the same defect the header describes for `stop`, in three verbs that
 # nobody had typed yet. `diagnostics` joined them in 5.1.0, and would fall the
-# same way: `--run` reads as neither a flag this script knows nor a path.
+# same way: `--run` reads as neither a flag this script knows nor a path. So did
+# `report`, `run`, `owner`, `grants` and `mcp`, which both editions' .mjs take.
 case "${1:-}" in
-  install-skill|uninstall-skill|install-hooks|uninstall-hooks|hooks-status|doctor|sessions|diagnostics)
+  install-skill|--install-skill|uninstall-skill|--uninstall-skill|install-hooks|uninstall-hooks|hooks-status|doctor|--doctor|sessions|diagnostics|report|run|owner|grants|mcp)
     _to_mjs "$@" ;;
 esac
 
@@ -75,7 +83,7 @@ esac
 # verb in BOTH trees. `viewer/test/fleet-refusal.test.ts` runs this very pattern
 # against every agent flag and every capability flag, so it cannot happen twice.
 case "${1:-}" in
-  list|open|stop|restart|status|log|logs|update|remove|--*install-agent|--agent-*)
+  list|open|stop|restart|status|log|logs|update|remove|autostart|profile|fleet|capability|accounts|--*install-agent|--agent-*)
     echo "phase-console: '$1' manages a fleet of consoles, which is Phase Console Pro." >&2
     echo "This build runs one console for one repository: phase-console [<repo>]" >&2
     exit 2

@@ -26,7 +26,7 @@ import {
 } from '../shared/situation-model.js';
 import {
   SITUATIONS as SERVER_SITUATIONS, MCP_PARK_RE, VERIFICATION_PARK_RE,
-  blockerStatement, blockerSubKind, classifySituation, collectEvidence, parseLockStatus,
+  blockerStatement, blockerSubKind, classifySituation, collectEvidence, declaredSubKind, parseLockStatus,
   summariseEvidence, workEvidence, type PhaseEvidence,
 } from '../server/runner/situation.ts';
 import { SITUATIONS as LADDER_SITUATIONS, RUNGS_BY_SITUATION, errandFor, rungsFor } from '../server/runner/ladder.ts';
@@ -506,6 +506,14 @@ test('declared blockers branch by what the session actually said it is blocked o
   assert.equal(blocked({ declared: { status: 'needs-human', needs: 'gates', reason: 'no gate in sight', watch: [] } }).key, 'blocked-declared:gate');
   assert.equal(blocked({ declared: { status: 'blocked', needs: 'waits', reason: 'nothing external here', watch: [] } }).key, 'blocked-declared:external');
   assert.equal(blocked({ declared: { status: 'blocked', needs: 'budgets', ...lockProse } }).key, 'blocked-declared:lock', 'no class points at budgets — the prose decides');
+  // #349: `--needs issues` — the manifest key of what the run may write
+  // outward — journalled `unknown`; it is its own sub-kind, whatever the prose,
+  // on blocked and needs-human alike, and a person's with no rung.
+  const issues = blocked({ declared: { status: 'blocked', needs: 'issues', reason: 'may this run file the bug it found upstream?', watch: [] } });
+  assert.equal(issues.key, 'blocked-declared:issues');
+  assert.equal(issues.actor, 'person');
+  assert.equal(blocked({ declared: { status: 'needs-human', needs: 'issues', ...lockProse } }).key, 'blocked-declared:issues');
+  assert.equal(declaredSubKind({ needs: 'issues', reason: 'blocked — could not proceed' }), 'issues');
   // And the persisted RECORD copy speaks after a restart, with the same precedence.
   const fromRecord = classifySituation({
     ...P7_BLOCKED_DECLARED,
@@ -1061,6 +1069,24 @@ test('a DECLARED wait still reads waiting-external — the guard costs the real 
  * Declared blockers — the permission wall and the watch schemes (P12)
  * ------------------------------------------------------------------ */
 
+test('blockerSubKind: "held by origin/main" is a branch fact, not a lock — LOCK_RE reads the lock grammar (one-pool phase 24, #274)', () => {
+  // issues-sweep-hub-tb-hz P14 (d80a5c0ba418), 2026-10-06: a person-owned park
+  // re-boarded at once because the handoff said its branches were "held by origin/main".
+  const p14 = "Nothing else is outstanding: the run's local branches, which are all held by origin/main, can be pruned by the operator.";
+  assert.equal(blockerSubKind(p14), 'unknown');
+  assert.equal(declaredSubKind({ needs: 'ambiguity', reason: 'which reading of the plan stands?' }, { text: p14 }), 'unknown');
+  for (const branchFact of ['every branch is held by `origin/main`', 'held by main since phase 14', 'owned by upstream/main', 'claimed by origin/main', 'held by 6afb80d3']) {
+    assert.equal(blockerSubKind(branchFact), 'unknown', branchFact);
+  }
+  // The lock grammar still reads as a lock.
+  for (const lock of [
+    'phase 7 is held by another session', 'the lock is held by autopilot/9c66853e1db3', 'locked by ops@example.com',
+    'claimed by autopilot/410a042587c8', 'held by session 834c9776', 'blocked: phase-lock reports a conflict', 'waiting on lock:control-tower/12',
+  ]) {
+    assert.equal(blockerSubKind(lock), 'lock', lock);
+  }
+});
+
 test('blockerSubKind: a tool the permission policy refused is `permission`, read before the credential phrases; ssh\'s own "Permission denied" stays a credential', () => {
   // The measured specimen: local-ci-fast-feedback P8, twice, and console-autopilot-orphans P7 before it.
   const p8 = "Edit/Write on .claude/** is permission-denied in this unattended session (.claude/rules/ = 'sensitive file'; "
@@ -1206,6 +1232,7 @@ test('LFC-3: the six empty sub-tables are a person\'s — one table, read by the
     'blocked-declared:credential': 'person',
     'blocked-declared:gate': 'person',
     'blocked-declared:human-acts': 'person',
+    'blocked-declared:issues': 'person',
     'never-started:refusal': 'person',
     'never-started:skill-missing': 'person',
   });

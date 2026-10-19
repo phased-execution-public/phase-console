@@ -38,6 +38,13 @@ export type PlanField = {
   question: string;
 };
 
+/**
+ * The flags the Accounts field reads back: the plan's line — and, in Pro, a phase's own bullet
+ * (`--accounts N`) and the pool policy beside it (`--pool-policy [N]`, one-pool phase 7). The
+ * question stays one: the template is held under 10 KB, and the pool is the accounts' question.
+ */
+const ACCOUNT_FLAGS: string[] = ['--accounts'];
+
 /** Every plan field the engine reads back, in the order the wizard asks them. */
 export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
   { field: 'Repos', flags: ['--repos'], home: '## Phase graph, the Repos column',
@@ -46,7 +53,8 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: 'every phase each phase must wait for — a DAG, never a line' },
   { field: 'Size', flags: ['--size'], home: '- **Size:** S|M|L on each phase',
     question: "each phase's weight against the session budget (default M)" },
-  { field: 'Target model', flags: ['--session-plan'], home: '## Session budget, **Target model:**',
+  // `--model [N]` (one-pool phase 4) reads back the target line and a phase's `- **Model:**`.
+  { field: 'Target model', flags: ['--session-plan', '--model'], home: '## Session budget, **Target model:**',
     question: 'the model that will EXECUTE the phases — it sets the budget' },
   { field: 'Gate-check', flags: ['--gated', '--gate-kind', '--gate-status'], home: '*(GATED)* headings with - **Gates:** and - **Gate-check:**',
     question: 'which phases wait on something outside the plan, and who can clear it (default ai)' },
@@ -62,8 +70,9 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: 'the logins the plan needs — gh, claude-login, env:NAME, keychain:SERVICE, file:PATH' },
   { field: 'Credential policy', flags: ['--credential-policy'], home: `**Credential policy:** ${MCP_POLICIES.join('|')}`,
     question: 'whether a missing credential parks a phase at boarding (default continue)' },
-  { field: 'Accounts', flags: ['--accounts'], home: '**Accounts:** `id:minHeadroom`',
+  { field: 'Accounts', flags: ACCOUNT_FLAGS, home: '**Accounts:** `id:minHeadroom`',
     question: 'which Claude accounts may spend, each with a headroom floor (default default:0)' },
+
   { field: 'QA gate', flags: ['--qa-mode'], home: '**QA gate:** on|off and - **QA:** on|off',
     question: 'whether a fresh-context reviewer gates each phase (default off)' },
   { field: 'QA exhausted', flags: ['--qa-exhausted'], home: '**QA exhausted:** waive|halt|<owner>',

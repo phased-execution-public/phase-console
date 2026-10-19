@@ -104,7 +104,7 @@ test('five sinks, planted values, scanned — none of them holds a code, a token
     // …and each sink still says what the step IS: redaction removed values, not meaning.
     assert.match(readFileSync(ledger.file, 'utf8'), /\[redacted\]/);
     assert.match(readFileSync(ledger.file, 'utf8'), /access_token=\[redacted\]&state=ok/, 'a URL keeps its parameter names');
-    assert.match(JSON.stringify(payloads), /sign in/);
+    assert.match(JSON.stringify(payloads), /sign in/i, 'the push still says what to do — sentence case since one-pool phase 14 (TCC-4)');
     assert.equal(payloads.length, 1);
     // A count that is not a declaration keeps its digits in a transcript.
     transcript.append('stream', { phase: 7, kind: 'text', text: 'ℹ duration_ms 4566159' });
@@ -205,3 +205,4 @@ test('a guide, proof words and what was tried never carry a planted value into t
     rmSync(dir, { recursive: true, force: true });
   }
 });
+

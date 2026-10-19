@@ -32,7 +32,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as meter from '@/ui/track/meter';
 import * as figures from './lazy';
-import { BarList, Bars, Calendar, FIGURES, MARKS, StackBar, calendarCells, type FigureName } from './lazy';
+import {
+  BarList,
+  Bars,
+  Calendar,
+  FIGURES,
+  MARKS,
+  Series,
+  StackBar,
+  calendarCells,
+  type FigureName,
+} from './lazy';
 import { FIGURE_CAP, FIGURE_DESCENT, FIGURE_TYPE, textWidth } from './paint';
 
 /** Calendar halves its window on a phone; the phone is this switch. */
@@ -91,6 +101,22 @@ const SAMPLES: Record<FigureName, ReactElement> = {
       label="phases"
     />
   ),
+  Series: (
+    <Series
+      buckets={[
+        { start: '2026-10-17T00:00:00.000Z', end: '2026-10-17T06:00:00.000Z' },
+        { start: '2026-10-17T06:00:00.000Z', end: '2026-10-17T12:00:00.000Z' },
+        { start: '2026-10-17T12:00:00.000Z', end: '2026-10-17T18:00:00.000Z' },
+      ]}
+      rows={[
+        { name: 'work', values: [1.5, 0, 2.25] },
+        { name: 'deepseek-main', values: [0.25, 0.5, 0] },
+      ]}
+      format={(value) => `$${value.toFixed(2)}`}
+      timeText={(start) => start.slice(11, 16)}
+      label="Spend over time, by account"
+    />
+  ),
 };
 
 /** Each figure's numbers fold, by the words it is labelled with. */
@@ -99,6 +125,7 @@ const FOLDS: Record<FigureName, RegExp> = {
   Calendar: /^The days with a completion/,
   BarList: /^The repos, in full/,
   StackBar: /^The phases as numbers/,
+  Series: /^The buckets with a value/,
 };
 
 /**
@@ -771,5 +798,28 @@ describe('one interaction vocabulary, on each figure', () => {
     // read at both ends, so neither answer can be the slider's resting value.
     expect(read('ltr', [95, 5])).toEqual(['2', '0']);
     expect(read('rtl', [5, 95])).toEqual(['2', '0']);
+  });
+});
+
+describe('a BarList’s numbers table is headed by its caller (#339)', () => {
+  it('heads a list of days Day and Spend, and keeps Name and Value when nobody says', () => {
+    const days = render(
+      <BarList
+        items={[{ name: '2026-10-17', value: 3 }]}
+        label="days"
+        heads={{ name: 'Day', value: 'Spend' }}
+      />,
+    );
+    fireEvent.click(fold(days.container, /^The days, in full/));
+    const heads = [...days.container.querySelectorAll('th')].map((th) => th.textContent);
+    expect(heads).toEqual(['Day', 'Spend', 'Share']);
+    days.unmount();
+    const plain = render(<BarList items={[{ name: 'a', value: 1 }]} label="rows" />);
+    fireEvent.click(fold(plain.container, /^The rows, in full/));
+    expect([...plain.container.querySelectorAll('th')].map((th) => th.textContent)).toEqual([
+      'Name',
+      'Value',
+      'Share',
+    ]);
   });
 });

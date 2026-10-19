@@ -495,6 +495,7 @@ export const DESK_REPO = 'example/tower-issues';
  * a closed one fixed and a closed one merely closed, and one title long
  * enough to wrap on a phone.
  */
+
 function seedIssues(box: ConsoleSandbox, anchor: number): void {
   const at = (min: number): string => new Date(anchor - min * 60_000).toISOString();
   const config = join(box.configHome, 'phase-console', 'config.json');

@@ -73,7 +73,7 @@ test('LP-3: the policies are seniority (the default), blocker-first and critical
   assert.equal(DEFAULT_SCHEDULING_POLICY, 'seniority');
   assert.equal(schedulingPolicy('fifo'), 'seniority');
   assert.equal(schedulingPolicy('critical-path'), 'critical-path');
-  assert.deepEqual([...QUEUE_ORDER_KEYS], ['dependency', 'reserved', 'class', 'pinned', 'bumped', 'policy', 'share', 'seniority'],
+  assert.deepEqual([...QUEUE_ORDER_KEYS], ['dependency', 'reserved', 'class', 'pinned', 'order', 'bumped', 'policy', 'share', 'seniority'],
     'the policy and the fair-share turn are scan keys the queue page names — behind an operator\'s pin and bump');
 });
 

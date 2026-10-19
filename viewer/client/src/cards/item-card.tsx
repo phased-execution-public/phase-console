@@ -47,7 +47,8 @@ import {
   type PersonStatus,
   type Readiness,
 } from '@shared/turn-model.js';
-import type { InboxAction, InboxItem, TurnOption } from '@/data/api';
+import { actionBody, type InboxAction, type InboxItem, type TurnOption } from '@/data/api';
+import { sendOnLeave } from '@/data/http';
 import {
   humanStepsApi as api,
   type HumanStepRecord,
@@ -70,6 +71,7 @@ import { MicField } from '@/ui/mic-field';
 import { OpsStatus } from '@/ui/status';
 import { DecisionCard, type DecisionAnswer, type DecisionOption } from './decision-card';
 import { guideOf } from './guide';
+import { NextStepNote } from './next-step-note';
 import {
   BIRTH_WORDS,
   DeviceCode,
@@ -227,6 +229,11 @@ function useItemVerbs(id: string | undefined) {
       run('answer', (at) => api.humanStepAnswer(at, body), 'Answer sent — the session carries on with it.'),
     decline: (reason: string) =>
       run('decline', (at) => api.humanStepDecline(at, reason), 'Not doing it — the session is told why.'),
+    /** The same answer, sent as the page goes away inside its undo window (#368). */
+    answerOnLeave: (body: DecisionAnswer) =>
+      id ? sendOnLeave(`/api/human-steps/${encodeURIComponent(id)}/answer`, body) : false,
+    declineOnLeave: (reason: string) =>
+      id ? sendOnLeave(`/api/human-steps/${encodeURIComponent(id)}/decline`, { reason }) : false,
     ask: (text: string) =>
       run('ask', (at) => api.humanStepAsk(at, text), 'Asked — the session reads it when it resumes.'),
     attach: (evidence: StepEvidenceInput) =>
@@ -752,7 +759,9 @@ export function ItemCard({
   const pressable = rowActions.filter((action) => !action.flag);
   const runAct = runActOf(item);
   const escalated = Boolean(record?.escalatedAt) && live && !notYet;
-  const title = record?.title ?? item.step?.title ?? item.title;
+  // The composer's title (#377): sentence case, at most 80 characters, no
+  // errand ref — the ledger's raw words only where an item carries none.
+  const title = item.title || record?.title || item.step?.title || '';
   // A check just pressed answers in words (#266), where the screen lends the
   // part: its outcome takes the verdict's place, and the ledger's verdict of
   // the same attempt — patched in by the same answer — is not drawn twice.
@@ -776,33 +785,52 @@ export function ItemCard({
 
   /** A row action: a yes or a no waits out the undo window; anything else goes at once. */
   function pressRow(action: InboxAction, words?: string) {
-    if (HELD_VERBS.has(action.verb)) held.hold(action.label, () => perform(row, action, words));
-    else perform(row, action, words);
+    if (HELD_VERBS.has(action.verb)) {
+      held.hold(
+        action.label,
+        () => perform(row, action, words),
+        () => sendOnLeave(action.endpoint, actionBody(action, words), action.method),
+      );
+    } else perform(row, action, words);
   }
 
   /** A bound option, sent through the undo window — a refusal said on the item, in the server's sentence. */
   function sendOption(option: TurnOption, typed: string | undefined) {
     setRefusal(null);
-    held.hold(option.label, async () => {
-      setOptionBusy(true);
-      try {
-        const pressed = await pressOption(option, typed);
-        if (pressed.state === 'asked') toast(pressed.words, 'info', 8000);
-        else toast(`${option.label} — done.`, 'ok');
-      } catch (cause) {
-        // A stale run, a door that may not press, a rule: the server's sentence, where the press was made.
-        setRefusal(errorWords(cause));
-      } finally {
-        setOptionBusy(false);
-        for (const queryKey of keys.afterInboxAct()) void client.invalidateQueries({ queryKey });
-      }
-    });
+    const leave = () =>
+      sendOnLeave(
+        option.verb.endpoint,
+        actionBody({ body: option.verb.body, ...(option.says ? { says: option.says } : {}) }, typed),
+        option.verb.method,
+      );
+    held.hold(
+      option.label,
+      async () => {
+        setOptionBusy(true);
+        try {
+          const pressed = await pressOption(option, typed);
+          if (pressed.state === 'asked') toast(pressed.words, 'info', 8000);
+          else toast(`${option.label} — done.`, 'ok');
+        } catch (cause) {
+          // A stale run, a door that may not press, a rule: the server's sentence, where the press was made.
+          setRefusal(errorWords(cause));
+        } finally {
+          setOptionBusy(false);
+          for (const queryKey of keys.afterInboxAct()) void client.invalidateQueries({ queryKey });
+        }
+      },
+      leave,
+    );
   }
 
   /** A decision sent: a ledger answer, or the chosen bound option with its typed words. */
   function sendDecision(answer: DecisionAnswer) {
     if (ledgerOptions.length || (ledger && !bound.length)) {
-      held.hold('Your decision', () => void extra.answer(answer));
+      held.hold(
+        'Your decision',
+        () => void extra.answer(answer),
+        () => extra.answerOnLeave(answer),
+      );
       return;
     }
     const option = bound.find((candidate) => candidate.id === answer.option);
@@ -821,7 +849,11 @@ export function ItemCard({
     if (yesOption || noOption) {
       const send = (option: DecisionOption) => (note: string | undefined) => {
         if (ledgerOptions.length) {
-          held.hold(option.label, () => void extra.answer({ option: option.id, ...(note ? { note } : {}) }));
+          held.hold(
+            option.label,
+            () => void extra.answer({ option: option.id, ...(note ? { note } : {}) }),
+            () => extra.answerOnLeave({ option: option.id, ...(note ? { note } : {}) }),
+          );
           return;
         }
         const boundOption = bound.find((candidate) => candidate.id === option.id);
@@ -854,9 +886,17 @@ export function ItemCard({
       // A check by eye with no options: the answer is the note, said as a yes or a no.
       return {
         onApprove: (note) =>
-          held.hold('Approve', () => void extra.answer({ note: note ? `Approved: ${note}` : 'Approved.' })),
+          held.hold(
+            'Approve',
+            () => void extra.answer({ note: note ? `Approved: ${note}` : 'Approved.' }),
+            () => extra.answerOnLeave({ note: note ? `Approved: ${note}` : 'Approved.' }),
+          ),
         onDeny: (note) =>
-          held.hold('Deny', () => void extra.answer({ note: note ? `Denied: ${note}` : 'Denied.' })),
+          held.hold(
+            'Deny',
+            () => void extra.answer({ note: note ? `Denied: ${note}` : 'Denied.' }),
+            () => extra.answerOnLeave({ note: note ? `Denied: ${note}` : 'Denied.' }),
+          ),
       };
     }
     return {};
@@ -896,7 +936,12 @@ export function ItemCard({
               check: verbs.check,
               snooze: verbs.snooze,
               cannot: verbs.cannot,
-              decline: (reason) => held.hold('Not doing this', () => void extra.decline(reason)),
+              decline: (reason) =>
+                held.hold(
+                  'Not doing this',
+                  () => void extra.decline(reason),
+                  () => extra.declineOnLeave(reason),
+                ),
               ask: extra.ask,
               attach: extra.attach,
               giveBack: (phase) => void extra.giveBack(phase),
@@ -1184,6 +1229,8 @@ export function ItemCard({
         )}
         {live && flagged.length > 0 && <FlaggedActions actions={flagged} />}
         {held.held && <HeldLine held={held.held} onUndo={held.undo} onSendNow={held.sendNow} />}
+        {/* What the last press answered that is a next step (#368) — a sign-in's terminal, an errand tree's paths. */}
+        {live && <NextStepNote id={row.id} />}
 
 
 

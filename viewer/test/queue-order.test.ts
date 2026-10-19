@@ -307,3 +307,53 @@ test('QV-6: the audit strip reads the queue\'s lines back, newest first, each in
   assert.match(rows[2]!.text, /operator held demo P6 — waiting for the CI fix/);
   for (const row of rows) assert.ok((QUEUE_VERBS as readonly string[]).includes(row.verb));
 });
+
+/* ================================================================== *
+ * QV-9 — an operator's ORDER (one-pool phase 39, #380): the override
+ * survives its entry and a restart, is spent when the phase boards, and
+ * ranks where it says
+ * ================================================================== */
+
+test('QV-9: an order survives its entry — a re-created entry is born ordered, ranks where it was put, and boarding spends it', async () => {
+  const h = harness();
+  const five = h.runner.admitNow(5); five.catch(() => {});
+  const six = h.runner.admitNow(6); six.catch(() => {});
+  await queued(h, 2);
+  assert.deepEqual(h.order().map((e) => e.phase), [5, 6]);
+  const out = h.runner.queueControl(6, 'order', who('6 goes before 5'), {
+    order: { at: new Date().toISOString(), by: 'operator', reason: '6 goes before 5', anchor: { slug: 'demo', phase: 5 }, side: 'before', stamp: h.scheduler.nextStamp() },
+  });
+  assert.equal(out.ok, true);
+  assert.deepEqual(h.order().map((e) => e.phase), [6, 5], 'the waiting entry takes the order at once');
+  assert.equal(h.journal.find((l) => l.event === 'phase.queue-ordered')?.data.reason, '6 goes before 5');
+
+  // The entries die and come back — the order is the record's, so it stands.
+  h.scheduler.withdrawRun(h.state.id);
+  await Promise.allSettled([five, six]);
+  const fiveAgain = h.runner.admitNow(5); fiveAgain.catch(() => {});
+  const sixAgain = h.runner.admitNow(6); sixAgain.catch(() => {});
+  await queued(h, 2);
+  assert.deepEqual(h.order().map((e) => e.phase), [6, 5], 'born ordered, whatever order the entries came back in');
+  assert.ok(h.scheduler.snapshot().entries.find((e) => e.phase === 6)!.control?.order, 'the entry carries the mark');
+
+  // A restart reads the record back: the mark is in the saved state.
+  const saved = JSON.parse(JSON.stringify(h.state)) as RunState;
+  assert.deepEqual(saved.phases['6']!.queueControl?.order?.anchor, { slug: 'demo', phase: 5 });
+
+  h.free();
+  const grant = await sixAgain;
+  assert.ok(grant, 'it boards first');
+  assert.equal(h.state.phases['6']!.queueControl?.order, undefined, 'spent when the phase boards');
+  h.scheduler.release(grant!);
+  const other = await fiveAgain.catch(() => null);
+  if (other) h.scheduler.release(other);
+
+  // A revert lifts it; a lapse says why.
+  h.runner.queueControl(5, 'order', who(), { order: { at: new Date().toISOString(), by: 'operator', anchor: 'first', side: 'before', stamp: 1 } });
+  assert.ok(h.state.phases['5']!.queueControl?.order);
+  h.runner.queueControl(5, 'unorder', who(), { lapsed: 'demo P9 finished' });
+  assert.equal(h.state.phases['5']!.queueControl?.order, undefined);
+  const lapsed = h.journal.find((l) => l.event === 'phase.queue-order-lapsed');
+  assert.equal(lapsed?.data.why, 'demo P9 finished');
+  h.scheduler.close();
+});

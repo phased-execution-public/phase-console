@@ -19,7 +19,11 @@
  * repeat a sentence. A press bound to a run that moved on (turn-by-turn phase
  * 5: an option's body names `expectRunId`) answers **409 `{error, stale}`** —
  * the run it was asked of and the run that stands now: nothing was pressed,
- * and the item says the server's sentence where the press was made.
+ * and the item says the server's sentence where the press was made. A press
+ * from a page an earlier release served (one-pool phase 18, #373) answers
+ * **409 `{outdated: true}`** — "This page is from a previous release of the
+ * console — reload it, then press again." — before any route reads it: the
+ * refusal is `outdated`, and the shell has already offered the reload.
  *
  * Before this file each card that pressed an authority verb handled the first
  * two itself (`features/turn/owner-key.ts`), and every other press read a 202
@@ -27,6 +31,7 @@
  * ceremony, fetched only when a press asks for it.
  */
 
+import { isOutdatedBody } from '@/lib/build';
 import { ApiError } from './http';
 import type { AuthorityRequest } from './owner';
 
@@ -61,6 +66,8 @@ export class PressRefusal extends ApiError {
   readonly rules: readonly string[];
   /** The run the press was bound to, and the one that stands now, when it went stale (409). */
   readonly stale: StaleBinding | null;
+  /** The page is from an earlier release than the console serves: reload, then press again (409, #373). */
+  readonly outdated: boolean;
 
   constructor(cause: ApiError) {
     super(cause.message, cause.status, cause.path, cause.body);
@@ -70,6 +77,7 @@ export class PressRefusal extends ApiError {
     const rules = Array.isArray(body.rules) ? body.rules : body.rule === undefined ? [] : [body.rule];
     this.rules = cause.status === 400 ? rules.filter((rule): rule is string => typeof rule === 'string') : [];
     this.stale = staleOf(cause);
+    this.outdated = isOutdatedBody(cause.status, cause.body);
   }
 }
 
@@ -121,8 +129,8 @@ function settle<T>(result: T): Pressed<T> {
  * `pressVerb` — and is called at most twice: once, and once more after a
  * touch when the route asks for one.
  *
- * Resolves `done` or `asked`; rejects with a `PressRefusal` for a 400, a 403
- * or a stale 409, and with the request's own error for anything else — a 409
+ * Resolves `done` or `asked`; rejects with a `PressRefusal` for a 400, a 403,
+ * a stale 409 or an outdated page's 409, and with the request's own error for anything else — a 409
  * with no `stale` block (a session already on the phase) stays the route's own.
  */
 export async function press<T>(call: () => Promise<T>, options: PressOptions = {}): Promise<Pressed<T>> {
@@ -135,7 +143,13 @@ export async function press<T>(call: () => Promise<T>, options: PressOptions = {
       return settle(await call());
     }
   } catch (cause) {
-    if (cause instanceof ApiError && (cause.status === 400 || cause.status === 403 || staleOf(cause)))
+    if (
+      cause instanceof ApiError &&
+      (cause.status === 400 ||
+        cause.status === 403 ||
+        staleOf(cause) ||
+        isOutdatedBody(cause.status, cause.body))
+    )
       throw new PressRefusal(cause);
     throw cause;
   }

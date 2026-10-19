@@ -89,9 +89,11 @@ export function UnitGroup({ state }: { state: ConsoleState }) {
       lead={
         <>
           Decided where it starts, never from a page.{' '}
+          {/* One box, not two line fragments: wrapped on a phone, an inline
+              link's centre is the paragraph's, between its two lines. */}
           <a
             href={settingsHref('essentials')}
-            className="tap-line underline decoration-ink-faint underline-offset-2 hover:text-ink"
+            className="tap-line inline-block underline decoration-ink-faint underline-offset-2 hover:text-ink"
           >
             Essentials composes the start command
           </a>{' '}

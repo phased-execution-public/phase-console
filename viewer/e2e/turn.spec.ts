@@ -54,7 +54,7 @@ test('every group holds its item, in order, and every primary wins its own centr
   const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
   if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
   const fx = await fixture();
-  await visit(page, { name: 'turn-items', hash: '#/turn' }, fx.anchor);
+  await visit(page, { name: 'turn-items', hash: '#/turn?view=cards&tab=all' }, fx.anchor);
 
   const sections = await page
     .getByTestId('turn-section')
@@ -106,7 +106,7 @@ test('a long command scrolls inside its card, never the page', async ({ page }, 
   const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
   if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
   const fx = await fixture();
-  await visit(page, { name: 'turn-command', hash: '#/turn/turn-now-signin' }, fx.anchor);
+  await visit(page, { name: 'turn-command', hash: '#/turn/turn-now-signin?view=cards&tab=all' }, fx.anchor);
   const card = page.locator('[data-testid="turn-item"][data-item="turn-now-signin"]');
   const command = card.getByTestId('guide-command').first();
   await command.scrollIntoViewIfNeeded();
@@ -136,7 +136,7 @@ test('unfolded, the page holds: axe light and dark, no overflow, the focus walk 
   const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
   if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
   const fx = await fixture();
-  await visit(page, { name: 'turn-open', hash: '#/turn' }, fx.anchor);
+  await visit(page, { name: 'turn-open', hash: '#/turn?view=cards&tab=all' }, fx.anchor);
   await unfold(page);
   const layout = (await layoutFindings(page, { touch: viewport.touch })).filter(
     (f) => f.cls === 'overflow' || f.cls === 'escape',
@@ -170,7 +170,7 @@ test('the permission card: the scopes stack on a phone, the typed rule sits abov
   const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
   if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
   const fx = await fixture();
-  await visit(page, { name: 'turn-permit', hash: '#/turn/turn-permit' }, fx.anchor);
+  await visit(page, { name: 'turn-permit', hash: '#/turn/turn-permit?view=cards&tab=all' }, fx.anchor);
   const card = page.locator('[data-testid="turn-item"][data-item="turn-permit"]');
   const scopes = card.getByTestId('grant-scope');
   await expect(scopes).toHaveCount(5);
@@ -247,7 +247,7 @@ test('#/turn/<id> marks its card, and opens the panel on it where the panel stan
   const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
   if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
   const fx = await fixture();
-  await visit(page, { name: 'turn-focus', hash: '#/turn/turn-decide' }, fx.anchor);
+  await visit(page, { name: 'turn-focus', hash: '#/turn/turn-decide?view=cards&tab=all' }, fx.anchor);
   const card = page.locator('[data-testid="turn-item"][data-item="turn-decide"]');
   await expect(card).toHaveAttribute('aria-current', 'true');
   const explain = page.getByTestId('turn-explain');
@@ -290,7 +290,7 @@ test('every type and status the seed holds is drawn in the card’s words, with 
   const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
   if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
   const fx = await fixture();
-  await visit(page, { name: 'turn-shapes', hash: '#/turn' }, fx.anchor);
+  await visit(page, { name: 'turn-shapes', hash: '#/turn?view=cards&tab=all' }, fx.anchor);
   await unfold(page);
   for (const shape of SHAPES) {
     const card = page.locator(`[data-testid="turn-item"][data-item="${shape.id}"]`);
@@ -323,3 +323,47 @@ test('every type and status the seed holds is drawn in the card’s words, with 
   expect(found, `${viewport.name}: overflow on Your turn`).toEqual([]);
   await shoot(page, info.project.name, 'turn-shapes');
 });
+
+/*
+ * The page a person works FROM (one-pool phase 14, #377 #366): the list by
+ * default, its line selected into the panel, the board grouped by plan and the
+ * timeline — each without overflow at every viewport — and a plan's own view.
+ */
+test('the list opens on one line per item, and a line opens its whole card in the panel', async ({
+  page,
+}, info) => {
+  const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
+  if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
+  const fx = await fixture();
+  await visit(page, { name: 'turn-list', hash: '#/turn' }, fx.anchor);
+  await expect(page.getByTestId('turn-page-body')).toHaveAttribute('data-view', 'list');
+  const rows = page.getByTestId('turn-row');
+  expect(await rows.count()).toBeGreaterThan(0);
+  await rows.first().locator('[data-select]').click();
+  await expect(page).toHaveURL(/#\/turn\/[^?]+/);
+  await expect(page.getByTestId('turn-panel-card')).toBeVisible();
+  const layout = (await layoutFindings(page, { touch: viewport.touch })).filter(
+    (f) => f.cls === 'overflow' || f.cls === 'escape',
+  );
+  expect(layout).toEqual([]);
+  await shoot(page, info.project.name, 'turn-list-selected');
+});
+
+for (const [name, hash] of [
+  ['turn-board-plan', '#/turn?view=board&group=plan&tab=all'],
+  ['turn-timeline', '#/turn?view=timeline'],
+  ['plan-turn', '#/plan/tower/turn'],
+] as const) {
+  test(`${name} draws without overflow`, async ({ page }, info) => {
+    const viewport = VIEWPORTS.find((v) => v.name === info.project.name);
+    if (!viewport) throw new Error(`no viewport named ${info.project.name}`);
+    const fx = await fixture();
+    await visit(page, { name, hash }, fx.anchor);
+    await expect(page.getByTestId('turn-page-body')).toBeVisible();
+    const layout = (await layoutFindings(page, { touch: viewport.touch })).filter(
+      (f) => f.cls === 'overflow' || f.cls === 'escape',
+    );
+    expect(layout).toEqual([]);
+    await shoot(page, info.project.name, name);
+  });
+}

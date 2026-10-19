@@ -143,6 +143,22 @@ test('marking read is explicit, per record or wholesale', () => {
   assert.equal(inbox.unread(), 0);
 });
 
+test('putting back marks named records unread again, and deletes nothing (#334)', () => {
+  const inbox = store();
+  const a = inbox.record(announcement({ title: 'a' }));
+  const b = inbox.record(announcement({ title: 'b' }));
+  inbox.markRead();
+
+  assert.equal(inbox.markUnread([a.id]), 1);
+  assert.equal(inbox.unread(), 1);
+  assert.equal(inbox.list().items.length, 2, 'a put-back record stays in the list');
+  assert.equal(inbox.list().items.find((r) => r.id === a.id)?.read, false);
+  assert.equal(inbox.list().items.find((r) => r.id === b.id)?.read, true, 'only the named record moves');
+  assert.equal(inbox.markUnread([a.id]), 0, 'putting back an unread record changes nothing');
+  assert.equal(inbox.markUnread([]), 0, 'an empty list is not "everything"');
+  assert.equal(inbox.unread(), 1);
+});
+
 test('clearing says exactly what it clears', () => {
   const inbox = store();
   const keep = inbox.record(announcement({ title: 'unread' }));
@@ -428,6 +444,7 @@ function fakeService(over: Record<string, unknown> = {}) {
     store: null,
     inbox: (query: never) => inbox.list(query),
     markNotificationsRead: (ids: string[] | null) => ({ changed: inbox.markRead(ids), unread: inbox.unread() }),
+    markNotificationsUnread: (ids: string[]) => ({ changed: inbox.markUnread(ids), unread: inbox.unread() }),
     clearNotifications: (what: never) => ({ removed: inbox.clear(what), unread: inbox.unread() }),
     restartReadiness: () => ({ ok: true, supervisor: { kind: 'launchd', supervised: true, detail: 'x' }, busy: false, run: null }),
     restart: () => ({ ok: true }),
@@ -456,6 +473,25 @@ test('mutating the inbox needs the console header and nothing more', async () =>
   const ok = await call(service, 'POST', '/api/notifications/read');
   assert.equal(ok.status, 200);
   assert.deepEqual(ok.body, { changed: 1, unread: 0 });
+});
+
+test('POST /api/notifications/unread puts named records back, under the same header check (#334)', async () => {
+  const service = fakeService();
+  const record = service._inbox.record(announcement());
+  service._inbox.markRead();
+
+  const refused = await call(service, 'POST', '/api/notifications/unread', { body: { ids: [record.id] }, header: false });
+  assert.equal(refused.status, 403);
+  assert.equal(service._inbox.unread(), 0);
+
+  const empty = await call(service, 'POST', '/api/notifications/unread', { body: {} });
+  assert.equal(empty.status, 200);
+  assert.deepEqual(empty.body, { changed: 0, unread: 0 }, 'no ids is nothing, never everything');
+
+  const ok = await call(service, 'POST', '/api/notifications/unread', { body: { ids: [record.id] } });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body, { changed: 1, unread: 1 });
+  assert.equal(service._inbox.list().items.length, 1, 'put back is not a delete');
 });
 
 test('a delete with no scope clears nothing', async () => {

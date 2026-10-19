@@ -12,8 +12,7 @@ groups the console puts only what is wrong with itself: *Claude Code is signed o
 this phase* when the board reads a phase as in progress and nothing is working on it, and a line for a
 repository whose GitHub jobs are not starting.
 
-Old addresses still land here, at the matching group: `#/now`, `#/ready`, `#/pulse`, `#/queue`, and any
-`?bay=`.
+Old addresses still land here, at the matching group: `#/now`, `#/ready`, `#/pulse`, and any `?bay=`.
 
 ## The six groups
 
@@ -72,8 +71,12 @@ labelled: `running 12m 03s`, `halted 12m 3s ago`, `queued 4m`, `wakes in 20m`, `
 
 Under the line come only the things that hold it: a hold (*Held by …: nothing new boards until it is
 released*), whoever the queue waits on, and one line on why it is slow or what it is doing: *Slow: machine
-load 82 on 14 CPUs is above the guard (and 1 more).* or *On p6.task2 — wire the endpoint — about 20–35 min
-left.*
+load 82 on 14 CPUs is above the guard (21): timed work runs slower and may flake (and 1 more).* or *On
+p6.task2 — wire the endpoint — about 20–35 min left.* That slow line reads the machine's one-minute load, 1.5
+per CPU; it warns and holds nothing. What holds new work is the console's **load guard** (Settings ▸
+Automation ▸ **The queue**), and it reads how busy the CPU was over the last 30 seconds: 85 % at its shipped
+factor of 1.5, scaled by the factor. The 5-minute load is only its ceiling, at the factor times the cores,
+times 2. Live lanes are never touched.
 
 
 The one action is chosen in this order:
@@ -129,7 +132,8 @@ go. A lamp with nothing behind it is dim, dashed, and cannot be pressed. **Halts
 
 ## The queue
 
-There is no queue page of its own: `#/queue` opens the **Queued** group. A queued run's line says whom it
+
+The **Queued** group holds every run waiting for a scope or a lane. A queued run's line says whom it
 waits on, and opening it says why — *queued — waiting on …*, *Also behind …*, *Held … ago by … —
 release it to let this line move*, *Chained behind …* — and moves it: **Bump**, **Board P7 first**,
 **Hold** and its priority. One phase's own place in line is in its **Actions**, in the panel: **Hold in

@@ -6,8 +6,10 @@
  *   its NEWEST run (by when it was made, whatever the list's order);
  * - the mark: a person waited on leads, then a run that has not settled, then
  *   the plan's own word; a document has a kind, never a status;
- * - the line folds to labelled stations, a closed plan's to what got done and
- *   what never ran, an unread board to nothing (the row draws the reading);
+ * - the counts (#360): every board bucket a segment in proportion, held by QA
+ *   carved out of done, gated a mark over next up and waiting, a closed plan's
+ *   what got done and what never ran, an unread board its last reading and a
+ *   hatch — the segments always summing to the phase count;
  * - the five orders lead with five different plans; the filters say what they
  *   hide, measured; the closed estate and the documents fold under the list,
  *   narrowed by the same search, never twice on one page.
@@ -27,7 +29,10 @@ import {
   hiddenBreakdown,
   layoutOf,
   leftWords,
-  lineOf,
+  countsLabel,
+  countsOf,
+  legendOf,
+  segmentsOf,
   markKind,
   markLabel,
   matchesPlan,
@@ -38,7 +43,10 @@ import {
   statusOptions,
   toRows,
   workSentence,
+  type PlanRow,
 } from './model';
+import { BOARD_STATE_UI } from '@shared/status-vocab.js';
+import { describeWord } from '@shared/status-model.js';
 
 const plan = (over: Partial<PlanSummaryFull> = {}): PlanSummaryFull => ({
   slug: 'alpha',
@@ -185,30 +193,214 @@ describe('the mark — which word leads a row', () => {
   });
 });
 
-describe('the line', () => {
-  it('folds a plan to what is done, every phase that stands, and what is left', () => {
+describe('the counts — every phase in proportion (#360)', () => {
+  /** What the track draws, summed: it must be the phase count, whatever the board says. */
+  const drawn = (row: PlanRow): number => segmentsOf(countsOf(row)).reduce((sum, s) => sum + s.count, 0);
+
+  it('counts every bucket, and keeps the waiting phases apart from what is left', () => {
     const [row] = toRows(
-      [plan({ phases: 72, done: 41, inProgress: [42], ready: [43], stuck: [], percent: 57 })],
+      [
+        plan({
+          phases: 72,
+          done: 41,
+          inProgress: [42],
+          stuck: [50, 51],
+          ready: [43],
+          waiting: 3,
+          percent: 57,
+        }),
+      ],
       [],
       NOW,
     );
-    expect(lineOf(row).map((s) => s.label)).toEqual(['41 done', 'P42 in progress', 'P43 next up', '29 left']);
-    expect(lineOf(row).map((s) => s.paint)).toEqual(['done', 'running', 'queued', 'queued']);
+    expect(countsOf(row)).toMatchObject({
+      phases: 72,
+      known: true,
+      closed: false,
+      done: 41,
+      heldByQa: 0,
+      inProgress: 1,
+      stuck: 2,
+      ready: 1,
+      waiting: 3,
+      gated: 0,
+      rest: 24,
+      neverRan: 0,
+      unread: 0,
+      percent: 57,
+    });
+    expect(legendOf(row)).toBe('41 done · 1 in progress · 2 stuck · 1 next up · 3 waiting · 24 left · 57 %');
+    expect(segmentsOf(countsOf(row)).map((s) => [s.key, s.count])).toEqual([
+      ['done', 41],
+      ['in-progress', 1],
+      ['stuck', 2],
+      ['ready', 1],
+      ['waiting', 3],
+      ['rest', 24],
+    ]);
   });
 
-  it('counts a crowd of next-up phases as one station', () => {
-    const [row] = toRows([plan({ phases: 10, done: 2, ready: [3, 4, 5] })], [], NOW);
-    expect(lineOf(row).map((s) => s.label)).toEqual(['2 done', '3 next up', '5 left']);
+  it('paints each segment from the board’s own table, and QA’s hold as QA words a fail', () => {
+    const [row] = toRows(
+      [plan({ phases: 9, done: 3, inProgress: [4], stuck: [5], ready: [6], waiting: 2, qaFailures: [2] })],
+      [],
+      NOW,
+    );
+    expect(Object.fromEntries(segmentsOf(countsOf(row)).map((s) => [s.key, s.paint]))).toEqual({
+      done: BOARD_STATE_UI.done,
+      'held-by-qa': describeWord('qa-result', 'fail').paint,
+      'in-progress': BOARD_STATE_UI['in-progress'],
+      stuck: BOARD_STATE_UI.stuck,
+      ready: BOARD_STATE_UI.ready,
+      waiting: BOARD_STATE_UI.waiting,
+      // What no bucket accounts for is the bare track: unpainted, no state claimed.
+      rest: null,
+    });
   });
 
-  it('paints a closed plan’s line as what got done and what never ran — never "next up"', () => {
-    const [row] = toRows([plan({ status: 'abandoned', phases: 6, done: 2, ready: [3, 4] })], [], NOW);
-    expect(lineOf(row).map((s) => s.label)).toEqual(['2 done', '4 never ran']);
+  it('carves a phase held by QA out of done — its own segment, never counted twice', () => {
+    const [row] = toRows(
+      [plan({ phases: 10, done: 6, ready: [7], waiting: 3, qaFailures: [4, 4, 6], percent: 60 })],
+      [],
+      NOW,
+    );
+    const counts = countsOf(row);
+    expect([counts.done, counts.heldByQa, counts.waiting]).toEqual([4, 2, 3]);
+    expect(legendOf(row)).toBe('4 done · 2 held by QA · 1 next up · 3 waiting · 60 %');
+    expect(drawn(row)).toBe(10);
+    // A failed phase the board already names as standing is not held twice.
+    const [standing] = toRows(
+      [plan({ phases: 4, done: 1, stuck: [2], ready: [], waiting: 1, qaFailures: [2] })],
+      [],
+      NOW,
+    );
+    expect(countsOf(standing).heldByQa).toBe(0);
   });
 
-  it('draws no line for a board the engine could not read', () => {
-    const [row] = toRows([plan({ progress: 'unknown', done: null, percent: null })], [], NOW);
-    expect(lineOf(row)).toEqual([]);
+  it('reads a gated phase as a mark over next up and waiting, never as a segment of its own', () => {
+    const summary = { ...plan({ phases: 6, done: 2, ready: [3, 4], waiting: 2 }), gated: [4, 5] };
+    const [row] = toRows([summary], [], NOW);
+    const counts = countsOf(row);
+    expect(counts.gated).toBe(2);
+    expect(segmentsOf(counts).map((s) => s.key)).not.toContain('gated');
+    expect(drawn(row)).toBe(6);
+    expect(legendOf(row)).toBe('2 done · 2 next up · 2 waiting · 2 gated · 25 %');
+    // The list sends no gate words today: no mark, nothing claimed.
+    expect(countsOf(toRows([plan()], [], NOW)[0]).gated).toBe(0);
+  });
+
+  it('adds up to the phase count for open, complete, closed and unread boards', () => {
+    const at = NOW - 3_600_000;
+    const rows = toRows(
+      [
+        plan({
+          slug: 'open',
+          phases: 12,
+          done: 5,
+          inProgress: [6],
+          stuck: [7],
+          ready: [8],
+          waiting: 4,
+          qaFailures: [3],
+        }),
+        plan({
+          slug: 'complete',
+          status: 'complete',
+          phases: 7,
+          done: 7,
+          ready: [],
+          waiting: 0,
+          percent: 100,
+        }),
+        plan({
+          slug: 'closed',
+          status: 'abandoned',
+          phases: 9,
+          done: 2,
+          ready: [3, 4],
+          waiting: 5,
+          qaFailures: [1],
+        }),
+        plan({
+          slug: 'unread',
+          phases: 8,
+          progress: 'unknown',
+          done: null,
+          percent: null,
+          lastGood: { done: 3, phases: 8, percent: 38, at, ageMs: 0 },
+        }),
+        plan({
+          slug: 'blind',
+          phases: 5,
+          progress: 'unknown',
+          done: null,
+          percent: null,
+          ready: [],
+          waiting: 0,
+        }),
+        // A board that over-counts (an older server) still draws exactly the phases.
+        plan({ slug: 'over', phases: 4, done: 3, inProgress: [4], ready: [5], waiting: 3 }),
+      ],
+      [],
+      NOW,
+    );
+    expect(rows.map((row) => [row.slug, drawn(row)])).toEqual([
+      ['open', 12],
+      ['complete', 7],
+      ['closed', 9],
+      ['unread', 8],
+      ['blind', 5],
+      ['over', 4],
+    ]);
+  });
+
+  it('words a closed plan as what got done and what never ran — never next up', () => {
+    const [row] = toRows(
+      [plan({ status: 'abandoned', phases: 6, done: 2, ready: [3, 4], qaFailures: [1], percent: 33 })],
+      [],
+      NOW,
+    );
+    expect(segmentsOf(countsOf(row)).map((s) => [s.key, s.count, s.paint])).toEqual([
+      ['done', 2, 'done'],
+      ['never', 4, 'skipped'],
+    ]);
+    expect(legendOf(row)).toBe('2 done · 4 never ran · 33 %');
+  });
+
+  it('words a complete plan as all done', () => {
+    const [row] = toRows([plan({ phases: 4, done: 4, ready: [], waiting: 0, percent: 100 })], [], NOW);
+    expect(legendOf(row)).toBe('4 done · 100 %');
+  });
+
+  it('says an unread board’s reading, never a track at 0 % — the last good reading drawn, the rest hatched', () => {
+    const [blind] = toRows([plan({ progress: 'unknown', done: null, percent: null })], [], NOW);
+    expect(countsOf(blind).known).toBe(false);
+    expect(segmentsOf(countsOf(blind)).map((s) => [s.key, s.count, s.hatch])).toEqual([['unread', 4, true]]);
+    expect(legendOf(blind)).toBe('progress unknown');
+    const [last] = toRows(
+      [
+        plan({
+          progress: 'unknown',
+          done: null,
+          percent: null,
+          lastGood: { done: 1, phases: 4, percent: 25, at: NOW, ageMs: 0 },
+        }),
+      ],
+      [],
+      NOW,
+    );
+    expect(segmentsOf(countsOf(last)).map((s) => [s.key, s.count])).toEqual([
+      ['done', 1],
+      ['unread', 3],
+    ]);
+    expect(legendOf(last, NOW)).toMatch(/^progress unknown · last read 1\/4 · 25%/);
+  });
+
+  it('names the counts in the accessible name, in words', () => {
+    const [row] = toRows([plan({ phases: 6, done: 2, inProgress: [3], ready: [4], waiting: 1 })], [], NOW);
+    expect(countsLabel(row)).toBe(
+      'Alpha plan, 6 phases: 2 done, 1 in progress, 1 next up, 1 waiting, 1 left, 25 %',
+    );
   });
 
   it('says the work left in sessions, and what a closed plan or a document leaves', () => {

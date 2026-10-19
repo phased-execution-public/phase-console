@@ -183,7 +183,10 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    question it asks of `Worktrees: on` above, and an overriding run tells each session the concrete
    branch and checkout to use for every line it runs over — nothing is left for the session to
    reconcile. Only a run started before that answer existed still asks its sessions to record the
-   discrepancy in their handoffs. The line here stays authoritative for hand-driven sessions.)
+   discrepancy in their handoffs. The line here stays authoritative for hand-driven sessions.
+   The console reads only a BACKTICKED branch token from it — never the prose around it — and a
+   line naming the run branch `pe/<slug>` among its tokens agrees with the run; a launch that cuts
+   no branch is asked the same question when the line names a branch its checkout is not on.)
    **Choose isolation at LAUNCH** (control-tower phase 90, #154). A run's own checkout is decided
    when it starts, and a resume cannot add one: a shared-checkout run stays shared for the rest of
    its life. The two escapes are explicit acts, never side effects: `POST /api/run/<slug>/isolate`
@@ -350,7 +353,20 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    template to fill in; a `\|` or a pipe inside backticks stays in its cell; the preamble's "runs from
    `<dir>`" is kept as a hint. A guide comes from the bullet's `guide:` file first, then from its row.
    A row no bullet names is a heads-up — nothing checks it or waits on it — and is advised about
-   (**F43** `errand-row-unbound`, by id). An item the 7.0 door raised is matched to its bullet by the
+   (**F43** `errand-row-unbound`, by id). A bullet's `proof:` is read the way the console's check reads
+   it, and two advisories name a proof that could never pass (one-pool phase 13): **F45**
+   `proof-unparsable` — a `cmd:` ref with a shell variable, a substitution, an unclosed quote or a
+   path relative to a session's cwd, or a proof with no watch scheme; an escaped inner quote is the
+   command's own quote (`cmd:"python3 -c \"import x\""` runs `python3 -c "import x"`), and after
+   `git` a `refs/…` word is a ref, never a path — and **F46** `proof-script-run-branch-only` — a `cmd:`
+   proof whose script (the first absolute path after `bash`, `sh`, `python3`, `node`…) is not on its
+   repository's trunk, so the console's checkout exits 127 on it and the check reads `unrunnable`
+   (never a rejection) until the script lands. Both are advisories, on stderr, and both read the
+   proof through `scripts/cmd-ref.sh`, the bash twin of the console's one `cmd:` reader
+   (`viewer/shared/proof-words.js` `cmdOfRef`). `unrunnable` is a watch word of its own: Your turn shows
+   the item as **Cannot run** — "the proof itself cannot run — <script> does not exist on the
+   console's checkout; exit 127" — and never as *Redo*, because nothing the person did is wrong. A plan item's proof is read from its bullet again at
+   check time when the bullet changed after launch. An item the 7.0 door raised is matched to its bullet by the
    same `(E-N…)`, so it gains the row's steps with no ledger write and is never asked twice:
    ```markdown
    ## Operator errands
@@ -379,7 +395,11 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    **Spelling the model.** The `**Target model:**` value may be an alias (`opus`), a full id
    (`claude-opus-5`), or either carrying the `[1m]` window suffix (`opus[1m]`, `claude-opus-5[1m]`) — all
    parse the same. The suffix, not the alias, is what claims the ~200K budget (`references/sizing.md`;
-   the name vocabulary is `scripts/models.env`).
+   the name vocabulary is `scripts/models.env`). `phase-graph.sh <slug> --model [N]` prints the model
+   phase N runs — its `- **Model:**` bullet's first word, else the plan's target model; with no
+   argument, the plan's alone; nothing when neither names one, so the run's model answers. A session
+   pinned to a model is held to it on every assistant frame: a fallback to another model mid-session
+   parks the phase rather than letting it run on (#281).
    Example:
    > **Target model:** `claude-opus-5` (1M window) · **Budget:** ~200K weight/session (≈60% of the window) · **Branch:** current branch (no new branch).
    > **Skills (every session):** `design-system`, `some-plugin:test-first`
@@ -413,7 +433,8 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    auto-grant answer the three publishing asks — `git push`, `gh pr create`, `gh pr merge` — and the
    one door through a session's console guard: a press named `Bash(phase-console <verb>:*)`, or
    `Console(<press>)` for a route no CLI verb presses, e.g. `Console(edit-policy)`; it never hands
-   anyone a grant, an override or the owner keys) · `issues` (what a session may write OUTWARD to
+   anyone a grant, an override or the owner keys; how a push is read is spelled out below the key
+   list) · `issues` (what a session may write OUTWARD to
    the repository's issue tracker — `off`, `draft` or `file`, the `**Issues:**` line's word) · `credentials` (backticked ids + the credential policy) · `accounts` (accounts in
    order, minimum headroom each, `onLimit`) · `mcp` (the servers and the MCP policy) · `gates`
    (`Gate-check` on every gated heading; `delegated` or `operator`) · `verification.person-check`
@@ -447,10 +468,33 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    (For `resume.on-restart`, `relay` and `accounts` the RUN's own answer from the launch form outranks
    all of these.)
 
+   **How `permission.destructive` reads a push** (one-pool phase 2, #276 #275). The value is prose,
+   and the one mistake that matters is reading a refusal as a permission, so the grammar is narrow and
+   a clause it cannot read narrows a grant, never widens one:
+   - **A trunk** — `main`, `master`, `trunk`, or the run's base branch — is answered from the row
+     only by a clause about pushing that names it, backticked, with its phases right after it:
+     `` `main` by phase 34 ``, `` push `main` in phases 35 and 144 ``. A whole `Bash(git push:*)` rule,
+     a branch-scoped rule or a trunk written without phases never answers a trunk push: it goes to a
+     person's card.
+   - **A push rule may be scoped to a branch:** `` `Bash(git push:*)` of `pe/x` `` names `pe/x` the way
+     `` `git push` of `pe/x` `` does, and lets nothing else be pushed.
+   - **A negated phase list excludes.** `never`, `not`, `no`, `except`, `deny`, `refuse`, `forbid` or a
+     `!` before a phase list (`phases !3`, `!3–5`) refuses those phases: `` `gh pr create` in phases
+     4–33, except phases 30 and 31 `` grants 4–29, 32 and 33. A clause whose only phases are negated —
+     `` `gh pr create` except in phases 30 and 31 ``, `phases !3` — grants NOTHING, never "every phase
+     but those": write the phases it grants.
+   - **A bare `git push`** — no remote and branch, so the shell, not the row, decides where it goes —
+     is answered `deny`, naming the bare form to run alone. A force (`-f`, `--force*`, a `+` refspec),
+     a delete, `--all`/`--mirror`/`--tags`, `--no-verify` or another remote goes to a person's card
+     even under a whole `Bash(git push:*)` rule.
+
    **Answers that arrive later never edit this table.** They go to the mutable twin
    `docs/handoffs/<slug>/decisions.md`, written only by `scripts/decisions.sh <slug> [--phase N]
    answer <key> --value … | waive <key> --reason … | promote --from-ruling <id> --key <key> | list`
-   in exactly the shape the readers parse (the `qa-mode.sh` rule). `--decisions` merges the twin OVER
+   in exactly the shape the readers parse (the `qa-mode.sh` rule) — a value over 500 characters
+   (an evidence over 200, a `--by` over 64) is refused with exit 2 and the limit named, never cut;
+   split a long rule into `--phase N` rows. A person's Continue re-reads these rows into the run
+   (a resume no person pressed only journals what it held), `run.decisions-reread`. `--decisions` merges the twin OVER
    the plan's rows — a twin row replaces the plan's whole row for its key, and a row written with
    `--phase N` replaces both, for that phase — and prints one
    `key<TAB>state<TAB>owner<TAB>blocking<TAB>source<TAB>value` line per row that exists, in
@@ -485,6 +529,12 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    - The phase number lives in column 1; **markdown-bold cells (`| **6** |`) are tolerated**, but don't put
      a phase's number anywhere the parser could mistake it. After writing, run `scripts/phase-graph.sh
      <slug>` and confirm the parsed phase count matches the frontmatter `phases:` (it warns on mismatch).
+     Two lints gate the table's shape, F1-tier: **F20** a table whose columns cannot be located by
+     name (no header row, no `Depends on` or `Repos` column, a row shorter than the header), and
+     **F21** a cell the parser read but could not believe — a discarded `Depends on` token, a repeated
+     Phase row, a zero-padded number, a phase with two handoff files, and since one-pool phase 22
+     (#228) `phase-section-repeated`: a `### Phase N` heading that heads more than one section, whose
+     directives every reader takes from the first section alone — merge them into one.
    - **`Repos` is the SCOPE column, and it is machine-read.** It names the repos/paths the phase touches,
      and that is what decides whether two sessions may run at the same time — so write it for every phase,
      not as decoration. Accepts a comma/`+`/space list, `` `backticks` ``, **bold**, parenthetical asides
@@ -780,8 +830,9 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      `scripts/phase-outcome.sh <slug> <N> verified --command "<command>" --exit <status>` — the
      command, its exit status and the working tree it ran against. The console's own pass after the
      session skips a command proven green at an equivalent tree (the same tree, or one where only
-     `docs/handoffs/**`, `.locks/**` or `CHANGELOG.md` changed since), runs the rest, and journals a
-     disagreement between the two verdicts. Its verdict is a GATE: a command red on its final attempt
+     `docs/handoffs/**`, `.locks/**` or `CHANGELOG.md` changed since — and, for a `cd <sub> && …` line
+     into another repository, one where that repository's own tree is unchanged), runs the rest, and
+     journals a disagreement between the two verdicts. Its verdict is a GATE: a command red on its final attempt
      over a phase whose handoff reads `complete` re-opens the phase — its direct dependents wait, it
      gets one fix session, then an errand — rather than letting the handoff's word stand.
      **A timeout is not a red.** Each command runs under a clock (`- **Verify timeout:**` below). A

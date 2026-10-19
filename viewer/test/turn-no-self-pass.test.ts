@@ -8,9 +8,12 @@
  *         the PERSON sent (a note, a piece of evidence) is asked for, never a
  *         pass — the item's words are the raising session's.
  *   NS-2  over HTTP exactly ONE route writes one — `POST
- *         /api/human-steps/:id/override` — which the door table opens to the
- *         owner alone (a `local` press on a console with no key); a session's
- *         door and the supervisor's are refused at the router, a call that
+ *         /api/human-steps/:id/override`, the one caller of
+ *         `overrideHumanStep` — which the door table opens to the owner alone
+ *         (a `local` press on a console with no key); a session's door and
+ *         the supervisor's are refused at the router on it and on every other
+ *         route of its `override` class (a waived §Verification line, the
+ *         Queue's order and revert — none a verdict), a call that
  *         names no door is refused in-process (override and rewrite alike),
  *         and a verdict smuggled in a `check` body is ignored: `check` only
  *         ASKS.
@@ -32,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 
 import { JUDGED, call, harness, judged, parked, verdictText } from './turn-harness.ts';
 
-const { AUTHORITY_ROUTES, AUTHORITY_VERBS, doorMay, PRESS_DOORS } = await import('../shared/door-model.js');
+const { AGENT_DOORS, AUTHORITY_ROUTES, AUTHORITY_VERBS, doorMay, PRESS_DOORS } = await import('../shared/door-model.js');
 const { VERDICT_BY } = await import('../shared/turn-model.js');
 type WatchState = import('../server/watch-refs.ts').WatchState;
 type SpawnRequest = import('../server/runner/spawn.ts').SpawnRequest;
@@ -120,13 +123,42 @@ test('NS-1 — a checker\'s pass with nothing the person sent is asked for, neve
 });
 
 test('NS-2 — one route writes a verdict, the owner\'s: refused at a session\'s and the supervisor\'s doors', async () => {
-  const rows = AUTHORITY_ROUTES.filter((row) => row.authority === 'override');
-  assert.deepEqual(rows.map((row) => `${row.method} ${row.path}`), ['POST /api/human-steps/:id/override']);
+  // What writes a verdict is what a route CALLS, not the word it is fenced
+  // with: `overrideHumanStep` is reached from one place, the human-steps
+  // router's `override` verb, and that route is an `override` press.
+  const callers = serverSources().filter((f) => /\.overrideHumanStep\(/.test(f.text));
+  assert.deepEqual(callers.map((f) => f.rel), ['server/api/routes.ts'], 'one router reaches the override');
+  assert.equal((callers[0].text.match(/\.overrideHumanStep\(/g) ?? []).length, 1, 'from one call site');
+  assert.match(callers[0].text, /verb === 'override' \? await service\.overrideHumanStep\(/);
+  const writes = AUTHORITY_ROUTES.find((row) => row.path === '/api/human-steps/:id/override');
+  assert.deepEqual([writes?.method, writes?.authority], ['POST', 'override']);
+  // `override` is also the class of the owner's other words over the
+  // machine's — a §Verification line waived, the Queue's order and its revert
+  // (Pro) — none of which writes a verdict (NS-1: only the check and this
+  // route move one). The class is what fences them: never a manifest's, so
+  // every one of its routes is refused at a session's and the supervisor's
+  // doors before anything runs.
+  const fenced = AUTHORITY_ROUTES.filter((row) => row.authority === 'override');
+  assert.ok(fenced.includes(writes!), 'the verdict route is in the class');
+  for (const door of AGENT_DOORS) {
+    assert.equal(doorMay(door, 'override', { mode: 'unenrolled', manifest: true }), 'refuse', `${door} × override × manifest`);
+  }
   const h = harness();
   try {
     const { state, step } = parked(h, GH);
     const before = h.svc.humanStepsNow().get(step.id)!.state;
     const token = h.svc.approvals.arm(state.id);
+    const bag0 = h.svc as unknown as { doorOf?: (req: unknown) => unknown };
+    for (const row of fenced) {
+      const path = row.path.replace(':id', step.id).replace(':slug', state.slug);
+      const asSession = await call(h.svc, row.method, path, {}, { authorization: `Bearer ${token}` });
+      assert.deepEqual([asSession.status, asSession.body.door, asSession.body.authority], [403, 'session', 'override'], `${row.verb} by a session`);
+      const doorOf = bag0.doorOf;
+      bag0.doorOf = () => ({ door: 'supervisor', label: 'chat-1', proof: 'chat-bearer' });
+      const asSupervisor = await call(h.svc, row.method, path, {});
+      bag0.doorOf = doorOf;
+      assert.deepEqual([asSupervisor.status, asSupervisor.body.door, asSupervisor.body.authority], [403, 'supervisor', 'override'], `${row.verb} by the supervisor`);
+    }
     const bySession = await call(h.svc, 'POST', `/api/human-steps/${step.id}/override`, {}, { authorization: `Bearer ${token}` });
     assert.equal(bySession.status, 403);
     assert.equal(bySession.body.door, 'session');

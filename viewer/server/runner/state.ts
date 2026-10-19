@@ -493,6 +493,16 @@ export type VerifyRun = {
    */
   environment?: string;
   /**
+   * The files this red line names that were not there where it ran (one-pool
+   * phase 20, #357 #311) — `grep … docs/handoffs/<plan>/pr-body.md` in a
+   * mirror with no `docs/`, a `! grep` over a missing directory. A line that
+   * reached nothing checked nothing: such a red is never INHERITED from the
+   * base tree, whatever the baseline read.
+   */
+  unreached?: string[];
+  /** Where the line ran, when that was not the verification's cwd — the docs root for a docs-only line in a mirror (#357). */
+  ranIn?: string;
+  /**
    * Processes the command left in its process GROUP after its leader exited
    * (control-tower phase 106, #168) — named, then stopped through the signal
    * ladder. The row's code is still the leader's: a sweep that passed and left
@@ -569,6 +579,32 @@ export type RunVerifyApprovals = {
   by?: string;
   at?: string;
 };
+
+/** One operator's mid-run waiver of a §Verification line (one-pool phase 21, #267). */
+export type VerifyWaiver = {
+  phase: number;
+  /** `commandFingerprint` of the line — what the verifier matches. */
+  fp: string;
+  /** The line as the plan writes it, for the person reading the run later. */
+  text: string;
+  reason: string;
+  by: string;
+  at: string;
+  /** The ruling the waiver was recorded as on the plan's ledger. */
+  rulingId?: string;
+};
+
+/**
+ * Record a waiver on a run, once per (phase, line): a second waiver of the
+ * same line replaces the first's reason and stamp. Returns the stored entry.
+ */
+export function applyVerifyWaiver(state: RunState, waiver: VerifyWaiver): VerifyWaiver {
+  const list = (state.verifyWaivers ??= []);
+  const at = list.findIndex((entry) => entry.phase === waiver.phase && entry.fp === waiver.fp);
+  const entry = { ...waiver };
+  if (at >= 0) list[at] = entry; else list.push(entry);
+  return entry;
+}
 
 export type VerifySummary = {
   ok: boolean;
@@ -734,6 +770,24 @@ export type QueueControl = {
    * once. Spent when it boards; the scheduler holds it while it stands.
    */
   reserve?: QueueMark & { lane?: { slug: string; phase: number }; via?: 'yield' };
+  /**
+   * An operator's ORDER (one-pool phase 39, #380): this phase boards `first`,
+   * `last`, or before/after an anchor — another phase of any open plan. Phase
+   * 99's durable bump, extended across plans: it survives the entry's
+   * re-creation, a retry, a wrap-up, a relaunch and a restart; it is spent when
+   * the phase boards, and it LAPSES to policy (journal `queue.order-lapsed`)
+   * when its anchor settles or is withdrawn. Written only by the Queue's
+   * order press (Pro), after its check said the order can hold.
+   */
+  order?: QueueOrder;
+};
+
+/** Where an operator's order puts a phase (one-pool phase 39) — see `QueueControl.order`. */
+export type QueueOrder = QueueMark & {
+  anchor: { slug: string; phase: number } | 'first' | 'last';
+  side: 'before' | 'after';
+  /** Orders two orders against each other, most recent first — the scheduler's bump stamp. */
+  stamp: number;
 };
 
 export type WipRed = {
@@ -773,6 +827,12 @@ export type VerifyBaseline = {
      * session inherits (control-tower phase 106, #185).
      */
     environment?: string;
+    /**
+     * The files this red line names that were not there on the base tree
+     * (one-pool phase 20, #357): the line read nothing, so a red now is never
+     * inherited from it.
+     */
+    unreached?: string[];
     from: 'reused' | 'measured';
     /**
      * A measured red, run ONCE and never retried (control-tower phase 105,
@@ -1288,7 +1348,7 @@ export type PhaseRecord = {
    * phase is pinned to (control-tower phase 54, #91, `phase.model-mismatch`).
    * Read with the status: a phase that boards again keeps the fact, not the park.
    */
-  modelMismatch?: { requested: string; resolved: string; at: string };
+  modelMismatch?: { requested: string; resolved: string; at: string; frame?: { kind: 'assistant'; messageId?: string; model: string } };
   /**
    * The usage wall this park waits on, when it is one (control-tower phase 54,
    * #78): the wall's reset is "until at the latest", never the clock taken on
@@ -1578,6 +1638,15 @@ export type PhaseRecord = {
    * ref is a new wait, watched afresh.
    */
   watchLandedDone?: string[];
+  /**
+   * When a person's Resume last RESET this wait's watch (one-pool phase 23,
+   * #245): every row was made due at that instant, and a `cmd:` ref's
+   * post-window back-off counts from it (`cmdStepMs`) — a ref whose window
+   * passed while the run was paused is asked at once and then on the first
+   * step, not on the hour the pause had reached. Cleared with the rest of the
+   * watch bookkeeping: a new declaration is watched afresh anyway.
+   */
+  watchResetAt?: string;
   /**
    * The watch refs whose landings have already been journalled
    * `phase.watch-landed` — a SET, one entry per ref (RCV-8).
@@ -1993,12 +2062,15 @@ export type PhaseRecord = {
   /**
    * A wrap-up KEEPS its lane (control-tower phase 109, #192): the session
    * handed off `partial` at the console's notice with its own WIP uncommitted
-   * in a tree its siblings share (`paths` files). Until it boards again it
+   * in a tree its siblings share (`paths` files). Since one-pool phase 21
+   * (#354 #295) any `partial` does, and so does a `waiting-external` on the
+   * session's own detached job (`watch`, its `cmd:` probe; reason
+   * `detached-verify` when no path is uncommitted). Until it boards again it
    * ranks right after a person's re-board (`boardingOrder`), and its scope is
    * held against every sibling whose scope meets it — in the very pass its lane
    * was released in, too. Written by `resumeAfterWrapup`, spent at boarding.
    */
-  keepsLane?: { at: string; reason: string; sessionId: string | null; paths: number };
+  keepsLane?: { at: string; reason: string; sessionId: string | null; paths: number; watch?: string };
   /**
    * The background agents this phase's last session ended with still running,
    * stopped by the CLI's ceiling mid-work (control-tower phase 109, #188):
@@ -2118,6 +2190,14 @@ export type RunArtefact = {
   /** The phase whose session it appeared under. */
   phase: number;
   at: string;
+  /**
+   * `unknown`: a tree that APPEARED while the phase ran, outside its own lane
+   * tree — a shared git directory has more writers than one phase's process
+   * tree, so it is named, never credited (one-pool phase 20, #262). Absent:
+   * made by the phase (a tree inside its own lane, or a branch no plan's lane
+   * machinery names).
+   */
+  maker?: 'unknown';
 };
 
 export type RungRecord = {
@@ -2367,6 +2447,15 @@ export type Errand = {
   need: string;
   how: string;
   at: string;
+  /**
+   * The act in the composer's words, when the writer composed one (#377): the
+   * landing errand's "Land demo on main: 2 repositories differ from
+   * origin/main" (`turn/compose.ts` `composeLanding`). Absent, a row derives
+   * its title from the need.
+   */
+  title?: string;
+  /** The landing errand's files, grouped by repository — the card's folded *Details* (#377). */
+  files?: { repo: string; paths: string[] }[];
   /**
    * `how` ends, wherever it is SHOWN, with the clause over the phase's live
    * watch state (`watch-refs.ts` `liveErrandHow`) — never frozen into `how`
@@ -3197,6 +3286,16 @@ export type RunState = {
    * set aside. See `RunVerifyApprovals`. Absent on runs started before it.
    */
   verifyApprovals?: RunVerifyApprovals;
+  /**
+   * An operator's waivers of ONE §Verification line for one phase, given
+   * mid-run (one-pool phase 21, #267) — the start door's `waive` answers only
+   * fragments the console would not run, and only before the run starts, so a
+   * line that went red after the baseline for a reason outside the phase had
+   * no door at all. `verifyApprovalsFor` merges these with the start door's;
+   * the line is then set aside, listed under the verdict's `waived` with who
+   * waived it and why. Written by `applyVerifyWaiver`, never removed.
+   */
+  verifyWaivers?: VerifyWaiver[];
   /**
    * The plan git lines this run runs over, answered `override` at launch — by
    * a person, or `automatic` from a door no person pressed (control-tower
@@ -4428,6 +4527,7 @@ export function clearWatchBookkeeping(record: PhaseRecord): void {
   // The healer's rejection count bounds THIS landing's deliveries; a new wait
   // is a new landing. `watchRetired` is deliberately NOT here — see the field.
   delete record.watchRejections;
+  delete record.watchResetAt;
 }
 
 /**
@@ -5284,7 +5384,11 @@ export function settleWaitingRecords(
     } else {
       record.status = 'pending';
       record.note = `parked until ${clock}; the clock passed with nothing to fire it — `
-        + `the declaration stands, and a Retry or a relaunch resumes the session`;
+        // The act that moves it, named (one-pool phase 23, #245): a relaunch
+        // of the run never boards a phase the board reads in progress, so it
+        // is not offered; the watch and the phase's own Resume are.
+        + `the declaration stands: its refs are still watched and a landing resumes the session, `
+        + `or Resume the phase to board its own session now`;
       settlement = {
         phase: record.phase, to: 'pending',
         why: state.stoppedBy === 'operator' ? 'operator-stopped' : 'clock-unarmed',

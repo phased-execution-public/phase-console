@@ -157,14 +157,12 @@ describe('the glance — which plan, and how far along', () => {
     expect(back.className).not.toMatch(/(^|\s)(\w+:)?hidden(\s|$)/);
   });
 
-  it('draws the plan as the list draws it — labelled stations, the ready phase named', () => {
+  it('draws the plan as the list draws it — a proportional track with its counts in words (#360)', () => {
     mount(detail());
-    const line = screen.getByRole('list', { name: /demo plan: 1 of 3 phases done/ });
     expect(
-      within(line)
-        .getAllByRole('listitem')
-        .map((li) => li.textContent),
-    ).toEqual(['1 done', 'P2 next up', '1 left']);
+      screen.getByRole('img', { name: 'demo plan, 3 phases: 1 done, 1 next up, 1 waiting, 33 %' }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('plan-legend')).toHaveTextContent('1 done · 1 next up · 1 waiting · 33 %');
   });
 
   it('says what is left in sessions, with the estimate and what it has cost', () => {

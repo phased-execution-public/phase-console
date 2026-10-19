@@ -334,3 +334,5 @@ test('the Tower, halts, quick start and a person\'s turn each have a section of 
   const own = ['quick-start', 'tower', 'halts', 'your-turn'];
   for (const id of own) assert.ok(GUIDE_SECTIONS.includes(id), `GUIDE_SECTIONS has no '${id}'`);
 });
+
+

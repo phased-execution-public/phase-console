@@ -185,6 +185,19 @@ resumed) or `needs-info`. Only a probe, the checker of that item and the owner's
 verdict: no session, yours included, can mark an item passed. Three rejections end with the person's
 choice — a rewritten guide, *I can't*, or *Accept anyway* (recorded as unverified).
 
+Three more readings of a check (one-pool phase 13). **A decision with options is answered by *Send my
+decision*** (#368, #367): the answer is sent, then checked against the item's proof, whatever its type —
+the card has no separate check button. **An item whose proof reads a gate's row closes when that gate
+opens** (#371): its last step says "Approve the gate on Phase N — the item closes when the gate opens",
+and only the gate's Approve opens it, never an answer or a note. **A proof that cannot run is not a
+rejection** (#374): a `cmd:` ref whose script is missing from the console's checkout, or not executable,
+exits 126 or 127 and reads `unrunnable` — the card says **Cannot run**, "the proof itself cannot run —
+<script> does not exist on the console's checkout; exit 127" — and it is polled again, because the
+script may land; the person is not sent to redo anything. A script that lives only on the run branch is
+the usual cause, which the lint names at plan time (**F46** `proof-script-run-branch-only`), beside a
+proof the check reader would refuse every time (**F45** `proof-unparsable`). Both read the ref the way
+the check does: `viewer/shared/proof-words.js` `cmdOfRef`, and its bash twin `scripts/cmd-ref.sh`.
+
 ## The guard
 
 Seven rules, run at the declaration's pre-check and again when the console takes it in:

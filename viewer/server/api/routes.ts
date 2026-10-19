@@ -40,7 +40,8 @@ import { Readable } from 'node:stream';
 import { bodyCarriesSecret } from '../human-steps.ts';
 import { RUN_SWITCH_WORDS } from '../../shared/verb-model.js';
 import { liveVerifying, slimRun } from '../runs-projection.ts';
-import { agentEnabled, checkRoot, gitDoorRefusal, listDirs } from '../config.ts';
+import { agentEnabled, checkRoot, distRev, gitDoorRefusal, listDirs } from '../config.ts';
+import { BUILD_REV_HEADER, outdatedPress } from './build-check.ts';
 import { fromAutomation } from '../../shared/automation-model.js';
 import { buildAgentLaunch, type ResumeTarget } from '../agent.ts';
 import { parseRecoveryRequest, type RecoveryFacts } from '../recovery.ts';
@@ -278,6 +279,7 @@ function guardWrite(req: IncomingMessage, service: Service): string | null {
  * is a separate flag and a separate guard rather than a wider reading of one.
  */
 
+
 function guardRun(req: IncomingMessage, service: Service): string | null {
   return guardMutation(req, service.flags.allowRun
     ? null
@@ -466,6 +468,16 @@ function accountChoice(value: unknown, service: Service): string | undefined {
  * than either. What a PLAN names is a different matter and is checked at
  * boarding, where the operator can be told which server is missing.
  */
+/**
+ * Whether the person pressing is at this machine — a loopback Host, no login a
+ * proxy or the fleet vouched for, no paired device. What decides whether an
+ * MCP sign-in may open a browser here (#372).
+ */
+function atThisMachine(req: IncomingMessage, service: Service): boolean {
+  const actor = actorOfRequest(req, service.flags);
+  return actor.origin === 'local' && !actor.remoteUser && actor.pressDoor !== 'device';
+}
+
 function mcpList(value: unknown, service: Service): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const ids = value
@@ -695,6 +707,7 @@ function phaseOptions(value: unknown, service: Service): Record<string, PhaseOpt
   }
   return out;
 }
+
 
 /**
  * ONE phase's choices, coerced.
@@ -1161,6 +1174,20 @@ async function routeApi(
   // neither forget the check nor answer first.
   // (A harness that stands the router up with no Service behind it gets the
   // transport's reading alone: no token is anybody's there.)
+  // A write from a page an earlier release served (#373): refused before the
+  // door and before any route, so nothing it asks for is done. Only a page
+  // sends the header; `distRev` is the build this console serves (a fake
+  // service in a test may name its own).
+  const outdated = path.startsWith('/api/')
+    ? outdatedPress(req.method, req.headers[BUILD_REV_HEADER],
+      (service as { servedRev?: () => string | null }).servedRev?.() ?? distRev())
+    : null;
+  if (outdated) {
+    log.info('press.outdated', { path, page: outdated.build.page.slice(0, 12), console: outdated.build.console.slice(0, 12) });
+    json(res, 409, outdated);
+    return true;
+  }
+
   const reading = stampDoor(req, typeof service.doorOf === 'function' ? service.doorOf(req) : transportDoor(req, service.flags ?? {}));
   const pressed = req.method && req.method !== 'GET' && req.method !== 'HEAD' ? authorityRouteOf(req.method, path) : null;
   if (pressed && await doorCheck(service, req, res, reading, pressed, path)) return true;
@@ -1954,6 +1981,19 @@ async function routeApi(
         return true;
       }
 
+      // Put back (#334): the named records become unread again. Only ids —
+      // no scope, and no "all": an empty or missing list changes nothing.
+      if (req.method === 'POST' && rest[0] === 'unread') {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const body = await readBody(req);
+        const ids = Array.isArray(body.ids)
+          ? body.ids.filter((v): v is string => typeof v === 'string').slice(0, 1_000)
+          : [];
+        json(res, 200, service.markNotificationsUnread(ids));
+        return true;
+      }
+
       if (req.method === 'DELETE') {
         const refusal = guardCsrf(req);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
@@ -2339,7 +2379,7 @@ async function routeApi(
           }
           return true;
         }
-        if (req.method === 'POST' && rest[1] === 'login') {
+        if (req.method === 'POST' && rest[1] === 'login' && rest.length === 2) {
           const refusal = guardMcp(req, service);
           if (refusal) { json(res, 403, { error: refusal }); return true; }
           // `accountId` is optional and names the PROFILE whose config dir the
@@ -2349,10 +2389,33 @@ async function routeApi(
           // reads, so the default keeps sign-in and status agreeing.
           const body = await readBody(req);
           try {
-            json(res, 200, await service.beginMcpLogin(
-              id,
-              typeof body.accountId === 'string' && body.accountId ? { accountId: body.accountId } : {},
-            ));
+            json(res, 200, await service.beginMcpLogin(id, {
+              ...(typeof body.accountId === 'string' && body.accountId ? { accountId: body.accountId } : {}),
+              // `--no-browser` only for a person who is not at this machine
+              // (#372): a browser the CLI opened would open here, unseen.
+              remote: !atThisMachine(req, service),
+            }));
+          } catch (error) {
+            json(res, 400, { error: (error as Error).message });
+          }
+          return true;
+        }
+        // The guided flow as it stands (#372) — the sheet's steps, the sign-in
+        // page's address once the CLI printed it, the deadline, the ending.
+        if (req.method === 'GET' && rest[1] === 'login' && rest.length === 2) {
+          const flow = service.mcpLoginFlow(id);
+          if (!flow) { json(res, 404, { error: `no sign-in for ${id} has been started on this console` }); return true; }
+          json(res, 200, { flow });
+          return true;
+        }
+        // The paste-back: the address the browser landed on, typed into the
+        // CLI waiting for it. Never logged.
+        if (req.method === 'POST' && rest[1] === 'login' && rest[2] === 'paste') {
+          const refusal = guardMcp(req, service);
+          if (refusal) { json(res, 403, { error: refusal }); return true; }
+          const body = await readBody(req);
+          try {
+            json(res, 200, { flow: service.pasteMcpLogin(id, typeof body.url === 'string' ? body.url : '') });
           } catch (error) {
             json(res, 400, { error: (error as Error).message });
           }
@@ -2368,6 +2431,7 @@ async function routeApi(
       json(res, 405, { error: 'method not allowed' });
       return true;
     }
+
 
     /* ---------------- Claude accounts ----------------
      * Also above the source-directory guard, for the same reason as tailscale:
@@ -3601,6 +3665,14 @@ async function routeApi(
       if (refusal) { json(res, 403, { error: refusal }); return true; }
       const body = await readBody(req);
       const phase = Number(body.phase);
+      const target = {
+        ...(typeof body.entryId === 'string' && body.entryId ? { entryId: body.entryId } : {}),
+        ...(typeof body.slug === 'string' && body.slug ? { slug: body.slug } : {}),
+        ...(body.phase !== undefined && Number.isSafeInteger(phase) ? { phase } : {}),
+      };
+      // Every verb answers the verdict it would have had, and a `no` refuses
+      // it (one-pool phase 39, #380): the check runs first. Free has no check.
+      let verdict: unknown = null;
       const out = service.queueControl(rest[0] ?? '', {
         ...(typeof body.entryId === 'string' && body.entryId ? { entryId: body.entryId } : {}),
         ...(typeof body.slug === 'string' && body.slug ? { slug: body.slug } : {}),
@@ -3611,7 +3683,10 @@ async function routeApi(
         ...(Array.isArray(body.phases) ? { phases: body.phases.map(Number) } : {}),
       });
       if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
-      json(res, 200, { ...service.queueSnapshot(), change: { verb: rest[0], slug: out.slug, phase: out.phase, changed: out.changed } });
+      json(res, 200, {
+        ...service.queueSnapshot(), change: { verb: rest[0], slug: out.slug, phase: out.phase, changed: out.changed },
+        ...(verdict ? { verdict } : {}),
+      });
       return true;
     }
 
@@ -3674,9 +3749,14 @@ async function routeApi(
         json(res, 200, { ...service.queueSnapshot(), yield: out });
         return true;
       }
+      // The lane marks answer their verdict too, and a `no` refuses (one-pool phase 39).
+      let verdict: unknown = null;
       const out = service.queueControl(verb, target, actor);
       if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
-      json(res, 200, { ...service.queueSnapshot(), change: { verb, slug: out.slug, phase: out.phase, changed: out.changed } });
+      json(res, 200, {
+        ...service.queueSnapshot(), change: { verb, slug: out.slug, phase: out.phase, changed: out.changed },
+        ...(verdict ? { verdict } : {}),
+      });
       return true;
     }
 
@@ -4871,6 +4951,24 @@ async function routeApi(
           case 'isolate-phase': {
             const answer = await service.isolatePhase(slug, Number(body.phase), actorOfRequest(req, service.flags, body).by);
             if (answer.ok) json(res, 200, { run: answer.run });
+            else json(res, answer.status, { error: answer.error });
+            return true;
+          }
+          // An operator's waiver of ONE §Verification line for one phase,
+          // mid-run (one-pool phase 21, #267): a ruling on the plan's ledger
+          // and an entry on the run, which the next verification honours.
+          case 'verify-waive': {
+            const phase = Number(body.phase);
+            if (!Number.isInteger(phase) || phase < 1 || typeof body.line !== 'string' || !body.line.trim()) {
+              json(res, 400, { error: 'verify-waive needs {phase, line, reason}.' });
+              return true;
+            }
+            const answer = await service.waiveVerifyLine(
+              slug, phase, body.line.slice(0, 8_000), typeof body.reason === 'string' ? body.reason : '',
+              pressActor(actorOfRequest(req, service.flags, body)),
+              typeof body.expectRunId === 'string' ? body.expectRunId : undefined,
+            );
+            if (answer.ok) json(res, 200, { waiver: answer.waiver, run: answer.run });
             else json(res, answer.status, { error: answer.error });
             return true;
           }

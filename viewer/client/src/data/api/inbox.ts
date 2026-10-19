@@ -169,6 +169,10 @@ export type InboxItem = {
   options?: TurnOption[];
   /** A yes or a no's block: what, who asked, if approved, if denied (turn-by-turn phase 4). */
   approval?: ApprovalBlock;
+  /** The row's whole words when its title was cut to the title rule — at most 80 characters (#377). */
+  headline?: string;
+  /** The landing errand's files, grouped by repository — the card's folded *Details* (#377). */
+  files?: { repo: string; paths: string[] }[];
 };
 
 /** One way on, bound to its verb — `server/turn/compose.ts` `TurnOption`. */
@@ -217,6 +221,20 @@ export type BulkAckResult = {
 };
 
 /** The inbox fetchers — merged into `api` by `./index`. */
+/**
+ * The body a remedy is sent with: its own, with the operator's words merged in
+ * the key the SERVER named. Merged only when there are some: an empty box must
+ * send the same request as no box, or every action grows a `note: ""` nobody
+ * wrote. One reading, for the press and for the press sent as the page goes
+ * away (`sendOnLeave`).
+ */
+export function actionBody(action: Pick<InboxAction, 'body' | 'says'>, says?: string): unknown {
+  const said = says?.trim();
+  return action.says && said
+    ? { ...(action.body as Record<string, unknown> | undefined), [action.says.field]: said }
+    : action.body;
+}
+
 export const inboxApi = {
   /** `all` includes acknowledged items; by default only what is still open. */
   inbox: (all?: boolean) => request<InboxView>('/api/inbox' + (all ? '?all=1' : '')),
@@ -252,14 +270,7 @@ export const inboxApi = {
    * request any of these endpoints accepts.
    */
   inboxAct: (action: InboxAction, says?: string) => {
-    // The operator's own words, in the key the SERVER named. Merged only when
-    // there are some: an empty box must send the same request as no box, or
-    // every action grows a `note: ""` nobody wrote.
-    const said = says?.trim();
-    const body =
-      action.says && said
-        ? { ...(action.body as Record<string, unknown> | undefined), [action.says.field]: said }
-        : action.body;
+    const body = actionBody(action, says);
     return request<unknown>(action.endpoint, {
       method: action.method,
       ...(body === undefined || action.method === 'GET'

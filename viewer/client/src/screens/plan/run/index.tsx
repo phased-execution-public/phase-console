@@ -45,7 +45,7 @@ import { looksLikeAuthFailure } from '@/lib/failures';
 import { scrollIntoScroller } from '@/lib/scroll';
 import { Button, Spinner, type Everything } from '@/ui';
 import { useRoute } from '@/shell/router';
-import { runPaneOf, runViewHref } from '@/shell/routes';
+import { navigate, runPaneOf, runViewHref, withQuery } from '@/shell/routes';
 import { SectionNav } from '@/shell/section-nav';
 import { PhaseTable } from '@/screens/plan/phases/table';
 import { ACCOUNT_RECOVERY_PARTS } from '@/screens/settings/account-row';
@@ -191,6 +191,15 @@ function LiveRun({
   const laneAsked = /^p(\d{1,4})$/.exec(route.query.lane ?? '')?.[1];
   const paneAsked = runPaneOf(route) != null;
   const journalLinked = route.query[JOURNAL_PARAM] != null;
+  // The run timeline's window (#376): `?zoom=` opens its fold and names what it shows.
+  const zoomAsked = route.query.zoom != null;
+  const onZoom = useCallback(
+    (zoom: string | null) => {
+      const { zoom: _drop, ...rest } = route.query;
+      navigate(withQuery(route, zoom ? { ...rest, zoom } : rest), { replace: true });
+    },
+    [route],
+  );
 
   const recheck = useCallback(() => {
     if (run?.accountId) {
@@ -371,10 +380,18 @@ function LiveRun({
         </RunFold>
 
         {run && (
-          <RunFold id="time" count={records.length} everything={everything}>
+          <RunFold id="time" count={records.length} everything={everything} forceOpen={zoomAsked}>
             <Suspense fallback={<Spinner label="Drawing the time" />}>
               <div className="flex min-w-0 flex-col gap-6">
-                {timeline ? <RunGantt timeline={timeline} run={run} onCompare={setComparePhase} /> : null}
+                {timeline ? (
+                  <RunGantt
+                    timeline={timeline}
+                    run={run}
+                    onCompare={setComparePhase}
+                    zoom={route.query.zoom}
+                    onZoom={onZoom}
+                  />
+                ) : null}
                 <RunClockSplit phases={records} />
               </div>
             </Suspense>

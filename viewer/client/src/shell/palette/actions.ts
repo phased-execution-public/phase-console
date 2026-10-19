@@ -6,7 +6,6 @@ import {
   FolderOpen,
   GitBranch,
   GitPullRequestArrow,
-  Hand,
   LifeBuoy,
   Moon,
   Plus,
@@ -37,7 +36,6 @@ import {
   sessionsNewHref,
   settingsHref,
   sourceHref,
-  turnHref,
   type Route,
 } from '../routes';
 import {
@@ -117,7 +115,7 @@ export const GROUPS = {
   do: 'Do',
 } as const;
 
-/** Every place: the seven, the heads a person reaches for by name, and Help. */
+/** Every place: the eight, the heads a person reaches for by name, and Help. */
 export function navigationActions(context: CommandContext): CommandAction[] {
   const { state } = context;
   const items = visibleNav(state).map<CommandAction>((item) => ({
@@ -126,18 +124,14 @@ export function navigationActions(context: CommandContext): CommandAction[] {
     label: item.label,
     hint: item.note,
     icon: item.icon,
-    keywords: item.note,
+    // Your turn is a place since one-pool phase 14; the words a person
+    // reaches for it by stay on its row.
+    keywords:
+      item.id === 'turn'
+        ? `${item.note} needs me needs you approve answer person human step task todo guide check`
+        : item.note,
     run: (ctx) => ctx.go(item.id),
   }));
-  items.push({
-    id: 'go:turn',
-    group: GROUPS.go,
-    label: 'Your turn',
-    icon: Hand,
-    hint: 'Everything only you can do, each with its guide',
-    keywords: 'needs me needs you approve answer person human step task todo guide check',
-    run: (ctx) => ctx.go(turnHref()),
-  });
   items.push({
     id: 'go:help',
     group: GROUPS.go,
@@ -404,6 +398,7 @@ export function verbActions(context: CommandContext): CommandAction[] {
       run: (ctx) => ctx.setDensity('comfortable'),
     },
   );
+
 
   // Freeze all stops every session on the machine mid-token: the palette
   // NAVIGATES to where the button and its confirm live, and fires nothing.

@@ -11,8 +11,8 @@
  *  - a settled thing is hollow and quiet unless it ended badly;
  *  - the icon map is total against the model's `STATUS_ICON_NAMES`.
  */
-import { render } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   ATTENTION_LEVELS,
   FACT_KINDS,
@@ -66,6 +66,12 @@ function expectDot(el: HTMLElement) {
   expect(dot, 'a dot is always drawn').not.toBeNull();
   expect(dot!.getAttribute('aria-hidden')).toBe('true');
 }
+
+// The tooltip opens on a keyboard reader's focus; a pointer press before it
+// (the tap tests) would otherwise carry into the next test.
+beforeEach(() => {
+  fireEvent.keyDown(window, { key: 'Tab' });
+});
 
 describe('the icon map', () => {
   it('resolves every icon name the model can hand the family', () => {
@@ -270,6 +276,62 @@ describe('a settled thing is hollow and quiet, unless it ended badly', () => {
   });
 });
 
+describe('the badge chrome — an outlined pill with the icon and the word in the hue (#361)', () => {
+  it('a plan and a phase draw as a badge: icon, word, hue on the border and the word, never a fill', () => {
+    for (const el of [
+      mark(render(<PlanStatus status="active" chrome="badge" />).container),
+      mark(render(<PhaseStatus board="stuck" chrome="badge" />).container),
+    ]) {
+      expectComplete(el);
+      expect(el.getAttribute('data-chrome')).toBe('badge');
+      expect(el.className).toContain('rounded-full');
+      expect(el.className).toContain('border-state/60');
+      expect(el.className).toContain('text-state');
+      expect(el.className).not.toMatch(/\bbg-/);
+      expect(el.querySelector('svg[data-icon]'), 'the status icon').not.toBeNull();
+      expect(el.querySelector('[data-dot]'), 'no dot inside a badge').toBeNull();
+      expect(el.textContent).not.toBe('');
+    }
+  });
+  it('a settled Done or Complete keeps its hue, muted — never grey text', () => {
+    for (const el of [
+      mark(render(<PlanStatus status="complete" chrome="badge" />).container),
+      mark(render(<PhaseStatus board="done" chrome="badge" />).container),
+    ]) {
+      expect(el.getAttribute('data-tense')).toBe('settled');
+      expect(el.hasAttribute('data-quiet')).toBe(true);
+      expect(el.className).toContain('text-state');
+      expect(el.className).toContain('border-state/30');
+      expect(el.className).not.toContain('text-ink-muted');
+      expect(el.getAttribute('data-paint')).toBe('done');
+    }
+  });
+  it('a bad ending keeps its red at full weight; Unknown is dashed and inked', () => {
+    const failed = mark(render(<PhaseStatus record={{ status: 'failed' }} chrome="badge" />).container);
+    expect(failed.getAttribute('data-paint')).toBe('failed');
+    expect(failed.className).toContain('border-state/60');
+    const unknown = mark(render(<PlanStatus status={'🤷' as WordOf<'plan'>} chrome="badge" />).container);
+    expect(unknown.getAttribute('data-known')).toBe('false');
+    expect(unknown.className).toContain('border-dashed');
+    expect(unknown.className).not.toContain('text-state');
+  });
+  it('the default chrome is still the dot and the word', () => {
+    const el = mark(render(<PlanStatus status="active" />).container);
+    expect(el.hasAttribute('data-chrome')).toBe(false);
+    expect(el.querySelector('[data-dot]')).not.toBeNull();
+  });
+  it('has no axe violations as badges', async () => {
+    const { container } = render(
+      <div>
+        <PlanStatus status="complete" chrome="badge" />
+        <PhaseStatus board="ready" chrome="badge" />
+        <RunStatus run={{ id: 'r', slug: 's', status: 'running' }} chrome="badge" />
+      </div>,
+    );
+    await expectNoAxeViolations(container);
+  });
+});
+
 describe('a word outside every vocabulary is the first-class Unknown', () => {
   const cases: [string, () => ReturnType<typeof render>][] = [
     ['a plan status that is a sentence', () => render(<PlanStatus status={'✅ GO' as WordOf<'plan'>} />)],
@@ -297,7 +359,13 @@ describe('a word outside every vocabulary is the first-class Unknown', () => {
       expect(el.getAttribute('data-paint')).not.toBe('needs-you');
       expect(el.getAttribute('data-attention')).toBe('none');
       expect(el.querySelector('[data-dot]')!.className).toContain('border-dashed');
-      expect(el.getAttribute('title')).toMatch(/not a word this console knows|No status was given/);
+      // No native title: the tooltip says it, on focus as on hover.
+      expect(el.getAttribute('title')).toBeNull();
+      fireEvent.focus(el);
+      expect(screen.getByRole('tooltip').textContent).toMatch(
+        /not a word this console knows|No status was given/,
+      );
+      fireEvent.blur(el);
     });
   }
 });
@@ -351,5 +419,140 @@ describe('the family is accessible', () => {
       </div>,
     );
     await expectNoAxeViolations(container);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * What a word means, one hover, focus or tap away (one-pool phase 14, #365)
+ * ------------------------------------------------------------------ */
+
+describe('a status says what it means and what comes next', () => {
+  const parked = WORD_ROWS.phase.parked;
+
+  it('every row of every vocabulary hands the tooltip a meaning and a next', () => {
+    for (const vocab of STATUS_VOCABS) {
+      for (const [word, row] of Object.entries(WORD_ROWS[vocab])) {
+        expect(row.meaning, `${vocab}:${word}`).toBeTruthy();
+        expect(row.next, `${vocab}:${word}`).toBeTruthy();
+      }
+    }
+  });
+
+  it('a focus that follows a pointer press opens nothing — a sheet moving focus to its first stop', () => {
+    const { container } = render(<PhaseStatus record={{ status: 'parked' }} />);
+    const el = mark(container);
+    fireEvent.pointerDown(window);
+    fireEvent.focus(el);
+    expect(screen.queryByRole('tooltip')).toBeNull();
+    fireEvent.blur(el);
+  });
+
+  it('on keyboard focus: the word, what it means, what comes next and a way to the reference', () => {
+    const { container } = render(<PhaseStatus record={{ status: 'parked' }} />);
+    const el = mark(container);
+    expect(el.getAttribute('title'), 'no native title: a phone and a keyboard never show one').toBeNull();
+    expect(el.tabIndex, 'standing alone, a status is a tab stop').toBe(0);
+    expect(screen.queryByRole('tooltip'), 'nothing is built while closed').toBeNull();
+
+    // A keyboard reader's focus follows a key: a focus no key led to — a page
+    // placing focus as it arrives — opens nothing (#394).
+    fireEvent.keyDown(window, { key: 'Tab' });
+    fireEvent.focus(el);
+    const tip = screen.getByRole('tooltip');
+    expect(tip.textContent).toContain('Parked');
+    expect(tip.textContent).toContain(parked.meaning);
+    expect(tip.textContent).toContain(parked.next);
+    const more = within(tip).getByRole('link', { name: 'More in Help' });
+    expect(more.getAttribute('href')).toMatch(/help=reference/);
+    expect(more.getAttribute('href')).toMatch(/card=phase-record/);
+
+    // …and the same words are the mark's accessible description.
+    expect(el.getAttribute('aria-describedby')).toBe(tip.id);
+    expect(el).toHaveAccessibleDescription(expect.stringContaining(parked.meaning));
+    expect(el).toHaveAccessibleDescription(expect.stringContaining(parked.next));
+
+    fireEvent.blur(el);
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('on hover', async () => {
+    const { container } = render(<RunStatus run={{ status: 'halted' }} />);
+    const el = mark(container);
+    fireEvent.pointerMove(el, { pointerType: 'mouse' });
+    const tip = await screen.findByRole('tooltip');
+    expect(tip.textContent).toContain(WORD_ROWS.run.halted.meaning);
+    expect(tip.textContent).toContain(WORD_ROWS.run.halted.next);
+    fireEvent.pointerLeave(el, { pointerType: 'mouse' });
+  });
+
+  it('on a tap, which a second tap closes', async () => {
+    const { container } = render(<PlanStatus status="active" />);
+    const el = mark(container);
+    fireEvent.pointerDown(el, { pointerType: 'touch' });
+    fireEvent.click(el);
+    expect(screen.getByRole('tooltip').textContent).toContain(WORD_ROWS.plan.active.meaning);
+    fireEvent.pointerDown(el, { pointerType: 'touch' });
+    fireEvent.click(el);
+    await waitFor(() => expect(screen.queryByRole('tooltip')).toBeNull());
+  });
+
+  it('a word that means two things says the one it means here', () => {
+    // "Live" is a session that is open and a grant that is in force.
+    const said = (el: HTMLElement) => {
+      fireEvent.focus(el);
+      const text = screen.getByRole('tooltip').textContent;
+      fireEvent.blur(el);
+      return text;
+    };
+    const session = said(mark(render(<OpsStatus vocab="presence" word="live" />).container));
+    const grant = said(mark(render(<OpsStatus vocab="grant" word="live" />).container));
+    expect(WORD_ROWS.presence.live.label).toBe(WORD_ROWS.grant.live.label);
+    expect(session).toContain(WORD_ROWS.presence.live.meaning);
+    expect(grant).toContain(WORD_ROWS.grant.live.meaning);
+    expect(session).not.toBe(grant);
+  });
+
+  it("a caller's own sentence joins the tooltip instead of a native title", () => {
+    const { container } = render(
+      <OpsStatus vocab="verification" word="red" title="Its own red, charged by its newest verdict" />,
+    );
+    const el = mark(container);
+    expect(el.getAttribute('title')).toBeNull();
+    fireEvent.focus(el);
+    const tip = screen.getByRole('tooltip');
+    expect(tip.textContent).toContain('Its own red, charged by its newest verdict');
+    expect(tip.textContent).toContain(WORD_ROWS.verification.red.meaning);
+  });
+
+  it('inside a link or a button it is no second tab stop, and a tap stays the control’s', () => {
+    const { container } = render(
+      <a href="#/runs">
+        <RunStatus run={{ status: 'running' }} />
+      </a>,
+    );
+    const el = mark(container);
+    expect(el.hasAttribute('tabindex')).toBe(false);
+    fireEvent.pointerDown(el, { pointerType: 'touch' });
+    fireEvent.click(el);
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('a summons says it needs you', () => {
+    const el = mark(
+      render(<RunStatus run={{ id: 'r', slug: 's', status: 'waiting', waitReason: 'person' }} />).container,
+    );
+    fireEvent.focus(el);
+    expect(screen.getByRole('tooltip').textContent).toMatch(/this needs you/);
+    fireEvent.blur(el);
+  });
+
+  it('stays accessible while open', async () => {
+    const { container } = render(
+      <div>
+        <PhaseStatus record={{ status: 'parked' }} />
+      </div>,
+    );
+    fireEvent.focus(mark(container));
+    await expectNoAxeViolations(document.body);
   });
 });

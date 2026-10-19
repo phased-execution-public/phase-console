@@ -234,6 +234,33 @@ export async function groupMembers(pgid: number): Promise<{ pid: number; comm?: 
   return members;
 }
 
+/** One row of the machine's process table (one-pool phase 26, #222). */
+export type ProcessRow = { pid: number; ppid: number; pgid: number; startedMs: number | null; command: string };
+
+/**
+ * Every process on the machine — pid, parent, group, when it started and its
+ * whole command line — in ONE `ps`, for the session reaper
+ * (`runner/reap.ts`), which tracks a session's descendants while it lives and
+ * finds the ones that outlived it. `lstart` is a fixed 24-character stamp, so
+ * it sits before the command, which is the rest of the line. Null when `ps`
+ * could not answer.
+ */
+export async function processTable(): Promise<ProcessRow[] | null> {
+  const stdout = await shellPs(['-A', '-ww', '-o', 'pid=,ppid=,pgid=,lstart=,command=']);
+  if (stdout === null) return null;
+  const rows: ProcessRow[] = [];
+  for (const line of stdout.split('\n')) {
+    const row = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$/.exec(line);
+    if (!row) continue;
+    const started = Date.parse(row[4]!.replace(/\s+/g, ' '));
+    rows.push({
+      pid: Number(row[1]), ppid: Number(row[2]), pgid: Number(row[3]),
+      startedMs: Number.isFinite(started) ? started : null, command: row[5]!.trim(),
+    });
+  }
+  return rows;
+}
+
 function parsePs(out: string): PsRow | null {
   const line = out.split('\n').find((row) => row.trim() !== '');
   if (!line) return null;

@@ -30,6 +30,13 @@ async function mount(over: Record<string, Partial<PrefSchemaRow>> = {}) {
   server.reads['/api/prefs/schema'] = schemaAnswer(rows);
   const view = renderWithClient(<CeilingGroup />);
   await waitFor(() => expect(view.client.getQueryState(keys.prefsSchema())?.status).toBe('success'));
+  // The NumberSetting fills its input in an effect AFTER the schema answers, so
+  // a read straight after the rows appear can see '' under a loaded suite
+  // (#326). Mounted means both values committed, whatever the case reads next.
+  await waitFor(() => {
+    expect(starts().value).not.toBe('');
+    expect(dollars().value).not.toBe('');
+  });
   return view;
 }
 

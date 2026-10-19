@@ -271,3 +271,97 @@ test('phase 132: credential:<id> is read by presence — the ids credentials-pro
   assert.equal((await probeWatchRef(target, {})).state, 'unknown', 'no prober, no guess');
   assert.equal(nextDueFor(target, 'pending', 0), WATCH_POLL_MS.credential);
 });
+
+/* ------------------------------------------------------------------ *
+ * one-pool phase 13 — the one reader of a cmd: ref (#345), a git ref is not
+ * a path (#350), a proof that cannot run reads unrunnable (#374)
+ * ------------------------------------------------------------------ */
+
+test('#345 — an escaped inner quote is the command\'s quote: the check reader and the policy both read the proof', async () => {
+  const wr = await import('../server/watch-refs.ts');
+  const { judgeCommand } = await import('../server/runner/verify.ts');
+  const { proofPartsOf } = await import('../shared/proof-words.js');
+  const ref = 'cmd:"python3 -c \\"import socket;socket.gethostbyname(\'mt-data.example.com\')\\""';
+  const target = wr.parseWatchRef(ref);
+  assert.equal(target?.kind, 'cmd');
+  const command = target && target.kind === 'cmd' ? target.command : '';
+  assert.equal(command, 'python3 -c "import socket;socket.gethostbyname(\'mt-data.example.com\')"');
+  assert.equal(wr.cmdRefProblem(command), null, 'the shape reads');
+  assert.equal(judgeCommand(command), null, 'the policy reads it too — no "unbalanced quoting"');
+  assert.equal(proofPartsOf(ref)?.scheme, 'cmd', 'the words read the same command');
+  // The readings a ref always had stay as they were.
+  assert.equal(wr.cmdOfRef('"grep -q "x" /f"'), 'grep -q "x" /f', 'unescaped inner quotes: the outer pair dropped, the inside as written');
+  assert.equal(wr.cmdOfRef("'test -f /x'"), 'test -f /x');
+  assert.equal(wr.cmdOfRef('test -f /x'), 'test -f /x');
+  assert.equal(wr.cmdOfRef('"a\\\\b \\"c\\""'), 'a\\b "c"', 'an escaped backslash is one backslash');
+});
+
+test('#350 — refs/heads/… after git is a ref, a gh api route is a route, an anchored command names no relative path', async () => {
+  const { relativePathIn, cmdRefProblem } = await import('../server/watch-refs.ts');
+  const { judgeCommand } = await import('../server/runner/verify.ts');
+  const specimen = 'git -C /home/me/work/hub show-ref --verify --quiet refs/heads/pe/fleet-sweep-2026-10 && exit 1 || exit 0';
+  assert.equal(relativePathIn(specimen), null);
+  assert.equal(cmdRefProblem(specimen), null);
+  assert.equal(judgeCommand(specimen), null, '`exit` is an exit status, not work');
+  assert.equal(relativePathIn('git push origin :refs/heads/x'), null, 'a deleting push names a ref');
+  assert.equal(relativePathIn('git ls-remote origin refs/heads/pe/one-pool'), null);
+  assert.equal(relativePathIn('git show origin/main:path/to/file.md'), null);
+  assert.equal(relativePathIn('gh api repos/acme/widgets/pulls/3'), null);
+  assert.equal(relativePathIn('cd /home/me/repo && test -f docs/a/b.md'), null, 'cd /abs anchors what follows');
+  // Still caught both ways.
+  assert.equal(relativePathIn('bash scripts/vpn/status.sh --assert ok'), 'scripts/vpn/status.sh');
+  assert.equal(relativePathIn('scripts/vpn/status.sh'), 'scripts/vpn/status.sh', 'the lead itself is read');
+  assert.equal(relativePathIn('git log refs/heads/a/b; cat docs/x/y.md'), 'docs/x/y.md', 'the next command is not git');
+  assert.equal(relativePathIn('test -f ./x'), './x');
+});
+
+test('#374 — exit 126 or 127 reads unrunnable, naming the missing script; any other miss stays pending', async () => {
+  const { probeWatchRef, scriptOfCommand, unrunnableDetail } = await import('../server/watch-refs.ts');
+  const script = '/home/me/work/hub/scripts/vpn/status.sh';
+  const target = { kind: 'cmd' as const, command: `bash ${script} --assert exit-node-approved`, ref: `cmd:"bash ${script} --assert exit-node-approved"` };
+  const ran = (code: number) => probeWatchRef(target, {
+    runCommand: async () => ({ ok: code === 0, code, detail: `exit ${code} — bash: ${script}: No such file or directory` }),
+  });
+  const missing = await ran(127);
+  assert.equal(missing.state, 'unrunnable');
+  assert.ok((missing.detail ?? '').includes(`the proof itself cannot run — ${script} does not exist on the console's checkout; exit 127`), missing.detail);
+  assert.equal((await ran(126)).state, 'unrunnable');
+  assert.equal((await ran(1)).state, 'pending', 'an ordinary miss is not unrunnable');
+  assert.equal((await ran(0)).state, 'landed');
+  assert.equal(scriptOfCommand('python3 /x/y.py --flag'), '/x/y.py');
+  assert.equal(scriptOfCommand('/x/run.sh'), '/x/run.sh');
+  assert.equal(scriptOfCommand('gh auth status'), null);
+  assert.match(unrunnableDetail('gh auth status', 127), /its program was not found; exit 127/);
+});
+
+test('cmd-ref parity — scripts/cmd-ref.sh reads every ref as shared/proof-words.js and watch-refs.ts do (one-pool phase 13)', async () => {
+  const { cmdOfRef, relativePathIn, scriptOfCommand } = await import('../server/watch-refs.ts');
+  const { execFileSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const script = fileURLToPath(new URL('../../scripts/cmd-ref.sh', import.meta.url));
+  const bodies = [
+    '"python3 -c \\"import socket;socket.gethostbyname(\'mt\')\\""',
+    '"grep -q "x" /f"',
+    "'test -f /x'",
+    '"a\\\\b \\"c\\""',
+    'git -C /home/me/work/hub show-ref --verify --quiet refs/heads/pe/x && exit 1 || exit 0',
+    'git push origin :refs/heads/x',
+    'git show origin/main:path/to/file.md',
+    'gh api repos/acme/w/pulls/3',
+    'cd /home/me && test -f docs/a/b.md',
+    'bash scripts/vpn/status.sh --assert ok',
+    'scripts/vpn/status.sh',
+    'git log refs/heads/a/b; cat docs/x/y.md',
+    'gh pr view 3 -R acme/widgets',
+    'bash /home/me/hub/scripts/vpn/status.sh --assert ok',
+    'python3 -u /x/y.py',
+  ];
+  const program = `. "${script}"\nwhile IFS= read -r line; do b="$(_cmd_body "cmd:$line")"; printf '%s\\t%s\\t%s\\n' "$b" "$(_relative_path_in "$b")" "$(_cmd_script "$b")"; done`;
+  const out = execFileSync('/bin/bash', ['-c', program], { input: `${bodies.join('\n')}\n`, encoding: 'utf8' });
+  const rows = out.split('\n').filter((line, i, all) => i < all.length - 1);
+  assert.equal(rows.length, bodies.length);
+  bodies.forEach((body, i) => {
+    const command = cmdOfRef(body);
+    assert.equal(rows[i], `${command}\t${relativePathIn(command) ?? ''}\t${scriptOfCommand(command) ?? ''}`, body);
+  });
+});

@@ -18,7 +18,8 @@
  *    and an unattended run would be talking to servers nobody chose for it.
  *    Determinism here is a safety property, not a tidiness one.
  *
- * `${VAR}` values are passed through untouched rather than expanded. The CLI
+ * `${VAR}` values are passed through untouched rather than expanded — unless
+ * this console holds the variable itself (a `var` ref, `expandHeld`). The CLI
  * expands them itself, in the child's environment, with `${VAR:-default}`
  * support — re-implementing that here would be a second, subtly different
  * expander, and would put the resolved value in a file when the whole point of
@@ -57,26 +58,33 @@ export type McpConfigDoc = { mcpServers: Record<string, McpConfigEntry> };
 export async function buildMcpConfig(
   servers: McpServerMeta[],
   credentials: McpCredentials,
+  opts: { vars?: boolean } = {},
 ): Promise<McpConfigDoc> {
   const mcpServers: Record<string, McpConfigEntry> = {};
   for (const meta of servers) {
     const headers: Record<string, string> = { ...(meta.headers ?? {}) };
     const env: Record<string, string> = { ...(meta.env ?? {}) };
+    const vars: Record<string, string> = {};
     for (const ref of meta.secretRefs ?? []) {
+      // A `var` is left as its `${NAME}` in a preview (`vars: false`): the
+      // name is what makes a registration legible, the value may be a DSN.
+      if (ref.kind === 'var' && opts.vars === false) continue;
       const secret = await credentials.read(meta.id, ref);
       if (!secret) continue;
       const value = ref.template ? ref.template.replace('{}', secret) : secret;
       if (ref.kind === 'header') headers[ref.name] = value;
-      else env[ref.name] = value;
+      else if (ref.kind === 'env') env[ref.name] = value;
+      else vars[ref.name] = value;
     }
+    const fill = (text: string): string => expandHeld(text, vars);
     const entry: McpConfigEntry = { type: meta.transport };
     if (meta.transport === 'stdio') {
-      entry.command = meta.command ?? '';
-      if (meta.args?.length) entry.args = [...meta.args];
-      if (Object.keys(env).length) entry.env = env;
+      entry.command = fill(meta.command ?? '');
+      if (meta.args?.length) entry.args = meta.args.map(fill);
+      if (Object.keys(env).length) entry.env = mapValues(env, fill);
     } else {
-      entry.url = meta.url ?? '';
-      if (Object.keys(headers).length) entry.headers = headers;
+      entry.url = fill(meta.url ?? '');
+      if (Object.keys(headers).length) entry.headers = mapValues(headers, fill);
     }
     if (meta.alwaysLoad) entry.alwaysLoad = true;
     // Below 1000 the CLI ignores it and falls through to MCP_TOOL_TIMEOUT, so a
@@ -85,6 +93,23 @@ export async function buildMcpConfig(
     mcpServers[meta.id] = entry;
   }
   return { mcpServers };
+}
+
+/**
+ * `${NAME}` → the value this console holds for it (a `var` ref, one-pool
+ * phase 19, #363), its `:-default` included; every other `${VAR}` stays as it
+ * is written, for the CLI to expand from the child's environment as before.
+ * The value is spliced HERE because nothing else could: the CLI expands a
+ * `${VAR}` from its own environment, and the variable is in the keychain.
+ */
+export function expandHeld(text: string, vars: Readonly<Record<string, string>>): string {
+  if (!Object.keys(vars).length) return text;
+  return text.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}/g, (whole, name: string) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? vars[name]! : whole);
+}
+
+function mapValues(values: Record<string, string>, fn: (value: string) => string): Record<string, string> {
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => [key, fn(value)]));
 }
 
 /**

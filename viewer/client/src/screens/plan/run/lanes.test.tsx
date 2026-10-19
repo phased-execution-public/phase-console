@@ -238,6 +238,14 @@ describe('the run’s lanes', () => {
       />,
     );
     const section = screen.getByRole('region', { name: 'Lanes' });
+    // Each lane names its phase's status as a badge, not only a leading edge (#361).
+    for (const li of screen.getAllByTestId('run-lane')) {
+      if (li.querySelector('[data-testid="lane-frozen"]')) continue;
+      expect(
+        li.querySelector('[data-vocab="phase"][data-chrome="badge"]'),
+        `lane ${li.dataset.phase}`,
+      ).not.toBeNull();
+    }
     expect(within(section).getByRole('heading', { name: /^Lanes/ }).textContent).toBe('Lanes3');
     // The silent lane leads; the healthy one and the check follow, oldest first.
     expect(lines()).toEqual(['lane 7', 'lane 6', 'check 8']);

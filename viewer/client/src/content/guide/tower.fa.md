@@ -14,8 +14,7 @@ this phase* وقتی تابلو یک فاز را در حال انجام می‌�
 jobهای GitHub آن شروع نمی‌شوند.
 
 نشانی‌های قدیمی باز هم به اینجا می‌رسند، روی گروهِ متناظر: <span dir="ltr">`#/now`</span>،
-<span dir="ltr">`#/ready`</span>، <span dir="ltr">`#/pulse`</span>، <span dir="ltr">`#/queue`</span>، و هر
-<span dir="ltr">`?bay=`</span>.
+<span dir="ltr">`#/ready`</span>، <span dir="ltr">`#/pulse`</span>، و هر <span dir="ltr">`?bay=`</span>.
 
 ## شش گروه
 
@@ -77,7 +76,12 @@ path*، *claimed by …*، *QA failed here before*. شش ردیف نشان دا�
 
 زیرِ خط فقط آن چیزهایی می‌آیند که اجرا را نگه داشته‌اند: یک hold (*Held by …: nothing new boards until it is
 released*)، کسی که صف منتظرِ اوست، و یک خط درباره‌ی اینکه چرا کند است یا چه می‌کند: *Slow: machine load 82 on
-14 CPUs is above the guard (and 1 more).* یا *On p6.task2 — wire the endpoint — about 20–35 min left.*
+14 CPUs is above the guard (21): timed work runs slower and may flake (and 1 more).* یا *On p6.task2 — wire
+the endpoint — about 20–35 min left.* آن خطِ «کند» بارِ یک‌دقیقه‌ای ماشین را می‌خواند، ۱٫۵ برای هر CPU؛ هشدار
+می‌دهد و چیزی را نگه نمی‌دارد. آنچه کارِ تازه را نگه می‌دارد **نگهبانِ بارِ** کنسول است (Settings ▸ Automation ▸
+<span dir="ltr">**The queue**</span>)، و این نگهبان می‌خواند که CPU در ۳۰ ثانیه‌ی گذشته چقدر مشغول بوده: ۸۵ ٪ در
+ضریبِ پیش‌فرضش، ۱٫۵، که با ضریب مقیاس می‌گیرد. بارِ ۵ دقیقه‌ای فقط سقفِ آن است، در ضریب ضربِ تعدادِ هسته‌ها، ضربِ ۲.
+خط‌های زنده هرگز دست نمی‌خورند.
 
 
 کنشِ یگانه به این ترتیب انتخاب می‌شود:
@@ -134,7 +138,8 @@ errand و گامی که شرح می‌دهد یک بار شمرده می‌شو�
 
 ## صف
 
-صفحه‌ی صفِ مخصوصِ خودش وجود ندارد: <span dir="ltr">`#/queue`</span> گروهِ **Queued** را باز می‌کند. خطِ یک
+
+گروهِ **Queued** هر اجرایی را نگه می‌دارد که منتظرِ یک محدوده یا یک خط است. خطِ یک
 اجرای در صف می‌گوید منتظرِ کیست، و بازکردنش می‌گوید چرا — *queued — waiting on …*، *Also behind …*،
 *Held … ago by … — release it to let this line move*، *Chained behind …* — و جابه‌جایش می‌کند: **Bump**،
 **Board P7 first**، **Hold** و اولویتش. جایگاهِ خودِ یک فاز در صف در **Actions** آن است، در پنل:

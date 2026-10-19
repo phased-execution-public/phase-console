@@ -12,6 +12,7 @@ import { isolateCompat, isRunRequestOf } from './turn/run-requests.ts';
 import { basename, join, resolve } from 'node:path';
 import { availableParallelism, homedir, loadavg } from 'node:os';
 import { isSchedulingPolicy, loadGuardFactor, schedulingPolicy, type SchedulingPolicy } from '../shared/orchestration-model.js';
+import { MachineJobs, cpuBusyNow } from './load-reading.ts';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -291,7 +292,9 @@ import {
   recoveryActionsFor,
 } from '../shared/recovery-model.js';
 import { isLiveStatus } from '../shared/status-vocab.js';
-import { DELIVERY_ISSUE_ID, deliveryIssue, environmentReport, type EnvIssue } from './env-doctor.ts';
+import {
+  DELIVERY_ISSUE_ID, PUSH_REJECT_ISSUE_PREFIX, PUSH_UNDELIVERED_ISSUE_ID, deliveryIssue, environmentReport, type EnvIssue,
+} from './env-doctor.ts';
 import { probeDelivery, type DeliveryFacts } from './prelude.ts';
 import { claudeConfigDirs, copyCommit, sessionSkillCopy, skillCopyReport, type SkillCopyReport } from './skill-copy.ts';
 import { tailscaleStatus } from './tailscale.ts';
@@ -538,6 +541,9 @@ import {
 } from './service-core.ts';
 import { lockRows, readLockFiles, type LockFilter, type LockRow } from './locks.ts';
 import type { Lock } from './parse/folder.ts';
+// The profile read's redaction (one-pool phase 2, #319) is in both editions.
+import { withheld } from './prefs-schema.ts';
+import { PROFILE_META } from '../shared/prefs-model.js';
 
 import type { Service } from './service.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
@@ -905,6 +911,10 @@ export abstract class ServiceBase {
   ): void;
   abstract refreshMcp(force?: boolean): Promise<McpServerView[]>;
   abstract releaseMcpBridge(id: string, configDir?: string): Promise<void>;
+  abstract finishMcpLogin(
+    id: string,
+    session: { id: string; code: number; bridged: boolean; configDir?: string },
+  ): Promise<void>;
   /** The recover verb — declared here so the runner's deps can reach it from the constructor (phase 9). */
   abstract recoverPhase(
     slug: string, phase: number, mode: RecoverMode,
@@ -1574,7 +1584,12 @@ export abstract class ServiceBase {
     // own obituary). Once per service|reason per process.
     this.push.onPersistentReject = ({ service: pushService, reason, streak, devices }) => {
       const key = `${pushService}|${reason}`;
-      if (this.pushHealthAnnounced.has(key)) return;
+      const id = `${PUSH_REJECT_ISSUE_PREFIX}${key}`;
+      // The row stands while the fault does, and comes back if it returns
+      // after a repair withdrew it (#280); the out-of-band notice and the log
+      // line stay once per process.
+      if (this.environment.issues.some((issue) => issue.id === id)) return;
+      const first = !this.pushHealthAnnounced.has(key);
       this.pushHealthAnnounced.add(key);
       const fix =
         reason === 'BadJwtToken'
@@ -1584,12 +1599,14 @@ export abstract class ServiceBase {
             ? 'Subscriptions predating the hashed-topic fix keep failing — remove and re-subscribe the device.'
             : 'Remove and re-subscribe the device in Settings → Notifications, and check the network.';
       this.environment.issues.push({
+        id,
         kind: 'push-broken',
         detail:
           `${pushService} is rejecting this console's pushes (${reason}, ${streak} in a row, ` +
           `${devices.length} device${devices.length === 1 ? '' : 's'})`,
         fix,
       });
+      if (!first) return;
       log.warn('push.health', { service: pushService, reason, streak, devices });
       notifyOutOfBand(
         'Phase Console: push delivery is broken',
@@ -1612,10 +1629,16 @@ export abstract class ServiceBase {
           .slice(-UNDELIVERED_KEEP);
         this.undelivered.lost += 1;
       }
-      if (this.pushHealthAnnounced.has('undelivered')) return;
+      // One row while the channel is not arriving, withdrawn the moment a push
+      // is delivered or the device list changes (#280) — and raised again by
+      // the next notification nobody heard. The notice below stays once per
+      // process.
+      if (this.environment.issues.some((issue) => issue.id === PUSH_UNDELIVERED_ISSUE_ID)) return;
+      const first = !this.pushHealthAnnounced.has('undelivered');
       this.pushHealthAnnounced.add('undelivered');
       const outcomes = [...new Set(devices.map((d) => d.outcome))].join(', ');
       this.environment.issues.push({
+        id: PUSH_UNDELIVERED_ISSUE_ID,
         kind: 'push-broken',
         detail:
           `A notification reached none of this console's ${devices.length} device` +
@@ -1624,6 +1647,7 @@ export abstract class ServiceBase {
           'Notifications are being sent and are not arriving. Send a test from ' +
           'Settings → Notifications; if that fails too, remove and re-subscribe the device.',
       });
+      if (!first) return;
       notifyOutOfBand(
         'Phase Console: a notification reached nobody',
         `${title} — see Settings → Notifications`,
@@ -1646,7 +1670,13 @@ export abstract class ServiceBase {
       log.warn('push.no-device', { category });
       this.refreshDeliveryIssue();
     };
-    this.push.onDevicesChanged = () => this.refreshDeliveryIssue();
+    this.push.onDevicesChanged = () => {
+      // A device removed or re-subscribed is the repair the rows' own fix asks for.
+      this.withdrawPushHealth('devices-changed');
+      this.refreshDeliveryIssue();
+    };
+    // A push a service accepted: the channel works (#280).
+    this.push.onDelivered = ({ service: pushService }) => this.withdrawPushHealth('delivered', pushService);
     this.webhooks.onRowsChanged = () => this.refreshDeliveryIssue();
     this.refreshDeliveryIssue();
     // The announce is suppressed under a test runner: the doctor reads the
@@ -1887,6 +1917,11 @@ export abstract class ServiceBase {
       // The machine-load guard (control-tower phase 100, #135 G.27): read per
       // scan, like `max`, so a factor moved in Settings lands on the next one.
       load: () => this.loadSample(),
+      // The machine's heavy-job budget (one-pool phase 26, #327): every
+      // console's suites and builds share one count through the fleet's job
+      // tokens, so two instances on one laptop cannot each run their own two.
+      jobs: new MachineJobs(),
+      instanceId: INSTANCE.id,
       // How much longer a holder's plan has — decoration on the queue page,
       // never an input to the decision. Synchronous off the memo above, so a
       // cold answer is `undefined` rather than an await inside the scan.
@@ -2495,48 +2530,7 @@ export abstract class ServiceBase {
   protected async sweepStaleWorktrees(): Promise<void> {
     if (!this.root?.ok) return;
     const root = this.root.path;
-    const live = this.liveRunIds();
-    for (const record of this.store?.list() ?? []) {
-      try {
-        const stateDir = runDir(root, record.slug);
-        const result = await sweepStale(root, {
-          // BOTH homes: whatever the setting says today, a tree made under the
-          // other one is still this console's to sweep.
-          homes: WORKTREE_ROOTS.map((mode) => worktreeHome({ mode, root, slug: record.slug, stateDir })),
-          slug: record.slug,
-          liveRunIds: live,
-          children: (runId) =>
-            childrenOf(loadRun(root, record.slug, runId, live) ?? ({ phases: {} } as RunState)).map(
-              (child) => child.pid,
-            ),
-          probe: (pid) => pidHoldsWork(pid),
-          // The same two answers the runner's own sweep gives (phase 15):
-          // each dead run's own retention word, else the console's — and
-          // whether it ended badly, which `keep-on-failure` asks. The boot
-          // sweep passed neither before, so it read every run as clean and
-          // every word as the shipped default.
-          retention: (runId) => loadRun(root, record.slug, runId, live)?.worktreeRetention ?? this.prefs.worktreeRetention,
-          failed: (runId) => runEndedBadly(loadRun(root, record.slug, runId, live)),
-          // 🔴 #94: this sweep runs BEFORE any runner re-registers, so `live` is
-          // empty here by construction and "not live" read as "over" — a paused
-          // run's clean mirror mounts went at every restart. The stored run is
-          // the only witness that something will drive it again.
-          resumable: (runId) => runResumable(loadRun(root, record.slug, runId, live)),
-        });
-        if (result.removed.length || result.kept.length || result.spared.length) {
-          log.info('run.worktrees-swept', {
-            slug: record.slug,
-            removed: result.removed,
-            kept: result.kept,
-            runs: result.runs,
-            ...(result.spared.length ? { spared: result.spared } : {}),
-          });
-        }
-      } catch (error) {
-        // One plan's unreadable state directory must not stop the boot.
-        log.warn('run.worktree-sweep-failed', { slug: record.slug, error });
-      }
-    }
+    for (const record of this.store?.list() ?? []) await this.sweepPlanWorktrees(record.slug, 'boot');
 
     // Once for the whole repository, after every plan: the registrations that
     // were never ours. A prunable one holds a branch for ever and nothing else
@@ -2557,6 +2551,89 @@ export abstract class ServiceBase {
     } catch (error) {
       log.warn('run.worktree-sweep-failed', { error });
     }
+  }
+
+  /**
+   * One plan's sweep — the boot sweep's body, and since one-pool phase 20
+   * (#333) also what a run's RESOLUTION asks for (`noteRunResolved`).
+   * Measured: six runs read `resolved` ("a closed plan's run is not driven
+   * again") from 2026-10-10, yet their mirrors stayed registered in up to 15
+   * repositories and pinned 9 finished `pe/*` branches until a restart,
+   * because this ran only at boot and at a drive's start. The same
+   * `sweepStale` rules: clean mounts go, tracked dirt is held, a resumable or
+   * live run is passed over whole.
+   */
+  protected async sweepPlanWorktrees(slug: string, trigger: 'boot' | 'resolved'): Promise<void> {
+    if (!this.root?.ok) return;
+    const root = this.root.path;
+    const live = this.liveRunIds();
+    try {
+      const stateDir = runDir(root, slug);
+      const result = await sweepStale(root, {
+        // BOTH homes: whatever the setting says today, a tree made under the
+        // other one is still this console's to sweep.
+        homes: WORKTREE_ROOTS.map((mode) => worktreeHome({ mode, root, slug, stateDir })),
+        slug,
+        liveRunIds: live,
+        children: (runId) =>
+          childrenOf(loadRun(root, slug, runId, live) ?? ({ phases: {} } as RunState)).map(
+            (child) => child.pid,
+          ),
+        probe: (pid) => pidHoldsWork(pid),
+        // The same two answers the runner's own sweep gives (phase 15):
+        // each dead run's own retention word, else the console's — and
+        // whether it ended badly, which `keep-on-failure` asks. The boot
+        // sweep passed neither before, so it read every run as clean and
+        // every word as the shipped default.
+        retention: (runId) => loadRun(root, slug, runId, live)?.worktreeRetention ?? this.prefs.worktreeRetention,
+        failed: (runId) => runEndedBadly(loadRun(root, slug, runId, live)),
+        // 🔴 #94: this sweep runs BEFORE any runner re-registers, so `live` is
+        // empty here by construction and "not live" read as "over" — a paused
+        // run's clean mirror mounts went at every restart. The stored run is
+        // the only witness that something will drive it again.
+        resumable: (runId) => runResumable(loadRun(root, slug, runId, live)),
+      });
+      if (result.removed.length || result.kept.length || result.spared.length) {
+        log.info('run.worktrees-swept', {
+          slug,
+          trigger,
+          removed: result.removed,
+          kept: result.kept,
+          runs: result.runs,
+          ...(result.spared.length ? { spared: result.spared } : {}),
+        });
+      }
+    } catch (error) {
+      // One plan's unreadable state directory must not stop the boot.
+      log.warn('run.worktree-sweep-failed', { slug, trigger, error });
+    }
+  }
+
+  /** Run ids whose resolution this process has already swept for — once each (#333). */
+  private resolvedSwept = new Set<string>();
+  /** Per plan, the resolution sweep in flight — one at a time, so two resolutions never race one tree. */
+  protected resolvedSweeps = new Map<string, Promise<void>>();
+
+  /**
+   * A run was marked resolved — by a person's dismissal, converge closing a
+   * plan, a recovery that found nothing wrong, the board's resolver — so its
+   * trees are swept NOW, not at the next boot (one-pool phase 20, #333).
+   * Every writer of `resolved` reaches here: the stored-run writer and the
+   * runner both emit `run:state`, and the read-path resolver calls it
+   * directly. A plan whose runner is live is left to that runner, which
+   * sweeps at its own start and prunes at its end; a resumable run keeps its
+   * trees (#94), and `sweepStale` passes over live runs whatever is asked.
+   */
+  protected noteRunResolved(state: RunState | null | undefined): Promise<void> | null {
+    if (!state?.resolved || !state.id || !state.slug || !this.root?.ok) return null;
+    if (this.resolvedSwept.has(state.id) || runResumable(state) || this.liveRunIds().has(state.id)) return null;
+    if (this.liveRunner(state.slug)) return null;
+    this.resolvedSwept.add(state.id);
+    const slug = state.slug;
+    const next = (this.resolvedSweeps.get(slug) ?? Promise.resolve()).then(() => this.sweepPlanWorktrees(slug, 'resolved'));
+    this.resolvedSweeps.set(slug, next);
+    void next.finally(() => { if (this.resolvedSweeps.get(slug) === next) this.resolvedSweeps.delete(slug); });
+    return next;
   }
 
   /** Runs whose surviving child's hook token could not be read back — `token-lost` for their cards. */
@@ -2726,6 +2803,10 @@ export abstract class ServiceBase {
       };
       try {
         const runner = this.runnerByRunId(approval.runId);
+        // A card turned standing no longer holds a hook (#220).
+        if (runner && event === 'standing' && approval.phase != null) {
+          try { runner.holdForCard(approval.phase, approval.id, false); } catch { /* the hold never costs the journal line */ }
+        }
         if (runner) runner.note(later, data, approval.phase ?? undefined);
         else if (this.root?.ok && approval.slug && approval.slug !== 'unknown') {
           Journal.for(this.root.path, approval.slug, approval.runId).append(later, data, approval.phase ?? undefined);
@@ -2756,6 +2837,10 @@ export abstract class ServiceBase {
     const phase = approval.phase ?? undefined;
     try {
       const runner = this.runnerByRunId(approval.runId);
+      // A tool card holds its session's hook open: the lane's watchdog waits on it (#220).
+      if (runner && approval.kind === 'tool' && phase !== undefined) {
+        try { runner.holdForCard(phase, approval.id, event === 'raised'); } catch { /* the hold never costs the journal line */ }
+      }
       if (runner) {
         runner.note(name, data, phase);
         return;
@@ -3322,6 +3407,30 @@ export abstract class ServiceBase {
     else log.info('env.delivery-channel', { ok: true, reason: verdict.reason });
   }
 
+  /**
+   * Withdraw the `push-broken` rows a failed push raised (one-pool phase 18,
+   * #280): the undelivered row on any delivered push, a service's rejection
+   * rows on a push that service accepted, and all of them when the device list
+   * changes. Before, nothing withdrew them, and `doctor` stayed blocking until
+   * a restart however the channel was repaired. The channel row
+   * (`DELIVERY_ISSUE_ID`) and an unreadable key's row are not this method's.
+   */
+  withdrawPushHealth(cause: 'delivered' | 'devices-changed', pushService?: string): void {
+    const issues = this.environment?.issues;
+    if (!issues) return;
+    const withdrawn: string[] = [];
+    for (let at = issues.length - 1; at >= 0; at -= 1) {
+      const id = issues[at]!.id ?? '';
+      const goes = id === PUSH_UNDELIVERED_ISSUE_ID ||
+        (id.startsWith(PUSH_REJECT_ISSUE_PREFIX) &&
+          (cause === 'devices-changed' || id.startsWith(`${PUSH_REJECT_ISSUE_PREFIX}${pushService ?? ''}|`)));
+      if (!goes) continue;
+      issues.splice(at, 1);
+      withdrawn.push(id);
+    }
+    if (withdrawn.length) log.info('push.health-cleared', { cause, service: pushService ?? null, issues: withdrawn });
+  }
+
   /** The `--remote` half of the channel row: Tailscale running and serving this port. */
   async checkDeliveryReachable(): Promise<void> {
     if (!this.flags.remoteHosts.length) return;
@@ -3410,9 +3519,18 @@ export abstract class ServiceBase {
    * `GET /api/fleet/profile` — the machine profile as every console reads it,
    * and what THIS console runs with: each setting's value and its source
    * (`flag`, `env`, this console's `override`, or the machine `profile`).
+   *
+   * A read needs no flag, so it serves no secret (one-pool phase 2, #319):
+   * every `secret: true` field of `PROFILE_META` — the notify command, which
+   * may carry a token, and the webhooks, whose URL is the whole authorisation
+   * to post — is said the way Settings ▸ Everything says it (`withheld`: a
+   * webhook as its origin and a masked tail, anything else `[withheld]`), and
+   * `secrets.<key>.hasValue` says whether it is set. The values are written by
+   * the profile's own writer (`phase-console profile set`), never through here.
    */
   fleetProfileView(): {
     profile: ReturnType<typeof fleetProfile>;
+    secrets: Record<string, { hasValue: boolean }>;
     console: {
       id: string;
       name: string;
@@ -3426,9 +3544,19 @@ export abstract class ServiceBase {
       overridden: string[];
     };
   } {
-    const profile = fleetProfile();
+    const machine = fleetProfile();
+    const profile = { ...machine } as Record<string, unknown>;
+    const secrets: Record<string, { hasValue: boolean }> = {};
+    for (const [key, meta] of Object.entries(PROFILE_META)) {
+      if (!meta.secret) continue;
+      const value = profile[key];
+      const hasValue = Array.isArray(value) ? value.length > 0 : value !== undefined && value !== null && value !== '';
+      secrets[key] = { hasValue };
+      if (key in profile) profile[key] = withheld(key, value);
+    }
     return {
-      profile,
+      profile: profile as ReturnType<typeof fleetProfile>,
+      secrets,
       console: {
         id: INSTANCE.id,
         name: INSTANCE.name,
@@ -3436,7 +3564,7 @@ export abstract class ServiceBase {
         remoteUsers: this.flags.remoteUsers,
         notifyCommand: Boolean(notifyCommand()),
         maxSessions: this.flags.maxSessions,
-        machineMaxSessions: profile.maxSessions ?? null,
+        machineMaxSessions: machine.maxSessions ?? null,
         autostart: readAutostart(INSTANCE.id),
         sources: this.flags.profile?.sources ?? {},
         overridden: this.flags.profile?.overridden ?? [],
@@ -4360,12 +4488,14 @@ export abstract class ServiceBase {
 
   /** What a phase's Repos column says it touches. Undefined for an unknown plan. */
   /**
-   * The machine's 5-minute load against the guard's factor (control-tower
-   * phase 100, #135 G.27) — the same `os.loadavg()` the phase report and the
-   * supervisor read; the factor is null when the guard is off.
+   * The machine's load against the guard's factor (control-tower phase 100,
+   * #135 G.27) — since one-pool phase 26 (#243) what its CPU did over the last
+   * 30 s (`cpuBusyNow`), with the 5-minute `os.loadavg()` as the ceiling; the
+   * factor is null when the guard is off. The supervisor's `machine-load`
+   * detector reads the same reading (#224).
    */
-  loadSample(): { avg5: number; cores: number; factor: number | null } {
-    return { avg5: loadavg()[1] ?? 0, cores: availableParallelism(), factor: loadGuardFactor(this.prefs) };
+  loadSample(): { avg5: number; cores: number; factor: number | null; busy: number | null } {
+    return { avg5: loadavg()[1] ?? 0, cores: availableParallelism(), factor: loadGuardFactor(this.prefs), busy: cpuBusyNow() };
   }
 
   /** A plan's scheduling policy: its own, else the console's, else `seniority` (control-tower phase 100). */
@@ -5367,27 +5497,14 @@ export abstract class ServiceBase {
     // halfway leaves the server exactly as it was, and the card keeps saying so.
     const loginMcp = session.meta?.intent === 'login' ? session.meta.mcpServer : undefined;
     if (loginMcp) {
-      const bridged = session.meta?.mcpBridged === true;
-      void (async () => {
-        // Take the bridged definition back BEFORE re-probing, so the probe
-        // measures the state the operator is left in rather than the temporary
-        // one this flow created. The probe reads its own `--mcp-config` and
-        // never the CLI's registry, so removing the entry cannot change the
-        // verdict — but a probe run against a registry we are about to edit
-        // would be a claim about a world that stops existing a moment later.
-        if (bridged) await this.releaseMcpBridge(loginMcp, session.meta?.mcpConfigDir);
-        const servers = await this.refreshMcp(true);
-        const view = servers.find((server) => server.id === loginMcp);
-        if (view?.status === 'connected') {
-          this.announce('limits', {
-            title: 'MCP server signed in',
-            body: `${view.label} is connected and available to runs on this console.`,
-            tag: tagFor('limits', 'mcp-login', loginMcp),
-          });
-          // A run parked waiting for exactly this can now be re-armed.
-          await this.healMcpParks(loginMcp);
-        }
-      })().catch((error) => log.warn('mcp.login.complete-failed', { server: loginMcp, error }));
+      // The guided flow's ending (#372): the bridge taken back, the server
+      // re-probed, the flow told connected or why not, the terminal cleared.
+      void this.finishMcpLogin(loginMcp, {
+        id: session.id,
+        code: failed ? (code || 1) : 0,
+        bridged: session.meta?.mcpBridged === true,
+        ...(session.meta?.mcpConfigDir ? { configDir: session.meta.mcpConfigDir } : {}),
+      }).catch((error) => log.warn('mcp.login.complete-failed', { server: loginMcp, error }));
       return;
     }
 
@@ -7245,6 +7362,18 @@ export abstract class ServiceBase {
   markNotificationsRead(ids?: string[] | null): { changed: number; unread: number } {
     const changed = this.notifications.markRead(ids);
     if (changed) this.emit('notification:read', { ids: ids ?? null, unread: this.notifications.unread() });
+    return { changed, unread: this.notifications.unread() };
+  }
+
+  /**
+   * Put records back as unread — the bell's *Put back* (#334). It rides the
+   * `notification:read` event, which every listener already treats as "the
+   * read state moved: refetch, take the new count", so the badge and an open
+   * drawer follow without a second event name.
+   */
+  markNotificationsUnread(ids: readonly string[]): { changed: number; unread: number } {
+    const changed = this.notifications.markUnread(ids);
+    if (changed) this.emit('notification:read', { ids: [...ids], read: false, unread: this.notifications.unread() });
     return { changed, unread: this.notifications.unread() };
   }
 

@@ -301,7 +301,9 @@ function ViewSheet({
         side="bottom"
         title="View"
         showTitle
-        description={`What to show in the ${label.toLowerCase()}, and how.`}
+        // The page's own name, as it names itself, and no article: "the
+        // ${label}" read "What to show in the your turn" (#334).
+        description={`${label}: what to show, and how.`}
       >
         <div className="flex flex-col gap-5">
           {present.map((id) => {

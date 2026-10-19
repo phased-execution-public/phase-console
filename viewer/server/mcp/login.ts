@@ -74,6 +74,10 @@ import { realExec, type Exec } from '../accounts/credentials.ts';
 import { shellQuote } from '../runner/auth.ts';
 import { authKind } from './index.ts';
 import type { McpServerMeta } from './store.ts';
+import type { MCP_LOGIN_STEPS } from '../../shared/ops-vocab.js';
+
+/** A guided sign-in's step — `MCP_LOGIN_STEPS`, owned by `shared/ops-vocab.js`. */
+export type McpLoginStep = (typeof MCP_LOGIN_STEPS)[number];
 
 /**
  * Transports `claude mcp add` accepts.
@@ -99,6 +103,13 @@ export type McpLoginTarget = {
   configDir?: string;
   /** Whose config dir this is, for the sentence the card shows. */
   accountLabel?: string;
+  /**
+   * The person asking is NOT at this machine (#372): the CLI is told
+   * `--no-browser`, prints the authorization URL and waits for the address
+   * the browser lands on to be pasted back. At the machine the CLI opens the
+   * browser itself and takes the callback on its own, so nobody pastes.
+   */
+  remote?: boolean;
 };
 
 /** What the flow will run, resolved once so every caller says the same thing. */
@@ -115,6 +126,8 @@ export type McpLoginPlan = {
   command: string;
   /** Just the login step, for the terminal the console mints. */
   loginCommand: string;
+  /** True when the login step carries `--no-browser` — the flow needs a paste-back. */
+  remote: boolean;
 };
 
 /** No path exists for this server — say which commands would, if any. */
@@ -208,11 +221,15 @@ export function planMcpLogin(meta: McpServerMeta, target: McpLoginTarget = {}): 
   }
 
   const add = ['mcp', 'add', '--transport', meta.transport, ...scope, ...headers, meta.id, url];
-  // `--no-browser` because the console is routinely driven from a phone or over
-  // ssh: it prints the authorization URL and takes the pasted callback, which
-  // works in a terminal pane and degrades to a copyable command when there is
-  // none. A local browser flow would simply hang on those machines.
-  const login = ['mcp', 'login', meta.id, '--no-browser'];
+  // `--no-browser` ONLY for a person who is not at this machine (#372): the
+  // console is often driven from a phone or over Tailscale, where a browser the
+  // CLI opened would open on a screen nobody is looking at — so it prints the
+  // authorization URL and takes the pasted callback instead. At the machine the
+  // CLI opens the browser and takes the callback itself; the paste-back it
+  // used to ask for there was a step nobody was told about, and four sign-ins
+  // timed out on it in one day.
+  const remote = target.remote === true;
+  const login = ['mcp', 'login', meta.id, ...(remote ? ['--no-browser'] : [])];
   const remove = ['mcp', 'remove', meta.id, ...scope];
 
   const prefix = target.configDir ? `CLAUDE_CONFIG_DIR=${shellQuote(target.configDir)} ` : '';
@@ -227,7 +244,43 @@ export function planMcpLogin(meta: McpServerMeta, target: McpLoginTarget = {}): 
     remove,
     command: [line(add), line(login), line(remove)].join(' && '),
     loginCommand: line(login),
+    remote,
   };
+}
+
+/**
+ * The authorization URL the CLI printed, read from its terminal's output — or
+ * undefined until it has printed one. The terminal is a pty, so the text
+ * carries colour and cursor sequences, which are taken out first (a pty wraps
+ * a long line on the screen, never in the stream, so the URL is one token).
+ * The URL is an `https` address carrying the OAuth `client_id` or a
+ * `redirect_uri`, which no other line the CLI prints does.
+ */
+export function authUrlOf(output: string): string | undefined {
+  const plain = output.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, '');
+  const found = [...plain.matchAll(/https:\/\/[^\s"'<>]+/g)]
+    .map((match) => match[0])
+    .filter((url) => /[?&](client_id|redirect_uri|response_type|code_challenge)=/.test(url));
+  return found.at(-1);
+}
+
+/**
+ * The address a browser lands on after approving, as the CLI asks for it back
+ * (#372): an http(s) URL carrying the OAuth `code` (or the provider's `error`).
+ * Anything else is refused before it is typed into the terminal, because the
+ * CLI would only answer it with a failure the person cannot see.
+ */
+export function pastedCallbackError(value: string): string | null {
+  const text = value.trim();
+  if (!text) return 'paste the address the browser landed on — it starts with http';
+  if (/[\r\n]/.test(text)) return 'paste one address, on one line';
+  let url: URL;
+  try { url = new URL(text); } catch { return 'that is not an address — copy the whole of what the browser’s address bar shows'; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return 'the address the browser lands on starts with http';
+  if (!url.searchParams.has('code') && !url.searchParams.has('error')) {
+    return 'that address carries no code — approve on the sign-in page first, then copy the address it lands on';
+  }
+  return null;
 }
 
 /**
@@ -296,4 +349,89 @@ export async function unbridgeDefinition(plan: McpLoginPlan, exec: Exec = realEx
     log.warn('mcp.login.unbridge-failed', { server: plan.id, error: (error as Error).message });
     return false;
   }
+}
+
+/**
+ * One guided sign-in, as the page draws it (one-pool phase 19, #372) — what
+ * `GET /api/mcp/:id/login` answers and the sheet walks a person through:
+ * which step it is on, the sign-in page's address once the CLI printed it,
+ * the CLI's five minutes as a deadline, and — at the end — connected, or why
+ * not, naming the step it stopped on.
+ */
+export type McpLoginFlow = {
+  server: string;
+  /** `embedded` — a terminal the console runs; `external`/`command` — the person runs it. */
+  mode: 'embedded' | 'external' | 'command';
+  /** The person is not at this machine, so the flow takes a pasted address (`--no-browser`). */
+  remote: boolean;
+  step: McpLoginStep;
+  startedAt: string;
+  /** The CLI gives up at this instant (`MCP_LOGIN_WINDOW_MS` after the start). */
+  deadline: string;
+  /** The sign-in page, read from the CLI's output — the sheet's *Open sign-in page*. */
+  authUrl?: string;
+  /** The terminal running it, when the console runs it. */
+  sessionId?: string;
+  /** The login line, as a person would type it. */
+  command: string;
+  /** This console wrote the definition the sign-in resolves, and owes it back. */
+  bridged?: boolean;
+  /** Set only when no flow could start: the commands that would work by hand. */
+  commands?: string[];
+  configDir?: string;
+  accountLabel?: string;
+  /** Why it failed or timed out, in words — the step it stopped on and what the CLI last said. */
+  detail?: string;
+  exitCode?: number;
+  /** When the address was pasted back. */
+  pastedAt?: string;
+  endedAt?: string;
+};
+
+/** What a flow waits on at each step, for the sentence a timeout ends with. */
+export const LOGIN_STEP_WAITS: Readonly<Record<McpLoginStep, string>> = Object.freeze({
+  starting: 'waiting for the Claude CLI to print the sign-in page',
+  approve: 'waiting for the sign-in to be approved in the browser',
+  paste: 'waiting for the address the browser landed on to be pasted back',
+  checking: 'waiting for the Claude CLI to finish with the pasted address',
+  connected: 'connected',
+  failed: 'failed',
+  'timed-out': 'timed out',
+});
+
+/**
+ * The step a running flow is on, from what it has seen: a page address once
+ * the CLI printed one — approve at the machine, paste from elsewhere — and
+ * `checking` once an address was pasted back.
+ */
+export function liveStep(flow: Pick<McpLoginFlow, 'remote' | 'authUrl' | 'pastedAt'>): McpLoginStep {
+  if (flow.pastedAt) return 'checking';
+  if (!flow.authUrl) return 'starting';
+  return flow.remote ? 'paste' : 'approve';
+}
+
+/**
+ * How a flow ended, from the CLI's exit: `timed-out` when it gave up on its
+ * own clock (a non-zero exit at or past the deadline, less a margin for the
+ * CLI's own rounding), else `failed`, each with the sentence the sheet shows.
+ * An exit 0 is not an ending — the probe that follows decides.
+ */
+export function endingOf(
+  flow: Pick<McpLoginFlow, 'remote' | 'authUrl' | 'pastedAt' | 'deadline'>,
+  exit: { code: number; at: number; lastLine?: string },
+): { step: 'failed' | 'timed-out'; detail: string } {
+  const step = liveStep(flow);
+  const said = exit.lastLine ? ` The Claude CLI said: “${exit.lastLine}”` : '';
+  if (exit.at >= Date.parse(flow.deadline) - 15_000) {
+    return { step: 'timed-out', detail: `The sign-in gave up after five minutes, ${LOGIN_STEP_WAITS[step]}.${said}` };
+  }
+  return { step: 'failed', detail: `The sign-in stopped (exit ${exit.code}) while ${LOGIN_STEP_WAITS[step]}.${said}` };
+}
+
+/** The last line a terminal printed that says anything, colour taken out. */
+export function lastLineOf(output: string): string | undefined {
+  const lines = output.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').split(/\r?\n|\r/)
+    .map((line) => line.trim()).filter(Boolean);
+  const line = lines.at(-1);
+  return line ? line.slice(0, 300) : undefined;
 }

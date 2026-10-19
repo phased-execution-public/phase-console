@@ -168,33 +168,74 @@ describe('one line per plan (criterion 1)', () => {
     mount();
 
     await waitFor(() => expect(listedSlugs()).toEqual(['alpha', 'beta']));
-    // 1 — the mark: the live run's word, a dot and a word. The list is drawn
-    // from the plans alone; the runs and the inbox join it when they answer.
-    await waitFor(() => expect(within(rowOf('alpha')).getByTestId('plan-mark')).toHaveTextContent('Running'));
+    // 1 — the mark: the plan's own status as a badge (#361), and beside it —
+    // never instead of it — the live run's word. The list is drawn from the
+    // plans alone; the runs and the inbox join it when they answer.
+    await waitFor(() =>
+      expect(within(rowOf('alpha')).getByTestId('plan-run-mark')).toHaveTextContent('Running'),
+    );
     const alpha = rowOf('alpha');
+    const badge = within(alpha).getByTestId('plan-mark');
+    expect(badge).toHaveAttribute('data-chrome', 'badge');
+    expect(badge).toHaveAttribute('data-vocab', 'plan');
+    expect(badge).toHaveTextContent('Active');
     // 2 — the name, through plainText, and the row's way in.
     expect(within(alpha).getByRole('link', { name: 'Alpha plan' })).toHaveAttribute(
       'href',
       '#/plan/alpha/phases',
     );
-    // 3 — the line, as labelled stations.
-    const line = within(alpha).getByRole('list', { name: /Alpha plan: 2 of 6 phases done/ });
-    expect(
-      within(line)
-        .getAllByRole('listitem')
-        .map((li) => li.textContent),
-    ).toEqual(['2 done', 'P3 in progress', 'P4 next up', '2 left']);
+    // 3 — the line, drawn in proportion (#360): every bucket a segment the
+    // length of its share, the counts in words beside it and in its name.
+    const track = within(alpha).getByRole('img', {
+      name: 'Alpha plan, 6 phases: 2 done, 1 in progress, 1 next up, 1 waiting, 1 left, 25 %',
+    });
+    const segments = [...track.querySelectorAll<HTMLElement>('[data-segment]')];
+    expect(segments.map((s) => [s.dataset.segment, Number(s.dataset.count)])).toEqual([
+      ['done', 2],
+      ['in-progress', 1],
+      ['ready', 1],
+      ['waiting', 1],
+      ['rest', 1],
+    ]);
+    expect(within(alpha).getByTestId('plan-legend')).toHaveTextContent(
+      '2 done · 1 in progress · 1 next up · 1 waiting · 1 left · 25 %',
+    );
     // 4 — the work left, in sessions.
     expect(alpha).toHaveTextContent('2 sessions');
     // 5 — when it last moved.
     expect(within(alpha).getByText(/ago$/)).toBeInTheDocument();
 
-    // A person waited on leads the other row's mark — amber, the one summons.
+    // A person waited on leads the other row's mark — amber, the one summons —
+    // and the plan's own badge still stands beside it.
     const beta = rowOf('beta');
-    const mark = within(beta).getByTestId('plan-mark');
-    await waitFor(() => expect(mark).toHaveTextContent('Needs you'));
-    expect(mark).toHaveAttribute('data-attention', 'needs-you');
+    const summons = await within(beta).findByTestId('plan-attention');
+    expect(summons).toHaveTextContent('Needs you');
+    expect(summons).toHaveAttribute('data-attention', 'needs-you');
+    expect(within(beta).getByTestId('plan-mark')).toHaveAttribute('data-chrome', 'badge');
     expect(beta).toHaveTextContent('5 sessions');
+  });
+
+  it('draws a card with the plan’s badge beside the run’s word, and the same track (#360, #361)', async () => {
+    setPrefs({ plansLayout: 'cards' });
+    plans = [plan({ phases: 8, done: 3, stuck: [4], ready: [5], waiting: 2, qaFailures: [2], percent: 38 })];
+    runs = [slimRun({ phases: { '1': 'done', '2': 'running' } })];
+    mount();
+    const card = await waitFor(() => {
+      const found = document.querySelector<HTMLElement>('[data-plan-card="alpha"]');
+      if (!found) throw new Error('no card yet');
+      return found;
+    });
+    await waitFor(() => expect(within(card).getByTestId('plan-run-mark')).toHaveTextContent('Running'));
+    expect(within(card).getByTestId('plan-mark')).toHaveAttribute('data-chrome', 'badge');
+    expect(within(card).getByTestId('plan-mark')).toHaveTextContent('Active');
+    const track = within(card).getByRole('img', { name: /^Alpha plan, 8 phases: / });
+    const counts = [...track.querySelectorAll<HTMLElement>('[data-segment]')].map((s) =>
+      Number(s.dataset.count),
+    );
+    expect(counts.reduce((a, b) => a + b, 0)).toBe(8);
+    expect(within(card).getByTestId('plan-legend')).toHaveTextContent(
+      '2 done · 1 held by QA · 1 stuck · 1 next up · 2 waiting · 1 left · 38 %',
+    );
   });
 
   it('reads the slim runs, never the whole list (#234)', async () => {
@@ -371,6 +412,10 @@ describe('the toolbar — one grammar, kept in the 6.x keys (criterion 2)', () =
     fireEvent.click(screen.getByRole('switch', { name: /everything/i }));
     expect(await screen.findByRole('columnheader', { name: /Slug/ })).toBeInTheDocument();
     expect(getPrefs().everything.plans).toBe(true);
+    // The plan-status column draws the badge too (#361).
+    const cell = within(rowOf('b-recent')).getByTestId('plan-status');
+    expect(cell).toHaveAttribute('data-chrome', 'badge');
+    expect(cell).toHaveAttribute('data-status', 'active');
   });
 });
 

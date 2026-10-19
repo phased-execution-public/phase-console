@@ -16,6 +16,21 @@ Search the list, narrow it with **Filter** by kind, **Group** it by kind or not 
 activity, start or kind, and **Everything** adds every column. **Locks**, beside **Sessions** at the top,
 is every phase claim and who holds it, at `#/sessions/locks`.
 
+Above the list a strip counts the machine at a glance: the live lanes, the shells, the agents, the other
+sessions, how many wait on you, and how many accounts the live sessions spend. The list's columns are
+**Status**, **Session**, **Working on** (a lane, a shell, an agent, a QA review, a recovery or a foreign
+session), **Account**, **Model and effort**, **Progress**, **Spend**, **Context**, **Elapsed** and **Last
+heard**; **Everything** adds **Kind**, **Note**, **Began**, **Attempts**, **Turns**, **Worktree**,
+**Terminal**, **Conversation** and **Doing**. **Inspect** says **What it runs on**: the model and effort the
+session itself reported, over what it was asked for.
+
+**Locks** has a **Map** too (`#/sessions/locks?view=map`): which plan holds which repository right now,
+and for how long. Each repository is a lane, and each claim a bar from when it was taken to the end of its
+lease, painted as held, holding others up, or lapsed (hatched: still on disk, holding for no reason). A
+claim that names no repository is drawn on every lane, because it collides with everything. A ◌ at a
+claim's end is a phase waiting on it. A bar opens the claim in the panel, with the same **Release** the
+table offers.
+
 Only the middle two are processes this console holds a terminal for, so only those offer **Freeze** and
 **Stop**, and, in an open session's panel, **Close**. A
 foreign row's own address is `#/sessions/<conversation id>`, which resolves to the pty once one is

@@ -549,10 +549,15 @@ export const DECLARATION_CONSUMERS = Object.freeze(
  * caller behaves exactly as it did before the module existed. `refused` is
  * terminal and different: the policy has judged this command and will judge it
  * identically for ever, so it is journalled once and dropped from the rotation
- * rather than re-argued every minute.
- *
+ * rather than re-argued every minute. `unrunnable` (#374) is a `cmd:` ref that
+ * ran and could not start — exit 126 or 127, a script missing from the
+ * console's checkout or not executable: the proof itself cannot run, which
+ * says nothing about the thing it proves. It is polled again like `pending`
+ * (the script may land), and a check that reads it is never a rejection.
  */
-export const WATCH_STATES = Object.freeze(/** @type {const} */ (['pending', 'landed', 'unknown', 'refused']));
+export const WATCH_STATES = Object.freeze(
+  /** @type {const} */ (['pending', 'landed', 'unknown', 'refused', 'unrunnable']),
+);
 
 /**
  * Why a `lock:` watch naming the DECLARING phase's own lock is refused (#42).
@@ -1243,6 +1248,8 @@ export const SESSION_MODES = Object.freeze(
  *   - `chat` — the supervisor chat's own caps (Pro, control-tower phase 27).
  *   - `check` — the checking session's caps (control-tower phase 134, #211):
  *     12 turns and $0.50 for one item's check, never raised.
+ *   - `smoke` — the provider smoke's caps (Pro, one-pool phase 5): four turns
+ *     and $0.10 by default for one tool round trip on an API key.
  */
 export const CAP_SOURCES = Object.freeze(
   /** @type {const} */ ([

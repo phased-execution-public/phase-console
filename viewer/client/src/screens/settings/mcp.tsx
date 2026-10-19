@@ -8,11 +8,13 @@
  *
  * Registered servers                                   Re-check all
  * ● Connected   GitHub  github      http · 41 tools · checked 4 min ago   Switch off
- * ● Needs sign-in   Linear  linear   http · never checked                 Switch on
+ * ● Needs sign-in   Linear  linear   http · never checked                 Sign in
+ * ● Failed   Filesystem  filesystem  stdio · needs MCP_FS_ROOT            Fill it in
  *   ▾ https://mcp.linear.app/sse
  *     Name  [ Linear      ]  Rename
  *     Sign in for  [ This console ▾ ]  Sign in
- *     Remove
+ *     Switch off · Remove
+ *                                                       [ Add by hand ]
  *
  * When a server cannot be reached
  * When one of a phase's servers cannot be reached   [ continue ▾ ]
@@ -27,9 +29,13 @@
  *
  * A server is ONE row that opens in place: its status, its name and id, its
  * transport, how many tools it advertises and when it was last checked, and
- * its one act (switch it on or off); opened, everything else — the command,
- * what changed in its tools, the secrets it holds, its name, the sign-in and
- * the account it signs in for, and Remove.
+ * its one act — the one it most needs (`rowAct`): *Switch on* when it is off,
+ * *Fill it in* when its command names a `${VAR}` nothing supplies (#363),
+ * *Sign in* when it signs in with OAuth and is not connected (#372), else
+ * *Switch off*; opened, everything else — the command, what changed in its
+ * tools, the secrets it holds, its name, the sign-in and the account it signs
+ * in for, Switch off and Remove. *Sign in* opens the guided sheet
+ * (`./mcp-signin`), and *Add by hand* (`./mcp-manual`) registers any server.
  *
  * Signing in for an account (`accountId`, a PROFILE account) puts the token in
  * that account's config dir, so the runs that spend it see the server signed
@@ -41,19 +47,20 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { MCP_POLICIES } from '@shared/run-lifecycle.js';
 import { useAccounts } from '@/data/accounts';
-import { api, type McpLoginStart, type McpServerView } from '@/data/api';
+import { api, type McpServerView } from '@/data/api';
 import { keys } from '@/data/keys';
 import { useMcp } from '@/data/mcp';
 import { useRoute } from '@/shell/router';
-import { navigate, sessionsHref, settingsHref } from '@/shell/routes';
+import { settingsHref } from '@/shell/routes';
 import { SectionNav } from '@/shell/section-nav';
 import { Banner, Button, Empty, Input, Label, Mono, RelativeTime, Row, Skeleton, toast } from '@/ui';
 import { ConfirmButton } from '@/ui/confirm';
-import { CopyButton } from '@/ui/copy-button';
 import { Dialog, DialogContent } from '@/ui/dialog';
 import { NativeSelect } from '@/ui/native-select';
 import { McpStatus } from '@/ui/status';
 import { McpCatalog } from './mcp-catalog';
+import { FillVarsDialog, ManualAddDialog } from './mcp-manual';
+import { SignInSheet } from './mcp-signin';
 import { SettingsGroup, WordSetting, failureWords, useSetting } from './setting';
 
 /** How many servers is a working number, per the ecosystem's own experience. */
@@ -81,6 +88,19 @@ const POLICY_WORDS: Readonly<Record<string, string>> = {
 /** Cannot be reached at all — as opposed to reachable but drifted. */
 export function cannotConnect(server: Pick<McpServerView, 'status'>): boolean {
   return server.status === 'needs-auth' || server.status === 'failed';
+}
+
+/** It signs in with OAuth through a transport the CLI can bridge. */
+export function signable(server: Pick<McpServerView, 'transport' | 'auth'>): boolean {
+  return SIGNABLE_TRANSPORTS.includes(server.transport) && server.auth.kind === 'oauth';
+}
+
+/** The one act a row offers — the one the server most needs (#363, #372). */
+export function rowAct(server: McpServerView): 'switch-on' | 'fill' | 'sign-in' | 'switch-off' {
+  if (!server.enabled) return 'switch-on';
+  if (server.needsConfig?.length) return 'fill';
+  if (signable(server) && server.status !== 'connected') return 'sign-in';
+  return 'switch-off';
 }
 
 /** One server's facts on its row, in words: switched off, transport, tools. */
@@ -130,16 +150,33 @@ export function McpServersSection() {
   // shipped `continue` boards without it; only `require` parks.
   const consequence =
     policy.value === 'require' ? 'will park at boarding' : 'will run without it and record an errand';
+  const [signingIn, setSigningIn] = useState<McpServerView | null>(null);
 
   return (
     <div className="flex min-w-0 flex-col gap-6" data-testid="mcp-settings">
       {unreachable.length > 0 && (
         <Banner severity="error">
-          {unreachable.length === 1
-            ? `${unreachable[0]!.label} cannot be reached — a phase naming it ${consequence}.`
-            : `${unreachable.length} servers cannot be reached — a phase naming one ${consequence}.`}
+          <span className="flex min-w-0 flex-col gap-2" data-testid="mcp-unreachable">
+            <span>
+              {unreachable.length === 1
+                ? `${unreachable[0]!.label} cannot be reached — a phase naming it ${consequence}.`
+                : `${unreachable.map((server) => server.label).join(', ')} cannot be reached — a phase naming one ${consequence}.`}
+            </span>
+            {allowed && unreachable.some((server) => rowAct(server) === 'sign-in') && (
+              <span className="flex min-w-0 flex-wrap gap-2">
+                {unreachable
+                  .filter((server) => rowAct(server) === 'sign-in')
+                  .map((server) => (
+                    <Button key={server.id} size="sm" onClick={() => setSigningIn(server)}>
+                      Sign in to {server.label}
+                    </Button>
+                  ))}
+              </span>
+            )}
+          </span>
         </Banner>
       )}
+      {signingIn && <SignInSheet server={signingIn} onClose={() => setSigningIn(null)} />}
       {drifted.length > 0 && (
         <Banner severity="warn">
           {drifted.length === 1
@@ -194,6 +231,7 @@ function Registry({
   attached: number;
 }) {
   const { busy, run } = usePresses();
+  const [manual, setManual] = useState(false);
   const recheck = (
     <Button
       size="sm"
@@ -226,9 +264,16 @@ function Registry({
         <Empty
           title="No server is registered: sessions here run with this machine’s own MCP configuration."
           action={
-            <Button size="sm" asChild>
-              <a href={settingsHref('mcp', { tab: 'catalog' })}>Open the catalog</a>
-            </Button>
+            <span className="flex flex-wrap gap-2">
+              <Button size="sm" asChild>
+                <a href={settingsHref('mcp', { tab: 'catalog' })}>Open the catalog</a>
+              </Button>
+              {allowed && (
+                <Button size="sm" variant="ghost" onClick={() => setManual(true)}>
+                  Add by hand
+                </Button>
+              )}
+            </span>
           }
         />
       ) : (
@@ -244,8 +289,21 @@ function Registry({
               <ServerRow key={server.id} server={server} allowed={allowed} />
             ))}
           </div>
+          {allowed && (
+            <span className="flex flex-wrap items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={() => setManual(true)}>
+                Add by hand
+              </Button>
+              <span className="text-meta text-ink-muted">
+                Any server — not only the catalog’s.{' '}
+                <code className="font-mono">phase-console mcp add --manual</code> does the same from a
+                terminal.
+              </span>
+            </span>
+          )}
         </>
       )}
+      {manual && <ManualAddDialog onClose={() => setManual(false)} />}
       {!allowed && (
         <p className="max-w-(--measure) text-meta text-ink-muted">
           {NEEDS_FLAG} Reading the registry, the statuses and the catalog works without it.
@@ -257,80 +315,79 @@ function Registry({
 
 function ServerRow({ server, allowed }: { server: McpServerView; allowed: boolean }) {
   const { busy, run } = usePresses();
+  const [signingIn, setSigningIn] = useState(false);
+  const [filling, setFilling] = useState(false);
+  const act = rowAct(server);
   return (
-    <Row
-      data-mcp-server={server.id}
-      mark={<McpStatus status={server.status} />}
-      name={
-        <span className="flex min-w-0 items-baseline gap-2">
-          <span className="min-w-0 truncate">{server.label}</span>
-          <Mono value={server.id} className="min-w-0 truncate text-meta text-ink-muted" />
-        </span>
-      }
-      fact={serverFact(server)}
-      clock={
-        server.checkedAt ? (
-          <>
-            checked <RelativeTime at={server.checkedAt} />
-          </>
-        ) : (
-          'never checked'
-        )
-      }
-      action={
-        allowed ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={busy !== null}
-            onClick={() => void run('toggle', () => api.mcpPatch(server.id, { enabled: !server.enabled }))}
-          >
-            {server.enabled ? 'Switch off' : 'Switch on'}
-          </Button>
-        ) : undefined
-      }
-      expandLabel={`details of ${server.label}`}
-    >
-      <ServerDetails server={server} allowed={allowed} />
-    </Row>
+    <>
+      {signingIn && <SignInSheet server={server} onClose={() => setSigningIn(false)} />}
+      {filling && <FillVarsDialog server={server} onClose={() => setFilling(false)} />}
+      <Row
+        data-mcp-server={server.id}
+        mark={<McpStatus status={server.status} />}
+        name={
+          <span className="flex min-w-0 items-baseline gap-2">
+            <span className="min-w-0 truncate">{server.label}</span>
+            <Mono value={server.id} className="min-w-0 truncate text-meta text-ink-muted" />
+          </span>
+        }
+        fact={serverFact(server)}
+        clock={
+          server.checkedAt ? (
+            <>
+              checked <RelativeTime at={server.checkedAt} />
+            </>
+          ) : (
+            'never checked'
+          )
+        }
+        action={
+          !allowed ? undefined : act === 'sign-in' ? (
+            <Button
+              size="sm"
+              disabled={busy !== null}
+              onClick={() => setSigningIn(true)}
+              data-row-act="sign-in"
+            >
+              Sign in
+            </Button>
+          ) : act === 'fill' ? (
+            <Button size="sm" disabled={busy !== null} onClick={() => setFilling(true)} data-row-act="fill">
+              Fill it in
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={busy !== null}
+              data-row-act={act}
+              onClick={() => void run('toggle', () => api.mcpPatch(server.id, { enabled: !server.enabled }))}
+            >
+              {server.enabled ? 'Switch off' : 'Switch on'}
+            </Button>
+          )
+        }
+        expandLabel={`details of ${server.label}`}
+      >
+        <ServerDetails server={server} allowed={allowed} onFill={() => setFilling(true)} />
+      </Row>
+    </>
   );
 }
 
-/** What a sign-in the console could not run needs instead, kept until it works. */
-interface ByHand {
-  detail?: string | undefined;
-  commands: string[];
-  configDir?: string | undefined;
-  accountLabel?: string | undefined;
-}
-
-function ServerDetails({ server, allowed }: { server: McpServerView; allowed: boolean }) {
+function ServerDetails({
+  server,
+  allowed,
+  onFill,
+}: {
+  server: McpServerView;
+  allowed: boolean;
+  onFill: () => void;
+}) {
   const { busy, run } = usePresses();
   const [secretFor, setSecretFor] = useState<string | null>(null);
-  const [byHand, setByHand] = useState<ByHand | null>(null);
-  const signable = SIGNABLE_TRANSPORTS.includes(server.transport) && server.auth.kind === 'oauth';
-
-  const signedIn = (started: McpLoginStart) => {
-    if (started.mode === 'embedded' && started.terminal) {
-      setByHand(null);
-      toast('Finish the sign-in in the terminal that just opened.', 'info');
-      navigate(sessionsHref(started.terminal.sessionId));
-      return;
-    }
-    if (started.mode === 'external') {
-      setByHand(null);
-      toast('A terminal opened — finish the sign-in there.', 'info');
-      return;
-    }
-    // No flow could start: the commands that would, kept on the row until the
-    // sign-in works — a toast is gone before anybody can read a command.
-    setByHand({
-      detail: started.detail,
-      commands: started.commands?.length ? started.commands : [started.command],
-      configDir: started.configDir,
-      accountLabel: started.accountLabel,
-    });
-  };
+  const [signIn, setSignIn] = useState<{ accountId: string } | null>(null);
+  const act = rowAct(server);
 
   return (
     <div className="flex min-w-0 flex-col gap-4 pb-2" data-mcp-details={server.id}>
@@ -340,8 +397,17 @@ function ServerDetails({ server, allowed }: { server: McpServerView; allowed: bo
       {server.issue && <Banner severity="error">{server.issue}</Banner>}
       {server.needsConfig?.length ? (
         <Banner severity="warn">
-          Its command refers to {server.needsConfig.join(', ')}, which nothing supplies, so it can never
-          connect. Register it again with the value filled in.
+          <span className="flex min-w-0 flex-col gap-2">
+            <span>
+              Its command refers to {server.needsConfig.join(', ')}, which nothing supplies, so it cannot
+              connect until {server.needsConfig.length === 1 ? 'it is' : 'they are'} filled in.
+            </span>
+            {allowed && (
+              <Button size="sm" className="self-start" onClick={onFill}>
+                Fill it in
+              </Button>
+            )}
+          </span>
         </Banner>
       ) : null}
       {server.toolsChanged && (
@@ -409,16 +475,27 @@ function ServerDetails({ server, allowed }: { server: McpServerView; allowed: bo
       {allowed ? (
         <div className="flex min-w-0 flex-col gap-4">
           <RenameServer server={server} busy={busy} run={run} />
-          {signable && (
-            <SignIn
+          {signable(server) && (
+            <SignIn server={server} busy={busy} onSignIn={(accountId) => setSignIn({ accountId })} />
+          )}
+          {signIn && (
+            <SignInSheet
               server={server}
-              busy={busy}
-              onSignIn={(accountId) =>
-                void run('login', () => api.mcpLogin(server.id, accountId ? { accountId } : {}), signedIn)
-              }
+              {...(signIn.accountId ? { accountId: signIn.accountId } : {})}
+              onClose={() => setSignIn(null)}
             />
           )}
-          {byHand && <ByHandPanel server={server} byHand={byHand} onDismiss={() => setByHand(null)} />}
+          {act !== 'switch-off' && act !== 'switch-on' && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="self-start"
+              disabled={busy !== null}
+              onClick={() => void run('toggle', () => api.mcpPatch(server.id, { enabled: false }))}
+            >
+              Switch off
+            </Button>
+          )}
           <ConfirmButton
             size="sm"
             variant="ghost"
@@ -549,50 +626,6 @@ function SignIn({
         {profiles.length
           ? 'The token lands in that account’s own config dir, so the runs that spend it see the server signed in. This console’s own is what its health check reads.'
           : 'The token lands in this console’s own config dir, which its health check reads. A profile account added under Accounts can be signed in for too.'}
-      </span>
-    </div>
-  );
-}
-
-function ByHandPanel({
-  server,
-  byHand,
-  onDismiss,
-}: {
-  server: McpServerView;
-  byHand: ByHand;
-  onDismiss: () => void;
-}) {
-  const commands = byHand.commands.join('\n');
-  return (
-    <div className="flex min-w-0 flex-col gap-2 border-s-2 border-s-rule ps-3" role="status">
-      <p className="text-body text-ink">This console cannot run the sign-in for {server.label}.</p>
-      {byHand.detail && <p className="text-meta text-ink-muted">{byHand.detail}</p>}
-      {byHand.commands.length > 0 && (
-        <>
-          <p className="max-w-(--measure) text-meta text-ink-muted">
-            Run {byHand.commands.length > 1 ? 'these' : 'this'} in a terminal, then re-check.
-            {byHand.configDir && (
-              <>
-                {' '}
-                The token lands in <code className="wrap-anywhere font-mono">{byHand.configDir}</code>
-                {byHand.accountLabel ? `, ${byHand.accountLabel}’s config dir.` : '.'}
-              </>
-            )}
-          </p>
-          <pre
-            dir="ltr"
-            className="whitespace-pre-wrap wrap-anywhere rounded bg-ground p-2 font-mono text-meta text-ink"
-          >
-            {commands}
-          </pre>
-        </>
-      )}
-      <span className="flex flex-wrap gap-2">
-        {byHand.commands.length > 0 && <CopyButton text={commands} label="Copy the commands" />}
-        <Button size="sm" variant="ghost" onClick={onDismiss}>
-          Dismiss
-        </Button>
       </span>
     </div>
   );

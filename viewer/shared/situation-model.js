@@ -209,7 +209,10 @@ export const SUB_KINDS = Object.freeze({
   // turn-by-turn phase 6 (#286): a run request, `--needs run --run-act <act>` —
   // an act only the RUN can take (relaunch isolated, switch account, raise the
   // budget, stop, hold), which a session declared as `permission` and nobody
-  // could grant.
+  // could grant. `issues` joined in one-pool phase 14 (#349): the classifier's
+  // reading of a session's `--needs issues` — the manifest's question of what
+  // the run may file, label or comment outward — which fell to the prose and
+  // journalled `unknown`, so the errand never said what was asked.
   'blocked-declared': Object.freeze(
     /** @type {const} */ ([
       'lock',
@@ -220,6 +223,7 @@ export const SUB_KINDS = Object.freeze({
       'external',
       'human-acts',
       'run',
+      'issues',
       'unknown',
     ]),
   ),
@@ -243,12 +247,13 @@ export const SUB_KINDS = Object.freeze({
  * and the path (phase 41 gives it a word of its own, a human-step kind).
  * `human-acts` is its reading of the `human-acts` KEY: a session names the
  * decision key itself, and a class spelled the same as a key would be two
- * meanings for one word (control-tower phase 53, #54).
+ * meanings for one word (control-tower phase 53, #54). `issues` is its reading
+ * of the `issues` KEY for the same reason (one-pool phase 14, #349).
  * `NEED_CLASSES` (`decisions-model.js`) is `SUB_KINDS['blocked-declared']`
  * minus these.
  */
 export const CLASSIFIER_ONLY_SUB_KINDS = Object.freeze(
-  /** @type {const} */ (['unknown', 'protected-path', 'human-acts']),
+  /** @type {const} */ (['unknown', 'protected-path', 'human-acts', 'issues']),
 );
 
 /**
@@ -349,6 +354,9 @@ export const SITUATION_SUB_ACTOR = Object.freeze({
   // Acts the plan keeps for a person (#54): no rung climbs them. A person
   // does them, or hands them to the session — the Delegate act.
   'blocked-declared:human-acts': 'person',
+  // What the run may write outward — file, label, comment on an issue (#349):
+  // the manifest's `issues` row, a person's answer; no rung climbs it.
+  'blocked-declared:issues': 'person',
   'never-started:refusal': 'person',
   'never-started:skill-missing': 'person',
 });

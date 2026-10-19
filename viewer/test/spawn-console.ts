@@ -103,7 +103,11 @@ export function sandbox(label = 'console'): ConsoleSandbox {
       // it holds one, so nothing would ever end it. Swept before the directory
       // goes, because the pid file is inside it.
       try { sweepBrokers(dir); } catch { /* a leftover broker is not a test failure */ }
-      rmSync(dir, { recursive: true, force: true });
+      // A straggling write — a grandchild the console started, finishing as
+      // the walk passes it — is retried rather than failing a green test with
+      // ENOTEMPTY (#318). `endConsoles` below is what keeps the consoles
+      // themselves from being that writer.
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     },
   };
 }
@@ -181,6 +185,28 @@ export async function stopConsole(child: ChildProcess, opts: { graceMs?: number 
   if (alive()) {
     try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
   }
+}
+
+/**
+ * The teardown for consoles that share one sandbox (one-pool phase 30, #318):
+ * every console SIGKILLed and its exit AWAITED, then the box removed — in that
+ * order, from one hook. Two hooks, one killing the first console and removing
+ * the box and a later one killing the second, let the second write into the
+ * directory while `rmSync` walked it: ENOTEMPTY on a test that had passed.
+ * A child that has already exited is fine; one that will not die is waited for
+ * `graceMs` and then left to the cleanup's retries.
+ */
+export async function endConsoles(
+  box: ConsoleSandbox, children: ChildProcess[], opts: { graceMs?: number } = {},
+): Promise<void> {
+  const graceMs = opts.graceMs ?? 5000;
+  await Promise.all(children.map((child) => new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+    const timer = setTimeout(resolve, graceMs);
+    child.once('exit', () => { clearTimeout(timer); resolve(); });
+    try { child.kill('SIGKILL'); } catch { clearTimeout(timer); resolve(); }
+  })));
+  box.cleanup();
 }
 
 const DEMO_PLAN = `---

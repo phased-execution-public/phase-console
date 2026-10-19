@@ -1,12 +1,15 @@
 /**
  * *Where the plans stand* (turn-by-turn phase 9, §Architecture 7): for every
- * plan the open items name, one line — how many of its phases are done, the
- * phase it is on now, the phase it can take next, and how many of its items
- * wait on you, that number a link to the page narrowed to the plan.
+ * plan the open items name, one line — its phases in proportion (the Plans
+ * page's own track, `screens/plans/track-bar.tsx`: every board bucket a
+ * segment, every count in words; #366 asked, #360 drew it), the phase it is on
+ * now, the phase it can take next, and how many of its items wait on you, that
+ * number a link to the page narrowed to the plan.
  *
  * ```
  * Where the plans stand
- * turn-by-turn   8 of 18 phases done   Now phase 9   Next phase 10   2 wait on you
+ * turn-by-turn   ████████▌▐▒▒▒▒▒▒   Now phase 9   Next phase 10   2 wait on you
+ *                8 done · 1 in progress · 1 next up · 8 waiting · 44 %
  * ```
  *
  * The board's facts are the plans list's (`GET /api/plans`, the same answer
@@ -21,6 +24,8 @@ import type { TurnAnswer } from '@/data/turn';
 import { usePlans } from '@/data/plans';
 import { phaseHref, planHref } from '@/shell/routes';
 import { SectionHeading } from '@/ui';
+import { toRows, type PlanRow } from '@/screens/plans/model';
+import { PlanTrack } from '@/screens/plans/track-bar';
 import { TURN_OPEN_GROUPS } from '@shared/turn-model.js';
 
 const link = 'tap-row text-ink underline decoration-rule-strong underline-offset-2 hover:decoration-ink';
@@ -33,6 +38,8 @@ export type PlanStanding = {
   now: number[];
   next: number[];
   waiting: number;
+  /** The plan as the Plans page resolves it — what the track draws. Absent for a plan the list does not know. */
+  row?: PlanRow;
 };
 
 /**
@@ -61,6 +68,9 @@ export function plansStanding(
       now: numbers(plan?.inProgress),
       next: numbers(plan?.ready),
       waiting: count,
+      ...(plan && typeof plan.phases === 'number'
+        ? { row: toRows([{ ...plan, slug, title: plan.title ?? slug } as PlanSummaryFull])[0] }
+        : {}),
     };
   });
 }
@@ -115,7 +125,9 @@ export function PlansStrip({
             <a className={`${link} font-medium`} href={planHref(plan.slug)}>
               {plan.slug}
             </a>
-            {plan.done != null && plan.phases != null ? (
+            {plan.row && plan.row.phases > 0 ? (
+              <PlanTrack row={plan.row} className="w-full min-w-60 max-w-md sm:w-auto sm:flex-1" />
+            ) : plan.done != null && plan.phases != null ? (
               <span className="text-ink-muted tabular-nums">
                 {plan.done} of {plan.phases} phases done
               </span>

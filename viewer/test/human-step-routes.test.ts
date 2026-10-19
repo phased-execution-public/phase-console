@@ -273,12 +273,12 @@ test('HR-6 — check on a landed proof: proven, journalled, and the SAME session
     const checked = await call(h.svc, 'POST', `/api/human-steps/${step.id}/check`);
     assert.equal(checked.status, 200);
     // Since phase 134 the check answers its verdict too: passed, by the probe, attempt 1.
-    assert.deepEqual(checked.body.check, { landed: true, read: 'landed — exit 0', state: 'passed', by: 'probe', attempt: 1, ref: 'cmd:"gh auth status"' });
+    assert.deepEqual(checked.body.check, { landed: true, read: 'it holds (the check exited 0)', state: 'passed', by: 'probe', attempt: 1, ref: 'cmd:"gh auth status"' });
     assert.deepEqual(checked.body.resumed, { launched: true });
     assert.equal(h.svc.humanStepsNow().get(step.id)!.state, 'proven');
     assert.equal(h.resumed.length, 1, 'one resume');
     assert.equal(h.resumed[0].mode, 'resume', 'of the phase\'s OWN session');
-    assert.match(String(h.resumed[0].instruction), /person's turn this phase declared is done: a person's turn is PROVEN — Sign in in a browser: "Sign the gh CLI in to the acme org"; proof cmd:"gh auth status" read: landed — exit 0/);
+    assert.match(String(h.resumed[0].instruction), /person's turn this phase declared is done: a person's turn is PROVEN — Sign in in a browser: "Sign the gh CLI in to the acme org"; proof cmd:"gh auth status" read: it holds \(the check exited 0\)/);
     const lines = journal(h.root, state);
     const proven = lines.filter((l) => l.event === 'phase.human-step-proven');
     assert.equal(proven.length, 1);
@@ -303,7 +303,8 @@ test('HR-7 — check on an unlanded proof answers what it read, in its own words
     assert.equal(checked.status, 200);
     const check = checked.body.check as { landed: boolean; read: string };
     assert.equal(check.landed, false);
-    assert.equal(check.read, 'pending — exit 1: You are not logged into any GitHub hosts', 'the proof\'s own words');
+    // Said in words since #368 (ce96d082): never a watch-state word — the proof's own output is kept.
+    assert.equal(check.read, 'not yet (exit 1: You are not logged into any GitHub hosts)', 'the proof\'s own words');
     const now = h.svc.humanStepsNow().get(step.id)!;
     assert.equal(now.state, 'returned', 'sent back — a miss is a rejection (phase 134)');
     assert.equal(now.verdict?.state, 'rejected');

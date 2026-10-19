@@ -89,7 +89,8 @@ test('the route the server still mints lands on the phase table, carrying its vi
   // tab's `map` view — and `qa` and `handoffs` become their views of the same
   // table — so a redirect keeps what the address MEANT, not only where it went.
   const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
-  assert.deepEqual(PLAN_TABS, ['phases', 'run', 'source']);
+  // Four since one-pool phase 14 (#366): Your turn scoped to the plan.
+  assert.deepEqual(PLAN_TABS, ['phases', 'run', 'turn', 'source']);
   assert.deepEqual(legacy.route, { tab: 'phases', view: 'map' });
   assert.deepEqual(legacy.qa, { tab: 'phases', view: 'qa' });
   assert.deepEqual(legacy.handoffs, { tab: 'phases', view: 'handoffs' });
@@ -110,7 +111,7 @@ test('each plan view names its readings, and the live run is the run view with n
   // 7.0 (quiet-console phase 10): the Run view gains a history reading beside
   // the live run. `live` leads, so `#/plan/<slug>/run` — the address every
   // in-flight push carries — still opens on the run as it is now.
-  assert.deepEqual(PLAN_PHASE_VIEWS, ['table', 'map', 'qa', 'handoffs']);
+  assert.deepEqual(PLAN_PHASE_VIEWS, ['table', 'map', 'qa', 'handoffs', 'schedule', 'burnup']);
   assert.deepEqual(PLAN_RUN_VIEWS, ['live', 'history']);
   const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
   for (const [id, to] of Object.entries(legacy)) {
@@ -138,30 +139,25 @@ test('the heads 6.0 retired still resolve, and an address that names nothing lan
   assert.ok(DESTINATIONS.includes(DEFAULT_HEAD), `DEFAULT_HEAD '${DEFAULT_HEAD}' must be a destination`);
 });
 
-test('Your turn is a head, the old answer page still resolves, and the destinations are the seven of 7.0', () => {
-  // Control-tower phase 137 (#214, §Architecture 19): the page is a HEAD that
-  // lights Runs, never an eighth destination — "does anything need me?" already
-  // has a home, and the phone's four tab slots are spoken for. `#/approve` is
-  // where every step push landed for a month and every link in the wild still
-  // says it, so it stays a head (a redirect onto `#/turn`).
+test('Your turn is a destination, the old answer page still resolves, and the destinations are the eight of 8.0', () => {
+  // Control-tower phase 137 (#214) made the page a HEAD that lit Runs; one-pool
+  // phase 14 (#366) made it a destination of its own, the second of the work
+  // band, in both editions. `#/approve` is where every step push landed for a
+  // month and every link in the wild still says it, so it stays a head (a
+  // redirect onto `#/turn`), and never a destination.
   assert.ok(isRouteHead('turn'), "'turn' must be a route head");
   assert.ok(isRouteHead('approve'), "'approve' is in pushes already on phones and must keep resolving");
-  assert.ok(!DESTINATIONS.includes('turn'), 'Your turn lights Runs; it is not a destination of its own');
+  assert.ok(DESTINATIONS.includes('turn'), 'Your turn is a destination of its own since one-pool phase 14');
   assert.ok(!DESTINATIONS.includes('approve'), "'approve' was never a destination");
-  // 7.0 (quiet-console phase 3): Debug became Logs, and the seven are the SAME
+  // 7.0 (quiet-console phase 3): Debug became Logs, and the places are the SAME
   // in both editions — Pro adds no destination. The Supervisor is the right
   // panel's second mode (and `#/chat` on a phone), Fleet opens from the
   // instance switcher, and `debug` lands on `#/logs`: each stays a head,
   // because an address that was ever in a bookmark, a push or a handoff keeps
   // resolving, and none is a place the rail lists.
-  const seven = ['runs', 'plans', 'sessions', 'repo', 'insights', 'logs', 'settings'];
-  assert.deepEqual(DESTINATIONS.filter((head) => seven.includes(head)), seven, 'the seven, in their order');
-  assert.deepEqual(
-    DESTINATIONS.filter((head) => !seven.includes(head)),
-    [],
-    'nothing beside the seven, in either edition',
-  );
-  const heads = ['debug', 'turn', 'approve', 'queue'];
+  const eight = ['runs', 'turn', 'plans', 'sessions', 'repo', 'insights', 'logs', 'settings'];
+  assert.deepEqual([...DESTINATIONS], eight, 'the eight, in their order, and nothing beside them in either edition');
+  const heads = ['debug', 'approve', 'queue'];
   for (const head of heads) {
     assert.ok(isRouteHead(head), `'${head}' must stay a route head`);
     assert.ok(!DESTINATIONS.includes(head), `'${head}' is a head, not a destination, since 7.0`);

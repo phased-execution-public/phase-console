@@ -336,6 +336,34 @@ describe('the run row’s datum ledger — every fact within two interactions', 
     expect(within(strip).getByTestId('halt-recommended')).toBeTruthy();
   });
 
+  it('a run that parked with its stop on a PHASE record still shows the halt card (#305)', () => {
+    // The runner parks on a red verification with `run.halt` null and the stop
+    // on the phase's own record; the Run view drew it, the Runs home did not.
+    const parked = {
+      ...busy,
+      id: 'r-parked',
+      slug: 'checkout',
+      status: 'parked',
+      children: {},
+      verifying: {},
+      halt: null,
+      phases: {
+        ...busy.phases,
+        3: {
+          ...busy.phases['3']!,
+          status: 'failed',
+          sessionId: 's3',
+          halt: { at: iso(NOW - 12 * MIN), kind: 'verify-failed', reason: 'red' },
+        },
+      },
+    } as unknown as RunState;
+    const strip = mount(parked);
+    expandStrips(strip);
+    const card = within(strip).getByTestId('halt-card');
+    expect(card).toHaveAttribute('data-halt-category', 'verification');
+    expect(card).toHaveTextContent('phase 3');
+  });
+
   it('a terminal holding the line is released, and an unbumped entry bumped, one press in', () => {
     const entry = {
       ...ENTRY,

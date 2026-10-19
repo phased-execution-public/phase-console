@@ -82,7 +82,7 @@ Install the phased-execution skill for me, and ask before each step.
                       for hours — the widest of the eight, say so plainly
      --allow-terminal a real shell in the browser, running as me
      --allow-agent    interactive claude sessions and the New-plan wizard
-     --allow-accounts register Claude accounts and switch between them mid-run
+     --allow-accounts register Claude accounts and pick one per run (a switch is --allow-run's)
      --allow-mcp      register MCP servers and attach them to plans and phases
      --allow-webhooks POST every announcement to a Slack/Discord/Telegram URL
      --allow-publish  push a finished phase's pe/* branch, never a trunk or forced
@@ -148,10 +148,9 @@ The long version, including push notifications and exactly what is enforced → 
 [QA gating](docs/qa-gating.md) · [Safety rails](docs/safety-rails.md) · [Phase Console](docs/console.md) · [Metrics](docs/metrics.md) ·
 [Install by hand](docs/install.md) · [Versioning & releases](docs/releasing.md) · [Reference](docs/reference.md)
 
-7.1 tells your turn step by step. Every act only you can do is one card on **Your turn** (`#/turn`) — an approval, a task, a decision or a heads-up —
-with why only you, numbered steps, NOW or NOT YET, a timing grid, where your press goes and how it is checked, *Undo* and *Hand it back*; an act only
-the run can take is one approval per run, and an item the run moved past closes itself. 6.2 brought that page, a grant with a scope and an end for a
-permission the AI lacks, an optional **owner key** and *Handled by the AI*; 6.1 the Issues desk and waits on another machine's job.
+8.0 makes **Your turn** (`#/turn`) a destination of its own and every plan's fourth view, gives a plan's map its tools,
+a Schedule and a Burn-up, and walls the console's own git off from what a session writes in its tree. What 7.1, 6.2
+and 6.1 added is in **[docs/console.md](docs/console.md)**, *What each release added*.
 
 
 Needs Claude Code, plus `bash` and `git`. The console adds Node 22.18+ (or 23.6+) and has **no runtime dependencies**.

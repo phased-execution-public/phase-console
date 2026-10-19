@@ -23,6 +23,8 @@ import { describe, expect, it } from 'vitest';
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const THEME = readFileSync(here('./theme.css'), 'utf8');
+/** The second palette, Departures (#362) — measured with the same arithmetic. */
+const DEPARTURES = readFileSync(here('./departures.css'), 'utf8');
 const INDEX_HTML = readFileSync(here('../../index.html'), 'utf8');
 const MANIFEST = JSON.parse(readFileSync(here('../../public/manifest.webmanifest'), 'utf8')) as {
   background_color: string;
@@ -84,8 +86,8 @@ export const inGamut = (colour: Oklch): boolean =>
 const OKLCH_RE = /oklch\(([\d.]+)%\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*[\d.]+%?)?\)/g;
 
 /** `--token: light-dark(oklch(…), oklch(…))` → both themes, or null. */
-function pair(token: string): { paper: Oklch; night: Oklch } | null {
-  const line = THEME.split('\n').find((l) => l.trim().startsWith(`${token}:`));
+function pair(token: string, sheet: string = THEME): { paper: Oklch; night: Oklch } | null {
+  const line = sheet.split('\n').find((l) => l.trim().startsWith(`${token}:`));
   if (!line) return null;
   const colours = [...line.matchAll(OKLCH_RE)].map(([, L, C, h]) => ({
     L: Number(L) / 100,
@@ -269,4 +271,41 @@ describe('tokens 6.0: the focus ring and the primary button are ink, and read', 
       expect(ratio, `ground on action (${theme}): ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
     }
   });
+});
+
+describe('the second palette, Departures, clears AA in both lights (#362)', () => {
+  /** A room token as Departures paints it: its own value where it re-declares one, else the shared one. */
+  const room = (token: string) => pair(token, DEPARTURES) ?? pair(token)!;
+  for (const theme of THEMES) {
+    for (const state of STATES) {
+      const colours = pair(`--status-${state}`)!;
+      for (const surface of TEXT_SURFACES) {
+        it(`${state} as text on ${surface} (${theme}) ≥ 4.5:1`, () => {
+          const ratio = contrast(colours[theme], room(surface)[theme]);
+          expect(ratio, `${state} on ${surface} ${theme}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+        });
+      }
+      for (const surface of MARK_SURFACES) {
+        it(`${state} as a mark against ${surface} (${theme}) ≥ 3:1`, () => {
+          const ratio = contrast(colours[theme], room(surface)[theme]);
+          expect(ratio, `${state} against ${surface} ${theme}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(
+            3,
+          );
+        });
+      }
+    }
+    it(`every ink clears 4.5:1 on every surface (${theme})`, () => {
+      for (const ink of ['--ink', '--ink-muted', '--ink-faint']) {
+        for (const surface of TEXT_SURFACES) {
+          const ratio = contrast(room(ink)[theme], room(surface)[theme]);
+          expect(ratio, `${ink} on ${surface} ${theme}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    });
+    it(`every room colour stays inside sRGB (${theme})`, () => {
+      for (const token of [...TEXT_SURFACES, ...MARK_SURFACES, '--ink', '--ink-muted', '--ink-faint']) {
+        expect(inGamut(room(token)[theme]), `${token} ${theme}`).toBe(true);
+      }
+    });
+  }
 });

@@ -162,6 +162,22 @@ describe('what the worker does answer for', () => {
   });
 });
 
+describe('the build check the page makes before it mounts (one-pool phase 18, #373)', () => {
+  test('`/.build-rev` is the server’s, never a cached copy — the worker leaves it to the network', () => {
+    expect(intercepted(`${ORIGIN}/.build-rev`)).toBe(false);
+  });
+
+  test('the shell is cached under `phase-shell-` — the prefix `lib/pwa.ts` drops when no new worker can take over', async () => {
+    const install = listeners.get('install');
+    expect(install, 'the worker registers an install listener').toBeDefined();
+    let work: Promise<unknown> = Promise.resolve();
+    install!({ waitUntil: (p: Promise<unknown>) => (work = p) });
+    await work.catch(() => undefined);
+    const open = (globalThis.caches as unknown as { open: { mock: { calls: [string][] } } }).open;
+    expect(open.mock.calls.some(([name]) => name.startsWith('phase-shell-'))).toBe(true);
+  });
+});
+
 describe('the guards above the routing', () => {
   test('a non-GET request is never intercepted, whatever its path', () => {
     for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']) {

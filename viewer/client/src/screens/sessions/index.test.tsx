@@ -193,6 +193,8 @@ let state: ConsoleState;
 let terminals: TerminalState;
 let registry: ForeignSession[];
 let runs: unknown[];
+/** What `GET /api/run/<slug>` answers — a live run's whole record (#369). */
+let runDetail: unknown;
 let approvals: unknown[];
 let locks: unknown[];
 let sent: Sent[];
@@ -213,6 +215,7 @@ function answer(call: Sent): unknown {
   if (path === '/api/terminal') return call.method === 'POST' ? mint(call.body ?? {}) : terminals;
   if (path === '/api/sessions/registry') return { sessions: registry };
   if (path === '/api/runs') return runs;
+  if (path?.startsWith('/api/run/')) return runDetail;
   if (path === '/api/approvals') return approvals;
   if (path === '/api/locks') return { rows: locks };
   if (path === '/api/plans') return [];
@@ -240,6 +243,7 @@ beforeEach(() => {
   terminals = listOf(SHELL);
   registry = [];
   runs = [];
+  runDetail = {};
   approvals = [];
   locks = [];
   sent = [];
@@ -600,6 +604,47 @@ describe('what it reads', () => {
     expect(reads('/api/approvals')).not.toHaveLength(0);
     expect(reads('/api/sessions/registry')).not.toHaveLength(0);
     expect(reads('/api/terminal')).not.toHaveLength(0);
+  });
+
+  it("reads each live run's whole record once, and the lane's row and the strip say what it holds (#369)", async () => {
+    runs = [slimRun()];
+    runDetail = {
+      run: {
+        id: 'r1',
+        slug: 'quiet-console',
+        phases: {
+          '15': {
+            phase: 15,
+            status: 'running',
+            attempts: 1,
+            costUsd: 2,
+            actualModel: 'claude-opus-5-5',
+            effort: 'high',
+            sessionAccountId: 'acct-b',
+            tasks: [
+              { id: 't1', content: 'one', status: 'completed' },
+              { id: 't2', content: 'two', status: 'pending' },
+            ],
+          },
+        },
+      },
+      history: [],
+      eta: null,
+    };
+    mount();
+
+    const lane = await waitFor(() => {
+      const row = document.querySelector<HTMLElement>('[data-session-row="lane:r1#15"]');
+      expect(row).toHaveTextContent('$2.00');
+      return row!;
+    });
+    expect(within(lane).getByRole('meter', { name: 'Tasks done' })).toHaveAttribute('aria-valuenow', '1');
+    expect(lane).toHaveTextContent('claude-opus-5-5');
+    // One read per live run — not the whole list (#234).
+    expect(reads('/api/run/quiet-console').length).toBeGreaterThan(0);
+    expect(reads('/api/runs')).toEqual([]);
+    expect(screen.getByTestId('sessions-strip-lanes')).toHaveTextContent('1 live lane');
+    expect(screen.getByTestId('sessions-strip-accounts')).toHaveTextContent('1 account in use');
   });
 
   it('marks the lane a pending permission card names as waiting on a person', async () => {

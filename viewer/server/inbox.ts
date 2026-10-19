@@ -115,7 +115,8 @@ import { isPersonErrand } from '../shared/recovery-model.js';
 import { itemOfErrand, ledgerTurn, turnOf, withRowWords, type TurnView } from './turn/fold.ts';
 import { isRunRequestOf } from './turn/run-requests.ts';
 import {
-  actTitle, composeErrandTitle, composeStepRow, boundToRun, gateOption, identityAsk, stepGateOf, supervisorTitle, type ApprovalBlock, type AskFacts, type TurnOption,
+  actTitle, composeErrandTitle, composeStepRow, boundToRun, gateOption, identityAsk, shortTitle, stepGateOf, supervisorTitle, type ApprovalBlock, type AskFacts,
+  type TurnOption,
 } from './turn/compose.ts';
 import { askFor, askOptionsFor, type BoundAskOption } from './runner/ladder.ts';
 import { isLiveStatus } from '../shared/status-vocab.js';
@@ -273,6 +274,14 @@ export type InboxItem = {
   approval?: ApprovalBlock;
   /** The situation's card words on an errand row (`runner/ladder.ts` `askFor`) — the act, its steps, its check. */
   ask?: AskFacts;
+  /**
+   * The row's whole words when its title had to be cut to the title rule
+   * (#377, `turn/compose.ts` `shortTitle`): the title is at most 80
+   * characters, and this is what it shortened.
+   */
+  headline?: string;
+  /** The landing errand's files, grouped by repository — the card's folded *Details* (#377). */
+  files?: { repo: string; paths: string[] }[];
 };
 
 /** What a `supervisor` row carries of its card — see `InboxItem.supervisor`. */
@@ -310,6 +319,10 @@ export type InboxErrand = {
   /** An act not due yet (control-tower phase 121) — the ledger's *Coming up* row, never this one. */
   upcoming?: boolean;
   at: string;
+  /** The act in the composer's words, when the writer composed one — the landing errand's (#377). */
+  title?: string;
+  /** The landing errand's files, grouped by repository (#377). */
+  files?: readonly { repo: string; paths: readonly string[] }[];
   /** The human step the errand is (`Errand.step`, control-tower phase 44) — a protected edit's act and path. */
   step?: { kind: string; act?: string; path?: string };
   /** The ledger item the errand IS (`Errand.stepId`, control-tower phase 132). */
@@ -1230,9 +1243,15 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         runId: run.id,
         // The act (turn-by-turn phase 3): the item's own title when one stands
         // behind the errand, else what the errand's need names, and where.
+        // The landing errand's title is the composer's (#377, `composeLanding`);
+        // one an older console wrote says its need, which the title rule below
+        // cuts, keeping the whole words as the row's headline.
         title: unlanded
-          ? `${run.slug} — ${errand.need.replace(/\.$/, '')}`
+          ? errand.title ?? `Land ${run.slug} on its trunk — ${errand.need.replace(/\.$/, '')}`
           : item ? actTitle(item.title) : composeErrandTitle(errand, run.slug, phase, ask),
+        ...(unlanded && errand.files?.length
+          ? { files: errand.files.map((group) => ({ repo: group.repo, paths: [...group.paths] })) }
+          : {}),
         ...(unlanded ? { category: { word: 'conflict' as const, label: HALT_CATEGORY_LABELS.conflict } } : familyOf(errand.situation)),
         need: errand.need,
         how: tree
@@ -1300,7 +1319,7 @@ function errandDrafts(facts: InboxFacts): Draft[] {
           // answer is *I've done this — check* on that item: the step ends
           // proven and resumes the session, never withdrawn as dismissed.
           : !identity && phase != null && isPersonErrand(errand.situation) && item
-            ? (item.kind === 'permission' ? permissionItemActions(item.id, item) : gateBoundActions(item, flags) ?? errandItemActions(item.id))
+            ? (item.kind === 'permission' ? permissionItemActions(item.id, item) : gateBoundActions(item, flags) ?? decisionActions(item) ?? errandItemActions(item.id))
             // Every other errand's buttons ARE its options (turn-by-turn
             // phase 4): the ASK row's ways on, bound where the errand stands —
             // signing in first on an auth wall, because continuing before it
@@ -3715,6 +3734,18 @@ function gateBoundActions(step: Pick<InboxHumanStep, 'id' | 'proof' | 'title' | 
 }
 
 /**
+ * A decision with options has ONE act (#368): *Send my decision*, pressed from
+ * the card's options. *I've done this — check* beside it was a second door that
+ * ran the proof without the answer — and, for a proof that reads the answer
+ * from a file, could never pass. The answer press now writes the answer and
+ * runs the check itself, so the check button is not offered.
+ */
+function decisionActions(step: Pick<InboxHumanStep, 'id' | 'options'>): InboxAction[] | null {
+  if (!step.options?.length) return null;
+  return humanStepActions(step.id).filter((action) => action.verb !== 'check');
+}
+
+/**
  * A person errand's row when an item stands behind it (control-tower phase
  * 132): the item's own verbs — since phase 137 every check carries the one
  * wording, so the errand's row and the step's are the same three.
@@ -3786,7 +3817,7 @@ function humanStepDrafts(facts: InboxFacts): Draft[] {
       ...(step.until ? { openUntil: step.until } : {}),
       href: phase != null ? phaseHref(step.slug, phase) : planHref(step.slug),
       actions: [
-        ...(step.kind === 'permission' ? permissionItemActions(step.id, step) : gateBoundActions(step, facts.flags) ?? humanStepActions(step.id)),
+        ...(step.kind === 'permission' ? permissionItemActions(step.id, step) : gateBoundActions(step, facts.flags) ?? decisionActions(step) ?? humanStepActions(step.id)),
         // An escalation raised as this item, whose act is pressed in the app
         // (turn-by-turn phase 4): the press rides the item, never its route as text.
         ...(step.birth === 'supervisor' ? supervisorActionFor(facts, step.id) : []),
@@ -3862,6 +3893,12 @@ export function buildInbox(facts: InboxFacts = {}, now: number = Date.now(), opt
     // home, the bell and a push say is what the card says.
     if (turn) {
       const step = turn.record === 'ledger' ? steps.get(turn.item) : undefined;
+      // The title rule (#377): a row that asks a person leads with the act in
+      // sentence case and at most 80 characters, as its card does; the whole
+      // words ride along as `headline` when they had to be cut.
+      const said = shortTitle(item.title);
+      if (said.headline) item.headline = said.headline;
+      item.title = said.title;
       item.turn = withRowWords(turn, {
         state: step?.state ?? null,
         dueWhen: step?.dueWhen ?? item.humanStep?.dueWhen ?? null,

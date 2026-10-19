@@ -368,8 +368,12 @@ test('AJ-6 (#205): the grammar reads a phase-qualified list per phase — named 
   // The run's own row (classic `allow`, no phases) answers every phase, as it always did.
   const ours = 'deny by default; allow `Bash(git push:*)`, `Bash(gh pr create:*)`, `Bash(gh release create:*)`';
   assert.equal(manifestVerdict('gh pr create --fill', ours, { phase: 107 }).answer, 'allow');
-  assert.equal(manifestVerdict('git add -A && git commit -m x && git push', ours, { phase: 107 }).answer, 'allow',
-    'a whole `Bash(git push:*)` rule answers any push, as TRS-4 always did');
+  assert.equal(manifestVerdict('git add -A && git commit -m x && git push origin pe/x', ours, { phase: 107 }).answer, 'allow',
+    'a whole `Bash(git push:*)` rule answers a push of any branch but a trunk, as TRS-4 did (the line beside it is the caller\'s to judge)');
+  // #276 (one-pool phase 2): a bare push goes wherever the upstream points — the trunk included — so it is
+  // re-run named, and a trunk is a person's card whatever the whole rule says.
+  assert.equal(manifestVerdict('git add -A && git commit -m x && git push', ours, { phase: 107 }).answer, 'deny');
+  assert.equal(manifestVerdict('git push origin main', ours, { phase: 107 }).answer, null);
 });
 
 test('AJ-6 (#205): the row answers the publishing act ALONE — a command beside it is judged as if it ran alone; a named form is that form; a remote is a name', async () => {

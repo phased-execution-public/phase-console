@@ -43,6 +43,83 @@ pe_landing() { DOCS_ROOT="${DOCS_ROOT:?}" "$SYS_BASH" "$PE_SCRIPTS/phase-landing
   refute_contains "$output" "aaa1111"
 }
 
+@test "#249: a held write never moves a landed row back — the sha and the PR survive" {
+  setup_docs landing landing
+  pe_landing landing 4 landed --repo r --ref main --sha abc1234 --pr https://example/pr/1
+  run pe_landing landing 4 held --repo r --ref pe/landing --by phase-console
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "kept"
+  run pe_landing landing list 4
+  assert_contains "$output" "landed"
+  assert_contains "$output" "abc1234"
+  assert_contains "$output" "https://example/pr/1"
+  refute_contains "$output" "| held |"
+}
+
+@test "#240: pr-merged survives held, integrated, pushed and pr-open — and a conflict or a failure" {
+  setup_docs landing landing
+  pe_landing landing 4 pr-merged --repo r --sha bbb2222 --pr https://example/pr/2
+  for weaker in held integrated pushed pr-open conflict failed; do
+    run pe_landing landing 4 "$weaker" --repo r
+    [ "$status" -eq 0 ]
+  done
+  run pg landing --landing 4
+  [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]
+  assert_contains "$output" "pr-merged"
+  assert_contains "$output" "bbb2222"
+}
+
+@test "a row still moves FORWARD, and off the path where nothing has merged" {
+  setup_docs landing landing
+  pe_landing landing 4 held --repo r
+  pe_landing landing 4 pushed --repo r --sha ccc3333
+  run pe_landing landing 4 conflict --repo r --note 'the rebase stopped'
+  [ "$status" -eq 0 ]
+  run pg landing --landing 4
+  assert_contains "$output" "conflict"
+  pe_landing landing 4 pushed --repo r --sha ddd4444
+  run pe_landing landing 4 landed --repo r --sha ddd4444
+  run pg landing --landing 4
+  assert_contains "$output" "landed"
+  assert_contains "$output" "ddd4444"
+}
+
+@test "--allow-backward is the deliberate move back, and it says so" {
+  setup_docs landing landing
+  pe_landing landing 4 landed --repo r --sha abc1234
+  run pe_landing landing 4 held --repo r --allow-backward
+  [ "$status" -eq 0 ]
+  run pg landing --landing 4
+  assert_contains "$output" "held"
+  refute_contains "$output" "abc1234"
+}
+
+@test "phase-landing.sh and the engine agree on the order — every pair of states, landingMovesBack word for word" {
+  command -v node >/dev/null 2>&1 || skip "node is not installed"
+  setup_docs landing landing
+  states="held integrated pushed pr-open pr-merged landed conflict failed"
+  table="$(node --input-type=module -e "
+    import('$PE_DIR/viewer/shared/landing-model.js').then(({ LANDING_STATES, landingMovesBack }) => {
+      for (const a of LANDING_STATES) for (const b of LANDING_STATES) console.log(a + ' ' + b + ' ' + (landingMovesBack(a, b) ? 'back' : 'moves'));
+    });")"
+  [ "$(printf '%s\n' "$table" | grep -c .)" -eq 64 ]
+  n=0
+  for from in $states; do
+    for to in $states; do
+      n=$((n + 1))
+      pe_landing landing 4 "$from" --repo "r$n" --allow-backward >/dev/null 2>&1
+      pe_landing landing 4 "$to" --repo "r$n" >/dev/null 2>&1
+      got="$(pg landing --landing 4 | awk -F'\t' -v k="r$n" '$1 == k || $2 == k { print }')"
+      want="$(printf '%s\n' "$table" | awk -v a="$from" -v b="$to" '$1 == a && $2 == b { print $3 }')"
+      if [ "$want" = back ]; then expect="$from"; else expect="$to"; fi
+      case "$got" in
+        *"$expect"*) ;;
+        *) echo "from=$from to=$to: the engine says $want, the ledger reads: $got" >&2; return 1 ;;
+      esac
+    done
+  done
+}
+
 @test "two REPOSITORIES of one phase are two rows — a mirror run lands N times" {
   setup_docs landing landing
   pe_landing landing 4 pushed --repo phased-execution --sha aaa1111

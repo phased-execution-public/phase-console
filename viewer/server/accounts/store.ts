@@ -24,16 +24,27 @@
  * never appear in `accounts.json` — that is `credentials.ts`'s single job.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import { INSTANCE_STATE_DIR } from '../config.ts';
 import { log } from '../log.ts';
 import { backupIfNewer, versionOk } from '../registry-file.ts';
-import { ACCOUNT_KINDS } from '../../shared/ops-vocab.js';
+import { ACCOUNT_KINDS, isAccountKind } from '../../shared/ops-vocab.js';
 
 export type AccountKind = (typeof ACCOUNT_KINDS)[number];
+
+/**
+ * Is this a kind whose secret THIS console holds (a pasted token; in Pro an API key) — as
+ * opposed to a login the Claude CLI owns (the machine's, a profile's)? Written without naming
+ * the Pro kind, so every edition reads it the same way: a console-held secret lives in our
+ * keychain item (or 0600 file), has no `.claude.json` identity to read, and is never polled
+ * against the CLI's own credential.
+ */
+export function holdsSecret(kind: AccountKind): boolean {
+  return kind !== 'default' && kind !== 'profile';
+}
 
 export type AccountMeta = {
   id: string;
@@ -86,11 +97,16 @@ export function profileConfigDir(id: string, dir: string = ACCOUNTS_DIR): string
 }
 
 /**
- * The version this build writes. Readers accept anything `>= REGISTRY_VERSION`
- * — see `readRegistry` — and a file from the future is backed up before it is
- * overwritten. See `registry-file.ts`.
+ * The version this build writes. Version 2 (one-pool phase 3) adds the API-key
+ * fields and the settings; a version-1 file reads as version 2 — every field
+ * it lacks is optional — and is upgraded in place on first read, a copy kept
+ * beside it as `accounts.json.v1.bak`. A file from the future is read forward
+ * and backed up before it is overwritten. See `registry-file.ts`.
  */
-const REGISTRY_VERSION = 1;
+export const REGISTRY_VERSION = 2;
+
+/** The oldest version this build reads (`versionOk` takes `>=`). */
+const REGISTRY_READ_FLOOR = 1;
 
 /** How many given-up ids are worth refusing to reissue. Oldest out first. */
 const RETIRED_IDS_MAX = 512;
@@ -132,6 +148,12 @@ export class AccountStore {
   private retiredIds: string[] = [];
   private machineName: string | undefined;
   private overageRows: Record<string, OverageSetting> = {};
+  /**
+   * Rows of a kind this edition does not know — a Pro console's API-key accounts read by a
+   * free one. Kept exactly as read and written back, so a downgrade never erases them, and
+   * never used: nothing here can run as, poll or list a kind it cannot spell.
+   */
+  private foreignRows: unknown[] = [];
   private readonly dir: string;
   private readonly file: string;
 
@@ -139,12 +161,30 @@ export class AccountStore {
   constructor(dir: string = ACCOUNTS_DIR) {
     this.dir = dir;
     this.file = join(dir, 'accounts.json');
-    const { accounts, defaultName, retired, overage } = readRegistry(this.file);
-    this.accounts = accounts;
-    this.retiredIds = retired;
-    this.machineName = defaultName;
-    this.overageRows = overage;
+    const read = readRegistry(this.file);
+    this.accounts = read.accounts;
+    this.retiredIds = read.retired;
+    this.machineName = read.defaultName;
+    this.overageRows = read.overage;
+    this.foreignRows = read.foreign;
+    if (read.version !== null && read.version < REGISTRY_VERSION) this.upgrade(read.version);
   }
+
+  /**
+   * A registry an older build wrote, upgraded in place on first read — the old file copied
+   * aside first (`accounts.json.v<N>.bak`, once), so a rollback costs a rename.
+   */
+  private upgrade(from: number): void {
+    const backup = join(this.dir, `accounts.json.v${from}.bak`);
+    try {
+      if (!existsSync(backup)) copyFileSync(this.file, backup);
+    } catch (error) {
+      log.warn('registry.backup-failed', { registry: 'accounts.registry', version: from, error: (error as Error).message });
+    }
+    this.persist();
+    log.info('accounts.registry.upgraded', { from, to: REGISTRY_VERSION, backup });
+  }
+
 
   /** The account's "use credits past plan limits" row (#146) — undefined is OFF. */
   overageOf(id: string): OverageSetting | undefined {
@@ -214,7 +254,8 @@ export class AccountStore {
    * alternative is a record that cannot be believed.
    */
   private taken(id: string): boolean {
-    return this.accounts.some((a) => a.id === id) || this.retiredIds.includes(id);
+    return this.accounts.some((a) => a.id === id) || this.retiredIds.includes(id)
+      || this.foreignRows.some((row) => (row as { id?: unknown })?.id === id);
   }
 
   /** Ids that have been used and given up. Never reissued — see `taken`. */
@@ -225,7 +266,9 @@ export class AccountStore {
   add(meta: AccountMeta): void {
     if (meta.id === DEFAULT_ACCOUNT_ID) throw new Error('the default account is built in');
     if (!ACCOUNT_ID_RE.test(meta.id)) throw new Error(`account id ${JSON.stringify(meta.id)} is not usable`);
-    if (this.accounts.some((a) => a.id === meta.id)) throw new Error(`account ${meta.id} already exists`);
+    if (this.accounts.some((a) => a.id === meta.id) || this.foreignRows.some((row) => (row as { id?: unknown })?.id === meta.id)) {
+      throw new Error(`account ${meta.id} already exists`);
+    }
     this.accounts.push({ ...meta });
     this.persist();
   }
@@ -286,13 +329,13 @@ export class AccountStore {
   private persist(): void {
     const body: RegistryFile = {
       version: REGISTRY_VERSION,
-      accounts: this.accounts,
+      accounts: [...this.accounts, ...(this.foreignRows as AccountMeta[])],
       ...(this.machineName ? { defaultName: this.machineName } : {}),
       ...(this.retiredIds.length ? { retired: this.retiredIds } : {}),
       ...(Object.keys(this.overageRows).length ? { overage: this.overageRows } : {}),
     };
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    backupIfNewer(this.file, 'accounts.registry');
+    backupIfNewer(this.file, 'accounts.registry', REGISTRY_VERSION);
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(body, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     renameSync(tmp, this.file);
@@ -328,18 +371,28 @@ function asReadRow(meta: AccountMeta): AccountMeta {
   };
 }
 
-/** An unreadable registry degrades to empty — same posture as the instance registry. */
-function readRegistry(file: string = REGISTRY_FILE): {
+type RegistryRead = {
   accounts: AccountMeta[]; defaultName: string | undefined; retired: string[]; overage: Record<string, OverageSetting>;
-} {
+  /** Rows of a kind this edition does not know, kept verbatim (`AccountStore.foreignRows`). */
+  foreign: unknown[];
+  /** The version the file said — null when there was no file to read. */
+  version: number | null;
+};
+
+/** An unreadable registry degrades to empty — same posture as the instance registry. */
+function readRegistry(file: string = REGISTRY_FILE): RegistryRead {
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as RegistryFile;
     // `>=`, not `===`. See `registry-file.ts` for why an exact match here is a
-    // data-loss bug with our own next release as its fuse.
-    if (versionOk(parsed, REGISTRY_VERSION) && Array.isArray(parsed.accounts)) {
+    // data-loss bug with our own next release as its fuse. The floor is 1: a
+    // version-1 file reads as version 2, every field it lacks being optional.
+    if (versionOk(parsed, REGISTRY_READ_FLOOR) && Array.isArray(parsed.accounts)) {
+      const usable = parsed.accounts.filter((a) => a && typeof a.id === 'string' && ACCOUNT_ID_RE.test(a.id));
       return {
-        accounts: parsed.accounts
-          .filter((a) => a && typeof a.id === 'string' && ACCOUNT_ID_RE.test(a.id))
+        version: typeof parsed.version === 'number' && Number.isFinite(parsed.version) ? parsed.version : REGISTRY_READ_FLOOR,
+        foreign: usable.filter((a) => a.id !== DEFAULT_ACCOUNT_ID && !isAccountKind(a.kind)),
+        accounts: usable
+          .filter((a) => a.id === DEFAULT_ACCOUNT_ID || isAccountKind(a.kind))
           .map(asReadRow),
         defaultName: typeof parsed.defaultName === 'string' && parsed.defaultName.trim()
           ? parsed.defaultName.trim()
@@ -354,7 +407,7 @@ function readRegistry(file: string = REGISTRY_FILE): {
       log.warn('accounts.registry.unreadable', { error: (error as Error).message });
     }
   }
-  return { accounts: [], defaultName: undefined, retired: [], overage: {} };
+  return { accounts: [], defaultName: undefined, retired: [], overage: {}, foreign: [], version: null };
 }
 
 /** The `overage` map as read: a row per usable id with an ISO `at`, anything else dropped. */

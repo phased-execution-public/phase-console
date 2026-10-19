@@ -14,6 +14,10 @@
  *   TC-5  #341 — a human step's window is `openUntil`, never a relayed
  *         question's `expiresAt`
  *   TC-6  the titles name the act — a plan act, an errand, a supervisor card
+ *   TC-8  #377 — the title rule: sentence case, at most 80 characters, never a
+ *         path list, the errand ref a chip (`errandRef`), the whole words as
+ *         `headline`; the landing errand's short title and grouped files; the
+ *         headline counts and never quotes a title
  */
 import './state-sandbox.ts';
 
@@ -25,7 +29,9 @@ import { join } from 'node:path';
 
 const { buildInbox } = await import('../server/inbox.ts');
 const { turnView } = await import('../server/turn/index.ts');
-const { composeItem, MACHINE_WORDS, scopeWords } = await import('../server/turn/compose.ts');
+const {
+  composeItem, composeLanding, landingFilesWords, MACHINE_WORDS, PATH_LIST, scopeWords, shortTitle, TITLE_MAX,
+} = await import('../server/turn/compose.ts');
 const { FirstSeen, FIRST_SEEN_MAX } = await import('../server/turn/first-seen.ts');
 const { humanStepPush, humanStepReminderPush } = await import('../server/push/catalogue.ts');
 const { declareHumanStep, HumanStepLedger } = await import('../server/human-steps.ts');
@@ -404,3 +410,136 @@ test('TC-7: an errands row no bullet names is a Heads-up — its steps, nothing 
   assert.ok(TURN_GROUPS.every((group) => answer.groups[group].length === 0), 'in no group');
   for (const said of wordsOf(item)) assert.doesNotMatch(said, MACHINE_WORDS);
 });
+
+test('#368 — no checkWords output carries a machine word, a ref, or the console\'s phrase for a ref it cannot read', async () => {
+  const { checkWords } = await import('../server/turn/compose.ts');
+  const { PROOF_UNREAD } = await import('../shared/proof-words.js');
+  const { PROOF_TYPES } = await import('../shared/turn-model.js');
+  const proofs = [
+    undefined, 'cmd:"gh auth status"', 'cmd:"grep -qi \'^store: answered\' /home/me/docs/owner-answers.md"',
+    'mcp:linear', 'whenever it is done', 'cmd:"python3 -c \\"import x\\""', 'phase:demo/3', 'gh:acme/w#pr/4',
+    'credential:keychain:svc', 'unit:box/build.service', 'date:2026-10-20T09:00:00Z',
+  ];
+  for (const proofType of PROOF_TYPES) {
+    for (const proof of proofs) {
+      for (const hasOptions of [false, true]) {
+        const said = checkWords({ proofType, ...(proof ? { proof } : {}), hasOptions });
+        assert.ok(!MACHINE_WORDS.test(said), `${proofType} ${proof ?? '-'}: ${said} carries a machine word`);
+        assert.ok(!said.includes(PROOF_UNREAD), `${proofType} ${proof ?? '-'}: ${said}`);
+        assert.ok(!/cmd:|POST \/api|phase 0\b/.test(said), said);
+      }
+    }
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * TC-8 — the title rule (#377)
+ * ------------------------------------------------------------------ */
+
+/** The landing need a 7.1 console wrote — the title #377 quotes. */
+const OLD_LANDING = 'ai-builder-e2e-fixes-r3 — pe/ai-builder-e2e-fixes-r3 in `aws` holds changes origin/main does not hold: '
+  + 'contracts/api/app/routes.ts, contracts/api/app/models.ts, docs/plans/ai-builder.md, web/src/app.tsx';
+
+test('TC-8 (#377): shortTitle — sentence case, at most 80 characters, cut at a word before a path list, the ref a chip', () => {
+  const plan = shortTitle("enter Feed B's investor-password data account (E-4)");
+  assert.deepEqual(plan, { title: "Enter Feed B's investor-password data account", errandRef: 'E-4' }, 'raised, the ref out, nothing cut');
+  assert.equal(shortTitle('Rotate the key (E-4, hub #105)').errandRef, 'E-4');
+  const old = shortTitle(OLD_LANDING);
+  assert.ok(old.title.length <= TITLE_MAX, `${old.title.length}: ${old.title}`);
+  assert.match(old.title, /^ai-builder-e2e-fixes-r3 /, 'a title that leads with a name says it as written — never "Ai-builder…"');
+  assert.match(old.title, /…$/, 'an ellipsis, because it cut');
+  assert.doesNotMatch(old.title, PATH_LIST);
+  assert.doesNotMatch(old.title, /contracts\//, 'no file of the list');
+  assert.equal(old.headline, OLD_LANDING, 'the whole words are the headline');
+  // Never mid-word: what is left before the ellipsis is a prefix ending on a whole word.
+  const kept = old.title.slice(0, -1);
+  assert.ok(OLD_LANDING.startsWith(kept), kept);
+  assert.match(OLD_LANDING.slice(kept.length, kept.length + 1), /[\s:,;]/, `cut at a boundary: "${kept}"`);
+  assert.equal(shortTitle('pe/alpha × pe/beta — these branches would not merge').title, 'pe/alpha × pe/beta — these branches would not merge');
+  const long = shortTitle('make sure the deploy key for the staging cluster is rotated before the window closes on friday evening');
+  assert.ok(long.title.length <= TITLE_MAX && /^Make /.test(long.title) && long.title.endsWith('…'), long.title);
+  const cut = long.title.slice(0, -1);
+  assert.ok(long.headline!.startsWith(cut) && /^[\s:,;]/.test(long.headline!.slice(cut.length)), `never mid-word: "${long.title}"`);
+  assert.deepEqual(shortTitle('Sign the gh CLI in'), { title: 'Sign the gh CLI in' }, 'a short title is left as it is');
+});
+
+test('TC-8 (#377): every item composes its title by the rule — a plan act with its ref, a long act with its headline, and its push', () => {
+  const base = { source: 'plan', record: 'ledger', kind: 'operator-act', proofType: 'attest', why: 'reserved', slug: 'demo', phase: 0, now: NOW } as const;
+  const plan = composeItem({ ...base, step: { title: "enter Feed B's investor-password data account (E-4)" } } as never);
+  assert.equal(plan.title, "Enter Feed B's investor-password data account");
+  assert.equal(plan.errandRef, 'E-4');
+  assert.equal(plan.headline, undefined);
+  const bound = composeItem({ ...base, step: { title: 'rotate the key', eref: 'E-9' } } as never);
+  assert.equal(bound.errandRef, 'E-9', 'the plan item\'s own eref is the chip');
+  const long = composeItem({ ...base, phase: 3, step: { title: `Check that ${OLD_LANDING}` } } as never);
+  assert.ok(long.title.length <= TITLE_MAX, long.title);
+  assert.ok(long.headline && long.headline.length > TITLE_MAX, 'the long form is the headline');
+  // The row and the push say the same short title (one composer).
+  const step = { ...stepOf('operator-act', 'notified', BIRTHS[1], 1), title: `Check that ${OLD_LANDING}` };
+  const inbox = buildInbox({ ...facts(), humanSteps: [step] } as never, NOW, { all: true });
+  const row = inbox.items.find((one) => one.kind === 'human-step')!;
+  assert.equal(row.title, long.title);
+  const push = humanStepPush({ ...step, label: KIND_META['operator-act'].label } as never);
+  assert.equal(push.message.title, `Now: ${long.title}`);
+  const answer = turnView(inbox, { steps: [step] as never, now: NOW });
+  const item = TURN_GROUPS.flatMap((group) => answer.groups[group]).find((one) => one.item === step.id)!;
+  assert.equal(item.title, long.title);
+  assert.equal(item.headline, long.headline);
+});
+
+test('TC-8 (#377): the landing errand — a short title that names the act, its files grouped by repository', () => {
+  const proof = (mount: string, n: number, state = 'ahead') => ({
+    mount, branch: 'pe/ai-builder-e2e-fixes-r3', state, into: 'origin/main',
+    files: Array.from({ length: n }, (_, i) => `${mount || 'docs'}/src/file-${i}.ts`),
+  });
+  const two = composeLanding('ai-builder-e2e-fixes-r3', [proof('aws', 12), proof('web', 3)], { mounted: true });
+  assert.equal(two.title, 'Land ai-builder-e2e-fixes-r3 on main: 2 repositories differ from origin/main');
+  assert.ok(two.title.length <= TITLE_MAX);
+  assert.deepEqual(two.files.map((group) => [group.repo, group.paths.length]), [['aws', 12], ['web', 3]]);
+  assert.equal(landingFilesWords(two.files), '12 files in aws · 3 in web');
+  assert.match(two.need, /^Land ai-builder-e2e-fixes-r3 on main: 2 repositories differ from origin\/main\. The run branch pe\/ai-builder-e2e-fixes-r3 differs in 12 files in aws · 3 in web\.$/);
+  assert.doesNotMatch(two.need, /file-0/, 'no path in the need either');
+  const one = composeLanding('demo', [proof('aws', 1)], { mounted: true });
+  assert.equal(one.title, 'Land demo on main: aws differs from origin/main');
+  assert.equal(composeLanding('demo', [proof('', 2, 'conflicted')], { mounted: true }).title, 'Land demo on main: the root repository conflicts with main');
+  assert.equal(composeLanding('demo', [proof('', 2, 'conflicted')]).title, 'Land demo on main: the repository conflicts with main');
+
+  // The row and the card: the composer's title, the files riding along.
+  const run = (errand: Record<string, unknown>) => ({
+    id: 'r9', slug: 'ai-builder-e2e-fixes-r3', status: 'parked', updatedAt: AT, halt: { at: AT, reason: 'unlanded', kind: 'unlanded' },
+    unlanded: { phase: 4 }, errand: { phase: 0, situation: 'unknown', tried: [], how: 'Merge it.', at: AT, ...errand },
+  });
+  const inbox = buildInbox({ runs: [run({ need: two.need, title: two.title, files: two.files })], flags: { allowRun: true } } as never, NOW, { all: true });
+  const row = inbox.items.find((one) => one.kind === 'errand')!;
+  assert.equal(row.title, two.title);
+  assert.deepEqual(row.files, two.files);
+  const answer = turnView(inbox, { now: NOW });
+  const item = TURN_GROUPS.flatMap((group) => answer.groups[group]).find((one) => one.rows.includes(row.id))!;
+  assert.equal(item.title, two.title);
+  assert.deepEqual(item.files, two.files, 'the card draws them under Details');
+  // An errand an older console wrote — the long need, no title — is cut to the rule, its whole words kept.
+  const old = buildInbox({ runs: [run({ need: OLD_LANDING.replace(/^[^—]+— /, '') })], flags: { allowRun: true } } as never, NOW, { all: true });
+  const oldRow = old.items.find((one) => one.kind === 'errand')!;
+  assert.ok(oldRow.title.length <= TITLE_MAX, oldRow.title);
+  assert.doesNotMatch(oldRow.title, PATH_LIST);
+  assert.ok(oldRow.headline && oldRow.headline.includes('contracts/api/app/routes.ts'), 'the whole words ride as the headline');
+  const oldItem = TURN_GROUPS.flatMap((group) => turnView(old, { now: NOW }).groups[group]).find((one) => one.rows.includes(oldRow.id))!;
+  assert.equal(oldItem.title, oldRow.title);
+  assert.equal(oldItem.headline, oldRow.headline);
+});
+
+test('TC-8 (#377): the headline counts — to do now, coming up, done today — and quotes no title', () => {
+  const inbox = buildInbox(facts() as never, NOW, { all: true });
+  const answer = turnView(inbox, { steps: STEPS as never, now: NOW });
+  const todo = answer.counts.approve + answer.counts.now + answer.counts.decide;
+  const parts = [
+    `${todo} to do now`,
+    ...(answer.counts.checking ? [`${answer.counts.checking} being checked`] : []),
+    ...(answer.counts.upcoming ? [`${answer.counts.upcoming} coming up`] : []),
+    ...(answer.counts.done ? [`${answer.counts.done} done today`] : []),
+  ];
+  assert.equal(answer.headline, `${parts.join(' · ')}.`);
+  for (const item of TURN_GROUPS.flatMap((group) => answer.groups[group])) assert.ok(!answer.headline.includes(item.title), item.title);
+  assert.equal(turnView({ items: [], generatedAt: new Date(NOW).toISOString() }, { now: NOW }).headline, 'Nothing needs you now.');
+});
+

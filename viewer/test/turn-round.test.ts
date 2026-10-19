@@ -145,7 +145,8 @@ test('RD-3: an act with a due-when ref is Coming up until the ref lands — then
     const after = await call(h.svc, 'GET', '/api/turn');
     assert.equal((after.body.counts as { now: number }).now, 1);
     assert.equal((after.body.round as { n: number }).n, 1);
-    assert.match(String(after.body.headline), /^1 needs you now: Rotate the deploy key has waited/);
+    // The headline counts, and never quotes a title (#377).
+    assert.match(String(after.body.headline), /^1 to do now\.$/);
     const again = await round.run('clock');
     assert.equal(again.n, 1, 'nothing changed: the counter stays');
     assert.equal(h.pushes.length - pushesBefore, 1, 'and nothing is pushed again');
@@ -274,23 +275,18 @@ test('RD-5: an item returned turnEscalateAfter times that never escalated escala
   }
 });
 
-test('RD-6: the headline is composed by rules — a fixture table', () => {
-  const now = Date.parse('2026-10-07T12:00:00Z');
-  const base = { open: 0, checking: 0, upcoming: 0, handled: 0, handledSince: 'seen' as const, oldest: null, now };
-  const gh = { title: 'Sign `gh` in', since: '2026-10-07T09:00:00Z', holds: [{ slug: 'ct', phase: 117 }, { slug: 'ct', phase: 118 }] };
+test('RD-6: the headline is composed by rules — a fixture table: it counts, never quotes (#377)', () => {
+  const base = { open: 0, checking: 0, upcoming: 0, done: 0, handled: 0, handledSince: 'seen' as const };
   const table: [Parameters<typeof headlineOf>[0], string][] = [
     [base, 'Nothing needs you now.'],
     [{ ...base, handled: 4 }, 'Nothing needs you now · 4 handled since you last looked.'],
     [{ ...base, handled: 1, handledSince: 'day' }, 'Nothing needs you now · 1 handled in the last day.'],
     [{ ...base, upcoming: 2 }, 'Nothing needs you now · 2 coming up.'],
-    [{ ...base, open: 1, oldest: { ...gh, holds: [{ slug: 'ct', phase: 117 }] } }, '1 needs you now: Sign `gh` in has waited 3 h and holds phase 117.'],
-    [{ ...base, open: 2, checking: 1, handled: 4, oldest: gh },
-      '2 need you now — the oldest (Sign `gh` in) has waited 3 h and holds phases 117 and 118 · 1 is being checked · 4 handled since you last looked.'],
-    [{ ...base, open: 3, checking: 2, upcoming: 1, oldest: { title: 'Approve the plan', since: '2026-10-07T11:48:00Z', holds: [{ slug: 'a', phase: 3 }, { slug: 'b', phase: 4 }] } },
-      '3 need you now — the oldest (Approve the plan) has waited 12 min and holds a phase 3 and b phase 4 · 2 are being checked · 1 coming up.'],
-    [{ ...base, open: 1, oldest: { title: 'Answer the question', since: '2026-10-04T12:00:00Z', holds: [] } }, '1 needs you now: Answer the question has waited 3 days.'],
-    [{ ...base, open: 2 }, '2 need you now.'],
-    [{ ...base, open: 1, oldest: { title: 'x'.repeat(80), since: '2026-10-07T11:59:30Z', holds: [] } }, `1 needs you now: ${'x'.repeat(59)}… has waited less than a minute.`],
+    [{ ...base, open: 1, upcoming: 5, done: 6 }, '1 to do now · 5 coming up · 6 done today.'],
+    [{ ...base, open: 2, checking: 1, handled: 4 }, '2 to do now · 1 being checked · 4 handled since you last looked.'],
+    [{ ...base, open: 3, checking: 2, upcoming: 1 }, '3 to do now · 2 being checked · 1 coming up.'],
+    [{ ...base, done: 3 }, 'Nothing needs you now · 3 done today.'],
+    [{ ...base, open: 2 }, '2 to do now.'],
   ];
   for (const [facts, sentence] of table) assert.equal(headlineOf(facts), sentence);
 });

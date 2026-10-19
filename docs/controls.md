@@ -1013,7 +1013,8 @@ relaunch or a restart re-creates the entry already bumped, and the run's own boa
 the phase first among its siblings; it is spent when the phase boards. Two bumps order by when they
 were given, the most recent first.
 
-**The queue** has no page of its own since 7.0: `#/queue` opens the Runs home's **Queued** group. A
+**The queue.** The Runs home's **Queued** group holds every run waiting for a scope or a lane; in the
+free edition `#/queue` opens that group, as it has since 7.0 (with Pro it is the Queue page, below). A
 queued run's line says whom it waits on, and opening it says why it sits there — a dependency, an
 aged-out reservation, its class, a bump, or first come first served — and moves it: **Bump**, **Board
 P<N> first**, **Hold**. One phase's own place in line is in its **Actions**, in the panel: **Hold in
@@ -1035,6 +1036,7 @@ at once, rather than refusing to start a run whose predecessor you are about to 
 `withdrawn` and `audit` — and **ordering advice** alongside them: remaining plan weight and an ETA
 per queued plan, computed when you ask and never stored. Nothing on the server reads the advice
 back: it is the figure to look at before deciding to use one of the controls above.
+
 
 **Run-level beats plan prose for console-minted sessions.** When a run uses the work branch and the
 plan's own `**Branch:**` line names a different branch, the session is told to use the run's branch
@@ -1104,7 +1106,7 @@ prints a `🔒 CLOSED` banner in place of the ready/waiting/batching lines. `val
 | `session-hook.sh` | The user-scope Claude Code hook — four entries, SessionStart · SessionEnd · Stop · Notification — that reports a session to the console owning its directory; installed by `phase-console install-hooks` or Settings ▸ Automation ▸ Session presence. Notification carries the ask's own `message` and its `notification_type`. The owner is resolved through the registry (`viewer/shared/instances.mjs owner`, from `$DOCS_ROOT` when it is an absolute existing directory, else the session's cwd) with no only-console fallback; a directory no registered console claims is recorded `unowned` in the machine's sink, `<state home>/fleet/sessions/inbox/`, rather than dropped or filed against the wrong console. The record is POSTed with a 2 s timeout; when no console answers it lands in the instance's `sessions/inbox/`, and when the console refused the connection and there is a `node`, the hook drains that inbox itself with `phase-console sessions ingest` — in the background, except at SessionStart, where it waits for the peers line it puts in the new session's context. `PHASE_CONSOLE_HOOK_INGEST=0` leaves the inbox for the console; `PHASE_CONSOLE_HOOK_OFF=1` silences the hook. Always exits 0. |
 | `decisions.sh <slug> [--phase N] answer <key> --value … \| waive <key> --reason … \| promote --from-ruling <id> --key <key> \| list` | Write the decision manifest's twin (`docs/handoffs/<slug>/decisions.md`), which `--decisions` merges over the plan's own `## Decisions` rows — never edit it by hand. `answer` records a value, `waive` that the decision does not apply, `promote` turns a ruling into a standing answer (found by the id `phase-outcome.sh` stamps on the RULING line, never its ack; `--key` is optional for a ruling that carries its own `decisionKey`); `--phase N` scopes the row to one phase. |
 | `qa-record.sh <slug> <N> <pass\|fail\|waived\|pending> [--report <path>] [--round N] [--reason TEXT]` | Record a QA verdict. `--round` defaults to previous + 1 and is what writes the `## QA rounds` ledger (refused with `pending`); `--reason` is `waived`-only and lands in `## QA waivers`. Read the history back with `phase-graph.sh <slug> --qa-history N`. |
-| `close-plan.sh <slug> [--status abandoned\|superseded\|complete] [--reason "…"] [--reopen] [--force]` | Close a plan that will never finish, or `--reopen` one. Sets `status:`, `closed:` and `closed_reason:`, and releases the plan's own phase locks. Idempotent; never touches git. |
+| `close-plan.sh <slug> [--status abandoned\|superseded\|complete] [--reason "…"] [--reopen] [--force]` | Close a plan that will never finish, or `--reopen` one. Sets `status:`, `closed:` and `closed_reason:`, and releases the plan's own phase locks. `complete` is refused while the run branch `pe/<slug>` is off its origin trunk, a landing row is `conflict`/`failed`, or a `plan:<slug>` issue is open — `--force` closes over them and records it (#320). Idempotent; reads git, never writes it. |
 | `validate.sh <slug>` | Full validation — plan structure *and* handoff consistency. |
 
 ## The console's own commands

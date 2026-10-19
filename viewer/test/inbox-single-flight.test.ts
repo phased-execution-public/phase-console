@@ -157,10 +157,31 @@ test('IS-1: N concurrent requests at one revision build the inbox once', async (
   for (let i = 0; i < 5; i++) await svc.attention();
   assert.equal(counter.builds, settled, 'a request at an unchanged revision builds nothing');
 
-  // The two shapes are two memos: `?all=1` is a different view.
+  // The two shapes are two memos, filled by ONE fold (one-pool phase 26, #237):
+  // `?all=1` is a different view, and it costs no build of its own.
   await svc.attention(true);
   await svc.attention(true);
-  assert.equal(counter.builds, settled + 1);
+  assert.equal(counter.builds, settled);
+});
+
+test('IS-4: one fold per change answers both shapes and the prune — the open list is the whole list less its acks (#237)', async (t) => {
+  const lib = library(t, 'is-four');
+  const spy = spyScripts(t);
+  const { svc, counter } = console_(t, lib, spy.dir);
+
+  const before = await svc.attention(true);
+  assert.equal(counter.builds, 1);
+  const id = before.items[0]?.id;
+  assert.ok(id, 'the library raises at least one item');
+  svc.ackInbox(id!, 'test');
+
+  const all = await svc.attention(true);
+  const open = await svc.attention(false);
+  assert.equal(counter.builds, 2, `an ack moves both shapes with ONE build, not ${counter.builds - 1}`);
+  assert.ok(all.items.find((item) => item.id === id)?.ack, 'the whole list marks the acknowledged item');
+  assert.deepEqual(open.items.map((item) => item.id), all.items.filter((item) => !item.ack).map((item) => item.id),
+    'the open list is the whole list, less its acknowledged items, in the same order');
+  assert.equal(open.generatedAt, all.generatedAt, 'from the same fold');
 });
 
 test('IS-2: the memo is keyed on its inputs’ revisions, and a newer request never gets an older build', async (t) => {

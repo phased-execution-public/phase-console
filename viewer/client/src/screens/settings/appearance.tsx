@@ -10,9 +10,9 @@
  * library the way the desk left it.
  */
 
-import { DENSITIES } from '@shared/prefs-model.js';
+import { DENSITIES, PALETTES } from '@shared/prefs-model.js';
 import { useConsoleState } from '@/data/console';
-import { usePrefs, type Density } from '@/lib/prefs';
+import { usePrefs, type Density, type Palette } from '@/lib/prefs';
 import { offeredModelOptions } from '@/screens/launch/model/defaults';
 import { SORTS } from '@/screens/plans/model';
 import { ThemeSwitch } from '@/shell/theme-switch';
@@ -24,6 +24,31 @@ const DENSITY_WORDS: Readonly<Record<Density, string>> = {
   comfortable: 'Comfortable',
   compact: 'Compact',
 };
+
+const PALETTE_WORDS: Readonly<Record<Palette, string>> = {
+  quiet: 'Quiet',
+  departures: 'Departures',
+};
+
+/** The room (#362): Quiet, 7.0's, or Departures, the 6.x room — in either light. */
+function PaletteSwitch() {
+  const [prefs, setPrefs] = usePrefs();
+  return (
+    <ButtonGroup aria-label="Palette">
+      {PALETTES.map((palette) => (
+        <Button
+          key={palette}
+          size="sm"
+          variant="ghost"
+          aria-pressed={prefs.palette === palette}
+          onClick={() => setPrefs({ palette })}
+        >
+          {PALETTE_WORDS[palette]}
+        </Button>
+      ))}
+    </ButtonGroup>
+  );
+}
 
 function DensitySwitch() {
   const [prefs, setPrefs] = usePrefs();
@@ -82,6 +107,12 @@ export function AppearanceSection() {
       >
         <SettingRow label="Theme" hint="Auto follows the device's own light or dark setting.">
           <ThemeSwitch />
+        </SettingRow>
+        <SettingRow
+          label="Palette"
+          hint="Departures is the 6.x room: a grey-blue page under white cards, with drawn rules. The status colours are the same in both."
+        >
+          <PaletteSwitch />
         </SettingRow>
         <SettingRow
           label="Density"

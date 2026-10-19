@@ -362,3 +362,27 @@ test('composeLanding: a packet directory that cannot be created is an answer, no
   assert.equal(outcome.ok, false);
   assert.match(outcome.detail, /could not be created/);
 });
+
+/* ---------------------------------------------------------------- *
+ * The ledger's order (one-pool phase 21, #249 #240)
+ * ---------------------------------------------------------------- */
+
+const { LANDING_ORDER, LANDING_SETTLED, LANDING_STATES, landingMovesBack } = await import('../shared/landing-model.js');
+
+test('#249 #240: a ledger row only moves forward — held never replaces pr-merged or landed', () => {
+  for (const settled of LANDING_SETTLED) {
+    for (const weaker of ['held', 'integrated', 'pushed', 'pr-open', 'conflict', 'failed']) {
+      assert.equal(landingMovesBack(settled, weaker), true, `${weaker} over ${settled} moves it back`);
+    }
+  }
+  assert.equal(landingMovesBack('landed', 'pr-merged'), false, 'two policies\' end states, not two steps');
+  assert.equal(landingMovesBack('pr-merged', 'pushed'), true);
+  assert.equal(landingMovesBack('pr-merged', 'landed'), false, 'forward along the path');
+  assert.equal(landingMovesBack('held', 'landed'), false);
+  assert.equal(landingMovesBack('pushed', 'conflict'), false, 'off the path, where nothing has merged');
+  assert.equal(landingMovesBack('conflict', 'held'), false, 'a conflict is no position to defend');
+  assert.equal(landingMovesBack(undefined, 'held'), false, 'no row');
+  assert.equal(landingMovesBack('landed', 'landed'), false, 'the same state is an idempotent write');
+  assert.deepEqual([...LANDING_ORDER], LANDING_STATES.filter((s: string) => s !== 'conflict' && s !== 'failed'),
+    'the path is every landing state but the two off it, in the vocabulary\'s own order');
+});

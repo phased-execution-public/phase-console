@@ -55,13 +55,14 @@ import { useNarrow } from '@/lib/media';
 import { Legend } from '@/ui/legend';
 
 import { FigureNumbers } from './numbers';
+import { seriesHeight } from './paint';
 
 /**
  * The figures — a block with its own data, which therefore owes its numbers.
  * Closed on purpose: a chart added here is a name in one of these two lists,
  * and the test then requires a figure to render its table.
  */
-export const FIGURES = Object.freeze(['Bars', 'Calendar', 'BarList', 'StackBar'] as const);
+export const FIGURES = Object.freeze(['Bars', 'Calendar', 'BarList', 'StackBar', 'Series'] as const);
 export type FigureName = (typeof FIGURES)[number];
 
 /** The marks — one datum of a row, drawn on the line's tokens (`ui/track/meter.tsx`). */
@@ -135,6 +136,18 @@ export interface StackSegment {
   label: string;
   value: number;
   tone: FigureTone;
+}
+
+/** One bucket of a `Series`' time axis, as the ledger cut it (UTC instants). */
+export interface SeriesBucket {
+  start: string;
+  end: string;
+}
+
+/** One strip of a `Series`: what it is, and one value per bucket, in the buckets' order. */
+export interface SeriesRow {
+  name: string;
+  values: readonly number[];
 }
 
 /* ------------------------------------------------------------------ *
@@ -238,6 +251,13 @@ const LazyStackBar = behindTheDoor(
   (drawings) => drawings.StackBarDrawing,
   () => 10 + LINE,
 );
+const LazySeries = behindTheDoor(
+  'Series',
+  loadBars,
+  () => bars,
+  (drawings) => drawings.SeriesDrawing,
+  (props) => seriesHeight(props.rows.length) + LINE,
+);
 const LazyRunCost = behindTheDoor(
   'RunCost',
   loadRunChart,
@@ -331,6 +351,7 @@ export function BarList({
   format,
   tone = 'running',
   label,
+  heads,
   empty,
   className,
 }: {
@@ -342,6 +363,12 @@ export function BarList({
   tone?: FigureTone;
   /** What one row IS, plural and lower case — names the numbers fold and its table. */
   label?: string;
+  /**
+   * The numbers table's column heads, from the caller who knows what a row is
+   * (#339): a list of days heads its first column Day, not Name. Each defaults
+   * to Name and Value; Share is always a share.
+   */
+  heads?: { name?: string; value?: string };
   /** The one line drawn when there is nothing to rank. */
   empty?: ReactNode;
   className?: string;
@@ -369,8 +396,8 @@ export function BarList({
         rows={items}
         getRowKey={(item) => item.name}
         columns={[
-          { head: 'Name', cell: (item) => <span className="break-words">{item.name}</span> },
-          { head: 'Value', cell: (item) => valueText(item.value), align: 'end' },
+          { head: heads?.name ?? 'Name', cell: (item) => <span className="break-words">{item.name}</span> },
+          { head: heads?.value ?? 'Value', cell: (item) => valueText(item.value), align: 'end' },
           {
             head: 'Share',
             cell: (item) => (total ? `${Math.round((item.value / total) * 100)}%` : '—'),
@@ -423,6 +450,91 @@ export function StackBar({ segments, label }: { segments: readonly StackSegment[
             align: 'end',
           },
         ]}
+      />
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Series — small multiples on one time axis
+ * ------------------------------------------------------------------ */
+
+/**
+ * A value over time for each of a few rows — what each account spent, bucket
+ * by bucket. A strip per row on one shared scale and one crosshair, never a
+ * stack of colours: the row is named in words, and its strip is the one paint.
+ * The numbers are the buckets as rows and the strips as columns, with a total.
+ */
+export function Series({
+  buckets,
+  rows,
+  format,
+  timeText,
+  label,
+  heads,
+  tone = 'running',
+  empty,
+}: {
+  buckets: readonly SeriesBucket[];
+  rows: readonly SeriesRow[];
+  /** A value as the page writes it, in the drawing, the readout and the numbers alike. */
+  format: (value: number) => string;
+  /** A bucket's start as a person reads it — the axis, the readout and the numbers' first column. */
+  timeText: (start: string) => string;
+  /** What the figure shows, as a sentence's subject — "Spend over time, by account". */
+  label: string;
+  /** The numbers' first column's head — "Time (UTC)". */
+  heads?: { time?: string };
+  tone?: FigureTone;
+  /** The one line drawn when no row has a value. */
+  empty?: ReactNode;
+}) {
+  const nonZero = rows.some((row) => row.values.some((value) => value > 0));
+  if (!buckets.length || !rows.length || !nonZero) {
+    return <div className="text-meta text-ink-muted">{empty ?? 'Nothing recorded yet.'}</div>;
+  }
+  const kept = buckets
+    .map((bucket, i) => ({ bucket, i, total: rows.reduce((sum, row) => sum + (row.values[i] ?? 0), 0) }))
+    .filter((point) => point.total > 0);
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <LazySeries
+        buckets={buckets}
+        rows={rows}
+        tone={tone}
+        valueText={format}
+        timeText={timeText}
+        label={label}
+      />
+      {/* Only the buckets something was spent in: a day of five-minute bars is
+          288 rows of which most are nothing, and the empty columns ARE the
+          absence. */}
+      <FigureNumbers
+        label="buckets with a value"
+        caption={`${label}: each bucket with a value, by row`}
+        rows={kept}
+        getRowKey={(point) => point.bucket.start || String(point.i)}
+        columns={[
+          {
+            head: heads?.time ?? 'Time',
+            cell: (point) => <span className="tnum">{timeText(point.bucket.start)}</span>,
+          },
+          ...rows.map((row) => ({
+            head: row.name,
+            cell: (point: (typeof kept)[number]) => format(row.values[point.i] ?? 0),
+            align: 'end' as const,
+          })),
+          ...(rows.length > 1
+            ? [
+                {
+                  head: 'Total',
+                  cell: (point: (typeof kept)[number]) => format(point.total),
+                  align: 'end' as const,
+                },
+              ]
+            : []),
+        ]}
+        note={`${buckets.length} buckets in the window; the rest held nothing.`}
       />
     </div>
   );

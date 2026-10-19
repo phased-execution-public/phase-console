@@ -28,7 +28,13 @@ import { Suspense } from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BAYS } from '@shared/bays.js';
-import { LEGACY_PLAN_TABS, LEGACY_SETTINGS_SECTIONS, PLAN_TABS, ROUTE_HEADS } from '@shared/route-meta.js';
+import {
+  LEGACY_PLAN_TABS,
+  LEGACY_SETTINGS_SECTIONS,
+  PLAN_TABS,
+  PLAN_VIEW_ALIASES,
+  ROUTE_HEADS,
+} from '@shared/route-meta.js';
 import { LOGS_SECTIONS, logsSectionHref, logsSectionOf } from '@/screens/logs/routes';
 import { REDIRECTS } from './redirects';
 import {
@@ -293,10 +299,11 @@ describe('the redirects — one hop, with what the old address said', () => {
     expect(redirectTarget(at('#/pulse'))).toBe(runsBayHref('live'));
   });
 
-  it('lands the queue page on the Queued group of the home, carrying its query (7.0)', () => {
+  it('lands the queue page on the Queued group of the home in Free, and draws the Queue page in Pro', () => {
     // Control-tower phase 99's `#/queue` is the home's Queued group since 7.0
-    // (quiet-console phase 7). The head stays in the vocabulary — the server
-    // and the palette still spell it — and lands in one hop.
+    // (quiet-console phase 7) — the FREE answer still. The head stays in the
+    // vocabulary — the server and the palette still spell it — and lands in one hop.
+    if (ROUTE_TABLE.queue!.kind === 'page') return;
     expect(ROUTE_TABLE.queue!.kind).toBe('redirect');
     expect(redirectTarget(at('#/queue'))).toBe(queueHref());
     expect(redirectTarget(at('#/queue'))).toBe(runsBayHref('queued'));
@@ -324,6 +331,7 @@ describe('the redirects — one hop, with what the old address said', () => {
   it('folds the MCP page into Settings, keeping which half of it you asked for', () => {
     expect(redirectTarget(at('#/mcp'))).toBe(settingsHref('mcp'));
     expect(redirectTarget(at('#/mcp/catalog'))).toBe(hrefOf(settingsHref('mcp'), { tab: 'catalog' }));
+    expect(redirectTarget(at('#/mcp?tab=catalog'))).toBe(hrefOf(settingsHref('mcp'), { tab: 'catalog' }));
   });
 
   it('retires both terminal heads into Sessions, keeping the session id — or the intent', () => {
@@ -406,6 +414,18 @@ describe('the redirects — one hop, with what the old address said', () => {
     }
   });
 
+  it('lands the two short addresses on their readings, in one hop, with their query (#376)', () => {
+    expect(Object.keys(PLAN_VIEW_ALIASES).sort()).toEqual(['burnup', 'schedule']);
+    for (const [tab, to] of Object.entries(PLAN_VIEW_ALIASES)) {
+      const target = redirectTarget(at(hrefOf(`plan/demo/${tab}`, { x: '1' })));
+      expect(target, tab).toBe(hrefOf(planHref('demo', 'phases'), { view: to.view, x: '1' }));
+      expect(redirectTarget(at(target!)), `${tab} lands in one hop`).toBeNull();
+      expect(Object.hasOwn(LEGACY_PLAN_TABS, tab), `${tab} is a reading's name, not a retired tab`).toBe(
+        false,
+      );
+    }
+  });
+
   it('leaves a LIVE plan tab, and the phase/handoff detail routes, exactly where they are', () => {
     for (const tail of [...PLAN_TABS, 'phase/3', 'handoff/2']) {
       expect(redirectTarget(at(hrefOf(`plan/demo/${tail}`))), tail).toBeNull();
@@ -481,21 +501,14 @@ describe('what the navigation lights up', () => {
     expect(destinationFor('agent')).toBe('sessions');
   });
 
-  it('lights Runs for every address Now answered, Your turn and the queue, and for the empty hash', () => {
-    for (const head of [
-      'now',
-      'ready',
-      'pulse',
-      'dashboard',
-      'notifications',
-      'search',
-      'guide',
-      'turn',
-      'approve',
-      'queue',
-    ]) {
+  it('lights Runs for every address Now answered and the queue, and for the empty hash — Your turn its own place', () => {
+    for (const head of ['now', 'ready', 'pulse', 'dashboard', 'notifications', 'search', 'guide', 'queue']) {
       expect(destinationFor(head), head).toBe('runs');
     }
+    // Your turn is a place of its own since one-pool phase 14 (#366), and the
+    // old answer page's address lights it while it redirects.
+    expect(destinationFor('turn')).toBe('turn');
+    expect(destinationFor('approve')).toBe('turn');
     expect(destinationFor(undefined)).toBe('runs');
     expect(destinationFor('')).toBe('runs');
     expect(DESTINATIONS as readonly string[]).not.toContain('now');
@@ -516,7 +529,7 @@ describe('what the navigation lights up', () => {
     for (const head of DESTINATIONS) expect(destinationFor(head), head).toBe(head);
   });
 
-  it('names one of the seven for every head but the picker', () => {
+  it('names one of the eight for every head but the picker', () => {
     for (const head of ROUTE_HEADS as readonly string[]) {
       const destination = destinationFor(head);
       if (head === 'source') {
@@ -527,10 +540,10 @@ describe('what the navigation lights up', () => {
     }
   });
 
-  it('keeps Your turn a lazy head that lights Runs — never an eighth destination (6.2)', () => {
+  it('makes Your turn a destination of its own — the second, after Runs (one-pool phase 14, #366)', () => {
     expect(resolveEntry('turn').kind).toBe('page');
     expect(resolveView('turn')).toBeTruthy();
-    expect(DESTINATIONS as readonly string[]).not.toContain('turn');
+    expect((DESTINATIONS as readonly string[]).indexOf('turn')).toBe(1);
     // The item's address is the head and the id — no redirect, it is the page.
     expect(redirectTarget(at(turnHref()))).toBeNull();
     expect(redirectTarget(at(turnHref('human-step-1')))).toBeNull();
@@ -693,8 +706,8 @@ describe('one spelling — hrefOf and the builders', () => {
     expect(runsHref('all')).toBe(hrefOf('runs', { view: 'all' }));
     expect(runsHref('groups')).toBe(hrefOf('runs', { view: 'groups' }));
     expect(plansHref()).toBe(hrefOf('plans'));
-    // The whole queue is the home's Queued group since 7.0.
-    expect(queueHref()).toBe(hrefOf('runs', { group: 'queued' }));
+    // The whole queue: the Queue page in Pro (one-pool phase 40), the home's Queued group in Free.
+    expect([hrefOf('queue'), hrefOf('runs', { group: 'queued' })]).toContain(queueHref());
     expect(insightsHref()).toBe(hrefOf('insights'));
     expect(insightsHref('x')).toBe(hrefOf('insights', { plan: 'x' }));
     expect(settingsHref()).toBe(hrefOf('settings'));

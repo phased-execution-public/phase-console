@@ -108,6 +108,8 @@ export interface PushDevice {
   id: string;
   label: string;
   service: string;
+  /** sha256 of the device's endpoint, first 16 hex — how a page finds its own row (#325). */
+  endpointTag?: string;
   categories: Record<string, boolean>;
   createdAt: string;
   lastOkAt: string | null;
@@ -138,6 +140,9 @@ export const notificationsApi = {
   // matches nothing on the server, so a slug that has not resolved yet cannot
   // clear the inbox by accident.
   markNotificationsReadFor: (scope: NotificationScope) => post<ReadResult>('/api/notifications/read', scope),
+  // Put back (#334): the named records become unread again — never a delete.
+  // Ids only; an empty list changes nothing on the server.
+  markNotificationsUnread: (ids: string[]) => post<ReadResult>('/api/notifications/unread', { ids }),
   clearNotifications: (what: string | { id: string }) =>
     request<unknown>(
       `/api/notifications?${typeof what === 'string' ? `scope=${what}` : `id=${q(what.id)}`}`,

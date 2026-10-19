@@ -26,6 +26,16 @@ Three independent checks have to agree before a phase advances:
 All three are run by the runner, not by the session. That is the whole design: a session cannot
 verify itself.
 
+The Run view's **Verification** fold reads each line as one of four words: **Green** (it exited 0), **Red**
+(it exited non-zero), **Timed out** (it ran, and the console's clock cut it at its limit: neither red nor
+green) and **Skipped** (this machine could not run it, because its command is missing). A heavy line, a full
+suite or a build, may first wait for a seat: every console on the machine shares one budget of heavy jobs,
+and the wait is journalled `phase.verify-queued`, naming who holds the seats. That wait is not a hang.
+
+When a red line is not the phase's fault, **Waive this line** asks why, and **Waive it for phase N** records
+your reason as a ruling on the plan. That phase no longer runs the line, and it is listed under **Waived by
+the operator**. It is an owner's press, and it waives the line for that one phase only.
+
 ## …and what it does not mean
 
 Plans write verification as prose with commands embedded. `… -m "not slow"` is a continuation

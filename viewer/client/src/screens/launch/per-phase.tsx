@@ -42,7 +42,40 @@ import {
   type ChoiceField,
   type PhaseChoice,
 } from './model/phase-choices';
-import type { McpServerView, PhaseOptions, PhaseView, SkillInfo } from '@/data/api';
+import type { AccountView, McpServerView, PhaseOptions, PhaseView, SkillInfo } from '@/data/api';
+
+/** One phase's model control — a select in the free edition, the catalog picker in Pro (one-pool phase 11). */
+type PhaseModelProps = {
+  phase: number;
+  value: string;
+  placeholder: string;
+  models: readonly string[];
+  disabled?: boolean | undefined;
+  onChange: (next: string) => void;
+};
+const PHASE_MODEL: { current: (props: PhaseModelProps) => ReactNode } = {
+  current: ({ phase, value, placeholder, models, disabled, onChange }) => (
+    <>
+      <label className="sr-only" htmlFor={`model-${phase}`}>
+        Model for phase {phase}
+      </label>
+      <NativeSelect
+        id={`model-${phase}`}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full max-w-full text-meta"
+      >
+        <option value="">{placeholder}</option>
+        {models.map((m) => (
+          <option key={m} value={m}>
+            {m}
+          </option>
+        ))}
+      </NativeSelect>
+    </>
+  ),
+};
 
 export function PerPhase({
   planPhases,
@@ -73,6 +106,8 @@ export function PerPhase({
   servers?: McpServerView[];
   /** What the RUN attaches — what `skip run's` would drop for this phase. */
   runMcp?: string[];
+  /** The console's accounts, so a phase can name its own (one-pool phase 11). */
+  accounts?: AccountView[];
   disabled?: boolean;
   onChange: (next: Record<string, PhaseOptions>) => void;
 }) {
@@ -155,23 +190,14 @@ export function PerPhase({
   // option — and fills the column it sits in.
   const modelSelect = (p: PhaseView, own: PhaseOptions) => (
     <>
-      <label className="sr-only" htmlFor={`model-${p.phase}`}>
-        Model for phase {p.phase}
-      </label>
-      <NativeSelect
-        id={`model-${p.phase}`}
-        value={own.model ?? ''}
-        disabled={disabled}
-        onChange={(e) => set(p.phase, 'model', e.target.value)}
-        className="w-full max-w-full text-meta"
-      >
-        <option value="">{inherited(p).model}</option>
-        {models.map((m) => (
-          <option key={m} value={m}>
-            {m}
-          </option>
-        ))}
-      </NativeSelect>
+      {PHASE_MODEL.current({
+        phase: p.phase,
+        value: own.model ?? '',
+        placeholder: inherited(p).model,
+        models,
+        disabled,
+        onChange: (next) => set(p.phase, 'model', next),
+      })}
       {runsAs(p, own, 'model')}
     </>
   );
@@ -280,9 +306,9 @@ export function PerPhase({
       aria-expanded={moreFor === p.phase}
       aria-label={`More for phase ${p.phase}`}
       onClick={() => setMoreFor(moreFor === p.phase ? null : p.phase)}
-      title="Permission mode and tool list for this phase alone."
+      title="Permission mode, tool list, accounts and pool policy for this phase alone."
     >
-      {own.permissionMode || own.tools?.length || own.autoApprove != null ? 'set' : 'add'}
+      {own.permissionMode || own.tools?.length || own.autoApprove != null || ownPool(own) ? 'set' : 'add'}
     </Button>
   );
 
@@ -392,6 +418,7 @@ export function PerPhase({
       </label>
     </div>
   );
+
 
   /** Whichever panels this phase has open, in the order the columns are in. */
   const panelsFor = (p: PhaseView, own: PhaseOptions): { key: string; node: ReactNode }[] =>
@@ -594,4 +621,10 @@ export function phaseModeSource(p: PhaseView, own: PhaseOptions, runMode: string
   return runMode
     ? `Starts in the plan’s mode when its Permission mode line names one, else ${name(runMode)} — this run’s default.`
     : 'Starts in the plan’s mode when its Permission mode line names one, else accept edits.';
+}
+
+/** Does a phase name accounts or a pool policy of its own? Always no in the free edition. */
+function ownPool(own: PhaseOptions): boolean {
+  const said = { pool: false, own };
+  return said.pool;
 }

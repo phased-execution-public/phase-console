@@ -112,6 +112,8 @@ export interface PlanSummaryFull {
   /** The engine's reason beside the word (`plan directive: QA gate: on`). */
   qaModeReason?: string;
   qaFailures: number[];
+  /** The open phases whose heading is GATED (#360) — absent from a server before one-pool phase 17. */
+  gated?: number[];
   locks: PhaseLock[];
   repos: string[];
   handoffCount: number;

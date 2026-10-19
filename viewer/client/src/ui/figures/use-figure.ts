@@ -118,6 +118,11 @@ export function useFigure(options: FigureOptions) {
 
   const reset = useCallback(() => setView(live.current.bounds), []);
 
+  /** Shows exactly `window` — a quick range, or a zoom an address asked for — clamped like any zoom. */
+  const zoomTo = useCallback((window: AxisWindow) => {
+    setView(zoomWindow(window, 1, (window[0] + window[1]) / 2, live.current.bounds, live.current.minSpan));
+  }, []);
+
   /** Moves the crosshair, panning the window when the stop has left it. */
   const moveTo = useCallback(
     (index: number) => {
@@ -292,7 +297,18 @@ export function useFigure(options: FigureOptions) {
   };
 
   const zoom = zoomOf(view, bounds);
-  return { view, zoom, zoomed: zoom > 1.001, cursor, setCursor, zoomBy, reset, surfaceProps, sliderProps };
+  return {
+    view,
+    zoom,
+    zoomed: zoom > 1.001,
+    cursor,
+    setCursor,
+    zoomBy,
+    zoomTo,
+    reset,
+    surfaceProps,
+    sliderProps,
+  };
 }
 
 export type Figure = ReturnType<typeof useFigure>;

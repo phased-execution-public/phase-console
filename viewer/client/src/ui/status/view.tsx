@@ -22,19 +22,32 @@ export interface Chrome extends Omit<HTMLAttributes<HTMLSpanElement>, 'children'
   live?: boolean;
   /** Draw the view's fact (a count, a reason) beside the word. Default yes. */
   withNote?: boolean;
+  /**
+   * `dot` (the default) is a 6 px dot and a word. `badge` is the same view as
+   * a bordered pill — the status's icon and word in its hue, never a fill —
+   * for the status of a plan or a phase where it is the row's headline
+   * (#361, design.md §1 rule 4). A settled badge keeps its hue, muted, so
+   * Done and Complete do not read as grey text.
+   */
+  chrome?: 'dot' | 'badge';
 }
 
-/** One line a hover can carry: the word, its fact, and whether it asks for you. */
-export function viewTitle(view: StatusView): string {
-  if (!view.known) {
-    return view.word == null || view.word === ''
-      ? 'No status was given here.'
-      : `“${view.word}” is not a word this console knows here.`;
-  }
+/** The tooltip's first line: the word, its fact, and whether it asks for you. */
+export function viewHeadline(view: StatusView): string {
+  if (!view.known) return view.label;
   const parts = [view.label, view.note?.text].filter(Boolean).join(', ');
   if (view.attention === 'urgent') return `${parts} — urgent: this needs you now.`;
   if (view.attention === 'needs-you') return `${parts} — this needs you.`;
   return parts;
+}
+
+/**
+ * Everything a hover says, as one plain string — the headline, what the word
+ * means here and what comes next (#365). The family's tooltip draws the same
+ * parts; this is for a surface that can carry only a line of text.
+ */
+export function viewTitle(view: StatusView): string {
+  return [viewHeadline(view), view.meaning, view.next].filter(Boolean).join(' ');
 }
 
 /**

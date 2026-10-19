@@ -39,14 +39,17 @@ import {
   centreView,
   clampView,
   fitScale,
+  mapObstacles,
   markGeometry,
   platforms,
   positions,
+  routeLanes,
   stationFacts,
   trackPath,
   wrapLabel,
   type PhaseDriver,
 } from './dag';
+import { meets, segmentBox } from '@/ui/figures/collide';
 import { expectNoAxeViolations } from '@/test/axe';
 import { getPrefs, setPrefs } from '@/lib/prefs';
 import type { RouteView, SessionPlanView } from '@/data/api';
@@ -57,7 +60,7 @@ vi.mock('@/lib/media', async (importOriginal) => {
   return { ...actual, useTouch: () => touch() };
 });
 
-const { COL_W, ROW_H, PAD, R, LABEL_LINE, TAP, MIN_K, MAX_K, FIT_MIN_K, FIT_MAX_K, ZOOM_STEP } =
+const { COL_W, ROW_H, PAD, TOP, R, LABEL_LINE, TAP, MIN_K, MAX_K, FIT_MIN_K, FIT_MAX_K, ZOOM_STEP } =
   MAP_CONSTANTS;
 
 /** A diamond: 1 → {2,3} → 4. Two layers of one, one layer of two. */
@@ -143,28 +146,59 @@ describe('the zoom floor', () => {
 describe('positions', () => {
   it('puts a layer in a column and a row in a row', () => {
     const { points } = positions(ROUTE);
-    expect(points.get(1)).toMatchObject({ x: PAD, y: PAD + 0.5 * ROW_H });
-    expect(points.get(2)).toMatchObject({ x: PAD + COL_W, y: PAD });
-    expect(points.get(3)).toMatchObject({ x: PAD + COL_W, y: PAD + ROW_H });
-    expect(points.get(4)).toMatchObject({ x: PAD + 2 * COL_W, y: PAD + 0.5 * ROW_H });
+    expect(points.get(1)).toMatchObject({ x: PAD, y: TOP });
+    expect(points.get(2)).toMatchObject({ x: PAD + COL_W, y: TOP });
+    expect(points.get(3)).toMatchObject({ x: PAD + COL_W, y: TOP + ROW_H });
+    expect(points.get(4)).toMatchObject({ x: PAD + 2 * COL_W, y: TOP });
   });
 
-  it('centres a short layer against the tallest one', () => {
-    // Layer 0 holds one node against a tallest layer of two, so it sits half a
-    // row down — a single station level with the gap, not with the top row.
+  it('stands every station on the row grid — a short column near the middle, never between two rows (#375)', () => {
+    // Centred by half rows, a short column's stations fell at its neighbour's
+    // label height, and a track along one row ran through the next column's
+    // names. Layer 0 holds one node against a tallest layer of two: row 0.
     const { points } = positions(ROUTE);
-    expect(points.get(1)!.y).toBe(points.get(2)!.y + ROW_H / 2);
+    expect(points.get(1)!.y).toBe(points.get(2)!.y);
+    // One node against three: the middle row, on the grid.
+    const tall = positions({
+      nodes: [
+        { phase: 1, layer: 0, row: 0, state: 'ready', size: 'S', gated: false, title: 'One' },
+        ...[0, 1, 2].map((row) => ({
+          phase: 2 + row,
+          layer: 1,
+          row,
+          state: 'ready',
+          size: 'S',
+          gated: false,
+          title: `Row ${row}`,
+        })),
+      ],
+      edges: [],
+      layers: 2,
+      rows: 3,
+    });
+    expect(tall.points.get(1)!.y).toBe(TOP + ROW_H);
+    for (const node of tall.points.values()) expect((node.y - TOP) % ROW_H).toBe(0);
+  });
+
+  it('starts the first row under the band the wave headings and its batch captions share (#375)', () => {
+    // A top-row station's caption hangs `halo + 6` above it and reaches an
+    // ascent higher; the heading's one line reaches a descender under its
+    // baseline. The caption's top clears the heading's foot.
+    const geo = markGeometry(R);
+    const captionTop = TOP - geo.halo - 6 - 0.8 * 12.5;
+    const headingFoot = MAP_CONSTANTS.HEADING_Y + 0.25 * 12.5;
+    expect(captionTop).toBeGreaterThan(headingFoot);
   });
 
   it('leaves room past the last column for half a label, and none below for one', () => {
     const { width, height } = positions(ROUTE);
     expect(width).toBe(PAD * 2 + (ROUTE.layers - 1) * COL_W + 60);
-    expect(height).toBe(PAD * 2 + ROW_H);
+    expect(height).toBe(TOP + PAD + ROW_H);
     // The whole point: the last row sits a full PAD above the bottom edge, and
     // a two-line label drops ~52 into it — its first line's drop, one line
     // more, a descender. A second allowance on top makes every fit 15-26% too
     // small.
-    const lastRow = PAD + ROW_H;
+    const lastRow = TOP + ROW_H;
     expect(height - lastRow).toBe(PAD);
     expect(PAD).toBeGreaterThan(markGeometry(R).label + LABEL_LINE + 3);
   });
@@ -178,7 +212,7 @@ describe('positions', () => {
     });
     expect(points.size).toBe(1);
     expect(width).toBe(PAD * 2 + 60);
-    expect(height).toBe(PAD * 2);
+    expect(height).toBe(TOP + PAD);
   });
 });
 
@@ -297,6 +331,86 @@ describe('trackPath', () => {
   });
 });
 
+describe('the layout pass: track routed around every word (#375)', () => {
+  const node = (phase: number, layer: number, row: number, title = `Phase ${phase}`) => ({
+    phase,
+    layer,
+    row,
+    state: 'ready',
+    size: 'M',
+    gated: false,
+    title,
+  });
+  /** Q corners of a path, as their control points — where it turns. */
+  const corners = (d: string) =>
+    [...d.matchAll(/Q([\d.-]+),([\d.-]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
+
+  it('turns in the gutter after its source column, never at mid-span — a long edge’s drop crossed the names between', () => {
+    const { points } = positions({
+      nodes: [node(1, 0, 0), node(2, 1, 0), node(3, 3, 1)],
+      edges: [],
+      layers: 4,
+      rows: 2,
+    });
+    const d = trackPath(points.get(1)!, points.get(3)!);
+    expect(corners(d)[0]![0]).toBe(PAD + COL_W / 2);
+    // With no lane it arrives along its target's row.
+    expect(d.endsWith(`,${points.get(3)!.y}`)).toBe(true);
+  });
+
+  it('runs a long edge at its lane, and turns back in the gutter before its target', () => {
+    const { points } = positions({
+      nodes: [node(1, 0, 0), node(2, 3, 0)],
+      edges: [],
+      layers: 4,
+      rows: 1,
+    });
+    const lane = TOP + ROW_H - MAP_CONSTANTS.CORRIDOR;
+    const d = trackPath(points.get(1)!, points.get(2)!, lane);
+    const turns = corners(d);
+    expect(turns.map(([x]) => x)).toEqual([
+      PAD + COL_W / 2,
+      PAD + COL_W / 2,
+      PAD + 2.5 * COL_W,
+      PAD + 2.5 * COL_W,
+    ]);
+    expect(turns.slice(1, 3).every(([, y]) => y === lane)).toBe(true);
+  });
+
+  it('chooses a lane no station, name or caption of another phase stands in', () => {
+    // A long edge along row 0 would run through phase 2's dot and name.
+    const route = {
+      nodes: [node(1, 0, 0), node(2, 1, 0, 'A long station name here'), node(4, 1, 1), node(3, 2, 0)],
+      edges: [{ from: 1, to: 3 }],
+      layers: 3,
+      rows: 2,
+    };
+    const layout = positions(route);
+    const head = layout.points.get(4)!;
+    const obstacles = mapObstacles(layout, [{ head, caption: 'S2 190K/200K gated' }]);
+    const lane = routeLanes(layout, route.edges, obstacles).get('1-3')!;
+    expect(lane).not.toBe(TOP);
+    const from = layout.points.get(1)!;
+    const to = layout.points.get(3)!;
+    // Every leg between the two gutters is clear of every box that is not its own.
+    const strokes = [
+      segmentBox(PAD + COL_W / 2, from.y, PAD + COL_W / 2, lane, 4.5),
+      segmentBox(PAD + COL_W / 2, lane, PAD + 1.5 * COL_W, lane, 4.5),
+      segmentBox(PAD + 1.5 * COL_W, lane, PAD + 1.5 * COL_W, to.y, 4.5),
+    ];
+    for (const { phase, box } of obstacles) {
+      if (phase === 1 || phase === 3) continue;
+      for (const stroke of strokes) expect(meets(stroke, box)).toBe(false);
+    }
+  });
+
+  it('routes no lane for neighbours: they turn in the one gutter between them, where nothing is written', () => {
+    const route = { nodes: [node(1, 0, 0), node(2, 1, 1)], edges: [{ from: 1, to: 2 }], layers: 2, rows: 2 };
+    const layout = positions(route);
+    expect(routeLanes(layout, route.edges, mapObstacles(layout)).size).toBe(0);
+  });
+});
+
 describe('wrapLabel', () => {
   it('keeps a short title on one line', () => {
     expect(wrapLabel('Cutover')).toEqual(['Cutover']);
@@ -307,6 +421,11 @@ describe('wrapLabel', () => {
     // line of exactly 17 stays whole.
     expect(wrapLabel('Design system and shell')).toEqual(['Design system and', 'shell']);
     expect('Design system and'.length).toBe(17);
+  });
+
+  it('elides one word longer than a line, rather than running it into the next column’s names (#375)', () => {
+    expect(wrapLabel('Supercalifragilisticexpialidocious')).toEqual(['Supercalifragili…']);
+    expect(wrapLabel('Supercalifragilisticexpialidocious rules')).toEqual(['Supercalifragili…', 'rules']);
   });
 
   it('elides rather than running a third line off the map', () => {

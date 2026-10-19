@@ -439,3 +439,47 @@ test('a console the sandbox hands over is armed by the sandbox itself — the br
     process.env.PHASE_CONSOLE_KEYCHAIN = saved;
   }
 });
+
+/**
+ * The usage belt (one-pool phase 30, #241). Every real `Service` a test builds
+ * makes a usage poller with no `fetchFn` and no `base`, so it polled the
+ * machine login's live meters: scope-fence SF-5 met the operator's weekly
+ * meter at 100 % as a `usage-climbing` announcement. In a test process, or
+ * under the sandbox's marker, such a poller asks no endpoint at all — and a
+ * test that wants an answer injects one, which unseals it.
+ */
+test('the usage belt: a poller built as a Service builds it asks no endpoint in a test process', async () => {
+  const { UsagePoller, usageSealed, USAGE_SEALED_DETAIL } = await import('../server/accounts/usage.ts');
+  const savedFetch = globalThis.fetch;
+  const savedBase = process.env.PHASE_CONSOLE_USAGE_BASE;
+  delete process.env.PHASE_CONSOLE_USAGE_BASE;
+  const reached: string[] = [];
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    reached.push(String(url));
+    throw new Error('a test reached the network');
+  }) as typeof fetch;
+  try {
+    const poller = new UsagePoller({ resolveToken: async () => ({ token: 'tok' }), exec: async () => ({ stdout: '2.1.0' }) });
+    try {
+      const usage = await poller.refresh('default');
+      assert.deepEqual(reached, [], 'a test process asked a usage endpoint');
+      assert.equal(usage?.error, USAGE_SEALED_DETAIL, 'the sealed read says why it holds no meters');
+      assert.equal(usage?.fetchedAt, undefined, 'a sealed read is not a reading');
+    } finally {
+      poller.stop();
+    }
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedBase === undefined) delete process.env.PHASE_CONSOLE_USAGE_BASE;
+    else process.env.PHASE_CONSOLE_USAGE_BASE = savedBase;
+  }
+  const console_ = ['/usr/local/bin/node', '/opt/phase-console/viewer/server/index.ts', '--port', '4130'];
+  assert.equal(usageSealed({}, {}, console_), false, 'a console in production must read its own meters');
+  assert.equal(usageSealed({}, { NODE_TEST_CONTEXT: 'child-v8' }, console_), true);
+  assert.equal(usageSealed({}, { PHASE_CONSOLE_KEYCHAIN: '0' }, ['node', 'test/accounts.test.ts']), true);
+  // What a test injects unseals it: a fetch, a base, or the environment's endpoint.
+  const marked = { NODE_TEST_CONTEXT: 'child-v8' };
+  assert.equal(usageSealed({ fetchFn: savedFetch }, marked, console_), false);
+  assert.equal(usageSealed({ base: 'http://usage.test' }, marked, console_), false);
+  assert.equal(usageSealed({}, { ...marked, PHASE_CONSOLE_USAGE_BASE: 'http://127.0.0.1:9' }, console_), false);
+});

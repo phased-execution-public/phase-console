@@ -57,7 +57,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
 import { argvLiterals } from './argv-scan.ts';
-import { PUSH_ARGV } from '../shared/landing-model.js';
+import { PROOF_FETCH_ARGV, PUSH_ARGV } from '../shared/landing-model.js';
 import { manifestPushVerdict } from '../server/runner/manifest-verdict.ts';
 import { PUSH_REF, pushRef } from '../server/runner/worktree.ts';
 import { fileURLToPath } from 'node:url';
@@ -173,11 +173,18 @@ const FORBIDDEN = [...REMOTE_VERBS, ...MUTATING_VERBS];
  *    working tree are untouched — what they write is unreferenced objects, as
  *    `merge-tree --write-tree` does. `write-tree` joins `GIT_VERBS` below so it
  *    is visible to this gate at all.
+ *  - `fetch` is the sixteenth (one-pool phase 21, #370), and like `push` it is
+ *    exempted for exactly ONE argv (`fetchTrunk`): the landing proof refreshes
+ *    `origin/<trunk>` before it compares, because a mirror nobody fetched called
+ *    a merged branch unlanded. It opens with `PROOF_FETCH_ARGV` (no tags, no
+ *    FETCH_HEAD, no submodules), names the remote `origin` and one refspec, and
+ *    exists in this file alone — the SHAPE test at the bottom holds all four.
+ *    `fetch` stays banned in every other file.
  */
 const EXEMPT_FILE = 'runner/worktree.ts';
 const WORKTREE_VERBS = [
   'worktree', 'merge', 'merge-tree', 'rev-parse', 'rev-list', 'diff', 'status',
-  'switch', 'symbolic-ref', 'branch', 'for-each-ref', 'log', 'push', 'add', 'write-tree',
+  'switch', 'symbolic-ref', 'branch', 'for-each-ref', 'log', 'push', 'add', 'write-tree', 'fetch',
 ];
 
 /** The flag that makes a phased-execution script commit and push its write. */
@@ -279,7 +286,7 @@ test('no argument list in viewer/server can fetch, pull or otherwise reach a rem
     && argv.args.slice(0, PUSH_ARGV.length).join('\u0000') === PUSH_ARGV.join('\u0000');
   const offences = ARGVS
     .filter((argv) => argv.args.some((a) => banned.has(a)))
-    .filter((argv) => !isTheOnePush(argv))
+    .filter((argv) => !isTheOnePush(argv) && !isTheOneFetch(argv))
     .map((argv) => `${argv.file}:${argv.line} ${JSON.stringify(argv.args)}`);
 
   assert.deepEqual(offences, [], 'a remote-talking git verb reached an argument list');
@@ -325,10 +332,34 @@ test('the worktree module runs ONLY the verbs its exemption names', () => {
   // …and of the three the reclaim and the branch hygiene added. Same rule,
   // same reason: an exemption nothing uses is a hole waiting for a first user,
   // and these three are the most dangerous entries on the list.
-  for (const verb of ['switch', 'symbolic-ref', 'branch', 'for-each-ref', 'push']) {
+  for (const verb of ['switch', 'symbolic-ref', 'branch', 'for-each-ref', 'push', 'fetch']) {
     assert.ok(used.has(verb),
       `${verb} is exempted but unused — take it out of WORKTREE_VERBS rather than leaving it open`);
   }
+});
+
+/** The landing proof's one fetch (one-pool phase 21, #370): `fetchTrunk`'s literal, in the worktree module. */
+function isTheOneFetch(argv: Argv): boolean {
+  return argv.file === EXEMPT_FILE
+    && argv.args[0] === 'fetch'
+    && argv.args.slice(0, PROOF_FETCH_ARGV.length).join('\u0000') === PROOF_FETCH_ARGV.join('\u0000');
+}
+
+test('the one fetch is SHAPED: the proof head, the remote `origin`, one refspec, the worktree module alone', () => {
+  const fetches = ARGVS.filter((argv) => argv.args.includes('fetch'));
+  assert.equal(fetches.length, 1, `exactly one fetch argv: ${fetches.map((a) => `${a.file}:${a.line}`).join(', ')}`);
+  const [only] = fetches;
+  assert.equal(only!.file, EXEMPT_FILE, 'the fetch lives in the worktree module');
+  assert.ok(isTheOneFetch(only!), `it opens with PROOF_FETCH_ARGV: ${JSON.stringify(only!.args)}`);
+  // The scanner keeps literals only: the refspec is the one variable after `origin`.
+  assert.deepEqual(only!.args.slice(PROOF_FETCH_ARGV.length), ['origin'], 'one named remote, never a URL');
+  const source = readFileSync(join(SERVER_DIR, EXEMPT_FILE), 'utf8');
+  assert.match(source, /'--no-recurse-submodules', 'origin', refspec\];/, 'the remote, then exactly one refspec');
+  assert.match(source, /const refspec = `\+refs\/heads\/\$\{trunk\}:refs\/remotes\/origin\/\$\{trunk\}`;/,
+    'the refspec moves the trunk\'s remote-tracking ref and nothing else');
+  assert.ok(!only!.args.some((a) => /^--(all|prune|tags|update-head-ok|unshallow|mirror)$/.test(a) || a === '-p'),
+    'no flag that fetches more than the trunk, or deletes a ref');
+  assert.deepEqual([...PROOF_FETCH_ARGV], ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules']);
 });
 
 test('the branch exemption is the DELETE form, and -D appears nowhere', () => {
@@ -359,10 +390,32 @@ test('no argument list in viewer/server passes --git to a script', () => {
   assert.deepEqual(offences, [], '--git makes a script commit and push; the console must never pass it');
 });
 
+/**
+ * String-literal arrays whose head is a git verb and which are NOT an argv —
+ * each named exactly (file and whole literal) with why, so a real `git grep`
+ * anywhere else, or a second literal in the same file, is still an offence.
+ * The `['wait', 'switch', 'pause']` treatment above: name it, do not widen.
+ */
+const NOT_AN_ARGV: { file: string; args: string[]; why: string }[] = [
+  {
+    file: 'runner/verify.ts',
+    args: ['grep', 'egrep', 'fgrep', 'rg'],
+    why: '`GREPS`, the grep family whose first operand is a pattern — a set of command NAMES the '
+      + 'verification reader parses a §Verification line with (one-pool phase 20, #357 #311); nothing spawns it',
+  },
+];
+
 test('the git verbs the console runs are exactly the reads plus the two file-writers', () => {
   const offences: string[] = [];
   const used = new Set<string>();
+  const named = (argv: Argv) => NOT_AN_ARGV.some((row) => row.file === argv.file
+    && JSON.stringify(row.args) === JSON.stringify(argv.args));
+  for (const row of NOT_AN_ARGV) {
+    assert.equal(ARGVS.filter((argv) => argv.file === row.file && JSON.stringify(argv.args) === JSON.stringify(row.args)).length, 1,
+      `${row.file} ${JSON.stringify(row.args)} is named as no argv, and the scan finds it exactly once (${row.why})`);
+  }
   for (const argv of ARGVS) {
+    if (named(argv)) continue;
     const verb = argv.args.find((a) => GIT_VERBS.has(a));
     if (!verb || argv.args[0] !== verb) continue;
     used.add(verb);

@@ -2378,3 +2378,126 @@ test('SW-3: the entry view names the account each admission would spend — `def
     s.release(await theirs);
   } finally { s.close(); }
 });
+
+test('#264: Recheck answers a waiting-external wall that names a ref — and the fence keeps its narrow meaning', async () => {
+  const { isExternalWall, isRecheckableWall } = await import('../server/runner/scheduler.ts');
+  const at = '2026-10-07T07:30:05.000Z';
+  const ci = {
+    phase: 40, status: 'waiting',
+    declared: { status: 'waiting-external', reason: 'the deploy run', watch: ['cmd:"gh run list -R acme/app --json status"'], at },
+  } as never;
+  assert.equal(isRecheckableWall(ci), true, 'the usual CI wait is rechecked by its refs');
+  assert.equal(isExternalWall(ci), false, 'and is still no fence — `fenceHolderOf` reads the narrow word');
+  const bare = { phase: 40, status: 'waiting', declared: { status: 'waiting-external', reason: 'a clock', at } } as never;
+  assert.equal(isRecheckableWall(bare), false, 'a wait naming no ref has nothing to ask');
+  const wall = { phase: 3, status: 'parked', declared: { status: 'needs-human', needs: 'external', reason: 'x', at } } as never;
+  assert.equal(isRecheckableWall(wall), true, 'every external wall still is');
+  const partial = { phase: 3, status: 'parked', declared: { status: 'partial', reason: 'x', watch: ['date:2026-10-08T00:00:00Z'], at } } as never;
+  assert.equal(isRecheckableWall(partial), false);
+});
+
+/* ------------------------------------------------------------------ *
+ * The heavy-job queue (one-pool phase 26, #327)
+ * ------------------------------------------------------------------ */
+
+test('HJ-1: a heavy job waits for the machine\'s budget, journals why once, and RUNS once a seat frees — never skipped (#327)', async () => {
+  const { HEAVY_LOAD_WAIT_MAX_MS } = await import('../server/runner/scheduler.ts');
+  assert.equal(HEAVY_LOAD_WAIT_MAX_MS, 30 * 60_000);
+  // 14 cores: a budget of two.
+  const scheduler = new Scheduler({ load: () => ({ avg5: 3, cores: 14, factor: 1.5, busy: 0.2 }), heavyPollMs: 10 });
+  try {
+    assert.equal(scheduler.heavyBudget(), 2);
+    const job = (slug: string, purpose = 'baseline') => ({ slug, phase: 1, runId: `run-${slug}`, purpose, command: 'npm test' });
+    const a = await scheduler.heavyJob(job('a'));
+    const b = await scheduler.heavyJob(job('b'));
+    assert.equal(a.queued || b.queued, false, 'the first two seat at once');
+    const told: string[] = [];
+    let seated = false;
+    const third = scheduler.heavyJob({ ...job('c'), onQueued: (wait) => told.push(`${wait.reason} ${wait.running}/${wait.budget}: ${wait.sentence}`) })
+      .then((grant) => { seated = true; return grant; });
+    await new Promise((done) => setTimeout(done, 60));
+    assert.equal(seated, false, 'the third waits: the machine runs two at once');
+    assert.equal(told.length, 1, `told once, however many looks it takes: ${told.join(' | ')}`);
+    assert.match(told[0]!, /^budget 2\/2: 2 of 2 heavy jobs the machine runs at once are running — it runs when one ends$/);
+    const view = scheduler.snapshot().jobs!;
+    assert.equal(view.budget, 2);
+    assert.deepEqual(view.running.map((row) => row.slug).sort(), ['a', 'b'], 'the queue page shows what runs');
+    assert.deepEqual(view.waiting.map((row) => [row.slug, row.reason]), [['c', 'budget']], 'and what waits, and why');
+
+    a.release();
+    const grant = await third;
+    assert.equal(grant.queued, true);
+    assert.ok(grant.id && grant.waitedMs >= 50, 'it ran once budget freed');
+    b.release();
+    grant.release();
+    assert.equal(scheduler.snapshot().jobs!.running.length, 0, 'a released seat is gone');
+  } finally {
+    scheduler.close();
+  }
+});
+
+test('HJ-2: the verdict\'s own job goes first and is not held by the load; a baseline waits on the load, softly; a stop seats nobody', async () => {
+  let busy = 0.95;
+  const scheduler = new Scheduler({ load: () => ({ avg5: 3, cores: 7, factor: 1.5, busy }), heavyPollMs: 10 });
+  try {
+    assert.equal(scheduler.heavyBudget(), 1);
+    const job = (slug: string, purpose: string) => ({ slug, phase: 1, runId: `run-${slug}`, purpose, command: 'npm test' });
+    const reasons: string[] = [];
+    let baselineSeated = false;
+    const baseline = scheduler.heavyJob({ ...job('base', 'baseline'), onQueued: (wait) => reasons.push(wait.reason) })
+      .then((grant) => { baselineSeated = true; return grant; });
+    await new Promise((done) => setTimeout(done, 40));
+    assert.equal(baselineSeated, false, 'a baseline waits while the CPU is busy');
+    assert.deepEqual(reasons, ['load']);
+    // The phase's verdict waits on its verification: urgent seats past the load, ahead of the baseline.
+    const verdict = await scheduler.heavyJob({ ...job('lane', 'verify'), urgent: () => true });
+    assert.ok(verdict.id, 'urgent: seated through the load');
+    assert.equal(verdict.pastLoad, false);
+    busy = 0.1;
+    await new Promise((done) => setTimeout(done, 40));
+    assert.equal(baselineSeated, false, 'the load dropped, and the budget (one) is the verdict\'s');
+    verdict.release();
+    const seat = await baseline;
+    assert.ok(seat.id, 'then the baseline runs');
+    // A stop resolves a waiter seatless — the caller's own signal check skips the command.
+    const stop = new AbortController();
+    const stopped = scheduler.heavyJob({ ...job('gone', 'baseline'), signal: stop.signal });
+    stop.abort();
+    const none = await stopped;
+    assert.equal(none.id, '', 'seatless');
+    none.release();
+    seat.release();
+  } finally {
+    scheduler.close();
+  }
+});
+
+test('HJ-3: two schedulers over one machine store share one budget — another console\'s suite counts (#223 ask 3)', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { MachineJobs } = await import('../server/load-reading.ts');
+  const home = mkdtempSync(join(tmpdir(), 'pc-hj3-'));
+  const env = { ...process.env, XDG_STATE_HOME: home };
+  const hub = new Scheduler({ load: () => ({ avg5: 1, cores: 14, factor: 1.5, busy: 0 }), jobs: new MachineJobs(env), instanceId: 'hub', heavyPollMs: 10 });
+  const peHub = new Scheduler({ load: () => ({ avg5: 1, cores: 14, factor: 1.5, busy: 0 }), jobs: new MachineJobs(env), instanceId: 'pe-hub', heavyPollMs: 10 });
+  try {
+    const job = (slug: string) => ({ slug, phase: 1, runId: `run-${slug}`, purpose: 'baseline', command: 'npm test' });
+    const one = await hub.heavyJob(job('x'));
+    const two = await hub.heavyJob(job('y'));
+    let seated = false;
+    const theirs = peHub.heavyJob(job('z')).then((grant) => { seated = true; return grant; });
+    await new Promise((done) => setTimeout(done, 50));
+    assert.equal(seated, false, 'the second console waits behind the first console\'s two');
+    assert.deepEqual(peHub.snapshot().jobs!.running.map((row) => [row.instance, row.own]), [['hub', false], ['hub', false]]);
+    one.release();
+    const seat = await theirs;
+    assert.ok(seat.id, 'the other console\'s release is heard on the next look');
+    seat.release();
+    two.release();
+  } finally {
+    hub.close();
+    peHub.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

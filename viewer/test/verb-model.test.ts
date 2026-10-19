@@ -38,6 +38,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 import {
   OPERATOR_VERBS,
+  PRO_READS,
   RUN_SWITCH_WORDS,
   VERB_EDITIONS,
   VERB_KINDS,
@@ -313,7 +314,8 @@ test('VT-1: row shape — unique names, valid kind and edition, act is pro, read
   // acts it can be asked to block a terminal for (the long poll's timeout is
   // seconds of a paid session's wall-clock, unlike every other read).
   const readNotFree = OPERATOR_VERBS
-    .filter((row) => row.kind === 'read' && row.name !== 'wait' && row.edition !== 'free')
+    // …and the Queue's check (one-pool phase 39): `PRO_READS` names them.
+    .filter((row) => row.kind === 'read' && !PRO_READS.includes(row.name) && row.edition !== 'free')
     .map((r) => r.name);
   assert.deepEqual(readNotFree, [], `read rows (other than wait) whose edition is not free: ${readNotFree.join(', ')}`);
   assert.equal(verbNamed('wait')?.edition, 'pro', 'wait is documented as the one Pro read — the table moved');

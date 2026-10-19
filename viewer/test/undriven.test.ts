@@ -240,3 +240,28 @@ test('UD-2: the inbox raises one row once the bound has passed, with Retry — n
 
   assert.deepEqual(rows({ ...state, status: 'parked' } as RunState, since + 31 * MINUTE), [], 'a stopped run asks through its halt, not here');
 });
+
+test('UD-1 (#219): a wrap-up re-board is not undriven while the candidate pass places it serial behind its sibling', () => {
+  // ai-builder-v7 P20/P21 (a84ae470d859), 2026-10-04: `phase.undriven` 1–3 s before `phase.serial-behind`.
+  const runner = tick();
+  const state = newRun({ slug: 'demo', root: '/nowhere', autoRecover: true });
+  state.status = 'running';
+  const at = new Date(runner.clock - 1_000).toISOString();
+  phaseRecord(state, 20).status = 'running';
+  Object.assign(phaseRecord(state, 21), {
+    status: 'pending', boardingHint: { situation: 'work-in-progress', rung: 'reboard-resume-brief', at, by: 'drive', brief: 'continue' },
+  });
+  runner.install(state, [20]);
+  const words = { 20: 'in-progress', 21: 'in-progress' };
+  runner.mark(board(words), [20]);
+  assert.equal(state.phases['21'].undriven, undefined, 'a hint a second old has not met the candidate pass yet');
+  // The pass places it behind phase 20's lane: still driven, past the grace.
+  phaseRecord(state, 21).serialBehind = 20;
+  runner.clock += 10 * MINUTE;
+  runner.mark(board(words), [20]);
+  assert.equal(state.phases['21'].undriven, undefined, 'serial behind a live lane of its own run is a placement');
+  // Its sibling's lane gone and nothing takes the hint: undriven, as #114 says.
+  (runner as unknown as { lanes: Map<number, unknown> }).lanes.delete(20);
+  runner.mark(board(words), []);
+  assert.ok(state.phases['21'].undriven, 'past the grace with no lane ahead of it, the hint is stranded');
+});

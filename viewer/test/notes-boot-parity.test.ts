@@ -89,8 +89,14 @@ function corpus(): Corpus {
       '  and the suite is the only writer.',
       '- **All:** bash 3.2 has no associative arrays.',
     ].join('\n')),
-    handoff(root, 2, 'left', 'complete', '2026-01-04',
-      '- **Phase 4:** the left half owns the parser.'),
+    // A note with nested sub-bullets (#378): they are the note's continuation,
+    // never notes of their own and never dropped.
+    handoff(root, 2, 'left', 'complete', '2026-01-04', [
+      '- **Phase 4:** the left half owns the parser:',
+      '  - #106: read the columns by header,',
+      '    never by index;',
+      '  - #107: the fixture stays frozen.',
+    ].join('\n')),
     // Not done: nothing it says has been handed over.
     handoff(root, 3, 'right', 'in-progress', '2026-01-05',
       '- **Phase 4:** written by a phase that has not finished.'),
@@ -211,7 +217,7 @@ test('phase 4 is handed all three sources, urgent first and then oldest to newes
     // it, and the ordinary boot message.
     ['handoff', 'the merge reads both halves; do not re-derive either.'],
     ['handoff', 'bash 3.2 has no associative arrays.'],
-    ['handoff', 'the left half owns the parser.'],
+    ['handoff', 'the left half owns the parser: - #106: read the columns by header, never by index; - #107: the fixture stays frozen.'],
     ['deferral', 'left the second decoder for the merge'],
     ['deferral', 'nobody re-spells the scope token'],
     ['deferral', 'the defaulted addressee is next'],
@@ -284,7 +290,7 @@ test('the bound keeps the newest and both readers append the same trailer', () =
   // last in display order.
   assert.equal(fromBash[0].text, 'note number 10');
   assert.equal(fromBash[10].text, 'note number 20');
-  assert.equal(fromBash[NOTES_MAX - 1].text, 'the left half owns the parser.');
+  assert.equal(fromBash[NOTES_MAX - 1].text, 'the left half owns the parser: - #106: read the columns by header, never by index; - #107: the fixture stays frozen.');
 });
 
 test('a note is clipped to the same length by both readers', () => {
@@ -352,7 +358,9 @@ test('the section parser reads every spelling of an address and refuses the rest
     '* Phase 9: no emphasis at all',
     '- **NEXT:** case does not matter',
     '- **All:** everybody',
+    '  - and its sub-bullet, folded in (#378)',
     '- **Outstanding:** a label that is not an address',
+    '  - **Phase 7:** nested under no address: a bullet of its own',
     '- no colon at all',
     '',
     '## Outstanding / blockers',
@@ -363,7 +371,8 @@ test('the section parser reads every spelling of an address and refuses the rest
     { target: '8', text: 'the other spelling' },
     { target: '9', text: 'no emphasis at all' },
     { target: 'next', text: 'case does not matter' },
-    { target: 'all', text: 'everybody' },
+    { target: 'all', text: 'everybody - and its sub-bullet, folded in (#378)' },
+    { target: '7', text: 'nested under no address: a bullet of its own' },
   ]);
 });
 

@@ -48,6 +48,8 @@ export type PlanItemWords = {
   why?: WhyPerson;
   /** The `## Operator errands` row the ref binds, and the section's "runs from". */
   errand?: ErrandRow & { runsFrom?: string };
+  /** The bullet's `proof:` now — what a check reads when it changed since the item was raised (one-pool phase 13, #345). */
+  proof?: string;
 };
 
 /**
@@ -136,6 +138,7 @@ export function composePlanItem(
     ...(bullet.effortMinutes !== undefined ? { effortMin: bullet.effortMinutes } : {}),
     ...(bullet.unblocks?.length ? { unblocks: bullet.unblocks.map((phase) => ({ slug: step.slug, phase })) } : {}),
     ...(bullet.why ? { why: bullet.why } : {}),
+    ...(bullet.proof ? { proof: bullet.proof } : {}),
     ...(row ? { errand: { ...row, ...(table?.runsFrom ? { runsFrom: table.runsFrom } : {}) } } : {}),
   };
 }

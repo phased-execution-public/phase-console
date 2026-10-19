@@ -120,6 +120,8 @@ export const HUMAN_STEP_SETTLED_STATES = Object.freeze(
  * cannot do it, or it was withdrawn — and is never opened or reminded first.
  * Only a check sends a step back (`checking` → `returned`), and a returned
  * step is worked again like any open one; a person may decline any open step.
+ * A reminder on a returned step keeps it returned (`returned` → `returned`,
+ * verb `remind`, #351): it is still the Redo the check sent back.
  * @type {Readonly<Record<HumanStepState, readonly HumanStepState[]>>}
  */
 export const HUMAN_STEP_TRANSITIONS = Object.freeze({
@@ -166,6 +168,7 @@ export const HUMAN_STEP_TRANSITIONS = Object.freeze({
     'dismissed',
   ]),
   returned: Object.freeze([
+    'returned',
     'notified',
     'opened',
     'checking',
@@ -680,6 +683,17 @@ export function secretRegExp(ere, flags = 'i') {
 
 /** @type {RegExp[]|null} */
 let compiled = null;
+/** The PEM headers' plain (non-global) forms, compiled once each (one-pool phase 26, #237). @type {Map<string, RegExp>} */
+const pemCompiled = new Map();
+/** @param {string} ere @returns {RegExp} */
+function pemRegExp(ere) {
+  let re = pemCompiled.get(ere);
+  if (!re) {
+    re = secretRegExp(ere);
+    pemCompiled.set(ere, re);
+  }
+  return re;
+}
 /** @returns {RegExp[]} */
 function patterns() {
   compiled ??= SECRET_PATTERNS.map((ere) => secretRegExp(ere, 'gi'));
@@ -752,7 +766,7 @@ export function redactSecrets(value, opts = {}) {
     const ere = SECRET_PATTERNS[index];
     // A PEM header means the key body follows: nothing after it is kept.
     if (ere.startsWith('-----begin')) {
-      const at = text.search(secretRegExp(ere));
+      const at = text.search(pemRegExp(ere));
       if (at >= 0) text = `${text.slice(0, at)}${REDACTED}`;
       return;
     }

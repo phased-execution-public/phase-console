@@ -276,3 +276,85 @@ test('LC-4: a genuinely failing lint after a complete phase still halts', async 
   assert.equal(journalled(events, 'phase.lint-unrun').length, 0);
   assert.equal(readFileSync(join(r.state, 'done'), 'utf8').trim(), '1');
 });
+
+/* ------------------------------------------------------------------ *
+ * LC-6 — a live sibling's half-written handoff is not this phase's lint (#225)
+ * ------------------------------------------------------------------ */
+
+/** A sibling's `complete` scaffold — "What this phase did" still the template — and its lock. */
+function halfWrittenSibling(root: string, opts: { leaseFromNow: number }): void {
+  const dir = join(root, 'docs', 'handoffs', 'demo');
+  mkdirSync(join(dir, '.locks'), { recursive: true });
+  const now = Math.floor(Date.now() / 1000);
+  writeFileSync(join(dir, '.locks', 'phase-02.lock'), [
+    'slug=demo', 'phase=2', 'owner=autopilot/r-sibling', 'host=h',
+    `claimed_at=${now - 60}`, `lease_until=${now + opts.leaseFromNow}`, 'scope=repoA', '',
+  ].join('\n'), 'utf8');
+  writeFileSync(join(dir, 'phase-02-beta.md'), [
+    '---', 'phase: 2', 'status: complete', '---', '', '# Phase 2 — Beta', '',
+    '## What this phase did', '<!-- what changed, and why -->', '', '## ▶ Start next phase(s)', 'closeout', '',
+  ].join('\n'), 'utf8');
+}
+
+/** validate.sh failing on exactly the sibling's scaffold, as the engine words it. */
+function scaffoldLint(r: { scripts: string }): void {
+  writeFileSync(join(r.scripts, 'validate.sh'), '#!/usr/bin/env bash\n'
+    + 'echo \'phase 2: handoff-scaffold-complete — phase-02-beta.md says complete but its "What this phase did" is still the template; the board reads it in-progress until the body is written\' >&2\n'
+    + 'echo "LINT FAIL: demo (1 issue[s])" >&2\nexit 1\n', 'utf8');
+  chmodSync(join(r.scripts, 'validate.sh'), 0o755);
+}
+
+test('LC-6: a LIVE sibling\'s half-written handoff neither halts nor charges the phase that finished — and is named', async () => {
+  const r = repo();
+  scaffoldLint(r);
+  halfWrittenSibling(r.root, { leaseFromNow: 3600 });
+  const events: { event: string; data: Record<string, unknown> }[] = [];
+  const instance = new Runner({
+    scriptsDir: r.scripts, spawn: session(r), verificationText: () => '`true`',
+    onEvent: (event, data) => events.push({ event, data }),
+  });
+
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+  await instance.wait();
+
+  const state = instance.current()!;
+  assert.equal(state.phases['1'].status, 'done', 'a green phase is never failed for a sibling\'s moment');
+  assert.ok(!state.halt, 'and the run does not halt');
+  assert.equal(state.consecutiveFailures, 0);
+  const skipped = journalled(events, 'phase.lint-sibling-skipped');
+  assert.equal(skipped.length, 1, 'the skip is named in the journal');
+  assert.deepEqual(skipped[0].siblings, [2]);
+  assert.match(String((skipped[0].issues as string[])[0]), /handoff-scaffold-complete/);
+});
+
+test('LC-6: the same scaffold with its lock LAPSED is a plan problem, and the halt stands', async () => {
+  const r = repo();
+  scaffoldLint(r);
+  halfWrittenSibling(r.root, { leaseFromNow: -60 });
+  const events: { event: string; data: Record<string, unknown> }[] = [];
+  const instance = new Runner({
+    scriptsDir: r.scripts, spawn: session(r), verificationText: () => '`true`',
+    onEvent: (event, data) => events.push({ event, data }),
+  });
+
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+  await instance.wait();
+
+  assert.equal(instance.current()!.halt?.kind, 'plan-lint');
+  assert.equal(journalled(events, 'phase.lint-sibling-skipped').length, 0);
+});
+
+test('LC-6: one problem besides the sibling\'s scaffold and the skip is off', async () => {
+  const { siblingLintSkip, issuePhaseOf } = await import('../server/runner/lint-siblings.ts');
+  const scaffold = 'phase 2: handoff-scaffold-complete — phase-02-beta.md says complete but …';
+  assert.equal(issuePhaseOf(scaffold), 2);
+  assert.equal(issuePhaseOf('  ✗ phase-07-x.md: missing the boot section'), 7);
+  assert.equal(issuePhaseOf('F15 plan: something'), undefined);
+  const live = () => true;
+  assert.deepEqual(siblingLintSkip({ summary: 'LINT FAIL: demo (1 issue[s])', issues: [scaffold, 'F15 plan: advisory'] }, 1, live),
+    { phases: [2], lines: [scaffold] }, 'an advisory line is not a counted problem');
+  assert.equal(siblingLintSkip({ summary: 'LINT FAIL: demo (2 issue[s])', issues: [scaffold, 'phase 3: undefined dependency 9'] }, 1, live), null);
+  assert.equal(siblingLintSkip({ summary: 'LINT FAIL: demo (1 issue[s])', issues: ['phase 1: handoff-scaffold-complete — mine'] }, 1, live), null,
+    'the finishing phase\'s own scaffold is its own problem');
+  assert.equal(siblingLintSkip({ summary: 'LINT FAIL: demo (1 issue[s])', issues: [scaffold] }, 1, () => false), null);
+});

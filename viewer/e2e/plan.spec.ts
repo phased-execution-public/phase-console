@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
+import { passThrough } from './lib/fetch.ts';
 import { coverage, scrollMainWithin, touch } from './lib/grid.ts';
 import { releaseRoutesAfterEach } from './lib/routes.ts';
 import { TOUR_PLAN, shoot } from './lib/shots.ts';
@@ -111,7 +112,7 @@ function widen(detail: Detail, count: number): Detail {
 async function servePlan(page: Page, count: number): Promise<() => Detail | null> {
   let served: Detail | null = null;
   await page.route(new RegExp(`/api/plans/${TOUR_PLAN}(?:\\?[^/]*)?$`), async (route) => {
-    const response = await route.fetch();
+    const response = await passThrough(route);
     served = widen((await response.json()) as Detail, count);
     await route.fulfill({ response, json: served });
   });

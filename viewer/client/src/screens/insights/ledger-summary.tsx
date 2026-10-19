@@ -52,6 +52,7 @@ export function LedgerSummaryPanel({ everything = false }: { everything?: boolea
             items={bars(data?.plans ?? [])}
             format={money}
             label="plans"
+            heads={{ name: 'Plan', value: 'Spend' }}
             empty="No run of an open plan has reported a session yet."
           />
         </FigureBlock>
@@ -60,6 +61,7 @@ export function LedgerSummaryPanel({ everything = false }: { everything?: boolea
             items={bars(data?.accounts ?? [])}
             format={money}
             label="accounts"
+            heads={{ name: 'Account', value: 'Spend' }}
             empty="No account has paid for a session yet."
           />
         </FigureBlock>

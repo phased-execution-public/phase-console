@@ -21,7 +21,7 @@
 
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AccountView, McpCatalogEntry, McpLoginStart, McpServerView } from '@/data/api';
+import type { AccountView, McpCatalogEntry, McpLoginFlow, McpLoginStart, McpServerView } from '@/data/api';
 import { renderWithClient, schemaAnswer, sent, type FixtureServer } from './test-kit';
 
 const server = vi.hoisted((): FixtureServer => ({ reads: {}, calls: [] }));
@@ -376,10 +376,19 @@ describe('the registry, read', () => {
     ]);
     mount();
 
+    // The banner names them (#372), and offers the sign-in of each that signs in.
     expect(
-      await screen.findByText('2 servers cannot be reached — a phase naming one will park at boarding.'),
+      await screen.findByText(
+        'Tracker, Broken cannot be reached — a phase naming one will park at boarding.',
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/will run without it and record an errand/)).toBeNull();
+    const banner = await drawn('[data-testid="mcp-unreachable"]');
+    expect(
+      within(banner)
+        .getAllByRole('button')
+        .map((button) => button.textContent),
+    ).toEqual(['Sign in to Tracker']);
     expect(markOf(await rowOf('broken'))).toHaveTextContent('Failed');
   });
 
@@ -456,12 +465,15 @@ describe('a server, opened in place', () => {
     ]);
     mount();
 
-    expect(await rowOf('files')).toHaveTextContent('stdio · needs MCP_FS_ROOT');
+    const row = await rowOf('files');
+    expect(row).toHaveTextContent('stdio · needs MCP_FS_ROOT');
+    // An unfinished registration's one act is to finish it (#363).
+    expect(row.querySelector('[data-row-act]')).toHaveTextContent('Fill it in');
     const files = await open('files');
     expect(within(files).getByText('npx -y files-mcp $MCP_FS_ROOT')).toBeInTheDocument();
     expect(files).toHaveTextContent('The process exited before it answered.');
     expect(files).toHaveTextContent(
-      'Its command refers to MCP_FS_ROOT, which nothing supplies, so it can never connect. Register it again with the value filled in.',
+      'Its command refers to MCP_FS_ROOT, which nothing supplies, so it cannot connect until it is filled in.',
     );
     expect(files).toHaveTextContent('Last used 1 day ago.');
 
@@ -655,17 +667,117 @@ describe('the presses on a server', () => {
 });
 
 describe('signing a server in', () => {
-  it('signs in for this console with no account named, and for a profile account by its id', async () => {
+  const AUTH =
+    'https://tracker.example.com/authorize?response_type=code&client_id=c&redirect_uri=http%3A%2F%2Flocalhost%3A5%2Fcallback';
+  /** A flow as the server answers it, five minutes from NOW. */
+  const flowOf = (patch: Partial<McpLoginFlow> = {}): McpLoginFlow => ({
+    server: 'tracker',
+    mode: 'embedded',
+    remote: false,
+    step: 'starting',
+    startedAt: NOW,
+    deadline: new Date(Date.parse(NOW) + 5 * 60_000).toISOString(),
+    command: 'claude mcp login tracker',
+    sessionId: 'pty-3',
+    ...patch,
+  });
+  /** The console's side of a flow: the start, then whatever `current` says on every read. */
+  function signs(current: { flow: McpLoginFlow }) {
+    server.reads['POST /api/mcp/tracker/login'] = (): McpLoginStart => ({
+      id: 'tracker',
+      command: current.flow.command,
+      mode: 'embedded',
+      terminal: { sessionId: 'pty-3', token: 't', expiresAt: Date.parse(NOW) + 600_000 },
+      flow: flowOf({ remote: current.flow.remote }),
+    });
+    server.reads['/api/mcp/tracker/login'] = () => ({ flow: current.flow });
+  }
+
+  it('is the row’s action when a server signs in and is not connected, and the sheet walks every step here', async () => {
     serve([TRACKER]);
-    server.reads['POST /api/mcp/tracker/login'] = (body: unknown): McpLoginStart =>
-      (body as { accountId?: string }).accountId
-        ? {
-            id: 'tracker',
-            command: 'claude mcp login tracker',
-            mode: 'embedded',
-            terminal: { sessionId: 'pty-3', token: 't', expiresAt: Date.parse(NOW) + 600_000 },
-          }
-        : { id: 'tracker', command: 'claude mcp login tracker', mode: 'external' };
+    const current = { flow: flowOf() };
+    signs(current);
+    mount();
+
+    const row = await rowOf('tracker');
+    const act = row.querySelector<HTMLElement>('[data-row-act]')!;
+    expect(act).toHaveTextContent('Sign in');
+    expect(within(row).queryByRole('button', { name: 'Switch off' })).toBeNull();
+    current.flow = flowOf({ step: 'approve', authUrl: AUTH });
+    await press(act);
+
+    const sheet = await drawn('[data-testid="mcp-signin"]');
+    await waitFor(() =>
+      expect(sheet.querySelector('[data-login-step]')).toHaveAttribute('data-login-step', 'approve'),
+    );
+    expect(sent(server, 'POST', '/api/mcp/tracker/login')).toStrictEqual([{}]);
+    const steps = [...sheet.querySelectorAll<HTMLElement>('[data-step]')].map((one) => [
+      one.dataset.step,
+      one.dataset.stepState,
+    ]);
+    expect(steps).toEqual([
+      ['starting', 'done'],
+      ['approve', 'now'],
+      ['checking', 'later'],
+    ]);
+    expect(sheet).toHaveTextContent('Approve in the browser that opened on this machine');
+    expect(within(sheet).getByRole('link', { name: 'Open sign-in page' })).toHaveAttribute('href', AUTH);
+    expect(within(sheet).queryByLabelText('The address the browser lands on')).toBeNull();
+    expect(sheet).toHaveTextContent('5:00 left — the Claude CLI gives up five minutes after it starts.');
+
+    current.flow = flowOf({ step: 'connected', authUrl: AUTH });
+    await waitFor(
+      () =>
+        expect(sheet).toHaveTextContent('Tracker is connected. Runs on this console can use it from now on.'),
+      { timeout: 3_000 },
+    );
+  });
+
+  it('from elsewhere, asks for the address the browser lands on and hands it to the CLI', async () => {
+    serve([TRACKER]);
+    const current = { flow: flowOf({ remote: true, step: 'paste', authUrl: AUTH }) };
+    signs(current);
+    server.reads['POST /api/mcp/tracker/login/paste'] = () => ({
+      flow: flowOf({ remote: true, step: 'checking', authUrl: AUTH, pastedAt: NOW }),
+    });
+    mount();
+
+    await press((await rowOf('tracker')).querySelector<HTMLElement>('[data-row-act]')!);
+    const sheet = await drawn('[data-testid="mcp-signin"]');
+    const field = await within(sheet).findByLabelText('The address the browser lands on');
+    expect(sheet).toHaveTextContent(
+      'Open the sign-in page, approve, and paste back the address the browser lands on',
+    );
+    expect(sheet).toHaveTextContent('it may say the page cannot be reached. That is expected');
+    fireEvent.change(field, { target: { value: 'http://localhost:5/callback?code=abc' } });
+    await press(within(sheet).getByRole('button', { name: 'Send it to the CLI' }));
+    await waitFor(() =>
+      expect(sent(server, 'POST', '/api/mcp/tracker/login/paste')).toStrictEqual([
+        { url: 'http://localhost:5/callback?code=abc' },
+      ]),
+    );
+  });
+
+  it('says which step a timed-out sign-in stopped on, and Try again starts another', async () => {
+    serve([TRACKER]);
+    const detail =
+      'The sign-in gave up after five minutes, waiting for the address the browser landed on to be pasted back.';
+    const current = { flow: flowOf({ remote: true, step: 'timed-out', authUrl: AUTH, detail }) };
+    signs(current);
+    mount();
+
+    await press((await rowOf('tracker')).querySelector<HTMLElement>('[data-row-act]')!);
+    const sheet = await drawn('[data-testid="mcp-signin"]');
+    expect(await within(sheet).findByText(detail)).toBeInTheDocument();
+    const paste = sheet.querySelector('[data-step="paste"]');
+    expect(paste).toHaveAttribute('data-step-state', 'now');
+    await press(within(sheet).getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(sent(server, 'POST', '/api/mcp/tracker/login')).toHaveLength(2));
+  });
+
+  it('signs in for a profile account by its id, from the opened row', async () => {
+    serve([{ ...TRACKER, status: 'connected', checkedAt: ago(10) }]);
+    signs({ flow: flowOf() });
     mount();
 
     const details = await open('tracker');
@@ -678,75 +790,111 @@ describe('signing a server in', () => {
           .map((option) => option.textContent),
       ).toEqual(['This console', 'Work', 'spare@example.com']),
     );
-    expect(signInFor).toHaveValue('');
     expect(details).toHaveTextContent(
       'The token lands in that account’s own config dir, so the runs that spend it see the server signed in. This console’s own is what its health check reads.',
     );
-
-    await press(within(details).getByRole('button', { name: 'Sign in' }));
-    await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith('A terminal opened — finish the sign-in there.', 'info'),
-    );
-    expect(window.location.hash).toBe('#/settings/mcp');
-
     fireEvent.change(signInFor, { target: { value: 'acct-work' } });
-    await press(within(details).getByRole('button', { name: 'Sign in' }));
-    // The console opened a terminal of its own: the page goes there.
-    await waitFor(() => expect(window.location.hash).toBe('#/sessions/pty-3'));
-    expect(toast).toHaveBeenCalledWith('Finish the sign-in in the terminal that just opened.', 'info');
-    expect(sent(server, 'POST', '/api/mcp/tracker/login')).toStrictEqual([{}, { accountId: 'acct-work' }]);
+    // A server that is signed in already is signed in again — and keeps Switch off as its row's act.
+    expect((await rowOf('tracker')).querySelector('[data-row-act]')).toHaveTextContent('Switch off');
+    await press(within(details).getByRole('button', { name: 'Sign in again' }));
+    await drawn('[data-testid="mcp-signin"]');
+    await waitFor(() =>
+      expect(sent(server, 'POST', '/api/mcp/tracker/login')).toStrictEqual([{ accountId: 'acct-work' }]),
+    );
   });
 
-  it('keeps the commands to run by hand on the line when no sign-in could start, until dismissed', async () => {
-    serve([{ ...TRACKER, status: 'connected', checkedAt: ago(10) }]);
+  it('shows the commands to run by hand when no sign-in could start here', async () => {
+    serve([TRACKER]);
     const commands = [
       'CLAUDE_CONFIG_DIR=/home/x/.claude-work claude mcp add --transport sse tracker https://tracker.example.com/sse',
       'CLAUDE_CONFIG_DIR=/home/x/.claude-work claude mcp login tracker',
     ];
-    server.reads['POST /api/mcp/tracker/login'] = (body: unknown): McpLoginStart =>
-      (body as { accountId?: string }).accountId
-        ? {
-            id: 'tracker',
-            command: commands[1]!,
-            mode: 'command',
-            detail: 'No terminal can be opened on this machine.',
-            configDir: '/home/x/.claude-work',
-            accountLabel: 'Work',
-            commands,
-          }
-        : { id: 'tracker', command: 'claude mcp login tracker', mode: 'command' };
+    server.reads['POST /api/mcp/tracker/login'] = (): McpLoginStart => ({
+      id: 'tracker',
+      command: commands[1]!,
+      mode: 'command',
+      detail: 'No terminal can be opened on this machine.',
+      configDir: '/home/x/.claude-work',
+      commands,
+    });
     mount();
 
-    const details = await open('tracker');
-    const signInFor = within(details).getByLabelText('Sign in for');
-    await waitFor(() => expect(within(signInFor).getAllByRole('option')).toHaveLength(3));
-    fireEvent.change(signInFor, { target: { value: 'acct-work' } });
-    // A server that is signed in already is signed in again.
-    await press(within(details).getByRole('button', { name: 'Sign in again' }));
-
-    const panel = await within(details).findByRole('status');
-    expect(sent(server, 'POST', '/api/mcp/tracker/login')).toStrictEqual([{ accountId: 'acct-work' }]);
-    expect(panel).toHaveTextContent('This console cannot run the sign-in for Tracker.');
-    expect(panel).toHaveTextContent('No terminal can be opened on this machine.');
-    expect(panel).toHaveTextContent(
-      'Run these in a terminal, then re-check. The token lands in /home/x/.claude-work, Work’s config dir.',
+    await press((await rowOf('tracker')).querySelector<HTMLElement>('[data-row-act]')!);
+    const sheet = await drawn('[data-testid="mcp-signin"]');
+    expect(
+      await within(sheet).findByText('This console cannot run the sign-in for Tracker itself.'),
+    ).toBeInTheDocument();
+    expect(sheet).toHaveTextContent('No terminal can be opened on this machine.');
+    expect(sheet).toHaveTextContent(
+      'Run these in a terminal, then press Re-check all. The token lands in /home/x/.claude-work.',
     );
-    expect(panel.querySelector('pre')!.textContent).toBe(commands.join('\n'));
-    // Kept on the line, not raised as a toast that is gone before a command can be read.
-    expect(toast).not.toHaveBeenCalled();
-    fireEvent.click(within(panel).getByRole('button', { name: 'Copy the commands' }));
-    await waitFor(() => expect(writeText).toHaveBeenCalledWith(commands.join('\n')));
-    fireEvent.click(within(panel).getByRole('button', { name: 'Dismiss' }));
-    expect(within(details).queryByRole('status')).toBeNull();
+    expect(sheet.querySelector('[data-testid="mcp-signin-by-hand-block"]')).toHaveTextContent(commands[0]!);
+  });
+});
 
-    // With no list, the one command the server named; with no config dir, no word about one.
-    fireEvent.change(signInFor, { target: { value: '' } });
-    await press(within(details).getByRole('button', { name: 'Sign in again' }));
-    const again = await within(details).findByRole('status');
-    expect(again).toHaveTextContent('Run this in a terminal, then re-check.');
-    expect(again).not.toHaveTextContent('The token lands in');
-    expect(again.querySelector('pre')!.textContent).toBe('claude mcp login tracker');
-    expect(sent(server, 'POST', '/api/mcp/tracker/login')).toStrictEqual([{ accountId: 'acct-work' }, {}]);
+/* ---------------- adding by hand, and filling a variable in (#363) ---------------- */
+
+describe('adding by hand', () => {
+  it('registers any server — its fields, one secret and a value for every ${VAR} its command writes', async () => {
+    serve([DOCS]);
+    mount();
+    await rowOf('docs');
+    fireEvent.click(screen.getByRole('button', { name: 'Add by hand' }));
+    const form = await drawn('[data-testid="mcp-manual-form"]');
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'Obs vault' } });
+    fireEvent.change(within(form).getByLabelText('Command'), { target: { value: 'npx' } });
+    fireEvent.change(within(form).getByLabelText('Arguments, one per line'), {
+      target: { value: '-y\nobs-mcp\n${OBS_ROOT}' },
+    });
+    fireEvent.change(within(form).getByLabelText('Environment, NAME=value per line'), {
+      target: { value: 'OBS_MODE=read' },
+    });
+    fireEvent.change(within(form).getByLabelText('Secret variable name'), { target: { value: 'OBS_TOKEN' } });
+    fireEvent.change(within(form).getByLabelText('Secret value'), { target: { value: 's3cret' } });
+    fireEvent.change(await within(form).findByLabelText('OBS_ROOT'), { target: { value: '/vault' } });
+    await press(within(form).getByRole('button', { name: 'Add server' }));
+    await waitFor(() =>
+      expect(sent(server, 'POST', '/api/mcp')).toStrictEqual([
+        {
+          label: 'Obs vault',
+          transport: 'stdio',
+          command: 'npx',
+          args: ['-y', 'obs-mcp', '${OBS_ROOT}'],
+          env: { OBS_MODE: 'read' },
+          secretRefs: [{ kind: 'env', name: 'OBS_TOKEN' }],
+          secrets: { 'env:OBS_TOKEN': 's3cret' },
+          vars: { OBS_ROOT: '/vault' },
+          source: 'manual',
+        },
+      ]),
+    );
+  });
+
+  it('says what is missing before it sends anything', async () => {
+    serve([DOCS]);
+    mount();
+    await rowOf('docs');
+    fireEvent.click(screen.getByRole('button', { name: 'Add by hand' }));
+    const form = await drawn('[data-testid="mcp-manual-form"]');
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'Remote' } });
+    fireEvent.change(within(form).getByLabelText('Transport'), { target: { value: 'http' } });
+    await press(within(form).getByRole('button', { name: 'Add server' }));
+    expect(await within(form).findByRole('alert')).toHaveTextContent('a remote server needs its address');
+    expect(sent(server, 'POST', '/api/mcp')).toStrictEqual([]);
+  });
+
+  it('*Fill it in* sends a value for each variable the registration left unfilled', async () => {
+    serve([{ ...FILES, needsConfig: ['MCP_FS_ROOT'], status: 'failed' }]);
+    mount();
+    await press((await rowOf('files')).querySelector<HTMLElement>('[data-row-act]')!);
+    const field = await screen.findByLabelText('MCP_FS_ROOT');
+    fireEvent.change(field, { target: { value: '/home/x/notes' } });
+    await press(screen.getByRole('button', { name: 'Store and re-check' }));
+    await waitFor(() =>
+      expect(sent(server, 'PATCH', '/api/mcp/files')).toStrictEqual([
+        { vars: { MCP_FS_ROOT: '/home/x/notes' } },
+      ]),
+    );
   });
 });
 
@@ -770,7 +918,7 @@ describe('the catalog', () => {
 
     expect(
       within(catalog).getByText(
-        'The official registry could not be reached (the registry answered 503), so this is the curated list only. Everything below still works.',
+        'The official registry could not be read (the registry answered 503), so this is the curated list only. Everything below still works, and a server in neither list can be added by hand.',
       ),
     ).toBeInTheDocument();
     const knowledge = within(catalog).getByRole('region', { name: 'Knowledge' });
@@ -871,10 +1019,63 @@ describe('the catalog', () => {
 
     fireEvent.change(search, { target: { value: 'zzqx' } });
     expect(
-      await screen.findByText('Nothing in the catalog matches. Try a shorter search, or a product name.'),
+      await screen.findByText(
+        'Nothing in the catalog matches. Try a shorter search or a product name — or add the server by hand under Registered.',
+      ),
     ).toBeInTheDocument();
     expect(catalogAsks()).toContain('/api/mcp/catalog?q=zzqx');
     expect(writes()).toEqual([]);
+  });
+
+  it('asks once per pause in typing, never once per keystroke (#363)', async () => {
+    mount('#/settings/mcp?tab=catalog');
+    await entryOf('calendar');
+    const search = screen.getByRole('searchbox', { name: 'Search the MCP catalog' });
+    for (const typed of ['s', 'sl', 'sla', 'slac', 'slack'])
+      fireEvent.change(search, { target: { value: typed } });
+    await waitFor(() => expect(catalogAsks()).toContain('/api/mcp/catalog?q=slack'));
+    expect(catalogAsks().filter((path) => /q=sl?a?c?$/.test(path))).toEqual([]);
+  });
+
+  it('says the registry copy is being read the first time, and what a search searched once it is in', async () => {
+    let state: 'refreshing' | 'fresh' = 'refreshing';
+    server.reads['/api/mcp/catalog'] = () => ({
+      entries: CATALOG,
+      registry: state === 'refreshing' ? { state, count: 0 } : { state, count: 4210, fetchedAt: ago(3) },
+    });
+    mount('#/settings/mcp?tab=catalog');
+    expect(
+      await screen.findByText(/Reading the official registry for the first time — about a minute\./),
+    ).toBeInTheDocument();
+    state = 'fresh';
+    const search = screen.getByRole('searchbox', { name: 'Search the MCP catalog' });
+    fireEvent.change(search, { target: { value: 'board' } });
+    expect(
+      await screen.findByText(/Searched the curated list and 4,210 servers in the registry copy\./),
+    ).toBeInTheDocument();
+  });
+
+  it('gives a catalog entry whose command writes a ${VAR} a field for it', async () => {
+    server.reads['/api/mcp/catalog'] = {
+      entries: [
+        {
+          ...CATALOG[2]!,
+          id: 'fs',
+          label: 'Filesystem',
+          args: ['-y', 'fs-mcp', '${MCP_FS_ROOT}'],
+          secretRefs: [],
+        },
+      ],
+    };
+    mount('#/settings/mcp?tab=catalog');
+    fireEvent.click(within(await entryOf('fs')).getByRole('button', { name: 'Add' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Add Filesystem' });
+    fireEvent.change(within(dialog).getByLabelText('MCP_FS_ROOT'), { target: { value: '/home/x/notes' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add server' }));
+    await waitFor(() => expect(sent(server, 'POST', '/api/mcp')).toHaveLength(1));
+    expect((sent(server, 'POST', '/api/mcp')[0] as { vars?: unknown }).vars).toStrictEqual({
+      MCP_FS_ROOT: '/home/x/notes',
+    });
   });
 });
 

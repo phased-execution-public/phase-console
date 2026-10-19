@@ -20,6 +20,21 @@ import { BP_PHONE, BP_SHELL, BP_WIDE } from '@/lib/media';
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const SRC = here('..');
 const THEME = readFileSync(here('./theme.css'), 'utf8');
+/** The second palette (#362): the 6.x room under `data-palette="departures"`. */
+const DEPARTURES = readFileSync(here('./departures.css'), 'utf8');
+/** What the second palette may re-declare: the room, never a status, the accent or the hatch. */
+const DEPARTURES_TOKENS = [
+  '--ground',
+  '--ground-deep',
+  '--surface',
+  '--surface-raised',
+  '--rule',
+  '--rule-strong',
+  '--ink',
+  '--ink-muted',
+  '--ink-faint',
+  '--track',
+];
 
 /** The only widths this design is allowed to branch on. */
 const ALLOWED = [640, 900, 1200];
@@ -221,6 +236,28 @@ describe('theme tokens', () => {
         if (Number(C) > 0) expect(Number(h), `${token} hue`).toBe(230);
       }
     }
+  });
+
+  it('holds the second palette, Departures, to the room alone and to the 6.x family (#362)', () => {
+    // One block, under the one selector, re-declaring only room tokens: a status
+    // hue, the accent or the hatch moving with the palette would make a status
+    // read differently in the two rooms.
+    const blocks = [...DEPARTURES.matchAll(/^([^{}\n]+)\{([^}]*)\}/gm)];
+    expect(blocks.map(([, selector]) => selector!.trim())).toEqual([":root[data-palette='departures']"]);
+    const declared = [...blocks[0]![2]!.matchAll(/^\s*(--[\w-]+):/gm)].map(([, name]) => name);
+    expect(declared.sort()).toEqual([...DEPARTURES_TOKENS].sort());
+    for (const token of DEPARTURES_TOKENS) {
+      const line = DEPARTURES.split('\n').find((l) => l.trim().startsWith(`${token}:`)) ?? '';
+      expect(line, `${token} should carry both lights`).toContain('light-dark(');
+      for (const [, C, h] of line.matchAll(/oklch\([\d.]+% ([\d.]+) ([\d.]+)/g)) {
+        expect(Number(C), `${token} chroma`).toBeLessThanOrEqual(0.045);
+        if (Number(C) > 0) {
+          expect(Number(h), `${token} hue`).toBeGreaterThanOrEqual(204);
+          expect(Number(h), `${token} hue`).toBeLessThanOrEqual(233.5);
+        }
+      }
+    }
+    expect(THEME).toContain("@import './departures.css';");
   });
 
   it('reserves amber for the thing that needs a person — reached only through --accent', () => {

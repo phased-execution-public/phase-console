@@ -22,6 +22,7 @@
 
 import { expect, test, type Page } from '@playwright/test';
 
+import { passThrough } from './lib/fetch.ts';
 import { layoutFindings, still } from './lib/probes.ts';
 import { releaseRoutesAfterEach } from './lib/routes.ts';
 import { fixture, shoot, visit } from './lib/shots.ts';
@@ -138,6 +139,9 @@ function turnItem(anchor: number) {
   const r = row(anchor);
   return {
     ...r,
+    // The composer titles an ITEM with its act (turn-by-turn phase 3); the
+    // "Your turn — …" sentence is the inbox row's alone.
+    title: 'Pair the deploy CLI',
     item: STEP,
     record: 'ledger',
     source: 'declared',
@@ -207,7 +211,7 @@ async function stage(page: Page, anchor: number, root: string): Promise<Staged> 
     (url) => url.pathname === '/api/runs',
     async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
-      const response = await route.fetch();
+      const response = await passThrough(route);
       const runs = (await response.json()) as unknown[];
       await route.fulfill({ response, json: [...runs, ship(anchor, root)] });
     },
@@ -216,7 +220,7 @@ async function stage(page: Page, anchor: number, root: string): Promise<Staged> 
     (url) => url.pathname === '/api/inbox',
     async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
-      const response = await route.fetch();
+      const response = await passThrough(route);
       const view = (await response.json()) as { items: unknown[] };
       await route.fulfill({
         response,
@@ -228,7 +232,7 @@ async function stage(page: Page, anchor: number, root: string): Promise<Staged> 
     (url) => url.pathname === '/api/turn',
     async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
-      const response = await route.fetch();
+      const response = await passThrough(route);
       const turn = (await response.json()) as {
         groups: { now: unknown[] };
         counts: { now: number; total: number };
@@ -348,8 +352,12 @@ test('on a phone the push’s one tap lands on the item on Your turn: the action
   await visit(page, { name: 'human-step-turn', hash: `#/approve?step=${STEP}` }, fx.anchor);
   await expect(page).toHaveURL(new RegExp(`#/turn/${STEP}$`));
 
-  const card = page.locator(`[data-testid="turn-item"][data-item="${STEP}"]`);
-  await expect(card).toHaveAttribute('aria-current', 'true');
+  // Since one-pool phase 14 the page is a list: the landed item is marked on its
+  // row, and its whole card opens in the panel — on a phone, the sheet (#394).
+  const row = page.locator(`[data-testid="turn-row"][data-item="${STEP}"] button[data-select]`);
+  await expect(row).toHaveAttribute('aria-current', 'true');
+  const card = page.locator(`[data-testid="turn-panel-card"] [data-testid="turn-item"][data-item="${STEP}"]`);
+  await expect(card).toBeVisible();
   await expect(card.getByTestId('turn-title')).toHaveText('Pair the deploy CLI');
 
   // The check is the one primary (turn-by-turn phase 8); the sign-in opener sits beside it.

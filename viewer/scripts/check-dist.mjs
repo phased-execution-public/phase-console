@@ -645,6 +645,27 @@ check(
 );
 
 
+/*
+ * Settings ▸ Accounts (one-pool phase 9): the desk is a section body the
+ * Settings chunk reaches through `lazy()` (`screens/settings/index.tsx` BODIES),
+ * so it is never folded into the precached Settings chunk or the entry. Found by
+ * CONTENT, the test id only the section writes.
+ */
+const DESK_MARK = 'settings-accounts';
+const deskChunks = assets.filter(
+  (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(DESK_MARK),
+);
+check(
+  `the accounts desk is in a chunk of its own (${deskChunks.join(', ') || 'none'})`,
+  deskChunks.length > 0 &&
+    entryMatch !== null &&
+    !deskChunks.includes(entryMatch[1]) &&
+    !deskChunks.some((name) => /^settings-/.test(name)),
+  'screens/settings/index.tsx reaches the Accounts section through `lazy()`; if no chunk carries settings-accounts, ' +
+    'or the entry or the Settings chunk does, the desk was folded into what every visitor downloads.',
+);
+
+
 
 /*
  * Your turn (control-tower phase 137, #214): the page, its item card and its

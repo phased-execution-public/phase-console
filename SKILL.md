@@ -11,7 +11,7 @@ allowed-tools:
   - Glob
   - Agent
 metadata:
-  version: 7.1.0
+  version: 8.0.0
 ---
 
 # Phased Execution
@@ -148,6 +148,9 @@ runs inside machinery it should not mistake for a malfunction. The short version
   3. **You need your own shell job and nothing else is left** → wait in ONE foreground call bounded by
      the Bash timeout: `until <probe>; do sleep 10; done` with `timeout: 600000`, at most once per ten
      minutes. The console allows a wait on your own job; it refuses one on somebody else's clock.
+     Never wait on `pgrep -f` text that is in your own command — the loop's shell matches it and the
+     wait never ends; wait on the job's pid (`while kill -0 <pid>`) or a sentinel it writes
+     (`until [ -f x.exit ]`).
   4. **Only subagents or monitors running in the background are left** → end your turn; the session
      stays alive and their notification wakes you. They are stopped ten minutes after your turn ends —
      dispatch a subagent that may take longer in the FOREGROUND. A background SHELL dies when your turn
@@ -366,9 +369,10 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    status, **and** the live DAG board, so you see at a glance what is done, what this phase depends on, and
    whether it is genuinely `ready`. Read this phase's **dependency** handoffs (the phase's `depends_on`, not
    merely the previous number), `docs/plans/<slug>.md` §Phase N + §Session budget, and memory
-   `project_<slug>`. In a dependency handoff's `▶ Start next phase(s)` section, read the shared boot and
-   **your own phase's block only — never a sibling's**: your boot prompt already carries the whole of it,
-   and a sibling's block is another session's prompt (#115). **Read the phase's decision rows** — `scripts/phase-graph.sh <slug> --decisions <N>`
+   `project_<slug>`. A dependency handoff's `▶ Start next phase(s)` section is a pointer to the
+   composer (#338) — your boot prompt already IS what it composes; an older handoff with prompts spliced
+   in: read the shared boot and **your own phase's block only — never a sibling's**, which is another
+   session's prompt (#115). **Read the phase's decision rows** — `scripts/phase-graph.sh <slug> --decisions <N>`
    (the boot prompt prints them; an `outstanding` row is a decision nobody has answered, and a
    `blocked` or `needs-human` you declare must name its key with `--needs`). **Read your notes** —
    `scripts/phase-graph.sh <slug> --notes <N>`, which your boot prompt already carries as
@@ -584,13 +588,12 @@ checklist is what makes it unmissable: **never hand off a phase whose verificati
    fill the frontmatter and body (see `references/handoff-format.md`) — and put every ruling you
    recorded into **Key decisions / gotchas**, since the handoff is what a person reads and the ledger
    is what the console reads. The script auto-fills `depends_on` +
-   `blocks` from the graph and **auto-generates the `## ▶ Start next phase(s)` section** — the whole boot
-   prompt of the one phase this phase unblocks, or, when it unblocks several, **the shared boot ONCE and a
-   block per phase** holding only that phase's own parts (its reading list, notes, gate, and whatever else
-   differs), from which `next-phase-prompt.sh <slug> <N> --phase <M>` and the console compose the full
-   prompt at launch — review it, don't rewrite it. (It reads the just-finished phase as done,
-   so the prompts are correct even before you commit the handoff.) Writing the handoff every phase keeps it
-   resumable from a fresh session **even when you batch** the next one.
+   `blocks` from the graph and **writes the `## ▶ Start next phase(s)` section as a pointer, never the
+   prompts** (#338): the board moves after the handoff is written, so `next-phase-prompt.sh <slug> <N>`
+   composes them when they are READ — every phase this one has unblocked by then, a lone phase's whole
+   prompt or a fan-out's shared boot once and a block per phase, `--phase <M>` one phase's — and the
+   console composes the same at launch. Don't paste prompts into it. Writing the handoff every phase keeps
+   it resumable from a fresh session **even when you batch** the next one.
 4. **Leave notes for later phases.** Fill the handoff's `## Notes for later phases` with what you
    learned that a later phase would otherwise have to rediscover — a measured fact, a trap, a name it
    must not re-spell. **This is the only channel that reaches a phase which has not started**: it has
@@ -745,7 +748,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   **`--lint`** (structural validation: exit non-zero on a malformed row (**F1**), an undefined
   dependency (**F2**), a cycle (**F3**), a table whose SHAPE the parser cannot trust — no header row, no
   `Depends on` column, no `Repos` column, a row shorter than the header (**F20**) — or a cell it read but
-  could not believe: a discarded `Depends on` token, a repeated Phase row, a zero-padded number, a phase
+  could not believe: a discarded `Depends on` token, a repeated Phase row, a repeated `### Phase N` section, a zero-padded number, a phase
   with two handoff files (**F21**) — naming each. F20 and F21 are F1-tier gates, not advisories: a board
   whose scopes are fiction is how two sessions end up in one working tree. **Since 5.0.0 four more
   checks gate, each naming itself in its line:** `verification-empty-open` (**F14** — an open, not-done
@@ -760,7 +763,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   `window`, `auto-open`, `credential`, `due`, `options`, `recommended`, `deadline` or `open:` link the
   grammar cannot read). **Since 7.1.0 a sixth:** `guide-file-missing` (**F42** — a `Human step:`'s
   `guide:` names no file under the docs root).
-  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F41, F43** on stderr, which
+  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F41, F43, F45–F46** on stderr, which
   never changes the exit code: F15 an unregistered MCP server, credential or account ·
   F16 a verification that waits on an external clock · F17 a lead binary not installed here ·
   F18 a cwd-sensitive lead with no `**Verify in:**` · F19 a plan that cannot progress at all ·
@@ -787,7 +790,12 @@ refuses to start when the console's and the skill's do not meet, naming the half
   reason, marked inferred on the item · **F41** a task or decision `Human step:` whose words are the
   plan's own with no `guide:`, no `options:` and no bound `## Operator errands` row
   (`human-step-no-guide`) — the person gets a title and no steps · **F43** a `## Operator errands`
-  table row no bullet names by its `(E-N)` (`errand-row-unbound`, ids only) — a heads-up nothing checks.
+  table row no bullet names by its `(E-N)` (`errand-row-unbound`, ids only) — a heads-up nothing checks ·
+  **F45** a `Human step:` whose `proof:` the console's check reader would refuse every time — a `cmd:`
+  ref with a shell variable, an unclosed quote or a relative path, or no watch scheme at all
+  (`proof-unparsable`) · **F46** a `cmd:` proof whose script is not on its repository's trunk, so the
+  console's checkout exits 127 on it and the check reads `unrunnable` until it lands
+  (`proof-script-run-branch-only`).
   `references/plan-format.md` has the full reasoning for each), **`--qa-mode [N]`** (the QA regime: `off` ·
   `on <reason>` · `waived <reason>` — with no argument the PLAN's, and with a phase number that phase's
   resolved answer naming which level decided it, since `- **QA:** on|off` in a §Phase section beats the
@@ -832,6 +840,9 @@ refuses to start when the console's and the skill's do not meet, naming the half
   `- **Permission mode:**` bullet OVERRIDING the plan's `**Permission mode:**` line, any case, printed as
   the CLI spells it; nothing when both are silent, so the run's default answers and `acceptEdits` below
   it; a word that is not a mode fails the lint, **F31** `permission-mode-unknown`),
+  **`--model [N]`** (the model phase N runs: its `- **Model:**` bullet's first word with a prose
+  "(1M window)" read as `[1m]`, else the plan's target model — with no argument, the plan's alone;
+  nothing when neither names one, so the run's model answers),
   **`--model-policy [N]`** (what a run may do to a phase's model, as `ladder|pinned<TAB>phase|plan` —
   the phase's answer over the §Session budget line; nothing when the plan is silent, so the run's
   `modelPolicy` answers, and `ladder` below it),
@@ -881,13 +892,14 @@ refuses to start when the console's and the skill's do not meet, naming the half
   bash twin of `viewer/shared/decisions-model.js`, which owns them.
 - `scripts/new-handoff.sh <slug> <N> <title> [status] [--qa] [--force]` — scaffold the phase handoff +
   create/update `INDEX.md`. Auto-fills `depends_on` + `blocks` from the graph and the
-  `## ▶ Start next phase(s)` section (the next phase's boot prompt, or a fan-out's shared boot once and a
-  block per unblocked phase). `status` is one of the four
+  `## ▶ Start next phase(s)` section — a pointer to `next-phase-prompt.sh <slug> <N>`, which composes the
+  prompts at read time, never a copy frozen at scaffold (#338). `status` is one of the four
   writable handoff words — **`complete | in-progress | blocked | pending`**, frozen (a fifth would change
   what "done" means; owner `viewer/shared/plan-vocab.js` `HANDOFF_STATUSES`) — and defaults to `complete`;
   pass `in-progress`/`blocked` mid-phase, and `pending` for a handoff scaffolded before its phase runs.
   Note these are not the board's buckets: the board folds `blocked` to `stuck` and has no `pending`.
-  `--force` overwrites an existing handoff (the only way to repair one). Touches `test-status.md` only
+  `--force` overwrites an existing handoff (the only way to repair one) and rewrites its INDEX row's
+  status cell (#265; it says `updated` only when the INDEX changed). Touches `test-status.md` only
   when the plan's qa-mode is not `off`; `--qa` forces QA on for this finish (creates the file,
   backfilling earlier completed phases as `waived`).
 - `scripts/handoff-status.sh <slug>` — INDEX + per-file status + the live DAG board (calls the engine).
@@ -899,7 +911,7 @@ refuses to start when the console's and the skill's do not meet, naming the half
   the next number); `none` forces the final-phase closeout (which prints the `qa-full` brief only for
   QA-`on` plans).
 - `scripts/validate.sh <slug>` — deterministic validator: structural lint of the plan
-  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37/F42, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F41, F43 on stderr) **plus**
+  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37/F42, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38–F41, F43, F45–F46 on stderr) **plus**
   handoff body/consistency checks (valid status, required sections, `depends_on` agreeing with the graph).
   Run before trusting a board or finishing a phase.
 - `scripts/phase-lock.sh <slug> <claim|release|status|list|conflicts|mirror> <N> [--owner ID] [--lease S]
@@ -937,12 +949,17 @@ refuses to start when the console's and the skill's do not meet, naming the half
   finds the docs root. Under a console run (`PE_OWNER=autopilot/…`) a build lane and `merge` refuse:
   a hand tree on the run branch takes the branch the run's own checkout needs.
 - `scripts/phase-landing.sh <slug> <N> <state> [--repo KEY] [--policy WORD] [--ref REF] [--sha SHA]
-  [--pr URL] [--by WHO] [--note TEXT]` · `<slug> list [N]` — the deterministic, idempotent writer for
+  [--pr URL] [--by WHO] [--note TEXT] [--allow-backward]` · `<slug> list [N]` — the deterministic, idempotent writer for
   `docs/handoffs/<slug>/landing.md`, the ledger the `landed N` and `pr-merged N` gates read. `state` is
   one of `held integrated pushed pr-open pr-merged landed conflict failed` (`scripts/landing.env`).
   **A row is a POSITION, not a log**: the upsert key is (phase, repo) and a second record REPLACES the
   first, because a phase that is pushed, then PR-open, then merged has MOVED — it has not happened three
-  times, and two rows for one phase would make "the state" ambiguous for every reader at once. The key
+  times, and two rows for one phase would make "the state" ambiguous for every reader at once. **A position
+  only moves FORWARD** (one-pool phase 21, #249): held → integrated → pushed → pr-open → pr-merged → landed
+  (`LANDING_ORDER`); a write that would take a row back — the console's `held` settle over a session's
+  `landed` — keeps the row, says so on stderr and exits 0, `conflict` and `failed` never replace a
+  `pr-merged` or `landed` row (those two, two policies' end states, may replace each other), and
+  `--allow-backward` is the deliberate move back. The key
   carries the repository because a mirror run lands N times, once per submodule, each on its own clock.
   Written by the landing session; never hand-edited; never touches git (the caller commits). The point
   of a file rather than a question: a gate that shells out to `gh` gives different answers to a page
@@ -1120,7 +1137,10 @@ refuses to start when the console's and the skill's do not meet, naming the half
   outside a git working tree it exits 2. Like a ruling it is never an outcome. The console's pass
   after the session skips a command proven green at an equivalent tree — the same tree, or one where
   only paperwork (`docs/handoffs/**`, `.locks/**`, `CHANGELOG.md`) changed since — runs everything
-  else, and journals any disagreement between the two verdicts (`phase.verify-disagreed`).
+  else, and journals any disagreement between the two verdicts (`phase.verify-disagreed`). A
+  `cd <sub> && …` line whose `<sub>` is ANOTHER repository (a superproject's submodule) is keyed by
+  that repository's own tree too (`repo`, `repo_tree`), so a commit elsewhere in the superproject —
+  a handoff, an audit doc — leaves its proof standing.
   Its fourth shape, **`… <N> progress --label TEXT --done N --of M`**, says how far the active task's
   long operation has got (a sweep, a batch): one line on the task channel (`$PE_TASKS_FILE`, else the
   console's inbox task file), journalled `phase.progress` on the task in progress at the next tool
@@ -1169,8 +1189,13 @@ refuses to start when the console's and the skill's do not meet, naming the half
   [--force]` — the stored decision "does anyone still care?", which no board can compute. Sets the plan's
   `status:`, `closed:` and `closed_reason:`, and releases the plan's own phase locks. A closed plan stops
   reporting ready phases, boot prompts, batching and QA/stuck warnings while its board still renders and
-  search still finds it. Idempotent; never touches git. Ask with `phase-graph.sh <slug> --closed`.
-- **Three more ship and are not verbs you call.** `scripts/session-hook.sh` is a user-scope Claude Code
+  search still finds it. **`complete` is checked first** (#320): it is refused, each item named, while the
+  plan's run branch `pe/<slug>` is not held by its repository's origin trunk (merged or squashed, as the clone
+  last fetched it), while `landing.md` holds a `conflict` or `failed` row, or while an issue labelled
+  `plan:<slug>` is open — exit 1; `--force` closes it anyway, prints what was still open and writes the
+  exception into `closed_reason`. Idempotent; reads git, never writes it. Ask with
+  `phase-graph.sh <slug> --closed`.
+- **Four more ship and are not verbs you call.** `scripts/session-hook.sh` is a user-scope Claude Code
   hook (SessionStart / SessionEnd / Stop / Notification) that tells the console which sessions are live on
   this machine — installed from Settings ▸ Automation or `phase-console install-hooks`, always exits 0, and
   on SessionStart prints your own session id back to you with the `phase-lock.sh --session <id>` line and
@@ -1181,6 +1206,11 @@ refuses to start when the console's and the skill's do not meet, naming the half
   `viewer/shared/instances.mjs` (where a console's state directory is) and `viewer/shared/scope.js` (how a
   plan's Repos column is read), so the scripts answer identically with no console up and no node on PATH.
   Never edit one half alone — `viewer/test/engine-parity.test.ts` holds them together.
+  `scripts/cmd-ref.sh` is sourced too (one-pool phase 13): how a `cmd:` ref reads in bash — the command
+  its quoting carries (an escaped inner quote is the command's own), whether its quotes close, the first
+  relative path it names (a `refs/…` word after `git` is a ref) and the script it runs — for
+  `phase-outcome.sh`'s refusals and the lint's F45/F46. Its JS twins are `shared/proof-words.js`
+  `cmdOfRef` and `server/watch-refs.ts`, held to it by `viewer/test/watch-refs.test.ts`.
 - Tests: `tests/run-tests.sh` runs the bats unit + integration suite (under bash 3.2). **QA is opt-in** —
   when a plan enables it (`**QA gate:** on`, `--qa`, or an existing `test-status.md`), a fresh-context QA
   subagent reviews each phase-finish (brief via `--qa-prompt`) and a `qa-full` pass runs at closeout; the
@@ -1194,8 +1224,9 @@ refuses to start when the console's and the skill's do not meet, naming the half
   never passes `--git`) · `--allow-run` (spawn unattended `claude -p` sessions that edit a repo for
   hours — this is what drives phases through these scripts by itself, and what the outcome protocol
   above exists for) · `--allow-terminal` (a real shell) · `--allow-agent` (interactive sessions and the
-  plan wizard) · `--allow-accounts` (register Claude accounts, pick one per run, switch mid-run —
-  *reading* the usage meters needs no flag) · `--allow-webhooks` (POST every announcement to URLs
+  plan wizard) · `--allow-accounts` (register Claude accounts, pick one per run —
+  *reading* the usage meters needs no flag; moving a running run to another account is a run act,
+  `--allow-run`'s) · `--allow-webhooks` (POST every announcement to URLs
   you register — Slack, Discord, Telegram, your own relay; one of the two that send anything off the
   machine, and *reading* the destination list needs none) · `--allow-publish` (push a finished phase's
   `pe/*` branch — never a trunk, never with force — only where the plan's `permission.destructive` row

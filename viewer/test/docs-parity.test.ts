@@ -192,6 +192,7 @@ const CATEGORY_COUNT_WORDS: Record<string, number> = {
   'twenty-eight': 28,
   'twenty-nine': 29,
   thirty: 30,
+  'thirty-one': 31, 'thirty-two': 32,
 };
 
 test('docs/phone.md documents every push category, and the right number of them', () => {
@@ -1065,9 +1066,10 @@ test('the UNDOCUMENTED_FLAGS allowance never outlives the flags it excuses', () 
  * joins them in control-tower phase 98 (#137): a stored trigger's own
  * lifecycle — armed, fired, expired, cancelled — is a subsystem the same way.
  * So is `supervisor` (control-tower phase 101, #145): detected, suggested,
- * acted, escalated and policy-changed are the supervisor's own journal lines.
+ * acted, escalated and policy-changed are the supervisor's own journal lines. And `account`
+ * (one-pool phase 7): the pool's own lines — a spill and a reached cap.
  */
-const EVENT_LITERAL = /'((?:phase|run|policy|git|http|engine|shell|msg|issue|retention|trigger|supervisor)\.[a-z0-9][a-z0-9.-]*)'/g;
+const EVENT_LITERAL = /'((?:phase|run|account|policy|git|http|engine|shell|msg|issue|retention|trigger|supervisor)\.[a-z0-9][a-z0-9.-]*)'/g;
 /**
  * `debug` joins the three levels whose first argument is a documented name.
  *
@@ -1644,7 +1646,8 @@ test('design.md records the figures-and-marks decision: every chart, every visx 
       (match) => match[1],
     );
   const named = [...members('FIGURES'), ...members('MARKS')];
-  assert.equal(named.length, 5, 'ui/figures/lazy.tsx still declares four figures and one mark');
+  // Five figures since one-pool phase 10 added `Series` (Insights ▸ Accounts' spend over time).
+  assert.equal(named.length, 6, 'ui/figures/lazy.tsx still declares five figures and one mark');
   for (const name of named) assert.ok(section.includes(`\`${name}\``), `the section names ${name}`);
 
   const pkg = JSON.parse(read('viewer/package.json')) as {
@@ -1670,4 +1673,118 @@ test('control-tower phase 140: USAGE names every part of Your turn a person meet
   }
   assert.ok(read('USAGE.fa.md').includes('#/turn'), 'USAGE.fa.md names the page by its address');
   for (const readme of ['README.md', 'README.fa.md']) assert.ok(read(readme).includes('#/turn'), `${readme} names Your turn's address`);
+});
+
+/* ------------------------------------------------------------------ *
+ * The reference's status tables read the model's paint (one-pool phase 14, #365)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The Guide's reference once told a person a parked run and a parked phase read
+ * **Needs you** while the model painted both the quiet Waiting — and its own
+ * eight-states table listed them under Waiting. Every word these tables name is
+ * held to `shared/status-model.js`: a run's and a phase's "Reads as" is its
+ * row's paint, said as that UI state's word (so nothing reads "Needs you" that
+ * the model does not paint amber, and no amber word reads anything else); a
+ * board word's is its row's own label; and every word the eight-states table
+ * files under a state paints that state. The Persian twin keeps the English
+ * words in those columns, so one check holds both.
+ */
+test('#365: the reference’s status tables say what the status model paints — both languages', async () => {
+  const { WORD_ROWS } = await import('../shared/status-model.js');
+  const { STATE_META } = await import('../shared/status-vocab.js');
+  const rows = WORD_ROWS as unknown as Record<string, Record<string, { label: string; paint: string; attention: string }>>;
+  /** `| \`word\` | cell | …` rows of a section's table: the word(s) and the second cell. */
+  const table = (body: string) =>
+    [...body.matchAll(/^\| `([^|]+?)` \| ([^|]+?) \|/gm)].map((m) => ({
+      words: m[1].split(/`\s*\/\s*`/).map((w) => w.trim()),
+      cell: m[2].trim(),
+    }));
+  const docs = [
+    {
+      file: 'viewer/client/src/content/guide/reference.md',
+      run: 'Run status',
+      phase: 'Phase record',
+      board: 'Board state',
+      eight: 'The eight states',
+      prefix: { run: /^run\b/, phase: /^phase\b/, board: /^board\b/, 'qa-result': /^QA\b/ },
+    },
+    {
+      file: 'viewer/client/src/content/guide/reference.fa.md',
+      run: 'وضعیتِ اجرا',
+      phase: 'رکوردِ فاز',
+      board: 'وضعیتِ تابلو',
+      eight: 'هشت حالت',
+      prefix: { run: /^اجرای/, phase: /^فاز/, board: /^تابلو/, 'qa-result': /^QA\b/ },
+    },
+  ];
+  for (const doc of docs) {
+    const body = read(doc.file);
+    for (const vocab of ['run', 'phase'] as const) {
+      const listed = table(section(body, doc[vocab]));
+      const seen = new Set(listed.flatMap((r) => r.words));
+      for (const word of Object.keys(rows[vocab])) {
+        assert.ok(seen.has(word), `${doc.file} §${doc[vocab]} never lists the ${vocab} word \`${word}\``);
+      }
+      for (const { words, cell } of listed) {
+        for (const word of words) {
+          const row = rows[vocab][word];
+          assert.ok(row, `${doc.file} §${doc[vocab]} lists \`${word}\`, which is no ${vocab} word`);
+          const paint = STATE_META[row.paint as keyof typeof STATE_META].label;
+          assert.equal(
+            cell,
+            paint,
+            `${doc.file} §${doc[vocab]}: the ${vocab} word \`${word}\` reads "${cell}" there, but the model paints it ${row.paint} (${paint}, attention ${row.attention})`,
+          );
+        }
+      }
+    }
+    for (const { words, cell } of table(section(body, doc.board))) {
+      const labels = cell.split('·').map((c) => c.trim());
+      words.forEach((word, i) => {
+        const row = rows.board[word];
+        assert.ok(row, `${doc.file} §${doc.board} lists \`${word}\`, which is no board word`);
+        assert.equal(labels[i] ?? labels[0], row.label, `${doc.file} §${doc.board}: \`${word}\` reads as its row's label`);
+      });
+    }
+    // The eight states: each row's "underlying words" paint that row's state.
+    const eight = section(body, doc.eight);
+    let checked = 0;
+    for (const m of eight.matchAll(/^\| `([a-z-]+)` \|[^|]*\|[^|]*\| ([^|]+) \|$/gm)) {
+      const state = m[1];
+      for (const part of m[2].split(' · ')) {
+        const said = part.trim();
+        const vocab = (Object.keys(doc.prefix) as (keyof typeof doc.prefix)[]).find((v) => doc.prefix[v].test(said));
+        if (!vocab) continue;
+        for (const [, word] of said.matchAll(/`([a-z-]+)`/g)) {
+          const row = rows[vocab][word];
+          assert.ok(row, `${doc.file} §${doc.eight} files \`${word}\` under ${vocab}, which has no such word`);
+          assert.equal(row.paint, state, `${doc.file} §${doc.eight} files the ${vocab} word \`${word}\` under ${state}; the model paints it ${row.paint}`);
+          checked++;
+        }
+      }
+    }
+    assert.ok(checked >= 20, `${doc.file} §${doc.eight}: the check read its words (${checked})`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The watch clock's scheme table names every scheme (#233)
+ * ------------------------------------------------------------------ */
+
+test("docs/loop.md's watch-scheme table has a row for every WATCH_SCHEMES scheme", () => {
+  // `phase:` and `verify:` shipped in 6.0.0 (control-tower phase 88) and
+  // `credential:` with phase 132; the table went on listing the older five.
+  const body = read('docs/loop.md');
+  const at = body.indexOf('**The schemes, and what each means by LANDED:**');
+  assert.ok(at >= 0, 'docs/loop.md: the scheme table is where it was');
+  const table = body.slice(at).split('\n\n')[1] ?? '';
+  const firstCells = [...table.matchAll(/^\| ([^|]+) \|/gm)].map((m) => m[1].trim());
+  const cellFor: Record<string, string> = { 'gh-run': '`gh:` run', 'gh-pr': '`gh:` pr', date: '`date:` / `until:`' };
+  for (const scheme of WATCH_SCHEMES) {
+    const want = cellFor[scheme] ?? `\`${scheme}:\``;
+    assert.ok(firstCells.includes(want), `docs/loop.md's scheme table has no ${want} row (WATCH_SCHEMES has ${scheme})`);
+  }
+  assert.equal(firstCells.filter((c) => c !== 'scheme' && !/^-+$/.test(c)).length, WATCH_SCHEMES.length,
+    'one row per scheme, no more');
 });

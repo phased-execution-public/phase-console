@@ -1511,6 +1511,8 @@ export interface PhaseOptions {
    * Both values are stored — false is a choice, never silence.
    */
   autoApprove?: boolean;
+  /** Fan this phase out (or not), whatever the run says. */
+  ultracode?: boolean;
 }
 
 /** One live `claude -p` process: which phase it is on, and the session it holds. */
@@ -1593,6 +1595,17 @@ export interface VerifyingLane {
   child?: { pid: number; procStartedAt: string };
 }
 
+/** One operator's waiver of a §Verification line for one phase, mid-run (one-pool phase 21, #267). */
+export interface VerifyWaiver {
+  phase: number;
+  fp: string;
+  text: string;
+  reason: string;
+  by: string;
+  at: string;
+  rulingId?: string;
+}
+
 export interface RunState {
   /** A run-wide budget past its warning line and not yet raised (phase 25, #40) — budget → fact. */
   budgetApproaching?: Record<string, BudgetFact>;
@@ -1651,6 +1664,8 @@ export interface RunState {
     by?: string;
     at?: string;
   };
+  /** An operator's mid-run waivers of single §Verification lines, one per (phase, line) (one-pool phase 21, #267). */
+  verifyWaivers?: VerifyWaiver[];
   /** The plan git lines this run runs over, answered `override` at launch — by a person or `automatic` (control-tower phase 11, #18). */
   gitStrategyOverride?: {
     lines: { kind: string; plan: string; run: string; phases?: number[] }[];
@@ -1896,6 +1911,8 @@ export interface RunState {
     repo?: string;
     phase: number;
     at: string;
+    /** `unknown`: it appeared while the phase ran, outside its own lane — named, never credited (#262). */
+    maker?: 'unknown';
   }[];
   /**
    * Which class this run's admissions are scanned in. Absent means `normal`,
@@ -3180,6 +3197,18 @@ export const runsApi = {
     post<RunEnvelope>(`/api/run/${q(slug)}/delegate`, {
       phase,
       instruction,
+    }),
+  /**
+   * Waive ONE §Verification line of a phase, mid-run, with a reason (one-pool
+   * phase 21, #267): a ruling on the plan's ledger, honoured at the phase's
+   * next verification.
+   */
+  runVerifyWaive: (slug: string, phase: number, line: string, reason: string, expectRunId?: string) =>
+    post<{ waiver: VerifyWaiver; run: RunState }>(`/api/run/${q(slug)}/verify-waive`, {
+      phase,
+      line,
+      reason,
+      ...(expectRunId ? { expectRunId } : {}),
     }),
   /** "Done — continue": a person did the errand the phase is parked on (control-tower phase 88, #124). */
   runErrandAnswered: (slug: string, phase: number, note?: string) =>

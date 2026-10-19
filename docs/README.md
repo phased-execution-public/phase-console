@@ -33,7 +33,7 @@ below is the long version, in the order it is worth reading.
 
 | | |
 |---|---|
-| [Phase Console](console.md) | The local web app: every plan's board, the graph, runs, terminal and search. |
+| [Phase Console](console.md) | The local web app: every plan's board, the graph, runs, terminal and search — and what each release added. |
 | [Reaching it from your phone](phone.md) | Tailscale end to end — serve, identity, push notifications, and what is actually enforced. |
 | [Metrics](metrics.md) | `GET /api/metrics` — the cost, progress and ladder numbers in Prometheus text, and the contract their names are. |
 | [Debugging](debugging.md) | Where every log, journal and declaration lives, how to tie a run to a session to a lock to a tree, and the one bundle to hand a model. |

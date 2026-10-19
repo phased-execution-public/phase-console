@@ -155,3 +155,21 @@ export function returnedSentence(verdict: StepVerdict): string {
   return `${verdict.state === 'needs-info' ? 'Needs more from you' : 'Back to you'} (attempt ${verdict.attempt}): `
     + `${verdict.note.replace(/[.\s]+$/, '')}.${list}`;
 }
+
+/**
+ * What a probe read, in words a person reads (#368): never a watch-state word
+ * (`pending`, `refused`) and never a ref — the composer's law, which the check's
+ * verdict and its Redo obey as the card's own words do. An exit status and the
+ * command's last output are kept, said as "the check exited 1: …".
+ */
+export function probeReadWords(state: string, detail?: string | null): string {
+  const text = String(detail ?? '').replace(/[\u0000-\u001f]+/g, ' ').trim();
+  if (state === 'unrunnable') return text || 'the proof itself cannot run';
+  const exit = /^exit (\d+)(?: — ([\s\S]*))?$/.exec(text);
+  const said = exit ? `the check exited ${exit[1]}${exit[2] ? `: ${exit[2].trim()}` : ''}` : text;
+  const head = state === 'landed' ? 'it holds'
+    : state === 'pending' ? 'not yet'
+      : state === 'refused' ? 'the console will not run it'
+        : 'it could not be read';
+  return redactSecrets(said ? `${head} (${said})` : head).slice(0, 280);
+}

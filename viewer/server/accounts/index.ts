@@ -33,7 +33,7 @@ import { log } from '../log.ts';
 import { parseAuth, type AuthStatus } from '../runner/auth.ts';
 import { classify, type RetirementEvidence } from '../runner/errors.ts';
 import {
-  AccountStore, ACCOUNTS_DIR, DEFAULT_ACCOUNT_ID, profileConfigDir,
+  AccountStore, ACCOUNTS_DIR, DEFAULT_ACCOUNT_ID, holdsSecret, profileConfigDir,
   type AccountKind, type AccountMeta, type OverageSetting,
 } from './store.ts';
 import { Credentials, realExec, type ClaudeOauth, type Exec } from './credentials.ts';
@@ -586,7 +586,8 @@ type Identity = {
 
 /** The model family a per-model window is named after (`seven_day_opus` ↔ an opus run). */
 function familyOf(forModel: string | undefined): string | undefined {
-  return forModel ? /(opus|sonnet|haiku|fable)/.exec(forModel.toLowerCase())?.[1] : undefined;
+  const family = forModel ? /(opus|sonnet|haiku|fable)/.exec(forModel.toLowerCase())?.[1] : undefined;
+  return family;
 }
 
 /**
@@ -740,7 +741,9 @@ export class Accounts {
   startPolling(): void {
     let pollDefault = true;
     if (pollDefault) this.poller.track(DEFAULT_ACCOUNT_ID);
-    for (const meta of this.store.stored()) this.poller.track(meta.id);
+    for (const meta of this.store.stored()) {
+      if (this.metered(meta)) this.poller.track(meta.id);
+    }
     // Keep-alive rides the same start (control-tower phase 91, #147): every
     // login-backed account is renewed through the CLI just before it lapses.
     if (!this.keepAliveTimer) {
@@ -753,6 +756,16 @@ export class Accounts {
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     this.keepAliveTimer = null;
     this.poller.stop();
+  }
+
+  /**
+   * Does this account have plan meters the usage endpoint reads? Every login
+   * and every setup-token does. In Pro an API key does not — what it spends
+   * is counted by the ledger — so it is never handed to the poller, whose
+   * fallback would read the MACHINE login's meters under its name.
+   */
+  private metered(meta: AccountMeta): boolean {
+    return Boolean(meta);
   }
 
   /* ---------------- reading ---------------- */
@@ -927,12 +940,12 @@ export class Accounts {
     // endpoint that served this credential and now refuses it (control-tower
     // phase 13, #33) — and a verdict outranks an estimate.
     const polled = this.auth.get(meta.id);
-    const observed = meta.kind === 'token'
+    let observed: AuthState = meta.kind === 'token'
       ? (polled === 'expired' || polled === 'signed-out' ? polled : tokenLoginState(Date.parse(meta.replacedAt ?? meta.createdAt), this.now()))
       : polled ?? authStateOf(identity.signedIn, identity.expiresAt, Date.now(), identity.canRefresh);
     const state: AuthState = entitlement.state === 'retired' || entitlement.state === 'suspect' ? 'unusable' : observed;
     const orgId = hashedOrgId(learned?.orgId ?? identity.orgId);
-    return {
+    const view: AccountView = {
       id: meta.id,
       kind: meta.kind,
       builtIn: meta.id === DEFAULT_ACCOUNT_ID,
@@ -957,10 +970,11 @@ export class Accounts {
       credits: this.creditOf(meta.id),
       ...(meta.kind === 'token'
         ? (() => { const ends = tokenExpiresAt(Date.parse(meta.replacedAt ?? meta.createdAt)); return ends ? { tokenExpiresAt: ends } : {}; })()
-        : { unattended: UNATTENDED_OFFER }),
+        : holdsSecret(meta.kind) ? {} : { unattended: UNATTENDED_OFFER }),
       meter: meterStateOf(state, usage),
       paying: this.payingOn(meta.id),
     };
+    return view;
   }
 
   /** The paying probe, read defensively — a view must render whatever the runs are doing. */
@@ -1011,7 +1025,7 @@ export class Accounts {
    * flow demands a name).
    */
   private async identity(meta: AccountMeta): Promise<Identity> {
-    if (meta.kind === 'token') return { signedIn: true, at: 0 };
+    if (holdsSecret(meta.kind)) return { signedIn: true, at: 0 };
     const cached = this.identities.get(meta.id);
     if (cached && Date.now() - cached.at < IDENTITY_TTL_MS) return cached;
     const configDir = meta.kind === 'profile' ? profileConfigDir(meta.id, this.accountsDir) : null;
@@ -1052,7 +1066,7 @@ export class Accounts {
    * read is a file read, cached like `identity`'s unless `fresh`.
    */
   private identityKey(meta: AccountMeta, fresh = false): string | undefined {
-    if (meta.kind === 'token') return undefined;
+    if (holdsSecret(meta.kind)) return undefined;
     const cached = this.identityKeys.get(meta.id);
     if (!fresh && cached && Date.now() - cached.at < IDENTITY_TTL_MS) return cached.key;
     const configDir = meta.kind === 'profile' ? profileConfigDir(meta.id, this.accountsDir) : null;
@@ -1105,7 +1119,7 @@ export class Accounts {
     const id = accountId ?? DEFAULT_ACCOUNT_ID;
     const meta = this.meta(id);
     if (!meta) return undefined;
-    if (meta.kind === 'token') return { account: id, key: `token:${this.fingerprintOf(id)}`, ...(meta.email ? { email: meta.email } : {}) };
+    if (holdsSecret(meta.kind)) return { account: id, key: `${meta.kind}:${this.fingerprintOf(id)}`, ...(meta.email ? { email: meta.email } : {}) };
     const configDir = meta.kind === 'profile' ? profileConfigDir(id, this.accountsDir) : null;
     const who = this.creds.readIdentity(configDir);
     if (!who?.email && !who?.orgId) return undefined;
@@ -1141,7 +1155,9 @@ export class Accounts {
   async renewLogin(accountId?: string): Promise<Renewal> {
     const id = accountId ?? DEFAULT_ACCOUNT_ID;
     const meta = this.meta(id);
-    if (!meta || meta.kind === 'token') return { outcome: 'no-login', reason: 'a setup-token has nothing to renew' };
+    if (!meta || holdsSecret(meta.kind)) {
+      return { outcome: 'no-login', reason: meta?.kind === 'token' || !meta ? 'a setup-token has nothing to renew' : 'an API key has nothing to renew' };
+    }
     const running = this.renewing.get(id);
     if (running) return running;
     const configDir = meta.kind === 'profile' ? profileConfigDir(id, this.accountsDir) : null;
@@ -1223,7 +1239,7 @@ export class Accounts {
    */
   private async confirmLogin(accountId: string, readAt: string, retiredAt: string): Promise<void> {
     const meta = this.meta(accountId);
-    if (!meta || meta.kind === 'token') return;
+    if (!meta || holdsSecret(meta.kind)) return;
     const configDir = meta.kind === 'profile' ? profileConfigDir(accountId, this.accountsDir) : null;
     let status: AuthStatus;
     try {
@@ -1321,17 +1337,7 @@ export class Accounts {
     // One name, one account (control-tower phase 13, #33): re-pasting was how
     // an operator answered "this token does not work", and it minted a second
     // row for one identity. The answer is the account that already has it.
-    const folded = (text: string | undefined) => (text ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
-    const taken = this.store.stored().find((meta) => meta.name && folded(meta.name) === folded(name));
-    if (taken) {
-      throw new AccountNameTakenError(
-        `an account named "${taken.name}" already exists (${taken.id}) — `
-          + (taken.kind === 'token'
-            ? `replace its credential instead (PUT /api/accounts/${taken.id}/credential), so nothing that names it has to change`
-            : 'sign it in again instead, or give the new token another name'),
-        { id: taken.id, kind: taken.kind },
-      );
-    }
+    this.refuseTakenName(name, 'token');
     const id = this.store.newId(name);
     await this.creds.storeToken(id, trimmed);
     const meta: AccountMeta = { id, kind: 'token', name, createdAt: new Date().toISOString() };
@@ -1355,6 +1361,23 @@ export class Accounts {
   }
 
   /**
+   * One name, one account (control-tower phase 13, #33): a name an account
+   * already has is refused with 409 (`AccountNameTakenError`) and the repair
+   * that keeps every reference to it — replace its secret, or sign it in.
+   */
+  private refuseTakenName(name: string, adding: 'token' | 'key'): void {
+    const folded = (text: string | undefined) => (text ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+    const taken = this.store.stored().find((meta) => meta.name && folded(meta.name) === folded(name));
+    if (!taken) return;
+    const repair = taken.kind === 'token'
+      ? `replace its credential instead (PUT /api/accounts/${taken.id}/credential), so nothing that names it has to change`
+      : holdsSecret(taken.kind)
+        ? `replace its key instead (\`phase-console accounts replace-key ${taken.id} --key-file <path>\`), so nothing that names it has to change`
+        : `sign it in again instead, or give the new ${adding} another name`;
+    throw new AccountNameTakenError(`an account named "${taken.name}" already exists (${taken.id}) — ${repair}`, { id: taken.id, kind: taken.kind });
+  }
+
+  /**
    * Replace a token account's credential, keeping its id and its name
    * (control-tower phase 13, #33) — the repair `addToken` used to perform by
    * minting a second account. The id is what journals, run files and pools
@@ -1368,7 +1391,9 @@ export class Accounts {
     const meta = this.store.get(id);
     if (!meta && id !== DEFAULT_ACCOUNT_ID) return undefined;
     if (!meta || meta.kind !== 'token') {
-      throw new Error(`${this.labelFor(id)} has no token to replace — sign it in again instead`);
+      throw new Error(meta && holdsSecret(meta.kind)
+        ? `${this.labelFor(id)} is an API-key account — replace its key instead (\`phase-console accounts replace-key ${id} --key-file <path>\`)`
+        : `${this.labelFor(id)} has no token to replace — sign it in again instead`);
     }
     const trimmed = token.trim();
     if (!/^[\w-]{20,512}$/.test(trimmed)) {
@@ -1494,7 +1519,7 @@ export class Accounts {
     this.lastTokens.delete(id);
     this.refusedTokens.delete(id);
     this.auth.delete(id);
-    if (meta.kind === 'token') await this.creds.deleteToken(id);
+    if (holdsSecret(meta.kind)) await this.creds.deleteToken(id);
     if (meta.kind === 'profile') await this.creds.deleteProfileCredential(profileConfigDir(id, this.accountsDir));
     try {
       rmSync(profileConfigDir(id, this.accountsDir), { recursive: true, force: true });
@@ -1525,6 +1550,7 @@ export class Accounts {
     const meta = this.meta(id);
     return meta ? this.view(meta) : undefined;
   }
+
 
   /* ---------------- what the runner needs ---------------- */
 
@@ -2009,6 +2035,33 @@ export class Accounts {
   }
 
   /**
+   * The account a fresh run with a requested pool starts on (#238): the first account in the
+   * requested order with room — the quota door's and the rank's yes (`roomOf`), and, where a
+   * live meter reads, its fullest window keeping the row's floor — else the first listed, and
+   * the preflight then fails over or parks, saying why. A signed-in login no meter has read
+   * yet is unused, not unknown: it has room. In Pro, `policy` puts the pick through the pool
+   * policy (one-pool phase 7, `poolVerdict`); `spill` and `words` are the verdict's.
+   */
+  startPick(
+    rows: readonly { id: string; minHeadroomPct: number }[], forModel?: string, opts: { policy?: string; forPlan?: string } = {},
+  ): { pick: string; spill: string; words: string } {
+    const ids = [...new Set(rows.map((row) => row.id))];
+    const floors: Record<string, number> = {};
+    for (const row of rows) if (row.minHeadroomPct > 0) floors[row.id] = row.minHeadroomPct;
+    const first = ids[0] ?? DEFAULT_ACCOUNT_ID;
+    for (const id of ids) {
+      const known = id === DEFAULT_ACCOUNT_ID || this.has(id);
+      if (!known) continue;
+      const room = this.roomOf(id === DEFAULT_ACCOUNT_ID ? undefined : id, forModel);
+      const floor = floors[id] ?? 0;
+      if (room.ok && !(floor > 0 && room.headroomPct !== null && room.headroomPct < floor)) {
+        return { pick: id, spill: 'first', words: `${this.labelFor(id)} has room — the first in the run's order` };
+      }
+    }
+    return { pick: first, spill: 'none', words: `no account in the run's order has room — starting on ${this.labelFor(first)}` };
+  }
+
+  /**
    * Every account id this instance knows — the synthesized default first, then
    * the registered ones. `rankAccounts` and the Scheduler's throttle snapshot
    * both need exactly this list, and had built it inline.
@@ -2069,7 +2122,9 @@ export class Accounts {
    * next session renews — #111). Ranked by the worse of the two shared utilizations,
    * ascending; unknown usage scores 50, between the measured.
    */
-  rankAccounts(excluding: string | null | undefined, forModel?: string, nowMs = Date.now()): string[] {
+  rankAccounts(
+    excluding: string | null | undefined, forModel?: string, nowMs = Date.now(),
+  ): string[] {
     const exclude = excluding === null ? null : excluding ?? DEFAULT_ACCOUNT_ID;
     // A per-model window disqualifies only for the model that would spend it
     // (`seven_day_opus` ↔ an opus run) and never feeds the score: an account
@@ -2094,13 +2149,14 @@ export class Accounts {
     });
     candidates.sort((a, b) => a.tier - b.tier || a.score - b.score || a.entitled - b.entitled || a.order - b.order);
     const seen = new Set<string>();
-    return candidates
+    const ranked = candidates
       .filter((c) => {
         if (seen.has(c.pool)) return false;
         seen.add(c.pool);
         return true;
       })
       .map((c) => c.id);
+    return ranked;
   }
 
   /**
@@ -2129,7 +2185,7 @@ export class Accounts {
     if (cached && Date.now() - cached.at < IDENTITY_TTL_MS) return cached.person;
     const meta = this.meta(id);
     let person: string | null = null;
-    if (meta && meta.kind !== 'token') {
+    if (meta && !holdsSecret(meta.kind)) {
       try {
         const who = this.creds.readIdentity(meta.kind === 'profile' ? profileConfigDir(id, this.accountsDir) : null);
         if (who?.email) person = `${who.email.toLowerCase()}\n${(who.orgId ?? '').toLowerCase()}`;
@@ -2388,7 +2444,7 @@ export class Accounts {
 
   private async resolveToken(accountId: string): Promise<TokenAnswer> {
     const meta = this.meta(accountId);
-    if (!meta) return null;
+    if (!meta || !this.metered(meta)) return null;
     if (meta.kind === 'token') {
       const token = await this.creds.readToken(accountId);
       return token ? { token, tokenKind: 'setup-token' } : { error: 'stored token is missing' };

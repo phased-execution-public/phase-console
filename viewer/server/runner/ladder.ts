@@ -1158,6 +1158,20 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     check: 'Your word is the check: the phase boards again with your note.',
     options: [ANSWERED],
   },
+  // What the run may write outward (one-pool phase 14, #349): the session
+  // asked the manifest's `issues` question — file, label or comment on an
+  // issue — and stopped rather than guess. A person's answer, never a rung.
+  'blocked-declared:issues': {
+    need: 'An answer to what this run may write on issues — file, label or comment — which the session asked and stopped rather than guess.',
+    how: "Answer the plan's `issues` decision (its `## Decisions` row or its `Issues:` line), or Settings ▸ Issues for this console, then Retry — the phase boards again under your answer.",
+    title: 'Say what the run may file on issues',
+    steps: [
+      'Read what the session wanted to file, label or comment, in its handoff.',
+      "Answer the plan's issues decision, or set Settings ▸ Issues, then tell the console you are done.",
+    ],
+    check: 'Your word is the check: the phase boards again under your answer.',
+    options: [ANSWERED],
+  },
   // A run request (turn-by-turn phase 6, #286): an act only the RUN can take,
   // which no session may press — ONE approval per run and act on Your turn,
   // every phase that asked a waiter on it.

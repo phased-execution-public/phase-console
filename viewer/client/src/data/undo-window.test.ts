@@ -128,3 +128,53 @@ describe('UW-6 useHeldPress', () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('a held press survives the page that held it (one-pool phase 13, #368)', () => {
+  it('UW-7 pagehide sends what is held, through its leave sender, once', () => {
+    const send = vi.fn();
+    const leave = vi.fn();
+    const { result } = renderHook(() => useHeldPress());
+    act(() => result.current.hold('Your decision', send, leave));
+    expect(result.current.held?.label).toBe('Your decision');
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+    });
+    expect(leave).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+    act(() => {
+      vi.advanceTimersByTime(UNDO_WINDOW_MS * 2);
+    });
+    expect(send).not.toHaveBeenCalled();
+    expect(leave).toHaveBeenCalledTimes(1);
+  });
+
+  it('UW-8 a hidden page sends it too; an undone press sends nothing on leaving', () => {
+    const send = vi.fn();
+    const leave = vi.fn();
+    const { result } = renderHook(() => useHeldPress());
+    act(() => result.current.hold('Not doing this', send, leave));
+    act(() => {
+      result.current.undo();
+    });
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(leave).not.toHaveBeenCalled();
+    act(() => result.current.hold('Approve', send, leave));
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(leave).toHaveBeenCalledTimes(1);
+    visibility.mockRestore();
+  });
+
+  it('UW-9 a press with no leave sender is sent as it is when the page goes', () => {
+    const send = vi.fn();
+    const held = holdPress(send);
+    held.leave();
+    expect(send).toHaveBeenCalledTimes(1);
+    held.leave();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+});

@@ -398,7 +398,9 @@ test('CF-5 (EC5): every CLI form is a verb the CLI dispatches, pressing the row\
   const bins = ['../../bin/phase-console.mjs'];
   for (const row of AUTHORITY_ROUTES) {
     for (const form of row.cli) {
-      const [group, name] = form.split(' ');
+      // A three-word form names a sub-verb row: `run queue order` is the `queue-order` row (one-pool phase 39).
+      const [group, ...words] = form.split(' ');
+      const name = words.join('-');
       if (group === 'run') {
         const verb = OPERATOR_VERBS.find((v) => v.name === name);
         assert.ok(verb?.cli, `${form}: phase-console run has no such verb`);
@@ -501,6 +503,7 @@ test('OD-5: every call of an authority method in the router is reached by an AUT
     'answer-run-request': [{ body: { phase: 3, answer: 'approve' } }],
     'approve-plan': [{ body: { phase: 1, decision: 'approve' } }],
     'delegate-step': [{ body: { phase: 1, instruction: 'do it yourself' } }],
+    'waive-verify-line': [{ body: { phase: 3, line: 'npm test', reason: 'the red is the fixture\'s' } }],
     'remember-ruling': [{ body: { scope: 'global' } }],
     'approve-gate': [{ body: { approve: true } }],
     'console-write': [{ body: { action: 'gate-approve', slug: 'demo', phase: 3 } }],

@@ -20,6 +20,11 @@ import { expect, test } from '@playwright/test';
 
 import { VIEWPORTS } from './lib/shots.ts';
 
+/** `#/queue`: the Queue page in Pro, the Runs home's Queued group in Free. */
+const QUEUE_LANDS: { from: string; to: string; title: string }[] = [
+  { from: '#/queue', to: '#/runs?group=queued', title: 'Runs' },
+];
+
 /** Where each old address lands, and the chrome's word for the place drawn there. */
 const LANDS: readonly { from: string; to: string; title: string }[] = [
   { from: '#/now', to: '#/runs', title: 'Runs' },
@@ -31,8 +36,9 @@ const LANDS: readonly { from: string; to: string; title: string }[] = [
   // One hop each, not through `#/now`: the server mints `/#/ready` today.
   { from: '#/ready', to: '#/runs?group=ready', title: 'Runs' },
   { from: '#/pulse', to: '#/runs?group=live', title: 'Runs' },
-  // The queue page (control-tower phase 99) is the home's Queued group since 7.0.
-  { from: '#/queue', to: '#/runs?group=queued', title: 'Runs' },
+  // The queue page (control-tower phase 99) was the home's Queued group from 7.0; in Pro it is a
+  // page again (one-pool phase 40) and stays where it is, query and all. Free keeps the redirect.
+  ...QUEUE_LANDS,
   // The overlays ride on the home now, and open over it.
   { from: '#/search?q=cart', to: '#/runs?k=cart', title: 'Runs' },
   { from: '#/guide/mobile', to: '#/runs?help=mobile', title: 'Runs' },

@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
+import { DEFAULT_HEAD, PLAN_TABS } from '../shared/route-meta.js';
 import { UI_STATES } from '../shared/status-vocab.js';
 import { still } from './lib/probes.ts';
 import { STOPS, VIEWPORTS, fixture, visit } from './lib/shots.ts';
@@ -190,8 +191,17 @@ for (const stop of STOPS) {
 }
 
 // The stops a keyboard spends most of its time on, each with a primary button
-// or a live badge in reach of the first dozen tabs.
-const RING_STOPS = STOPS.filter((s) => ['runs', 'plan-route', 'approve'].includes(s.name));
+// or a live badge in reach of the first dozen tabs: the home, a plan's first
+// view (its phases and route) and Your turn. Named from `shared/route-meta.js`,
+// and every name must find its stop: a filter that matched one stop of three
+// passed vacuously for the other two for a whole release (#291), so a renamed
+// stop now fails this spec at load instead of skipping.
+const RING_NAMES = [DEFAULT_HEAD, `plan-${PLAN_TABS[0]}`, 'turn'];
+const RING_STOPS = RING_NAMES.map((name) => {
+  const stop = STOPS.find((s) => s.name === name);
+  if (!stop) throw new Error(`status.spec: no tour stop is named "${name}" — rename it here with the tour`);
+  return stop;
+});
 
 for (const stop of RING_STOPS) {
   test(`the focus ring is ink, never amber, in both themes: ${stop.name}`, async ({ page }, info) => {

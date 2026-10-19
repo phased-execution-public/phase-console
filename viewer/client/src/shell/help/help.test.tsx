@@ -31,7 +31,7 @@ import { closeOverlaysHref, helpHref, settingsHref, type Route } from '@/shell/r
 import { expectNoAxeViolations } from '@/test/axe';
 import { HELP_BODIES } from './bodies';
 import { HelpCard } from './card';
-import { wearStatusWord } from './prose';
+import { SHORT_CODE_CHARS, StatusProse, wearStatusWord } from './prose';
 import { PageRoutes, pageSurface } from './route-strip';
 // Loaded up front, so the sheet's `lazy()` resolves from the module cache and
 // no case waits on a cold import under a full suite's load.
@@ -334,9 +334,9 @@ describe('the help sheet', () => {
     expect(done!.className).toContain('state-done');
     expect(done!.getAttribute('title')).toMatch(/Finished/);
 
-    // A code word that is NOT a status stays a plain code span.
+    // A code word that is NOT a status stays a plain code span — only kept whole when short (#335).
     const flag = [...panel.querySelectorAll('code')].find((el) => el.textContent?.startsWith('--allow'));
-    if (flag) expect(flag.className).toBe('');
+    if (flag) expect(flag.className).toMatch(/^(whitespace-nowrap)?$/);
   });
 });
 
@@ -559,5 +559,17 @@ describe('the route strip', () => {
     expect(reads.length + presses.length + settings.length).toBe(0);
     const { container } = render(<PageRoutes route={route} />);
     expect(container.innerHTML).toBe('');
+  });
+});
+
+describe('inline code in the guides', () => {
+  it('keeps a short token whole and lets a long path break (#335)', async () => {
+    const long = 'viewer/client/src/screens/plan/run/verification.tsx';
+    expect(long.length).toBeGreaterThan(SHORT_CODE_CHARS);
+    const { container } = render(<StatusProse text={`Open \`?bay=\` or \`${long}\`.`} />);
+    await waitFor(() => expect(container.querySelectorAll('code').length).toBe(2));
+    const [short, path] = [...container.querySelectorAll('code')];
+    await waitFor(() => expect(short!.className).toContain('whitespace-nowrap'));
+    expect(path!.className).not.toContain('whitespace-nowrap');
   });
 });

@@ -77,6 +77,29 @@ export const MCP_STATUSES = Object.freeze(
  */
 export const MCP_TRANSPORTS = Object.freeze(/** @type {const} */ (['http', 'sse', 'ws', 'stdio']));
 
+/**
+ * The guided MCP sign-in's steps (one-pool phase 19, #372), in the order a
+ * flow walks them: `starting` (the CLI is asked for the sign-in page) ·
+ * `approve` (a console at this machine: the CLI opened the browser, approve
+ * there) · `paste` (a console reached from elsewhere: open the page, approve,
+ * paste the address it lands on back) · `checking` (the CLI finished; the
+ * server is probed) · then one of `connected`, `failed`, `timed-out`.
+ * @typedef {'starting'|'approve'|'paste'|'checking'|'connected'|'failed'|'timed-out'} McpLoginStep
+ * @type {readonly McpLoginStep[]}
+ */
+export const MCP_LOGIN_STEPS = Object.freeze(
+  /** @type {const} */ (['starting', 'approve', 'paste', 'checking', 'connected', 'failed', 'timed-out']),
+);
+
+/** The steps a flow ends on. @type {readonly McpLoginStep[]} */
+export const MCP_LOGIN_ENDS = Object.freeze(MCP_LOGIN_STEPS.slice(MCP_LOGIN_STEPS.indexOf('connected')));
+
+/**
+ * How long the CLI's `mcp login` waits for the browser before it gives up —
+ * five minutes, its own clock (CLI 2.1.299, #372); the page counts it down.
+ */
+export const MCP_LOGIN_WINDOW_MS = 5 * 60_000;
+
 /** @param {unknown} v @returns {v is McpStatus} */
 export function isMcpStatus(v) {
   return typeof v === 'string' && MCP_STATUSES.includes(/** @type {McpStatus} */ (v));
@@ -94,10 +117,15 @@ export function isMcpTransport(v) {
 /**
  * How a registered Claude account authenticates: the CLI's own logged-in
  * default, a named profile directory, or a bare API token.
- * @typedef {'default'|'profile'|'token'} AccountKind
- * @type {readonly AccountKind[]}
  */
-export const ACCOUNT_KINDS = Object.freeze(/** @type {const} */ (['default', 'profile', 'token']));
+export const ACCOUNT_KINDS = Object.freeze(
+  /** @type {const} */ ([
+    'default',
+    'profile',
+    'token',
+  ]),
+);
+/** @typedef {(typeof ACCOUNT_KINDS)[number]} AccountKind */
 
 /**
  * The usage levels the console acts on, in PERCENT (0–100) — the account
@@ -480,6 +508,23 @@ export const RESTART_UPDATE_STATES = Object.freeze(
 export const DELIVERY_OUTCOMES = Object.freeze(
   /** @type {const} */ (['sent', 'throttled', 'failed', 'gone', 'quiet', 'skipped', 'no-device']),
 );
+
+/**
+ * The two rows that name NO device (one-pool phase 18, #314 #324): `no-device`
+ * (nobody was there to take it) and `skipped` (the console could not see it
+ * delivered). They say why a ledger is empty; they are not a device and not a
+ * failed handover — the delivery tally counts no device for them, and a
+ * summary of what became of an announcement drops them before it counts.
+ * @type {readonly DeliveryOutcome[]}
+ */
+export const DELIVERY_PLACEHOLDERS = Object.freeze(
+  /** @type {DeliveryOutcome[]} */ (DELIVERY_OUTCOMES.filter((o) => o === 'skipped' || o === 'no-device')),
+);
+
+/** Whether a delivery row is a placeholder rather than a device's handover. */
+export function isDeliveryPlaceholder(/** @type {unknown} */ outcome) {
+  return DELIVERY_PLACEHOLDERS.includes(/** @type {DeliveryOutcome} */ (outcome));
+}
 
 /**
  * What one PROBE answered — the run-start prelude's four (accounts, MCP,

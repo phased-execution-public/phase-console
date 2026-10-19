@@ -268,6 +268,22 @@ test('a default-branch run composes the prompt it always composed — not one by
   } finally { r.cleanup(); }
 });
 
+test('#322: a default-branch run launched OVER the plan\'s branch is told so — and works where it stands', async () => {
+  const r = repo();
+  try {
+    const prompts = await promptsFor(r, {
+      onlyPhases: [1],
+      gitStrategyOverride: {
+        lines: [{ kind: 'branch', plan: 'pe/demo', run: 'every phase stands on `main`; `pe/demo` is never created or checked out' }],
+        ack: 'automatic', at: new Date().toISOString(),
+      },
+    });
+    assert.match(prompts[0]!, /names the branch `pe\/demo`, and this\nrun was launched OVER it/);
+    assert.match(prompts[0]!, /Work on the\nbranch the checkout already has out/);
+    assert.doesNotMatch(prompts[0]!, /ONE plan-wide branch/, 'a default-branch run is never told to cut the run branch');
+  } finally { r.cleanup(); }
+});
+
 test('a new-branch run states the branch rule between the plan and the directive', async () => {
   const r = repo();
   try {
@@ -302,9 +318,17 @@ test('the mismatch note appears exactly when the plan names a real branch', asyn
     // The first drive marked phase 1 done in the stub; put it back.
     writeFileSync(join(r.state, 'done'), '');
     const named = await promptsFor(r, { onlyPhases: [1], gitMode: 'new-branch' },
-      { planBranch: () => 'feature/checkout' });
+      { planBranch: () => '`feature/checkout`' });
     assert.match(named[0]!, /names the branch `feature\/checkout`/);
     assert.match(named[0]!, /record the discrepancy in your\s+handoff/);
+
+    // #235's second site: prose naming the RUN branch, wrapped, with trailing
+    // text, is the run's own branch — no false note, no `run.branch-mismatch`.
+    writeFileSync(join(r.state, 'done'), '');
+    const agreeing = await promptsFor(r, { onlyPhases: [1], gitMode: 'new-branch' },
+      { planBranch: () => '`pe/demo` — the run\nbranch in every repo the run mounts, cut from `origin/main`' });
+    assert.doesNotMatch(agreeing[0]!, /discrepancy/, 'the run branch named in prose agrees with itself');
+    assert.doesNotMatch(agreeing[0]!, /names the branch/);
   } finally { r.cleanup(); }
 });
 
@@ -3171,7 +3195,7 @@ function ackService(lines: Record<string, unknown>[]) {
   const started: Record<string, unknown>[] = [];
   Object.assign(service as object, {
     root: { ok: true, path: tmpdir() },
-    store: { get: () => ({ slug: 'demo', plan: { phased: true, graph: [{ phase: 1, repos: '' }], phases: {}, sessionBudget: {} } }), list: () => [] },
+    store: { get: () => ({ slug: 'demo', plan: { phased: true, graph: [{ phase: 1, repos: '' }], phases: {}, sessionBudget: { accounts: [] } } }), list: () => [] },
     liveRunner: () => null,
     foreignRunHoldingWork: () => null,
     assertNotClaimed: () => {},
@@ -3224,6 +3248,17 @@ test('EC7 — override runs over the lines and records them; honour refuses a li
   await honourTrees.service.startRun('demo', { gitMode: 'new-branch', gitStrategyAck: 'honour', gitStrategyAckRequired: true });
   assert.equal(honourTrees.started[0]!.isolation, 'worktree');
   assert.equal(honourTrees.started[0]!.gitStrategyOverride, undefined, 'honoured, so nothing is overridden');
+
+  // #322: a launch that cuts no branch, over a plan naming `pe/<slug>` — honour
+  // launches it on the new-branch strategy, and isolates nothing it was not asked to.
+  const ownBranch = ackService([{
+    kind: 'branch', plan: 'pe/demo', honourable: true,
+    run: 'every phase stands on `main`; `pe/demo` is never created or checked out',
+  }]);
+  await ownBranch.service.startRun('demo', { gitStrategyAck: 'honour', gitStrategyAckRequired: true });
+  assert.equal(ownBranch.started[0]!.gitMode, 'new-branch');
+  assert.notEqual(ownBranch.started[0]!.isolation, 'worktree', 'a branch line needs a branch, not a checkout of its own');
+  assert.equal(ownBranch.started[0]!.gitStrategyOverride, undefined);
 });
 
 test('EC7 — an automatic door answers override for itself, and the run journals run.git-strategy-overridden', async () => {

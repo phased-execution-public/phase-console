@@ -433,3 +433,30 @@ guided_docs() {
   run pg guided --human-steps 0
   [ "${#lines[@]}" -eq 2 ]
 }
+
+# ---- #346: a bullet inside an HTML comment ----------------------------------
+
+@test "#346: a Human step inside an HTML comment is no step — one line, across lines, trailing, never closed" {
+  setup_docs commented-human-step commented-human-step
+  run pg commented-human-step --human-steps
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 2 ]
+  [ "${lines[0]}" = "1$(tab)browser-login$(tab)sign the gh CLI in to the org$(tab)gh auth login --web$(tab)cmd:\"gh auth status\"$(tab)host$(tab)$(tab)$(tab)$(tab)$(tab)identity$(tab)$(tab)$(tab)" ]
+  case "${lines[1]}" in "2$(tab)operator-act$(tab)rotate the deploy key (E-1)$(tab)"*) : ;; *) echo "$output"; return 1 ;; esac
+  run pg commented-human-step --human-steps 0
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "#346: no lint sees a commented bullet (F37 F38 F40 F41), and one binds no errand row (F43)" {
+  setup_docs commented-human-step commented-human-step
+  run pg commented-human-step --lint
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "LINT OK: commented-human-step"
+  [[ "$output" != *"(F37)"* ]]
+  [[ "$output" != *"F38 "* ]]
+  [[ "$output" != *"F40 "* ]]
+  [[ "$output" != *"F41 "* ]]
+  assert_contains "$output" "F43 errand-row-unbound — the ## Operator errands row E-2 has no Human step bullet"
+  [[ "$output" != *"row E-1 "* ]]
+}

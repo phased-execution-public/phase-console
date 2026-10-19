@@ -37,7 +37,15 @@ import { Bar, Line } from '@visx/shape';
 import { cn } from '@/lib/cn';
 import { Button } from '@/ui/button';
 
-import type { BarListItem, BarPoint, CalendarCell, FigureTone, StackSegment } from './lazy';
+import type {
+  BarListItem,
+  BarPoint,
+  CalendarCell,
+  FigureTone,
+  SeriesBucket,
+  SeriesRow,
+  StackSegment,
+} from './lazy';
 import {
   AXIS_PAINT,
   FIGURE_BAND,
@@ -45,6 +53,8 @@ import {
   FIGURE_DESCENT,
   FIGURE_TYPE,
   inside,
+  SERIES,
+  seriesHeight,
   textWidth,
   useWidth,
 } from './paint';
@@ -685,6 +695,183 @@ export function StackBarDrawing({ segments }: { segments: readonly StackSegment[
           ))}
         </div>
       ) : null}
+    </FigureFrame>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Series — one strip per row on one shared time axis
+ * ------------------------------------------------------------------ */
+
+/** A label cut, with an ellipsis, to the room it is written in — the numbers carry it in full. */
+function clip(text: string, room: number): string {
+  if (textWidth(text) <= room) return text;
+  let out = text;
+  while (out.length > 1 && textWidth(`${out}…`) > room) out = out.slice(0, -1);
+  return `${out}…`;
+}
+
+/**
+ * Small multiples, never a stack of colours: each row (an account) is a strip of
+ * its own in the one paint, named in words above it, on one time axis and one
+ * crosshair — the row is its label, never its hue (design.md §8.2). The column
+ * still being written, the last bucket, is drawn apart in the action's ink, as
+ * `Bars` draws its current week.
+ */
+export function SeriesDrawing({
+  buckets,
+  rows,
+  tone: paint,
+  valueText,
+  timeText,
+  label,
+}: {
+  buckets: readonly SeriesBucket[];
+  rows: readonly SeriesRow[];
+  tone: FigureTone;
+  valueText: (value: number) => string;
+  /** A bucket's start as the axis and the readout write it. */
+  timeText: (start: string) => string;
+  label: string;
+}) {
+  const box = useRef<HTMLDivElement>(null);
+  const svg = useRef<SVGSVGElement>(null);
+  const width = useWidth(box, 320);
+  const count = buckets.length;
+  const height = seriesHeight(rows.length);
+  const plotW = Math.max(1, width - 2 * SERIES.side);
+  const max = Math.max(0, ...rows.flatMap((row) => row.values));
+  const top = max > 0 ? max : 1;
+
+  const xOf = (view: AxisWindow) => linear(view, [SERIES.side, SERIES.side + plotW]);
+  const figure = useFigure({
+    label,
+    count,
+    bounds: [0, Math.max(count, 1)],
+    minSpan: Math.max(1, Math.min(6, count / 2)),
+    describe: (i) => {
+      const parts = rows
+        .map((row) => ({ name: row.name, value: row.values[i] ?? 0 }))
+        .filter((part) => part.value > 0)
+        .map((part) => `${part.name} ${valueText(part.value)}`);
+      return `${timeText(buckets[i]?.start ?? '')}: ${parts.length ? parts.join(', ') : 'nothing'}`;
+    },
+    stopAt: (i) => i + 0.5,
+    locate: (clientX, clientY, view) => {
+      const point = svgPoint(svg.current, clientX, clientY);
+      if (!point) return null;
+      const at = xOf(view).invert(point.x);
+      return { at, stop: at >= 0 && at < count ? Math.floor(at) : null };
+    },
+  });
+
+  const x = xOf(figure.view);
+  const gap = Math.min(2, (x(1) - x(0)) * 0.2);
+  const pitch = Math.max(0, ...buckets.map((b) => textWidth(timeText(b.start)))) + FIGURE_TYPE;
+  const every = Math.max(1, Math.ceil((figure.view[1] - figure.view[0]) / Math.max(1, plotW / pitch)));
+  const labelled = buckets.map((_, i) => i).filter((i) => i % every === (count - 1) % every);
+  const cursor = figure.cursor;
+  const axisAt = height - SERIES.times;
+  const sum = rows.reduce((total, row) => total + row.values.reduce((a, b) => a + b, 0), 0);
+
+  return (
+    <FigureFrame
+      name="Series"
+      figure={figure}
+      idle={
+        max > 0
+          ? `${valueText(sum)} in all; the tallest column, on every strip, is ${valueText(max)}`
+          : 'Nothing was spent in this window'
+      }
+      readout={cursor !== null && buckets[cursor] ? figure.sliderProps['aria-valuetext'] : null}
+    >
+      <div ref={box}>
+        <svg
+          ref={svg}
+          viewBox={`0 0 ${width} ${height}`}
+          height={height}
+          className="block w-full overflow-hidden"
+          role="img"
+          aria-label={label}
+        >
+          {rows.map((row, r) => {
+            const y0 = r * (SERIES.name + SERIES.strip + SERIES.gap);
+            const base = y0 + SERIES.name + SERIES.strip;
+            const total = row.values.reduce((a, b) => a + b, 0);
+            const name = `${row.name}  ${valueText(total)}`;
+            return (
+              <g key={row.name} data-row={row.name}>
+                <text
+                  x={SERIES.side}
+                  y={y0 + FIGURE_BAND - FIGURE_DESCENT - 1}
+                  fontSize={FIGURE_TYPE}
+                  fill="var(--ink-muted)"
+                >
+                  {clip(name, plotW)}
+                </text>
+                <line
+                  x1={SERIES.side}
+                  x2={SERIES.side + plotW}
+                  y1={base + 0.5}
+                  y2={base + 0.5}
+                  stroke="var(--rule-strong)"
+                  strokeWidth={1}
+                />
+                {row.values.map((value, i) => {
+                  const x0 = Math.max(SERIES.side, x(i) + gap / 2);
+                  const x1 = Math.min(SERIES.side + plotW, x(i + 1) - gap / 2);
+                  if (x1 <= x0) return null;
+                  const h = (value / top) * SERIES.strip;
+                  const current = i === count - 1;
+                  return (
+                    <Bar
+                      key={buckets[i]?.start ?? i}
+                      data-datum={`${row.name}@${buckets[i]?.start ?? i}`}
+                      data-value={value}
+                      x={x0}
+                      y={base - h}
+                      width={x1 - x0}
+                      height={Math.max(value > 0 ? 1.5 : 0, h)}
+                      rx={1}
+                      className={current ? undefined : `state-${paint}`}
+                      fill={current ? 'var(--action)' : 'var(--state)'}
+                      opacity={current || cursor === i ? 1 : 0.75}
+                    >
+                      <title>{`${row.name}, ${timeText(buckets[i]?.start ?? '')}: ${valueText(value)}`}</title>
+                    </Bar>
+                  );
+                })}
+              </g>
+            );
+          })}
+          <AxisBottom
+            top={axisAt}
+            scale={x}
+            tickValues={labelled.map((i) => i + 0.5)}
+            tickFormat={(value) => timeText(buckets[Math.floor(Number(value))]?.start ?? '')}
+            {...AXIS_PAINT}
+            tickLabelProps={(value) => ({
+              ...AXIS_PAINT.tickLabelProps,
+              dy: 0,
+              ...inside(
+                x(Number(value)),
+                textWidth(timeText(buckets[Math.floor(Number(value))]?.start ?? '')),
+                width,
+              ),
+            })}
+          />
+          {cursor !== null && buckets[cursor] ? (
+            <Line
+              from={{ x: x(cursor + 0.5), y: 0 }}
+              to={{ x: x(cursor + 0.5), y: axisAt }}
+              stroke="var(--ink-muted)"
+              strokeWidth={1}
+              strokeDasharray="2 2"
+              pointerEvents="none"
+            />
+          ) : null}
+        </svg>
+      </div>
     </FigureFrame>
   );
 }

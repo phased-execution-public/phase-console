@@ -18,7 +18,7 @@ vi.mock('@/data/http', async (importOriginal) =>
   (await import('./test-kit')).fixtureHttp(await importOriginal(), server),
 );
 
-import { DENSITIES, THEMES } from '@shared/prefs-model.js';
+import { DENSITIES, PALETTES, THEMES } from '@shared/prefs-model.js';
 import { getPrefs, setPrefs } from '@/lib/prefs';
 import { SORTS } from '@/screens/plans/model';
 import { AppearanceSection } from './appearance';
@@ -53,6 +53,7 @@ beforeEach(() => {
     setPrefs({
       theme: 'system',
       density: 'comfortable',
+      palette: 'quiet',
       showDocuments: false,
       terminalWebgl: false,
       terminalScreenReader: false,
@@ -86,6 +87,21 @@ describe('this browser', () => {
     expect(document.documentElement).toHaveAttribute('data-density', 'compact');
     fireEvent.click(within(group('Density')).getByRole('button', { name: 'Comfortable' }));
     expect(document.documentElement).not.toHaveAttribute('data-density');
+    expect(posted()).toEqual([]);
+  });
+
+  it('offers both palettes, and Departures repaints the room in this browser and survives a reload (#362)', async () => {
+    await mount();
+    expect(within(group('Palette')).getAllByRole('button')).toHaveLength(PALETTES.length);
+    fireEvent.click(within(group('Palette')).getByRole('button', { name: 'Departures' }));
+    expect(getPrefs().palette).toBe('departures');
+    expect(document.documentElement).toHaveAttribute('data-palette', 'departures');
+    // Kept where a reload reads it back.
+    expect(JSON.parse(localStorage.getItem('phase-console.ui') ?? '{}')).toMatchObject({
+      palette: 'departures',
+    });
+    fireEvent.click(within(group('Palette')).getByRole('button', { name: 'Quiet' }));
+    expect(document.documentElement).not.toHaveAttribute('data-palette');
     expect(posted()).toEqual([]);
   });
 

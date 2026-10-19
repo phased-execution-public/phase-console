@@ -222,7 +222,9 @@ function Rows({
   state: ConsoleState | undefined;
 }) {
   return (
-    <div className="flex min-w-0 flex-col divide-y divide-rule">
+    // The rows lay themselves out by the room this list has (`@container/strips`):
+    // a page column beside the open panel is a tablet's, whatever the viewport.
+    <div className="@container/strips flex min-w-0 flex-col divide-y divide-rule">
       {runs.map((t) => (
         <RunRow key={t.key} placed={t} allowRun={allowRun} state={state} />
       ))}

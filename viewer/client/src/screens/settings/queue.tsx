@@ -13,8 +13,8 @@
  *   The longest remaining chain first.
  *   Plan [ trade ▾ ]  Policy [ Blocker first ▾ ]  Give the plan its own policy
  * Load guard                                             [ 1.5 ] times the cores
- * New work waits while the machine's 5-minute load is above this many times its cores; …
- * The 5-minute load is 8.1; new work waits above 21 (1.5 times 14 cores).
+ * New work waits while the machine is busy: at the default 1.5, at 85 % CPU over 30 s, or a 5-minute load over …
+ * CPU 23 % over the last 30 s, 5-minute load 8.1; new work waits at 85 % CPU or a load over 42.
  * ```
  *
  * The three keys are written through the queue's own door, `POST
@@ -63,10 +63,23 @@ export function loadGuardWords(load: QueueLoad): string {
   if (load.factor === null || load.threshold === null) {
     return 'The guard is off: new work starts however loaded the machine is.';
   }
-  const basis = `${load.factor} times ${plural(load.cores, 'core')}`;
-  return load.holding
-    ? `Holding new work now: the 5-minute load is ${load.avg5}, over ${load.threshold} (${basis}). Live lanes carry on.`
-    : `The 5-minute load is ${load.avg5}; new work waits above ${load.threshold} (${basis}).`;
+  const pct = (share: number) => `${Math.round(share * 100)} %`;
+  // What the CPU did, beside the load (one-pool phase 26, #243): the guard
+  // gates on it, with the 5-minute average as a ceiling only.
+  const limit = typeof load.busyLimit === 'number' ? `${pct(load.busyLimit)} CPU or ` : '';
+  const ceiling = `a load over ${load.threshold} (${load.factor} times ${plural(load.cores, 'core')}${limit ? ', times 2' : ''})`;
+  if (load.holding) {
+    const why =
+      load.cause === 'cpu' && typeof load.busy === 'number' && typeof load.busyLimit === 'number'
+        ? `the CPU is ${pct(load.busy)} busy over the last 30 s, at or over ${pct(load.busyLimit)}; the 5-minute load is ${load.avg5}`
+        : `the 5-minute load is ${load.avg5}, over ${load.threshold} (${load.factor} times ${plural(load.cores, 'core')}${limit ? ', times 2' : ''})`;
+    return `Holding new work now: ${why}. Live lanes carry on.`;
+  }
+  const now =
+    typeof load.busy === 'number'
+      ? `CPU ${pct(load.busy)} over the last 30 s, 5-minute load ${load.avg5}`
+      : `The 5-minute load is ${load.avg5}`;
+  return `${now}; new work waits at ${limit}${ceiling}.`;
 }
 
 const LINK =
@@ -370,7 +383,7 @@ function LoadRow({ load, pending, off, why, send }: RowProps & { load: QueueLoad
     <SettingRow
       pref="loadGuardFactor"
       label="Load guard"
-      hint="New work waits while the machine’s 5-minute load is above this many times its cores; 0 switches the guard off. Live lanes are never touched."
+      hint="New work waits while the machine is busy: at 1.5, at 85 % CPU over the last 30 s (the factor scales it) or a 5-minute load over this many times its cores, times 2; 0 switches the guard off. Live lanes are never touched."
       note={error ?? undefined}
       facts={
         <span className="min-w-0 break-words text-ink" data-testid="load-reading">

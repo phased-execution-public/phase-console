@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
 
 import { planViewHref } from '../shared/routes.js';
+import { passThrough } from './lib/fetch.ts';
 import { touch } from './lib/grid.ts';
 import { releaseRoutesAfterEach } from './lib/routes.ts';
 import { TOUR_PLAN, shoot } from './lib/shots.ts';
@@ -56,7 +57,7 @@ const TOUR_ONLY = new Set(['live', 'lock', 'handoff']);
 /** Serve the tour plan with the fixture's route and phases in place of its own. */
 async function serveFixture(page: Page): Promise<void> {
   await page.route(new RegExp(`/api/plans/${TOUR_PLAN}(?:\\?[^/]*)?$`), async (route) => {
-    const response = await route.fetch();
+    const response = await passThrough(route);
     const detail = (await response.json()) as {
       summary: Record<string, unknown>;
       phases: Record<string, unknown>[];
@@ -117,10 +118,9 @@ async function serveFixture(page: Page): Promise<void> {
 
 /** The map's own zoom readout, as a number. */
 async function zoom(page: Page): Promise<number> {
-  const text = await page
-    .locator('div:has(> .route-frame)')
-    .getByText(/^\d+%$/)
-    .textContent();
+  // The readout by its own handle: phase 16 wrapped the frame, and a selector
+  // that walked up from it found a box with no readout in it (#394).
+  const text = await page.getByTestId('map-zoom').textContent();
   return Number(text!.replace('%', ''));
 }
 
@@ -388,9 +388,11 @@ test.describe('the route map at 71 stations', () => {
     test.skip(touch(info.project.name), 'a keyboard');
     await openMap(page);
     await expect(page.locator('.route-svg .route-station[tabindex="0"]')).toHaveCount(1);
-    // Tab from the search, through the toolbar, onto the map's one stop.
+    // Tab from the search, through the toolbar and the map's tools (phase 16's
+    // chips, trace, colour, layers, layouts and export — #394), onto the map's
+    // one stop. Bounded, so a tab trap still fails here rather than hanging.
     await page.getByRole('searchbox', { name: 'Find a station' }).focus();
-    for (let press = 0; press < 12; press++) {
+    for (let press = 0; press < 80; press++) {
       await page.keyboard.press('Tab');
       if (await page.evaluate(() => document.activeElement?.classList.contains('route-station'))) break;
     }

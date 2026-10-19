@@ -15,6 +15,24 @@ MSG
   exit 127
 fi
 
+# A session Phase Console supervises runs this with the console's variables
+# exported — the run's owner, lock mirror, channel files and issue policy — and
+# each of them steers a script under test (#230: a planted PE_ISSUES_SOURCE
+# turned three issue-policy tests red). So every PE_* variable, and DOCS_ROOT,
+# leaves the environment before bats starts, and the names are printed: a test
+# sets what it needs, and nothing a session carries leaks in.
+scrubbed=""
+for name in $(compgen -e); do
+  case "$name" in
+    PE_*|DOCS_ROOT) unset "$name"; scrubbed="$scrubbed $name" ;;
+  esac
+done
+if [ -n "$scrubbed" ]; then
+  echo "== environment: scrubbed${scrubbed} =="
+else
+  echo "== environment: no PE_* or DOCS_ROOT to scrub =="
+fi
+
 fail=0
 
 if command -v shellcheck >/dev/null 2>&1; then

@@ -27,13 +27,13 @@
  * switch. Two controls for one preference disagree the day their fallbacks do.
  */
 
-import type { ReactNode } from 'react';
 import { CAPABILITY_WORDS } from '@shared/capability-model.js';
 import type { ConsoleState } from '@/data/api';
 import { useConsoleState } from '@/data/console';
 import { cn } from '@/lib/cn';
 import { homePath, plural, weight } from '@/lib/format';
 import { CAPABILITIES } from '@/lib/start-command';
+import { KEYMAP } from '@/shell/keymap';
 import { settingsHref, sourceHref } from '@/shell/routes';
 import { Button, Kbd, KbdChord, KeyValue, Mono, Skeleton } from '@/ui';
 import { Disclosure } from '@/ui/disclosure';
@@ -310,25 +310,20 @@ function EngineGroup({ state }: { state: ConsoleState }) {
 }
 
 /**
- * What the palette cannot document from inside itself — the same keys the help
- * sheet's Keyboard table lists (`content/guide/reference.md`). The 2.x
- * single-letter jumps stay gone: the palette replaced them with one chord that
- * shows its own contents.
+ * What the palette cannot document from inside itself — every key the shell
+ * answers, drawn from the ONE table its hooks read (`shell/keymap.ts`, #334),
+ * so this card cannot drift from the keys. The same keys are the help sheet's
+ * Keyboard table (`content/guide/reference.md`). The 2.x single-letter jumps
+ * stay gone: the palette replaced them with one chord that shows its own
+ * contents.
  */
 function KeyboardGroup() {
-  const keys: readonly (readonly [ReactNode, string])[] = [
-    [<KbdChord keys={['⌘', 'K']} />, 'Search and commands'],
-    [<Kbd>/</Kbd>, 'The same, without a modifier'],
-    [<KbdChord keys={['⌘', 'I']} />, 'Open or close the panel’s Details'],
-    [<Kbd>Esc</Kbd>, 'Close a dialog, a sheet, the palette, the bell or the help sheet'],
-    [<KbdChord keys={['←', '→']} />, 'Widen or narrow the panel from its focused edge'],
-  ];
   return (
     <SettingsGroup id="keyboard" title="Keyboard">
       <dl className="grid min-w-0 grid-cols-[max-content_minmax(0,1fr)] items-center gap-x-6 gap-y-2">
-        {keys.map(([key, does]) => (
+        {KEYMAP.map(({ keys, does }) => (
           <div key={does} className="contents">
-            <dt className="min-w-0">{key}</dt>
+            <dt className="min-w-0">{keys.length > 1 ? <KbdChord keys={keys} /> : <Kbd>{keys[0]}</Kbd>}</dt>
             <dd className="min-w-0 text-body text-ink">{does}</dd>
           </div>
         ))}

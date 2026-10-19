@@ -43,6 +43,7 @@
  * the CLI offer `AskUserQuestion` in `-p`. Never both.
  */
 
+import type { PlantedConfig } from '../git-guard.ts';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
@@ -52,6 +53,7 @@ import { MAX_TASKS, MAX_TASK_TEXT } from '../../shared/task-model.js';
 import { ENDED_BY, type EndedBy } from '../../shared/run-lifecycle.js';
 import { CHAT_TOOL_SERVER } from '../../shared/supervisor-model.js';
 import { log } from '../log.ts';
+import { parkedOutcome, sessionReaper } from './reap.ts';
 import { API_RETRY_ERRORS, BG_WAIT_CEILING_MS, childEnv, type PermissionDenial, type StopSignal } from './errors.ts';
 import { DEFAULT_KILL_AFTER_MS, INT_GRACE_MS, forgetInterrupt, groupSignal, interruptOnce, wakeAndTerm } from './signals.ts';
 import { resolveCaps, type SessionCaps } from './session-record.ts';
@@ -295,6 +297,15 @@ export type StreamEvent =
     /** `system/init.mcp_servers`, name and status — how a failed connection is known, since `--strict-mcp-config` does not exit on one (DOC-5). */
     mcpServers?: { name: string; status: string }[];
   }
+  /**
+   * The model an assistant frame of the session's OWN conversation names
+   * (`message.model`; one-pool phase 4, #281) — emitted when it differs from the
+   * last frame's, never for a subagent's frame (a subagent may run on another
+   * model by design) and never for the CLI's `<synthetic>` API-error lines. The
+   * init frame says what the session started on; this is what each turn ran on,
+   * which a mid-session fallback changes without a new init.
+   */
+  | { kind: 'model'; model: string; messageId?: string }
   | { kind: 'text'; text: string }
   /** Coalesced `text_delta`s — the same words, arriving as they are written. */
   | { kind: 'partial'; text: string }
@@ -523,6 +534,12 @@ export type StreamEvent =
   | {
     kind: 'result'; subtype?: string; costUsd?: number; turns?: number; isError?: boolean; terminalReason?: string;
     queuedTurns?: number;
+    /**
+     * The result line's own `usage` — the turn's totals as the CLI summed them (one-pool
+     * phase 5). An endpoint that is not Anthropic's can leave a stream frame's output count at
+     * 0 and report it only here, so the provider smoke reads this beside the stream's fold.
+     */
+    usage?: CallUsage;
   }
   | { kind: 'stderr'; text: string };
 
@@ -554,6 +571,15 @@ export type SpawnHandle = {
    * its stdin on the very next tick, which is the same bug wearing a hat.
    */
   setFrozen(frozen: boolean): void;
+  /**
+   * A permission card holds this session's hook open (one-pool phase 24, #220):
+   * while one does, the session waits on a PERSON, not on itself, so neither
+   * silence clock — the init→result bound (`SPAWN_INIT_IDLE_MS`, 55 min) nor the
+   * idle closer — may end it; the card's own auto-deny (59 min 40 s) is the
+   * clock that ends that wait. Keyed by the card's id, so two cards are two
+   * holds; the last release re-stamps the silence clocks, as a thaw does.
+   */
+  holdForCard?(cardId: string, open: boolean): void;
   /**
    * Say who is about to end this session, before signalling it.
    *
@@ -693,6 +719,24 @@ export type SpawnOutcome = {
   signal: StopSignal;
   sessionId?: string;
   /**
+   * Git configuration the session planted in the trees it could reach (one-pool
+   * phase 2, #272), found by the spawn door when it ended — the door has
+   * already halted the lane `run-tree-config`, so a caller stops here.
+   */
+  plantedConfig?: PlantedConfig[];
+  /**
+   * Why the spawn door refused the session's model before it started (one-pool phase 5) —
+   * nothing on the run's account serves it. The door has already halted the run
+   * `models-exhausted`, so a caller stops here.
+   */
+  modelRefused?: string;
+  /**
+   * The orphaned `index.lock`s the spawn door found in the session's trees
+   * before it started (one-pool phase 20, #328). The door has already halted
+   * the lane `run-tree-locked`, so a caller stops here.
+   */
+  treeLocked?: { tree: string; path: string; mtime: string; ageMs: number }[];
+  /**
    * The model the session's own `system/init` frame reported (control-tower
    * phase 54, #91) — what the request RESOLVED to, beside `request.model`,
    * which is only what was asked. Absent when the child never got that far.
@@ -767,6 +811,14 @@ export type SpawnOutcome = {
 
 export type SpawnFn = (request: SpawnRequest) => Promise<SpawnOutcome>;
 
+/**
+ * A session's usage meter (one-pool phase 6 — Pro's ledger, `pro/accounts/meter.ts`): fed every
+ * event the session emits and ended once, with its outcome or with nothing when the spawn threw.
+ * The console's own sessions that are nobody's run (the supervisor's chat, the checker, the plan
+ * author) take one from their host; absent, nothing is metered.
+ */
+export type SessionMeterHandle = { onEvent(event: StreamEvent): void; end(outcome: SpawnOutcome | null): void };
+
 /** argv is bounded by the OS; a boot prompt is kilobytes, so this is a sanity bound. */
 const MAX_PROMPT_BYTES = 512 * 1024;
 /** Keep the last of stderr for classification — not a whole build log. */
@@ -804,6 +856,17 @@ const PARTIAL_FLUSH_MS = 120;
  * session that is working.
  */
 const IDLE_CLOSE_MS = 10 * 60 * 1_000;
+/**
+ * How long before a turn's `result` an operator message must have been written
+ * for that result to vouch for it (one-pool phase 24, #259). A completed result
+ * reporting `queued_turn_count: 0` says the CLI holds nothing queued, so every
+ * tagged message written before the turn ended was READ — folded into the turn,
+ * mid-turn, without the echo the close rule waits on (the console's own 60 %
+ * wrap-up steer, three sightings at 10 idle minutes a lane). The grace keeps a
+ * message written in the milliseconds after the CLI printed that result, which
+ * the CLI will read as its NEXT turn, out of the drain.
+ */
+export const FOLDED_MARK_GRACE_MS = 500;
 /**
  * How many unparseable NDJSON lines are logged in full before the rest are
  * only counted. A CLI writing malformed output writes a lot of it.
@@ -987,6 +1050,9 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // teardown paths in `signals.ts`.
     detached: true,
   });
+  // Its descendants are recorded while it lives, and the test runners among
+  // them that outlive it are ended with it (one-pool phase 26, #222).
+  if (child.pid) sessionReaper.begin(child.pid, { sessionId: sessionIdForChild });
 
   let sessionId = request.resume ?? undefined;
   let costUsd = 0;
@@ -996,6 +1062,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   // The phase's own last prose (#108) — never a subagent's, never an assistant
   // line the CLI flagged as the API speaking.
   let lastText = '';
+  // The last model an assistant frame of the session's own conversation named (#281).
+  let lastFrameModel: string | undefined;
   let subtype: string | undefined;
   let stopReason: string | null | undefined;
   let stderr = '';
@@ -1107,6 +1175,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   let sentSinceLastResult = false;
   /** Tags of operator messages written but not yet echoed back by the CLI. */
   const unecho = new Set<string>();
+  /** When each tag in `unecho` was written — what `FOLDED_MARK_GRACE_MS` reads. */
+  const unechoAt = new Map<string, number>();
   /** The previous result's `num_turns`; `undefined` until a result arrives. */
   let lastResultTurns: number | null | undefined;
   /** A user, assistant, delta or task-notification line arrived after the previous result. */
@@ -1328,6 +1398,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   let sawProductive = false;
   /** Set by `setFrozen` — see `SpawnHandle.setFrozen` for why the watchdog must not run. */
   let frozen = false;
+  /** The permission cards holding this session's hook open — see `SpawnHandle.holdForCard`. */
+  const cardHolds = new Set<string>();
   /** When the session last produced a productive event — the init→result bound's clock. */
   let lastProductiveAt = Date.now();
   const initIdleAfter = request.initIdleMs ?? SPAWN_INIT_IDLE_MS;
@@ -1355,8 +1427,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     if (!phaseTurnDone || !stdinOpen || settled || idleAfter <= 0 || request.conversation) return;
     // A frozen lane is silent BY CONSTRUCTION. Measuring that silence and
     // acting on it is the watchdog mistaking the operator's own act for the
-    // failure it exists to catch.
-    if (frozen) return;
+    // failure it exists to catch. A card a person has not answered is the same (#220).
+    if (frozen || cardHolds.size) return;
     idleTimer = setTimeout(() => {
       idleTimer = null;
       if (!stdinOpen || settled) return;
@@ -1386,7 +1458,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       // and no attributed answer, which is the old behaviour rather than a new
       // failure. Everything the console sends is tagged.
       const mark = operatorMark(text);
-      if (mark) unecho.add(mark);
+      if (mark) { unecho.add(mark); unechoAt.set(mark, Date.now()); }
       else sentSinceLastResult = true;
       injected++;
       // A message opens a turn; only its completed `result` closes it.
@@ -1413,6 +1485,21 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         if (backgroundHold) clearTimeout(backgroundHold);
         armBackgroundHold();
       }
+    },
+    holdForCard: (cardId: string, open: boolean) => {
+      if (open) {
+        if (cardHolds.has(cardId)) return;
+        cardHolds.add(cardId);
+        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        clearInitIdle();
+        return;
+      }
+      if (!cardHolds.delete(cardId) || cardHolds.size) return;
+      // The wait on a person was not silence the session chose (the thaw's rule).
+      lastEventAt = Date.now();
+      lastProductiveAt = lastEventAt;
+      armIdle();
+      armInitIdle();
     },
     markEnding: (endedBy: EndedBy, reason?: string) => { noteEnding(endedBy, reason); },
   });
@@ -1541,10 +1628,10 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    */
   const armInitIdle = (delay = initIdleAfter): void => {
     clearInitIdle();
-    if (!initWatch || settled || frozen || initIdleAfter <= 0) return;
+    if (!initWatch || settled || frozen || cardHolds.size || initIdleAfter <= 0) return;
     initIdleTimer = setTimeout(() => {
       initIdleTimer = null;
-      if (!initWatch || settled || frozen) return;
+      if (!initWatch || settled || frozen || cardHolds.size) return;
       const quiet = Date.now() - lastProductiveAt;
       if (quiet < initIdleAfter) { armInitIdle(initIdleAfter - quiet); return; }
       initWatch = false;
@@ -1836,6 +1923,17 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       // credential classes read (#57). Every other assistant line is prose.
       const apiError = typeof message.error === 'string' && message.error ? message.error.slice(0, 60) : undefined;
       const apiSpeaking = Boolean(apiError) || message.is_api_error_message === true;
+      // What this turn RAN on (#281): a fallback mid-session moves it without a
+      // new init frame, so the pin is checked here as well as there.
+      const frame = message.message as { model?: unknown; id?: unknown } | undefined;
+      if (!parent && !apiSpeaking && typeof frame?.model === 'string' && frame.model
+        && frame.model !== '<synthetic>' && frame.model !== lastFrameModel) {
+        lastFrameModel = frame.model;
+        emit({
+          kind: 'model', model: frame.model.slice(0, 120),
+          ...(typeof frame.id === 'string' && frame.id ? { messageId: frame.id.slice(0, 80) } : {}),
+        });
+      }
       if (apiSpeaking) {
         if (apiError) apiErrors.push(apiError);
         for (const block of content?.content ?? []) {
@@ -2005,6 +2103,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       // carry no pending tag, so both are correctly ignored here.
       const mark = text ? operatorMark(text) : null;
       if (!mark || !unecho.delete(mark)) return;
+      unechoAt.delete(mark);
       emit({ kind: 'injected', text: stripMark(text), mark, delivered: true });
       return;
     }
@@ -2097,6 +2196,10 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         ...(terminalReason ? { terminalReason } : {}),
         ...(typeof message.queued_turn_count === 'number' && Number.isFinite(message.queued_turn_count)
           ? { queuedTurns: Math.max(0, message.queued_turn_count) } : {}),
+        ...((): { usage?: CallUsage } => {
+          const usage = usageOf(message.usage);
+          return usage ? { usage } : {};
+        })(),
       });
 
       // One result per TURN. The first belongs to the boot prompt, so the phase
@@ -2115,6 +2218,16 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       //   an EXTRA result beyond the session's own turns: it is not a new turn,
       //   so it is not a close decision at all (the counter would have
       //   decremented to zero and closed the door on an unanswered question).
+      // A completed turn with nothing queued behind it has READ every message
+      // written before it ended (#259): the CLI folded it into the turn without
+      // an echo. Left in `unecho`, that tag held stdin open until the idle
+      // closer, ten minutes later, on every wrap-up steer the console sends.
+      if (message.queued_turn_count === 0 && !terminalReason?.startsWith('aborted') && unecho.size) {
+        const before = Date.now() - FOLDED_MARK_GRACE_MS;
+        const folded = [...unecho].filter((mark) => (unechoAt.get(mark) ?? 0) <= before);
+        for (const mark of folded) { unecho.delete(mark); unechoAt.delete(mark); }
+        if (folded.length) log.info('spawn.folded-unechoed', { marks: folded, pid: child.pid });
+      }
       if (!newTurn) { armIdle(); return; }
       phaseTurnDone = true;
       const wroteUntagged = sentSinceLastResult;
@@ -2154,6 +2267,13 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   child.on('close', (code, sig) => {
     request.signal?.removeEventListener('abort', onAbort);
     stdinOpen = false;
+    // What it left behind: its group, and its orphaned test runners — unless it
+    // parked on a wait, the shape of a job it detached on purpose (#222).
+    if (child.pid) {
+      const leader = child.pid;
+      void sessionReaper.ended(leader, { spare: parkedOutcome(request.env?.PE_OUTCOME_FILE) })
+        .catch((error) => log.warn('session.reap-failed', { error: String(error) }));
+    }
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     stdoutLines.flush();
     flushPartials();
@@ -2231,6 +2351,14 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     });
   });
 });
+
+/**
+ * The ending of a session the spawn door refused before any child existed — nothing spent,
+ * nothing run, the reason as its text (one-pool phase 5: a model nothing on the account serves).
+ */
+export function refusedOutcome(reason: string, caps: SessionCaps): SpawnOutcome {
+  return fail(reason, Date.now(), [], caps);
+}
 
 function fail(reason: string, started: number, argv: string[], caps: SessionCaps): SpawnOutcome {
   return {

@@ -20,6 +20,16 @@
  * status, process and clock are on the glance; its tasks are the whole
  * record's, read when the row is opened.
  *
+ * Since one-pool phase 17 (#369) the row also carries what the run record
+ * holds about a lane's session — the account it runs on, its model and
+ * effort, what it has spent, its context against the model's window, its
+ * task progress, its worked clock against the estimate, its attempts and
+ * turns — read ONCE here from the whole record of each live run
+ * (`GET /api/run/<slug>`, `records`) and the plan detail (`details`), so the
+ * list, the inspector and the phone's records read one row. A slim lane's
+ * own live facts (its model, its session's context and unbooked dollars)
+ * stand in until the record lands; its zeroes never do.
+ *
  * Two clocks, because they answer different questions: `startedAt` is the
  * LAST thing that happened to a row (a pty's exit or last output, a foreign
  * session's last sighting) and `createdAt` is when it began — "what has gone
@@ -29,11 +39,23 @@
  */
 
 import { describeWord, type StatusView } from '@shared/status-model.js';
+import { taskSummary } from '@shared/task-model.js';
 import type { SessionVocab } from '@/ui/status';
-import type { ForeignSession, PhaseTask, TerminalSession } from '@/data/api';
+import type {
+  AccountView,
+  ForeignSession,
+  LaneLiveness,
+  PhaseRecord,
+  PhaseTask,
+  PlanDetail,
+  RunDetail,
+  RunState,
+  TerminalSession,
+} from '@/data/api';
 import { checkLabel } from '@/data/check-words';
 import { endedLabel, foreignVehicle, otherSessions, type NowLane } from '@/data/lanes';
 import { defineFilters, defineSorts, matchesWords, words } from '@/lib/list-model';
+import { accountName } from '@/shell/limits';
 import { phaseHref, runHref, sessionsHref } from '@/shell/routes';
 
 /* ------------------------------------------------------------------ *
@@ -88,6 +110,29 @@ export const KIND_LABEL: Readonly<Record<SessionGroupKind, string>> = Object.fre
   Object.fromEntries(SESSION_GROUPS.map((group) => [group.kind, group.title])),
 ) as Record<SessionGroupKind, string>;
 
+/**
+ * What a session IS, finer than its group: a lane, a shell, an agent — and
+ * the two agents the console mints for a purpose, a QA reviewer and a
+ * recovery session — or somebody else's. The row draws it as a quiet
+ * outlined word beside what it works on, never as a status (#369).
+ */
+export type SessionBadge = SessionGroupKind | 'qa' | 'recovery';
+
+/** Each badge's word and the one sentence a hover says. */
+export const SESSION_BADGES: Readonly<Record<SessionBadge, { label: string; blurb: string }>> = Object.freeze(
+  {
+    lane: { label: 'Lane', blurb: 'An autopilot lane: a phase this console is running.' },
+    shell: { label: 'Shell', blurb: 'A plain shell on this machine.' },
+    agent: { label: 'Agent', blurb: 'A Claude session this console started.' },
+    qa: { label: 'QA', blurb: 'A QA reviewer: a session checking a finished phase.' },
+    recovery: { label: 'Recovery', blurb: 'A session started to mend a stopped run or phase.' },
+    foreign: {
+      label: 'Foreign',
+      blurb: 'Someone’s own Claude, or another console’s lane, reported by the session-presence hook.',
+    },
+  },
+);
+
 /* ------------------------------------------------------------------ *
  * The row
  * ------------------------------------------------------------------ */
@@ -126,8 +171,34 @@ export interface SessionRow {
   view: StatusView;
   /** Stopped on a PERSON — a pending permission card (lanes) or the registry's waiting flag — and since when. */
   attention?: { kind: 'permission' | 'input'; since?: string };
-  /** The session's own task list, on the rows that carry one (a QA reviewer's pty). */
+  /** The session's own task list, on the rows that carry one (a lane's record, a QA reviewer's pty). */
   tasks?: readonly PhaseTask[];
+
+  /* ---- What the run record holds (#369) — absent where nothing says it ---- */
+
+  /** What it is, finer than its group — the row's kind badge. */
+  badge: SessionBadge;
+  /** The account the session runs on, named as the registry names it (its id when the registry does not know it). */
+  account?: { id: string; name: string };
+  /** What it runs on — the session's own `init` word over what it was asked for. */
+  model?: string;
+  effort?: string;
+  /** Dollars: what the record booked, plus the session in flight's unbooked spend. */
+  spendUsd?: number;
+  /** The newest context, against the window the server judged it by (null when it knew none). */
+  context?: { tokens: number; window: number | null; stage?: 'wrap-up' | 'checkpoint' };
+  /** The session's task list, counted. */
+  progress?: { done: number; total: number; active: string | null };
+  /** The phase's worked clock (attempt windows less frozen time), as its record says. */
+  workedMs?: number;
+  /** The server's own estimate of that clock, for this phase. Never computed here. */
+  estimateMs?: number;
+  attempts?: number;
+  turns?: number;
+  /** The Claude conversation the session is — a lane's, an agent pty's, a reported session's. */
+  conversation?: string;
+  /** A lane's run's own checkout, when it has one. */
+  worktree?: string;
   /**
    * The record the row was BUILT FROM — printed in the inspector's Raw tab,
    * never read: a branch on it would make it a fifth view of the same facts.
@@ -180,6 +251,12 @@ export function sessionRows(input: {
   lanes?: readonly NowLane[] | undefined;
   foreign?: readonly ForeignSession[] | undefined;
   approvals?: readonly { status: string; runId: string; phase: number | null; createdAt: string }[];
+  /** The whole record of each live run, by plan slug — what a lane's facts are read from (#369). */
+  records?: ReadonlyMap<string, RunDetail> | undefined;
+  /** The plan detail, by slug — a slim lane's phase title and estimate. */
+  details?: ReadonlyMap<string, PlanDetail> | undefined;
+  /** The registry's accounts — what names an account id. */
+  accounts?: readonly AccountView[] | undefined;
   now?: number;
 }): SessionRow[] {
   const now = input.now ?? Date.now();
@@ -192,11 +269,13 @@ export function sessionRows(input: {
     // 105, #193): which line of which pass, and it is live.
     const check = lane.check ? checkLabel(lane.check) : null;
     const started = lane.startedAt ? Date.parse(lane.startedAt) : undefined;
+    const facts = laneFacts(lane, input);
+    const title = lane.title ?? phaseTitle(input.details?.get(lane.slug), lane.phase);
     rows.push({
       key: `lane:${lane.key}`,
       kind: 'lane',
       label: `${lane.planTitle} P${lane.phase}`,
-      ...(lane.title ? { detail: lane.title } : check ? { detail: check } : {}),
+      ...(title ? { detail: title } : check ? { detail: check } : {}),
       note: lane.frozen ? 'frozen' : (check ?? (lane.status === 'running' ? null : lane.status)),
       href: runHref(lane.slug),
       lane: { slug: lane.slug, phase: lane.phase, runId: lane.runId },
@@ -204,16 +283,21 @@ export function sessionRows(input: {
       ...(started != null && Number.isFinite(started) ? { startedAt: started, createdAt: started } : {}),
       vocab: 'phase',
       view: describeWord('phase', lane.status),
-      ...(lane.tasks?.length ? { tasks: lane.tasks } : {}),
+      ...facts,
       ...(card ? { attention: { kind: 'permission' as const, since: card.createdAt } } : {}),
       record: lane,
     });
   }
 
   for (const session of input.terminals ?? []) {
+    const claude = (session.kind ?? 'shell') === 'claude';
     rows.push({
       key: `pty:${session.id}`,
-      kind: (session.kind ?? 'shell') === 'claude' ? 'agent' : 'shell',
+      kind: claude ? 'agent' : 'shell',
+      badge: !claude ? 'shell' : session.meta?.qa ? 'qa' : session.meta?.recovery ? 'recovery' : 'agent',
+      ...(session.meta?.model ? { model: session.meta.model } : {}),
+      ...(session.meta?.effort ? { effort: session.meta.effort } : {}),
+      ...(session.meta?.claudeSessionId ? { conversation: session.meta.claudeSessionId } : {}),
       label: session.label,
       detail: session.cwd,
       note: sessionStateNote(session),
@@ -226,7 +310,7 @@ export function sessionRows(input: {
       view: describeWord('terminal', terminalWord(session)),
       // A QA reviewer's list, folded by the server from its inbox — the one
       // pty whose list the console can see.
-      ...(session.tasks?.length ? { tasks: session.tasks } : {}),
+      ...(session.tasks?.length ? { tasks: session.tasks, ...progressOf(session.tasks) } : {}),
       record: session,
     });
   }
@@ -235,6 +319,10 @@ export function sessionRows(input: {
     rows.push({
       key: `foreign:${session.sessionId}`,
       kind: 'foreign',
+      badge: 'foreign',
+      conversation: session.sessionId,
+      // A count the registry could not make is not a zero (REG-9).
+      ...(session.turnsSource !== 'unknown' ? { turns: session.turns } : {}),
       label: foreignLabel(session),
       detail: session.cwd,
       // A live waiting session's own words beat the silence of a bare row; an
@@ -267,6 +355,103 @@ export function sessionRows(input: {
       (b.startedAt ?? 0) - (a.startedAt ?? 0) ||
       a.label.localeCompare(b.label),
   );
+}
+
+/** A phase's title in its plan's detail, when the detail has landed. */
+function phaseTitle(detail: PlanDetail | undefined, phase: number): string | undefined {
+  return detail?.phases?.find((view) => view.phase === phase)?.title || undefined;
+}
+
+/** A task list, counted — `taskSummary`'s figures, nothing for an empty list. */
+function progressOf(tasks: readonly PhaseTask[]): Pick<SessionRow, 'progress'> {
+  const summary = taskSummary(tasks as PhaseTask[]);
+  return summary.total
+    ? { progress: { done: summary.done, total: summary.total, active: summary.active } }
+    : {};
+}
+
+/** An account id, named the way the registry names it — its id when the registry does not know it. */
+function accountOf(id: string | undefined, accounts: readonly AccountView[] | undefined) {
+  if (!id) return {};
+  const known = accounts?.find((account) => account.id === id);
+  return { account: { id, name: known ? accountName(known) : id } };
+}
+
+/**
+ * What the run record holds about one lane's session (#369), read once.
+ *
+ * The WHOLE record answers when it is this lane's run (`run.id`): a newer run
+ * of the same plan is another run's phase 3, never this one's. A SLIM lane's
+ * own live facts stand in until it lands — its model and effort (the run's),
+ * its session's context and unbooked dollars (the slim liveness) — but never
+ * its `costUsd: 0` and `attempts: 0`, which on a slim row mean "not read".
+ */
+function laneFacts(
+  lane: NowLane,
+  input: {
+    records?: ReadonlyMap<string, RunDetail> | undefined;
+    details?: ReadonlyMap<string, PlanDetail> | undefined;
+    accounts?: readonly AccountView[] | undefined;
+  },
+): Partial<SessionRow> & Pick<SessionRow, 'badge'> {
+  const whole = input.records?.get(lane.slug);
+  const run: RunState | undefined = whole?.run && whole.run.id === lane.runId ? whole.run : undefined;
+  const record: PhaseRecord | undefined = run?.phases?.[String(lane.phase)];
+  // The detail's liveness is fresher than the record's copy; the lane's own is the slim row's.
+  const beat: LaneLiveness | undefined =
+    (run ? whole?.liveness?.find((one) => one.phase === lane.phase) : undefined) ??
+    lane.liveness ??
+    record?.liveness;
+  const read = record != null || !lane.slim;
+
+  const model = record?.actualModel ?? record?.model ?? lane.model;
+  const effort = record?.effort ?? lane.effort;
+
+  const booked = record ? (record.costUsd ?? 0) : read ? lane.costUsd : undefined;
+  const unbooked = record?.live?.spentUsd ?? beat?.spentUsd;
+  const spendUsd = booked == null && unbooked == null ? undefined : (booked ?? 0) + (unbooked ?? 0);
+
+  const tokens = record?.live?.contextTokens ?? beat?.tokens?.context;
+  const counters = record?.tokens;
+  const window =
+    beat?.tokens?.window ?? counters?.[counters.length - 1]?.window ?? record?.contextWrapup?.window ?? null;
+
+  const tasks = record?.tasks ?? lane.tasks;
+  const counted = tasks?.length ? progressOf(tasks) : {};
+  const liveTasks = record?.live?.tasks;
+  const progress =
+    liveTasks && liveTasks.total > 0
+      ? { done: liveTasks.done, total: liveTasks.total, active: counted.progress?.active ?? null }
+      : counted.progress;
+
+  const worked = (record?.live?.phaseClocks ?? record?.phaseClocks)?.workedMs ?? record?.durationMs;
+  const estimate =
+    (run ? whole?.phaseEta?.find((eta) => eta.phase === lane.phase)?.estMs : undefined) ??
+    lane.eta?.estMs ??
+    input.details?.get(lane.slug)?.eta?.perPhase?.find((eta) => eta.phase === lane.phase)?.estMs;
+
+  const attempts = record?.attempts ?? (read ? lane.attempts : undefined);
+  const turns = record?.turns ?? lane.turns;
+  const conversation = lane.child?.sessionId ?? record?.sessionId;
+
+  return {
+    badge: lane.qa ? 'qa' : 'lane',
+    ...accountOf(record?.sessionAccountId ?? run?.accountId, input.accounts),
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+    ...(spendUsd != null ? { spendUsd } : {}),
+    ...(tokens != null
+      ? { context: { tokens, window, ...(beat?.tokens?.stage ? { stage: beat.tokens.stage } : {}) } }
+      : {}),
+    ...(tasks?.length ? { tasks } : {}),
+    ...(progress ? { progress } : {}),
+    ...(worked != null ? { workedMs: worked } : {}),
+    ...(estimate != null ? { estimateMs: estimate } : {}),
+    ...(attempts != null ? { attempts } : {}),
+    ...(turns != null ? { turns } : {}),
+    ...(conversation ? { conversation } : {}),
+    ...(run?.workRoot ? { worktree: run.workRoot } : {}),
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -325,7 +510,7 @@ export const { NO_FILTERS, applyFilters, activeCount } = defineFilters<SessionRo
       // The directory is the only thing that tells eight `zsh` shells apart,
       // and an id is what a lock, a journal line or a `--resume` command hands you.
       matchesWords(
-        `${row.label} ${row.detail ?? ''} ${row.id ?? ''} ${row.sessionId ?? ''}`,
+        `${row.label} ${row.detail ?? ''} ${row.id ?? ''} ${row.sessionId ?? ''} ${row.conversation ?? ''}`,
         terms as string[],
       ),
   },
@@ -405,4 +590,32 @@ export function situationWords(rows: readonly SessionRow[]): string {
   if (!parts.length) return '';
   const last = parts.pop()!;
   return `${parts.length ? `${parts.join(', ')} and ${last}` : last}.`;
+}
+
+/** The strip's figures (#369): what is live, by kind, who waits on a person, and how many accounts the live ones spend. */
+export interface SessionSummary {
+  lanes: number;
+  shells: number;
+  agents: number;
+  foreign: number;
+  /** Sessions stopped on a person — live or not, the summons is the point. */
+  waiting: number;
+  /** Distinct accounts the LIVE sessions run on. */
+  accounts: number;
+}
+
+export function sessionSummary(rows: readonly SessionRow[]): SessionSummary {
+  const out: SessionSummary = { lanes: 0, shells: 0, agents: 0, foreign: 0, waiting: 0, accounts: 0 };
+  const accounts = new Set<string>();
+  for (const row of rows) {
+    if (row.attention) out.waiting++;
+    if (!row.live) continue;
+    if (row.kind === 'lane') out.lanes++;
+    else if (row.kind === 'shell') out.shells++;
+    else if (row.kind === 'agent') out.agents++;
+    else out.foreign++;
+    if (row.account) accounts.add(row.account.id);
+  }
+  out.accounts = accounts.size;
+  return out;
 }

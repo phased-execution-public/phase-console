@@ -62,8 +62,12 @@ function run(file, args, timeoutMs = 10_000, cwd) {
   });
 }
 
-/** GET one path on a port as JSON; `{status, body}`, or null when nothing answers. */
-function fetchJson(port, path, timeoutMs = 4000) {
+/**
+ * GET one path on a port as JSON: `{status, body}`; `{status: 0, body: null,
+ * timedOut: true}` when something accepted the connection and did not answer in
+ * time; null when nothing is listening at all.
+ */
+export function fetchJson(port, path, timeoutMs = 4000) {
   return new Promise((done) => {
     const req = httpRequest({ host: '127.0.0.1', port, path, timeout: timeoutMs }, (res) => {
       let body = '';
@@ -74,28 +78,47 @@ function fetchJson(port, path, timeoutMs = 4000) {
       });
     });
     req.on('error', () => done(null));
-    req.on('timeout', () => { req.destroy(); done(null); });
+    req.on('timeout', () => { req.destroy(); done({ status: 0, body: null, timedOut: true }); });
     req.end();
   });
 }
 
 /**
+ * How long the console's own doctor may take. Its report runs the slowest probes
+ * there are — `gh auth status` and the credential probe at 10 s each, the
+ * machine login at 20 s — so the old 4 s cut it off whenever any of them was
+ * slow, and the miss was then read as "a build from before doctor existed" and
+ * answered from disk: exit 0 over a console whose live rows were red (#279).
+ * `PHASE_CONSOLE_DOCTOR_TIMEOUT_MS` overrides it (a test, a slow machine).
+ */
+export const DOCTOR_ROUTE_TIMEOUT_MS = 30_000;
+
+/**
  * The running console's own report, or what could be learned about the
  * console instead: `{ report }` when it answered `GET /api/doctor`;
- * `{ state }` when a console answered `/api/state` but has no doctor route (a
- * build from before phase 11 — it can still be judged reachable and healthy);
- * `{}` when nothing answered at all.
+ * `{ state }` when a console answered `/api/state` but not with a report —
+ * either a build from before phase 11 (a 404: it can still be judged reachable
+ * and healthy) or a console whose doctor did not answer (`state.liveMissed`:
+ * slow, or an error — its live rows are unknown, and the report says so and
+ * fails rather than passing on disk rows, #279); `{}` when nothing answered.
  */
-async function askConsole(port) {
-  const doctor = await fetchJson(port, '/api/doctor');
+export async function askConsole(port, timeoutMs = Number(process.env.PHASE_CONSOLE_DOCTOR_TIMEOUT_MS) || DOCTOR_ROUTE_TIMEOUT_MS) {
+  const doctor = await fetchJson(port, '/api/doctor', timeoutMs);
   if (doctor?.status === 200 && Array.isArray(doctor.body?.rows)) return { report: doctor.body };
   const state = await fetchJson(port, '/api/state');
   if (state?.status === 200 && state.body && typeof state.body === 'object') {
+    const seconds = Math.round(timeoutMs / 100) / 10;
+    const missed = doctor?.status === 404 ? null
+      : doctor?.timedOut ? `did not answer GET /api/doctor within ${seconds} s`
+        : doctor ? `answered GET /api/doctor with ${doctor.status || 'nothing readable'}${doctor.status === 200 ? ' but no report' : ''}`
+          : 'dropped the GET /api/doctor connection';
     return {
       state: {
         healthy: state.body.health?.healthy !== false,
         serverStale: Boolean(state.body.serverStale),
-        version: 'a build from before doctor existed — restart it onto this checkout for the live rows',
+        ...(missed
+          ? { liveMissed: missed }
+          : { version: 'a build from before doctor existed — restart it onto this checkout for the live rows' }),
       },
       // The console's own node arguments when its state carries them (#71) —
       // this process is a person's shell, and its execArgv would answer nothing.

@@ -67,6 +67,7 @@ flat.
 Settings ▸ Automation holds the defaults these forms open with; each launch can override them for
 itself.
 
+
 ## Autonomy — keep going, or stop and ask 🟡
 
 **If something is unclear** offers two answers:

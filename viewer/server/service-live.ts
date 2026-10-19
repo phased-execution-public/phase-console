@@ -180,6 +180,7 @@ import { G5_ERRAND_HOW } from '../shared/turn-model.js';
 import { answeredByItem, grantedByItem, ruleFamilyOf, wallOfHookDenial } from './permissions/walls.ts';
 import { callMatches, callSubject } from './permissions/grants.ts';
 import { readFileSync } from 'node:fs';
+import { haltedPushWords } from './turn/compose.ts';
 
 /**
  * How long a board read that timed out stays this revision's cached answer
@@ -312,6 +313,8 @@ export abstract class ServiceLive extends ServiceBase {
       try { listener(event, data, id); } catch { /* a dead client must not stop the others */ }
     }
     this.nudgeInbox(event);
+    // A run that reads resolved has its trees swept now, not at the next boot (#333).
+    if (event === 'run:state') this.noteRunResolved((data as { state?: RunState } | null)?.state);
   }
 
   /**
@@ -365,6 +368,10 @@ export abstract class ServiceLive extends ServiceBase {
         || (event === 'run:journal' && (moved.event === 'phase.reopened' || moved.event === 'phase.verification-failed')))) {
       this.watchClock.boardMoved(moved.slug, moved.phase);
     }
+    // A declaration was just parked (`phase.waiting`): its refs get their first
+    // STORED reading on a pass fired now, not when the timer next wakes
+    // (one-pool phase 23, #337 #303).
+    if (event === 'run:journal' && moved?.event === 'phase.waiting') this.watchClock.poke();
     if (event === 'run:phase') {
       // A `require` MCP park starts its clock here — the service owns the
       // timer because only the service can restart a run the park stopped.
@@ -462,9 +469,12 @@ export abstract class ServiceLive extends ServiceBase {
     };
 
     switch (state.status) {
-      case 'halted':
-        push('halted', `${state.slug} halted`, state.halt?.reason ?? 'the run stopped and needs a person');
+      case 'halted': {
+        // The composer's words — a reached spend cap's are the card's and the bell's (one-pool phase 11).
+        const said = haltedPushWords(state.slug, state.halt);
+        push('halted', said.title, said.body);
         break;
+      }
       case 'interrupted':
         // Nothing is driving it and nothing said why — the failure mode that
         // otherwise looks exactly like a run still working.
@@ -1257,6 +1267,15 @@ export abstract class ServiceLive extends ServiceBase {
       this.forget(slug);
     }
     for (const slug of before.keys()) if (!store.get(slug)) this.forget(slug);
+    // A gate approved outside the console — `gate-approve.sh` in a terminal, an
+    // AI session's row (#371): the plan's gate-bound items are read again now,
+    // not at the next round.
+    const gated = new Set(relevant.filter((p) => /(^|[\\/])gate-status\.md$/.test(p)).map(slugOf).filter((s): s is string => Boolean(s)));
+    for (const slug of gated) {
+      void this.gateOpened(slug, null, { by: 'watch' }).catch((error: unknown) => {
+        log.warn('human-steps.clock-failed', { pass: 'gate-opened', error: (error as Error)?.message ?? String(error) });
+      });
+    }
     this.portfolioCache = null;
     this.generation++;
     void this.refreshRepoInfo();
@@ -1270,6 +1289,10 @@ export abstract class ServiceLive extends ServiceBase {
     // settled — hours, on a one-lane run.
     if (paths.some((p) => p.includes('/.locks/'))) this.scheduler.poll();
     for (const slug of slugs) this.runners.get(slug)?.noteDocsChanged();
+    // …and every OTHER live run holding a phase on a gate (one-pool phase 23,
+    // #239): a `plan <slug>:<N>` gate reads another plan's handoff, so the
+    // change that opens it is never this run's own slug.
+    for (const [slug, runner] of this.runners) if (!slugs.includes(slug)) runner.noteForeignDocs();
     // …and the convergence loop, debounced: a handoff written by hand, a lock
     // released, a plan edited — any of them may be what a stopped run waited on.
     if (this.convergeAutomatic()) for (const slug of slugs) this.converger.request(slug, 'change');
@@ -1851,6 +1874,16 @@ export abstract class ServiceLive extends ServiceBase {
     }
   }
 
+  /**
+   * A gate opened (#371): every open Your turn item bound to it settles —
+   * `ServiceRecovery.gateOpened`. `phase: null` asks of every gate-bound item
+   * of the plan (its `gate-status.md` changed outside the console). The ids
+   * settled.
+   */
+  protected async gateOpened(_slug: string, _phase: number | null, _opts: { by: string; actor?: Actor }): Promise<string[]> {
+    return [];
+  }
+
   async gateStatus(slug: string, phase: number) {
     const record = this.store?.get(slug);
     if (!record) return null;
@@ -1947,6 +1980,13 @@ export abstract class ServiceLive extends ServiceBase {
     const ok = opts.approve ? Boolean(gate?.clear) : outcome.ok;
     log.info('gate.approve', { slug, phase, approve: opts.approve, ok, by: opts.by, code: outcome.code });
     if (ok) this.invalidateAll();
+    // Every Your turn item bound to this gate settles with it (#371): its
+    // proof reads the gate's row, and the gate now reads clear.
+    if (ok && opts.approve) {
+      try { await this.gateOpened(slug, phase, { by: opts.by ?? opts.actor?.by ?? 'a person', ...(opts.actor ? { actor: opts.actor } : {}) }); } catch (error) {
+        log.warn('human-steps.clock-failed', { pass: 'gate-opened', error: (error as Error)?.message ?? String(error) });
+      }
+    }
     // A gate a person approved is Done on Your turn (turn-by-turn phase 5): a
     // gate writes no run journal line, so its settled record is kept here.
     if (ok && opts.approve && person) {

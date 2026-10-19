@@ -123,3 +123,20 @@ setup() {
   run pg dep3 --gate-status 2
   [ "$output" = "blocked: half phase(s) 11 not verified" ]
 }
+
+@test "#239: the same read clears the moment the other plan's phase verifies — no cache between two reads" {
+  # The engine half of #239: the console re-reads a held gate on its drive
+  # tick, so the engine must answer from the other plan's handoffs as they
+  # stand at THAT read — never from anything the first read left behind.
+  other_plan v7 22 1 2 3
+  dep_plan sweep "v7:22" "v7:22" "v7:22"
+  run pg sweep --gate-status 1
+  [ "$status" -eq 1 ]
+  [ "$output" = "blocked: v7 phase(s) 22 not verified" ]
+  write_handoff v7 22 p22 complete
+  run pg sweep --gate-status 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "clear (v7 phases 22 verified)" ]
+  run pg sweep --gate-status 3
+  [ "$status" -eq 0 ]
+}

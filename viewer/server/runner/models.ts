@@ -147,7 +147,8 @@ export function isModelMode(model?: string, env: ModelsEnv = MODELS_ENV_FALLBACK
  */
 export function isKnownModel(model?: string, env: ModelsEnv = MODELS_ENV_FALLBACK): boolean {
   if (!model || !model.trim()) return false;
-  return isModelMode(model, env) || modelFamily(model, env) !== null;
+  if (isModelMode(model, env) || modelFamily(model, env) !== null) return true;
+  return false;
 }
 
 /**

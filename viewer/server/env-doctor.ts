@@ -36,6 +36,16 @@ export type EnvIssue = {
 export const DELIVERY_ISSUE_ID = 'delivery-channel';
 
 /**
+ * The `push-broken` rows a failed push raises (one-pool phase 18, #280): one
+ * for a notification that reached no device, one per `service|reason`
+ * rejection streak. Each has an id so a delivered push or a device change can
+ * withdraw it (`withdrawPushHealth` in `service-base.ts`) — without one,
+ * nothing could, and the row outlived its repair until a restart.
+ */
+export const PUSH_UNDELIVERED_ISSUE_ID = 'push-undelivered';
+export const PUSH_REJECT_ISSUE_PREFIX = 'push-reject:';
+
+/**
  * The boot doctor's channel row: a console must reach a person — one subscribed
  * device, the operator's notifier, or one webhook row; with `--remote`, Tailscale
  * running and serving this port. `verdict` is the prelude's own

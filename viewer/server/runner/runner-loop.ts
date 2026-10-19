@@ -93,11 +93,11 @@ import {
 } from './scheduler.ts';
 import { claimsDisjoint, formatScope, normalizeToken, scopesIntersect } from '../../shared/scope.js';
 import { creditDrift, declaredScope } from './scope-drift.ts';
-import { closeQueueEpisode, foldRunBlocked, restartedAt, seniorityOf } from './queue-episodes.ts';
-import { standsAside } from './queue-control.ts';
+import { closeQueueEpisode, foldRunBlocked, restartedAt } from './queue-episodes.ts';
+import { boardingOrderOf } from './boarding-order.ts';
 import { withdrawnReason } from '../../shared/orchestration-model.js';
 import { resolvePhaseChoice, resolvePermissionMode } from '../../shared/run-settings.js';
-import { gitOverrideInstruction } from '../prelude.ts';
+import { gitOverrideInstruction, readPlanBranch } from '../prelude.ts';
 import {
   ISOLATED, SETTLE_UNSUPPORTED_MULTI, settleOf, WORKTREE_DEFAULTS,
   directiveIsolates, reclaimModeOf, detachedRef, type SettleStrategy,
@@ -118,12 +118,21 @@ import {
 import { reboardResumeBrief, resumePolicyInstruction, sessionLostInstruction, settleVehicle, type VettedResume } from './runner-core.ts';
 import { consoleSkillDirective } from './runner-core.ts';
 import { SCRIPTS_REF } from '../skill-copy.ts';
+import { composeLanding } from '../turn/compose.ts';
 import type { Runner } from './runner.ts';
 import { RunnerControl } from './runner-control.ts';
 import { enter, runTraceId } from '../trace.ts';
 import { INSTANCE } from '../config.ts';
 import { credentialTurnInput, mcpTurnInput } from '../turn/index.ts';
 import type { HumanStep } from '../human-steps.ts';
+
+/**
+ * The statuses in which a kept lane holds its tree (one-pool phase 21): the
+ * phase is resumable by the console itself — re-boarding, queued, or parked on
+ * a clock or a watch. A phase parked for a person, failed or settled holds
+ * nothing; its `keepsLane` is spent the next time it boards.
+ */
+const KEEPER_STATUSES: readonly PhaseStatus[] = ['pending', 'queued', 'waiting'];
 
 /** A closeout brief's turn cap, as the brief composed it. */
 const closeoutBriefTurns = (value: number): Cap => ({ value, source: 'closeout', basis: 'a closeout brief' });
@@ -379,6 +388,16 @@ export function spentBudgetPark(state: RunState, phase: number, opts: {
 
 /** `setTimeout`'s ceiling: a longer delay fires at once (Node clamps it to 1 ms). */
 const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** The note a gate's hold writes — what `rereadGates` recognises a gate hold by (a review hold writes its own). */
+export const GATE_HELD_NOTE = 'gate not clear:';
+
+/**
+ * How often a live run re-reads a gate it is holding a phase on (one-pool
+ * phase 23, #239): a minute, the watch clock's own floor — a `--gate-status`
+ * read is one engine call, and a docs change anywhere reads it at once besides.
+ */
+export const GATE_REREAD_MS = 60_000;
 
 export abstract class RunnerLoop extends RunnerControl {
   /* ---------------------------------------------------------------- *
@@ -931,15 +950,18 @@ export abstract class RunnerLoop extends RunnerControl {
       const grows = mirrorable && mounts.length
         ? mounts.some((mount) => !(state.mountedRepos ?? []).includes(mount.rel))
         : false;
-      if (capped || outOfScope || mountRefusal || !grows) {
+      if (!grows || outOfScope || mountRefusal) {
         return keep(capped ? 'cap-reached'
           : outOfScope ? 'scope-outside-root'
             : mountRefusal ? mountRefusal.refusal : undefined);
       }
       // The scope grew: fall through to the build, which adopts every mount
-      // that stands and mounts what the plan now names.
+      // that stands and mounts what the plan now names. Growing takes no new
+      // slot of the cap — it is still this run's one checkout (one-pool
+      // phase 20, #356) — so a full cap never keeps a phase out of its
+      // repository.
     }
-    if (capped) return refuse('cap-reached');
+    if (capped && !holding) return refuse('cap-reached');
     if (outOfScope) return refuse('scope-outside-root');
     if (mountRefusal) return refuse(mountRefusal.refusal, mountRefusal.detail);
     // The repositories this run's checkout will be built out of — one for a
@@ -1090,6 +1112,15 @@ export abstract class RunnerLoop extends RunnerControl {
     if (state.isolation !== ISOLATED) return true;
     if (this.lanes.size) return true;
     if (state.checkout === 'worktree' && state.workRoot && await this.runTreeStands(state)) {
+      // A mirror whose plan now names a repository it lacks GROWS here, at a
+      // boundary with no lane live (one-pool phase 20, #356). Measured: a
+      // phase added mid-drive with a third repository in its Repos cell was
+      // admitted into a mirror of the first two, its baseline red from its
+      // own `cd <repo>`, and the session could only park — this
+      // returned early on a mirror that stood, so the scope-grew build ran
+      // only when a drive started.
+      const lacking = await this.mirrorLacks(state);
+      if (lacking.length) return this.growMirror(state, lacking);
       // A boundary, no lane live: the moment a branch a release squash-merged
       // can be put on what landed without moving a tree under a session (#183).
       await this.reseatLanded(state);
@@ -1106,6 +1137,58 @@ export abstract class RunnerLoop extends RunnerControl {
       return true;
     }
     return !this.parkRefusedIsolation();
+  }
+
+  /**
+   * The repositories the plan's Repos cells now name that this run's MIRROR
+   * does not mount — the same reading the preamble's scope-grew build uses
+   * (`partitionScope`, then `resolveMounts`), so the two cannot disagree.
+   * Empty for a single-tree run, or when the scope cannot be resolved (the
+   * preamble names that refusal itself).
+   */
+  private async mirrorLacks(state: RunState): Promise<string[]> {
+    if (!state.mountedRepos?.length) return [];
+    const planScope = this.deps.planScope?.(state.slug) ?? [];
+    const split = partitionScope(state.root, planScope);
+    if (!split.inside.length) return [];
+    const resolved = await resolveMounts(
+      state.root, planScope.filter((token) => !split.outside.includes(normalizeToken(token))),
+    ).catch(() => null);
+    if (!resolved?.ok) return [];
+    return resolved.mounts.map((mount) => mount.rel).filter((rel) => !(state.mountedRepos ?? []).includes(rel));
+  }
+
+  /**
+   * Grow a standing mirror to mount what the plan now names (#356), through
+   * the one preamble that builds it — journalled `run.mirror-grown`. A mirror
+   * that could not grow never boards a phase into a tree without its
+   * repository: the run parks `isolation-refused`, naming the repositories.
+   */
+  private async growMirror(state: RunState, lacking: readonly string[]): Promise<boolean> {
+    const before = [...(state.mountedRepos ?? [])];
+    await this.ensureRunCheckout();
+    const after = state.mountedRepos ?? [];
+    const added = after.filter((rel) => !before.includes(rel));
+    const still = lacking.filter((rel) => !after.includes(rel));
+    if (state.checkout === 'worktree' && !still.length) {
+      this.record('run.mirror-grown', { dir: state.workRoot ?? null, added, mounts: [...after] });
+      this.persist();
+      return true;
+    }
+    if (state.checkout === 'refused') return !this.parkRefusedIsolation();
+    this.record('run.mirror-grow-refused', {
+      dir: state.workRoot ?? null, lacking: still, mounts: [...after],
+      ...(state.isolationRefusal ? { refusal: state.isolationRefusal } : {}),
+    });
+    this.persist();
+    this.park(
+      `${state.slug}'s plan now names ${still.map((rel) => `\`${rel}\``).join(', ')}, which this run's checkout `
+        + `does not mount, and the checkout could not grow to mount ${still.length === 1 ? 'it' : 'them'}. `
+        + 'Nothing boarded into a tree without its repository: initialise the repository in the run root '
+        + '(`git submodule update --init <path>`) and Retry, or Drop isolation to run in the shared checkout.',
+      null, 'isolation-refused',
+    );
+    return false;
   }
 
   /**
@@ -2031,6 +2114,12 @@ export abstract class RunnerLoop extends RunnerControl {
         await this.rearmLockCapParks(board);
         // …and every park's own clock is armed, whoever wrote the park (#132).
         this.armOwnParkPokes();
+        // …and a phase this live run left `gated` has its gate read again
+        // (one-pool phase 23, #239): a `gated` record is settled, so nothing
+        // else here ever asked a cross-plan `plan <slug>:<N>` gate a second
+        // time — Wave B sat 50 minutes on free lanes after the other plan's
+        // phase verified, until a person retried each phase.
+        await this.rereadGates(board);
 
         const outstanding = [...board.ready, ...board.waiting, ...board.inProgress, ...board.stuck];
         // A run asked for specific phases is finished when THOSE are settled —
@@ -2126,12 +2215,44 @@ export abstract class RunnerLoop extends RunnerControl {
         // verify green (control-tower phase 62, #68). Held, not settled: it
         // stays outstanding, and boards the tick the hold lifts.
         const held = this.verificationHeld(candidates);
-        const boardable = this.boardingOrder(candidates.filter((p) => !fenced.has(p) && !held.has(p)));
+        // …and a KEPT lane holds its tree for its phase while that phase cannot
+        // board yet (one-pool phase 21, #354 #295): a partial's uncommitted WIP,
+        // a wait on its own detached verify. A sibling in the same tree waits
+        // (`run.lane-held`); one in a worktree of its own boards.
+        const laneHeld = await this.keptLaneHolds(candidates.filter((p) => !fenced.has(p) && !held.has(p)), inFlight, held);
+        // …and a phase ahead of its OWN unmet dependency is never admitted
+        // (one-pool phase 23, #288), whatever its handoff's word: a `blocked`
+        // or `in-progress` handoff puts it in a bucket the board reads before
+        // its dependencies, and the dependency boards first. An owed
+        // re-verification is not a boarding and is never held.
+        const depHeld = new Set<number>();
+        const heldKeys = new Set<string>();
+        for (const p of candidates) {
+          const candidate = phaseRecord(state, p);
+          if (owesVerification(candidate)) continue;
+          // A PERSON's re-board is a person's word (Retry, resume-phase): it
+          // outranks the rule, as it outranks every console ordering. Only the
+          // console's own boardings are held.
+          if (candidate.boardingHint?.by === PERSON_SLOT_BY) continue;
+          const unmet = this.dependencyHeld(board, p);
+          if (!unmet) continue;
+          depHeld.add(p);
+          const key = `${p}:${unmet.join(',')}`;
+          heldKeys.add(key);
+          if (this.admissionRefused.has(key)) continue;
+          this.admissionRefused.add(key);
+          this.record('phase.dependency-held', { reason: 'dependency', unmet, board: board.states[p] ?? null }, p);
+        }
+        // A hold that lifted is forgotten, so the same unmet set held again
+        // later — a dependency re-opened — is said again.
+        for (const key of this.admissionRefused) if (!heldKeys.has(key)) this.admissionRefused.delete(key);
+        const boardable = this.boardingOrder(candidates.filter((p) => !fenced.has(p) && !held.has(p) && !laneHeld.has(p) && !depHeld.has(p)));
         // What nothing drives, named (control-tower phase 79, #114): a phase the
         // board reads in progress that no lane, queue entry, hint, park or
         // errand of this run holds. Stamped every tick, so it is never stale.
         // A lane still settling is driven (#192): its attempt has not returned.
-        this.noteUndriven(board, new Set([...boardable, ...inFlight.keys()]));
+        // A phase held on its dependency is driven by that dependency.
+        this.noteUndriven(board, new Set([...boardable, ...inFlight.keys(), ...depHeld]));
 
         // Nothing to start, but something is running: it may be about to make
         // more phases ready. Concluding "finished" here is the fastest way to
@@ -2465,15 +2586,18 @@ export abstract class RunnerLoop extends RunnerControl {
         const serialNow = new Set<number>();
         for (const phase of boardable) {
           const behind = await this.serialBehindOf(phase, ahead);
+          // A keeper this pass cannot board still holds its scope against the
+          // siblings after it (#192) — it is first in `boardingOrder`, so only
+          // they can be behind it, never a phase ahead of it. Serial behind a
+          // live lane too (one-pool phase 21): a sibling disjoint from that
+          // lane but not from the keeper's WIP must not board over it.
+          const keeps = Boolean(phaseRecord(state, phase).keepsLane);
           if (behind !== null) {
             serialNow.add(phase);
             this.markSerial(phase, behind);
+            if (keeps) ahead.push(await this.laneClaim(phase));
             continue;
           }
-          // A keeper this pass cannot board still holds its scope against the
-          // siblings after it (#192) — it is first in `boardingOrder`, so only
-          // they can be behind it, never a phase ahead of it.
-          const keeps = Boolean(phaseRecord(state, phase).keepsLane);
           if (inFlight.size >= this.maxLanes()) {
             if (keeps) ahead.push(await this.laneClaim(phase));
             continue;
@@ -2712,6 +2836,49 @@ export abstract class RunnerLoop extends RunnerControl {
     return out;
   }
 
+  /**
+   * The candidates a KEPT lane holds back (one-pool phase 21, #354 #295), each
+   * mapped to its holder: a phase of this run with `keepsLane` that is
+   * resumable (`KEEPER_STATUSES`), holds no grant, is not in flight and is not
+   * itself boardable in this pass — a keeper that boards now holds its scope
+   * through the fill pass instead. A candidate whose claim meets the holder's
+   * in the same tree (the scheduler's own test, `serialBehindOf`) waits, and
+   * is journalled `run.lane-held` once per holder, sibling and keep.
+   */
+  private async keptLaneHolds(
+    pool: readonly number[], inFlight: ReadonlyMap<number, unknown>, verificationHeld: ReadonlySet<number> = new Set(),
+  ): Promise<Map<number, number>> {
+    const out = new Map<number, number>();
+    const state = this.state!;
+    // Never a keeper held on a dependency's re-verification — the fix it waits
+    // for may share its scope, and the two would hold each other with nothing
+    // in flight — nor one an operator withdrew from the queue (its siblings
+    // board instead, control-tower phase 99).
+    const holders = Object.values(state.phases).filter((record) => record.keepsLane
+      && KEEPER_STATUSES.includes(record.status) && !inFlight.has(record.phase)
+      && !this.lanes.get(record.phase)?.grant && !pool.includes(record.phase)
+      && !verificationHeld.has(record.phase) && !record.queueControl?.withdrawn);
+    if (!holders.length) return out;
+    const claims = await Promise.all(holders.map((record) => this.laneClaim(record.phase)));
+    for (const phase of pool) {
+      const behind = await this.serialBehindOf(phase, claims);
+      if (behind === null) continue;
+      out.set(phase, behind);
+      const keep = phaseRecord(state, behind).keepsLane!;
+      const key = `${behind}:${phase}:${keep.at}`;
+      if (this.laneHeldJournalled.has(key)) continue;
+      this.laneHeldJournalled.add(key);
+      this.record('run.lane-held', {
+        holder: behind, reason: keep.reason, paths: keep.paths, since: keep.at,
+        holderStatus: phaseRecord(state, behind).status, ...(keep.watch ? { watch: keep.watch } : {}),
+      }, phase);
+    }
+    return out;
+  }
+
+  /** The kept-lane holds this loop already journalled, by `holder:phase:at`. */
+  private readonly laneHeldJournalled = new Set<string>();
+
   /** A phase just boarded this pass, as a claim the rest of the pass is serial behind. */
   private async laneClaim(phase: number): Promise<{ phase: number; scope: string[]; branch?: string; tree?: string }> {
     const claim = await this.admissionClaim(phase);
@@ -2772,6 +2939,51 @@ export abstract class RunnerLoop extends RunnerControl {
   }
 
   /**
+   * Read every gate this live run is holding a phase on again (one-pool phase
+   * 23, #239) — on the drive tick, at most once per `GATE_REREAD_MS` per phase,
+   * and at once after a docs change anywhere in the docs root
+   * (`noteForeignDocs`): the gate a `plan <slug>:<N>` check reads is ANOTHER
+   * plan's handoff, a change this run's own watcher filter never named. A gate
+   * that now reads clear puts its phase back to `pending` — the board lists it
+   * ready, and the boarding's own gate read decides it as it always does; one
+   * still closed keeps its record and its note, and nothing is journalled. A
+   * review hold is not a gate and is not re-read here.
+   */
+  private async rereadGates(board: Board): Promise<void> {
+    const state = this.state!;
+    const now = this.now().getTime();
+    const dirty = this.gatesDirty;
+    this.gatesDirty = false;
+    let anyHeld = false;
+    for (const record of Object.values(state.phases)) {
+      if (record.status !== 'gated' || !record.note?.startsWith(GATE_HELD_NOTE)) continue;
+      if (board.states[record.phase] !== 'ready' || this.lanes.has(record.phase)) continue;
+      anyHeld = true;
+      const last = this.gateReadAt.get(record.phase) ?? 0;
+      if (!dirty && now - last < GATE_REREAD_MS) continue;
+      this.gateReadAt.set(record.phase, now);
+      let gate: ReturnType<typeof readGateStatus>;
+      try {
+        gate = readGateStatus(await this.engine(['--gate-status', String(record.phase)], { PHASE_EXEC_GATES: '1' }));
+      } catch (error) {
+        log.warn('runner.gate-reread-failed', { slug: state.slug, phase: record.phase, error });
+        continue;
+      }
+      if (!gate.clear) { record.gate = gate; continue; }
+      const was = record.note;
+      record.status = 'pending';
+      record.gate = gate;
+      delete record.note;
+      this.gateReadAt.delete(record.phase);
+      this.record('phase.gate-cleared', { gate, was: was ?? null, by: dirty ? 'docs-change' : 'reread' }, record.phase);
+      this.emit('phase', { phase: record.phase, status: record.status, gate });
+    }
+    // While a gate holds a phase the loop wakes on the re-read's own clock —
+    // a lane can run for hours, and its settling is the loop's only other wake.
+    if (anyHeld) this.armLadderRecheck(now + GATE_REREAD_MS);
+  }
+
+  /**
    * The order this pass boards its candidates in — SENIORITY (control-tower
    * phase 86, #128 #132 #114), never "the board's ready phases first":
    *
@@ -2804,58 +3016,15 @@ export abstract class RunnerLoop extends RunnerControl {
   private boardingOrder(phases: number[]): number[] {
     if (phases.length < 2) return phases;
     const state = this.state!;
-    const now = this.now().toISOString();
-    const keyed = phases.map((phase, index) => {
-      const record = phaseRecord(state, phase);
-      const senior = seniorityOf(record, now);
-      const person = record.boardingHint?.by === PERSON_SLOT_BY;
-      // A phase whose committed WIP is red boards next after a person's press
-      // (control-tower phase 89, #127): every sibling on the branch builds on
-      // that red, and only its owner can take it away.
-      const wipRed = !person && Boolean(record.wipRed);
-      // An operator's word on the queue (control-tower phase 99, #135): a bump
-      // is a person's order, so it boards right after a person's re-board — the
-      // most recent bump first — and a held or deferred phase boards LAST, only
-      // to wait in the queue, so its run's lanes go to its siblings first.
-      const bump = !person ? record.queueControl?.bump : undefined;
-      const aside = standsAside(record.queueControl, Date.parse(now));
-      // A wrap-up that keeps its lane (control-tower phase 109, #192): its WIP
-      // is uncommitted in the tree its siblings would board into, so it boards
-      // next after a person's own re-board — the fill pass also holds its
-      // scope for it while its attempt settles.
-      const keeps = !person && !aside ? record.keepsLane : undefined;
-      // A pin and a kept lane (control-tower phase 100): a person's word on the
-      // plan's NEXT lane, so right after a person's own re-board.
-      const pin = !person && !aside && !keeps ? record.queueControl?.pin : undefined;
-      const kept = !person && !aside && !keeps && !pin ? record.queueControl?.reserve : undefined;
-      const promoted = !person && !aside && !keeps && !pin && !kept && !bump && !wipRed ? this.promotionOf(phase) : null;
-      const rank = aside ? 6 : person ? 0 : keeps ? 0.1 : pin ? 0.25 : kept ? 0.3 : bump ? 0.5 : wipRed ? 1 : promoted ? 1.75 : this.landingReserve.has(phase) ? 2 : owesVerification(record) ? 3 : senior ? 4 : 5;
-      const at = keeps ? Date.parse(keeps.at)
-        : pin ? Date.parse(pin.at)
-        : kept ? Date.parse(kept.at)
-          : bump && !aside ? -bump.stamp
-            : promoted ? -promoted.rank
-              : Date.parse((person ? record.boardingHint!.at : wipRed ? record.wipRed!.at : senior?.at) ?? '');
-      return {
-        phase, index, rank, clock: Number.isFinite(at) ? at : Number.POSITIVE_INFINITY,
-        why: person
-          ? { clock: 'operator', since: record.boardingHint!.at }
-          : keeps
-            ? { clock: 'lane-kept', since: keeps.at }
-          : pin
-            ? { clock: 'pin', since: pin.at }
-          : kept
-            ? { clock: 'reserved', since: kept.at }
-          : bump && !aside
-            ? { clock: 'bump', since: bump.at }
-          : wipRed
-            ? { clock: 'wip-red', since: record.wipRed!.at ?? record.wipRed!.sha }
-          : promoted
-            ? { clock: promoted.policy, since: promoted.text }
-            : senior ? { clock: senior.clock, since: senior.at } : null,
-      };
+    // The ranker is pure and shared with the queue forecast (one-pool phase 39,
+    // #380): `runner/boarding-order.ts`, its ranks in its header.
+    const ordered = boardingOrderOf(phases, {
+      slug: state.slug,
+      recordOf: (phase) => phaseRecord(state, phase),
+      now: this.now().toISOString(),
+      promotionOf: (phase) => this.promotionOf(phase),
+      landingReserve: this.landingReserve,
     });
-    const ordered = [...keyed].sort((a, b) => a.rank - b.rank || a.clock - b.clock || a.index - b.index);
     ordered.forEach((row, position) => {
       if (!row.why) return;
       const ahead = ordered.slice(position + 1).filter((other) => other.index < row.index).map((other) => other.phase);
@@ -3121,7 +3290,7 @@ export abstract class RunnerLoop extends RunnerControl {
             ? 'a gate the plan marks manual is a person\'s — never delegated to a session, whatever the gates row says'
             : null;
         record.status = 'gated';
-        record.note = `gate not clear: ${gate.kind}${gate.detail ? ` — ${gate.detail}` : ''}${why ? ` (${why})` : ''}`;
+        record.note = `${GATE_HELD_NOTE} ${gate.kind}${gate.detail ? ` — ${gate.detail}` : ''}${why ? ` (${why})` : ''}`;
         this.record('phase.gated', { gate, ...(why ? { why, decisionKey: 'gates', source: gatesPolicy.source } : {}) }, phase);
         this.emit('phase', { phase, status: record.status, gate });
         // Other ready phases may still be runnable, so this is not a halt.
@@ -5083,15 +5252,11 @@ export abstract class RunnerLoop extends RunnerControl {
       return false;
     }
 
-    const where = (proof: LandingProof): string => (proof.mount
-      ? `\`${proof.mount}\``
-      : mounts ? 'the root repository' : 'the repository');
     const trunkOf = (proof: LandingProof): string => proof.into.replace(/^origin\//, '') || 'its trunk';
-    const parts = unlanded.map((proof) => (proof.state === 'conflicted'
-      ? `${proof.branch} conflicts with ${trunkOf(proof)} in ${proof.files.join(', ')} (${where(proof)})`
-      : proof.state === 'ahead'
-        ? `${proof.branch} in ${where(proof)} holds changes ${proof.into} does not hold: ${proof.files.join(', ') || 'its own commits'}`
-        : `${proof.branch} in ${where(proof)} could not be proved against its trunk: ${proof.detail ?? 'git did not answer'}`));
+    // The words are the composer's (#377): a short title that names the act,
+    // the need that adds the branch and how many files, and the files grouped
+    // by repository for the card's folded Details — never a path list in a title.
+    const landing = composeLanding(state.slug, unlanded, { mounted: Boolean(mounts) });
     const conflicted = unlanded.filter((proof) => proof.state === 'conflicted');
     const policy = landPolicyOf(state.landing);
     const into = unlanded[0]!.into || 'its trunk';
@@ -5099,7 +5264,7 @@ export abstract class RunnerLoop extends RunnerControl {
     // The phase the errand tree is made for: the last one this run finished.
     const finalPhase = Math.max(0, ...Object.values(state.phases)
       .filter((record) => record.status === 'done').map((record) => record.phase), ...board.done);
-    const need = `${parts.join('; ')}.`;
+    const need = landing.need;
     const how = `Every phase of ${state.slug} is done, but its work is not on ${into} yet, so the run is parked, not `
       + `finished — its landing is \`${policy}\`, and nothing moves \`${names.runBranch}\` onto the trunk by itself. `
       + 'Open a merge errand tree (a checkout at the run branch that the console never prunes), merge '
@@ -5107,11 +5272,11 @@ export abstract class RunnerLoop extends RunnerControl {
       + `and land the result on ${trunkOf(unlanded[0]!)} — push it, or merge its pull request. Then Recover & continue: `
       + `the run finishes once every repository's \`${names.runBranch}\` passes the landing proof `
       + `(\`git merge-tree --write-tree ${into} <tip>\` writing \`${into}^{tree}\`).`;
-    const errand: Errand = { phase: 0, situation: 'unknown', tried: [], need, how, at };
+    const errand: Errand = { phase: 0, situation: 'unknown', tried: [], need, how, at, title: landing.title, files: landing.files };
     // The settle's own sentence leads — what the strategy did is still true
     // (a staging merge, a pull request opened) — and the landing follows it.
     const reason = `${settled ? settled.trim().replace(/[.\s]+$/, '') : `every phase of ${state.slug} is done`}, `
-      + `but its work is not on ${into}: ${need}`;
+      + `but its work is not on ${into}. ${need}`;
     state.unlanded = { at, phase: finalPhase || null, repos: unlanded };
     state.errand = errand;
     state.halt = { at, reason, kind: 'unlanded' };
@@ -5778,7 +5943,10 @@ export abstract class RunnerLoop extends RunnerControl {
    */
   private async gitStrategy(phase: number, board: Board): Promise<string> {
     const state = this.state!;
-    if (state.gitMode !== 'new-branch') return '';
+    // A run that cuts no branch says nothing — unless it was launched OVER
+    // the plan's branch (#322), when the session must hear that it works on
+    // the checkout's own branch rather than stop on the plan's.
+    if (state.gitMode !== 'new-branch') return gitOverrideInstruction(state.gitStrategyOverride?.lines, '', phase, false);
     const branch = `pe/${state.slug}`;
     const scope = await this.scopeFor(phase);
 
@@ -5829,8 +5997,10 @@ export abstract class RunnerLoop extends RunnerControl {
 
     // The plan's Branch prose, read only to warn. The default idioms —
     // "current branch", "no new branch", "default" — are not a named branch.
-    const prose = this.deps.planBranch?.(state.slug)?.trim();
-    const planNames = prose && !/current|no new branch|default/i.test(prose) ? prose : undefined;
+    // `readPlanBranch` is the start door's reader too (#235): a backticked
+    // token only, and a line naming the run branch agrees with it.
+    const reading = readPlanBranch(this.deps.planBranch?.(state.slug), branch);
+    const planNames = reading.agrees ? undefined : reading.named;
     if (planNames && !this.branchMismatchNoted) {
       this.branchMismatchNoted = true;
       this.record('run.branch-mismatch', { plan: planNames, run: branch });

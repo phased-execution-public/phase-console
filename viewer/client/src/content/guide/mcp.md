@@ -8,6 +8,21 @@ The console's job here is narrow and specific. Claude Code can already connect t
 own — what it cannot do is tell you, *before* an unattended run spends an hour, that the server the
 plan chose was never signed in.
 
+## Adding a server
+
+**From the catalog** — Settings ▸ MCP servers ▸ **Catalog**. It is a short curated list plus the
+official registry, which the console reads whole into a copy on this machine once a day and searches
+here, so a search answers at once. The first read takes about a minute; the page says so and searches
+again when it is in.
+
+**By hand** — **Add by hand** under Registered takes any server: a name, the transport, the command and
+its arguments or the address, environment, headers, one secret, and a value for every `${VAR}` the
+command writes. From a terminal, `phase-console mcp add --manual '<json>'` sends the same — a file
+holding the JSON, or `-` to read it from stdin, when it carries a secret.
+
+**A server whose command writes a `${VAR}` nothing supplies** cannot connect. Its row offers **Fill it
+in**; `phase-console mcp fill <id> NAME=<value>` does the same. The value is held like a secret.
+
 ## The three places a server gets attached
 
 **The plan.** A line in §Session budget:
@@ -83,15 +98,20 @@ sitting at zero was paid for on every turn and never used.
 
 Three kinds, and the console holds only one of them.
 
-- **OAuth** (Sentry, Linear, Notion, Figma, Vercel…) — open the server's row, choose whom to sign in
-  for — this console, or one of its profile accounts — and press **Sign in**. That runs
-  `claude mcp login <id> --no-browser` in a terminal; the token goes to the Claude CLI's own store,
-  which this console never reads or writes. A second writer is how two processes corrupt one login.
+- **OAuth** (Sentry, Linear, Notion, Figma, Vercel…) — press **Sign in** on the server's row (or open
+  the row to choose whom to sign in for — this console, or one of its profile accounts). A sheet walks
+  every step: the Claude CLI asks the server for a sign-in page; at this machine the browser opens and
+  you approve there; from elsewhere — a phone, Tailscale — open the page, approve, and paste back the
+  address the browser lands on (it may say the page cannot be reached: that is expected). The CLI gives
+  up after five minutes; the sheet counts them down, and a timeout says which step it stopped on. The
+  token goes to the Claude CLI's own store, which this console never reads or writes. A second writer
+  is how two processes corrupt one login.
 - **A token in a header** (GitHub's PAT, for instance) — the console holds this one, in your
   keychain on macOS or a 0600 file elsewhere. It never appears in the registry file, in the UI, or in
   any log.
 - **`${VAR}` references** — not a secret, the *name* of one, resolved from the console's own
-  environment when a run starts. A team can share a plan naming `postgres` without sharing a DSN.
+  environment when a run starts, or from a value **Fill it in** stored. A team can share a plan naming
+  `postgres` without sharing a DSN.
 
 A URL that carries its own credential (`?token=…`, or `user:pass@`) is refused on add, with the fix
 named: put it in a header, where it is kept.

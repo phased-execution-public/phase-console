@@ -117,11 +117,17 @@ const PENDING_HEIGHT: Readonly<Record<InsightId, string>> = {
 /** The combobox's own value for "no plan": a slug is kebab-case, so it can never be this. */
 const EVERY_PLAN = '*';
 
+
 /** An error in the words its sender gave it. */
 const said = (error: unknown): string =>
   (error instanceof Error ? error.message : String(error ?? '')) || 'the read failed and said nothing.';
 
 export default function Insights({ route }: { route: Route }) {
+  return <QuestionsPage route={route} />;
+}
+
+
+function QuestionsPage({ route }: { route: Route }) {
   const plan = route.query.plan || undefined;
   const everything = useEverything('insights');
   const statsQuery = useStats();

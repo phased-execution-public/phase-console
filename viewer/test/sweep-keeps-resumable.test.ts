@@ -201,3 +201,54 @@ test('WS-4 — a plan whose every cell is outside the root still refuses the run
   assert.equal(state.isolationRefusal, 'scope-outside-root');
   assert.equal(h.requests[0]!.cwd, root);
 });
+
+/* ------------------------------------------------------------------ WS-5 */
+
+test('WS-5 (one-pool phase 20, #333) — a run swept when it RESOLVES, not at the next boot; a resumable one keeps its mirror', async () => {
+  // Measured: six runs read resolved ("a closed plan's run is not driven
+  // again") for days while their mirrors stayed registered and pinned their
+  // `pe/*` branches — the sweep ran only at boot and at a drive's start.
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { Service } = await import('../server/service.ts');
+  const { newRun, saveRun, runDir: runDirOf } = await import('../server/runner/state.ts');
+  const { worktreeHome } = await import('../server/runner/worktree.ts');
+  const { root } = superRoot();
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), [
+    '---', 'status: active', '---', '# demo', '', '## Phase graph', '',
+    '| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |',
+    '|------:|-------|-----------|--------------------|-------|---------------|',
+    '| 1 | one | — | — | web | it works |', '', '## Phases', '', '### Phase 1 — one', '- **Size:** S', '',
+  ].join('\n'));
+  const res = await resolveMounts(root, ['web']);
+  const mounts = (res as { mounts: { rel: string; source: string }[] }).mounts;
+  const home = worktreeHome({ mode: 'project', root, slug: 'demo', stateDir: runDirOf(root, 'demo') });
+  const mirrorOf = async (status: string): Promise<{ id: string; integration: string }> => {
+    const state = newRun({ slug: 'demo', root });
+    Object.assign(state, { status, stoppedBy: 'system', halt: { at: new Date().toISOString(), reason: 'stopped', kind: 'nothing-ready' } });
+    saveRun(state);
+    const names = laneNames({ home, runId: state.id, slug: 'demo', phase: 0 });
+    assert.equal((await ensureMirror({ names, runId: state.id, slug: 'demo', mounts })).ok, true);
+    return { id: state.id, integration: names.integration };
+  };
+  const closed = await mirrorOf('halted');
+  const svc = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: true, allowRun: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  (svc as never as { push: { announce: unknown } }).push.announce = () => {};
+  try {
+    assert.equal(svc.open(root).ok, true);
+    const sweeps = (svc as never as { resolvedSweeps: Map<string, Promise<void>> }).resolvedSweeps;
+    await svc.resolveRun('demo', closed.id, { by: 'ana', actor: { by: 'ana', via: 'api', origin: 'local', remoteUser: null } });
+    assert.ok(sweeps.get('demo'), 'the resolution asked for its plan\'s sweep at once');
+    await sweeps.get('demo');
+    assert.equal(existsSync(closed.integration), false, 'the resolved run\'s clean mirror is gone without a restart');
+    // Asked once per run, and never for a run something will drive again (#94).
+    const note = (state: unknown) => (svc as never as { noteRunResolved: (s: unknown) => unknown }).noteRunResolved(state);
+    assert.equal(note({ id: closed.id, slug: 'demo', status: 'halted', resolved: { at: 'x' } }), null, 'swept once');
+    assert.equal(note({ id: 'r-paused', slug: 'demo', status: 'paused', resolved: null }), null, 'not resolved, nothing to sweep');
+    assert.equal(note({ id: 'r-waiting', slug: 'demo', status: 'waiting', resolved: null }), null);
+  } finally {
+    await svc.close();
+  }
+});

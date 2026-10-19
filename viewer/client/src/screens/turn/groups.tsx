@@ -7,9 +7,9 @@
  * Grouped by plan (`?group=plan`), the open items stand under one heading per
  * plan instead, and *Done* and the handled log follow as they are.
  *
- * An empty section stays as one line saying so: the order is the thing a
- * glance learns, and a section that vanished when empty would move every one
- * below it. *Done* and the handled log are folded with their counts, because
+ * Every empty group folds into ONE line after the rest ("Nothing to approve,
+ * to do now or to decide.", one-pool phase 14, #377): three empty headings
+ * were three sentences about nothing. *Done* and the handled log are folded with their counts, because
  * what is over is the record, not the work; Everything unfolds them and opens
  * every folded card. An item held on the page after a press (#270) is drawn
  * where it stood, saying what was pressed.
@@ -38,8 +38,8 @@ export interface TurnSectionsProps {
   settling: readonly Settling[];
   /** The section `#/turn/<id>` names an item in — its fold opens. */
   focusedSection: SectionId | null;
-  /** View ▸ Compact: every open card folded to its head. */
-  compact?: boolean;
+  /** The one line every empty group folds into (one-pool phase 14, #377). */
+  emptyLine?: string | null;
   /** A section's one control — *Do now*'s *Grant every low-risk ask*. */
   asideOf?: (section: TurnSection) => ReactNode;
   /** The item, drawn by the page: the card with its parts, its moves and its inspect. */
@@ -90,7 +90,7 @@ export function TurnSections({
   handledSince,
   settling,
   focusedSection,
-  compact = false,
+  emptyLine = null,
   asideOf,
   renderItem,
 }: TurnSectionsProps) {
@@ -109,7 +109,9 @@ export function TurnSections({
 
   const heldIn = (id: TurnSection['id']) =>
     settling.filter((one) =>
-      id.startsWith('plan:') ? `plan:${one.item.slug ?? ''}` === id : one.item.group === id,
+      id.startsWith('plan:')
+        ? `plan:${one.item.slug ?? ''}` === id
+        : !id.includes(':') && one.item.group === id,
     );
 
   return (
@@ -175,7 +177,7 @@ export function TurnSections({
               <Items>
                 {section.items.map((item) => (
                   <li key={item.item} className="min-w-0">
-                    {renderItem(item, !everything && (compact || section.id === 'upcoming'))}
+                    {renderItem(item, !everything && section.id === 'upcoming')}
                   </li>
                 ))}
                 {held.map((one) => (
@@ -192,6 +194,11 @@ export function TurnSections({
           </SectionBlock>
         );
       })}
+      {emptyLine && (
+        <p className="py-5 text-body text-ink-muted" data-testid="turn-empty-groups">
+          {emptyLine}
+        </p>
+      )}
     </div>
   );
 }

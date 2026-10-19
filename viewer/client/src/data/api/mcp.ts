@@ -4,7 +4,11 @@
  */
 
 import { request, post, q } from '../http';
-import { type MCP_STATUSES, type MCP_TRANSPORTS } from '../../../../shared/ops-vocab.js';
+import {
+  type MCP_LOGIN_STEPS,
+  type MCP_STATUSES,
+  type MCP_TRANSPORTS,
+} from '../../../../shared/ops-vocab.js';
 
 /* ---------------- MCP servers ---------------- */
 
@@ -62,7 +66,7 @@ export interface McpCatalogEntry {
   command?: string;
   args?: string[];
   auth: 'none' | 'oauth' | 'header' | 'env';
-  secretRefs?: { kind: 'header' | 'env'; name: string; template?: string }[];
+  secretRefs?: { kind: 'header' | 'env' | 'var'; name: string; template?: string }[];
   authNote?: string;
   category: string;
   registryName?: string;
@@ -70,10 +74,48 @@ export interface McpCatalogEntry {
   homepage?: string;
 }
 
+/** Where the cached copy of the official registry stands (#363). */
+export interface McpRegistryState {
+  /** `refreshing` — no copy yet, the first read runs; `stale` — searched as it is, read again behind. */
+  state: 'fresh' | 'stale' | 'refreshing' | 'unavailable';
+  fetchedAt?: string;
+  count: number;
+  error?: string;
+}
+
 export interface McpCatalogResult {
   entries: McpCatalogEntry[];
-  /** Set when the official registry could not be reached — curated only. */
+  /** The registry copy this answer searched. */
+  registry?: McpRegistryState;
+  /** Set when there is no registry copy to search — curated only. */
   registryError?: string;
+}
+
+/** A guided sign-in's step (`MCP_LOGIN_STEPS`). */
+export type McpLoginStep = (typeof MCP_LOGIN_STEPS)[number];
+
+/** One guided sign-in, as `GET /api/mcp/:id/login` answers it (#372). */
+export interface McpLoginFlow {
+  server: string;
+  mode: 'embedded' | 'external' | 'command';
+  /** The person is not at the machine: the flow takes the browser's address pasted back. */
+  remote: boolean;
+  step: McpLoginStep;
+  startedAt: string;
+  /** When the CLI gives up — five minutes after the start. */
+  deadline: string;
+  /** The sign-in page, once the CLI printed it. */
+  authUrl?: string;
+  sessionId?: string;
+  command: string;
+  commands?: string[];
+  configDir?: string;
+  accountLabel?: string;
+  /** Why it failed or timed out, naming the step. */
+  detail?: string;
+  exitCode?: number;
+  pastedAt?: string;
+  endedAt?: string;
 }
 
 /** The multi-modal outcome of starting `claude mcp login` — as accounts do it. */
@@ -96,6 +138,8 @@ export interface McpLoginStart {
    * fail, which is the whole complaint issue #8 opened with.
    */
   commands?: string[];
+  /** The guided flow the sheet walks (#372). */
+  flow?: McpLoginFlow;
 }
 
 /** The MCP fetchers — merged into `api` by `./index`. */
@@ -119,6 +163,8 @@ export const mcpApi = {
       label?: string;
       secretRef?: { kind: string; name: string };
       secret?: string;
+      /** A value for each `${VAR}` the registration writes and nothing supplies (#363). */
+      vars?: Record<string, string>;
     },
   ) =>
     request<{ server: McpServerView }>(`/api/mcp/${q(id)}`, {
@@ -127,12 +173,18 @@ export const mcpApi = {
       body: JSON.stringify(body),
     }),
   /**
-   * Starts `claude mcp login <id> --no-browser` where a person can answer it.
+   * Starts `claude mcp login <id>` where a person can answer it — with
+   * `--no-browser` only when the person is not at the machine (#372).
    * `accountId` names a PROFILE account: the token lands in its config dir, so
    * the runs that spend it see the server signed in; absent, this console's own.
    */
   mcpLogin: (id: string, options: { accountId?: string } = {}) =>
     post<McpLoginStart>(`/api/mcp/${q(id)}/login`, options.accountId ? { accountId: options.accountId } : {}),
+  /** The guided sign-in as it stands — its step, the sign-in page, the deadline, the ending. */
+  mcpLoginFlow: (id: string) => request<{ flow: McpLoginFlow }>(`/api/mcp/${q(id)}/login`),
+  /** The paste-back: the address the browser landed on, handed to the CLI waiting for it. */
+  mcpLoginPaste: (id: string, url: string) =>
+    post<{ flow: McpLoginFlow }>(`/api/mcp/${q(id)}/login/paste`, { url }),
   /** Re-probe every enabled server. Not behind the flag — checking changes nothing. */
   mcpRefresh: () => post<{ servers: McpServerView[] }>('/api/mcp/refresh', {}),
   /** "I have seen that its tools changed." Clears the rug-pull flag. */

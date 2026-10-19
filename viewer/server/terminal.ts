@@ -894,6 +894,25 @@ export class Terminals {
     return { ok: true };
   }
 
+  /**
+   * Type into a live session, as a person at its terminal would — the guided
+   * MCP sign-in's paste-back (one-pool phase 19, #372), whose sheet takes the
+   * address the browser landed on and hands it to the CLI waiting for it.
+   * False for an unknown or ended session. What is typed is never logged.
+   */
+  input(id: string, data: string): boolean {
+    const session = this.sessions.get(id);
+    if (!session || session.exited) return false;
+    try { session.pty.write(data); } catch { return false; }
+    return true;
+  }
+
+  /** Whether a session still runs — false for an unknown or ended one. */
+  isLive(id: string): boolean {
+    const session = this.sessions.get(id);
+    return Boolean(session && !session.exited);
+  }
+
   /* ---------------- per-session controls ---------------- */
 
   private signal(session: Session, signal: NodeJS.Signals): void {

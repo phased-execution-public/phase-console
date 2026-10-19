@@ -1,4 +1,5 @@
-// The machine's load, held still for the e2e fixture's console.
+// The machine's load, held still for the e2e fixture's console — its load
+// average and its CPU-busy reading both.
 //
 // The console draws one thing from `os.loadavg()`: the phase report's "Slow
 // because: machine load … is above the guard", a line in the Now card of a live
@@ -18,5 +19,11 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 
 const os = createRequire(import.meta.url)('node:os');
 os.loadavg = () => [1, 1, 1];
+// …and the CPU-busy reading the guard gates on since one-pool phase 26 (#243):
+// the real cores, every one of them idle for as long as the clock has run, so
+// a delta between two samples reads 0 % busy whatever the machine is doing.
+const realCpus = os.cpus.bind(os);
+os.cpus = () =>
+  realCpus().map((cpu) => ({ ...cpu, times: { user: 0, nice: 0, sys: 0, irq: 0, idle: Date.now() } }));
 // `import { loadavg } from 'node:os'` is a live binding: this re-points it.
 syncBuiltinESMExports();

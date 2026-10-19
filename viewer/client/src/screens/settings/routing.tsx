@@ -29,6 +29,7 @@ import type { NotificationCategory, PushDevice, WebhookRow } from '@/data/api';
 import { useWebhooks } from '@/data/webhooks';
 import { plural } from '@/lib/format';
 import { currentEndpoint } from '@/lib/push';
+import { endpointTag, matchThisDevice } from '@/lib/push-match';
 import { Banner, Skeleton } from '@/ui';
 import { Checkbox } from '@/ui/checkbox';
 import { Origin, SettingsGroup, useSetting } from './setting';
@@ -41,19 +42,28 @@ import { Origin, SettingsGroup, useSetting } from './setting';
  */
 const LOAD_BEARING: ReadonlySet<string> = new Set(['approval', 'session-ask', 'needs-you', 'halted']);
 
-/** Which subscribed device is this browser: the endpoint is the only thing that says so, and the server never returns it. */
+/**
+ * Which subscribed device is this browser: the endpoint is the only thing that
+ * says so, and the server never returns it — only its tag, the sha256 prefix
+ * this page computes from its own endpoint (#325).
+ */
 export function useThisDevice(devices: readonly PushDevice[] | undefined): PushDevice | null {
-  const [endpoint, setEndpoint] = useState<string | null>(null);
+  const [mine, setMine] = useState<{ endpoint: string | null; tag: string | null }>({
+    endpoint: null,
+    tag: null,
+  });
   useEffect(() => {
     let live = true;
-    void currentEndpoint().then((found) => {
-      if (live) setEndpoint(found);
+    void currentEndpoint().then(async (endpoint) => {
+      const tag = endpoint ? await endpointTag(endpoint) : null;
+      if (live) setMine({ endpoint, tag });
     });
     return () => {
       live = false;
     };
   }, [devices]);
-  return devices?.find((device) => device.service && endpoint?.startsWith(device.service)) ?? null;
+  // By the endpoint's tag, never the push service's origin alone (#325).
+  return matchThisDevice(devices, mine.endpoint, mine.tag);
 }
 
 /**

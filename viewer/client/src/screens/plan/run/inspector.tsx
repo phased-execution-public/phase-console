@@ -712,7 +712,10 @@ function isolation(run: RunState, state?: ConsoleState): KeyValueItem[] {
                   on <Mono value={left.branch} />
                 </>
               ) : null}
-              , phase {left.phase}, {when(left.at)}
+              {left.maker === 'unknown'
+                ? `, appeared while phase ${left.phase} ran (maker unknown)`
+                : `, phase ${left.phase}`}
+              , {when(left.at)}
             </>
           ))}
         />

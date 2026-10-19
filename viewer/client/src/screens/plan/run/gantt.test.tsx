@@ -40,6 +40,7 @@ import { applyEffect } from '@/data/live';
 import { useRun } from '@/data/runs';
 import { expectNoAxeViolations } from '@/test/axe';
 import { AXIS } from '@/ui/figures/swimlane';
+import { zoomParamOf, zoomWindowOf } from '@/ui/figures/zoom-controls';
 import { BAR_STYLE, RunGantt, laneLabel, liveNowMs } from './gantt';
 
 const MIN = 60_000;
@@ -280,6 +281,29 @@ describe('G-4 what the chart would otherwise claim silently', () => {
  * moves with no new projection asked for. And the cost of each attempt rides
  * the same axis on a dollar scale of its own.
  */
+describe('G-4b marks that share a spot (#375)', () => {
+  it('draws four notes pinned at one instant as one counted ✎, never four glyphs on one spot', () => {
+    const at = 20 * MIN;
+    render(
+      <RunGantt
+        timeline={timeline({
+          marks: [1, 2, 3, 4].map((n) => ({
+            kind: 'note' as const,
+            atMs: at,
+            phase: 1,
+            label: `pinned ${n}`,
+          })),
+        })}
+      />,
+    );
+    const svg = screen.getByTestId('run-gantt').querySelector('svg')!;
+    const notes = [...svg.querySelectorAll('text:not([data-tick])')];
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.firstChild?.textContent).toBe('✎×4');
+    expect(notes[0]!.querySelector('title')?.textContent?.split('\n')).toHaveLength(4);
+  });
+});
+
 describe('G-5 a live axis', () => {
   const T0 = '2026-09-23T10:00:00.000Z';
   const live = (over: Partial<RunTimeline> = {}) =>
@@ -441,5 +465,56 @@ describe('G-6 its numbers, and an empty axis', () => {
       />,
     );
     await expectNoAxeViolations(container);
+  });
+});
+
+describe('G-7 the zoom, said on the figure (#376)', () => {
+  const HOUR = 60 * MIN;
+  const long = () =>
+    timeline({
+      spanMs: 30 * HOUR,
+      endedAt: '2026-08-25T16:00:00.000Z',
+      horizonAt: '2026-08-25T16:00:00.000Z',
+      lanes: [
+        lane({
+          phase: 1,
+          bars: [{ kind: 'working', startMs: 0, endMs: 30 * HOUR, attempt: 1, open: false }],
+        }),
+      ],
+    });
+
+  it('reads `?zoom=` as a quick range or a window, and refuses a word it does not know', () => {
+    expect(zoomWindowOf('1h', 30 * HOUR)).toEqual([29 * HOUR, 30 * HOUR]);
+    expect(zoomWindowOf('24h', 3 * HOUR)).toBeNull();
+    expect(zoomWindowOf('600~1800', 30 * HOUR)).toEqual([600_000, 1_800_000]);
+    expect(zoomWindowOf('all', 30 * HOUR)).toBeNull();
+    expect(zoomWindowOf('soon', 30 * HOUR)).toBeNull();
+    expect(zoomParamOf([600_000, 1_800_000], 30 * HOUR)).toBe('600~1800');
+    expect(zoomParamOf([0, 30 * HOUR], 30 * HOUR)).toBeNull();
+  });
+
+  it('draws − / + and the quick ranges, and a press writes the address', () => {
+    const asked: (string | null)[] = [];
+    render(<RunGantt timeline={long()} onZoom={(zoom) => asked.push(zoom)} />);
+    const controls = screen.getByTestId('zoom-controls');
+    expect(within(controls).getByRole('button', { name: 'Zoom in' })).toBeEnabled();
+    expect(within(controls).getByRole('button', { name: 'Zoom out' })).toBeDisabled();
+    expect(within(controls).getByText(/wheel zooms too/)).toBeInTheDocument();
+    fireEvent.click(within(controls).getByRole('button', { name: 'Last hour' }));
+    expect(asked).toEqual(['1h']);
+    expect(screen.getByRole('button', { name: /Reset zoom \(×30\.0\)/ })).toBeInTheDocument();
+    fireEvent.click(within(controls).getByRole('button', { name: 'Zoom in' }));
+    expect(asked.at(-1)).toMatch(/^\d+~\d+$/);
+    fireEvent.click(screen.getByRole('button', { name: /Reset zoom/ }));
+    expect(asked.at(-1)).toBeNull();
+  });
+
+  it('opens on the window the address names, and a reload keeps it', () => {
+    render(<RunGantt timeline={long()} zoom="6h" />);
+    expect(screen.getByRole('button', { name: /Reset zoom \(×5\.0\)/ })).toBeInTheDocument();
+    expect(within(screen.getByTestId('zoom-controls')).getByRole('button', { name: '6 h' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
   });
 });

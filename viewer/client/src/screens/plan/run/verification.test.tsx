@@ -24,10 +24,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { request } = vi.hoisted(() => ({ request: vi.fn() }));
+const { request, posted } = vi.hoisted(() => ({ request: vi.fn(), posted: vi.fn() }));
 vi.mock('@/data/http', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/data/http')>()),
   request: (path: string) => request(path),
+  post: (path: string, body?: unknown) => posted(path, body),
 }));
 
 import type { RunState } from '@/data/api';
@@ -226,7 +227,12 @@ describe('the Verification fold', () => {
     const [cut] = within(within(phaseOf(4)).getByTestId('verification-verdicts')).getAllByTestId(
       'verification-run',
     );
-    expect(cut!.getAttribute('data-word')).toBe('skipped');
+    // Its own word, Timed out — never Skipped, which is a line this machine could not run (#331).
+    expect(cut!.getAttribute('data-word')).toBe('timed-out');
+    const mark = cut!.querySelector<HTMLElement>('[data-vocab="verification-line"]')!;
+    expect(mark.dataset.status).toBe('timed-out');
+    expect(mark.dataset.paint).not.toBe('failed');
+    expect(mark.textContent).toContain('Timed out');
     expect(cut!.textContent).toContain('cut at its limit after 30m');
     expect(cut!.textContent).not.toContain('exit 124');
   });
@@ -287,6 +293,49 @@ describe('the Verification fold', () => {
     expect(await screen.findByTestId('verification-empty')).toHaveTextContent(
       'Nothing is on file yet: no session recorded a proof and the console verified nothing.',
     );
+  });
+
+  it("a red the phase still owes can be waived, with a reason, through the run's waiver route (#267)", async () => {
+    posted.mockReset().mockResolvedValue({ waiver: {}, run: RUN });
+    mount();
+    await screen.findAllByTestId('verification-phase');
+    const owed = within(phaseOf(2)).getByTestId('verification-owed');
+    fireEvent.click(within(owed).getByTestId('verification-waive'));
+    const confirm = within(owed).getByTestId('verification-waive-confirm');
+    expect(confirm).toBeDisabled();
+    fireEvent.change(within(owed).getByTestId('verification-waive-reason'), {
+      target: { value: 'another plan opened the window' },
+    });
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(posted).toHaveBeenCalledWith('/api/run/demo/verify-waive', {
+        phase: 2,
+        line: 'npm run lint',
+        reason: 'another plan opened the window',
+        expectRunId: RUN.id,
+      }),
+    );
+  });
+
+  it('a waived line is listed with who waived it and why, and is owed no more', async () => {
+    mount({
+      ...RUN,
+      verifyWaivers: [
+        {
+          phase: 2,
+          fp: 'f'.repeat(64),
+          text: 'npm run lint',
+          reason: 'not ours',
+          by: 'owner@desk',
+          at: ago(5),
+        },
+      ],
+    } as RunState);
+    await screen.findAllByTestId('verification-phase');
+    const waiver = within(phaseOf(2)).getByTestId('verification-waiver');
+    expect(waiver.textContent).toContain('npm run lint');
+    expect(waiver.textContent).toContain('owner@desk: not ours');
+    expect(owedIn(2)).toHaveLength(0);
   });
 
   it('a ledger that cannot be read says why, and the proofs still draw', async () => {

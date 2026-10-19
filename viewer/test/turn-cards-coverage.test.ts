@@ -14,6 +14,9 @@
  *          every route, in both editions
  *   TCC-3  the negative: a machine word planted in one step's lines, or a card
  *          stripped of its check, fails the walk and names the item
+ *   TCC-4  #377 — every title is at most 80 characters, starts upper-case
+ *          (unless it leads with a name: a branch, a path, a slug),
+ *          holds no path list and no errand ref (the ref is `errandRef`, a chip)
  */
 import './state-sandbox.ts';
 
@@ -37,6 +40,12 @@ type Edition = (typeof EDITIONS)[number];
 
 /** A watch ref echoed instead of said — the scheme a person must never read. */
 const REF_ECHO = /\b(?:gh|cmd|date|verify|lock|unit|credential):\S/;
+/** Two or more `/`-separated paths in a row — a list a title never carries (#377). */
+const PATH_LIST = /(?:[\w.@~-]+\/)+[\w.@~-]+\s*,\s*(?:[\w.@~-]+\/)*[\w.@~-]+/;
+/** A first word that is a name — a branch, a path, a slug with digits, a command in backticks. */
+const NAME_LEAD = /^[^\s]*[/._@:\d`]/;
+/** A plan's errands-table ref left in a title — "(E-4)" — which is a chip, never words (#377). */
+const ERRAND_REF_IN_TITLE = /\(E-\d+\b[^)]*\)/;
 /** The person's statuses a card says once the act is no longer theirs. */
 const SETTLED_WORDS = new Set(['passed', 'not-doing', 'closed']);
 
@@ -134,6 +143,16 @@ function inboxFacts(steps: readonly Record<string, unknown>[]): Record<string, u
         errand: {
           phase: 0, situation: 'resource-wall:auth', tried: [], at: AT, need: 'A person\'s choice of login.',
           how: 'Choose which login goes on.', identity: { was: 'a@example.com', now: 'b@example.com' },
+        },
+      },
+      // A landing errand (#377): its title the composer's, its files for Details.
+      {
+        id: 'r4', slug: 'landing', status: 'parked', updatedAt: AT, halt: { at: AT, reason: 'unlanded', kind: 'unlanded' }, unlanded: { phase: 2 },
+        errand: {
+          phase: 0, situation: 'unknown', tried: [], at: AT, how: 'Merge the trunk into a merge errand tree and land it.',
+          need: 'Land landing on main: 2 repositories differ from origin/main. The run branch pe/landing differs in 2 files in aws · 1 in web.',
+          title: 'Land landing on main: 2 repositories differ from origin/main',
+          files: [{ repo: 'aws', paths: ['contracts/api/a.ts', 'contracts/api/b.ts'] }, { repo: 'web', paths: ['src/app.tsx'] }],
         },
       },
       {
@@ -253,6 +272,14 @@ function cardMisses(item: Card, edition: Edition): string[] {
   if (edition === 'free' && item.route === 'supervisor') misses.push(`${id}: the free edition says the supervisor`);
   if (!item.checkedBy || !(Object.values(CHECKED_BY_LABEL) as string[]).includes(item.checkedBy)) misses.push(`${id}: no Checked by (${item.checkedBy})`);
   if (!item.title?.trim()) misses.push(`${id}: no title`);
+  // The title rule (#377): short, sentence case, no path list, no errand ref.
+  else {
+    if (item.title.length > 80) misses.push(`${id}: a title of ${item.title.length} characters ("${item.title}")`);
+    // Sentence case raises a word, never a name: "pe/alpha × pe/beta …" leads as written.
+    if (/^\p{Ll}/u.test(item.title) && !NAME_LEAD.test(item.title)) misses.push(`${id}: a title that starts in lower case ("${item.title}")`);
+    if (PATH_LIST.test(item.title)) misses.push(`${id}: a path list in the title ("${item.title}")`);
+    if (ERRAND_REF_IN_TITLE.test(item.title)) misses.push(`${id}: an errand ref in the title ("${item.title}")`);
+  }
   if (!/\S.*\.$/.test(item.check ?? '')) misses.push(`${id}: the check is not a sentence ("${item.check ?? ''}")`);
   if (item.group !== 'done') {
     const options = item.options?.length ?? item.step?.options?.length ?? 0;
@@ -282,6 +309,32 @@ test('TCC-1: every source × kind × state × edition yields a complete card, an
       assert.ok((READINESS as readonly string[]).includes(row.turn.readiness as string), `${row.id}: the row carries the card's readiness`);
     }
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * TCC-4 — the title rule (#377)
+ * ------------------------------------------------------------------ */
+
+test('TCC-4: every title is short and sentence case, with no path list and no errand ref — the ref a chip, the files Details', () => {
+  for (const edition of EDITIONS) {
+    const { inbox, items } = walk(edition);
+    // The walk's plan items carry "(E-n)" in their raw titles: each is a chip now.
+    const plan = items.filter((item) => item.record === 'ledger' && item.source === 'plan');
+    assert.ok(plan.length && plan.every((item) => /^E-\d+$/.test(item.errandRef ?? '')), `${edition}: every plan item carries its ref as a chip`);
+    for (const row of inbox.items) {
+      if (!row.turn) continue;
+      assert.ok(row.title.length <= 80 && !PATH_LIST.test(row.title) && !ERRAND_REF_IN_TITLE.test(row.title), `${row.id}: "${row.title}"`);
+    }
+    const landing = items.find((item) => item.slug === 'landing');
+    assert.equal(landing?.title, 'Land landing on main: 2 repositories differ from origin/main');
+    assert.deepEqual(landing?.files?.map((group) => [group.repo, group.paths.length]), [['aws', 2], ['web', 1]]);
+  }
+  const { items } = walk('free');
+  const whole = items.find((item) => item.group === 'now' && item.record === 'ledger' && item.steps.length > 0 && !item.options?.length && !item.approval)!;
+  assert.match(cardMisses({ ...whole, title: 'x'.repeat(81) }, 'free').join('\n'), /a title of 81 characters/);
+  assert.match(cardMisses({ ...whole, title: 'sign the gh CLI in' }, 'free').join('\n'), /starts in lower case/);
+  assert.match(cardMisses({ ...whole, title: 'Land it: contracts/a.ts, docs/b.md' }, 'free').join('\n'), /path list/);
+  assert.match(cardMisses({ ...whole, title: 'Rotate the key (E-4)' }, 'free').join('\n'), /errand ref/);
 });
 
 /* ------------------------------------------------------------------ *

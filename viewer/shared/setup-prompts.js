@@ -49,7 +49,7 @@ export const INSTALL_PROMPT = `Install the phased-execution skill for me, and as
                       for hours — the widest of the eight, say so plainly
      --allow-terminal a real shell in the browser, running as me
      --allow-agent    interactive claude sessions and the New-plan wizard
-     --allow-accounts register Claude accounts and switch between them mid-run
+     --allow-accounts register Claude accounts and pick one per run (a switch is --allow-run's)
      --allow-mcp      register MCP servers and attach them to plans and phases
      --allow-webhooks POST every announcement to a Slack/Discord/Telegram URL
      --allow-publish  push a finished phase's pe/* branch, never a trunk or forced

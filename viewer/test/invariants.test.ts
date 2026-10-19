@@ -194,6 +194,10 @@ test('clause 1: only pid.ts shells `ps`', () => {
 const KILL_ALLOWED: Record<string, string> = {
   'api/routes.ts':
     'service.terminals.kill(id) — the Terminals class\'s own method, closing a pty SESSION',
+  'service.ts':
+    'this.terminals.kill(previous.sessionId) — the Terminals class\'s own method, closing the pty of an '
+    + 'MCP sign-in still running for the same server when a person presses Try again (startMcpLogin, '
+    + 'one-pool phase 19), so two terminals never wait on one sign-in; Terminals.kill wakes a frozen pty first',
   'mcp/health.ts':
     'the one-turn `claude -p` MCP probe, ended when it answers or times out. Since zero-touch-console '
     + 'phase 7 the ending is signals.ts\'s killLadder() with the interrupt rung off — SIGCONT, SIGTERM '
@@ -687,7 +691,7 @@ const RESUME_ID_READERS: Record<string, { count: number; why: string }> = {
   },
   'runner/runner-control.ts': {
     count: 2,
-    why: 'resumeWithInstruction hands it to resumableSession before the spawn; boardAtBoundary names the session on '
+    why: 'resumeWithInstruction hands it to resumableSession before the spawn; and boardAtBoundary names the session on '
       + 'a person-slot hint, which boards through composeBrief\'s gate like the ladder\'s (control-tower phase 98)',
   },
   'runner/runner-loop.ts': {

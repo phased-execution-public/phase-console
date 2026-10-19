@@ -35,9 +35,18 @@
  * Since 7.0 the breaker's two verbs, the credits switch and the tombstones are
  * the free tree's too; Pro adds one group, the quota plan of a plan and a run
  * (`accounts-dashboard.tsx`).
+ *
+ * The list sits under the one toolbar (design.md principle 8): search, Filter
+ * by kind, and Everything, which opens every line. Since one-pool phase 9 Pro
+ * makes the section the POOL DESK: an API key is one more line
+ * (`accounts-inspect.tsx` `ApiAccountItem`), every line inspects in the panel
+ * on four tabs with every control the account has, the Pool card says how the
+ * console spends its accounts and what the next session would get
+ * (`accounts-pool-card.tsx`), and Add an account offers an API key
+ * (`accounts-add.tsx`).
  */
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { burnPhrase, trendPhrase } from '@shared/ops-vocab.js';
 import { RetirementEvidence } from '@/cards/retirement-evidence';
 import {
@@ -59,8 +68,11 @@ import { useConsoleState } from '@/data/console';
 import { duration, plural } from '@/lib/format';
 import { accountName, bucketLabel, meterWords } from '@/shell/limits';
 import { planHref, settingsHref } from '@/shell/routes';
-import { Button, Input, KeyValue, Mono, RelativeTime, Row, Skeleton, Banner, toast } from '@/ui';
+import { Button, Input, KeyValue, Mono, RelativeTime, Row, Skeleton, Banner, Empty, toast } from '@/ui';
 import { ConfirmButton } from '@/ui/confirm';
+import { useEverything } from '@/ui/everything';
+import { NativeSelect } from '@/ui/native-select';
+import { Toolbar, type ToolbarVerb } from '@/ui/toolbar';
 import { Dialog, DialogContent } from '@/ui/dialog';
 import { AccountStatus, OpsStatus } from '@/ui/status';
 import { LoadMeter } from '@/ui/track/meter';
@@ -202,6 +214,30 @@ export function accountsSituation(accounts: readonly AccountView[]): string {
   // A window credits carry past is not spent (control-tower phase 93, #146): said, as the opened row says it.
   const carried = worst.account.credits?.carrying === true && worst.pct >= 99 ? ', and credits carry it' : '';
   return `${count} The fullest 5-hour window is ${accountName(worst.account)}’s, at ${Math.round(worst.pct)} %${carried}.`;
+}
+
+/** The kinds the list's Filter narrows to, in the toolbar's words. */
+export const ACCOUNT_FILTERS = [
+  ['all', 'Every account'],
+  ['login', 'Logins'],
+  ['token', 'Setup tokens'],
+] as const;
+export type AccountFilter = (typeof ACCOUNT_FILTERS)[number][0];
+
+/** Does an account belong under a filter word? A login is the machine's own or a signed-in profile. */
+export function accountMatchesFilter(account: AccountView, filter: AccountFilter): boolean {
+  if (filter === 'all') return true;
+  const kind = account.kind as string;
+  if (filter === 'login') return account.builtIn || kind === 'default' || kind === 'profile';
+  return kind === filter;
+}
+
+/** Does an account answer to the search: its name, its email, its id — and, for a key, its provider? */
+export function accountMatchesSearch(account: AccountView, query: string): boolean {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  const said = [accountName(account), account.email ?? '', account.id, account.plan ?? ''];
+  return said.some((text) => text.toLowerCase().includes(needle));
 }
 
 /** Warn at 80, alert at 95 — the thresholds the server announces at, and the rail's bar's. */
@@ -611,10 +647,13 @@ function AccountItem({
   account,
   allowed,
   defaultExpanded,
+  expanded,
 }: {
   account: AccountView;
   allowed: boolean;
   defaultExpanded: boolean;
+  /** Everything is on: every line stands open. */
+  expanded?: boolean;
 }) {
   const { refresh, busy } = useAccountRefresh(account.id);
   const name = accountName(account);
@@ -658,6 +697,7 @@ function AccountItem({
       }
       expandLabel={`details of ${name}`}
       defaultExpanded={defaultExpanded}
+      {...(expanded ? { expanded: true } : {})}
     >
       <div className="flex min-w-0 flex-col gap-4 pb-2">
         <KeyValue
@@ -931,8 +971,40 @@ export function AccountsSection() {
   const { data: state } = useConsoleState();
   const { refresh, busy } = useAccountRefresh();
   const allowed = data?.allowAccounts ?? state?.allowAccounts ?? false;
-  const accounts = data?.accounts ?? [];
+  const accounts = useMemo(() => data?.accounts ?? [], [data]);
   const duplicates = duplicateIdentities(accounts);
+  const everything = useEverything('settings-accounts');
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<AccountFilter>('all');
+  const shown = accounts.filter(
+    (account) => accountMatchesFilter(account, filter) && accountMatchesSearch(account, query),
+  );
+  const verbs: ToolbarVerb[] = [];
+  const filterPicker = (
+    <NativeSelect
+      aria-label="Show"
+      className="w-full md:w-48"
+      value={filter}
+      onChange={(event) => setFilter(event.target.value as AccountFilter)}
+    >
+      {ACCOUNT_FILTERS.map(([id, words]) => (
+        <option key={id} value={id}>
+          {words}
+        </option>
+      ))}
+    </NativeSelect>
+  );
+  const rowOf = (account: AccountView) => {
+    return (
+      <AccountItem
+        key={account.id}
+        account={account}
+        allowed={allowed}
+        defaultExpanded={accounts.length === 1}
+        expanded={everything.on}
+      />
+    );
+  };
 
   return (
     <div className="flex min-w-0 flex-col gap-6" data-testid="settings-accounts">
@@ -967,22 +1039,51 @@ export function AccountsSection() {
           title="Every account"
           lead="Each is read on a budget: about every 90 seconds while a session runs on it, every ten minutes when idle."
         >
+          <Toolbar
+            label="Accounts"
+            search={{
+              value: query,
+              onChange: setQuery,
+              placeholder: 'Search accounts',
+              label: 'Search the accounts by name, email or id',
+            }}
+            filter={{
+              label: 'Show',
+              value: ACCOUNT_FILTERS.find(([id]) => id === filter)![1],
+              active: filter === 'all' ? 0 : 1,
+              panel: filterPicker,
+              inline: filterPicker,
+            }}
+            {...(verbs.length ? { more: verbs } : {})}
+            everything={everything}
+            {...(shown.length !== accounts.length
+              ? { note: <span>{`${shown.length} of ${plural(accounts.length, 'account')} shown`}</span> }
+              : {})}
+          />
           {isPending && !data ? (
             <Skeleton className="h-24" aria-busy="true" aria-label="Reading the accounts" />
           ) : accounts.length === 0 ? (
             <p className="text-body text-ink-muted">
               Not even the machine login answered — is the server current?
             </p>
+          ) : shown.length === 0 ? (
+            <Empty
+              title="No account matches."
+              action={
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setQuery('');
+                    setFilter('all');
+                  }}
+                >
+                  Show every account
+                </Button>
+              }
+            />
           ) : (
             <div className="flex min-w-0 flex-col gap-1" data-testid="account-list">
-              {accounts.map((account) => (
-                <AccountItem
-                  key={account.id}
-                  account={account}
-                  allowed={allowed}
-                  defaultExpanded={accounts.length === 1}
-                />
-              ))}
+              {shown.map(rowOf)}
             </div>
           )}
           <UsageAlertsLine />

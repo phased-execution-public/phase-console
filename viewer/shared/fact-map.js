@@ -39,7 +39,7 @@
  * `HALT_KIND_SITUATION` is total over `HALT_KINDS` because a halt kind with no
  * situation is a stop nothing can classify, and the classifier's fallback for
  * one is `unknown` — which reads to a person as "the console has no idea",
- * from a console that has a thirty-word table saying exactly what happened.
+ * from a console that has a thirty-two-word table saying exactly what happened.
  *
  * `inboxKind: null` is a real answer and means **raise nothing**: `superseded`
  * and `work-in-progress` are the board and a live session doing their jobs.
@@ -253,6 +253,14 @@ export const HALT_KIND_SITUATION = Object.freeze({
    * rung list hands it to them at once instead of a session nothing would help.
    */
   'verify-timeout': 'unknown',
+  /**
+   * A git configuration a session planted in its tree (one-pool phase 2,
+   * #272): `unknown`'s empty rung list hands it to a person at once — no
+   * session goes back into a tree the console will not run git in.
+   */
+  'run-tree-config': 'unknown',
+  /** An orphaned index.lock (one-pool phase 20, #328): a person's, like the planted config above. */
+  'run-tree-locked': 'unknown',
   'mcp-preflight': 'mcp-unavailable',
   budget: 'resource-wall',
   'models-exhausted': 'resource-wall',

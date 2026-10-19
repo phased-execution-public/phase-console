@@ -12,6 +12,15 @@
  *         — while every live lane carries on; below it the next scan admits;
  *         the queue view shows the reading, and `POST /api/queue/policy`
  *         moves the factor.
+ *
+ * Since one-pool phase 26 (#243) the reading is CPU busy over 30 s (85 % at
+ * the default factor) with the 5-minute average as a ceiling only
+ * (`factor × cores × 2`) — `load-reading.test.ts` holds the recorded cases —
+ * and:
+ *
+ *   LP-7  a phase RESUMING its own work (a `partial` declared moments ago) is
+ *         not new work: the guard does not hold it, and every other holder
+ *         still does.
  */
 
 import './state-sandbox.ts';
@@ -38,38 +47,65 @@ test('LP-6: the guard is on by default at 1.5 × cores; 0 switches it off; anyth
   assert.equal(loadGuardFactor({ loadGuardFactor: 2 }), 2);
   assert.equal(loadGuardFactor({ loadGuardFactor: 0 }), null, 'zero is off, like the start ceiling\'s limits');
   assert.equal(loadGuardFactor({ loadGuardFactor: 'lots' }), 1.5);
-  assert.deepEqual(loadReading({ avg5: 22.4, cores: 14, factor: 1.5 }), { avg5: 22.4, cores: 14, factor: 1.5, threshold: 21, holding: true });
-  assert.equal(loadReading({ avg5: 21, cores: 14, factor: 1.5 }).holding, false, 'AT the threshold is not over it');
-  assert.equal(loadReading({ avg5: 99, cores: 14, factor: null }).holding, false, 'off holds nothing');
+  assert.deepEqual(loadReading({ avg5: 44.4, cores: 14, factor: 1.5 }), {
+    avg5: 44.4, cores: 14, factor: 1.5, threshold: 42, busy: null, busyLimit: 0.85, holding: true, cause: 'ceiling',
+  });
+  assert.equal(loadReading({ avg5: 42, cores: 14, factor: 1.5 }).holding, false, 'AT the ceiling is not over it');
+  assert.equal(loadReading({ avg5: 22.4, cores: 14, factor: 1.5, busy: 0.3 }).holding, false, 'the old threshold, with the CPU idle: admits (#243)');
+  assert.equal(loadReading({ avg5: 99, cores: 14, factor: null, busy: 1 }).holding, false, 'off holds nothing');
 });
 
 test('LP-6: above the threshold every NEW admission waits on the machine load, named; live lanes carry on; below it the next scan admits', async () => {
-  let sample = { avg5: 3, cores: 14, factor: 1.5 as number | null };
+  let sample = { avg5: 3, cores: 14, factor: 1.5 as number | null, busy: 0.1 };
   const scheduler = new Scheduler({ max: 4, load: () => sample });
   const live = await scheduler.admit({ slug: 'alpha', phase: 1, runId: 'aaaa', scope: ['app'] });
 
-  sample = { avg5: 30.2, cores: 14, factor: 1.5 };
+  sample = { avg5: 30.2, cores: 14, factor: 1.5, busy: 0.93 };
   const fresh = scheduler.admit({ slug: 'beta', phase: 2, runId: 'bbbb', scope: ['docs'] });
   for (let i = 0; i < 5; i++) await tick();
   const [entry] = scheduler.snapshot().entries;
   assert.ok(entry, 'the new admission waits');
   assert.equal(entry!.waitingOn[0]?.slug, LOAD_HOLDER);
-  assert.match(entry!.waitingOn[0]!.owner, /5-min load 30\.2 over 21 \(1\.5 × 14 cores\)/);
+  assert.match(entry!.waitingOn[0]!.owner, /CPU 93 % over the last 30 s, over 85 % \(5-min load 30\.2 on 14 cores\)/);
   assert.equal(entry!.waitingOn[0]!.clock, true, 'a clock holder: the two-hour cap never parks a phase for the machine\'s load');
   assert.deepEqual(scheduler.snapshot().grants.map((g) => g.slug), ['alpha'], 'the live lane is untouched');
   assert.equal(scheduler.snapshot().load?.holding, true, 'the snapshot carries the reading');
   assert.equal(scheduler.wouldBlock({ slug: 'gamma', phase: 3, runId: 'cccc', scope: ['site'] })[0]?.slug, LOAD_HOLDER, 'asked before joining, the answer is the same');
 
-  sample = { avg5: 12, cores: 14, factor: 1.5 };
+  sample = { avg5: 12, cores: 14, factor: 1.5, busy: 0.4 };
   scheduler.poll();
   const grant = await fresh;
   assert.equal(grant.slug, 'beta', 'the load fell: the next scan admits');
 
-  sample = { avg5: 99, cores: 14, factor: null };
+  sample = { avg5: 99, cores: 14, factor: null, busy: 1 };
   const off = await scheduler.admit({ slug: 'gamma', phase: 3, runId: 'cccc', scope: ['site'] });
   assert.equal(off.slug, 'gamma', 'switched off, the guard holds nothing');
   for (const g of [live, grant, off]) scheduler.release(g);
   scheduler.close();
+});
+
+test('LP-7: a phase resuming its own work keeps its place under load — every other holder still governs it (#243)', async () => {
+  const scheduler = new Scheduler({ max: 4, load: () => ({ avg5: 10, cores: 14, factor: 1.5, busy: 0.95 }) });
+  const fresh = { slug: 'beta', phase: 2, runId: 'bbbb', scope: ['docs'] };
+  assert.equal(scheduler.wouldBlock(fresh)[0]?.slug, LOAD_HOLDER, 'new work waits on the machine');
+  assert.deepEqual(scheduler.wouldBlock({ ...fresh, resumed: true }), [], 'a resume does not');
+  const grant = await scheduler.admit({ ...fresh, resumed: true });
+  assert.equal(grant.slug, 'beta', 'it boards at once, the machine still busy');
+  // A resume is not an exemption from scope: its sibling on the same tree waits as ever.
+  const sibling = scheduler.admit({ slug: 'beta', phase: 3, runId: 'bbbb', scope: ['docs'], resumed: true });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.notEqual(scheduler.snapshot().entries[0]?.waitingOn[0]?.slug, LOAD_HOLDER, 'held by the scope, not the load');
+  assert.equal(scheduler.snapshot().entries.length, 1);
+  scheduler.release(grant);
+  scheduler.release(await sibling);
+  scheduler.close();
+
+  const { resumingOwnWork, RESUME_ADMISSION_GRACE_MS } = await import('../server/runner/runner-control.ts');
+  const now = Date.parse('2026-10-18T12:00:00Z');
+  assert.equal(resumingOwnWork({ lastPartial: { sessionId: 's', reason: 'context', at: new Date(now - 60_000).toISOString() } }, now), true);
+  assert.equal(resumingOwnWork({ lastPartial: { sessionId: 's', reason: 'context', at: new Date(now - RESUME_ADMISSION_GRACE_MS - 1).toISOString() } }, now), false,
+    'a partial long ago is new work again');
+  assert.equal(resumingOwnWork({}, now), false);
 });
 
 test('LP-6: the console reads this machine\'s load against its cores, shows it on the queue, and the factor moves through the policy route', async () => {
@@ -85,7 +121,9 @@ test('LP-6: the console reads this machine\'s load against its cores, shows it o
     const reading = svc.loadGuard();
     assert.equal(reading.factor, 1.5, 'on by default');
     assert.equal(reading.cores, availableParallelism());
-    assert.equal(reading.threshold, Math.round(1.5 * availableParallelism() * 100) / 100);
+    assert.equal(reading.threshold, Math.round(1.5 * availableParallelism() * 2 * 100) / 100, 'the 5-minute ceiling');
+    assert.equal(reading.busyLimit, 0.85);
+    assert.ok(reading.busy === null || (reading.busy >= 0 && reading.busy <= 1), 'and what the CPU did');
 
     const { handleApi } = await import('../server/api/routes.ts');
     const call = async (method: 'GET' | 'POST', path: string, body: unknown = {}) => {

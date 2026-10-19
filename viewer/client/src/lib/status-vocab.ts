@@ -158,8 +158,9 @@ export const RUN_STATUS_HELP: Record<RunStatus, StatusHelp> = {
     then: 'Continue the frozen session to resume instantly, or Stop it.',
   },
   parked: {
-    means: 'Every remaining phase needs a person first — a gate, an approval, a decision.',
-    then: 'Read "Ways forward": each blocker is named with its remedy.',
+    means:
+      'The run stopped driving at a point it can name, and nothing new boards — a gate, an approval, a decision.',
+    then: 'Read "Ways forward": each blocker is named with its remedy. It reads Needs you only while an item for it is open.',
   },
   queued: {
     means: 'In line behind another plan holding the same repos; starts itself when the scope frees.',
@@ -226,8 +227,9 @@ export const PHASE_STATUS_HELP: Record<PhaseStatus, StatusHelp> = {
     then: 'Retry it later if it should still happen.',
   },
   parked: {
-    means: 'Needs a person before the loop will touch it again — the note says exactly why.',
-    then: 'Read the note (gate, foreign lock, decision), act on it, then Retry.',
+    means:
+      'The run set this phase aside, and its note says exactly why — a gate, a foreign lock, a decision.',
+    then: 'Read the note, act on it, then Retry. It reads Needs you only while an item for it is open.',
   },
   queued: {
     means: 'Waiting for repos another phase or plan is holding; starts itself when they free.',

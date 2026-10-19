@@ -837,6 +837,8 @@ export type GitStrategyFacts = {
   superproject: boolean;
   /** §Session budget's `**Branch:**` prose, verbatim. */
   planBranch?: string;
+  /** The branch the run's checkout stands on now (`git symbolic-ref`); absent when detached or unread. */
+  checkoutBranch?: string;
   /** §Session budget says `Worktrees: on`. */
   planWorktrees: boolean;
   /** The phases whose `- **Checkout:**` asks to board detached at the trunk. */
@@ -856,6 +858,44 @@ export type GitStrategyLine = {
   phases?: number[];
 };
 
+/** A git branch name as a plan writes one between backticks: no space, nothing a ref refuses. */
+const BRANCH_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+/** Backticked words that are refs but never a plan's WORK branch: what a branch is cut from. */
+const NOT_A_WORK_BRANCH = /^(?:HEAD|(?:origin|upstream)\/.+|refs\/.+)$/;
+
+/** What the plan's `**Branch:**` line names, read by {@link readPlanBranch}. */
+export type PlanBranchReading = {
+  /** The branch the plan names — the run branch itself when the line names it. */
+  named?: string;
+  /** The line names the run branch among its tokens. */
+  agrees: boolean;
+};
+
+/**
+ * The ONE reader of §Session budget's `**Branch:**` prose (#235, #322) — the
+ * start door's probe and the boot prompt's mismatch note both ask it, because
+ * two readers of one line are how the door demanded an answer the prompt never
+ * mentioned. Its grammar: only a BACKTICKED token is a branch, never the prose
+ * around it — a token with no space, of git's branch characters, that is not a
+ * ref a branch is cut from (`HEAD`, `origin/…`, `upstream/…`, `refs/…`). A line
+ * naming the run branch among its tokens agrees with it; otherwise the plan
+ * names its first `pe/…` token, else its first token with a `/` (a repository
+ * named beside a branch is a word without one), else its first token. The default idioms
+ * ("current branch", "no new branch", "default") name no branch unless they
+ * carry a `pe/…` token, and a line with no token names none at all.
+ */
+export function readPlanBranch(prose: string | undefined, runBranch: string): PlanBranchReading {
+  const text = (prose ?? '').replace(/\s+/g, ' ');
+  const tokens = [...text.matchAll(/`([^`]+)`/g)]
+    .map((match) => match[1]!.trim())
+    .filter((token) => BRANCH_TOKEN.test(token) && !NOT_A_WORK_BRANCH.test(token)
+      && !token.includes('..') && !token.endsWith('/') && !token.endsWith('.lock'));
+  if (tokens.includes(runBranch)) return { named: runBranch, agrees: true };
+  const named = tokens.find((token) => token.startsWith('pe/')) ?? tokens.find((token) => token.includes('/')) ?? tokens[0];
+  if (!named || (!named.startsWith('pe/') && /current|no new branch|default/i.test(text))) return { agrees: false };
+  return { named, agrees: false };
+}
+
 /** A person's answer to probe 7's rows at launch — `shared/run-settings.js` owns the words. */
 export { GIT_STRATEGY_ACKS };
 export type GitStrategyAck = (typeof GIT_STRATEGY_ACKS)[number];
@@ -866,9 +906,11 @@ export type GitStrategyAck = (typeof GIT_STRATEGY_ACKS)[number];
  *
  * - `branch` — the console's new-branch strategy puts every phase on
  *   `pe/<slug>`, so §Session budget's `**Branch:**` naming another branch is
- *   never created. The default idioms ("current branch", "no new branch",
- *   "default") name none, and prose that names the run branch itself agrees.
- *   No launch setting honours it.
+ *   never created; no launch setting honours that. A launch that cuts no
+ *   branch (#322) stands every phase on the shared checkout's own branch, so a
+ *   plan naming one the checkout is not on is not honoured either — `honour`
+ *   makes it hold, on the new-branch strategy, when it names `pe/<slug>`.
+ *   What the line names is {@link readPlanBranch}'s answer, never its prose.
  * - `worktrees` — `Worktrees: on` is a per-LANE ask: a shared checkout cannot
  *   grant it, and a superproject never grants it (the run-level mirror is its
  *   answer, refused per lane `has-submodules`). Honourable only by isolating a
@@ -881,17 +923,31 @@ export function gitStrategyLines(facts: GitStrategyFacts | null): GitStrategyLin
   if (!facts) return [];
   const lines: GitStrategyLine[] = [];
   const newBranch = facts.gitMode === 'new-branch';
-  const prose = facts.planBranch?.replace(/\s+/g, ' ').trim();
-  if (newBranch && prose && !/current|no new branch|default/i.test(prose) && !prose.includes(facts.runBranch)) {
+  const reading = readPlanBranch(facts.planBranch, facts.runBranch);
+  // `honour` of a branch line launches the run on the new-branch strategy, so
+  // the lines below it are honourable as a new-branch run's would be.
+  let honoursAsNewBranch = newBranch;
+  if (newBranch && reading.named && !reading.agrees) {
     lines.push({
-      kind: 'branch', plan: prose.slice(0, 240), honourable: false,
+      kind: 'branch', plan: reading.named, honourable: false,
       run: `every phase works on \`${facts.runBranch}\`; the plan's branch is never created`,
+    });
+  } else if (!newBranch && reading.named && reading.named !== facts.checkoutBranch) {
+    // #322: a launch that cuts no branch stands every phase on whatever the
+    // shared checkout has out, so a plan naming its branch is not honoured
+    // either — and `honour` can make it hold only when that branch is the
+    // console's own `pe/<slug>`, by launching on the new-branch strategy.
+    honoursAsNewBranch = reading.agrees;
+    lines.push({
+      kind: 'branch', plan: reading.named, honourable: reading.agrees,
+      run: `every phase stands on ${facts.checkoutBranch ? `\`${facts.checkoutBranch}\`` : 'whatever the shared checkout has out'}; `
+        + `\`${reading.named}\` is never created or checked out`,
     });
   }
   if (facts.planWorktrees && (facts.superproject || !facts.isolated)) {
     lines.push({
       kind: 'worktrees', plan: 'Worktrees: on',
-      honourable: newBranch && !facts.superproject,
+      honourable: honoursAsNewBranch && !facts.superproject,
       run: facts.superproject
         ? 'a superproject never grants a worktree per lane — its phases share the run\'s mirror'
         : 'the phases share one checkout — a shared-checkout run cannot grant a worktree per lane',
@@ -901,7 +957,7 @@ export function gitStrategyLines(facts: GitStrategyFacts | null): GitStrategyLin
     const list = facts.checkoutPhases.join(', ');
     lines.push({
       kind: 'checkout', plan: `Checkout: main on phase${facts.checkoutPhases.length === 1 ? '' : 's'} ${list}`,
-      honourable: newBranch, phases: [...facts.checkoutPhases],
+      honourable: honoursAsNewBranch, phases: [...facts.checkoutPhases],
       run: newBranch
         ? `inert in the shared checkout — the phase${facts.checkoutPhases.length === 1 ? ' stands' : 's stand'} on \`${facts.runBranch}\``
         : 'inert in the shared checkout — the phases stand on whatever it has checked out',
@@ -942,14 +998,24 @@ export function probeGitStrategy(facts: GitStrategyFacts | null): ProbeVerdict {
  * sessions each rediscovered that the plan's per-phase branches did not exist
  * and repaired their own `gh pr checks` line while eighty stayed wrong.
  * Empty when nothing was overridden, so the boot prompt says what it always said.
+ * `newBranch: false` is a run that cut no branch (#322): it is told only of its
+ * branch line, as a block of its own, since it has no git block to sit in.
  */
 export function gitOverrideInstruction(
   lines: readonly { kind: string; plan: string; run: string; phases?: number[] }[] | undefined,
-  branch: string, phase: number,
+  branch: string, phase: number, newBranch = true,
 ): string {
   const out: string[] = [];
   for (const line of lines ?? []) {
-    if (line.kind === 'branch') {
+    // A run that cuts no branch is told about its branch line alone: the
+    // other two are said in terms of the run branch it does not have.
+    if (!newBranch && line.kind !== 'branch') continue;
+    if (line.kind === 'branch' && !newBranch) {
+      out.push(`\n\nGit strategy for this run: the plan's §Session budget names the branch \`${line.plan}\`, and this\n`
+        + `run was launched OVER it on the checkout as it stands: ${line.run}. Work on the\n`
+        + 'branch the checkout already has out and commit there; do not create, check out or wait for\n'
+        + `\`${line.plan}\`, and do not stop on the plan's branch line. There is no discrepancy to record.`);
+    } else if (line.kind === 'branch') {
       out.push(`- The plan's §Session budget names the branch \`${line.plan}\`, and this run was launched\n`
         + `  OVER it: \`${branch}\` IS this plan's branch for the whole run. Every branch the plan names\n`
         + `  instead — that one, a per-phase \`${branch}-pN\`, the branch in a \`gh pr checks …\` line —\n`
@@ -962,6 +1028,7 @@ export function gitOverrideInstruction(
         + '  other phase, and commits there. Do not switch to the trunk.');
     }
   }
+  if (!newBranch) return out.join('');
   return out.length ? `\n${out.join('\n')}` : '';
 }
 
@@ -1247,6 +1314,72 @@ export function resolvedManifest(prelude: Prelude, override?: { rows: string[]; 
     ...(override ? { overridden: { rows: override.rows, by: override.by, at: prelude.at } } : {}),
     at: prelude.at,
   };
+}
+
+/** One row a resume found changed in the plan since the run's manifest was resolved (#226). */
+export type DecisionChange = {
+  key: string;
+  /** `added`: the plan now writes a row the launch had synthesised; `changed`: a written row moved. */
+  change: 'added' | 'changed';
+  /** The value the run held, cut to 200 characters. */
+  from?: string;
+  /** The value the plan holds now, cut to 200 characters. */
+  to: string;
+};
+
+/**
+ * A resumed run's manifest re-read against the plan (#226). The manifest used
+ * to be resolved at first launch only, so a `## Decisions` row amended after it
+ * — a `permission.destructive` widened for a release phase — never reached the
+ * live run, and nothing said so. A resume now takes the plan's WRITTEN rows
+ * (the plan's table with its twin merged over it) as they stand: a written row
+ * replaces the run's row for its key, and every other row stands as the launch
+ * resolved it. A row the plan stopped writing is NOT dropped: the launch also
+ * synthesised rows of origin `plan` from the plan's own lines (`accounts`,
+ * `credentials`, `mcp`), which no table carries, and what a removed row falls
+ * back to only the full prelude can say. The probes, accounts and credentials
+ * are the launch's — a resume is answered at its own door.
+ *
+ * Only an ANSWERED (or waived) row replaces one: a row the plan now leaves
+ * `outstanding`, or writes with no state, is `held` — un-answering a decision
+ * is a launch's question, never a resume's. And the caller applies `manifest`
+ * only on a person's resume (`runner-control.ts`): the rows are in the tree,
+ * which a session can write, so a door no person pressed applies nothing.
+ */
+export function rereadManifest(
+  stored: ResolvedManifest, written: readonly DecisionRow[],
+): { manifest: ResolvedManifest; changes: DecisionChange[]; held: DecisionChange[] } {
+  const cut = (value: string) => value.slice(0, 200);
+  const now = new Map<string, ManifestDecision>();
+  for (const row of written) {
+    now.set(row.key, {
+      key: row.key, value: row.value, owner: row.owner, state: plain(row.state),
+      source: row.source || 'plan', blocking: row.blocking === 'yes' ? 'yes' : 'no', origin: 'plan',
+    });
+  }
+  const changes: DecisionChange[] = [];
+  const held: DecisionChange[] = [];
+  const decisions: ManifestDecision[] = [];
+  const seen = new Set<string>();
+  const settled = (row: ManifestDecision) => row.state === 'answered' || row.state === 'waived';
+  for (const row of stored.decisions) {
+    seen.add(row.key);
+    const fresh = now.get(row.key);
+    const moved = fresh && (fresh.value !== row.value || fresh.state !== row.state || fresh.blocking !== row.blocking);
+    if (!fresh || !moved) { decisions.push(fresh && settled(fresh) ? fresh : row); continue; }
+    const change: DecisionChange = { key: row.key, change: row.origin === 'plan' ? 'changed' : 'added', from: cut(row.value), to: cut(fresh.value) };
+    if (!settled(fresh)) { held.push(change); decisions.push(row); continue; }
+    changes.push(change);
+    decisions.push(fresh);
+  }
+  for (const [key, fresh] of now) {
+    if (seen.has(key)) continue;
+    const change: DecisionChange = { key, change: 'added', to: cut(fresh.value) };
+    if (!settled(fresh)) { held.push(change); continue; }
+    changes.push(change);
+    decisions.push(fresh);
+  }
+  return { manifest: { ...stored, decisions }, changes, held };
 }
 
 /**

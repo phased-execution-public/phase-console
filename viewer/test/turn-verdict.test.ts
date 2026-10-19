@@ -73,7 +73,9 @@ test('TV-4 / TV-2 — a probe that misses is a rejection quoting what it read: r
     assert.equal(verdict.state, 'rejected');
     assert.equal(verdict.by, 'probe');
     assert.equal(verdict.attempt, 1);
-    assert.match(verdict.note, /The proof did not hold — cmd:"gh auth status" read: pending — exit 1 — not logged in/);
+    assert.match(verdict.note, /The proof did not hold: the gh CLI reads signed in — not yet \(the check exited 1: not logged in\)/);
+    // Said in words (#368): no ref and no watch-state word reaches a person.
+    assert.ok(!/cmd:|pending/.test(verdict.note + verdict.redo.join(' ') + verdict.read.join(' ')), JSON.stringify(verdict));
     assert.ok(verdict.redo.length >= 1, 'it says what to redo');
     const now = h.svc.humanStepsNow().get(step.id)!;
     assert.equal(now.state, 'returned');
@@ -83,6 +85,32 @@ test('TV-4 / TV-2 — a probe that misses is a rejection quoting what it read: r
     assert.equal(h.pushes.length - pushesBefore, 1, 'the person is told ONCE');
     assert.match(JSON.stringify(h.pushes.at(-1)), /Back to you/);
     assert.ok(journal(h.root, state).some((l) => l.event === 'phase.human-step-returned' && l.data.verdict === 'rejected'));
+  } finally { h.cleanup(); }
+});
+
+test('#374 — a proof whose script is missing reads unrunnable: never a rejection, the path named, the item back where it stood', async () => {
+  const h = harness();
+  try {
+    const { state, step } = parked(h, GH);
+    const missing = '/home/me/work/hub/scripts/vpn/status.sh';
+    h.svc.watchClock.probeNow = async (ref: string): Promise<WatchState> => ({
+      ref, state: 'unrunnable', detail: `the proof itself cannot run — ${missing} does not exist on the console's checkout; exit 127`,
+    });
+    const pushesBefore = h.pushes.length;
+    const checked = await call(h.svc, 'POST', `/api/human-steps/${step.id}/check`, {});
+    assert.equal(checked.status, 200, JSON.stringify(checked.body));
+    const check = checked.body.check as { state: string; landed: boolean; read: string };
+    assert.equal(check.state, 'unrunnable');
+    assert.equal(check.landed, false);
+    assert.ok(check.read.includes(missing), 'the item names the missing script');
+    assert.equal(checked.body.verdict, undefined, 'no verdict is written: nothing was decided');
+    const now = h.svc.humanStepsNow().get(step.id)!;
+    assert.equal(now.state, 'notified', 'To do again — never Redo on a proof that could not run');
+    assert.equal(now.verdicts?.length ?? 0, 0, 'no rejection counted towards escalation');
+    assert.ok(now.read?.includes(missing), 'the card says what is missing and where');
+    assert.equal(h.resumed.length, 0, 'nothing is resumed');
+    assert.equal(h.pushes.length - pushesBefore, 0, 'no "back to you" push for a proof that could not run');
+    assert.ok(journal(h.root, state).some((l) => l.event === 'phase.human-step-check-skipped' && l.data.why === 'unrunnable'));
   } finally { h.cleanup(); }
 });
 

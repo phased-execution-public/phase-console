@@ -299,6 +299,12 @@ type MoveLine = {
   read?: string;
   /** `check` (turn-by-turn phase 5): the note the person sent with it — kept on the attempt it starts. */
   sent?: string;
+  /**
+   * `check` (one-pool phase 13, #345): the proof re-read from the plan's
+   * bullet at check time, because the bullet changed since the item was raised
+   * — the item reads it from this line on (`turn.proof-reread`).
+   */
+  proof?: string;
 };
 
 /** One line of a step's history, as `history` answers it — the datums a card shows. */
@@ -335,6 +341,7 @@ function foldMove(known: HumanStep, state: HumanStepState, move: MoveLine): Huma
     ...(typeof move.pushed === 'boolean' ? { pushed: move.pushed } : {}),
     ...(move.stored ? { stored: move.stored } : {}),
     ...(typeof move.note === 'string' ? { note: move.note } : {}),
+    ...(typeof move.proof === 'string' && move.proof ? { proof: move.proof } : {}),
   };
   switch (verb) {
     case 'notify': next.notifiedAt ??= move.at; break;
@@ -789,6 +796,8 @@ export type MoveExtra = {
   read?: string;
   /** `check` (turn-by-turn phase 5): the note sent with it, redacted and bounded here. */
   sent?: string;
+  /** `check` (one-pool phase 13, #345): the proof the plan's bullet says NOW, when it changed since the item was raised. */
+  proof?: string;
 };
 
 /**
@@ -1001,6 +1010,7 @@ export class HumanStepLedger {
       ...(extra.escalated ? { escalated: true as const } : {}),
       ...(extra.read ? { read: redactSecrets(extra.read.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, 280) } : {}),
       ...(extra.sent ? { sent: redactSecrets(extra.sent.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, CHECK_NOTE_MAX) } : {}),
+      ...(extra.proof ? { proof: extra.proof.replace(/[\u0000-\u001f]+/g, ' ').slice(0, PROOF_MAX) } : {}),
     };
     this.append(line);
     const moved = this.get(id)!;
@@ -1325,14 +1335,18 @@ export function provenDetail(
 
 /** The instruction a session is resumed with when its step is proven — and what the person asked meanwhile. */
 export function provenInstruction(
-  step: Pick<HumanStep, 'kind' | 'title' | 'proof'> & Partial<Pick<HumanStep, 'question' | 'verdict' | 'proofWords'>>,
+  step: Pick<HumanStep, 'kind' | 'title' | 'proof'> & Partial<Pick<HumanStep, 'question' | 'verdict' | 'proofWords' | 'answer' | 'options'>>,
   read: string | undefined, by: string,
 ): string {
+  // A decision checked after its answer (#367): the session is told the
+  // answer as well as the proof that took it.
+  const answered = step.answer ? answeredInstruction({ kind: step.kind, title: step.title, ...(step.options ? { options: step.options } : {}) }, step.answer) : '';
   return [
     `The person's turn this phase declared is done: ${provenDetail(step, read, by)}. `
       + 'Carry on from where you parked — re-run what the step unblocked, then take the phase to its exit '
       + 'criteria: verify, commit, and write the handoff — or declare the next honest outcome with phase-outcome.sh.',
-    askedLines(step),
+    answered,
+    answered ? '' : askedLines(step),
   ].filter(Boolean).join('\n\n');
 }
 
@@ -1571,7 +1585,10 @@ export function tickHumanSteps(deps: StepClockDeps): StepClockPass {
     try { pushed = deps.remind(step, (step.reminders ?? 0) + 1); } catch (error) {
       log.warn('human-steps.clock-failed', { id: step.id, error: (error as Error)?.message ?? String(error) });
     }
-    const moved = deps.ledger.move(step.id, 'notified', { by: 'console', verb: 'remind', pushed });
+    // A reminder re-announces; it never changes what the step IS — a returned
+    // step is still the Redo its check sent back (#351).
+    const to: HumanStepState = step.state === 'returned' ? 'returned' : 'notified';
+    const moved = deps.ledger.move(step.id, to, { by: 'console', verb: 'remind', pushed });
     if (!('refused' in moved)) pass.reminded.push(step.id);
   }
   return pass;

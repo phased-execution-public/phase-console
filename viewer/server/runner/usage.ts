@@ -13,7 +13,7 @@
  * the newest totals, and the THRESHOLDS below are the one place the runner's
  * wrap-up and checkpoint read their numbers from.
  */
-import { budgetClassOf, MODELS_ENV_FALLBACK, type ModelsEnv } from './models.ts';
+import { budgetClassOf, MODELS_ENV_FALLBACK, modelFamily, type ModelsEnv } from './models.ts';
 
 /** One API call's `message.usage`, and the context it read (input + cache write + cache read). */
 export type CallUsage = { input: number; cacheWrite: number; cacheRead: number; output: number; context: number };
@@ -261,6 +261,24 @@ export function priceRowOf(model: string | null | undefined): string | null {
   return Object.prototype.hasOwnProperty.call(TOKEN_PRICES_USD, base) ? base : null;
 }
 
+/** USD per token for the four counters a call reports. */
+export type TokenRates = Readonly<{ input: number; cacheWrite: number; cacheRead: number; output: number }>;
+
+/**
+ * What a model's tokens cost at an instant (one-pool phase 4), USD per token: a measured row
+ * of `TOKEN_PRICES_USD` first — the rates a Claude session was found to book — then, in Pro,
+ * the model catalog's price (`providers.priceOverrides` over a live list's and the seed's), at
+ * `at` because a provider can price by the hour (DeepSeek halves its rates off-peak). Null when
+ * nobody has priced the model. Corroborating what the CLI REPORTED stays on the measured rows
+ * alone (`priceUsage`): a provider model is one the CLI prices at nothing.
+ */
+export function priceOf(model: string | null | undefined, at: Date | number | string = Date.now()): TokenRates | null {
+  const row = priceRowOf(model);
+  if (row) return TOKEN_PRICES_USD[row];
+  void at;
+  return null;
+}
+
 /** A session's own calls, priced — null when its model has no measured row. */
 export function priceUsage(model: string | null | undefined, counters: Pick<TokenCounters, 'input' | 'cacheWrite' | 'cacheRead' | 'output'>): number | null {
   const row = priceRowOf(model);
@@ -484,7 +502,7 @@ export function contextWindowOf(
   for (const model of models) {
     if (!model || !model.trim()) continue;
     const cls = budgetClassOf(model, env);
-    const size = cls === '1m' || cls === 'big' ? CONTEXT_WINDOW_1M : CONTEXT_WINDOW_DEFAULT;
+    let size = cls === '1m' || cls === 'big' ? CONTEXT_WINDOW_1M : CONTEXT_WINDOW_DEFAULT;
     window = Math.max(window ?? 0, size);
   }
   return window;

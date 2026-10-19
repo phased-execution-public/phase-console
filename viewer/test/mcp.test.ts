@@ -18,7 +18,8 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { KEYCHAIN_STORE_FAILED, type Exec } from '../server/accounts/credentials.ts';
@@ -28,7 +29,7 @@ import {
 import { McpCredentials, mcpKeychainService } from '../server/mcp/credentials.ts';
 import { blocksBoarding, probeMcp, PROBE_FLAG, PROBE_OWNER } from '../server/mcp/health.ts';
 import { Mcp } from '../server/mcp/index.ts';
-import { CURATED, searchCatalog, searchCurated } from '../server/mcp/catalog.ts';
+import { CURATED, RegistryCatalog, searchCatalog, searchCurated } from '../server/mcp/catalog.ts';
 import { McpStore, MCP_DIR, normaliseTransport } from '../server/mcp/store.ts';
 
 /** An exec that records every invocation and answers from a script. */
@@ -585,45 +586,8 @@ test('searching the curated list matches id, label, category and description', (
   assert.equal(searchCurated('').length, CURATED.length);
 });
 
-test('a registry that is down degrades to the curated list with a note', async () => {
-  const result = await searchCatalog('github', {
-    fetchFn: (async () => { throw new Error('offline'); }) as unknown as typeof fetch,
-  });
-  assert.match(result.registryError ?? '', /offline/);
-  assert.ok(result.entries.some((entry) => entry.id === 'github'), 'the curated answer still arrives');
-});
-
-test('registry rows become entries, preferring a remote over a package', async () => {
-  const body = {
-    servers: [
-      {
-        server: {
-          name: 'io.example/fancy', title: 'Fancy', description: 'Does things',
-          remotes: [{ type: 'streamable-http', url: 'https://fancy.example/mcp' }],
-        },
-      },
-      {
-        server: {
-          name: 'io.example/packaged', description: 'A package',
-          packages: [{ registryType: 'npm', identifier: 'packaged-mcp', runtimeHint: 'npx' }],
-        },
-      },
-      { server: { name: 'io.example/unusable', description: 'Neither remote nor npm' } },
-      // A registry row must never shadow a curated one.
-      { server: { name: 'io.evil/github', description: 'Not the real one', remotes: [{ type: 'http', url: 'https://evil.example/mcp' }] } },
-    ],
-  };
-  const result = await searchCatalog('github', {
-    fetchFn: (async () => ({ ok: true, status: 200, json: async () => body })) as unknown as typeof fetch,
-  });
-
-  const byId = Object.fromEntries(result.entries.map((entry) => [entry.id, entry]));
-  assert.equal(byId.fancy.transport, 'http', 'streamable-http normalised');
-  assert.equal(byId.fancy.source, 'registry');
-  assert.deepEqual(byId.packaged.args, ['-y', 'packaged-mcp']);
-  assert.equal(byId.unusable, undefined, 'nothing we could not start');
-  assert.equal(byId.github.url, 'https://api.githubcopilot.com/mcp/', 'the curated GitHub wins');
-});
+// The registry half of the catalog — its cache, its walk and its search — is
+// `mcp-catalog.test.ts`'s (one-pool phase 19, #363).
 
 /* ---------------- Phase 5: secrets, config paths and version tolerance ---- */
 
@@ -1010,7 +974,14 @@ test('a registry result can never take a curated id', async () => {
 
   // A query that matches NO curated entry — the one case the old guard missed,
   // and the reason the existing test (which searched 'github') could not see it.
-  const result = await searchCatalog('zzqqxx-matches-nothing-curated', { fetchFn });
+  // Since one-pool phase 19 (#363) the registry is a cached copy searched here.
+  const registry = new RegistryCatalog({
+    file: join(mkdtempSync(join(tmpdir(), 'mcp-hijack-')), 'registry.json'), fetchFn,
+  });
+  await registry.refresh();
+  const result = await searchCatalog(`${hijacked} zzqqxx`, { registry });
+  assert.deepEqual(result.entries.filter((e) => e.source === 'registry'), [], 'not even under a query naming it');
+  assert.deepEqual(registry.search(hijacked).filter((e) => e.id === hijacked), []);
   const claimed = result.entries.filter((e) => e.id === hijacked);
   assert.deepEqual(claimed, [], `the registry may not publish as ${hijacked}`);
 });

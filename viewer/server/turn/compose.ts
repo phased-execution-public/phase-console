@@ -24,7 +24,7 @@ import { KIND_META, redactSecrets, type HumanStepKind } from '../../shared/human
 import {
   CHECKED_BY_LABEL, REASON_META, readinessOf, type ProofType, type StepsFrom, type TurnRecord, type TurnSource, type WhyPerson,
 } from '../../shared/turn-model.js';
-import { gateProofOf, proofWords, startAtOf, whenWords } from '../../shared/proof-words.js';
+import { gateProofOf, proofPartsOf, proofWords, startAtOf, whenWords } from '../../shared/proof-words.js';
 import type { Guide } from '../../shared/guide-grammar.js';
 import type { StepVerdict } from './verdict.ts';
 
@@ -82,10 +82,25 @@ export type ApprovalBlock = {
 /** A situation's card words from the ladder's ASK table (`runner/ladder.ts` `askFor`). */
 export type AskFacts = { title: string; steps: readonly string[]; check: string };
 
+/**
+ * The files a run branch holds that its trunk does not, grouped by repository
+ * (#377) — the landing errand's folded *Details*: "12 files in aws · 3 in
+ * web". `repo` is the repository as a person reads it.
+ */
+export type LandingFiles = { repo: string; paths: string[] }[];
+
 /** Every word the composer writes for one item. */
 export type Composed = {
-  /** The act, as a person would say it: "Sign the gh CLI in", never "Your turn — …". */
+  /**
+   * The act, as a person would say it: "Sign the gh CLI in", never "Your turn
+   * — …". Sentence case, at most `TITLE_MAX` characters, never a path list and
+   * never the plan's errand ref (#377, `shortTitle`).
+   */
   title: string;
+  /** The act's whole words when `title` had to be cut — absent when the title says it all (#377). */
+  headline?: string;
+  /** The plan's errands-table ref the act carries — "E-4" — drawn as a chip, never in the title (#377). */
+  errandRef?: string;
   /** Where it belongs and what it costs, in words: "demo · Phase 3 · about 10 min · unblocks Phase 4". */
   meta: string;
   /** Why only the person fits it — the row's need. */
@@ -192,9 +207,70 @@ function sentence(text: string): string {
   return !t ? t : /[.!?]$/.test(t) ? t : `${t}.`;
 }
 
+/** A plan's errands-table ref at the end of an act — "(E-4)", "(E-4, hub #105)" — its id captured. */
+const ERRAND_REF = /\s*\((E-\d+)\b[^)]*\)\s*$/;
+
 /** The act without the plan's errand ref a 7.0 title carried — "(E-4)", "(E-4, hub #105)" — which the meta says instead. */
 export function actTitle(title: string): string {
-  return line(title, 240).replace(/\s*\(E-\d+\b[^)]*\)\s*$/, '').trim() || line(title, 240);
+  return line(title, 240).replace(ERRAND_REF, '').trim() || line(title, 240);
+}
+
+/** The errand ref an act ends on — "E-4" — or undefined. */
+export function errandRefOf(title: string | undefined | null): string | undefined {
+  return ERRAND_REF.exec(line(title, 600))?.[1];
+}
+
+/** A first word that is a name, not a word — a branch, a path, a slug with digits, a command in backticks. */
+export const IDENTIFIER_LEAD = /^[^\s]*[/._@:\d`]/;
+
+/** The longest title a card, a row or a push leads with (#377). */
+export const TITLE_MAX = 80;
+
+/**
+ * Two or more paths in a row — "contracts/api/app.ts, docs/a.md" — the list a
+ * title never carries (#377): it moves to the item's details.
+ */
+export const PATH_LIST = /(?:[\w.@~-]+\/)+[\w.@~-]+(?:\s*,\s*(?:[\w.@~-]+\/)*[\w.@~-]+\.[\w-]+)+/;
+
+/**
+ * Cut words to at most `limit` characters at a boundary: the last clause
+ * break (" — ", "; ", ": ", ", ") past four tenths of the limit, else the last
+ * space — never mid-word unless one word is longer than the limit.
+ */
+function atBoundary(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const head = text.slice(0, limit + 1);
+  const clause = Math.max(head.lastIndexOf(' — '), head.lastIndexOf('; '), head.lastIndexOf(': '), head.lastIndexOf(', '));
+  if (clause >= limit * 0.4) return text.slice(0, clause);
+  const space = head.lastIndexOf(' ');
+  return space > 0 ? text.slice(0, space) : text.slice(0, limit);
+}
+
+/**
+ * The title rule (#377): the act in sentence case — its first letter raised,
+ * unless it leads with a name (`IDENTIFIER_LEAD`) —
+ * at most `max` characters, its errand ref taken out (`errandRef`), and never
+ * a path list. Longer words are cut before a path list, then at a word
+ * boundary, and end on an ellipsis; the whole words are then `headline`.
+ * Pure: the composer, the inbox and the errand titles all say it this way.
+ */
+export function shortTitle(text: string, max: number = TITLE_MAX): { title: string; headline?: string; errandRef?: string } {
+  const full = line(text, 600);
+  const ref = ERRAND_REF.exec(full);
+  const words = (ref ? full.slice(0, ref.index) : full).trim() || full;
+  // Sentence case raises a word, never a name: a title that leads with a
+  // branch, a path, a slug or a command ("pe/alpha × pe/beta …") says it as written.
+  const said = IDENTIFIER_LEAD.test(words) ? words : cap(words);
+  const errandRef = ref?.[1];
+  let cut = said;
+  const list = PATH_LIST.exec(cut);
+  if (list && list.index > 0) cut = cut.slice(0, list.index);
+  cut = atBoundary(cut.replace(/[\s,;:—–-]+$/, ''), max - 1).replace(/[\s,;:—–(-]+$/, '');
+  // A code span the cut opened and never closed is dropped whole.
+  if ((cut.match(/`/g) ?? []).length % 2) cut = cut.slice(0, cut.lastIndexOf('`')).replace(/[\s,;:—–(-]+$/, '');
+  if (!cut) cut = said.slice(0, max - 1);
+  if (cut === said) return { title: said, ...(errandRef ? { errandRef } : {}) };
+  return { title: `${cut}…`, headline: said, ...(errandRef ? { errandRef } : {}) };
 }
 
 /**
@@ -230,8 +306,11 @@ export function checkWords(facts: { proofType: ProofType; proof?: string; proofW
   const words = line(facts.proofWords, 300);
   switch (facts.proofType) {
     case 'probe':
-      return facts.proof
-        ? `The console checks that ${proofWords(facts.proof)}.`
+      // A proof no scheme reads is told by its label and words, never as
+      // "the check the session named" (#368): that is the console's phrase
+      // for a ref it cannot read, not a check a person can follow.
+      return facts.proof && proofPartsOf(facts.proof)
+        ? `The console checks that ${proofWords(facts.proof)}${facts.hasOptions ? ' once you send your decision' : ''}.`
         : `${CHECKED_BY_LABEL.probe}${words ? `: ${words}` : ''}.`;
     case 'judgement':
       return `${CHECKED_BY_LABEL.judgement}${words ? ` against this: ${words}` : ''}.`;
@@ -262,9 +341,17 @@ function openSteps(step: Pick<StepFacts, 'openUrl' | 'openCommand' | 'code' | 't
 /** The step every guide ends on when nothing else says what proves it. */
 const PRESS_CHECK = "When it is done, press I've done this — check.";
 
-/** The last step, by how the item is answered: a choice is sent, a permission granted or denied, an act checked. */
-function pressWords(proofType: ProofType, hasOptions: boolean): string {
-  if (proofType === 'answer') return hasOptions ? 'Choose one of the options and send your decision.' : 'Give your answer.';
+/**
+ * The last step, by how the item is answered: a gate-bound item by its gate's
+ * Approve (#371), a choice sent (#368 — whatever proves it, a decision with
+ * options is answered by *Send my decision*, which runs its check), a
+ * permission granted or denied, an act checked. Never a button the card does
+ * not show.
+ */
+function pressWords(proofType: ProofType, hasOptions: boolean, gatePhase?: number | null): string {
+  if (gatePhase != null) return `Approve the gate on Phase ${gatePhase} — the item closes when the gate opens.`;
+  if (hasOptions) return 'Choose one of the options and send your decision.';
+  if (proofType === 'answer') return 'Give your answer.';
   if (proofType === 'grant') return 'Grant it at the scope you choose, or deny it.';
   return PRESS_CHECK;
 }
@@ -347,7 +434,7 @@ function rowTitle(row: RowFacts, scope: string): string {
 
 function stepsOf(facts: ComposeFacts): { steps: ComposedStep[]; from: StepsFrom; trouble: Composed['trouble'] } {
   const step = facts.step;
-  const press = pressWords(facts.proofType, Boolean(step?.options?.length));
+  const press = pressWords(facts.proofType, Boolean(step?.options?.length), step && facts.slug ? stepGateOf(step)?.phase : null);
   // 1–2. An authored guide, or the errands row read into one.
   if (step?.guide?.steps?.length) {
     return {
@@ -427,7 +514,12 @@ export function composeItem(facts: ComposeFacts): Composed {
   const scope = scopeWords(facts.slug, facts.phase);
   const step = facts.step;
   const row = facts.row;
-  const title = step ? actTitle(step.title) : row ? rowTitle(row, scope) : 'Something only you can do';
+  // The act's whole words, then its title by the one rule (#377): sentence
+  // case, at most TITLE_MAX characters, the errand ref a chip of its own.
+  const act = step ? actTitle(step.title) : row ? rowTitle(row, scope) : 'Something only you can do';
+  const short = shortTitle(act);
+  const title = short.title;
+  const errandRef = step?.eref ?? errandRefOf(step?.title ?? row?.humanStep?.title ?? row?.title);
   const options = optionsOf(facts);
   const approval = approvalOf(row?.approval);
   const check = row?.ask?.check ? sentence(line(row.ask.check, 300)) : checkWords({
@@ -449,13 +541,14 @@ export function composeItem(facts: ComposeFacts): Composed {
       step.code ? `The code is ${step.code}.` : '',
       facts.phase != null && facts.phase > 0 ? `${scope} waits on it.` : '',
     ].filter(Boolean).join(' ');
-    how = `${when}${open ? `: ${open}` : ''}. ${check} ${pressWords(facts.proofType, Boolean(step.options?.length))}`;
+    how = `${when}${open ? `: ${open}` : ''}. ${check} ${pressWords(facts.proofType, Boolean(step.options?.length), facts.slug ? stepGateOf(step)?.phase : null)}`;
   } else {
-    need = line(row?.need) || (reason ? sentence(cap(reason.sentence)) : sentence(title));
+    need = line(row?.need) || (reason ? sentence(cap(reason.sentence)) : sentence(act));
     how = line(row?.how) || check;
   }
   return {
-    title, meta: metaWords(facts), need: line(need), how: line(how, 900), steps, stepsFrom: from, check, trouble, timing,
+    title, ...(short.headline ? { headline: short.headline } : {}), ...(errandRef ? { errandRef } : {}),
+    meta: metaWords(facts), need: line(need), how: line(how, 900), steps, stepsFrom: from, check, trouble, timing,
     options, approval,
   };
 }
@@ -607,10 +700,73 @@ export function composeStepErrand(step: LedgerFacts, now: number = Date.now()): 
  * situation's ASK names (turn-by-turn phase 4), else the first clause of its
  * need, and where.
  */
-export function composeErrandTitle(errand: { need: string }, slug: string, phase: number | null | undefined, ask?: AskFacts | null): string {
+export function composeErrandTitle(
+  errand: { need: string; title?: string; situation?: string },
+  slug: string, phase: number | null | undefined, ask?: AskFacts | null,
+): string {
   const scope = phase != null && phase > 0 ? scopeWords(slug, phase) : `the run of ${slug}`;
-  const act = ask?.title ? cap(line(ask.title, 240)) : firstClause(errand.need) || 'An answer';
-  return `${act} (${scope})`;
+  // A reached spend cap names its account and window (one-pool phase 11): the errand's own
+  // title is `composeCapWall`'s, which the card, the push and the Runs home say too.
+  const capTitle = errand.situation === 'resource-wall:budget' && errand.title?.startsWith(CAP_TITLE_LEAD) ? errand.title : '';
+  const act = capTitle || (ask?.title ? cap(line(ask.title, 240)) : firstClause(errand.need) || 'An answer');
+  const said = `${act} (${scope})`;
+  // The title rule (#377): an act too long for its scope keeps the scope.
+  return said.length <= TITLE_MAX ? said : `${shortTitle(act, TITLE_MAX - scope.length - 3).title} (${scope})`;
+}
+
+/** One repository's landing proof, as the runner's `landingProofs` answers it (`runner/landing.ts` `LandingProof`). */
+export type LandingProofFacts = {
+  mount: string;
+  branch: string;
+  state: string;
+  into: string;
+  files: readonly string[];
+  detail?: string | undefined;
+};
+
+/** "12 files in aws · 3 in web" — how much each repository holds, in words (#377). */
+export function landingFilesWords(files: LandingFiles): string {
+  return files
+    .filter((group) => group.paths.length)
+    .map((group, i) => `${group.paths.length}${i === 0 ? ` file${group.paths.length === 1 ? '' : 's'}` : ''} in ${group.repo}`)
+    .join(' · ');
+}
+
+/**
+ * The landing errand's words (#377, control-tower phase 112's `unlanded`
+ * park): a short title that names the act — "Land demo on main: 2
+ * repositories differ from origin/main", or for one repository "Land demo on
+ * main: aws differs from origin/main" — a need that adds the branch and how
+ * many files, and the files themselves grouped by repository for the card's
+ * folded *Details*. Never a path in the title. `mounted` says whether the
+ * run's root is one of several repositories ("the root repository").
+ */
+export function composeLanding(slug: string, proofs: readonly LandingProofFacts[], opts: { mounted?: boolean } = {}): {
+  title: string; need: string; files: LandingFiles;
+} {
+  const repoOf = (proof: LandingProofFacts): string => (proof.mount ? proof.mount : opts.mounted ? 'the root repository' : 'the repository');
+  const first = proofs[0];
+  const into = first?.into || 'its trunk';
+  const trunk = first?.into.replace(/^origin\//, '') || 'its trunk';
+  const branch = first?.branch || `pe/${slug}`;
+  const conflicted = proofs.filter((proof) => proof.state === 'conflicted').length;
+  const what = proofs.length === 1 && first
+    ? first.state === 'conflicted'
+      ? `${repoOf(first)} conflicts with ${trunk}`
+      : first.state === 'ahead'
+        ? `${repoOf(first)} differs from ${into}`
+        : `${repoOf(first)} could not be checked against ${into}`
+    : `${proofs.length} repositories differ from ${into}${conflicted ? `, ${conflicted} in conflict` : ''}`;
+  const title = shortTitle(`Land ${slug} on ${trunk}: ${what}`).title;
+  const files: LandingFiles = proofs.map((proof) => ({ repo: repoOf(proof), paths: [...proof.files] }));
+  const counted = landingFilesWords(files);
+  const unknown = proofs.filter((proof) => proof.state !== 'conflicted' && proof.state !== 'ahead');
+  const need = [
+    `${title}.`,
+    counted ? `The run branch ${branch} differs in ${counted}.` : `The run branch ${branch} holds commits of its own.`,
+    ...unknown.map((proof) => `Git did not answer for ${repoOf(proof)}: ${line(proof.detail || 'no reason given', 200)}.`),
+  ].join(' ');
+  return { title, need, files };
 }
 
 /**
@@ -667,3 +823,19 @@ export function composePush(step: LedgerFacts & { label?: string }, opts: { remi
   const detail = line(`${composed.title} — ${scope}${place}.${opts.reminder ? ` Reminder ${opts.reminder}.` : ''}`, 400);
   return { title, body, detail };
 }
+
+/**
+ * A halted run's push — the lock screen's title and body. A reached spend cap says the
+ * composer's own words (`composeCapWall`, one-pool phase 11), the card's and the bell's.
+ */
+export function haltedPushWords(
+  slug: string,
+  halt: { reason?: string } | null | undefined,
+): { title: string; body: string } {
+  const said = { title: `${slug} halted`, body: halt?.reason ?? 'the run stopped and needs a person' };
+  return said;
+}
+
+/** How every cap headline opens — what tells a cap errand's own title from any other. */
+const CAP_TITLE_LEAD = 'Cap reached on ';
+

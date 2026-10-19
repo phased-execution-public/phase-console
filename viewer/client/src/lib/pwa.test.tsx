@@ -426,3 +426,156 @@ describe('returning to the tab re-checks for an update', () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * The previous release never mounts (one-pool phase 18, #373)
+ * ------------------------------------------------------------------ */
+
+describe('staleShellCheck — the build checked before the app mounts', () => {
+  const MINE = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const NEW = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+  /** A cache store holding the old shell's cache and one that is not ours. */
+  function cacheStore() {
+    const names = new Set(['phase-shell-old1', 'someone-else']);
+    return {
+      names,
+      keys: vi.fn(async () => [...names]),
+      delete: vi.fn(async (name: string) => names.delete(name)),
+    };
+  }
+
+  beforeEach(() => {
+    (container as unknown as { getRegistration: () => Promise<unknown> }).getRegistration = vi.fn(
+      async () => registration,
+    );
+  });
+
+  it('a page whose build is the server’s mounts, and forgets any earlier reload', async () => {
+    sessionStorage.setItem('pc-stale-shell-reload', JSON.stringify({ rev: NEW, at: Date.now() }));
+    const { staleShellCheck } = await import('./pwa');
+    const reloadSpy = vi.fn();
+    await expect(
+      staleShellCheck({ mine: MINE, controlled: true, served: async () => MINE, reload: reloadSpy }),
+    ).resolves.toBe('current');
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem('pc-stale-shell-reload')).toBeNull();
+  });
+
+  it('a page the network served — no worker in control — is the server’s own and is never asked about', async () => {
+    const { staleShellCheck } = await import('./pwa');
+    const served = vi.fn(async () => NEW);
+    await expect(staleShellCheck({ mine: MINE, controlled: false, served })).resolves.toBe('skipped');
+    expect(served).not.toHaveBeenCalled();
+  });
+
+  it('a server that cannot name its build, or does not answer in time, lets the page mount', async () => {
+    const { staleShellCheck } = await import('./pwa');
+    await expect(
+      staleShellCheck({ mine: MINE, controlled: true, served: async () => '<!doctype html>' }),
+    ).resolves.toBe('skipped');
+    await expect(
+      staleShellCheck({ mine: MINE, controlled: true, served: () => new Promise(() => {}), askMs: 20 }),
+    ).resolves.toBe('skipped');
+    await expect(
+      staleShellCheck({ mine: 'unknown', controlled: true, served: async () => NEW }),
+    ).resolves.toBe('skipped');
+  });
+
+  it('a mismatch with a worker waiting: it takes over, the page reloads ONCE, and the old app never mounts', async () => {
+    const waiting = fakeWorker();
+    registration.waiting = waiting;
+    const { staleShellCheck } = await import('./pwa');
+    const reloadSpy = vi.fn();
+    const announce = vi.fn();
+    const caches = cacheStore();
+    const verdict = staleShellCheck({
+      mine: MINE,
+      controlled: true,
+      served: async () => NEW,
+      reload: reloadSpy,
+      announce,
+      cacheStorage: caches,
+    });
+    await waitFor(() => expect(waiting.postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' }));
+    container.emit('controllerchange');
+    await expect(verdict).resolves.toBe('reloading');
+    expect(announce).toHaveBeenCalledTimes(1);
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    // The new worker took over: its own activate drops the old cache, so the page touched none.
+    expect(caches.delete).not.toHaveBeenCalled();
+  });
+
+  it('a mismatch with no worker able to take over: the shell caches are dropped so the reload comes from the network', async () => {
+    registration.waiting = null;
+    registration.installing = null;
+    const { staleShellCheck } = await import('./pwa');
+    const reloadSpy = vi.fn();
+    const caches = cacheStore();
+    await expect(
+      staleShellCheck({
+        mine: MINE,
+        controlled: true,
+        served: async () => NEW,
+        reload: reloadSpy,
+        cacheStorage: caches,
+        waitMs: 20,
+      }),
+    ).resolves.toBe('reloading');
+    expect(registration.update).toHaveBeenCalled();
+    expect([...caches.names]).toEqual(['someone-else']);
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('never loops: a second mismatch for the same build within a minute mounts instead — the 409 guards its presses', async () => {
+    const { staleShellCheck } = await import('./pwa');
+    const reloadSpy = vi.fn();
+    const options = {
+      mine: MINE,
+      controlled: true,
+      served: async () => NEW,
+      reload: reloadSpy,
+      cacheStorage: cacheStore(),
+      waitMs: 20,
+      now: () => 1_000_000,
+    };
+    await expect(staleShellCheck(options)).resolves.toBe('reloading');
+    await expect(staleShellCheck(options)).resolves.toBe('declined');
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    // A minute on, or another build, is a new question.
+    await expect(staleShellCheck({ ...options, now: () => 1_061_000 })).resolves.toBe('reloading');
+    expect(reloadSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('suppression cannot bite before mounting: a live surface or a focused input would have kept the toast, this reloads anyway', async () => {
+    window.location.hash = '#/sessions/abc';
+    const { staleShellCheck } = await import('./pwa');
+    const reloadSpy = vi.fn();
+    await expect(
+      staleShellCheck({
+        mine: MINE,
+        controlled: true,
+        served: async () => NEW,
+        reload: reloadSpy,
+        cacheStorage: cacheStore(),
+        waitMs: 20,
+      }),
+    ).resolves.toBe('reloading');
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('a press the server refused as outdated (#373)', () => {
+  it('pins one reload prompt, however many presses were refused', async () => {
+    render(<Harness />);
+    await waitFor(() => expect(container.register).toHaveBeenCalled());
+    act(() => {
+      window.dispatchEvent(new CustomEvent('phase-console:outdated'));
+      window.dispatchEvent(new CustomEvent('phase-console:outdated'));
+    });
+    expect(screen.getByTestId('count').textContent).toBe('1');
+    expect(screen.getByTestId('messages').textContent).toBe(
+      'This page is from a previous release of the console.',
+    );
+  });
+});

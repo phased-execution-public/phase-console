@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 
-import { STOPS, fixture, shoot, visit } from './lib/shots.ts';
+import { STOPS, fixture, shoot, stampTour, visit } from './lib/shots.ts';
 
 // The tour: every stop `lib/shots.ts` names — every destination
 // `shared/route-meta.js` declares, every plan tab, Your turn and the three
@@ -8,6 +8,10 @@ import { STOPS, fixture, shoot, visit } from './lib/shots.ts';
 // an uncaught error or a fallen error boundary, and photographed. The pictures
 // (`e2e/.shots/<viewport>/<stop>.png`) are never compared by pixel; they are
 // for the session that changed a page to open and READ.
+
+// Each viewport's folder says which stops it was asked for (#353), so a node
+// test reading it later can tell a stale folder from a tour that missed a stop.
+test.beforeAll(({}, info) => stampTour(info.project.name));
 
 for (const stop of STOPS) {
   test(`tour: ${stop.name}`, async ({ page }, info) => {

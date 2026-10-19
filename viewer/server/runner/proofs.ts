@@ -26,7 +26,10 @@ import { join } from 'node:path';
 
 import { runDir } from './run-paths.ts';
 import { foldCommand } from './verify.ts';
-import { treeChanges, workingTreeOf } from './worktree.ts';
+import { realish, treeChanges, workingTreeOf } from './worktree.ts';
+
+/** Is `path` the directory `dir`, or under it? */
+const within = (path: string, dir: string): boolean => path === dir || path.startsWith(`${dir}/`);
 
 export { foldCommand };
 
@@ -44,6 +47,16 @@ export type Proof = {
   head?: string;
   at: string;
   session?: string;
+  /**
+   * The repository a `cd <path> && …` line runs in, as the line spells it, and
+   * that repository's own working tree when the session proved it (one-pool
+   * phase 20, #301) — present when `<path>` stands in another repository than
+   * the judged tree's, a superproject's submodule. The proof's key there is
+   * `{repo, repoTree}`: a commit elsewhere in the superproject leaves it
+   * standing.
+   */
+  repo?: string;
+  repoTree?: string;
 };
 
 /** A proof the console honours instead of running the command. */
@@ -53,6 +66,11 @@ export type ProvenBy = {
   session?: string;
   /** The paperwork paths changed since the proven tree — empty when it IS the tree. */
   paperwork: string[];
+  /** Judged by the line's own repository (#301): its path, and the tree it was proven at. */
+  repo?: string;
+  repoTree?: string;
+  /** The superproject paths outside that repository that changed since — none a suite inside it reads. */
+  outside?: string[];
 };
 
 /** Everything the console concluded about one phase's proofs, before it verified. */
@@ -78,6 +96,22 @@ export function isPaperwork(path: string): boolean {
 }
 
 const TREE = /^[0-9a-f]{40,64}$/;
+
+/**
+ * The directory a §Verification line moves into before it runs — the `<path>`
+ * of a leading `cd <path> &&`, relative and plain (no `..`, no expansion, no
+ * quote inside) — or null. The bash writer reads the line by the same rule
+ * (`scripts/phase-outcome.sh`, `cd_re`), so the two agree on which proofs carry
+ * a repository key.
+ */
+export function lineDirOf(command: string): string | null {
+  const match = /^cd\s+([^\s;&|]+)\s*&&/.exec(command.trim());
+  if (!match) return null;
+  let dir = match[1]!.replace(/^(["'])(.*)\1$/, '$2');
+  dir = dir.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!dir || dir === '.' || dir.startsWith('/') || dir.startsWith('~') || dir.split('/').includes('..') || /[$`"'\\]/.test(dir)) return null;
+  return dir;
+}
 
 /**
  * The proofs one phase of one plan recorded, the LAST per command — a session
@@ -119,6 +153,8 @@ export function proofRows(file: string, slug: string, phase?: number): (Proof & 
       ...(typeof row.head === 'string' && row.head ? { head: row.head } : {}),
       at: typeof row.at === 'string' ? row.at : '',
       ...(typeof row.session_id === 'string' && row.session_id ? { session: row.session_id } : {}),
+      ...(typeof row.repo === 'string' && row.repo && typeof row.repo_tree === 'string' && TREE.test(row.repo_tree)
+        ? { repo: row.repo, repoTree: row.repo_tree } : {}),
     });
   }
   return [...out.values()];
@@ -152,9 +188,48 @@ export async function judgeProofs(opts: {
     if (!diffs.has(tree)) diffs.set(tree, treeChanges(current.top, tree, current.tree).catch(() => null));
     return diffs.get(tree)!;
   };
+  // The line's own repository, read once per path (#301): its working tree now,
+  // when `<cwd>/<path>` stands in another repository than the judged tree's.
+  const lineRepos = new Map<string, Promise<{ top: string; tree: string } | null>>();
+  const lineRepo = (dir: string) => {
+    if (!lineRepos.has(dir)) {
+      lineRepos.set(dir, workingTreeOf(join(opts.cwd, dir)).then((sub) => (
+        sub && realish(sub.top) !== realish(current.top) ? { top: sub.top, tree: sub.tree } : null
+      )).catch(() => null));
+    }
+    return lineRepos.get(dir)!;
+  };
   for (const proof of recorded.values()) {
     if (proof.code !== 0) {
       refused.push({ command: proof.command, why: `it exited ${proof.code} when the session ran it — a red is not a proof` });
+      continue;
+    }
+    // A `cd <sub> && …` line is judged by its own repository (#301): keyed
+    // `{repo, repoTree}`, its tree must match (bar paperwork); with no key — an
+    // older proof — the superproject's changes outside `<sub>/` are not paths
+    // a suite inside it reads.
+    const dir = lineDirOf(proof.command);
+    const sub = dir ? await lineRepo(dir) : null;
+    if (sub && dir && proof.repo === dir && proof.repoTree) {
+      const inside = await treeChanges(sub.top, proof.repoTree, sub.tree).catch(() => null);
+      if (inside === null) {
+        refused.push({ command: proof.command, why: `the proven tree of ${dir} is not an object of that repository` });
+        continue;
+      }
+      const real = inside.filter((path) => !isPaperwork(path));
+      if (real.length) {
+        refused.push({
+          command: proof.command,
+          why: `${dir} changed since it was proven (${real.length} path${real.length === 1 ? '' : 's'} its suite may read)`,
+          changed: real.slice(0, 20).map((path) => `${dir}/${path}`),
+        });
+        continue;
+      }
+      const outside = ((await changesSince(proof.tree)) ?? []).filter((path) => !within(path, dir));
+      proven.set(proof.command, {
+        tree: proof.tree, at: proof.at, ...(proof.session ? { session: proof.session } : {}), paperwork: inside,
+        repo: dir, repoTree: proof.repoTree, ...(outside.length ? { outside: outside.slice(0, 20) } : {}),
+      });
       continue;
     }
     const changed = await changesSince(proof.tree);
@@ -162,7 +237,8 @@ export async function judgeProofs(opts: {
       refused.push({ command: proof.command, why: 'the proven tree is not an object of this repository' });
       continue;
     }
-    const real = changed.filter((path) => !isPaperwork(path));
+    const scoped = sub && dir ? changed.filter((path) => within(path, dir)) : changed;
+    const real = scoped.filter((path) => !isPaperwork(path));
     if (real.length) {
       refused.push({
         command: proof.command,
@@ -171,8 +247,11 @@ export async function judgeProofs(opts: {
       });
       continue;
     }
+    const outside = sub && dir ? changed.filter((path) => !within(path, dir)) : [];
     proven.set(proof.command, {
-      tree: proof.tree, at: proof.at, ...(proof.session ? { session: proof.session } : {}), paperwork: changed,
+      tree: proof.tree, at: proof.at, ...(proof.session ? { session: proof.session } : {}),
+      paperwork: scoped.filter(isPaperwork),
+      ...(outside.length ? { repo: dir!, outside: outside.slice(0, 20) } : {}),
     });
   }
   return { recorded, proven, refused, tree: current.tree };

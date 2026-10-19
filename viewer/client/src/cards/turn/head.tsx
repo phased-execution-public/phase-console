@@ -6,7 +6,10 @@
  *      person's (`readinessShown`); the type's mark (Approval · Task · Decision ·
  *      Heads-up, `TYPE_META`); the person's status as a dot and a word (the
  *      typed family's `turn` member); Inspect at the end;
- *   2. the title — the act, as the composer said it;
+ *   2. the title — the act, as the composer said it (sentence case, at most 80
+ *      characters, #377) — with the plan's errand ref as a chip beside it, the
+ *      whole words beneath it when the title had to cut them, and a landing
+ *      errand's files folded under *Details*, grouped by repository;
  *   3. the meta — the plan, the phase, the run, what it unblocks, the effort —
  *      each its own fact and each a link where it can be one (never a dotted
  *      string);
@@ -21,6 +24,8 @@ import type { TurnItem } from '@/data/turn';
 import { cn } from '@/lib/cn';
 import { phaseHref, planHref, runHref } from '@/shell/routes';
 import { Button } from '@/ui';
+import { CopyButton } from '@/ui/copy-button';
+import { Disclosure } from '@/ui/disclosure';
 import { TurnReadiness, TurnStatus } from '@/ui/status';
 
 const link = 'tap-row text-ink underline decoration-rule-strong underline-offset-2 hover:decoration-ink';
@@ -142,6 +147,55 @@ export function WhyLine({
   );
 }
 
+/** "12 files in aws · 3 in web" — the server's `landingFilesWords`, said the same way. */
+export function filesWords(files: NonNullable<TurnItem['files']>): string {
+  return files
+    .filter((group) => group.paths.length)
+    .map(
+      (group, i) =>
+        `${group.paths.length}${i === 0 ? ` file${group.paths.length === 1 ? '' : 's'}` : ''} in ${group.repo}`,
+    )
+    .join(' · ');
+}
+
+/** A landing errand's files, folded under *Details*: each repository's paths, and one copy of them all. */
+export function FilesDetails({ files }: { files: NonNullable<TurnItem['files']> }) {
+  const groups = files.filter((group) => group.paths.length);
+  if (!groups.length) return null;
+  const all = groups.map((group) => [`# ${group.repo}`, ...group.paths].join('\n')).join('\n\n');
+  return (
+    <Disclosure
+      label={`Details — ${filesWords(groups)}`}
+      openLabel="Hide the details"
+      testId="turn-files-toggle"
+      bodyClassName="flex min-w-0 flex-col gap-3 pt-2"
+    >
+      <div data-testid="turn-files" className="flex min-w-0 flex-col gap-3">
+        {groups.map((group) => (
+          <section key={group.repo} className="flex min-w-0 flex-col gap-1">
+            <h4 className="text-meta font-medium text-ink">
+              {group.paths.length} {group.paths.length === 1 ? 'file' : 'files'} in {group.repo}
+            </h4>
+            <ul className="flex min-w-0 flex-col gap-0.5">
+              {group.paths.map((path) => (
+                <li key={path} className="font-mono text-meta break-all text-ink-muted">
+                  {path}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))}
+        <CopyButton
+          text={all}
+          label="Copy the file list"
+          className="self-start"
+          data-testid="turn-files-copy"
+        />
+      </div>
+    </Disclosure>
+  );
+}
+
 export function Head({
   item,
   titleId,
@@ -186,9 +240,26 @@ export function Head({
           </Button>
         )}
       </div>
-      <h3 id={titleId} data-testid="turn-title" className="max-w-prose text-section font-semibold text-ink">
-        {title}
-      </h3>
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+        <h3 id={titleId} data-testid="turn-title" className="max-w-prose text-section font-semibold text-ink">
+          {title}
+        </h3>
+        {item.errandRef && (
+          <span
+            data-testid="turn-errand-ref"
+            title={`The plan's errand ${item.errandRef}`}
+            className="rounded-sm border border-rule px-1.5 font-mono text-meta text-ink-muted"
+          >
+            {item.errandRef}
+          </span>
+        )}
+      </div>
+      {item.headline && item.headline !== title && (
+        <p data-testid="turn-headline" className="max-w-prose text-meta break-words text-ink-muted">
+          {item.headline}
+        </p>
+      )}
+      {item.files?.length ? <FilesDetails files={item.files} /> : null}
     </header>
   );
 }

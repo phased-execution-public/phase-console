@@ -36,7 +36,9 @@
 #             blocker class as its short form (NEED_CLASSES: lock permission
 #             credential gate external). Read by the runner BEFORE the prose
 #             (chapter 10 ZTD-3): `blocked-declared:unknown` then means "a key
-#             the manifest lacks", a defect report, not 39 % of asks.
+#             the manifest lacks", a defect report, not 39 % of asks. Two keys
+#             are read as a sub-kind of their own spelling: `human-acts` and
+#             `issues` (`blocked-declared:issues`, one-pool phase 14, #349).
 #   --rule / --command  optional structured fields for a permission block —
 #             the rule that refused and the command it refused — beside --needs.
 #   --run-act ACT  blocked --needs run ONLY (turn-by-turn phase 6, #286): an act
@@ -395,76 +397,11 @@ _watch_problem() {  # _watch_problem <ref>
   esac
 }
 
-# The command a cmd: ref runs — the ref's own quote pair is punctuation, exactly
-# as `watch-refs.ts` `parseWatchRef` strips it.
-_cmd_body() {  # _cmd_body <ref>
-  printf '%s' "${1#cmd:}" | sed "s/^[[:space:]]*//; s/[[:space:]]*\$//; s/^\"\\(.*\\)\"\$/\\1/; s/^'\\(.*\\)'\$/\\1/" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
-}
-
-# Does every quote in <text> close? Backslash escapes outside single quotes, as
-# the shell the console runs it in reads them (control-tower phase 88, #125).
-_quotes_balanced() {  # _quotes_balanced <text>
-  local s="$1" i=0 n="${#1}" c q=""
-  while [ "$i" -lt "$n" ]; do
-    c="${s:$i:1}"
-    if [ -z "$q" ]; then
-      case "$c" in \\) i=$((i + 1)) ;; "'") q="'" ;; '"') q='"' ;; esac
-    elif [ "$q" = "'" ]; then
-      [ "$c" = "'" ] && q=""
-    else
-      case "$c" in \\) i=$((i + 1)) ;; '"') q="" ;; esac
-    fi
-    i=$((i + 1))
-  done
-  [ -z "$q" ]
-}
-
-# The first word of <command> that is a path relative to the session's working
-# directory, or nothing. The console runs a cmd: ref from ITS root, so such a
-# path names another file, or none (#152). Read as words with the quotes
-# dropped; a flag, a URL, an assignment, `owner/repo` after -R/--repo and a sed
-# expression are not paths. The JS twin is `watch-refs.ts` `relativePathIn`.
-_relative_path_in() {  # _relative_path_in <command>
-  local words word prev="" found=""
-  words="$(printf '%s' "$1" | tr "\"'" '  ')"
-  set -f
-  for word in $words; do
-    case "$prev" in -R|--repo) prev="$word"; continue ;; esac
-    prev="$word"
-    case "$word" in
-      ./*|../*) found="$word"; break ;;
-      /*|\~*|-*|*://*|*=*|s/*|y/*) continue ;;
-      */*) ;;
-      *) continue ;;
-    esac
-    case "$word" in *[!A-Za-z0-9._/@+-]*) continue ;; esac
-    if printf '%s' "$word" | grep -Eq '/.*/|\.[A-Za-z0-9]{1,8}$'; then found="$word"; break; fi
-  done
-  set +f
-  [ -n "$found" ] && printf '%s' "$found"
-  return 0
-}
-
-# Why the console could not run a cmd: ref AS WRITTEN — the shapes that exit 2
-# here rather than park on a ref nothing can land (control-tower phase 88, #125,
-# #152). A cmd: ref is self-contained: absolute paths, no shell variable, no
-# substitution, every quote closed. The console's own policy is asked too, at
-# declaration (`_probe_declaration`), and its refusal also exits 2.
-_cmd_ref_problem() {  # _cmd_ref_problem <ref>
-  local body rel
-  body="$(_cmd_body "$1")"
-  case "$body" in
-    *'$'*) printf '%s' 'it carries a shell variable or substitution ($) — the console runs a cmd: ref in a shell of its own, where your session'"'"'s variables do not exist; write the value out'; return 0 ;;
-    *'`'*) printf '%s' 'it carries a command substitution (a backtick) whose inner command the console cannot judge'; return 0 ;;
-  esac
-  if ! _quotes_balanced "$body"; then
-    printf '%s' 'its quoting does not balance (a quote never closes) — the console would refuse it as unreadable; close every quote'
-    return 0
-  fi
-  rel="$(_relative_path_in "$body")"
-  [ -n "$rel" ] && printf '%s' "it names a relative path ($rel) — the console runs a cmd: ref from its own root, not your working directory; write the absolute path"
-  return 0
-}
+# The command a cmd: ref runs (`_cmd_body`), whether its quoting closes
+# (`_quotes_balanced`), the first relative path it names (`_relative_path_in`)
+# and why the console could not run it as written (`_cmd_ref_problem`) live in
+# ONE sourced file, `cmd-ref.sh`, which the plan lint (F45) reads too.
+. "$SCRIPT_DIR/cmd-ref.sh"
 
 # Advice for a well-formed ref the console has a better scheme for — printed,
 # never refused: a handoff's status is console state (`phase:`), and a workflow
@@ -1271,7 +1208,28 @@ if [ "$mode" = proof ]; then
   command_text="$(printf '%s' "$command_text" | tr '\n\t' '  ' | tr -s ' ' | sed 's/^ //; s/ $//')"
   head_json="$( [ -n "$head_sha" ] && printf ',"head":"%s"' "$head_sha" || true )"
   session_json="$( [ -n "$session" ] && printf ',"session_id":"%s"' "$session" || true )"
-  line="{\"version\":1,\"type\":\"proof\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"command\":\"$(_json_str "$command_text")\",\"code\":$((10#$exit_code)),\"tree\":\"$tree\"${head_json},\"at\":\"$(_json_str "$now")\"${session_json}}"
+  # The repository a `cd <path> && …` line runs in (one-pool phase 20, #301):
+  # when <path> stands in ANOTHER repository than the judged tree's — a
+  # submodule of the superproject — that repository's own working tree keys
+  # the proof too, so a commit elsewhere in the superproject (a handoff, an
+  # audit doc) leaves it standing. Measured: two docs commits in hub's root
+  # voided six `cd <repo> && … verify:local` proofs and re-ran ~1.9 h of suites.
+  repo_json=""
+  cd_re='^cd[[:space:]]+([^[:space:];&|]+)[[:space:]]*&&'
+  if [[ "$command_text" =~ $cd_re ]]; then
+    line_repo="${BASH_REMATCH[1]}"
+    line_repo="${line_repo#\"}"; line_repo="${line_repo%\"}"; line_repo="${line_repo#\'}"; line_repo="${line_repo%\'}"
+    line_repo="${line_repo#./}"; line_repo="${line_repo%/}"
+    case "$line_repo" in ''|.|/*|*..*|*'$'*|'~'*|*'`'*|*'"'*|*"'"*|*'\'*) line_repo="" ;; esac
+    if [ -n "$line_repo" ] && [ -d "$where/$line_repo" ]; then
+      sub_top="$(git -C "$where/$line_repo" rev-parse --show-toplevel 2>/dev/null || true)"
+      if [ -n "$sub_top" ] && [ "$(cd "$sub_top" && pwd -P)" != "$(cd "$top" && pwd -P)" ]; then
+        sub_tree="$(_proof_tree "$sub_top")"
+        [ -n "$sub_tree" ] && repo_json="$(printf ',"repo":"%s","repo_tree":"%s"' "$(_json_str "$line_repo")" "$sub_tree")"
+      fi
+    fi
+  fi
+  line="{\"version\":1,\"type\":\"proof\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"command\":\"$(_json_str "$command_text")\",\"code\":$((10#$exit_code)),\"tree\":\"$tree\"${repo_json}${head_json},\"at\":\"$(_json_str "$now")\"${session_json}}"
   if [ -n "${PE_PROOFS_FILE:-}" ]; then
     ledger="$PE_PROOFS_FILE"
     if mkdir -p "$(dirname "$ledger")" 2>/dev/null && printf '%s\n' "$line" >> "$ledger" 2>/dev/null; then

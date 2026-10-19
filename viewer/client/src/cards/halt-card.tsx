@@ -572,6 +572,7 @@ export function HaltRow({
   );
 }
 
+
 export function HaltCard({
   run,
   variant = 'full',
@@ -609,6 +610,8 @@ export function HaltCard({
     refs.every((r) => r.state === 'refused');
   const tree = recordFor?.verification?.ran?.find((r) => !r.ok && r.tree)?.tree;
   const budget = view.budget && view.budget.budget !== 'streak' ? (view.budget as BudgetFact) : null;
+  // A reached spend cap says the composer's words and offers its own three ways (one-pool phase 11).
+  const capWall: { words?: string; body?: string; actions?: ReactNode } = {};
 
   return (
     <section
@@ -634,18 +637,19 @@ export function HaltCard({
           <p className="text-meta text-ink-muted">The console picked this run back up. What stopped it:</p>
         )}
         <p data-testid="halt-sentence" className="max-w-prose text-section font-semibold text-ink">
-          {budget ? budgetHeadline(budget, 'spent') : view.sentence}
+          {capWall.words ?? (budget ? budgetHeadline(budget, 'spent') : view.sentence)}
         </p>
         {!live && (
           <p data-testid="halt-fix" className="max-w-prose text-body text-ink-muted">
-            {HALT_CATEGORY_FIX[view.category]}
+            {capWall.body ?? HALT_CATEGORY_FIX[view.category]}
           </p>
         )}
       </header>
 
       {!live && (
         <div className="flex min-w-0 flex-col gap-3">
-          {budget && <BudgetRaise slug={run.slug} phase={view.phase} fact={budget} />}
+          {capWall.actions}
+          {budget && !capWall.actions && <BudgetRaise slug={run.slug} phase={view.phase} fact={budget} />}
           {view.streak && <StreakLine slug={run.slug} count={view.streak.count} max={view.streak.max} />}
           {view.roots.length > 0 && (
             <ul data-testid="halt-roots" className="flex flex-col gap-0.5 text-meta text-ink-muted">
@@ -686,15 +690,17 @@ export function HaltCard({
           )}
           {children}
           {/* The recommended verb, first and alone; every other way forward is
-              one press behind it. */}
-          <RecoveryActions
-            target={targetOf(run, view, target)}
-            ctx={{ ...view.ctx, run }}
-            max={1}
-            legend
-            leadTestId="halt-recommended"
-            {...(parts ? { parts } : {})}
-          />
+              one press behind it. A reached cap's three ways are its own, above. */}
+          {!capWall.actions && (
+            <RecoveryActions
+              target={targetOf(run, view, target)}
+              ctx={{ ...view.ctx, run }}
+              max={1}
+              legend
+              leadTestId="halt-recommended"
+              {...(parts ? { parts } : {})}
+            />
+          )}
         </div>
       )}
 

@@ -872,9 +872,12 @@ function realTruth(): SurfaceTruth {
     blockKeys(read('viewer/server/retention-policy.ts') ?? '', 'export type RetentionPolicy = {'),
     'the retention policy',
   );
+  // A run field is free when the free build of `shared/run-settings.js` still names it — one
+  // listed only inside a `!pro:` region (one-pool phase 7's `poolPolicy`) is Pro's.
+  const runSettingsFree = freeText(read('viewer/shared/run-settings.js') ?? '');
   add(
     'run.',
-    new Map([...new Set([...RUN_START_FIELDS, ...RUN_SETTINGS_FIELDS])].map((field) => [field, true])),
+    new Map([...new Set([...RUN_START_FIELDS, ...RUN_SETTINGS_FIELDS])].map((field) => [field, runSettingsFree.includes(`'${field}'`)])),
     "a run's fields (`RUN_START_FIELDS`, `RUN_SETTINGS_FIELDS`)",
   );
   add(

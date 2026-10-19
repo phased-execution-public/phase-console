@@ -238,6 +238,11 @@ export class Mcp {
     headers?: Record<string, string>;
     secretRefs?: McpSecretRef[];
     secrets?: Record<string, string>;
+    /**
+     * A value for each `${VAR}` the configuration writes, held like a secret
+     * and spliced at spawn (one-pool phase 19, #363). Each becomes a `var` ref.
+     */
+    vars?: Record<string, string>;
     alwaysLoad?: boolean;
     timeoutMs?: number;
     source?: 'manual' | 'catalog' | 'imported';
@@ -258,6 +263,18 @@ export class Mcp {
       assertSafeUrl(url);
     }
 
+    // Every `${VAR}` given a value is a `var` ref, so the value is held where
+    // a secret is and the row says the variable is supplied.
+    const varRefs = Object.entries(input.vars ?? {})
+      .filter(([, value]) => typeof value === 'string' && value.trim())
+      .map(([name]) => assertVarName(name));
+    const secretRefs = [
+      ...(input.secretRefs ?? []).filter((ref) => !(ref.kind === 'var' && varRefs.includes(ref.name))),
+      ...varRefs.map((name) => ({ kind: 'var' as const, name })),
+    ];
+    const secrets: Record<string, string> = { ...(input.secrets ?? {}) };
+    for (const name of varRefs) secrets[`var:${name}`] = input.vars![name]!.trim();
+
     const meta: McpServerMeta = {
       id,
       transport,
@@ -273,7 +290,7 @@ export class Mcp {
             url: input.url!.trim(),
             ...(input.headers && Object.keys(input.headers).length ? { headers: input.headers } : {}),
           }),
-      ...(input.secretRefs?.length ? { secretRefs: input.secretRefs } : {}),
+      ...(secretRefs.length ? { secretRefs } : {}),
       ...(input.alwaysLoad ? { alwaysLoad: true } : {}),
       ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
       ...(input.source ? { source: input.source } : {}),
@@ -296,7 +313,7 @@ export class Mcp {
     const stored: McpSecretRef[] = [];
     try {
       for (const ref of meta.secretRefs ?? []) {
-        const secret = input.secrets?.[refKey(ref)];
+        const secret = secrets[refKey(ref)];
         if (!secret) continue;
         await this.creds.store(id, ref, secret);
         stored.push(ref);
@@ -333,6 +350,38 @@ export class Mcp {
     // A new credential can only change the answer, so stop reusing the old one.
     this.health.delete(id);
     this.changed();
+  }
+
+  /**
+   * Fill in the `${VAR}`s a registration left unfinished (#363) — the row's
+   * *Fill it in*, the verb's `mcp fill`. Each value is stored first, as a
+   * secret is, and only then declared as a `var` ref, so a keychain that
+   * refuses leaves the server exactly as unfinished as it was. A name the
+   * configuration does not write is refused: a value nothing splices is a
+   * place to put secrets and forget them.
+   */
+  async fillVars(id: string, vars: Record<string, string>): Promise<McpServerView> {
+    const meta = this.store.get(id);
+    if (!meta) throw new Error(`no MCP server called ${id}`);
+    const written = writtenVars(meta);
+    const entries = Object.entries(vars).filter(([, value]) => typeof value === 'string' && value.trim());
+    if (!entries.length) throw new Error('give a value for each variable — an empty one fills nothing');
+    for (const [name] of entries) {
+      assertVarName(name);
+      if (!written.includes(name)) {
+        throw new Error(
+          `${id}'s configuration does not refer to \${${name}} — it refers to ${written.length ? written.map((v) => `\${${v}}`).join(', ') : 'no variable'}`,
+        );
+      }
+    }
+    for (const [name, value] of entries) await this.creds.store(id, { kind: 'var', name }, value.trim());
+    const refs = meta.secretRefs ?? [];
+    const added = entries.map(([name]) => name).filter((name) => !refs.some((ref) => ref.kind === 'var' && ref.name === name));
+    const next = added.length ? this.store.update(id, { secretRefs: [...refs, ...added.map((name) => ({ kind: 'var' as const, name }))] }) : meta;
+    this.health.delete(id);
+    this.changed();
+    log.info('mcp.vars-filled', { server: id, vars: entries.map(([name]) => name) });
+    return this.view(next ?? meta);
   }
 
   async rename(id: string, label: string): Promise<McpServerView | undefined> {
@@ -508,7 +557,7 @@ export class Mcp {
   /** The same document a run would get, with every secret masked. */
   async previewFor(ids: readonly string[]): Promise<McpConfigDoc> {
     const { servers } = this.resolve(ids);
-    return redactConfig(await buildMcpConfig(servers, this.creds));
+    return redactConfig(await buildMcpConfig(servers, this.creds, { vars: false }));
   }
 
   /* ---------------- internals ---------------- */
@@ -650,8 +699,17 @@ export class Mcp {
 export function unresolvedVars(meta: McpServerMeta): string[] {
   const supplied = new Set([
     ...Object.keys(meta.env ?? {}),
-    ...(meta.secretRefs ?? []).filter((ref) => ref.kind === 'env').map((ref) => ref.name),
+    // `var` — a value this console holds and splices itself (#363).
+    ...(meta.secretRefs ?? []).filter((ref) => ref.kind === 'env' || ref.kind === 'var').map((ref) => ref.name),
   ]);
+  return writtenVars(meta, { withDefaults: false }).filter((name) => !supplied.has(name) && !process.env[name]);
+}
+
+/**
+ * Every `${VAR}` this server's own configuration writes, in order, once each.
+ * `${VAR:-default}` supplies its own and is left out unless asked for.
+ */
+export function writtenVars(meta: Pick<McpServerMeta, 'command' | 'args' | 'url' | 'headers' | 'env'>, opts: { withDefaults?: boolean } = {}): string[] {
   const haystack = [
     meta.command ?? '', ...(meta.args ?? []), meta.url ?? '',
     ...Object.values(meta.headers ?? {}), ...Object.values(meta.env ?? {}),
@@ -659,11 +717,18 @@ export function unresolvedVars(meta: McpServerMeta): string[] {
   const out: string[] = [];
   for (const match of haystack.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(:-[^}]*)?\}/g)) {
     const [, name, fallback] = match;
-    if (fallback) continue;
-    if (supplied.has(name) || process.env[name]) continue;
-    if (!out.includes(name)) out.push(name);
+    if (fallback && opts.withDefaults === false) continue;
+    if (!out.includes(name!)) out.push(name!);
   }
   return out;
+}
+
+/** A variable's name as a shell would accept it — the shape `${…}` is matched by. */
+function assertVarName(name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error(`${JSON.stringify(name)} is not a variable name — letters, digits and _ only, not starting with a digit`);
+  }
+  return name;
 }
 
 /**

@@ -31,6 +31,10 @@
    (`screens/plan/map/route-map.css`). */
 @import './prose.css';
 @import './console.css';
+/* The second palette, Departures (#362): the 6.x room, chosen in Settings ▸
+   Appearance. One block under `:root[data-palette='departures']`, which
+   outranks `:root` by specificity, so its place in the file does not matter. */
+@import './departures.css';
 
 /* ------------------------------------------------------------------ *
  * Fonts — vendored, hashed by Vite (no network at runtime, ever)
@@ -145,6 +149,9 @@
   /* The narrowest a run row's name may get before the row wraps instead —
      a row with no legible name is a coloured bar. */
   --strip-name-floor: 12ch;
+  /* The narrowest a run row's folded track may get on the desk line: below it
+     the list gives the track a line of its own (#342). */
+  --strip-track-floor: 14rem;
   --text-input: 16px;
   /* The shell's height. lib/viewport.ts overwrites it with the visual
      viewport's real height while the software keyboard is up (iOS never

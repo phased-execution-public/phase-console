@@ -361,3 +361,4 @@ test('SL-8: the settings door names the `switch-account` verb for `accountId`, a
     assert.equal(readRun(root, run.id).accountId, undefined, 'the account did not move through the settings door');
   } finally { cleanup(); }
 });
+

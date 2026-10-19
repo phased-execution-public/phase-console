@@ -4,7 +4,8 @@
  * plus the approvals its sessions hold, the start's prelude and the money.
  */
 
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { useMemo } from 'react';
+import { keepPreviousData, useQueries, useQuery } from '@tanstack/react-query';
 import { api, runList, runStrip, type PreludeDraft } from './api';
 import { q, request } from './http';
 import { keys } from './keys';
@@ -81,6 +82,33 @@ export function useRun(slug: string | undefined, enabled = true) {
     enabled: Boolean(slug) && enabled,
     placeholderData: keepPreviousData,
   });
+}
+
+/**
+ * The whole records of a few named runs, by slug — the Sessions rows' lanes
+ * (#369): each live run's account, spend, tasks and clocks live only on its
+ * whole record, never on the slim list. Under `useRun`'s own key, so the live
+ * events that keep the run page fresh keep these fresh too; a handful of
+ * reads, never the run list.
+ */
+export function useRunRecords(slugs: readonly string[], enabled = true) {
+  const results = useQueries({
+    queries: slugs.map((slug) => ({
+      queryKey: keys.run(slug),
+      queryFn: () => api.run(slug),
+      enabled,
+      placeholderData: keepPreviousData,
+    })),
+  });
+  const bySlug = useMemo(() => {
+    const map = new Map<string, NonNullable<(typeof results)[number]['data']>>();
+    results.forEach((result, i) => {
+      if (result.data) map.set(slugs[i]!, result.data);
+    });
+    return map;
+    // `results` is a fresh array each render (the `usePlanDetails` trade).
+  }, [results, slugs]);
+  return { bySlug };
 }
 
 /**

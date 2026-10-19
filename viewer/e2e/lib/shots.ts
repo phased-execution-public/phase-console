@@ -14,7 +14,8 @@
  * Plain enough for `node --test` to import (`test/dist-dir.test.ts` holds the
  * tour to one PNG per stop): no runtime import of Playwright.
  */
-import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -45,8 +46,12 @@ export type Stop = { name: string; hash: string; overlay?: Overlay };
 export const STOPS: readonly Stop[] = [
   ...DESTINATIONS.map((d) => ({ name: d, hash: `#/${d}` })),
   ...PLAN_TABS.map((t) => ({ name: `plan-${t}`, hash: `#/plan/${TOUR_PLAN}/${t}` })),
-  // Your turn (control-tower phase 137) — the head that replaced `#/approve`, an item in every group
-  { name: 'turn', hash: '#/turn' },
+  // Your turn (control-tower phase 137; a destination since one-pool phase 14, so `turn` itself is
+  // derived above as the list): its other three views — the cards as 7.1 drew them, an item in
+  // every group, the board in a lane per plan, and the timeline
+  { name: 'turn-cards', hash: '#/turn?view=cards&tab=all' },
+  { name: 'turn-board', hash: '#/turn?view=board&group=plan&tab=all' },
+  { name: 'turn-timeline', hash: '#/turn?view=timeline' },
   // The Issues desk (control-tower phase 118): the fixture's added repository, every state and reading
   { name: 'repo-issues', hash: '#/repo/issues?state=all' },
   // Sessions ▸ Locks (#24; 7.0's section, quiet-console phase 15): the live lane's claim on its grid
@@ -80,6 +85,60 @@ export const STOPS: readonly Stop[] = [
 ];
 
 export const shotPath = (project: string, stop: string): string => join(SHOTS_DIR, project, `${stop}.png`);
+
+/**
+ * What a tour was asked to photograph, beside its pictures: one
+ * `e2e/.shots/<project>/.tour.json` per viewport — the stops it was given, the
+ * build it toured and when. `test/dist-dir.test.ts` holds the pictures to it
+ * (#353): a folder left by a tour of another route table (fewer stops, or none
+ * of today's) is named stale for what it is, rather than read as a tour of
+ * this tree that forgot sixty-four stops.
+ */
+export type TourStamp = { rev: string | null; stops: string[]; at: string };
+export const stampPath = (project: string): string => join(SHOTS_DIR, project, '.tour.json');
+
+/** The build the tour serves: the production build's own stamp, else the tree's HEAD. */
+function tourRev(): string | null {
+  const dist = process.env.PHASE_CONSOLE_DIST_DIR;
+  if (dist) {
+    try {
+      return readFileSync(join(dist, '.build-rev'), 'utf8').trim() || null;
+    } catch {
+      /* a build with no stamp: say the tree's */
+    }
+  }
+  const head = spawnSync('git', ['rev-parse', '--short=12', 'HEAD'], {
+    cwd: fileURLToPath(new URL('.', import.meta.url)),
+    encoding: 'utf8',
+  });
+  return head.status === 0 ? head.stdout.trim() || null : null;
+}
+
+/** Stamp this viewport's folder with today's stops — once per worker, atomically. */
+export function stampTour(project: string): void {
+  const stamp: TourStamp = { rev: tourRev(), stops: STOPS.map((s) => s.name), at: new Date().toISOString() };
+  const was = readStamp(project);
+  if (was && was.rev === stamp.rev && was.stops.join('\n') === stamp.stops.join('\n')) return;
+  const path = stampPath(project);
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(stamp, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+export function readStamp(project: string): TourStamp | null {
+  try {
+    const parsed = JSON.parse(readFileSync(stampPath(project), 'utf8')) as Partial<TourStamp>;
+    if (!Array.isArray(parsed.stops)) return null;
+    return {
+      rev: typeof parsed.rev === 'string' ? parsed.rev : null,
+      stops: parsed.stops,
+      at: String(parsed.at ?? ''),
+    };
+  } catch {
+    return null;
+  }
+}
 
 /** What the fixture wrote into its library root — `e2e-fixture.json`. */
 export type Fixture = {

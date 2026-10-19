@@ -2,9 +2,10 @@
  * The bell — two questions, over whatever page you are on (7.0 in
  * quiet-console phase 5; `?bell=1`).
  *
- * **Needs you** is the inbox (`GET /api/inbox`): the rows the Runs page leads
- * with, drawn by the same `InboxRow`, with the same remedies doing the same
- * thing — one component over one query, so acting from either surface updates
+ * **Needs you** is a PREVIEW of the inbox (`GET /api/inbox`, #377): at most
+ * five rows, one line each, under the door to Your turn (`#/turn`), where every
+ * item is and where it is acted on. More than five says how many more wait
+ * there. One query with the Runs page, so acting from either surface updates
  * the other in the same tick.
  *
  * **Announcements** is the log of what the console has SAID — every row says
@@ -32,7 +33,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { X } from 'lucide-react';
-import { attentionCount } from '@shared/attention-model.js';
+import { SEVERITY_UI, attentionCount } from '@shared/attention-model.js';
+import { isDeliveryPlaceholder } from '@shared/ops-vocab.js';
 import {
   api,
   partitionAsks,
@@ -46,7 +48,8 @@ import { press } from '@/data/press';
 import { plural } from '@/lib/format';
 import { usePhone } from '@/lib/media';
 import { cn } from '@/lib/cn';
-import { InboxRow, useInboxActions } from '@/cards/inbox-row';
+import { useInboxActions } from '@/cards/inbox-row';
+import { TurnRowWords } from '@/cards/turn/row-words';
 import { useNavigate } from '@/shell/router';
 import {
   OVERLAY_KEYS,
@@ -57,6 +60,7 @@ import {
   plansHref,
   settingsHref,
   toHash,
+  turnHref,
   type PanelKey,
   type Route,
 } from '@/shell/routes';
@@ -204,11 +208,19 @@ function PanelScroller({ children, className }: { children: React.ReactNode; cla
   );
 }
 
+/** How many needs-you rows the bell previews; the rest wait on Your turn (#377). */
+export const PREVIEW_ROWS = 5;
+
 /**
- * The needs-you rows. `compact`: in a narrow sheet the plan-and-phase line is
- * what pushes the remedies below the fold, and a row's title names the plan.
+ * The needs-you PREVIEW (#377): at most five rows, one line each, and the door
+ * to the page at its top. The bell is where a person glances; Your turn is
+ * where they act — so a row here is its marks, its title cut to one line and
+ * its clock, and the remedies live on the page and the card. Live asks lead,
+ * as they do everywhere: a session stopped dead outranks an errand.
+ *
  * The bar offers acknowledgement only — a two-inch sheet is not where anyone
- * should be starting four recovery sessions.
+ * should be starting four recovery sessions. It acts on what is shown; its
+ * *Acknowledge all* names, in its confirm, every row that waits.
  */
 function NeedsYouPanel({
   items,
@@ -219,17 +231,24 @@ function NeedsYouPanel({
   loading: boolean;
   onOpen: (url: string) => void;
 }) {
-  const { perform, ack, ackMany, busy, bulkBusy } = useInboxActions();
+  const { ackMany, unackMany, bulkBusy } = useInboxActions();
   const rows = useMemo(() => items ?? [], [items]);
-  const pick = useSelection(rows);
-  const picked = useMemo(() => rows.filter((item) => pick.has(item.id)), [rows, pick]);
+  // Asks first, then the rest, each half in the server's own order — then cut.
+  const { asks, shown } = useMemo(() => {
+    const parts = partitionAsks(rows);
+    return { asks: parts.asks, shown: [...parts.asks, ...parts.rest].slice(0, PREVIEW_ROWS) };
+  }, [rows]);
+  const pick = useSelection(shown);
+  const picked = useMemo(() => shown.filter((item) => pick.has(item.id)), [shown, pick]);
   const unacked = useMemo(() => rows.filter((item) => !item.ack), [rows]);
+  const allAcked = picked.length > 0 && picked.every((item) => item.ack);
+  const more = rows.length - shown.length;
 
   if (loading && !items) {
     return (
-      <PanelScroller className="flex flex-col gap-3 p-4">
+      <PanelScroller className="flex flex-col gap-2 p-4">
         {[0, 1, 2].map((i) => (
-          <Skeleton key={i} className="h-16" />
+          <Skeleton key={i} className="h-7" />
         ))}
       </PanelScroller>
     );
@@ -250,40 +269,53 @@ function NeedsYouPanel({
     );
   }
 
-  // Live asks — sessions stopped dead until a person answers — above
-  // everything else that waits. Headed only when both halves exist; a heading
-  // over a list of everything says nothing.
-  const { asks, rest } = partitionAsks(items);
+  // Headed only when both halves are on screen; a heading over a list of
+  // everything says nothing.
+  const shownAsks = shown.filter((item) => asks.includes(item));
+  const shownRest = shown.filter((item) => !asks.includes(item));
   const row = (item: InboxItem) => (
-    <InboxRow
+    <PreviewRow
       key={item.id}
       item={item}
-      perform={perform}
-      ack={ack}
       checked={pick.has(item.id)}
       onCheck={(extend) => pick.toggle(item.id, extend)}
-      {...(busy ? { busy } : {})}
-      compact
       onOpen={onOpen}
     />
   );
 
   return (
     <>
+      {/* The door, above the list and outside its scroller: the page is where
+          every item is, and the drawer only ever shows a few of them. */}
+      <div className="flex min-w-0 shrink-0 items-center gap-3 border-b border-rule px-4 py-2">
+        <Button size="sm" variant="primary" asChild>
+          <a href={turnHref()} data-testid="bell-turn-door">
+            Open Your turn
+          </a>
+        </Button>
+        <span className="text-meta text-ink-muted tabular-nums">{plural(rows.length, 'thing')} waiting</span>
+      </div>
       <PanelScroller>
-        {!asks.length || !rest.length ? (
-          <ul className="flex flex-col gap-1 px-4 py-3">{items.map(row)}</ul>
+        {!shownAsks.length || !shownRest.length ? (
+          <ul className="flex flex-col gap-1 px-4 py-3">{shown.map(row)}</ul>
         ) : (
           <div className="flex flex-col gap-2 px-4 py-3">
             <SectionHeading as="h3" count={asks.length}>
               Sessions asking you
             </SectionHeading>
-            <ul className="flex flex-col gap-1">{asks.map(row)}</ul>
+            <ul className="flex flex-col gap-1">{shownAsks.map(row)}</ul>
             <SectionHeading as="h3" className="mt-3 border-t border-rule pt-3">
               Also waiting
             </SectionHeading>
-            <ul className="flex flex-col gap-1">{rest.map(row)}</ul>
+            <ul className="flex flex-col gap-1">{shownRest.map(row)}</ul>
           </div>
+        )}
+        {more > 0 && (
+          <p className="px-4 pb-3 text-meta" data-testid="bell-turn-more">
+            <a href={turnHref()} className="text-ink underline underline-offset-2">
+              {more} more on Your turn
+            </a>
+          </p>
         )}
       </PanelScroller>
       <SelectionBar
@@ -294,12 +326,15 @@ function NeedsYouPanel({
         onClear={pick.clear}
         verbs={[]}
         onVerb={() => {}}
+        // The word is the press: every ticked row already acknowledged puts
+        // them back; anything else acknowledges.
+        acknowledgeLabel={allAcked ? 'Put back' : 'Acknowledge'}
         onAcknowledge={() => {
           const undo = pick.ids;
-          ackMany(picked, () => pick.restore(undo));
+          if (allAcked) unackMany(picked.map((item) => item.id));
+          else ackMany(picked, () => pick.restore(undo));
           pick.clear();
         }}
-        allAcked={picked.length > 0 && picked.every((item) => item.ack)}
         busy={bulkBusy}
       >
         <ConfirmButton
@@ -328,6 +363,69 @@ function NeedsYouPanel({
   );
 }
 
+/**
+ * One needs-you row in the preview — ONE line: the pick, the card's marks (NOW
+ * or NOT YET and the type; the *when* is the page's), the title cut by CSS to
+ * the line it has (whole in the link's name and its hover), and the clock.
+ * Its leading edge wears the severity's paint, as the page's rows do.
+ */
+function PreviewRow({
+  item,
+  checked,
+  onCheck,
+  onOpen,
+}: {
+  item: InboxItem;
+  checked: boolean;
+  onCheck: (extend: boolean) => void;
+  onOpen: (url: string) => void;
+}) {
+  const href = toHash(item.href);
+  const since = Date.parse(item.since);
+  const paint = SEVERITY_UI[item.severity] ?? 'queued';
+  return (
+    <li
+      data-testid="inbox-row"
+      data-kind={item.kind}
+      data-severity={item.severity}
+      data-checked={checked || undefined}
+      className={cn(
+        `state-${paint}`,
+        'flex min-w-0 items-center gap-2 border-s-2 py-1.5 pe-1 ps-3',
+        item.ack ? 'border-rule-strong' : 'border-state',
+        checked && 'bg-surface-raised',
+      )}
+    >
+      <Checkbox
+        checked={checked}
+        onClick={(event) => onCheck(event.shiftKey)}
+        onCheckedChange={() => {}}
+        aria-label={`${checked ? 'Unpick' : 'Pick'} ${item.title}`}
+      />
+      <TurnRowWords
+        turn={item.turn && { ...item.turn, startWhen: undefined }}
+        className="shrink-0 flex-nowrap"
+      />
+      {/* `relative`: a positioned link hit-tests above the pick box's
+          thumb-floor overlay, which overhangs its 16 px box. */}
+      <a
+        href={href}
+        title={item.title}
+        aria-label={item.title}
+        onClick={(event) => {
+          if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
+          event.preventDefault();
+          onOpen(href);
+        }}
+        className="relative min-w-0 flex-1 truncate font-medium text-ink hover:underline"
+      >
+        {item.title}
+      </a>
+      {Number.isFinite(since) && <RelativeTime at={since} className="shrink-0 text-meta text-ink-faint" />}
+    </li>
+  );
+}
+
 /** Day headings, newest first, with the two everyone actually reads named. */
 export function groupByDay(items: NotificationRecord[]): [string, NotificationRecord[]][] {
   const today = new Date().toDateString();
@@ -351,7 +449,10 @@ export function groupByDay(items: NotificationRecord[]): [string, NotificationRe
 
 /** What became of one announcement, in the fewest words that are still true. */
 export function deliverySummary(item: NotificationRecord): { text: string; failed: boolean } {
-  const delivered = item.delivery ?? [];
+  // The two placeholders (`no-device`, `skipped`) name no device and are no
+  // failed handover: dropped before counting, so a ledger of only those reads
+  // as the empty one it stands for (#324).
+  const delivered = (item.delivery ?? []).filter((d) => !isDeliveryPlaceholder(d.outcome));
   if (!delivered.length) return { text: 'no device', failed: false };
   // `quiet` is a device inside its own quiet hours: nothing was attempted, on
   // purpose — neither a delivery nor a failure, or every night would read red.
@@ -583,20 +684,28 @@ export function DrawerBody({
         onToggleAll={pick.toggleAll}
         onClear={pick.clear}
         // Reading is this list's own verb; acknowledging is the other list's.
-        verbs={[{ verb: 'read', label: 'Mark read' }]}
-        onVerb={() => {
+        // *Delete* is the ticked rows' delete — said as one, never as an undo.
+        verbs={[
+          { verb: 'read', label: 'Mark read' },
+          { verb: 'delete', label: 'Delete' },
+        ]}
+        onVerb={(verb) => {
           const ids = pick.ids;
-          act(() => api.markNotificationsRead(ids));
+          if (verb === 'delete')
+            act(async () => {
+              for (const id of ids) await api.clearNotifications({ id });
+            });
+          else act(() => api.markNotificationsRead(ids));
           pick.clear();
         }}
+        // *Put back* is a real put-back (#334): the ticked records stay in the
+        // list, unread again. It once deleted them under this word.
+        acknowledgeLabel="Put back"
         onAcknowledge={() => {
           const ids = pick.ids;
-          act(async () => {
-            for (const id of ids) await api.clearNotifications({ id });
-          });
+          act(() => api.markNotificationsUnread(ids));
           pick.clear();
         }}
-        allAcked
         busy={busy}
       >
         {/* The whole-list verbs, in the bar the selection verbs use, so "for

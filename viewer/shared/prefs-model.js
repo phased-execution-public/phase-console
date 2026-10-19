@@ -42,6 +42,12 @@ export const THEMES = Object.freeze(/** @type {const} */ (['system', 'light', 'd
 /** How much room a row takes. */
 export const DENSITIES = Object.freeze(/** @type {const} */ (['comfortable', 'compact']));
 
+/**
+ * The room the page is drawn in, independent of light and dark (#362): `quiet`
+ * is 7.0's (the default), `departures` the 6.x room (`styles/departures.css`).
+ */
+export const PALETTES = Object.freeze(/** @type {const} */ (['quiet', 'departures']));
+
 /** What `autostart` holds for one console in the machine profile, as words: `once` starts the next boot and is spent. */
 export const AUTOSTART_WORDS = Object.freeze(/** @type {const} */ (['true', 'false', 'once']));
 
@@ -50,8 +56,8 @@ export const AUTOSTART_WORDS = Object.freeze(/** @type {const} */ (['true', 'fal
  *
  *   - `default` — nothing stores it: the value is the shipped default;
  *   - `config` — the person's file, `config.json` (the default console's only
- *     file; for every console the person-wide keys — theme, density, sort,
- *     model; and a console that has not saved yet reads it whole);
+ *     file; for every console the person-wide keys — theme, density, palette,
+ *     sort, model; and a console that has not saved yet reads it whole);
  *   - `instance` — this console's own file, `instances/<id>.json`;
  *   - `migrated` — derived from another key or an older spelling the loader
  *     still reads (a boolean `resumeAtBoot`, `settle` from
@@ -162,6 +168,11 @@ export const PREF_META = Object.freeze({
   ),
   theme: word(THEMES, 'appearance', 'The colour scheme: follow the device, or always light or always dark.'),
   density: word(DENSITIES, 'appearance', 'How much room a row takes.'),
+  palette: word(
+    PALETTES,
+    'appearance',
+    'The room the page is drawn in: Quiet (7.0) or Departures (the 6.x room), in either light.',
+  ),
   sort: row('appearance', 'string', 'How the plans library orders its plans.'),
   model: row('appearance', 'string', 'The model a session plan is sized for.'),
 
@@ -270,7 +281,7 @@ export const PREF_META = Object.freeze({
   }),
   loadGuardFactor: number(
     'factor',
-    "New work waits while the machine's load is above this many times its cores; 0 switches it off.",
+    'New work waits while the machine is busy: 1.5 holds at 85 % CPU over the last 30 s (the factor scales it) or a 5-minute load over this × cores × 2; 0 switches it off.',
     {
       writable: false,
       cli: `${QUEUE_POLICY} --load-factor <n>`,

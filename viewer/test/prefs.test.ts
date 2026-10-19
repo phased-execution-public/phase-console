@@ -437,7 +437,7 @@ test('every automation preference the loader accepts can also be SET', () => {
 
   // `notify` is a map with its own merge rule, and `lastRoot`/`recentRoots` are
   // written by opening a directory, not by a settings patch.
-  const skip = new Set(['notify', 'lastRoot', 'recentRoots', 'theme', 'density', 'sort']);
+  const skip = new Set(['notify', 'lastRoot', 'recentRoots', 'theme', 'density', 'palette', 'sort']);
   // A preference whose value is an OBJECT needs a hand-written "different"
   // value — flipping a boolean or bumping a number does not generalise — and it
   // needs a structural comparison, because its coercer necessarily returns a

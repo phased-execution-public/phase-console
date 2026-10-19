@@ -265,6 +265,31 @@ describe('windowed drawing: the DOM is the size of the frame, not of the plan', 
   });
 });
 
+describe('names at a size a person can read (#375)', () => {
+  const labelled = (container: HTMLElement) =>
+    [...container.querySelectorAll('.route-station')]
+      .filter((station) => station.querySelector('.route-station-label'))
+      .map((station) => Number(station.getAttribute('data-phase')));
+
+  it('draws numbers below a legible size, a name where it is asked for, and every name once it reads', () => {
+    measure(DESK);
+    const { container } = render(<RouteMap route={ROUTE} />);
+    // The rows' fit: a name would be under 9 px on screen, so none is drawn.
+    const opened = Number(screen.getByText(/^\d+%$/).textContent!.replace('%', '')) / 100;
+    expect(opened * MAP_CONSTANTS.MAP_TYPE).toBeLessThan(MAP_CONSTANTS.LEGIBLE_PX);
+    expect(labelled(container)).toEqual([]);
+    expect(container.querySelectorAll('.route-station-number').length).toBeGreaterThan(0);
+    // A pointer on a station asks for its name and its neighbours'.
+    const first = container.querySelector('.route-station')!;
+    fireEvent.mouseEnter(first);
+    expect(labelled(container)).toContain(Number(first.getAttribute('data-phase')));
+    fireEvent.mouseLeave(first);
+    // Closer in, every drawn station is named.
+    for (let i = 0; i < 6; i++) fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+    expect(labelled(container).length).toBe(drawnPhases(container).length);
+  });
+});
+
 describe('a minimap under a crowded plan', () => {
   it('draws the whole plan small — one track, one path per state — and the window on it', () => {
     measure(DESK);
@@ -459,13 +484,26 @@ describe('the keyboard reaches every station', () => {
     expect(first.getAttribute('tabindex')).toBe('-1');
   });
 
-  it('draws and brings into the window a station the frame had left behind', () => {
+  // Each ArrowRight re-lays the whole 71-station window, synchronously, so the
+  // walk's wall time is the machine's load times the number of presses (#316:
+  // 20 s timed out at load 90). It walks to the FIRST wave the frame left
+  // behind — the press that has to move the window — rather than to the end of
+  // the line, and the limit is the walk's own, not vitest's shared 20 s.
+  it('draws and brings into the window a station the frame had left behind', { timeout: 90_000 }, () => {
     measure(DESK);
     const { container } = render(<RouteMap route={ROUTE} focus={1} />);
-    const lastWave = ROUTE.nodes.filter((node) => node.layer === ROUTE.layers - 1).map((node) => node.phase);
-    for (const phase of lastWave) expect(drawnPhases(container)).not.toContain(phase);
-    // Right, wave after wave, to the end of the line.
-    for (let wave = 0; wave < ROUTE.layers - 1; wave++) {
+    const drawn = new Set(drawnPhases(container));
+    const waveOf = (layer: number) =>
+      ROUTE.nodes.filter((node) => node.layer === layer).map((node) => node.phase);
+    let target = 1;
+    while (target < ROUTE.layers && waveOf(target).some((phase) => drawn.has(phase))) target++;
+    expect(target, 'the frame draws every wave, so nothing is left behind to bring in').toBeLessThan(
+      ROUTE.layers,
+    );
+    const lastWave = waveOf(target);
+    for (const phase of lastWave) expect(drawn).not.toContain(phase);
+    // Right, wave after wave, to the first wave the frame had left behind.
+    for (let wave = 0; wave < target; wave++) {
       fireEvent.keyDown(
         document.activeElement?.classList.contains('route-station')
           ? document.activeElement

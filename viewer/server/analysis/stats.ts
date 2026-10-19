@@ -121,6 +121,8 @@ export type PlanStats = {
    */
   qaModeReason?: string;
   qaFailures: number[];
+  /** The open phases whose heading is GATED — the plan track's gate mark (#360). */
+  gated: number[];
   locks: { phase: number; owner: string; expired: boolean; leaseUntil?: number }[];
   repos: string[];
   handoffCount: number;
@@ -273,6 +275,7 @@ export function planStats(ctx: PlanContext, sizing: Sizing, mcp?: McpSizing, ses
     qaMode: qaMode.mode,
     ...(qaMode.reason ? { qaModeReason: qaMode.reason } : {}),
     qaFailures: record.qa.filter((q) => q.result === 'fail').map((q) => q.phase),
+    gated: rows.map((r) => r.phase).filter((n) => plan?.phases[n]?.gated && !board.done.includes(n)),
     locks: record.locks.map((l) => ({ phase: l.phase, owner: l.owner, expired: l.expired, leaseUntil: l.leaseUntil })),
     repos,
     handoffCount: record.handoffs.length,

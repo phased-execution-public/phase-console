@@ -73,6 +73,8 @@ const SECTION_RE = /^##\s+notes for later phases/i;
 const HEADING_RE = /^##\s/;
 const BULLET_RE = /^\s*[-*]\s/;
 const CONTINUATION_RE = /^\s+\S/;
+/** An indented bullet: under an addressed note, that note's continuation (#378). */
+const SUB_BULLET_RE = /^\s+[-*]\s/;
 
 /** A handoff, as `collectNotes` needs it — the caller reads the file. */
 export type NoteHandoff = {
@@ -133,7 +135,11 @@ export type CollectNotesInput = {
  *
  * A wrapped sentence is part of the note above it, not a second instruction.
  * Markdown wraps and a handoff is written by hand, so a note long enough to
- * matter is a note long enough to wrap.
+ * matter is a note long enough to wrap. An INDENTED bullet under an addressed
+ * note is its continuation too (#378), folded in behind ` - ` (ASCII): read as a bullet
+ * of its own it flushed the note and was dropped, so the note arrived as its
+ * first line alone. Under no address it stays a bullet. `_note_rows_of` in
+ * `phase-graph.sh` is the bash half; `notes-boot-parity.test.ts` holds them equal.
  */
 export function parseNoteSection(body: string): { target: string; text: string }[] {
   const out: { target: string; text: string }[] = [];
@@ -161,6 +167,11 @@ export function parseNoteSection(body: string): { target: string; text: string }
     if (raw.includes('<!--')) comment = true;
     if (comment) { if (raw.includes('-->')) comment = false; continue; }
 
+    if (target && SUB_BULLET_RE.test(raw)) {
+      const sub = raw.replace(/^\s+[-*]\s*/, '').trimEnd();
+      if (sub) text += ` - ${sub}`;
+      continue;
+    }
     if (BULLET_RE.test(raw)) {
       flush();
       let line = raw.replace(/^\s*[-*]\s*/, '').replace(/^\*+/, '');

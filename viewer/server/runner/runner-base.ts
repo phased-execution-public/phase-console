@@ -8,6 +8,7 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
+import { configTreesOf, plantedSince, treeConfigBaseline, type PlantedConfig } from '../git-guard.ts';
 import type { ResolvedPolicy } from '../../shared/policy-model.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -27,13 +28,13 @@ import {
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import {
-  markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent,
+  markFor, refusedOutcome, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent,
 } from './spawn.ts';
 import {
   bookedDelta, creditBooked, MAX_COST_MARKS, permissionPromptsFor, relayArmingFor, resolveCaps, sessionRecordOf, type Cap, type CapTable,
   type SessionCaps,
 } from './session-record.ts';
-import { loadModelsEnv } from './models.ts';
+import { loadModelsEnv, sameModel, type ModelsEnv } from './models.ts';
 import { proofsFile } from './proofs.ts';
 import { contextWindowOf, CostDrift, costMismatch, MAX_TOKEN_ATTEMPTS, priceRowOf, priceUsage, type TokenAttempt } from './usage.ts';
 import type { PollLoopState } from '../../shared/poll-loop.js';
@@ -58,8 +59,8 @@ import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
 // too — only the ledger path below it is Pro.
 import { DEFAULT_MESSAGING } from '../../shared/message-model.js';
 import {
-  isRegistered, laneNames, realish, restoreSettledMirror, scopeConfined,
-  type LaneNames, type RadarState, type RunGitView,
+  isRegistered, laneNames, orphanIndexLocks, realish, restoreSettledMirror, scopeConfined,
+  type LaneNames, type OrphanIndexLock, type RadarState, type RunGitView,
   managedRoots,
   stagingHome,
   stagingNames,
@@ -126,6 +127,15 @@ import {
  * ------------------------------------------------------------------ */
 
 /** One `run:progress` payload — `RUN_PROGRESS_FIELDS`, and nothing else. */
+
+/**
+ * The least time between two docs-change re-reads of a live run's held gates
+ * (one-pool phase 23, #239): a `plan <slug>:<N>` gate is answered within this of
+ * the other plan's change, and a burst of another plan's lock writes costs one
+ * read, not one per write.
+ */
+export const GATE_DIRTY_MIN_MS = 10_000;
+
 export type RunProgress = {
   phase: number;
   status: string;
@@ -189,6 +199,14 @@ export type BoardingVerdict =
   | { boarded: true }
   | { queued: { position: number | null; behind?: { kind: string; slug: string; phase: number | null; owner: string } } };
 
+/** What a halt may carry beside its sentence: a refusal's evidence (#57), a reached cap (one-pool phase 7). */
+export type HaltExtra = {
+  evidence?: RetirementEvidence;
+};
+
+/** The sessions that ARE a phase's lane — the ones whose hook a tool card holds (#220). */
+const LANE_SESSION_MODES: ReadonlySet<string> = new Set(['phase', 'resume', 'repair', 'closeout']);
+
 export abstract class RunnerBase {
   /** Set while `ensureRunCheckout` is between the cap check and the finished tree. */
   protected abstract reservingCheckout: boolean;
@@ -232,7 +250,7 @@ export abstract class RunnerBase {
   protected abstract enterRunWaiting(nowIso: string, asked?: Set<number> | null, beside?: WaitBeside | null): boolean;
   protected abstract evaluateLane(lane: Lane, thresholds: StallThresholds, now: number): Promise<boolean>;
   protected abstract gitOrNull(args: string[]): Promise<string | null>;
-  protected abstract halt(reason: string, phase: number | undefined, kind: HaltKind, extra?: { evidence?: RetirementEvidence }): void;
+  protected abstract halt(reason: string, phase: number | undefined, kind: HaltKind, extra?: HaltExtra): void;
   protected abstract now(): Date;
   protected abstract onStream(phase: number, event: StreamEvent): void;
   protected abstract noteContext(phase: number, event: Extract<StreamEvent, { kind: 'usage' }>): void;
@@ -450,6 +468,14 @@ export abstract class RunnerBase {
   protected lanes = new Map<number, Lane>();
 
   /**
+   * A tool card for this phase was raised (`open`) or decided (one-pool phase
+   * 24, #220): the lane's spawn watchdog waits on the card while it stands.
+   */
+  holdForCard(phase: number, cardId: string, open: boolean): void {
+    this.lanes.get(phase)?.handle?.holdForCard?.(cardId, open);
+  }
+
+  /**
    * What this run may do to phase N's model (control-tower phase 54, #91): the
    * PLAN's word — the phase's bullet, else §Session budget's line — then the
    * run's `modelPolicy`, then `ladder`. The plan outranks the run here as it
@@ -491,9 +517,38 @@ export abstract class RunnerBase {
    * refusal (`RunnerAttempt.verifyCwd`); telling a session where its lines are
    * judged (`proofEnv`) is not a verdict.
    */
-  protected async verifyDirOf(phase: number): Promise<{ dir: string; root: string; declared?: string; refused?: string }> {
+  protected async verifyDirOf(phase: number): Promise<{
+    dir: string; root: string; declared?: string; refused?: string;
+    /** `Verify in: .` (or none) at a mirror root that is no git tree, moved to its one mount (#311). */
+    mount?: string;
+    /** Where a docs-only line runs: the docs root, when the plan's lines are judged at a mirror's root (#357). */
+    docsRoot?: string;
+  }> {
     const root = resolve(this.laneRoot(phase));
     const declared = (await this.deps.verifyIn?.(this.state!.slug, phase))?.trim();
+    // A mirror's ROOT (one-pool phase 20, #311 #357). The plan's root, `.`,
+    // means the plan's root tree — and a mirror whose root is not mounted is a
+    // plain directory of mounts, which is no tree at all: Setup ran `yarn
+    // install` there and every `! grep` passed vacuously. With exactly one
+    // mount, that mount IS the plan's tree; with several, the lines `cd` into
+    // theirs, and a docs-only line runs where the docs are.
+    const state = this.state!;
+    const mirror = Boolean(state.workRoot && state.mountedRepos?.length) && resolve(state.workRoot!) === root;
+    const bare = mirror && !(state.mountedRepos ?? []).some((rel) => !rel || rel === '.') && !existsSync(join(root, '.git'));
+    if (bare && (!declared || declared === '.')) {
+      // Only a BARE mirror sends docs-only lines to the docs root: one whose
+      // root is mounted is the run branch's own tree of the root, `docs/`
+      // included, and a phase that edited a doc there is judged on its edit.
+      const docsRoot = resolve(state.root) !== root ? state.root : undefined;
+      const mounts = (state.mountedRepos ?? []).filter((rel) => rel && rel !== '.');
+      const only = mounts.length === 1 ? mounts[0]! : null;
+      // …and a plan whose lines `cd <mount>` (or name `<mount>/…`) already
+      // speak from the root: moving them into the mount would break them.
+      if (only && existsSync(join(root, only)) && !(await this.linesNameMount(phase, only))) {
+        return { dir: join(root, only), root, ...(declared ? { declared } : {}), mount: only, ...(docsRoot ? { docsRoot } : {}) };
+      }
+      return { dir: root, root, ...(declared ? { declared } : {}), ...(docsRoot ? { docsRoot } : {}) };
+    }
     if (!declared) return { dir: root, root };
     const target = resolve(root, declared);
     if (!(target === root || target.startsWith(`${root}/`))) {
@@ -505,6 +560,20 @@ export abstract class RunnerBase {
       return { dir: root, root, declared, refused: 'no such directory under the repository root' };
     }
     return { dir: target, root, declared };
+  }
+
+  /** Does any §Verification or Setup line of this phase `cd` into `mount`, or name a path under it? (#311) */
+  private async linesNameMount(phase: number, mount: string): Promise<boolean> {
+    const slug = this.state!.slug;
+    const read = async (get: (() => string | undefined | Promise<string | undefined>) | undefined): Promise<string> => {
+      try { return (await get?.()) ?? ''; } catch { return ''; }
+    };
+    const text = [
+      await read(this.deps.verificationText ? () => this.deps.verificationText(slug, phase) : undefined),
+      await read(this.deps.setupText ? () => this.deps.setupText!(slug, phase) : undefined),
+    ].join('\n');
+    const escaped = mount.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|[\\s'"\`(=])(?:\\./)?${escaped}(?:/|[\\s'"\`;&|)]|$)`, 'm').test(text);
   }
 
   /**
@@ -1066,6 +1135,54 @@ export abstract class RunnerBase {
    * the `awaiting` probe (#136). A phase the board reads `waiting` is held
    * behind the phases its `blocked:` line names; any other word holds nothing.
    */
+  /**
+   * The dependencies of `phase` the board says are not done, when its handoff
+   * put it in a bucket that says nothing about them — `stuck` (a `blocked`
+   * handoff) or `in-progress` — or null (one-pool phase 23, #288). Such a
+   * phase is never admitted: control-tower phase 65's blocked handoff boarded
+   * a max-effort session ahead of phase 150, the dependency an amendment had
+   * just given it. The board names the pair (`blocked:` line) since this
+   * phase; a `waiting` phase is the board's own word and is never a candidate.
+   */
+  protected dependencyHeld(board: Board, phase: number): number[] | null {
+    const word = board.states[phase];
+    if (word !== 'stuck' && word !== 'in-progress') return null;
+    const deps = board.blockedBy?.[phase] ?? [];
+    return deps.length ? [...deps] : null;
+  }
+  /**
+   * A docs change somewhere in the docs root may have opened a gate this run
+   * holds a phase on (one-pool phase 23, #239) — read on the next drive tick.
+   */
+  protected gatesDirty = false;
+  /** When each `gated` phase's gate was last re-read (epoch ms) — `rereadGates`' throttle. */
+  protected gateReadAt = new Map<number, number>();
+
+  /**
+   * Another plan's docs changed (one-pool phase 23, #239). A `plan <slug>:<N>`
+   * gate reads exactly that, and the watcher's own slug filter never named
+   * this run for it: wake the loop when it holds a phase on a gate.
+   */
+  noteForeignDocs(): void {
+    if (!this.state) return;
+    const held = Object.values(this.state.phases).some((record) =>
+      record.status === 'gated' && Boolean(record.note?.startsWith('gate not clear:')));
+    if (!held) return;
+    // Not more than once per `GATE_DIRTY_MIN_MS`: another plan's lanes write a
+    // handoff or a lock every few seconds, and each dirty read runs the gate's
+    // command (`PHASE_EXEC_GATES=1`). The tick after the interval still reads.
+    const now = this.now().getTime();
+    if (now - this.gatesDirtyAt < GATE_DIRTY_MIN_MS) return;
+    this.gatesDirtyAt = now;
+    this.gatesDirty = true;
+    this.wake.resolve();
+  }
+  /** When `noteForeignDocs` last marked the gates dirty (epoch ms). */
+  protected gatesDirtyAt = 0;
+
+  /** `<phase>:<deps>` refusals already journalled — said once per unmet set, not every tick. */
+  protected admissionRefused = new Set<string>();
+
   protected awaitingOf(phase: number): number[] | null {
     const board = this.lastBoard;
     if (!board || board.states[phase] !== 'waiting') return null;
@@ -1155,6 +1272,9 @@ export abstract class RunnerBase {
   }
 
   current(): RunState | null { return this.state; }
+
+  /** The account each live lane spends (one-pool phase 11): what an account's `sessionsAtOnce` cap counts. */
+  laneAccounts(): string[] { return [...this.lanes.values()].map((lane) => lane.accountId ?? this.state?.accountId ?? 'default'); }
 
   /**
    * Does this run hold one of the console's managed checkouts, or is it about to?
@@ -1649,7 +1769,33 @@ export abstract class RunnerBase {
     await this.restoreIdleMirror('spawn');
     // `--resume` only ever arrives vetted (`resumableSession`, REG-1/SLF-10):
     // the type admits nothing else, and this is the one line that unwraps it.
-    const { resumeFrom, ...rest } = request;
+    const { resumeFrom, ...asked } = request;
+    // The model this session is SENT (one-pool phase 5): on an API-key account the
+    // asked model is mapped to an id the account serves, the chain becomes that
+    // provider's own and the window of the model it runs is stated; a model
+    // nothing on the run's account serves is refused HERE, before a cent is spent.
+    const door = this.deps.sessionModel?.(this.state?.accountId, {
+      model: asked.model, fallbackModels: asked.fallbackModels ?? [], effort: asked.effort,
+      pinned: this.state ? this.modelPolicyOf(phase) === 'pinned' : false,
+    });
+    if (door && !door.ok) return this.refuseUnservedModel(phase, mode, asked.model, door.refusal, ctx.caps);
+    const rest: typeof asked = door?.ok
+      ? {
+        ...asked,
+        model: door.model,
+        fallbackModels: door.fallbackModels,
+        effort: door.effort,
+        env: { ...(asked.env ?? process.env), ...door.env },
+      }
+      : asked;
+    if (door?.ok && door.mapped && asked.model !== rest.model) {
+      this.record('phase.model-mapped', { mode, asked: asked.model, sent: rest.model, account: this.state?.accountId ?? 'default' }, phase);
+    }
+    // What the pinned and differs checks compare a frame with, beside what was asked.
+    if (mode === 'phase') {
+      if (rest.model && rest.model !== asked.model) this.sentModels.set(phase, rest.model);
+      else this.sentModels.delete(phase);
+    }
     // The floor for a run nobody can answer (QRL-9): every session of a
     // `relay: off` run carries `--permission-prompts none`, unless the CLI is
     // known to predate the flag — which is said once, on the run.
@@ -1731,6 +1877,18 @@ export abstract class RunnerBase {
     const lane = mode === 'phase' ? shared : undefined;
     const pollTracker = lane?.signals.pollLoop;
     const pollBefore = pollTracker ? { ...pollTracker.counts } : undefined;
+    // The ledger's meter (one-pool phase 6): every session this door spawns writes its usage
+    // rows — at each `result`, every five minutes and at its end — under the account it was
+    // spawned on, read here because a switch can move the run's account mid-session.
+    let meter: ReturnType<NonNullable<RunnerDeps['sessionMeter']>> = null;
+    try {
+      meter = this.deps.sessionMeter?.({
+        mode, phase, account: this.state?.accountId ?? 'default', model: rest.model ?? null,
+        plan: this.state?.slug ?? null, run: this.state?.id ?? null,
+        // A bridged session's meter binds its token and revokes it at the end (one-pool phase 8).
+        ...(rest.env ? { env: rest.env } : {}),
+      }) ?? null;
+    } catch { meter = null; }
     const sent: SpawnRequest = {
       ...rest,
       ...(resumeFrom ? { resume: resumeFrom.sessionId } : {}),
@@ -1744,6 +1902,7 @@ export abstract class RunnerBase {
       // the version every later arming is judged on, and — on an armed session —
       // whether the relay actually has a tool to answer and a host to hold it.
       onEvent: (event) => {
+        try { meter?.onEvent(event); } catch { /* the ledger never costs the stream */ }
         try { this.noteSessionEvent(phase, event, armed, version); } catch { /* bookkeeping never costs the stream */ }
         // The session a phase's boarding prompt was composed for has STARTED:
         // the next-attempt notes that prompt carried are delivered now, to it
@@ -1760,6 +1919,20 @@ export abstract class RunnerBase {
         if (event.kind === 'usage' && mode === 'phase') this.noteContext(phase, event);
       },
     };
+    // The trees this session can reach, and what their git configuration holds
+    // before it runs (one-pool phase 2, #272) — read again when it ends, for
+    // every mode this door spawns: a QA round, a closeout or a repair works in
+    // the same trees as the phase's own session.
+    const scope = this.lanes.get(phase)?.grant?.scope ?? await this.scopeFor(phase).catch(() => [] as string[]);
+    // An `index.lock` nothing is writing (one-pool phase 20, #328) — named and
+    // the lane halted HERE, before a session boards a tree whose every index
+    // write would fail.
+    const locked = this.treeLocks(sent.cwd, scope);
+    if (locked.length) {
+      this.haltTreeLocked(phase, mode, locked, 'boarding');
+      return { ...refusedOutcome(`an orphaned index.lock blocks ${locked.map((l) => l.tree).join(', ')}`, ctx.caps), treeLocked: locked };
+    }
+    const configBaseline = treeConfigBaseline(configTreesOf(sent.cwd, scope));
     const ceilings = childEnvDecisions(sent.env ?? process.env);
     this.record('phase.retry-ceiling', {
       mode,
@@ -1781,10 +1954,11 @@ export abstract class RunnerBase {
       ? this.state?.phases[String(phase)]
       : undefined;
     if (worked) openSessionWindow(worked, mode, this.now().toISOString());
-    let outcome: SpawnOutcome;
+    let outcome: SpawnOutcome | undefined;
     try {
       outcome = await (this.deps.spawn ?? spawnClaude)(sent);
     } finally {
+      try { meter?.end(outcome ?? null); } catch { /* the ledger never costs the session */ }
       // Closed even when the spawn throws: a window left open on a record that
       // still reads `running` would count to now on every read.
       if (worked) {
@@ -1808,9 +1982,86 @@ export abstract class RunnerBase {
     this.noteSpendProof(phase, account, sent, outcome, booking.booked, shared);
     this.noteEnding(phase, mode, sent, outcome);
     this.record('phase.session', sessionRecordOf({ mode, request: sent, outcome, attempt: ctx.attempt }), phase);
+    // Its tool cards die with it (#220): answered nowhere, a later timeout of
+    // one would park the run while the phase's next attempt works.
+    // A reviewer's or a landing session's ending is not the lane's, whose card it would take.
+    if (LANE_SESSION_MODES.has(mode)) {
+      try { if (this.state) this.deps.approvals?.retireSession(this.state.id, phase); } catch { /* bookkeeping */ }
+    }
     this.noteTokens(phase, mode, sent, outcome, ctx.attempt, lane ? { lane, tracker: pollTracker, before: pollBefore } : undefined, account);
     this.corroborateSpend(phase, mode, sent, outcome, booking, delegated);
+    // A git configuration the session planted (#272) — a hook path, an
+    // fsmonitor, a driver, a credential helper — halts the lane HERE, before the
+    // caller's verification, landing or idle-attempt git runs in those trees.
+    // The console's own git is hardened against the keys an override can undo
+    // (`git-guard.ts`); this is the stop for the ones it cannot.
+    const planted = plantedSince(configBaseline);
+    if (planted.length) {
+      this.haltPlantedConfig(phase, mode, planted);
+      return { ...outcome, plantedConfig: planted };
+    }
     return outcome;
+  }
+
+  /**
+   * The model each phase's own session was SENT when the door mapped it (one-pool phase 5) — an
+   * alias on a DeepSeek key runs as `deepseek-v4-pro`, and a frame naming that is the model asked.
+   */
+  protected readonly sentModels = new Map<number, string>();
+
+  /** Did the session run the model it was asked for — as asked, or as the door sent it? */
+  protected ranAsAsked(phase: number, asked: string, running: string, env: ModelsEnv): boolean {
+    if (sameModel(asked, running, env)) return true;
+    const sent = this.sentModels.get(phase);
+    return Boolean(sent) && sameModel(sent!, running, env);
+  }
+
+  /**
+   * A session whose model nothing on the run's account serves (one-pool phase 5): journalled
+   * and the run halted `models-exhausted` with the door's words, before any child exists.
+   */
+  private refuseUnservedModel(phase: number, mode: SessionMode, model: string | undefined, refusal: string, caps: SessionCaps): SpawnOutcome {
+    const account = this.state?.accountId ?? 'default';
+    this.record('phase.model-unserved', { mode, model: model ?? null, account, reason: refusal }, phase);
+    this.halt(`phase ${phase}'s ${mode} session was not started: ${refusal}`, phase, 'models-exhausted');
+    return { ...refusedOutcome(refusal, caps), modelRefused: refusal };
+  }
+
+  /** The orphaned `index.lock`s in the trees a session or a verification under `cwd` reaches (#328). */
+  protected treeLocks(cwd: string, scope: readonly string[]): OrphanIndexLock[] {
+    try { return orphanIndexLocks(configTreesOf(cwd, scope), { now: this.now().getTime() }); } catch { return []; }
+  }
+
+  /**
+   * Journal and halt a lane an orphaned `index.lock` blocks (one-pool phase
+   * 20, #328): `phase.run-tree-locked` names every path, its age and the stage
+   * that met it, and the halt's sentence tells a person what to check and
+   * remove. A phase halt: the other lanes, in other trees, drive on.
+   */
+  protected haltTreeLocked(phase: number, mode: SessionMode | 'verify', locks: readonly OrphanIndexLock[], stage: 'boarding' | 'verification'): void {
+    this.record('phase.run-tree-locked', {
+      stage, mode,
+      locks: locks.map((lock) => ({ path: lock.path, tree: lock.tree, mtime: lock.mtime, ageMinutes: Math.round(lock.ageMs / 60_000) })),
+    }, phase);
+    const named = locks.map((lock) => `${lock.path} (${Math.max(1, Math.round(lock.ageMs / 60_000))} min old)`).join(', ');
+    this.halt(
+      `phase ${phase}'s ${stage === 'boarding' ? `${mode} session was not started` : 'verification did not run'}: `
+        + `an index.lock no git command is writing blocks every index write in its tree — ${named}. `
+        + 'Check that no git of yours is running there, remove the lock, then Retry.',
+      phase, 'run-tree-locked',
+    );
+  }
+
+  /** Journal and halt a lane whose session planted git configuration (#272). */
+  private haltPlantedConfig(phase: number, mode: SessionMode, planted: readonly PlantedConfig[]): void {
+    const keys = [...new Set(planted.map((p) => p.key))];
+    const trees = [...new Set(planted.map((p) => p.tree))];
+    this.record('phase.run-tree-config', { mode, keys, trees, entries: planted.map((p) => p.entry.slice(0, 200)) }, phase);
+    this.halt(
+      `phase ${phase}'s ${mode} session planted git configuration the console will not run: ${keys.join(', ')} `
+        + `(in ${trees.join(', ')}). Remove it — or confirm it is yours — then Retry.`,
+      phase, 'run-tree-config',
+    );
   }
 
   /**

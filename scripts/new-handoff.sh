@@ -276,61 +276,33 @@ export PE_HANDOFF_WRITING="$((10#$phase)):${this_handoff}"
     printf -- '- Check memory `%s` for outstanding user gates (push / prod deploy).\n' "$memory_key"
     printf -- '- `/clear` when done.\n'
   elif [ "$GRAPH_OK" = 1 ]; then
-    ready="$(bash "$ENGINE" "$slug" --ready-after "$phase" 2>/dev/null || true)"
-    if [ -z "$ready" ]; then
-      printf '_Completing Phase %s does not unblock any phase yet — downstream phases still\n' "$phase"
-      printf 'wait on other dependencies. Run `scripts/phase-graph.sh %s` for the WAITING list._\n' "$slug"
-    else
-      nready=$(printf '%s\n' $ready | grep -c . || true)
-      if [ "$nready" -gt 1 ]; then
-        printf '> Phases **%s** are all unblocked — run them in any order. Ones with DISJOINT\n' "$(echo $ready | sed 's/ /, /g')"
-        printf '> scopes may run as concurrent sessions; ones sharing a repo run one at a time. Each\n'
-        printf '> phase'\''s prompt states its scope and the `phase-lock.sh … conflicts` check to run first.\n'
-        printf '> The console runs one phase per session; driving by hand, if the remaining budget allows, the\n'
-        printf '> finishing session MAY instead continue straight into ONE of them (not a 🔒GATED one).\n'
-        printf '> Commit before switching sessions; never `git stash`.\n\n'
-      else
-        # Single next phase — batch-friendly BY HAND whenever the remaining budget fits
-        # (gated phases excepted: they always start fresh after their gates are
-        # confirmed). The console never batches: it boards the next phase itself (#153).
-        sz="$(bash "$ENGINE" "$slug" --size "$ready" 2>/dev/null || echo M)"
-        rdeps=" $(bash "$ENGINE" "$slug" --deps "$ready" 2>/dev/null || true) "
-        gated_next="$(bash "$ENGINE" "$slug" --gated "$ready" 2>/dev/null || echo no)"
-        if [ "$gated_next" != yes ]; then
-          case "$rdeps" in
-            *" $phase "*)
-              printf '> _Phase %s (size %s) is sequential on this one. The console runs one phase per session;\n> driving by hand, you MAY continue into it in the SAME session if it fits the remaining budget\n> (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
-            *)
-              printf '> _Phase %s (size %s) is independent of this one. The console runs one phase per session;\n> driving by hand, it may still share the SAME session if the remaining budget allows\n> (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
-          esac
-        fi
-      fi
-      # A fan-out writes the shared boot ONCE and each phase only its own block
-      # (#115): eight whole prompts were ~1,100 lines of copies of each other,
-      # and every session told to read this handoff read them all. The full
-      # prompt is composed at launch — `--boot-prompt`, next-phase-prompt.sh
-      # `--phase N`, Phase Console — never copied out of a handoff.
-      if [ "$nready" -gt 1 ]; then
-        bash "$ENGINE" "$slug" --boot-fanout "$ready"
-      else
-        for p in $ready; do
-          gated="$(bash "$ENGINE" "$slug" --gated "$p" 2>/dev/null || echo no)"
-          gmark=""
-          if [ "$gated" = yes ]; then
-            gk="$(bash "$ENGINE" "$slug" --gate-kind "$p" 2>/dev/null || echo human)"
-            case "$gk" in
-              ai)   gmark=' — 🔒 GATED·ai (the session clears the gate first)' ;;
-              auto) gmark=' — 🔒 GATED·auto (confirm --gate-status reads clear)' ;;
-              *)    gmark=' — 🔒 GATED·human (operator must approve first)' ;;
-            esac
-          fi
-          printf '### Phase %s%s\n\n' "$p" "$gmark"
-          printf '```\n'
-          bash "$ENGINE" "$slug" --boot-prompt "$p"
-          printf '```\n\n'
-        done
-      fi
-    fi
+    # A POINTER, never the prompts themselves (#338). The board moves after this
+    # file is written — a sibling finishes and another phase becomes ready, a
+    # later phase leaves a note — and a prompt spliced here at scaffold time went
+    # on naming the phases that were ready THEN, while validate.sh passed it. The
+    # readers compose at read time: next-phase-prompt.sh prints every phase this
+    # one has unblocked by now (a lone phase's whole prompt, or a fan-out's shared
+    # boot once and a block per phase, #115), `--phase <M>` one phase's whole
+    # prompt, and Phase Console composes the same when it boards a phase. An
+    # indented command rather than a fence: a fence here is read as a prompt.
+    printf '_Composed when it is read, never frozen here (#338): the board moves after this handoff is
+'
+    printf 'written, so the prompts for the phases it unblocks — and the notes left for them — are the
+'
+    printf 'engine'\''s to print at the moment they are needed. Every phase this one has unblocked by now:_
+
+'
+    printf '    bash "${PE_SCRIPTS:-<skill-root>/scripts}"/next-phase-prompt.sh %s %s
+
+' "$slug" "$((10#$phase))"
+    printf '_One phase'\''s whole prompt: add `--phase <M>`. Phase Console composes the same prompt when it
+'
+    printf 'boards a phase. The console runs one phase per session, so a supervised session stops after
+'
+    printf 'its handoff; driving by hand, you MAY continue into a ready phase in the SAME session if it
+'
+    printf 'fits the remaining budget (`references/sizing.md`) — never past a 🔒GATED one._
+'
   else
     # Legacy fallback: no parseable graph → single linear next-phase prompt.
     printf '```\n'
@@ -355,10 +327,36 @@ rm -f "$prompts_tmp"
 # The whole body lands in ONE rename, still under its interim status.
 mv "$draft" "$dest"
 
-# Append INDEX row if not already listed.
-if ! grep -qF "${this_handoff}" "$index"; then
+# The INDEX row: appended when the handoff is not listed, and when it is, its
+# Status cell — the third — rewritten to this status (#265). A `--force` from
+# in-progress to complete used to leave the row reading in-progress while the
+# script printed "updated". The row is found by its handoff's NAME, every other
+# cell is kept as written, and "updated" is said only when the file changed.
+index_changed=0
+if ! awk -v file="${this_handoff}" '/^[[:space:]]*\|/ && index($0, file) { found = 1 } END { exit !found }' "$index"; then
   printf '| %s | %s | %s | [%s](%s) |\n' \
     "$padded" "$title" "$status" "${this_handoff}" "${this_handoff}" >> "$index"
+  index_changed=1
+else
+  awk -v file="${this_handoff}" -v st="$status" '
+    BEGIN { FS = "|"; OFS = "|" }
+    !done && /^[[:space:]]*\|/ && index($0, file) && NF >= 5 {
+      cur = $4; gsub(/^[[:space:]]+|[[:space:]]+$/, "", cur)
+      if (cur != st) { $4 = " " st " "; changed = 1 }
+      done = 1
+    }
+    { print }
+    END { exit changed ? 0 : 3 }
+  ' "$index" > "$index.tmp.$$" && rc=0 || rc=$?
+  if [ "$rc" = 0 ]; then
+    if ! cat "$index.tmp.$$" > "$index"; then
+      rm -f "$index.tmp.$$"; echo "could not rewrite the INDEX row in $index" >&2; exit 1
+    fi
+    index_changed=1
+  elif [ "$rc" != 3 ]; then
+    rm -f "$index.tmp.$$"; echo "could not rewrite the INDEX row in $index" >&2; exit 1
+  fi
+  rm -f "$index.tmp.$$"
 fi
 
 # LAST: the status. Only the first `status:` line — the frontmatter's — and its
@@ -371,4 +369,8 @@ if [ "$interim" != "$status" ]; then
 fi
 
 echo "created $dest"
-echo "updated $index"
+if [ "$index_changed" = 1 ]; then
+  echo "updated $index"
+else
+  echo "INDEX.md already reads $status for ${this_handoff}"
+fi

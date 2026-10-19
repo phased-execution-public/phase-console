@@ -228,6 +228,11 @@ describe('the track', () => {
     // card or a hovered row it is a patch.
     const label = RULES.match(/\.ui-station-label\s*\{([^}]*)\}/)?.[1] ?? '';
     expect(label).not.toMatch(/background/);
+    // The words are stacked ABOVE every line the track draws (#299): the
+    // lines (`::before`, `::after`) are painted with no z-index of their own,
+    // so a line that ever reached under a label would sit behind it.
+    expect(label).toMatch(/position:\s*relative/);
+    expect(label).toMatch(/z-index:\s*1/);
   });
 
   it('a start-aligned vertical track draws its line leg by leg, never past the last station', () => {

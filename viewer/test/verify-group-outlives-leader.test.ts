@@ -141,3 +141,87 @@ test('VE-4: a process that LEFT the group cannot hold the line past its clock pl
   assert.equal(row.code, 0, 'the leader\'s code');
   assert.match(row.output, /outside its group/, 'the record says a process outside the group still held its output');
 });
+
+/* ------------------------------------------------------------------ *
+ * one-pool phase 26 (#222) — the orphan sweep's rule, on a process table
+ * ------------------------------------------------------------------ */
+
+test('RG-2: an orphan is a recorded descendant, alive with the same start, parented by pid 1, a test runner, started before its session ended', async () => {
+  const { orphansOf, testRunnerCommand, descendantsOf } = await import('../server/runner/reap.ts');
+  const t0 = Date.parse('2026-10-04T07:38:00Z');
+  const end = t0 + 60 * 60_000;
+  const seen = new Map([
+    [41831, { startedMs: t0, command: 'node --test --test-force-exit --test-concurrency=1 --test-reporter=tap test/assert-no-pro.test.ts' }],
+    [15710, { startedMs: t0 + 5_000, command: 'node --test --test-force-exit viewer/test/allow-issues-flag.test.ts' }],
+    [500, { startedMs: t0, command: 'sleep 999' }],
+    [600, { startedMs: t0, command: 'npx vitest run' }],
+  ]);
+  const rows = [
+    { pid: 41831, ppid: 1, pgid: 41831, startedMs: t0, command: 'node --test --test-force-exit --test-concurrency=1 --test-reporter=tap test/assert-no-pro.test.ts' },
+    { pid: 15710, ppid: 1, pgid: 15710, startedMs: t0 + 9 * 60 * 60_000, command: 'node --test x.test.ts' }, // a recycled pid
+    { pid: 500, ppid: 1, pgid: 500, startedMs: t0, command: 'sleep 999' },                                 // not a test runner
+    { pid: 600, ppid: 4242, pgid: 600, startedMs: t0, command: 'npx vitest run' },                         // still parented
+    { pid: 700, ppid: 1, pgid: 700, startedMs: end + 1_000, command: 'node --test y.test.ts' },            // never recorded
+  ];
+  assert.deepEqual(orphansOf(rows, seen, end).map((row) => row.pid), [41831], 'the 8 h 23 min spinner of #222, and nothing else');
+  assert.deepEqual(descendantsOf([
+    { pid: 2, ppid: 1, pgid: 2, startedMs: null, command: 'claude' }, { pid: 3, ppid: 2, pgid: 3, startedMs: null, command: 'zsh' },
+    { pid: 4, ppid: 3, pgid: 3, startedMs: null, command: 'node --test' }, { pid: 5, ppid: 1, pgid: 5, startedMs: null, command: 'other' },
+  ], 2).map((row) => row.pid), [3, 4]);
+  for (const runner of ['node --test a.ts', 'npx vitest run', 'node /x/node_modules/vitest/vitest.mjs', '/bin/bash /opt/homebrew/bin/bats tests', 'python3 -m pytest']) {
+    assert.equal(testRunnerCommand(runner), true, runner);
+  }
+  for (const other of ['node server/index.ts', 'claude -p', 'bash /tmp/p13op/run.sh', 'sleep 30', 'grep vitest file']) {
+    assert.equal(testRunnerCommand(other), false, other);
+  }
+});
+
+test('RG-3: a session that PARKED keeps its detached suite for the spare window; the sweep ends it after — and ends at once the orphans of one that did not', async () => {
+  const { SessionReaper, REAP_SPARE_MS, parkedOutcome } = await import('../server/runner/reap.ts');
+  let clock = Date.parse('2026-10-18T12:00:00Z');
+  let table: { pid: number; ppid: number; pgid: number; startedMs: number | null; command: string }[] = [];
+  const ended: number[] = [];
+  const reaper = new SessionReaper({
+    table: async () => table, now: () => clock,
+    end: async (pid) => { ended.push(pid); table = table.filter((row) => row.pid !== pid); return 'exited'; },
+  });
+  const suite = { pid: 301, ppid: 300, pgid: 301, startedMs: clock, command: 'bash -c node --test --test-concurrency=1 viewer/test/a.test.ts' };
+  const runner = { pid: 302, ppid: 301, pgid: 301, startedMs: clock, command: 'node --test --test-concurrency=1 viewer/test/a.test.ts' };
+  try {
+    // Parked: the suite it detached is its own job, waited on.
+    reaper.begin(100);
+    table = [{ pid: 100, ppid: 1, pgid: 100, startedMs: clock, command: 'claude -p' }, { pid: 300, ppid: 100, pgid: 300, startedMs: clock, command: 'zsh' }, suite, runner];
+    await reaper.observe();
+    table = [{ ...suite, ppid: 1 }, { ...runner }];
+    clock += 60_000;
+    assert.deepEqual(await reaper.ended(100, { spare: true }), [], 'a parked session keeps its job');
+    clock += 60 * 60_000;
+    assert.deepEqual(await reaper.sweep(), [], 'and keeps it while its wait may still run');
+    clock += REAP_SPARE_MS;
+    const swept = await reaper.sweep();
+    assert.deepEqual(swept.map((row) => row.pid), [301], 'past the spare it is an orphan older than its session');
+    assert.deepEqual(ended, [301]);
+
+    // Not parked: ended with the session.
+    ended.length = 0;
+    reaper.begin(200);
+    const vitest = { pid: 401, ppid: 400, pgid: 401, startedMs: clock, command: 'npx vitest run' };
+    table = [{ pid: 200, ppid: 1, pgid: 200, startedMs: clock, command: 'claude -p' }, { pid: 400, ppid: 200, pgid: 400, startedMs: clock, command: 'zsh' }, vitest,
+      { pid: 210, ppid: 200, pgid: 200, startedMs: clock, command: 'npx some-mcp-server' }];
+    await reaper.observe();
+    table = [{ ...vitest, ppid: 1 }, { pid: 210, ppid: 1, pgid: 200, startedMs: clock, command: 'npx some-mcp-server' }];
+    const reaped = await reaper.ended(200);
+    assert.deepEqual(reaped.map((row) => row.pid).sort(), [210, 401], 'its group (an MCP server left in it) and its orphaned suite');
+    assert.deepEqual(ended.sort(), [200, 401], 'the group through its leader\'s id, the suite through its own');
+  } finally {
+    reaper.stop();
+  }
+
+  const dir = scratch();
+  writeFileSync(join(dir, 'parked.json'), JSON.stringify({ status: 'waiting-external', watch: ['cmd:"test -f /tmp/x"'] }));
+  writeFileSync(join(dir, 'done.json'), JSON.stringify({ status: 'complete' }));
+  assert.equal(parkedOutcome(join(dir, 'parked.json')), true);
+  assert.equal(parkedOutcome(join(dir, 'done.json')), false);
+  assert.equal(parkedOutcome(join(dir, 'missing.json')), false, 'unreadable is no: the default is the reap');
+  assert.equal(parkedOutcome(undefined), false);
+});

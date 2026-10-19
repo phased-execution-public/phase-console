@@ -136,6 +136,40 @@ EOF
   [ "$(printf '%s\n' "$output" | grep -c 'handoff')" -eq 2 ]
 }
 
+@test "--notes: a note's nested sub-bullets arrive with it, whole (#378)" {
+  # dependabot-estate-2026-10 phase 2: the verdicts sat in four indented
+  # sub-bullets, and phase 7 was handed the first line alone.
+  notes_handoff 1 root complete 2026-01-02 <<'EOF'
+- **Phase 4:** VCA verdicts, squash `dff95333`:
+  - #106: keep the pin,
+    and say why;
+  - #107: drop it.
+- **Phase 4:** and this one is separate.
+EOF
+  run pg diamond --notes 4
+  [ "$status" -eq 0 ]
+  assert_contains "$output" 'VCA verdicts, squash `dff95333`: - #106: keep the pin, and say why; - #107: drop it.'
+  assert_contains "$output" "and this one is separate."
+  [ "$(printf '%s\n' "$output" | grep -c 'handoff')" -eq 2 ]
+  # The lint reads the same parser: a sub-bullet is no address, so no F26.
+  run pg diamond --lint
+  refute_contains "$output" "note-target-unknown"
+}
+
+@test "--notes: a note with sub-bullets is still bounded at 500 characters" {
+  local long
+  long="$(awk 'BEGIN { while (i++ < 300) printf "y" }')"
+  notes_handoff 1 root complete 2026-01-02 <<EOF
+- **Phase 4:** head
+  - $long
+  - $long
+EOF
+  run pg diamond --notes 4
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | awk -F'\t' '{print length($5)}')" -le 500 ]
+  assert_contains "$output" "head - yyy"
+}
+
 @test "--notes: the scaffolded section's own example is a COMMENT, not a note" {
   # The scaffold teaches the grammar by showing `- **Phase 7:** …` inside an
   # HTML comment. Read as content it hands phase 7 an example nobody wrote —

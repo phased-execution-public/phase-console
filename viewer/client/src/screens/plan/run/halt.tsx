@@ -23,7 +23,6 @@ import { useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { budgetHeadline, type BudgetFact } from '@shared/budget-model.js';
 import { heldStopReason } from '@shared/orchestration-model.js';
-import { SETTLED, SETTLED_WELL, runEndedBadly } from '@shared/run-lifecycle.js';
 import { PROFILE_LABELS } from '@shared/run-settings.js';
 import { waitSentence } from '@shared/status-model.js';
 import { runStatusWord, waitReasonOf } from '@shared/status-vocab.js';
@@ -33,6 +32,7 @@ import { useInboxActions } from '@/cards/inbox-row';
 import { LazyItemRow } from '@/cards/lazy-item-row';
 import { accountsApi, type AccountView } from '@/data/api/accounts';
 import { runsApi, type RunGitView, type RunState } from '@/data/api/runs';
+import { runStopOf } from '@/data/run-stop';
 import { systemApi, type AuthStatus } from '@/data/api/system';
 import { useAttentionInbox } from '@/data/inbox';
 import { keys } from '@/data/keys';
@@ -505,27 +505,6 @@ function noteSpecs(
   }
 
   return notes;
-}
-
-/** A phase a stop left behind: settled, and not well. */
-const stoppedPhase = (status: string): boolean =>
-  (SETTLED as readonly string[]).includes(status) && !(SETTLED_WELL as readonly string[]).includes(status);
-
-/**
- * The stop the card is about. A run that halted carries its own. One that
- * stopped with the cause on a PHASE's record instead — a park on a red
- * verification, a wait that ran out — is about that phase's stop, the
- * lowest-numbered first; every other stopped phase is the Ways forward fold's.
- * A live or resolved run has no phase stop to answer.
- */
-export function runStopOf(run: RunState | null, live: boolean): RunState['halt'] {
-  if (!run) return null;
-  if (run.halt) return run.halt;
-  if (live || run.resolved || !runEndedBadly(run)) return null;
-  const record = Object.values(run.phases ?? {})
-    .filter((one) => one && stoppedPhase(one.status) && one.halt)
-    .sort((a, b) => a!.phase - b!.phase)[0];
-  return record?.halt ? { ...record.halt, phase: record.halt.phase ?? record.phase } : null;
 }
 
 /**

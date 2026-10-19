@@ -21,7 +21,7 @@ import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { MANIFEST_BLOCKING } from '../shared/policy-model.js';
 import {
   PreludeRefusal, manifestRows, preludeFor, probeAccounts, probeCredentials, probeDelivery, probeMcp, probeTrees, resolvedManifest,
-  gitStrategyLines, probeGitStrategy, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps, doorOpens, doorSteps, itemOf, planStepInput,
+  gitStrategyLines, probeGitStrategy, readPlanBranch, gitOverrideInstruction, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps, doorOpens, doorSteps, itemOf, planStepInput,
   type AccountFacts, type PreludeDeps, type PreludeStep,
 } from '../server/prelude.ts';
 import { HumanStepLedger, sanitiseStep } from '../server/human-steps.ts';
@@ -509,14 +509,59 @@ const FACTS = {
 };
 
 test('probe 7 names a Branch line the new-branch strategy will not create — and only then', () => {
-  const named = gitStrategyLines({ ...FACTS, planBranch: 'feature/checkout' });
+  const named = gitStrategyLines({ ...FACTS, planBranch: '`feature/checkout`' });
   assert.deepEqual(named.map((line) => [line.kind, line.plan, line.honourable]), [['branch', 'feature/checkout', false]]);
   assert.match(named[0]!.run, /`pe\/demo`/);
   // The default idioms name no branch, prose naming the run branch agrees,
-  // and a run that imposes no branch of its own overrides nothing.
+  // and a line with no backticked branch names none.
   assert.deepEqual(gitStrategyLines({ ...FACTS, planBranch: 'current branch (no new branch)' }), []);
   assert.deepEqual(gitStrategyLines({ ...FACTS, planBranch: '`pe/demo` — it EXISTS, adopted at launch' }), []);
-  assert.deepEqual(gitStrategyLines({ ...FACTS, gitMode: 'current', planBranch: 'feature/checkout' }), []);
+  assert.deepEqual(gitStrategyLines({ ...FACTS, planBranch: 'feature/checkout' }), [], 'prose is never a branch');
+});
+
+test('#235: the Branch reader takes a backticked branch token only — never the prose around it', () => {
+  // The tmr-ci-capacity line, wrapped as the plan wrote it: the run branch is
+  // among its tokens, so it agrees, and nothing is asked at the door.
+  const wrapped = 'work-state on hub `main` by pathspec; code on\n`pe/demo`, cut from `origin/main` in each repo (R5)';
+  assert.deepEqual(readPlanBranch(wrapped, 'pe/demo'), { named: 'pe/demo', agrees: true });
+  assert.deepEqual(gitStrategyLines({ ...FACTS, planBranch: wrapped }), []);
+  // The Solve line: prose describing the console's own branch, one ref it is cut from.
+  assert.deepEqual(readPlanBranch("the run's branch, one branch for the plan, cut from `origin/HEAD`", 'pe/demo'), { agrees: false });
+  assert.deepEqual(gitStrategyLines({ ...FACTS, planBranch: "the run's branch, one branch for the plan, cut from `origin/HEAD`" }), []);
+  // A `pe/…` token is preferred over a trunk named beside it; a spaced span is prose.
+  assert.deepEqual(readPlanBranch('on `main` by pathspec; code on `pe/other`', 'pe/demo'), { named: 'pe/other', agrees: false });
+  assert.deepEqual(readPlanBranch('`work state on main`', 'pe/demo'), { agrees: false });
+  assert.deepEqual(readPlanBranch('`main`', 'pe/demo'), { named: 'main', agrees: false });
+  // A repository named beside a branch is a word without a slash.
+  assert.deepEqual(readPlanBranch('in `phased-execution`, branch `fix/x`', 'pe/demo'), { named: 'fix/x', agrees: false });
+  assert.deepEqual(readPlanBranch(undefined, 'pe/demo'), { agrees: false });
+});
+
+test('#322: a launch that cuts no branch names a plan branch its checkout is not on — honourable on pe/<slug>', () => {
+  const shared = { ...FACTS, gitMode: 'default-branch' };
+  const own = gitStrategyLines({ ...shared, planBranch: '`pe/demo` — the run branch in every repo the run mounts', checkoutBranch: 'main' });
+  assert.deepEqual(own.map((line) => [line.kind, line.plan, line.honourable]), [['branch', 'pe/demo', true]]);
+  assert.match(own[0]!.run, /stands on `main`; `pe\/demo` is never created/);
+  // Another branch cannot be honoured by any launch setting.
+  const other = gitStrategyLines({ ...shared, planBranch: '`feature/x`' });
+  assert.deepEqual(other.map((line) => [line.kind, line.honourable]), [['branch', false]]);
+  assert.match(other[0]!.run, /whatever the shared checkout has out/);
+  // The checkout already on the plan's branch holds it; the idioms name none.
+  assert.deepEqual(gitStrategyLines({ ...shared, planBranch: '`feature/x`', checkoutBranch: 'feature/x' }), []);
+  assert.deepEqual(gitStrategyLines({ ...shared, planBranch: 'current branch (no new branch)', checkoutBranch: 'main' }), []);
+  // `honour` launches it on the new-branch strategy, so a `Checkout: main` beside it is honourable too.
+  const both = gitStrategyLines({ ...shared, planBranch: '`pe/demo`', checkoutPhases: [2] });
+  assert.deepEqual(both.map((line) => [line.kind, line.honourable]), [['branch', true], ['checkout', true]]);
+});
+
+test('#322: a default-branch run launched over its branch line is told to work on the checkout as it stands', () => {
+  const lines = [{ kind: 'branch', plan: 'pe/demo', run: 'every phase stands on `main`; `pe/demo` is never created or checked out' },
+    { kind: 'checkout', plan: 'Checkout: main on phase 2', run: 'inert', phases: [2] }];
+  const text = gitOverrideInstruction(lines, '', 2, false);
+  assert.match(text, /names the branch `pe\/demo`/);
+  assert.match(text, /do not stop on the plan's branch line/);
+  assert.doesNotMatch(text, /Checkout: main/, 'only the branch line is said to a run with no branch');
+  assert.equal(gitOverrideInstruction(undefined, '', 1, false), '');
 });
 
 test('probe 7: Worktrees: on is a per-lane ask a shared checkout cannot grant and a superproject never grants', () => {
@@ -540,13 +585,13 @@ test('probe 7: Checkout: main is inert under a shared checkout and names its pha
 
 test('probe 7 warns and never blocks; the start door asks for honour or override instead', async () => {
   assert.deepEqual([...GIT_STRATEGY_ACKS], ['honour', 'override']);
-  const verdict = probeGitStrategy({ ...FACTS, planBranch: 'feature/x', checkoutPhases: [2] });
+  const verdict = probeGitStrategy({ ...FACTS, planBranch: '`feature/x`', checkoutPhases: [2] });
   assert.equal(verdict.ok, true);
   assert.equal(verdict.warnings?.length, 2);
   assert.equal(probeGitStrategy(null).status, 'skip');
   assert.equal(probeGitStrategy(FACTS).warnings, undefined);
 
-  const prelude = await preludeFor('demo', {}, deps({ gitStrategy: async () => ({ ...FACTS, planBranch: 'feature/x' }) }));
+  const prelude = await preludeFor('demo', {}, deps({ gitStrategy: async () => ({ ...FACTS, planBranch: '`feature/x`' }) }));
   assert.equal(prelude.probes['git-strategy'].warnings?.length, 1);
   assert.equal(prelude.blocking.length, 0, 'a git line is answered at the start door, never as a blocking row');
   const refusal = new GitStrategyRefusal((prelude.probes['git-strategy'].detail as { lines: never[] }).lines, null);

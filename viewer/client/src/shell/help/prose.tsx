@@ -70,6 +70,9 @@ export function wearStatusWord(word: string): { className: string; title: string
   };
 }
 
+/** An inline code token at or under this many characters never wraps inside itself (#335). */
+export const SHORT_CODE_CHARS = 24;
+
 /** The elements already drawn — a fresh render's elements are new ones, so this never holds a stale node. */
 const worn = new WeakSet<Element>();
 
@@ -90,7 +93,15 @@ export function StatusProse({ text, className }: { text?: string; className?: st
       // A fenced block's line is a command to copy, not a word to read.
       if (worn.has(el) || el.closest('pre')) continue;
       const dressed = wearStatusWord(el.textContent ?? '');
-      if (!dressed) continue;
+      if (!dressed) {
+        // A short inline token (`?bay=`, a flag, a key) stays whole: breaking
+        // it after its `?` reads as two tokens (#335). A long path still
+        // breaks where it must.
+        if (el.tagName === 'CODE' && (el.textContent ?? '').length <= SHORT_CODE_CHARS) {
+          el.classList.add('whitespace-nowrap');
+        }
+        continue;
+      }
       el.className = dressed.className;
       el.setAttribute('title', dressed.title);
       el.prepend(dot());

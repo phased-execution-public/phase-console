@@ -149,9 +149,26 @@ fi
 [ -n "$by" ] || by="${PE_OWNER:-$(whoami 2>/dev/null || echo operator)@$(hostname -s 2>/dev/null || hostname)}"
 # Table cells: one line, no pipes, bounded — the readers split on `|`.
 cell() { printf '%s' "$1" | tr '\r\n\t|' '    ' | sed 's/  */ /g; s/^ //; s/ *$//'; }
-by="$(cell "$by" | cut -c1-64)"
-value="$(cell "$value" | cut -c1-500)"
-evidence="$(cell "$evidence" | cut -c1-200)"
+by="$(cell "$by")"
+value="$(cell "$value")"
+evidence="$(cell "$evidence")"
+# A value the row cannot hold is REFUSED, never shortened (#253): a cut
+# `permission.destructive` row lost half its rule and still exited 0, and a twin
+# row replaces the plan's whole row. phase-landing.sh refuses a long note the
+# same way: the limit and the length, exit 2, nothing written.
+limit_of() { # <flag> <limit> <text>
+  # Characters, not bytes: a launchd-spawned console runs under the C locale,
+  # where `${#v}` counts an em dash as three.
+  local n
+  n="$(printf '%s' "$3" | LC_ALL=en_US.UTF-8 wc -m 2>/dev/null | tr -d ' ')"
+  case "$n" in ''|*[!0-9]*) n="${#3}" ;; esac
+  [ "$n" -le "$2" ] && return 0
+  echo "$1 is limited to $2 characters, got $n — nothing written (split a long rule into per-phase rows with --phase N)" >&2
+  exit 2
+}
+limit_of --by 64 "$by"
+limit_of --value 500 "$value"
+limit_of --evidence 200 "$evidence"
 today="${PE_TODAY:-$(date +%F)}"
 [ -n "$evidence" ] || evidence="decisions.sh $today"
 phase_cell="${phase:-—}"

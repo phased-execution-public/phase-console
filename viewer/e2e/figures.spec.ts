@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
+import { passThrough } from './lib/fetch.ts';
 import { releaseRoutesAfterEach } from './lib/routes.ts';
 import { VIEWPORTS, shoot } from './lib/shots.ts';
 
@@ -62,7 +63,7 @@ const touch = (project: string): boolean => VIEWPORTS.find((v) => v.name === pro
 
 async function serveStats(page: Page): Promise<void> {
   await page.route(/\/api\/stats(?:\?.*)?$/, async (route) => {
-    const response = await route.fetch();
+    const response = await passThrough(route);
     const stats = (await response.json()) as Record<string, unknown>;
     const now = Date.now();
     const day = (back: number) => new Date(now - back * 86_400_000).toISOString().slice(0, 10);

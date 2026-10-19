@@ -583,7 +583,23 @@ const USAGE_RE = /usage limit|rate limit|too many requests|window (reopens|reset
  * today" — noun matching read it as a credential blocker; it was two exit
  * criteria left unbuilt (sub-kind unknown → one unblock session).
  */
-const LOCK_RE = /\b(lock(ed)?|claim(ed)?|held|owned) by\b|phase-lock|another session (holds|is in|has claimed|is working)|\block:\S+/i;
+/*
+ * The LOCK grammar, never the bare word "held" (one-pool phase 24, #274): "held
+ * by `origin/main`" is the console's own landing vocabulary — a branch fact —
+ * and read as a lock it re-boarded a person's park at once. "Locked/claimed by"
+ * and "lock … held by" name a lock whatever follows; a bare "held/owned by"
+ * counts only when its holder is a session, a lane, a phase or an owner id
+ * (`autopilot/<run>`, `user@host`), and never when it is a git ref or a sha.
+ */
+const GIT_HOLDER = String.raw`[\x60'"]?(?:(?:origin|upstream)/|(?:main|master|trunk|HEAD)\b|the (?:trunk|remote|default branch)\b|[0-9a-f]{7,40}\b)`;
+const LOCK_RE = new RegExp([
+  String.raw`\block\b[^\n.]{0,40}?\b(?:held|owned|taken|claimed) by\b`,
+  String.raw`\b(?:locked|claimed) by\b(?!\s+${GIT_HOLDER})`,
+  String.raw`\b(?:held|owned) by\s+[\x60'"]?(?:another (?:session|lane|phase|run)|(?:a |the )?(?:live )?session\b|(?:a |the )?lane\b|phase \d|[\w.-]+@[\w.-]+|[\w-]+/[0-9a-f]{8,}\b)`,
+  String.raw`phase-lock`,
+  String.raw`another session (?:holds|is in|has claimed|is working)`,
+  String.raw`\block:\S+`,
+].join('|'), 'i');
 /*
  * A tool the run's permission policy refused — the console's own wall, in the
  * words a session uses when it meets it. Measured on two real plans: an

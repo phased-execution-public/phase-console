@@ -35,6 +35,11 @@ run; `--ci` reinstalls `viewer/node_modules` first; `--keep-going` runs past a f
 run records the sha it verified in `.git/phase-console-gates-ok`. Every `node --test` the gates run,
 like `npm test`, carries `--test-timeout=600000 --test-force-exit`: a test still running after ten
 minutes fails by name, and its file exits instead of waiting on a handle nothing will close.
+The server suite runs under `PHASE_CONSOLE_GATE_STAGE=server-suite`: it runs long before the e2e
+stage re-shoots the tour, so `dist-dir.test.ts` may skip, naming why, on pictures from a tour of
+another route table, and the e2e stage asks it again (#353). The tour runs on a scratch HOME — a
+fixture login, meter, unit and tailnet — so no picture carries the operator's email or live meter;
+`PHASE_CONSOLE_E2E_REAL_MACHINE=1` tours this machine as it is instead, and says so on stderr.
 
 
 **The hook — `scripts/git-hooks/pre-push`.** Once per clone, `scripts/gates.sh --install-hook`
@@ -90,6 +95,73 @@ slack: `server/http/static.ts` serves them and never compresses at request time,
 that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
+
+## Upgrading to 8.0.0
+
+The root `package.json` says 8.0.0, and `CHANGELOG.md` carries its section. 8.0.0 is a major version
+(plan `one-pool`, phases 1–41) because a handful of things a 7.1 operator or script relies on now
+read differently: the accounts registry's file version, how a push is answered, the console's own git
+configuration, the load guard's knob and the destinations' count. `PE_API` stays 2: nothing a 7.1
+plan, session or script writes stops working unless this section says so, and the plugin and the
+console's scripts still move together. In both editions it fixes every issue that was open on
+2026-10-17.
+`CHANGELOG.md` §Migration is the full list; what follows is what an operator, a script that reads the
+API or a plan author will notice first.
+
+### The console: the registry, a push, its git, a stale page
+
+- **`accounts.json` is v2 in both editions.** A v1 file is upgraded in place on its first read and
+  copied once to `accounts.json.v1.bak`. A row of a kind this edition does not run is kept verbatim.
+- **A push is read by its clause.** A bare `git push` is `deny`. A trunk (`main`, `master`, `trunk`,
+  the run's base) is pushed only where a `permission.destructive` row names it with its phases
+  (`` `main` by phase 34 ``); a negated phase list excludes them. A forced or deleting push,
+  `--no-verify` or another remote asks a person even under a whole `Bash(git push:*)` rule.
+- **The console's own git ignores the system config and runs no hooks.** A credential helper set only
+  in the system config (macOS `osxkeychain`) is no longer seen: set `credential.helper` in
+  `~/.gitconfig`. A session that changes its tree's git configuration halts the run
+  `run-tree-config`, and a git lock file nothing is writing halts it `run-tree-locked`.
+- **A press from a page of an older release answers 409** with a sentence asking for a reload (the
+  page sends `x-build-rev`). The CLI, the scripts and the hooks send no such header and are never
+  refused, so a roll-out never strands a script.
+- **`loadGuardFactor` keeps its name and changes its meaning:** it scales a CPU reading (85 % busy
+  over 30 s at factor 1.5), and the five-minute load average is only a ceiling at factor × cores × 2.
+  A heavy §Verification line waits for a seat in one machine-wide budget (`phase.verify-queued`).
+- **New state:** `mcp/registry.json` under the instance's state directory, the MCP registry's
+  24-hour cache.
+
+### The client: eight destinations
+
+Your turn is the eighth destination and every plan's fourth view (`#/turn`, `#/plan/<slug>/turn`).
+The phone's tab bar reads Runs · Your turn · Plans · Sessions · More, and 7.1's `?view=compact` on
+Your turn reads as the list. Every 7.x address still lands. A plan's Phases view gains Schedule and
+Burn-up, and the map's tools live in its address.
+
+### Plans and sessions: the Branch line, the lint, the scripts
+
+- **A `**Branch:**` line names a branch only in backticks** (`` `pe/<slug>` ``). A repeated
+  `### Phase N` section fails the lint (F21 `phase-section-repeated`). Two new advisories, F45
+  `proof-unparsable` and F46 `proof-script-run-branch-only`, read a `Human step:`'s proof.
+- **`decisions.sh` refuses** a `--value` over 500 characters, an `--evidence` over 200 and a `--by`
+  over 64 (exit 2) instead of cutting them.
+- **The landing ledger moves forward only:** `phase-landing.sh` keeps a row that is further along,
+  says so on stderr and exits 0, unless `--allow-backward`.
+- **`close-plan.sh --status complete` refuses** while the plan's work is unlanded, a landing row is
+  `conflict` or `failed`, or a `plan:<slug>` issue is open, naming each; `--force` closes it anyway.
+- **`phase-outcome.sh … verified`** writes `repo` and `repo_tree`, so a proof is keyed to its own
+  repository.
+- **A handoff's ▶ Start next phase(s) section is a pointer** to `next-phase-prompt.sh`, composed when
+  read.
+
+### Packaging: what the tarball gained
+
+- The root `package.json` `files` allowlist gained `viewer/shared/status-meanings.js`, and so did the
+  free tree's own `package.json`. `.github/scripts/assert-tarball.sh` asserts it and the new server
+  files: `viewer/server/git-guard.ts`, `viewer/server/load-reading.ts`,
+  `viewer/server/api/build-check.ts`, `viewer/server/runner/reap.ts`,
+  `viewer/server/runner/boarding-order.ts`, `viewer/server/runner/artefacts.ts`, `bin/mcp-verb.mjs`
+  and `scripts/cmd-ref.sh`.
+- The tarball is 11.3 MB (11,323,811 B), 1339 entries, 31.0 MB of files unpacked, measured at 8.0.0
+  with `pack-and-assert.sh --keep`. First paint is 134.2 KB served of 170.
 
 ## Upgrading to 7.1.0
 
@@ -164,6 +236,9 @@ session or script writes stops working, and `PE_API` stays 2. What follows is wh
 script that reads the API or a fork of the client will notice.
 
 ### The client: seven places, and every old address still lands
+
+7.0 drew seven places. Since 8.0 (one-pool phase 14, #377) Your turn is the eighth destination
+(`#/turn`) and every plan's fourth view (`#/plan/<slug>/turn`); the addresses below still land.
 
 - **Every 6.2 address lands, in one hop, with its query** (`viewer/client/src/shell/redirects.ts`):
   `#/now…` and `#/ready` on the Runs home, `#/queue` on its Queued group, `#/approve` on Your turn,
@@ -505,8 +580,13 @@ notice it.
 - **A person's turn parks its phase on a person**: an unbudgeted wait with one inbox row and one push,
   reminded on a clock, proven by its own ref and resumed in the same session. Its ledger is
   `human-steps.ndjson` in the instance's state directory, and no secret is ever written there.
-- **A loaded machine holds new work.** The scheduler admits no NEW lane while the five-minute load is
-  above 1.5 × the cores (`loadGuardFactor`; `0` switches it off); a running lane is never touched.
+- **A loaded machine holds new work.** The scheduler admits no NEW lane while the machine is loaded
+  (`loadGuardFactor`, 1.5 by default; `0` switches it off); a running lane is never touched. 6.0 read
+  the five-minute load against 1.5 × the cores. Since 8.0 (one-pool phase 26, #243 #223) the guard
+  reads the share of CPU busy over the last 30 s, against 85 % at factor 1.5 (scaled by the factor,
+  held to 5–98 %), and the five-minute average is only a ceiling, at factor × cores × 2. A heavy
+  baseline or §Verification line takes a seat in one machine-wide budget (cores / 7, at least 1) that
+  every console shares; a line waiting for one is journalled `phase.verify-queued`, not hung (#327).
   Inside a priority class the plans take turns, and `#/queue` names every entry's reason — with
   `POST /api/queue/{bump,hold,release,defer,withdraw,requeue,reorder}` and
   `POST /api/lane/{pin,unpin,reserve,unreserve,yield,isolate-phase,isolate}` to move it.

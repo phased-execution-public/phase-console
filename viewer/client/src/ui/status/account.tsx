@@ -18,3 +18,4 @@ export function AccountStatus({ auth, entitlement, ...chrome }: AccountStatusPro
     entitlement !== undefined ? describeWord('entitlement', entitlement) : describeWord('auth', auth);
   return <DotWord view={view} {...chrome} />;
 }
+

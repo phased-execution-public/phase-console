@@ -91,10 +91,11 @@ import { wantsDefaultCheckout } from '../shared/worktree-model.js';
 import { phaseClocks } from '../shared/phase-clocks.js';
 import { wallReading, withWallWhy } from '../shared/situation-model.js';
 import { mergeDecisions, subKindOfNeed } from '../shared/decisions-model.js';
+import { resolvePolicy } from '../shared/policy-model.js';
 import { PreludeRefusal, doorOpens, itemOf, planStepInput, preludeFor, resolvedManifest, scopedSteps, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
 import type { PreludeStep, SkillApiFacts } from './prelude.ts';
 import { openUrlOnHost, type HostOpen } from './host-open.ts';
-import { GitStrategyRefusal, type GitStrategyLine } from './prelude.ts';
+import { GitStrategyRefusal, rereadManifest, type GitStrategyLine } from './prelude.ts';
 import { credentialsHeld } from './credentials-probe.ts';
 import {
   doctorReport, presenceDirs, skipped, type DoctorDeps, type DoctorInstance, type DoctorReport, type PresenceDir, type UnitFacts,
@@ -103,7 +104,7 @@ import {
 // export is stripped from doctor.ts there, so the import goes with it.
 import { probeAccounts, probeCredentials, probeDelivery, probeMcp } from './prelude.ts';
 import { cliVersion } from './accounts/transcripts.ts';
-import { unitName, unitPath } from '../shared/instances.mjs';
+import { readAutostart, unitName, unitPath } from '../shared/instances.mjs';
 import { execFile as execFileCb } from 'node:child_process';
 
 /**
@@ -195,7 +196,7 @@ import {
   type AskResult, type RecoverMode, type RunSettingsPatch, type StartOptions,
 } from './runner/runner.ts';
 import { spentBudgetPark } from './runner/runner-loop.ts';
-import { Scheduler, isExternalWall, lockLapsed, planRemainingEta, type HolderEta, type LockView, type QueueEntry } from './runner/scheduler.ts';
+import { Scheduler, isExternalWall, isRecheckableWall, lockLapsed, planRemainingEta, type HolderEta, type LockView, type QueueEntry } from './runner/scheduler.ts';
 import { offeredModels } from './runner/models.ts';
 import {
   continueMcpParkedRecord, mcpParkDueAt, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult,
@@ -208,7 +209,7 @@ import {
   accountPersonRung, accountRung, boardInPersonSlot, errandFor, forgiveRungs, ladderCaps, nextRung, personSituationOf,
   replenishedPayload, retryForgives, rungsFor, settleRung, switchRungDecision, LADDER_TIMED_PARK_MS, PERSON_SLOT_BY, type Rung,
 } from './runner/ladder.ts';
-import type { McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import type { AccountRequirement, McpDegradation, PhaseRecord as RunPhaseRecord, QueueOrder } from './runner/state.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import { ISOLATED, isolationMode } from '../shared/worktree-model.js';
 import { branchHolderOf, readHolds, readTrees } from './runner/tree-state.ts';
@@ -239,14 +240,14 @@ import { MESSAGING_WORDS, type MessagingWord } from '../shared/message-model.js'
 import { ISSUE_MODES, type IssueMode } from '../shared/issues-model.js';
 import {
   clearBudgetHold,
-  applyErrandAnswer, autoResolveRun, childrenOf, retirePhaseHalt, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, pidHoldsWork, procIdentity, syncWaitClock,
+  applyErrandAnswer, applyVerifyWaiver, autoResolveRun, childrenOf, retirePhaseHalt, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, pidHoldsWork, procIdentity, syncWaitClock,
   reconcileRecordsAgainstBoard, resetForRetry, resetStreak, resolveRunsAgainst, retireSettledErrands, retryOverrideFrom, saveRun,
   slugsNeedingBoard, runDir, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText, setRunState,
   type BoardingBrief, type Errand, type McpPolicy, type PhaseOptions, type PreflightWarning, type RungRecord, type RunState, type RunVerifyApprovals, type VerifySummary, clearWatchBookkeeping, isSessionGone,
   journalOf, runIsOver, prepareReboard, chargeDeclaration, consumeDeclaration, DECLARATION_REFUSED_EVENT, type DeclarationCharge,
   type Actor, type PressAnswer, type PressLaunch, accountPool, type AccountChoice,
   identityChangeWords, identityEcho, keepAccountInPool, keepNotes, RUN_NOTE_MAX, type RunNote,
-  dismissedByPerson, SCRIPT_BY, type RunResolution,
+  dismissedByPerson, SCRIPT_BY, type RunResolution, type VerifyWaiver,
 } from './runner/state.ts';
 import {
   RECOVER_MAX_PER_PHASE, resumePolicyInstruction, resumePolicyWhy, sessionLostInstruction,
@@ -261,7 +262,7 @@ import {
   needsOf,
 } from './runner/outcome.ts';
 import { readTranscript, replayFor, transcriptFile, type TranscriptEntry } from './runner/transcript.ts';
-import { extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './runner/verify.ts';
+import { commandFingerprint, extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './runner/verify.ts';
 import { loadVerifyEnv } from './runner/verify-env.ts';
 import { approvalsForPhase, resolveVerifyAnswers, reviewPhase, type PhaseReview } from './runner/verify-review.ts';
 import { checkAuth, checkAuthFor, forgetAuth, openLoginTerminal, openCommandTerminal, shellQuote, type AuthStatus } from './runner/auth.ts';
@@ -635,6 +636,19 @@ export abstract class ServiceRuns extends ServiceLive {
   }
 
   /**
+   * The account a fresh run with a requested pool starts on (#238): `Accounts.startPick` over
+   * the pool in its requested order — in Pro, the pool policy's pick (one-pool phase 7), and the
+   * verdict rides to `run.start` so a spill there is journalled.
+   */
+  private poolStart(slug: string, pool: readonly AccountRequirement[], options: Partial<StartOptions>): Partial<StartOptions> {
+    const verdict = this.accounts.startPick(pool, options.model, {
+    });
+    return {
+      accountId: verdict.pick,
+    };
+  }
+
+  /**
    * Start or continue a run. Whether the plan is fresh or half-finished is not
    * a distinction the caller has to make — the engine derives ready phases from
    * the done-set, so both are the same code path.
@@ -677,6 +691,11 @@ export abstract class ServiceRuns extends ServiceLive {
     // `auto` resolves here, once, against the cached meters — the run then
     // carries a concrete id, so the journal and the header say which account
     // is paying rather than "whatever looked best at some point".
+    // A fresh run that names no account, or asks for `auto`, starts on its POOL's first account
+    // with room, in the requested order (#238) — decided below, once the prelude has read the
+    // pool from the form or the plan. Without a pool, `auto` is the roomiest account as before.
+    const startsOnPool = !options.resumeRunId && (options.accountId === undefined || options.accountId === 'auto')
+      && Boolean(options.accounts?.length || record.plan.sessionBudget.accounts.length);
     if (options.accountId === 'auto') {
       options = { ...options, accountId: this.accounts.pickAccount(null, options.model) ?? DEFAULT_ACCOUNT_ID };
     }
@@ -725,8 +744,14 @@ export abstract class ServiceRuns extends ServiceLive {
           const cannot = gitLines.filter((line) => !line.honourable);
           if (cannot.length) throw new GitStrategyRefusal(cannot, 'honour');
           // Every honourable line is one a checkout of the run's own makes
-          // hold: `Worktrees: on` in a plain repository, `Checkout: main`.
-          options = { ...options, isolation: ISOLATED };
+          // hold: `Worktrees: on` in a plain repository, `Checkout: main` —
+          // and a plan's `pe/<slug>` branch under a launch that cut none
+          // (#322), which the new-branch strategy creates.
+          options = {
+            ...options,
+            ...(gitLines.some((line) => line.kind === 'branch') ? { gitMode: 'new-branch' as const } : {}),
+            ...(gitLines.some((line) => line.kind !== 'branch') ? { isolation: ISOLATED } : {}),
+          };
         } else {
           options = {
             ...options,
@@ -749,6 +774,9 @@ export abstract class ServiceRuns extends ServiceLive {
         resumeOnRestart: options.resumeOnRestart ?? (prelude.rows.find((r) => r.key === 'resume.on-restart')?.value !== 'hold'),
         relay: options.relay ?? (prelude.rows.find((r) => r.key === 'relay')?.value === 'last-resort' ? 'last-resort' : 'off'),
         accounts: prelude.accounts,
+        // #238: the run starts on its pool's first account with room, in the order the form or
+        // the plan asked — never on the machine login appended to the list and picked first.
+        ...(startsOnPool && prelude.accounts.length ? this.poolStart(slug, prelude.accounts, options) : {}),
         acknowledgedWaivers: prelude.acknowledged,
         ...(override && prelude.blocking.length ? { manifestOverride: { rows: override.rows, by: override.by } } : { manifestOverride: undefined }),
         // The draft's §Verification answers as the prelude resolved them —
@@ -758,6 +786,16 @@ export abstract class ServiceRuns extends ServiceLive {
           ? { ...prelude.verifyApprovals, by: options.actor?.by ?? 'operator', at: prelude.at }
           : undefined,
       };
+    } else {
+      // A RESUME re-reads the plan's decisions (#226): every door that
+      // continues a run — a Continue, a converge relaunch, a closeout press —
+      // used to keep the manifest its first launch resolved, so a row amended
+      // since never went live. The plan's written rows replace the stored
+      // ones; `Runner.start` journals `run.decisions-reread` with what moved.
+      const stored = loadRun(this.root.path, slug, options.resumeRunId, null);
+      if (stored?.manifest) {
+        options = { ...options, manifestReread: rereadManifest(stored.manifest, mergeDecisions(record.plan.decisions, record.decisionsTwin)) };
+      }
     }
 
     // QA on launch, resolved BEFORE the runner starts so the run's first board
@@ -1095,8 +1133,17 @@ export abstract class ServiceRuns extends ServiceLive {
         // defaults when the draft does not say, exactly as probe 6 reads it.
         const gitMode = options.gitMode;
         const isolation = options.isolation ?? isolationMode(this.prefs.isolation);
+        // The checkout's branch is read beside the plan's line (#322): a
+        // launch that cuts no branch stands on it, so it is what the plan's
+        // branch is held against — one name when every scoped tree agrees.
+        const standing = gitMode === 'new-branch' || !plan.sessionBudget.branch ? []
+          : await readTrees(root, union((p) => scopeOfRow(plan.graph.find((row) => row.phase === p)?.repos ?? ''))).catch(() => []);
+        // A detached tree names no branch, and is not a disagreement.
+        const branches = [...new Set(standing.map((tree) => tree.branch).filter((b): b is string => Boolean(b)))];
+        const checkoutBranch = branches.length === 1 ? branches[0] : undefined;
         return {
           ...(gitMode ? { gitMode } : {}),
+          ...(checkoutBranch ? { checkoutBranch } : {}),
           runBranch: `pe/${slug}`,
           isolated: gitMode === 'new-branch' && isolation === ISOLATED,
           superproject: existsSync(join(root, '.gitmodules')),
@@ -1631,6 +1678,7 @@ export abstract class ServiceRuns extends ServiceLive {
       // fail because the disk did.
       try { saveRun(state); } catch { /* the annotation is worth less than the read */ }
       log.info('run.resolved', { slug: state.slug, runId: state.id, reason: state.resolved?.reason });
+      this.noteRunResolved(state);
     }
     return runs;
   }
@@ -2636,11 +2684,15 @@ export abstract class ServiceRuns extends ServiceLive {
       until?: string; position?: 'front'; phases?: readonly number[];
       /** `reserve`: the live lane whose end it waits for, and whether a yield made it (control-tower phase 100). */
       lane?: { slug: string; phase: number }; via?: 'yield';
+      /** The Queue's override (one-pool phase 39): the mark `order` writes, why `unorder` lapsed, and the move's facts for the journal. */
+      order?: QueueOrder; lapsed?: string; facts?: Record<string, unknown>;
     } = {},
   ): { ok: true; slug: string; phase: number | null; changed: boolean } | { ok: false; status: number; error: string } {
     const actor = asActor(who, 'Service.queueControl');
-    // Phase 99's words, and the lane marks (control-tower phase 100): a pin and a kept lane.
-    const verbs: readonly string[] = [...QUEUE_VERBS, ...LANE_MARK_VERBS];
+    // Phase 99's words, the lane marks (control-tower phase 100): a pin and a
+    // kept lane — and the Queue's override (one-pool phase 39), which no route
+    // of its own reaches: the Queue's order press writes it after its check.
+    const verbs: readonly string[] = [...QUEUE_VERBS, ...LANE_MARK_VERBS, 'order', 'unorder'];
     if (!verbs.includes(verb)) {
       return { ok: false, status: 404, error: `no queue verb ${verb} — one of ${verbs.join(', ')}` };
     }
@@ -2689,9 +2741,12 @@ export abstract class ServiceRuns extends ServiceLive {
     const position = opts.position === 'front' ? 'front' as const : undefined;
     const lane = opts.lane;
     const via = opts.via;
+    const marks = {
+      ...(opts.order ? { order: opts.order } : {}), ...(opts.lapsed ? { lapsed: opts.lapsed } : {}), ...(opts.facts ? { facts: opts.facts } : {}),
+    };
     if (onLive) {
       const out = runner!.queueControl(phase, act, actor, {
-        ...(until ? { until } : {}), ...(position ? { position } : {}), ...(lane ? { lane } : {}), ...(via ? { via } : {}),
+        ...(until ? { until } : {}), ...(position ? { position } : {}), ...(lane ? { lane } : {}), ...(via ? { via } : {}), ...marks,
       });
       return out.ok ? { ok: true, slug, phase, changed: out.changed } : out;
     }
@@ -2703,7 +2758,7 @@ export abstract class ServiceRuns extends ServiceLive {
       const refusal = laneMarkRefusal(state, target2, act);
       if (refusal) { result = { ok: false, status: 409, error: refusal }; return; }
       result = applyQueueControl(phaseRecord(state, target2), act, actor, {
-        ...(until ? { until } : {}), ...(position ? { position } : {}), ...(lane ? { lane } : {}), ...(via ? { via } : {}),
+        ...(until ? { until } : {}), ...(position ? { position } : {}), ...(lane ? { lane } : {}), ...(via ? { via } : {}), ...marks,
         nextStamp: () => this.scheduler.nextStamp(),
       });
       if (result.ok && result.changed) {
@@ -2720,7 +2775,7 @@ export abstract class ServiceRuns extends ServiceLive {
       const control = done.change.control;
       if (act === 'withdraw') this.scheduler.withdrawEntry(entry.id);
       else if (control.bump && (act === 'bump' || act === 'requeue')) this.scheduler.bump(entry.id, control.bump);
-      else this.scheduler.markEntry(entry.id, { hold: control.hold ?? null, defer: control.defer ?? null, pin: control.pin ?? null });
+      else this.scheduler.markEntry(entry.id, { hold: control.hold ?? null, defer: control.defer ?? null, pin: control.pin ?? null, order: control.order ?? null });
     }
     // A kept lane stands in the scheduler whether or not the phase has an entry.
     if (done.changed && (act === 'reserve' || act === 'unreserve')) {
@@ -2875,6 +2930,7 @@ export abstract class ServiceRuns extends ServiceLive {
     // queue and what may be holding all of it, beside it.
     return { ...snapshot, ...view, policy: this.schedulingPolicies(), load: this.loadGuard() };
   }
+
 
   /* ---------------------------------------------------------------- *
    * Fleet freeze — the panic button
@@ -3289,6 +3345,10 @@ export abstract class ServiceRuns extends ServiceLive {
     }
     try {
       const run = await this.startRun(slug, { actor: actor, resumeRunId: stored.id });
+      // A pass now, AFTER the start (one-pool phase 23, #245): the run is live,
+      // so the pass reads — and saves — the runner's own object, never the
+      // paused copy on disk over the run the start just made live.
+      if (!isAutomatic(actor)) this.watchClock.poke();
       return { ok: true, run, resumed: { runId: stored.id, from, act: 'relaunched' } };
     } catch (error) {
       return { ok: false, status: 409, error: (error as Error).message };
@@ -3318,9 +3378,20 @@ export abstract class ServiceRuns extends ServiceLive {
     const waiting = Object.values(stored.phases ?? {})
       .filter((record) => record?.status === 'waiting' && record.parkedUntil && Date.parse(record.parkedUntil) > now)
       .sort((a, b) => a.phase - b.phase);
-    const cuts: { phase: number; was: string; parker: string; ref?: string; read?: string }[] = [];
+    // …and a declared wait whose clock SETTLED it to `pending` while the run
+    // stood (one-pool phase 23, #245): its declaration stands, its refs are its
+    // wait, and a Resume used to skip it — answering 200 and re-parking the run
+    // `nothing-ready` 59 s later. It is asked exactly like a live window.
+    const settledWaits = Object.values(stored.phases ?? {})
+      .filter((record) => record?.status === 'pending' && !record.parkedUntil
+        && record.declared?.status === 'waiting-external' && pollableRefs(record.declared.watch ?? []).length > 0)
+      .sort((a, b) => a.phase - b.phase);
+    const settledSet = new Set(settledWaits.map((record) => record.phase));
+    const cuts: { phase: number; was: string; parker: string; ref?: string; read?: string; settled?: boolean }[] = [];
     const standing: string[] = [];
-    for (const record of waiting) {
+    for (const record of [...waiting, ...settledWaits]) {
+      const settled = settledSet.has(record.phase);
+      const clockWords = settled ? 'its clock passed while the run stood' : `or at ${record.parkedUntil}`;
       const declared = record.declared;
       if (declared?.by === 'watchdog') {
         cuts.push({ phase: record.phase, was: record.parkedUntil!, parker: 'watchdog' });
@@ -3329,7 +3400,12 @@ export abstract class ServiceRuns extends ServiceLive {
       if (record.usageWall) {
         return { ok: false, why: `phase ${record.phase} waits on its account's usage window until ${record.parkedUntil} — switch the run's account, or let the window open` };
       }
-      const refs = pollableRefs(declared?.watch ?? record.watch ?? []);
+      // A `cmd:` ref the CONSOLE minted runs only where the timer would run it
+      // (SLF-8, `watchMintedCmdRefs`): a person's Resume is no licence to
+      // execute the console's own inference.
+      const mintedOk = this.flags.allowRun && this.prefs.watchMintedCmdRefs === true;
+      const refs = pollableRefs(declared?.watch ?? record.watch ?? [])
+        .filter((target) => mintedOk || target.kind !== 'cmd' || !declared?.minted?.includes(target.ref));
       const reads: string[] = [];
       let landed: WatchState | null = null;
       for (const target of refs) {
@@ -3339,34 +3415,53 @@ export abstract class ServiceRuns extends ServiceLive {
       }
       if (landed) {
         cuts.push({
-          phase: record.phase, was: record.parkedUntil!, parker: declared?.by ?? 'session', ref: landed.ref,
+          phase: record.phase, was: record.parkedUntil ?? record.queueSince ?? new Date(now).toISOString(),
+          parker: declared?.by ?? 'session', ref: landed.ref,
           ...(landed.detail ? { read: landed.detail } : {}),
+          ...(settled ? { settled: true } : {}),
         });
         continue;
       }
+      // The act that moves it, named (#245 ask 2): a Resume of the PHASE boards
+      // its own session; a relaunch of the run never does for a phase the
+      // board reads in progress.
       standing.push(refs.length
-        ? `phase ${record.phase} waits on ${reads.join(', ')}, which has not landed; it resumes when it does, `
-          + `or at ${record.parkedUntil} — Retry the phase to board it now`
-        : `phase ${record.phase} waits until ${record.parkedUntil} on a wait that names no ref the console can check — `
-          + 'Retry the phase to board it now');
+        ? `phase ${record.phase} waits on ${reads.join(', ')}, which has not landed; it resumes when it does`
+          + `${settled ? ` (${clockWords})` : `, ${clockWords}`} — Resume the phase to board its own session now`
+        : `phase ${record.phase} waits ${settled ? `(${clockWords})` : `until ${record.parkedUntil}`} on a wait that names `
+          + 'no ref the console may check — Resume the phase to board its own session now');
     }
     // Nothing cut, a wait still standing, and nothing else for the loop to
     // board: the relaunch would only park the run again. Said, not done.
     if (!cuts.length && standing.length) {
       const board = await this.board(slug).catch(() => null);
-      const parked = new Set(waiting.map((record) => record.phase));
+      const parked = new Set([...waiting, ...settledWaits].map((record) => record.phase));
       const other = board && !board.error ? board.ready.filter((phase) => !parked.has(phase)) : [];
       if (!other.length) return { ok: false, why: standing[0]! };
     }
-    if (!cuts.length || !this.root?.ok) return { ok: true };
+    if (!this.root?.ok) return { ok: true };
+    // Every declared wait this resume leaves standing starts its watch over
+    // (#245 ask 3): each row due now, a `cmd:` ref's post-window back-off
+    // counted from this press — never the hour step the pause had reached.
+    const watched = [...waiting, ...settledWaits].map((record) => record.phase)
+      .filter((phase) => !cuts.some((cut) => cut.phase === phase));
+    if (!cuts.length && !watched.length) return { ok: true };
     const at = new Date(now).toISOString();
     this.editStoredRunById(slug, stored.id, (run) => {
       for (const cut of cuts) {
         const record = run.phases[String(cut.phase)];
         if (record?.status === 'waiting') record.parkedUntil = at;
+        // A settled wait whose ref landed is put back as an EXPIRED wait: the
+        // loop admits it as one and resumes the phase's own session.
+        else if (cut.settled && record?.status === 'pending') {
+          record.status = 'waiting';
+          record.parkedUntil = at;
+        }
       }
+      if (watched.length) this.watchClock.reset(run, watched, now);
       syncWaitClock(run);
     });
+    if (!cuts.length) return { ok: true };
     const journal = Journal.for(this.root.path, slug, stored.id);
     for (const cut of cuts) {
       journal.append('phase.wait-cut', {
@@ -4271,6 +4366,72 @@ export abstract class ServiceRuns extends ServiceLive {
   }
 
   /**
+   * An operator's waiver of ONE §Verification line for one phase, mid-run
+   * (one-pool phase 21, #267) — `POST /api/run/:slug/verify-waive {phase,
+   * line, reason}`. The start door's answers were the only way to set a line
+   * aside, and they answer only fragments the console would not run: a line
+   * that went red after the baseline for a reason outside the phase (another
+   * plan's merge opening a contract window) left the owner's waiver in the
+   * chat, and the verifier re-ran the line for eighty minutes and failed on it.
+   *
+   * `line` is the command as the plan writes it, or its fingerprint; it must be
+   * one of the phase's runnable lines. The waiver is a ruling on the plan's
+   * ledger (`deviation`, naming who waived it and why) and an entry on the run
+   * (`verifyWaivers`), journalled `phase.verify-waived`; `verifyApprovalsFor`
+   * sets the line aside at the phase's next verification, under `waived`.
+   */
+  async waiveVerifyLine(
+    slug: string, phase: number, line: string, reason: string, actor: StartActor,
+    /** The run the press was made on (turn-by-turn phase 5's `expectRunId`): another run standing now refuses it. */
+    expectRunId?: string,
+  ): Promise<{ ok: true; waiver: VerifyWaiver; run: RunState } | { ok: false; status: number; error: string }> {
+    const root = this.root?.path;
+    if (!root) return { ok: false, status: 409, error: 'No repository is open.' };
+    const why = reason.replace(/\s+/g, ' ').trim().slice(0, 500);
+    if (!why) return { ok: false, status: 400, error: 'A waiver says why: send {phase, line, reason}.' };
+    const target = listRuns(root, slug, this.liveRunIds()).find((run) => run.phases[String(phase)]);
+    if (!target || runIsOver(target)) {
+      return { ok: false, status: 409, error: `No open run of ${slug} holds phase ${phase} — a waiver applies to a run that will verify it.` };
+    }
+    if (expectRunId && expectRunId !== target.id) {
+      return {
+        ok: false, status: 409,
+        error: `This page showed run ${expectRunId.slice(0, 8)}, and run ${target.id.slice(0, 8)} holds phase ${phase} now — nothing was waived; look again before you waive.`,
+      };
+    }
+    const text = this.store?.get(slug)?.plan?.phases[phase]?.verification ?? '';
+    const lines = extractCommands(text, 'verify').commands;
+    const wanted = line.trim();
+    const match = lines.find((command) => commandFingerprint(command) === wanted || commandFingerprint(command) === commandFingerprint(wanted));
+    if (!match) {
+      return {
+        ok: false, status: 404,
+        error: `That is not one of phase ${phase}'s ${lines.length} runnable §Verification lines — name the line as the plan writes it.`,
+      };
+    }
+    const by = actor.by;
+    const shown = match.length > 160 ? `${match.slice(0, 157)}…` : match;
+    const ruling = appendRuling(rulingsFile(root, slug), {
+      slug, phase, kind: 'deviation', by,
+      what: `${by} waived the §Verification line \`${shown}\` for phase ${phase}, mid-run`,
+      why,
+    });
+    const waiver: VerifyWaiver = {
+      phase, fp: commandFingerprint(match), text: match, reason: why, by, at: new Date().toISOString(),
+      ...(ruling ? { rulingId: ruling.id } : {}),
+    };
+    const live = this.liveRunner(slug);
+    if (live?.current()?.id === target.id && live.waiveVerifyLine(waiver)) {
+      return { ok: true, waiver, run: live.current()! };
+    }
+    const stored = this.editStoredRunById(slug, target.id, (state) => { applyVerifyWaiver(state, waiver); });
+    journalOf(target)('phase.verify-waived', {
+      by, line: match, fp: waiver.fp, reason: why, rulingId: waiver.rulingId ?? null,
+    }, phase);
+    return { ok: true, waiver, run: stored ?? target };
+  }
+
+  /**
    * "Done — continue" (control-tower phase 88, #124) — the answer to a phase
    * parked on a person's errand that the person has DONE: the two Terraform
    * applies ran, the sign-in happened, the secret is in.
@@ -4683,8 +4844,11 @@ export abstract class ServiceRuns extends ServiceLive {
     // Recheck asks the wall's refs instead, and is not held to the RCV-4
     // ledger below: a probe of the world is new evidence every time.
     const walled = target.phases[String(phase)];
-    if (mode === 'recheck' && walled && (walled.status === 'parked' || walled.status === 'waiting')
-      && isExternalWall(walled, target.recoveries?.[String(phase)]?.errand)) {
+    // A `waiting-external` wall whose clock settled it to `pending` (#245) is
+    // still that wall: its declaration stands and its refs are its wait.
+    const settledWait = walled?.status === 'pending' && walled.declared?.status === 'waiting-external';
+    if (mode === 'recheck' && walled && (walled.status === 'parked' || walled.status === 'waiting' || settledWait)
+      && isRecheckableWall(walled, target.recoveries?.[String(phase)]?.errand)) {
       return this.recheckWall(slug, target, phase, opts.by ?? 'console');
     }
     // …but a click over evidence the LAST recovery already ran under is not a

@@ -231,6 +231,7 @@ export const keys = {
     ['accounts', 'switch-preview', slug, accountId, when] as const,
   mcp: () => ['mcp'] as const,
   mcpCatalog: (query: string) => ['mcp', 'catalog', query] as const,
+  mcpLogin: (id: string) => ['mcp', 'login', id] as const,
   launcher: () => ['launcher'] as const,
   skills: () => ['skills'] as const,
   notifications: () => ['notifications'] as const,

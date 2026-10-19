@@ -38,8 +38,10 @@
  */
 
 import { type ChildProcess, spawn } from 'node:child_process';
+import { basename } from 'node:path';
 
 import { count } from './counters.ts';
+import { hardenedGitEnv } from './git-guard.ts';
 import { gitTraceDir, gitTraceEnv } from './git-trace.ts';
 import { log } from './log.ts';
 import { groupSignal, killLadder } from './runner/signals.ts';
@@ -303,8 +305,13 @@ export async function shell(file: string, argv: readonly string[], options: Shel
         // shape for the same reason — with tracing off it states
         // `GIT_TRACE2_EVENT: undefined`, so a variable the operator's own shell
         // exported cannot send git's events somewhere nothing will drain.
+        //
+        // A git command runs HARDENED (one-pool phase 2, #272): a hook, an
+        // fsmonitor, a pager or a credential helper a session planted in the
+        // tree's config is never run by the console's own git (`git-guard.ts`).
         env: {
-          ...(options.env ?? process.env),
+          ...(options.channel === 'git' || basename(file) === 'git'
+            ? hardenedGitEnv(options.env ?? process.env) : (options.env ?? process.env)),
           ...(options.channel === 'git' ? gitTraceEnv(gitTraceDir()) : {}),
           ...envCarrier(),
         },

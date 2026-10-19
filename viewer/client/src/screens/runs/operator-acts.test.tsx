@@ -266,7 +266,8 @@ describe('OA-C4 Your turn', () => {
       seen: null,
       issues: null,
     } satisfies TurnAnswer);
-    return withClient(<TurnPage route={parseHash('#/turn') as Route} />);
+    // The cards, as 7.1 drew them (one-pool phase 14 made the list the default).
+    return withClient(<TurnPage route={parseHash('#/turn?view=cards') as Route} />);
   }
 
   const section = (id: string) =>
@@ -288,8 +289,11 @@ describe('OA-C4 Your turn', () => {
   it('still draws Coming up when nothing is due', async () => {
     mount(['upcoming']);
     await screen.findByTestId('turn-headline');
-    expect(within(section('now')).queryAllByTestId('turn-item')).toHaveLength(0);
-    expect(within(section('now')).getByText('Nothing to do now.')).toBeTruthy();
+    // An empty Do now folds into the one shared line (#377).
+    expect(screen.getAllByTestId('turn-section').map((el) => el.getAttribute('data-section'))).not.toContain(
+      'now',
+    );
+    expect(screen.getByTestId('turn-empty-groups').textContent).toContain('to do now');
     expect(within(section('upcoming')).getByTestId('turn-item')).toBeTruthy();
   });
 });

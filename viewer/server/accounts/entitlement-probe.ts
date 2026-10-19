@@ -45,6 +45,7 @@ import { log } from '../log.ts';
 import { PROBE_FLAG, PROBE_SESSION_KIND, SESSION_KIND_ENV } from '../mcp/health.ts';
 import { API_RETRY_ERRORS, type StopSignal } from '../runner/errors.ts';
 import { killLadder, type LadderOptions } from '../runner/signals.ts';
+import { usageOf, type CallUsage } from '../runner/usage.ts';
 
 /** The probe's name, in the vocabulary the locks and the session registry read. */
 export const ENTITLEMENT_PROBE_OWNER = 'console/entitlement-probe';
@@ -109,6 +110,8 @@ export type ProbeSession = {
   cliVersion?: string;
   model?: string;
   sessionId?: string;
+  /** The result line's `usage` — what the one turn read and wrote, for the ledger (one-pool phase 6). */
+  usage?: CallUsage;
   /** Why the session could not run or answer, when it could not. */
   error?: string;
 };
@@ -182,6 +185,7 @@ export async function runProbeSession(opts: ProbeSessionOptions): Promise<ProbeS
     let cliVersion: string | undefined;
     let model: string | undefined;
     let sessionId: string | undefined;
+    let usage: CallUsage | undefined;
     let exitCode: number | null | undefined;
     let closed = false;
     let child: ReturnType<typeof spawn> | null = null;
@@ -211,6 +215,7 @@ export async function runProbeSession(opts: ProbeSessionOptions): Promise<ProbeS
         ...(cliVersion ? { cliVersion } : {}),
         ...(model ? { model } : {}),
         ...(sessionId ? { sessionId } : {}),
+        ...(usage ? { usage } : {}),
         ...(error ? { error } : {}),
       });
       end(ending);
@@ -334,6 +339,7 @@ export async function runProbeSession(opts: ProbeSessionOptions): Promise<ProbeS
           terminalReason = typeof message.terminal_reason === 'string' && message.terminal_reason
             ? message.terminal_reason : undefined;
           if (typeof message.num_turns === 'number') turns = message.num_turns;
+          usage = usageOf(message.usage) ?? undefined;
           const text = message.result ?? message.error;
           if (typeof text === 'string') resultText = text;
           finish('result');

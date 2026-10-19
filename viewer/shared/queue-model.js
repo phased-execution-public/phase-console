@@ -100,7 +100,8 @@ export function holderWords(holder, extra = {}) {
  *           priority?: string, bumped?: boolean, since: number, pinned?: boolean,
  *           laneReserved?: { by?: string, reason?: string }|null,
  *           promotion?: { policy: string, rank: number, text: string }|null,
- *           share?: { round: number, lanes?: number }|null }} entry
+ *           share?: { round: number, lanes?: number }|null,
+ *           control?: { order?: { anchor: { slug: string, phase: number }|'first'|'last', side: string, by?: string, reason?: string } }|null }} entry
  * @param {{ nowMs: number, bump?: { by?: string, reason?: string }|null,
  *           pin?: { by?: string, reason?: string }|null,
  *           seniority?: { clock: string, since: string }|null }} ctx
@@ -145,6 +146,20 @@ export function queueOrderReason(entry, ctx) {
     all.push({
       key: 'pinned',
       text: `pinned next in its plan${pin?.by ? ` by ${pin.by}` : ''}${pin?.reason ? ` — ${pin.reason}` : ''} — its run's other phases wait for it`,
+    });
+  }
+  // An operator's order (one-pool phase 39): where it was put, by whom and why.
+  const order = entry.control?.order;
+  if (order) {
+    const where =
+      order.anchor === 'first'
+        ? 'first'
+        : order.anchor === 'last'
+          ? 'last'
+          : `${order.side} ${order.anchor.slug} P${order.anchor.phase}`;
+    all.push({
+      key: 'order',
+      text: `put ${where} by ${order.by ?? 'an operator'}${order.reason ? ` — ${order.reason}` : ''}`,
     });
   }
   if (entry.bumped) all.push({ key: 'bumped', text: `${bumpReason(ctx.bump)} — first in its class` });

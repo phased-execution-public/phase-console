@@ -32,7 +32,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ForeignSession, TerminalSession } from '@/data/api';
+import type { AccountView, ForeignSession, RunDetail, TerminalSession } from '@/data/api';
 import { keys, queryClientConfig } from '@/data/keys';
 import type { NowLane } from '@/data/lanes';
 import { InspectorHost, __resetInspectorForTests } from '@/shell/panel/inspector-host';
@@ -40,6 +40,7 @@ import { TooltipProvider } from '@/ui/tooltip';
 import { ForeignSessionPage } from './foreign';
 import { SessionList, sessionColumns, type SessionListProps } from './list';
 import { SORTS, isSortId, sessionRows, type SessionRow } from './model';
+import { SessionsStrip } from './strip';
 
 vi.setConfig({ testTimeout: 20_000 });
 
@@ -161,18 +162,40 @@ async function open(key: string): Promise<HTMLElement> {
 }
 
 describe('the columns', () => {
-  it('draws four facts at the glance, the kind among them once no heading says it, and the rest under Everything', () => {
+  it('draws the session’s working facts at the glance, the kind among them once no heading says it, and the heavy ones under Everything (#369)', () => {
     const glance = (by: 'kind' | 'none') =>
       sessionColumns(by)
         .filter((column) => !column.everything)
         .map((column) => column.id);
-    expect(glance('kind')).toEqual(['status', 'session', 'detail', 'heard']);
-    expect(glance('none')).toEqual(['status', 'session', 'detail', 'heard', 'kind']);
+    const DEFAULT = [
+      'status',
+      'session',
+      'detail',
+      'account',
+      'model',
+      'progress',
+      'spend',
+      'context',
+      'elapsed',
+      'heard',
+    ];
+    expect(glance('kind')).toEqual(DEFAULT);
+    expect(glance('none')).toEqual([...DEFAULT, 'kind']);
     expect(
       sessionColumns('kind')
         .filter((column) => column.everything)
         .map((column) => column.id),
-    ).toEqual(['kind', 'note', 'began', 'for', 'terminal', 'conversation', 'tasks']);
+    ).toEqual([
+      'kind',
+      'note',
+      'began',
+      'attempts',
+      'turns',
+      'worktree',
+      'terminal',
+      'conversation',
+      'tasks',
+    ]);
     // The name is the row's identity: never folded, the holder of its link and its toggle.
     expect(sessionColumns('kind').find((column) => column.identity)?.id).toBe('session');
   });
@@ -481,6 +504,117 @@ describe('<SessionList>', () => {
   });
 });
 
+describe('the rich row (#369)', () => {
+  const RECORD = {
+    run: {
+      id: 'run-1',
+      slug: 'alpha',
+      workRoot: '/work/.worktrees/runs/alpha/run-1',
+      phases: {
+        '3': {
+          phase: 3,
+          status: 'running',
+          attempts: 2,
+          turns: 41,
+          costUsd: 1.5,
+          actualModel: 'claude-opus-5-5[1m]',
+          effort: 'high',
+          sessionAccountId: 'acct-b',
+          sessionId: 'conv-3',
+          tasks: [
+            ...['one', 'two', 'three', 'four'].map((content, i) => ({
+              id: `t${i}`,
+              content,
+              status: 'completed',
+            })),
+            ...['five', 'six', 'seven'].map((content, i) => ({ id: `u${i}`, content, status: 'pending' })),
+          ],
+          phaseClocks: { workedMs: 12 * 60_000 },
+          live: { spentUsd: 0.25, contextTokens: 300_000 },
+          tokens: [{ window: 1_000_000 }],
+        },
+      },
+    },
+    history: [],
+    eta: null,
+    phaseEta: [{ phase: 3, weight: 1, estMs: 40 * 60_000, basis: 'history', clock: 'working', label: '' }],
+  } as unknown as RunDetail;
+  const rich = () =>
+    sessionRows({
+      lanes: [lane({ phase: 3, slim: true, title: 'Server B' })],
+      records: new Map([['alpha', RECORD]]),
+      accounts: [{ id: 'acct-b', name: 'Work login' }] as unknown as AccountView[],
+      now: NOW,
+    });
+
+  it('draws the status as a badge, the kind as a quiet word beside what it works on', async () => {
+    mount(rich());
+    const row = await waitFor(() => rowOf('lane:run-1#3'));
+    const marks = row.querySelectorAll<HTMLElement>('[data-status]');
+    expect(marks).toHaveLength(1);
+    expect(marks[0]).toHaveAttribute('data-chrome', 'badge');
+    // The kind is a word, not a status: no `data-status`, so the row still carries ONE mark.
+    const kind = row.querySelector<HTMLElement>('[data-session-badge]');
+    expect(kind).toHaveAttribute('data-session-badge', 'lane');
+    expect(kind).toHaveTextContent('Lane');
+  });
+
+  it('shows the account, the model and effort, progress and context as meters, the spend and the clock at the glance', async () => {
+    mount(rich());
+    const row = await waitFor(() => rowOf('lane:run-1#3'));
+    expect(row).toHaveTextContent('Work login');
+    expect(row).toHaveTextContent('claude-opus-5-5[1m]');
+    expect(row).toHaveTextContent('high');
+    expect(row).toHaveTextContent('$1.75');
+    const progress = within(row).getByRole('meter', { name: 'Tasks done' });
+    expect(progress).toHaveAttribute('aria-valuenow', '4');
+    expect(progress).toHaveAttribute('aria-valuemax', '7');
+    expect(progress).toHaveAttribute('aria-valuetext', '4 of 7 tasks done');
+    const context = within(row).getByRole('meter', { name: 'Context used' });
+    expect(context).toHaveAttribute('aria-valuenow', '300000');
+    expect(context).toHaveAttribute('aria-valuemax', '1000000');
+    const clock = within(row).getByRole('meter', { name: 'Worked against the estimate' });
+    expect(clock).toHaveAttribute('aria-valuetext', '12m of about 40m');
+    // The heavy facts wait under Everything: no column of their own at the glance.
+    for (const head of [/^Attempts/, /^Turns/, /^Worktree/, /^Conversation/]) {
+      expect(screen.queryByRole('columnheader', { name: head })).toBeNull();
+    }
+  });
+
+  it('draws the heavy facts as columns under Everything', async () => {
+    mount(rich(), { everything: EVERYTHING });
+    const row = await waitFor(() => rowOf('lane:run-1#3'));
+    for (const head of [/^Attempts/, /^Turns/, /^Worktree/, /^Conversation/]) {
+      expect(screen.getByRole('columnheader', { name: head })).toBeInTheDocument();
+    }
+    expect(within(row).getByRole('cell', { name: '2' })).toBeInTheDocument();
+    expect(within(row).getByRole('cell', { name: '41' })).toBeInTheDocument();
+    expect(row).toHaveTextContent('conv-3');
+  });
+});
+
+describe('<SessionsStrip>', () => {
+  it('says the live lanes, shells, agents, others, who waits on you and the accounts in use', () => {
+    render(
+      <SessionsStrip
+        rows={sessionRows({
+          lanes: [lane({ phase: 1 }), lane({ phase: 2 })],
+          terminals: [pty({ id: 's1' })],
+          foreign: [foreign({ sessionId: 'asking', waiting: { since: at(2), kind: 'permission' } })],
+          now: NOW,
+        })}
+      />,
+    );
+    const figure = (id: string) => screen.getByTestId(`sessions-strip-${id}`);
+    expect(figure('lanes')).toHaveTextContent('2 live lanes');
+    expect(figure('shells')).toHaveTextContent('1 shell');
+    expect(figure('foreign')).toHaveTextContent('1 other session');
+    expect(figure('waiting')).toHaveTextContent('1 waiting on you');
+    expect(figure('accounts')).toHaveTextContent('0 accounts in use');
+    expect(figure('waiting')).toHaveAttribute('data-value', '1');
+  });
+});
+
 describe('the clocks on the rows', () => {
   it('says when every row was last heard, and only a live one how long it has run', async () => {
     mount(
@@ -498,10 +632,11 @@ describe('the clocks on the rows', () => {
     // 6.2's live row carried one ticking DURATION as its clock. 7.0's first
     // clock is "Last heard", an INSTANT on every row, live or not…
     for (const row of [live, dead]) {
-      expect(row.querySelector('time')?.getAttribute('datetime')).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      const instants = [...row.querySelectorAll('time')].map((time) => time.getAttribute('datetime') ?? '');
+      expect(instants.some((datetime) => /^\d{4}-\d{2}-\d{2}T/.test(datetime))).toBe(true);
     }
     expect(dead).toHaveTextContent('2 minutes ago');
-    // …and the duration that grows is "Running for", on a live row only.
+    // …and the duration that grows is the Elapsed column's, on a live row only.
     expect(live.querySelector('time[datetime^="PT"]')).not.toBeNull();
     expect(dead.querySelector('time[datetime^="PT"]')).toBeNull();
   });

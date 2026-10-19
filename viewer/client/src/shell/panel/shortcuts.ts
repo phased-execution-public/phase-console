@@ -1,4 +1,5 @@
 import { useShortcut } from '@/lib/shortcut';
+import { DETAILS_KEY } from '../keymap';
 import { togglePanel, type PanelState } from './modes';
 
 /**
@@ -11,7 +12,8 @@ export function usePanelShortcuts(
   phone: boolean,
   navigate: (path: string) => void,
 ): void {
-  useShortcut({ key: 'i', mod: true, whileTyping: true }, () => togglePanel('details'), { enabled: !phone });
+  // The chords are the keymap's, the one table the Keyboard card draws.
+  useShortcut(DETAILS_KEY.chords ?? [], () => togglePanel('details'), { enabled: !phone });
   void state;
   void navigate;
 }

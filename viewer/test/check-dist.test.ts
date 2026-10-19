@@ -58,6 +58,10 @@ function baseline(): Dist {
       // Your turn (control-tower phase 137): the page's own lazy chunk, found by
       // the attribute only it writes.
       'turn-zzzz.js': 'export const Turn = { "data-turn-page": "" };\n',
+      // Settings ▸ Accounts (one-pool phase 9): the section body the Settings
+      // chunk reaches through `lazy()`, found by the id only it writes — a chunk
+      // of its own, never `settings-*`, never the entry.
+      'accounts-iiii.js': 'export const AccountsSection = { everything: "settings-accounts" };\n',
       // Phase 4's two. A destination chunk missing from the precache is a page
       // absent from the offline shell, so the gate names each one — which means
       // the baseline has to carry each one too.
@@ -572,6 +576,30 @@ test('the hover card in a preloaded chunk fails — first paint would carry the 
   assert.ok(failures(out).some((l) => l.includes('first paint carries no hover card')), out);
 });
 
+
+/* ---- Settings ▸ Accounts (one-pool phase 9) ---- */
+
+test('the accounts desk in a chunk of its own is exactly what is wanted', () => {
+  const { ok, out } = runGate(baseline());
+  assert.ok(ok, out);
+  assert.match(out, /✓ the accounts desk is in a chunk of its own \(accounts-iiii\.js\)/);
+});
+
+test('the accounts desk folded into the Settings chunk or the entry fails, and so does no desk at all', () => {
+  for (const into of ['settings-cccc.js', 'index-aaaa.js']) {
+    const dist = baseline();
+    dist.assets[into] += 'export const AccountsSection = { everything: "settings-accounts" };\n';
+    delete dist.assets['accounts-iiii.js'];
+    const { ok, out } = runGate(dist);
+    assert.equal(ok, false, `the desk folded into ${into} passed`);
+    assert.ok(failures(out).some((l) => l.includes('the accounts desk is in a chunk of its own')), out);
+  }
+  const none = baseline();
+  delete none.assets['accounts-iiii.js'];
+  const missing = runGate(none);
+  assert.equal(missing.ok, false);
+  assert.ok(failures(missing.out).some((l) => l.includes('the accounts desk is in a chunk of its own (none)')), missing.out);
+});
 
 test('Your turn is a lazy chunk of its own — found by data-turn-page, never first paint', () => {
   const { ok, out } = runGate(baseline());

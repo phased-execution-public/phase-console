@@ -42,7 +42,7 @@ import {
   parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor, verifyTimeoutFor,
   humanStepsFor, humanStepLine, waitCountFor,
   landFor, gitlinkFor, issuesFor, isolationFor, baseBranchOf, conflictPolicyOf, messagingOf, clashZonesOf,
-  permissionModeFor, modelPolicyFor, type Plan,
+  permissionModeFor, modelPolicyFor, phaseModelFor, type Plan,
 } from '../server/parse/plan.ts';
 import { mergeDecisions, formatDecisionsTsv, parseDecisionsTsv } from '../shared/decisions-model.js';
 import { readDecisions, readCredentials, readWaitBudget, readWaitsOn } from '../server/engine.ts';
@@ -1285,6 +1285,25 @@ test('the two parsers agree about landing, isolation and issues — the word AND
   });
 });
 
+test('the two parsers agree about the model each phase runs, and the plan\'s — `--model [N]` (one-pool phase 4)', async () => {
+  // The bullet's first word with a prose "(1M window)" read as [1m], else the
+  // plan's target model — a provider id (`deepseek-v4-pro[1m]`) included in Pro.
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    for (const record of samplePlans(corpus)) {
+      const fromEngine = await engine(corpus, [record.slug, '--model'], `${record.slug} --model`);
+      const fromJs = phaseModelFor(record.plan!) ?? '';
+      if (fromEngine !== fromJs) problems.push(`${record.slug} --model: JS ${JSON.stringify(fromJs)} vs engine ${JSON.stringify(fromEngine)}`);
+    }
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const fromEngine = await engine(corpus, [slug, '--model', String(phase)], `${slug} p${phase} --model`);
+      const fromJs = phaseModelFor(plan, phase) ?? '';
+      if (fromEngine !== fromJs) problems.push(`${slug} p${phase} --model: JS ${JSON.stringify(fromJs)} vs engine ${JSON.stringify(fromEngine)}`);
+    });
+    assert.deepEqual(problems, [], `${corpus.name} model mismatches:\n  ${problems.join('\n  ')}`);
+  });
+});
+
 test('the two parsers agree about the plan-wide directives — base branch, conflicts, messaging, clash zones', async () => {
   await forEachCorpus(async (corpus) => {
     const problems: string[] = [];
@@ -1329,6 +1348,7 @@ test('the fixture corpus is real, and covers the divergences this suite exists f
     'permission-mode.md',         // the permission-mode line and bullets: override, a typo, camelCase in any case
     'model-policy.md',            // the model-policy line and bullets: override, a typo, bold and case (#91)
     'human-steps.md',             // the Human step bullet: every field, defaults, case and bold (phase 41)
+    'model-provider.md',          // provider model ids in the target line and the bullets, a prose window (one-pool phase 4)
   ]) {
     assert.ok(files.includes(required), `fixture ${required} is missing from the parity corpus`);
   }
@@ -1349,4 +1369,36 @@ test('the fixture corpus parses without the engine reporting an error', async ()
   } finally {
     fixtures.cleanup();
   }
+});
+
+/**
+ * #228: two `### Phase N` sections. The engine's index joins them under N and
+ * every per-phase read answers the first section's bullet; the JS parser kept
+ * the LAST, so the two readers answered about different phases while the lint
+ * said OK. Now lint F21 names the phase `phase-section-repeated`, the parser
+ * names the same phases (`repeatedSections`), and both read the first section.
+ */
+test('a repeated ### Phase N fails F21 in the engine, the parser names the same phases, and both read the FIRST section', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    await forEachPlan(samplePlans(corpus), async (record) => {
+      const lint = await run(optsFor(corpus), 'phase-graph.sh', [record.slug, '--lint']);
+      const named = [...`${lint.stdout}\n${lint.stderr}`.matchAll(/phase (\d+): phase-section-repeated/g)].map((m) => Number(m[1]));
+      const js = record.plan!.repeatedSections ?? [];
+      if (JSON.stringify(named) !== JSON.stringify(js)) problems.push(`${record.slug}: engine F21 ${JSON.stringify(named)} vs parser ${JSON.stringify(js)}`);
+      if (named.length && lint.code === 0) problems.push(`${record.slug}: a repeated section linted OK`);
+    });
+    assert.deepEqual(problems, [], `${corpus.name} repeated-section mismatches:\n  ${problems.join('\n  ')}`);
+    if (!corpus.live) {
+      const store = new Store(checkRoot(corpus.root));
+      store.scan();
+      const plan = store.get('duplicate-phase')!.plan!;
+      assert.deepEqual(plan.repeatedSections, [1]);
+      assert.equal(plan.phases[1]!.title, 'Alpha', 'the first heading stands');
+      assert.deepEqual(permissionModeFor(plan, 1), { value: 'acceptEdits', source: 'phase' });
+      assert.equal(phaseModelFor(plan, 1), 'sonnet');
+      assert.equal(plan.phases[1]!.size, 'S');
+      assert.equal(await engine(corpus, ['duplicate-phase', '--permission-mode', '1'], 'dup --permission-mode 1'), 'acceptEdits\tphase');
+    }
+  });
 });

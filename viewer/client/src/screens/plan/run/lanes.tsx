@@ -44,6 +44,7 @@ import { cn } from '@/lib/cn';
 import { clockTime, clockWords, etaPoint, money } from '@/lib/format';
 import { scrollBehavior } from '@/lib/media';
 import { Money, Mono, SectionHeading } from '@/ui';
+import { PhaseStatus, type PhaseStatusProps } from '@/ui/status';
 import { laneClock, recordClocks } from '@/screens/runs/model';
 import { RunLaneControls, laneFrozen } from './lane-controls';
 import { LastActivity } from './activity';
@@ -263,6 +264,19 @@ function LaneLine({
     >
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
         <span className="text-ink tnum">P{lane.phase}</span>
+        {!lane.frozen && (
+          <PhaseStatus
+            chrome="badge"
+            withNote={false}
+            live={lane.status === 'running'}
+            record={
+              {
+                status: lane.qa ? 'running' : lane.status,
+                ...(lane.stop ? { lifecycle: { stop: lane.stop } } : {}),
+              } as PhaseStatusProps['record']
+            }
+          />
+        )}
         <span className="min-w-0 flex-1 break-words text-body text-ink">{lane.title ?? view.label}</span>
         {lane.qa && <span className="text-ink-muted tnum">QA round {lane.qa.round}</span>}
         {lane.child?.branch && (

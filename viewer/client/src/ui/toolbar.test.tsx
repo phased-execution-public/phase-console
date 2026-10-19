@@ -156,7 +156,7 @@ describe('below 900', () => {
     render(<Toolbar {...everySlot()} />);
     fireEvent.click(screen.getByRole('button', { name: /^View/ }));
     const sheet = await screen.findByRole('dialog', { name: 'View' });
-    expect(sheet).toHaveAccessibleDescription('What to show in the runs, and how.');
+    expect(sheet).toHaveAccessibleDescription('Runs: what to show, and how.');
     expect(slotsIn(sheet)).toEqual(['filter', 'group', 'sort', 'view', 'more', 'everything']);
     expect(
       within(sheet)

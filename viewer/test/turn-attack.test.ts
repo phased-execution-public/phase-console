@@ -99,13 +99,25 @@ test('A3: background jobs are the same line — nohup, a subshell, disown, setsi
 test('A4: the CLI twin of a row with `cli` forms is caught, however the CLI is reached', () => {
   for (const row of AUTHORITY_ROUTES) {
     for (const form of row.cli) {
-      const [group, verb] = form.split(' ');
-      const command = `phase-console ${group} ${verb} x`;
-      const f = forge(command);
-      assert.ok(f, `${form}: not caught`);
-      assert.equal(f!.verb, row.verb, form);
+      // The whole form: a three-word form names a sub-verb row (`run queue
+      // revert` is the `queue-revert` row, one-pool phase 39), and its first two
+      // words alone are the read `run queue`.
+      const [group, ...words] = form.split(' ');
+      const commands = [`phase-console ${form} x`];
+      // `run`'s global flags stand anywhere (`extractGlobalFlags`): one between
+      // each word hides nothing — in the line, and in text that hides its program.
+      if (group === 'run') {
+        const flagged = `phase-console run --console pe-hub ${words.join(' --json ')} x`;
+        commands.push(flagged, `python3 -c "import os; os.system('${flagged}')"`);
+      }
+      for (const command of commands) {
+        const f = forge(command);
+        assert.ok(f, `${form}: not caught — ${command}`);
+        assert.equal(f!.verb, row.verb, command);
+      }
     }
   }
+  assert.equal(forge('phase-console run queue x'), null, '`run queue` reads the queue — it presses nothing');
   // Reached by path and by a runner, as the hook reads them.
   assert.equal(forge('node /x/console/bin/phase-console.mjs run approve a1')?.verb, 'answer-card');
   assert.equal(forge('npx phase-console grants revoke g-1')?.verb, 'revoke-grant');

@@ -4,6 +4,7 @@
 # Usage:
 #   phase-landing.sh <slug> <phase> <state> [--repo KEY] [--policy WORD] [--ref REF]
 #                                           [--sha SHA] [--pr URL] [--by WHO] [--note TEXT]
+#                                           [--allow-backward]
 #   phase-landing.sh <slug> list [phase]
 #
 #   state: held | integrated | pushed | pr-open | pr-merged | landed | conflict | failed
@@ -34,6 +35,16 @@
 # clock. A run on a plain repository writes an empty repo cell and has one row,
 # which is the same rule stated for the case where N is 1.
 #
+# ## A position only moves FORWARD (one-pool phase 21, #249 #240)
+#
+# held → integrated → pushed → pr-open → pr-merged → landed (`LANDING_ORDER`).
+# A write that would take a row back along that path — the console's `held`
+# settle over a session's `pr-merged`, say — KEEPS the row, says so on stderr
+# and exits 0: the ledger already holds the truer position. `conflict` and
+# `failed` are off the path and never replace a `LANDING_SETTLED` row;
+# `pr-merged` and `landed` (two policies' end states) may replace each other.
+# `--allow-backward` is the deliberate move, and it says so too.
+#
 # Deterministic and idempotent, like every writer under scripts/: it never
 # touches git (the caller commits), never prompts, and refuses rather than
 # guesses. bash 3.2.
@@ -50,6 +61,8 @@ DOCS_ROOT="$(pe_docs_root)"
 # The vocabulary, with the same in-file defaults every script here carries so a
 # missing .env cannot silently narrow what the ledger will accept.
 LANDING_STATES="held integrated pushed pr-open pr-merged landed conflict failed"
+LANDING_ORDER="held integrated pushed pr-open pr-merged landed"
+LANDING_SETTLED="pr-merged landed"
 DEFAULT_LAND="hold"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/landing.env" ] && . "$SCRIPT_DIR/landing.env"
@@ -76,7 +89,7 @@ phase="$verb"
 state="${3:?state required: $LANDING_STATES}"
 shift 3
 
-repo=""; policy=""; ref=""; sha=""; pr=""; by=""; note=""
+repo=""; policy=""; ref=""; sha=""; pr=""; by=""; note=""; backward=0
 while [ $# -gt 0 ]; do
   case "$1" in
     # An EMPTY key is a legal one — the root of a mirror, or a plain
@@ -89,6 +102,7 @@ while [ $# -gt 0 ]; do
     --pr)     pr="${2:?--pr needs a url or number}"; shift 2 ;;
     --by)     by="${2:?--by needs a name}"; shift 2 ;;
     --note)   note="${2:?--note needs text}"; shift 2 ;;
+    --allow-backward) backward=1; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -201,6 +215,47 @@ fi
 
 row="$(printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' \
   "$phase" "${repo:--}" "$state" "$policy" "${ref:--}" "${sha:--}" "${pr:--}" "$by" "$recorded" "${note:--}")"
+
+# The row this write would replace, and whether replacing it moves it BACK —
+# the twin of `landingMovesBack` (viewer/shared/landing-model.js).
+current="$(awk -F'|' -v ph="$phase" -v rp="${repo:--}" '
+  function trim(s){ gsub(/[*`]/,"",s); sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
+  /^\|/ && trim($2) == ph && trim($3) == rp && trim($2) != "Phase" { print trim($4); exit }
+' "$f")"
+rank_of() {
+  local word="$1" i=0 w
+  for w in $LANDING_ORDER; do
+    [ "$w" = "$word" ] && { echo "$i"; return; }
+    i=$((i + 1))
+  done
+  echo -1
+}
+moves_back() {
+  local from="$1" to="$2" at next settled_from
+  [ -n "$from" ] && [ "$from" != "$to" ] || return 1
+  at="$(rank_of "$from")"
+  [ "$at" -ge 0 ] || return 1
+  next="$(rank_of "$to")"
+  case " $LANDING_SETTLED " in *" $from "*) settled_from=1 ;; *) settled_from=0 ;; esac
+  if [ "$next" -lt 0 ]; then
+    [ "$settled_from" = 1 ]
+    return
+  fi
+  # pr-merged and landed are two policies' end states: either replaces the other.
+  case " $LANDING_SETTLED " in *" $to "*) [ "$settled_from" = 1 ] && return 1 ;; esac
+  [ "$next" -lt "$at" ]
+}
+if moves_back "$current" "$state"; then
+  if [ "$backward" != 1 ]; then
+    leave_section
+    printf 'landing: %s phase %s%s kept at %s — a %s write never moves a row back (--allow-backward to move it)\n' \
+      "$slug" "$phase" "${repo:+ [$repo]}" "$current" "$state" >&2
+    printf 'landing: %s phase %s%s → %s (kept; %s refused)\n' "$slug" "$phase" "${repo:+ [$repo]}" "$current" "$state"
+    exit 0
+  fi
+  printf 'landing: %s phase %s%s moved BACK from %s to %s (--allow-backward)\n' \
+    "$slug" "$phase" "${repo:+ [$repo]}" "$current" "$state" >&2
+fi
 
 # Upsert on (phase, repo), located by HEADER NAME on the read side and by the
 # first two cells here — the writer owns the column order, so it may count.

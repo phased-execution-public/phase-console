@@ -1,5 +1,6 @@
 import { useCallback } from 'react';
 import { useShortcut } from '@/lib/shortcut';
+import { PALETTE_BARE_KEY, PALETTE_KEY } from '../keymap';
 import { OVERLAY_KEYS, closeOverlaysHref, paletteHref, type Route } from '../routes';
 
 /**
@@ -19,5 +20,6 @@ export function usePaletteShortcut(route: Route, navigate: (path: string) => voi
     () => navigate(open ? closeOverlaysHref(route) : paletteHref('', route)),
     [navigate, open, route],
   );
-  useShortcut([{ key: 'k', mod: true, whileTyping: true }, { key: '/' }], toggle);
+  // The chords are the keymap's, the one table the Keyboard card draws.
+  useShortcut([...(PALETTE_KEY.chords ?? []), ...(PALETTE_BARE_KEY.chords ?? [])], toggle);
 }

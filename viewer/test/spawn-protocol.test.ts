@@ -1584,3 +1584,51 @@ test('ACC-8.4 (TRS-2): a control_request line is an event of its own — and a r
     assert.equal(outcome.signal.terminalReason, 'tool_deferred');
   } finally { d.cleanup(); }
 });
+
+/* ------------------------------------------------------------------ *
+ * The session door's recipes (one-pool phase 5)
+ * ------------------------------------------------------------------ */
+
+test('a variable a recipe clears never reaches the child, however the environment it is laid over carried it', async () => {
+  const b = bench();
+  const envFile = join(b.dir, 'env.json');
+  // sessionEnv's shape: the console's own environment, then the account's recipe over it —
+  // which sets every variable it owns and does not use to undefined.
+  const inherited = { ...b.env, PC_STUB_ENV: envFile, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-inherited' };
+  await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: { ...inherited, CLAUDE_CODE_OAUTH_TOKEN: undefined } });
+  const seen = JSON.parse(readFileSync(envFile, 'utf8')) as Record<string, string | null>;
+  assert.equal(seen.CLAUDE_CODE_OAUTH_TOKEN, null, 'an inherited login never speaks for an API-key account');
+  b.cleanup();
+});
+
+const USAGE_STUB = `#!/usr/bin/env node
+'use strict';
+const say = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const sid = '11111111-2222-3333-4444-555555555555';
+say({ type: 'system', subtype: 'init', session_id: sid, model: 'deepseek-flash', tools: [], claude_code_version: '2.1.302' });
+// An endpoint that is not Anthropic's: the stream frame says 0 output; the result line has the totals.
+say({ type: 'assistant', session_id: sid, message: { id: 'msg_1', model: 'deepseek-flash', role: 'assistant',
+  content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 3000, output_tokens: 0, cache_read_input_tokens: 5000 } } });
+say({ type: 'result', subtype: 'success', session_id: sid, total_cost_usd: 0.02, num_turns: 1, result: 'ok', is_error: false,
+  usage: { input_tokens: 3003, output_tokens: 241, cache_read_input_tokens: 5376, cache_creation_input_tokens: 0 } });
+process.exit(0);
+`;
+
+test("the result line's own usage reaches the result event — the totals an endpoint may report nowhere else", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-usage-stub-'));
+  try {
+    const bin = join(dir, 'claude');
+    writeFileSync(bin, USAGE_STUB, 'utf8');
+    chmodSync(bin, 0o755);
+    const results: StreamEvent[] = [];
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: dir,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` },
+      onEvent: (event) => { if (event.kind === 'result') results.push(event); },
+    });
+    assert.equal(results.length, 1);
+    const result = results[0] as Extract<StreamEvent, { kind: 'result' }>;
+    assert.deepEqual(result.usage, { input: 3003, output: 241, cacheRead: 5376, cacheWrite: 0, context: 8379 });
+    assert.equal(outcome.tokens?.output, 0, 'the stream fold is what the stream said; the result event carries the rest');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

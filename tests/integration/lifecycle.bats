@@ -127,7 +127,10 @@ setup() {
   [ "$status" -eq 0 ]
   body="$(cat "$DOCS_ROOT/docs/handoffs/todocount2/phase-02-beta.md")"
   refute_contains "$body" "Final phase — closeout"
-  assert_contains "$body" "start Phase 3 in this fresh session"
+  # The prompt itself is composed at read time (#338): the handoff points at it.
+  assert_contains "$body" "next-phase-prompt.sh todocount2 2"
+  run pe_nextp todocount2 2
+  assert_contains "$output" "start Phase 3 in this fresh session"
 }
 
 @test "closeout: an out-of-order plan closes on the phase that finishes it, not the highest number" {

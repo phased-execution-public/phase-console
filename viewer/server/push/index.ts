@@ -116,7 +116,20 @@ function extraFields(extra: SubscribeExtra | undefined): { site?: string; device
   return out;
 }
 
-export type PublicDevice = Omit<Device, 'endpoint' | 'keys'> & { service: string };
+/**
+ * A device as the page sees it: never its endpoint (a capability — anyone who
+ * holds it can push), but the endpoint's push service and its `endpointTag`,
+ * the first 16 hex characters of the endpoint's sha256. Two browsers behind
+ * one push service share the service; the tag is what tells the page which
+ * row is THIS browser (one-pool phase 18, #325) — it hashes its own endpoint
+ * the same way (`client/src/lib/push.ts` `endpointTag`).
+ */
+export type PublicDevice = Omit<Device, 'endpoint' | 'keys'> & { service: string; endpointTag: string };
+
+/** The page's handle on an endpoint: sha256, first 16 hex characters. */
+export function endpointTag(endpoint: string): string {
+  return createHash('sha256').update(endpoint).digest('hex').slice(0, 16);
+}
 
 /**
  * Where a register keeps its key and its devices, and who it speaks as. The
@@ -182,6 +195,13 @@ export class Push {
   onNoDevice?: (info: { category: CategoryId; tag: string; title: string; subscribed: number }) => void;
   /** Fired after the register gains or loses a device — what the delivery-channel check re-reads. */
   onDevicesChanged?: () => void;
+  /**
+   * Fired when a push service ACCEPTED a push for a device — an announcement's
+   * or Settings' *Send a test* alike (one-pool phase 18, #280): the channel
+   * works again, so a `push-broken` row an earlier failure raised is
+   * withdrawn without a restart. `service` is the device's push service.
+   */
+  onDelivered?: (info: { device: string; service: string }) => void;
   /** Same notification, same device, twice in a row: send it once. */
   private recent = new Map<string, number>();
 
@@ -209,7 +229,7 @@ export class Push {
   }
 
   list(): PublicDevice[] {
-    return this.devices.map(({ endpoint, keys, ...rest }) => ({ ...rest, service: origin(endpoint) }));
+    return this.devices.map((device) => this.publicOf(device));
   }
 
   state(): { publicKey: string; devices: PublicDevice[]; categories: readonly unknown[] } {
@@ -491,6 +511,9 @@ export class Push {
         for (const key of this.rejectStreaks.keys()) {
           if (key.startsWith(`${service}|`)) this.rejectStreaks.delete(key);
         }
+        try {
+          this.onDelivered?.({ device: device.id, service });
+        } catch { /* a health report must never affect delivery */ }
         break;
       case 'gone':
         // Its normal end of life: the app was deleted, or permission revoked.
@@ -552,7 +575,7 @@ export class Push {
 
   private publicOf(device: Device): PublicDevice {
     const { endpoint, keys, ...rest } = device;
-    return { ...rest, service: origin(endpoint) };
+    return { ...rest, service: origin(endpoint), endpointTag: endpointTag(endpoint) };
   }
 
   private persist(): void {

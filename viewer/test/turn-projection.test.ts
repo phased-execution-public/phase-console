@@ -113,9 +113,9 @@ test('TP-1: the answer is {round, headline, groups, handled, counts} — an erra
   assert.deepEqual(words(step!), ['do', 'todo', 'now', 'phase'], 'a session\'s sign-in: a task, its phase resumes');
   assert.deepEqual(words(gate!), ['approve', 'todo', 'now', 'gate'], 'a manual gate: an approval, the gate opens');
   assert.deepEqual(words(answer.groups.upcoming[0]!), ['do', 'todo', 'not-yet', 'phase'], 'an act not due yet');
-  // Composed by phase 136's rules: how many need the person and the oldest,
-  // then what is coming up.
-  assert.equal(answer.headline, '2 need you now — the oldest (Sign the gh CLI in to acme) has waited 1 h and holds phase 2 · 1 coming up.');
+  // Composed by phase 136's rules, counting since #377: how many are the
+  // person's to do now, then what is coming up — never a quoted title.
+  assert.equal(answer.headline, '2 to do now · 1 coming up.');
 });
 
 test('TP-1: a step settled in the last day is Done, with nothing to press; an older one is gone', () => {
@@ -124,8 +124,8 @@ test('TP-1: a step settled in the last day is Done, with nothing to press; an ol
   const answer = turnView({ items: [], generatedAt: new Date(NOW).toISOString() }, { steps: [settled, old] as never, now: NOW });
   assert.deepEqual(answer.groups.done.map((item) => item.item), ['step-done']);
   assert.deepEqual(answer.groups.done[0]!.actions, []);
-  // The headline's rules are phase 136's (`turn/headline.ts` `headlineOf`).
-  assert.equal(answer.headline, 'Nothing needs you now.');
+  // The headline's rules are phase 136's (`turn/headline.ts` `headlineOf`); since #377 it counts Done too.
+  assert.equal(answer.headline, 'Nothing needs you now · 1 done today.');
 });
 
 test('TP-4: the four words on every item — a plan\'s own act is the console\'s, the ladder\'s ask the run\'s or the supervisor\'s, an owner request waits for the owner', () => {
@@ -421,7 +421,7 @@ test('TP-v2 (turn-by-turn phase 9): the six groups by type and readiness, counts
   // The nearest deadline of any item not done — an overdue one is the nearest of all.
   assert.equal(answer.strip.nextDeadline?.item, 'st-up');
   assert.equal(answer.strip.nextDeadline?.at, at(-600));
-  assert.ok(answer.headline.startsWith(`${answer.strip.todo} need you now`), 'the headline counts Approve too');
+  assert.ok(answer.headline.startsWith(`${answer.strip.todo} to do now`), 'the headline counts Approve too');
 });
 
 test('TP-8: an inbox row carries its card’s type, readiness and when — and the group its card sits in', () => {

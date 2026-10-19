@@ -1,6 +1,7 @@
 import {
   ChartLine,
   GitBranch,
+  Hand,
   Route,
   ScrollText,
   Settings,
@@ -11,8 +12,9 @@ import {
 import { DESTINATIONS } from '@shared/route-meta.js';
 
 /**
- * Where you can go, defined once — **seven places**, the same in both editions
- * (7.0, quiet-console phase 3).
+ * Where you can go, defined once — **eight places**, the same in both editions
+ * (seven in 7.0, quiet-console phase 3; Your turn joined in 8.0, one-pool
+ * phase 14, #366).
  *
  * The seven are the questions an operator actually has, in the order they have
  * them; everything else in the URL space is a page one of these has absorbed,
@@ -73,9 +75,17 @@ export const NAV: readonly NavItem[] = [
     label: 'Runs',
     icon: Waypoints,
     band: 'work',
-    note: 'What needs you, what is running, what is next — and every run there has been',
+    note: 'What is running, what is next — and every run there has been',
+  },
+  {
+    id: 'turn',
+    label: 'Your turn',
+    icon: Hand,
+    band: 'work',
+    note: 'Every act only you can do — approve, do, decide — with its steps and its check',
     // The one count that is a summons rather than a census: it answers "does
-    // anything need me?", and it wears the attention hue for that reason.
+    // anything need me?", and it wears the attention hue for that reason. It
+    // decorates the place where the answer is acted on (one-pool phase 14).
     badge: 'needsYou',
   },
   {
@@ -134,7 +144,7 @@ if (NAV.map((item) => item.id).join() !== (DESTINATIONS as readonly string[]).jo
 }
 
 
-/** Every item the shell may draw: the seven, and the heads the tab bar adds. */
+/** Every item the shell may draw: the eight, and the heads the tab bar adds. */
 const DRAWN: readonly NavItem[] = [
   ...NAV,
 ];
@@ -158,13 +168,16 @@ export function visibleNav(state: NavState | undefined): NavItem[] {
 /**
  * The phone tab bar, in order — its first `TAB_SLOTS` entries, then More.
  *
- * Runs leads: it is the home. In the Pro tree the fourth slot is the
- * Supervisor's (`chat`, named in a `!pro:` region ahead of Insights): the bar
- * is the first four DECLARED, so the Supervisor takes the slot and Insights
- * moves to More there, while the Free tree keeps Insights where it is.
+ * Runs leads: it is the home. Your turn is second (one-pool phase 14, #366):
+ * a push lands there, and a phone is where a person meets most of their
+ * turns. Plans follows. The fourth slot is Sessions in the Free tree; in the
+ * Pro tree it is the Supervisor's (`chat`, named in a `!pro:` region ahead of
+ * Sessions): the bar is the first four DECLARED, so the Supervisor takes the
+ * slot and Sessions moves to More there. Insights is in More in both.
  */
 export const TAB_BAR: readonly string[] = [
   'runs',
+  'turn',
   'plans',
   'sessions',
   'insights',

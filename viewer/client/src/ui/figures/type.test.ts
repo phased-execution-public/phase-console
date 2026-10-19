@@ -76,9 +76,10 @@ describe('no type in a figure is under the floor', () => {
       }
     }
     expect(offenders).toEqual([]);
-    // The axis paint, the tick labels and both kinds of glyph: a guard that
-    // read nothing would pass this folder by reading nothing.
-    expect(seen).toBeGreaterThanOrEqual(4);
+    // The axis paint, the tick labels and the marks (one drawing for the axis's
+    // marks and a row's since #375, which clusters both): a guard that read
+    // nothing would pass this folder by reading nothing.
+    expect(seen).toBeGreaterThanOrEqual(3);
   });
 
   it('is shown its own negative: each spelling of a small size is caught, and the floor and the name pass', () => {

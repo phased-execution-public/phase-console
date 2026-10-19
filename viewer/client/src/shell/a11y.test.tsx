@@ -279,7 +279,17 @@ describe('the navigation names itself', () => {
     mount(<Shell phone={false} />);
     const rail = await screen.findByRole('navigation', { name: 'Main' });
     // The badge is a decoration (`aria-hidden`); the count is in the name.
-    for (const name of ['Runs, 1', 'Plans, 2', 'Sessions, 4', 'Repo', 'Insights', 'Logs', 'Settings']) {
+    // The summons count is Your turn's since one-pool phase 14; Runs is unbadged.
+    for (const name of [
+      'Runs',
+      'Your turn, 1',
+      'Plans, 2',
+      'Sessions, 4',
+      'Repo',
+      'Insights',
+      'Logs',
+      'Settings',
+    ]) {
       expect(within(rail).getByRole('button', { name }), name).toBeTruthy();
     }
   });
@@ -302,11 +312,11 @@ describe('the navigation names itself', () => {
 
   it('marks where you are — a deeper head lights the place it belongs under', async () => {
     for (const [at, current] of [
-      [hrefOf('runs'), 'Runs, 1'],
+      [hrefOf('runs'), 'Runs'],
       [planHref('demo', 'run'), 'Plans, 2'],
       // The old head lights the new place for the instant its redirect runs.
       ['#/debug/health', 'Logs'],
-      [turnHref('abc'), 'Runs, 1'],
+      [turnHref('abc'), 'Your turn, 1'],
     ] as const) {
       const { unmount } = mount(<Shell phone={false} />, at);
       const rail = await screen.findByRole('navigation', { name: 'Main' });
@@ -367,10 +377,13 @@ describe('the More sheet', () => {
     // Queried BY NAME, which is the whole claim: the group points at the
     // heading it draws (`aria-labelledby`) rather than repeating it. Matching
     // on text instead stays green when `aria-labelledby` is deleted. The tab
-    // bar takes the whole work band, so the sheet holds the other two.
+    // bar takes the work band — in Pro all but Sessions, which yields its slot
+    // to the Supervisor — so the sheet holds the other two, and Sessions in Pro.
     expect(within(sheet).getByRole('group', { name: 'The record' })).toBeTruthy();
     expect(within(sheet).getByRole('group', { name: 'The console' })).toBeTruthy();
-    expect(within(sheet).queryByRole('group', { name: 'The work' })).toBeNull();
+    const work = within(sheet).queryByRole('group', { name: 'The work' });
+    if (STATE.chat) expect(within(work!).getByRole('button', { name: /^Sessions/ })).toBeTruthy();
+    else expect(work).toBeNull();
     expect(within(sheet).getByRole('button', { name: /^Logs/ })).toBeTruthy();
     expect(within(sheet).getByRole('button', { name: /^Settings/ })).toBeTruthy();
   });

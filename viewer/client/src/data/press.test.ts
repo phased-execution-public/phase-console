@@ -53,6 +53,44 @@ afterEach(() => {
 });
 
 describe('press()', () => {
+  it('#373: a page from an earlier release is refused as outdated, announced for the reload prompt, and never retried', async () => {
+    const words = 'This page is from a previous release of the console — reload it, then press again.';
+    answers = [
+      [409, { error: words, outdated: true, build: { page: 'a'.repeat(40), console: 'b'.repeat(40) } }],
+    ];
+    const heard = vi.fn();
+    window.addEventListener('phase-console:outdated', heard);
+    try {
+      const refusal = await press(pause).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(PressRefusal);
+      expect((refusal as PressRefusal).outdated).toBe(true);
+      expect((refusal as PressRefusal).stale).toBeNull();
+      expect((refusal as PressRefusal).message).toBe(words);
+      expect(heard).toHaveBeenCalledTimes(1);
+      expect(calls).toBe(1);
+    } finally {
+      window.removeEventListener('phase-console:outdated', heard);
+    }
+  });
+
+  it('#373: every request carries this page’s build — and none does in dev, where the two builds differ by design', async () => {
+    const { buildRevHeader } = await import('@/lib/build');
+    expect(buildRevHeader('e68f18adbee1', false)).toEqual({ 'x-build-rev': 'e68f18adbee1' });
+    expect(buildRevHeader('e68f18adbee1', true)).toEqual({});
+    expect(buildRevHeader('unknown', false)).toEqual({});
+    vi.stubEnv('DEV', false);
+    try {
+      answers = [[200, { ok: true }]];
+      await press(pause);
+      const init = (fetch as unknown as { mock: { calls: [string, RequestInit][] } }).mock.calls[0]![1];
+      const headers = init.headers as Record<string, string>;
+      expect(headers['x-phase-console']).toBe('1');
+      expect(headers['x-build-rev']).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('a press the route made is done, with its answer', async () => {
     answers = [[200, { ok: true, status: 'paused' }]];
     await expect(press(pause)).resolves.toEqual({ state: 'done', result: { ok: true, status: 'paused' } });

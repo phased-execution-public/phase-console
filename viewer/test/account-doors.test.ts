@@ -198,3 +198,34 @@ test('phase 15: the one-turn account check is a PRESS — never refused or count
     svc.close();
   } finally { cleanup(); }
 });
+
+test('#238: a run whose form lists b, a, default starts on b when b has room — on a when b has none — and never on the machine login appended and picked first', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const svc = service(root);
+    const starts = recordStarts(svc);
+    // Two registered logins, read without a live meter (a fresh profile is unused, not unknown).
+    const room: Record<string, boolean> = { b: true, a: true, default: true };
+    const accounts = svc.accounts as unknown as {
+      has: (id: string) => boolean;
+      roomOf: (id: string | undefined) => { ok: boolean; headroomPct: number | null; resetsAt: null; why?: string };
+    };
+    accounts.has = (id) => id === 'a' || id === 'b';
+    accounts.roomOf = (id) => {
+      const key = id ?? 'default';
+      return room[key] ? { ok: true, headroomPct: null, resetsAt: null } : { ok: false, headroomPct: 0, resetsAt: null, why: `${key} hit its usage limit` };
+    };
+    const pool = [{ id: 'b', minHeadroomPct: 0 }, { id: 'a', minHeadroomPct: 0 }, { id: 'default', minHeadroomPct: 0 }];
+    const actor = pressActor({ by: 'operator', via: 'browser', origin: 'test' });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], accounts: pool, actor });
+    assert.equal(starts[0].accountId, 'b', 'the first account in the requested order, with room');
+    assert.deepEqual((starts[0].accounts as { id: string }[]).map((row) => row.id), ['b', 'a', 'default'], 'the order as asked, nothing appended');
+    room.b = false;
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], accounts: pool, actor });
+    assert.equal(starts[1].accountId, 'a', 'b has no room: the next in order, never the machine login first');
+    // An explicit account is still an override.
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], accounts: pool, accountId: 'default', actor });
+    assert.equal(starts[2].accountId, 'default');
+    svc.close();
+  } finally { cleanup(); }
+});

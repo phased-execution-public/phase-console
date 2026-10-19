@@ -2058,6 +2058,46 @@ test('RB-3 (control-tower phase 112, #183): a session\'s detach of its OWN mirro
 });
 
 
+test('#283 (one-pool phase 20): an unexpanded $VAR is never a path — the guard names it instead of judging <mirror>/$S', async () => {
+  const { RUN_TREE_DETACH_RULE } = await import('../server/runner/approvals.ts');
+  const own = (command: string, cwd = MIRROR) =>
+    treeGuard('Bash', { command }, { cwd, runRoot: HUB, runTrees: RUN_TREES, ownTree: MIRROR, runBranch: 'pe/demo' });
+  // The measured shape: `S=<shared hub>/…; git -C $S switch --detach <sha>`.
+  for (const command of [
+    'S=/work/hub/mql5-sample-lib/Include/x; git -C $S switch --detach 48be6d91',
+    'git -C ${D} switch --detach origin/main',
+    'git -C "$(pwd)/trade" checkout --detach origin/main',
+    'cd $S && git switch --detach origin/main',
+  ]) {
+    const verdict = own(command);
+    assert.equal(verdict?.verdict, 'deny', command);
+    assert.equal(verdict?.rule, RUN_TREE_DETACH_RULE, command);
+    assert.match(String(verdict?.reason), /cannot expand a shell variable/, command);
+    assert.match(String(verdict?.reason), /literal absolute path/, command);
+    assert.doesNotMatch(String(verdict?.reason), /integration\/\$|integration\/\$\{/, `${command}: never a resolved path the shell would not use`);
+  }
+  assert.match(String(own('git -C $S switch --detach 48be6d91')?.reason), /`\$S`/);
+  // The same command with the literal absolute path outside the mirror runs (the issue's control).
+  assert.equal(own('git -C /work/hub/mql5-sample-lib/Include/x switch --detach 48be6d91'), null);
+  // A non-detaching git line under an expansion is none of the guard's business.
+  assert.equal(own('git -C $S status'), null);
+  assert.equal(own('git -C $S log --oneline -3'), null);
+  // A clone whose place is a variable cannot be judged either: refused by name.
+  const clone = guardOf('cd $WT && git clone https://example.invalid/org/x.git x', HUB);
+  assert.equal(clone?.verdict, 'deny');
+  assert.equal(clone?.rule, RUN_TREE_CLONE_RULE);
+  assert.match(String(clone?.reason), /`\$WT`/);
+  // … unless its target is absolute, which the guard can still judge — both ways.
+  assert.equal(guardOf('cd $WT && git clone https://example.invalid/org/x.git /tmp/scratch/x', HUB), null);
+  const into = guardOf(`cd "$X" && git clone https://example.invalid/org/x.git ${MIRROR}/web`, HUB);
+  assert.equal(into?.verdict, 'deny', 'an absolute target in a run tree is denied whatever the variable holds');
+  assert.equal(into?.rule, RUN_TREE_CLONE_RULE);
+  // `git submodule` where a variable points: a person decides, and the card says why.
+  const sub = guardOf('git -C $M submodule update --init aws', HUB);
+  assert.equal(sub?.verdict, 'ask');
+  assert.match(String(sub?.reason), /where `\$M` points, which the guard cannot expand/);
+});
+
 test('#189 (control-tower phase 107): rules match only what a line RUNS — the wall is never weaker than the raw reading, and data never matches', async () => {
   const { bashSubjects, carvedPolicy, classifyTool, matchedDenyRule } = await import('../server/runner/approvals.ts');
   const policy = { deny: [...DEFAULT_DENY], ask: [...DEFAULT_ASK], allow: [] };

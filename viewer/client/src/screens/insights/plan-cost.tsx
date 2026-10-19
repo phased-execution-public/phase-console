@@ -296,6 +296,7 @@ export function PlanCostPanel({
             <FigureBlock caption="By model, booked to the model each phase ended on">
               <BarList
                 label="models"
+                heads={{ name: 'Model', value: 'Cost' }}
                 format={money}
                 items={cost.byModel.map((row) => ({ name: row.model, value: row.usd }))}
               />
@@ -305,6 +306,7 @@ export function PlanCostPanel({
             <FigureBlock caption={cost.byDayTruncated ? `By day, the newest ${cost.byDay.length}` : 'By day'}>
               <BarList
                 label="days"
+                heads={{ name: 'Day', value: 'Cost' }}
                 format={money}
                 items={cost.byDay.map((row) => ({ name: row.day, value: row.usd }))}
               />

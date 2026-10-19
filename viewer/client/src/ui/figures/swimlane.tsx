@@ -32,6 +32,7 @@ import { useMemo, useRef, type KeyboardEvent, type ReactNode } from 'react';
 
 import { cn } from '@/lib/cn';
 
+import { clusterMarks, type PlacedMark } from './collide';
 import {
   FIGURE_ASCENT,
   FIGURE_BAND,
@@ -268,6 +269,42 @@ export function Swimlane({
       : {}),
   });
 
+  /**
+   * One mark as drawn (#375): a lone moment is its glyph at its instant; marks
+   * whose glyphs would cover each other are ONE counted mark (`✎×4`), its title
+   * every member's on a line of its own, so a hover reads them all.
+   */
+  const drawMark = (placed: PlacedMark<SwimlaneMark>, baseline: number, quiet: string) => {
+    const [first] = placed.members;
+    if (!first) return null;
+    const one = placed.members.length === 1;
+    const state =
+      placed.members.find((mark) => mark.state === 'state-failed')?.state ??
+      placed.members.find((mark) => mark.state)?.state ??
+      quiet;
+    const title = placed.members
+      .map((mark) => mark.title)
+      .filter(Boolean)
+      .join('\n');
+    const onSelect = one ? first.onSelect : undefined;
+    const px = x(first.atMs);
+    return (
+      <text
+        key={one ? first.key : `${first.key}+${placed.members.length}`}
+        {...(one ? { x: px, ...glyphAt(px) } : { x: placed.x0, textAnchor: 'start' as const })}
+        y={baseline}
+        fontSize={FIGURE_TYPE}
+        data-mark-count={one ? undefined : placed.members.length}
+        className={cn(state, !onSelect && INERT, !one && 'tnum')}
+        fill="var(--state)"
+        {...(onSelect ? pressable(first.title, onSelect) : {})}
+      >
+        {placed.text}
+        {title ? <title>{title}</title> : null}
+      </text>
+    );
+  };
+
   return (
     <div
       className={cn('grid gap-x-2', className)}
@@ -346,24 +383,9 @@ export function Swimlane({
               </g>
             ))}
 
-            {axisMarks.map((mark) => {
-              const px = x(mark.atMs);
-              return (
-                <text
-                  key={mark.key}
-                  x={px}
-                  y={AXIS + MARKS - FIGURE_DESCENT}
-                  fontSize={FIGURE_TYPE}
-                  {...glyphAt(px)}
-                  className={cn(mark.state ?? '[--state:var(--ink-muted)]', !mark.onSelect && INERT)}
-                  fill="var(--state)"
-                  {...(mark.onSelect ? pressable(mark.title, mark.onSelect) : {})}
-                >
-                  {mark.glyph}
-                  {mark.title ? <title>{mark.title}</title> : null}
-                </text>
-              );
-            })}
+            {clusterMarks(axisMarks, x, width).map((placed) =>
+              drawMark(placed, AXIS + MARKS - FIGURE_DESCENT, '[--state:var(--ink-muted)]'),
+            )}
 
             {rows.map((one, index) => {
               const y = top + index * row;
@@ -403,26 +425,11 @@ export function Swimlane({
                       </rect>
                     ),
                   )}
-                  {(one.marks ?? []).map((mark) => {
-                    const px = x(mark.atMs);
-                    return (
-                      // Hung from the bar's lower edge into the row's second
-                      // line, so the glyph marks the bar without hiding it.
-                      <text
-                        key={mark.key}
-                        x={px}
-                        y={y + row - 2}
-                        fontSize={FIGURE_TYPE}
-                        {...glyphAt(px)}
-                        className={cn(mark.state ?? FAINT, !mark.onSelect && INERT)}
-                        fill="var(--state)"
-                        {...(mark.onSelect ? pressable(mark.title, mark.onSelect) : {})}
-                      >
-                        {mark.glyph}
-                        {mark.title ? <title>{mark.title}</title> : null}
-                      </text>
-                    );
-                  })}
+                  {/* Hung from the bar's lower edge into the row's second
+                      line, so the glyph marks the bar without hiding it. */}
+                  {clusterMarks(one.marks ?? [], x, width).map((placed) =>
+                    drawMark(placed, y + row - 2, FAINT),
+                  )}
                 </g>
               );
             })}

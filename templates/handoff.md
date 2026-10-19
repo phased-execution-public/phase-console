@@ -38,7 +38,7 @@ memory: {{MEMORY_KEY}}
        - **All:** …       every later phase; never handed back to you
      `phase-graph.sh <slug> --notes N` is asked per phase and collects only what reaches N,
      so an UNADDRESSED line is collected by nobody. A wrapped sentence continues the bullet
-     above it; 500 characters is the cap, and what does not fit belongs in the sections above,
+     above it, and so does an indented sub-bullet (folded in behind " - "); 500 characters is the cap, and what does not fit belongs in the sections above,
      which the note can point at. A note for a phase this plan does not have fails the lint by
      name (F26 note-target-unknown): nothing would ever deliver it, and whoever wrote it would
      go on believing it had been handed over; one addressed to a phase already done is a
@@ -49,17 +49,15 @@ memory: {{MEMORY_KEY}}
 
 ## ▶ Start next phase(s) (paste into fresh sessions)
 
-<!-- AUTO-FILLED by scripts/new-handoff.sh from the plan's phase graph: the boot
-     prompt of the phase THIS phase unblocks — or, when it unblocks several, the
-     shared boot ONCE and a block per phase with only what is that phase's own
-     (a booting session reads the shared boot and its own block, never a
-     sibling's). None if downstream still waits on other deps. The console runs
-     one phase per session, so a supervised session stops after its handoff;
-     only a person driving by hand may batch straight into a ready phase while
-     the budget lasts. Compose one
-     phase's full prompt at launch with:
-       bash "${PE_SCRIPTS:-<skill-root>/scripts}"/next-phase-prompt.sh {{SLUG}} {{PHASE}} --phase <N>
-     and check live state with:
+<!-- AUTO-FILLED by scripts/new-handoff.sh: a POINTER to the composer, never the
+     prompts themselves (#338). The board moves after this file is written — a
+     sibling finishes, a later phase leaves a note — so the prompts are composed
+     when they are read:
+       bash "${PE_SCRIPTS:-<skill-root>/scripts}"/next-phase-prompt.sh {{SLUG}} {{PHASE}} [--phase <N>]
+     and Phase Console composes the same at launch. Do not paste prompts here.
+     The console runs one phase per session, so a supervised session stops after
+     its handoff; only a person driving by hand may batch straight into a ready
+     phase while the budget lasts. Check live state with:
        bash "${PE_SCRIPTS:-<skill-root>/scripts}"/phase-graph.sh {{SLUG}}
      ($PE_SCRIPTS is the console's scripts in any session it starts; never write a
      skill copy's own path here — it pins the next session to that copy.) -->

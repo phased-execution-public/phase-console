@@ -25,14 +25,32 @@
  */
 export const NOTE_SEVERITIES = Object.freeze(/** @type {const} */ (['error', 'warn', 'info', 'ok']));
 
-/** @param {string} label @param {string} icon @param {UiState} paint @returns {StatusRow} */
-const note = (label, icon, paint) =>
-  Object.freeze({ label, icon, paint, tense: 'standing', attention: 'none' });
+/**
+ * One note row — and, like every row of the model (`shared/status-meanings.js`,
+ * #365), what it means and what comes next, in a sentence each. Four short
+ * pairs, so they ride here rather than costing first paint a second module.
+ * @param {string} label @param {string} icon @param {UiState} paint
+ * @param {string} meaning @param {string} next @returns {StatusRow}
+ */
+const note = (label, icon, paint, meaning, next) =>
+  Object.freeze({ label, icon, paint, tense: 'standing', attention: 'none', meaning, next });
 
 /** @type {Readonly<Record<NoteSeverity, StatusRow>>} */
 export const NOTE_ROWS = Object.freeze({
-  error: note('Error', 'circle-x', 'failed'),
-  warn: note('Caution', 'triangle-alert', 'queued'),
-  info: note('Note', 'info', 'running'),
-  ok: note('Done', 'circle-check', 'done'),
+  error: note(
+    'Error',
+    'circle-x',
+    'failed',
+    'Something went wrong.',
+    'Read the message: it says what failed and what to try.',
+  ),
+  warn: note(
+    'Caution',
+    'triangle-alert',
+    'queued',
+    'Worth care, though nothing is broken.',
+    'Read it before you go on.',
+  ),
+  info: note('Note', 'info', 'running', 'A fact worth knowing.', 'Nothing to do: read it if it helps.'),
+  ok: note('Done', 'circle-check', 'done', 'It worked.', 'Nothing to do: carry on.'),
 });

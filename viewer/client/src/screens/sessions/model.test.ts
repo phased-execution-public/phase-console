@@ -29,12 +29,20 @@
 
 import { describe, expect, it } from 'vitest';
 import { describeWord } from '@shared/status-model.js';
-import type { ForeignSession, TerminalSession, VerifyingLane } from '@/data/api';
+import type {
+  AccountView,
+  ForeignSession,
+  PlanDetail,
+  RunDetail,
+  TerminalSession,
+  VerifyingLane,
+} from '@/data/api';
 import { endedLabel, turnsLabel, type NowLane } from '@/data/lanes';
 import {
   KIND_LABEL,
   KIND_ORDER,
   NO_FILTERS,
+  SESSION_BADGES,
   SESSION_GROUPINGS,
   SESSION_GROUPS,
   SORTS,
@@ -49,6 +57,7 @@ import {
   kindOf,
   sessionRows,
   sessionStateNote,
+  sessionSummary,
   situationWords,
   sortRows,
   terminalWord,
@@ -100,6 +109,8 @@ const foreign = (over: Partial<ForeignSession> & { sessionId: string }): Foreign
 /** A row as the orders, filters and groups read it — they never read its word, so any word will do. */
 const row = (over: Partial<SessionRow> & Pick<SessionRow, 'key' | 'kind'>): SessionRow => ({
   label: over.key,
+  // Every group kind is a badge word of its own; QA and Recovery are agents' finer words.
+  badge: over.kind,
   href: '#/sessions/x',
   live: true,
   vocab: 'terminal',
@@ -692,5 +703,205 @@ describe('the situation', () => {
     expect(situationWords([asking('a'), asking('b')])).toBe('2 need you.');
     expect(situationWords([asking('a'), live('b')])).toBe('1 needs you and 1 running.');
     expect(situationWords([])).toBe('');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * #369 — the row carries what the run record holds
+ * ------------------------------------------------------------------ */
+
+/**
+ * The Sessions tables showed four facts and a dot though the run record holds
+ * the account, the model, the spend, the context and the task list (#369).
+ * The fold reads them ONCE, into the row, so the list, the inspector and the
+ * phone's records read one row: these cases hold the row model against a
+ * phase record's own fields.
+ */
+describe('the row carries what the run record holds (#369)', () => {
+  const tasks = [
+    ...['one', 'two', 'three', 'four'].map((content, i) => ({ id: `t${i}`, content, status: 'completed' })),
+    { id: 't4', content: 'wire the meter', activeForm: 'Wiring the meter', status: 'in_progress' },
+    { id: 't5', content: 'six', status: 'pending' },
+    { id: 't6', content: 'seven', status: 'pending' },
+  ];
+  const record = {
+    phase: 3,
+    status: 'running',
+    attempts: 2,
+    turns: 41,
+    costUsd: 1.5,
+    model: 'opus',
+    actualModel: 'claude-opus-5-5[1m]',
+    effort: 'high',
+    sessionAccountId: 'acct-b',
+    sessionId: 'conv-3',
+    tasks,
+    phaseClocks: { workedMs: 12 * 60_000 },
+    // The `run:progress` overlay: this session's unbooked dollars and its newest context.
+    live: { spentUsd: 0.25, contextTokens: 300_000 },
+    tokens: [{ window: 1_000_000, lastContext: 120_000 }],
+  };
+  const detail = (over: Record<string, unknown> = {}) =>
+    ({
+      run: {
+        id: 'run-1',
+        slug: 'alpha',
+        accountId: 'acct-run',
+        workRoot: '/work/.worktrees/runs/alpha/run-1',
+        phases: { '3': record },
+      },
+      history: [],
+      eta: null,
+      phaseEta: [{ phase: 3, weight: 1, estMs: 40 * 60_000, basis: 'history', clock: 'working', label: '' }],
+      liveness: [{ phase: 3, tokens: { context: 200_000, peak: 210_000, window: 1_000_000 }, spentUsd: 0.1 }],
+      ...over,
+    }) as unknown as RunDetail;
+  const accounts = [{ id: 'acct-b', name: 'Work login' }] as unknown as AccountView[];
+
+  it("folds a lane's account, model and effort, spend, context, progress and clocks from its phase record", () => {
+    const [r] = sessionRows({
+      lanes: [lane({ phase: 3, slim: true })],
+      records: new Map([['alpha', detail()]]),
+      accounts,
+      now: NOW,
+    });
+    expect(r).toMatchObject({
+      badge: 'lane',
+      // The account the SESSION ran on, named as the registry names it — not the run's default.
+      account: { id: 'acct-b', name: 'Work login' },
+      // What the session's own `init` said it runs on beats what it was asked for.
+      model: 'claude-opus-5-5[1m]',
+      effort: 'high',
+      // Booked, plus this session's unbooked dollars.
+      spendUsd: 1.75,
+      // The newest context against the window the server judged it by.
+      context: { tokens: 300_000, window: 1_000_000 },
+      progress: { done: 4, total: 7, active: 'Wiring the meter' },
+      workedMs: 12 * 60_000,
+      estimateMs: 40 * 60_000,
+      attempts: 2,
+      turns: 41,
+      conversation: 'conv-3',
+      worktree: '/work/.worktrees/runs/alpha/run-1',
+      tasks,
+    });
+  });
+
+  it('takes the phase title from the plan detail when the slim lane has none', () => {
+    const details = new Map([
+      ['alpha', { phases: [{ phase: 3, title: 'Server B' }] } as unknown as PlanDetail],
+    ]);
+    const [r] = sessionRows({ lanes: [lane({ phase: 3, slim: true })], details, now: NOW });
+    expect(r?.detail).toBe('Server B');
+  });
+
+  it("never reads another run's record onto a lane", () => {
+    const other = detail();
+    (other.run as { id: string }).id = 'run-0';
+    const [r] = sessionRows({
+      lanes: [lane({ phase: 3, slim: true })],
+      records: new Map([['alpha', other]]),
+      now: NOW,
+    });
+    expect(r?.account).toBeUndefined();
+    expect(r?.progress).toBeUndefined();
+    expect(r?.attempts).toBeUndefined();
+    expect(r?.worktree).toBeUndefined();
+  });
+
+  it("reads a slim lane's live facts before its record lands — and never a slim lane's zeroes as facts", () => {
+    const [r] = sessionRows({
+      lanes: [
+        lane({
+          phase: 3,
+          slim: true,
+          model: 'opus',
+          effort: 'max',
+          liveness: {
+            phase: 3,
+            lastOutputAt: at(1),
+            turnsSinceLastTool: 0,
+            commitsSinceStart: 0,
+            treeDirty: false,
+            tokens: {
+              context: 50_000,
+              peak: 50_000,
+              calls: 3,
+              rebuilds: 0,
+              input: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              output: 0,
+              pollCalls: 0,
+              window: 200_000,
+            },
+            spentUsd: 0.4,
+          },
+        }),
+      ],
+      now: NOW,
+    });
+    expect(r).toMatchObject({
+      model: 'opus',
+      effort: 'max',
+      spendUsd: 0.4,
+      context: { tokens: 50_000, window: 200_000 },
+    });
+    // A slim row's `costUsd: 0` and `attempts: 0` are "not read yet", never a measurement.
+    expect(r?.attempts).toBeUndefined();
+    expect(r?.progress).toBeUndefined();
+  });
+
+  it('badges each process by what it is: lane, shell, agent, QA, recovery, foreign', () => {
+    const rows = sessionRows({
+      lanes: [lane({ phase: 1 }), lane({ phase: 2, qa: { round: 1 } })],
+      terminals: [
+        pty({ id: 's1' }),
+        pty({
+          id: 'a1',
+          kind: 'claude',
+          meta: { model: 'sonnet', effort: 'low', claudeSessionId: 'conv-a' },
+        }),
+        pty({ id: 'q1', kind: 'claude', meta: { qa: { slug: 'alpha', phase: 2 } } }),
+        pty({ id: 'r1', kind: 'claude', meta: { recovery: { kind: 'halt', slug: 'alpha' } } }),
+      ],
+      foreign: [foreign({ sessionId: 'f1' })],
+      now: NOW,
+    });
+    const badgeOf = (key: string) => rows.find((r) => r.key === key)?.badge;
+    expect(badgeOf('lane:run-1#1')).toBe('lane');
+    expect(badgeOf('lane:run-1#2')).toBe('qa');
+    expect(badgeOf('pty:s1')).toBe('shell');
+    expect(badgeOf('pty:a1')).toBe('agent');
+    expect(badgeOf('pty:q1')).toBe('qa');
+    expect(badgeOf('pty:r1')).toBe('recovery');
+    expect(badgeOf('foreign:f1')).toBe('foreign');
+    // Every badge has its word; an agent pty carries the model it was launched on and its conversation.
+    for (const r of rows) expect(SESSION_BADGES[r.badge].label).toBeTruthy();
+    expect(rows.find((r) => r.key === 'pty:a1')).toMatchObject({
+      model: 'sonnet',
+      effort: 'low',
+      conversation: 'conv-a',
+    });
+    expect(rows.find((r) => r.key === 'foreign:f1')).toMatchObject({ conversation: 'f1', turns: 3 });
+  });
+
+  it('sums the strip: live lanes, shells, agents, others, who waits on a person, accounts in use', () => {
+    const rows = sessionRows({
+      lanes: [lane({ phase: 3, slim: true }), lane({ phase: 4, slim: true, status: 'queued' })],
+      records: new Map([['alpha', detail()]]),
+      accounts,
+      terminals: [pty({ id: 's1' }), pty({ id: 'gone', exited: { code: 0 }, exitedAt: ago(1) })],
+      foreign: [foreign({ sessionId: 'asking', waiting: { since: at(2), kind: 'permission' } })],
+      now: NOW,
+    });
+    expect(sessionSummary(rows)).toEqual({
+      lanes: 1,
+      shells: 1,
+      agents: 0,
+      foreign: 1,
+      waiting: 1,
+      accounts: 1,
+    });
   });
 });

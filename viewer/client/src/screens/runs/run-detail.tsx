@@ -35,6 +35,7 @@ import type { Lifecycle, LifecycleVerb } from '@/data/lifecycle';
 import { press } from '@/data/press';
 import { holderLabel, waitingLabel } from '@/data/queue-words';
 import type { PlacedRun } from '@/data/run-groups';
+import { runStopOf } from '@/data/run-stop';
 import { useRun } from '@/data/runs';
 import { cn } from '@/lib/cn';
 import { clockWords, holderEtaText, money, plural } from '@/lib/format';
@@ -85,12 +86,22 @@ export function RunDetail({
   const active = clockPhase != null && whole ? whole.phases?.[String(clockPhase)] : undefined;
   const liveActive = active != null && model.livePhases.includes(active.phase);
   const note = waitNote(folded as Parameters<typeof waitNote>[0]);
+  // A run that parked with its stop on a PHASE's record (a red verification, a
+  // spent wait) carries no halt of its own, and still has a card (#305) — the
+  // Run view's reader, so the two pages agree.
+  const stop = runStopOf(folded, live);
 
   return (
     <div className="flex min-w-0 flex-col gap-3 py-3" data-testid="strip-detail">
       {/* A person's turn, whole — the row's one action is its primary (phase 42). */}
       {model.action.kind === 'step' && <LazyHumanStepCard item={model.action.item} />}
-      {run.halt && <HaltCard run={folded} live={live} parts={ACCOUNT_RECOVERY_PARTS} />}
+      {stop && (
+        <HaltCard
+          run={stop === folded.halt ? folded : { ...folded, halt: stop }}
+          live={live}
+          parts={ACCOUNT_RECOVERY_PARTS}
+        />
+      )}
       {note && (
         <p className="text-meta text-ink-muted" data-testid="wait-note">
           {note}

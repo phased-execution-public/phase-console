@@ -379,16 +379,36 @@ export function severityOf(labels) {
 }
 
 /**
- * The `#n` numbers a phase's `Fixes:` line names, once each, in order. A bare
- * number ("phase 19") is not an issue: only `#` makes one.
+ * One reference on a `Fixes:` line: a GitHub issue or pull URL, or `#n` with an
+ * optional `owner/name` before it — the URL first, so its own `#fragment` is
+ * never read as a second reference.
+ */
+const FIXES_REF_RE =
+  /https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(?:issues|pull)\/(\d{1,9})\b|(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#(\d{1,9})\b/g;
+
+/**
+ * The issue numbers a phase's `Fixes:` line names, once each, in order. A bare
+ * number ("phase 19") is not an issue: only `#` or an issue URL makes one.
+ *
+ * `nameWithOwner` is the repository the plan's issues are on (#321). Given it,
+ * that repository's issue URLs are its issues too — `…/acme/widgets/issues/371`
+ * is `#371` — and a reference to ANOTHER repository (its URL, or
+ * `acme/elsewhere#5`) is no issue of this one: it is neither counted nor an
+ * error. Without it the line reads as it always has: every `#n`, `owner/name#n`
+ * included, and no URL.
  * @param {string | undefined} text
+ * @param {string | null} [nameWithOwner]
  * @returns {number[]}
  */
-export function fixesNumbers(text) {
+export function fixesNumbers(text, nameWithOwner) {
+  const own = nameWithOwner ? fold(nameWithOwner) : null;
   /** @type {number[]} */
   const out = [];
-  for (const match of String(text ?? '').matchAll(/#(\d{1,9})\b/g)) {
-    const number = Number(match[1]);
+  for (const match of String(text ?? '').matchAll(FIXES_REF_RE)) {
+    const repo = match[1] ?? match[3];
+    if (match[1] !== undefined && (!own || fold(repo) !== own)) continue;
+    if (match[3] !== undefined && own && fold(repo) !== own) continue;
+    const number = Number(match[2] ?? match[4]);
     if (number > 0 && !out.includes(number)) out.push(number);
   }
   return out;

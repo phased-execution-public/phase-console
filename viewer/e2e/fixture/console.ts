@@ -18,7 +18,7 @@
  * is up before they look for it.
  */
 import { appendFileSync, chmodSync, copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { request } from 'node:http';
+import { createServer, request } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -55,8 +55,81 @@ write({ ready: false });
 
 const bin = join(dirname(box.root), 'bin');
 mkdirSync(bin, { recursive: true });
-copyFileSync(fileURLToPath(new URL('./stub-claude.mjs', import.meta.url)), join(bin, 'claude'));
-chmodSync(join(bin, 'claude'), 0o755);
+const stub = (name: string, file: string): string => {
+  copyFileSync(fileURLToPath(new URL(file, import.meta.url)), join(bin, name));
+  chmodSync(join(bin, name), 0o755);
+  return join(bin, name);
+};
+stub('claude', './stub-claude.mjs');
+
+// The machine, stubbed (#297, #329). The sandbox redirects the console's XDG
+// homes, but three of its reads go round them: the machine login's keychain
+// item and the live usage endpoint it unlocks (a tour on a machine past 97 % of
+// its five-hour window had Launch disabled, and every picture carried the
+// operator's email and live meter), the launch unit under `~/Library`, and the
+// `tailscale` CLI (real paths, the real tailnet's login and devices). So the
+// console gets a scratch HOME — a `.claude.json` naming a fixture login, a git
+// identity, no launch unit — a `security` that answers only the login's
+// lookup with a token that means nothing, a usage endpoint of the fixture's
+// own answering a seeded reading with headroom, and a `tailscale` that
+// answers an example tailnet. `PHASE_CONSOLE_E2E_REAL_MACHINE=1` tours the
+// machine as it is instead, and says so.
+const realMachine = process.env.PHASE_CONSOLE_E2E_REAL_MACHINE === '1';
+if (realMachine) {
+  process.stderr.write(
+    "e2e fixture: PHASE_CONSOLE_E2E_REAL_MACHINE=1 — touring this machine's own login, meter, unit and tailnet\n",
+  );
+} else {
+  const home = join(dirname(box.root), 'home');
+  mkdirSync(home, { recursive: true });
+  writeFileSync(
+    join(home, '.claude.json'),
+    `${JSON.stringify({
+      oauthAccount: {
+        emailAddress: 'operator@example.com',
+        organizationName: 'Example Org',
+        organizationUuid: '00000000-0000-4000-8000-00000000e2e0',
+      },
+    })}\n`,
+  );
+  writeFileSync(
+    join(home, '.gitconfig'),
+    '[user]\n\tname = Phase Console e2e\n\temail = e2e@example.com\n[init]\n\tdefaultBranch = main\n',
+  );
+  box.env.HOME = home;
+  stub('security', './stub-security.mjs');
+  box.env.PHASE_CONSOLE_TAILSCALE_BIN = stub('tailscale', './stub-tailscale.mjs');
+  box.env.PHASE_CONSOLE_USAGE_BASE = await usageEndpoint(anchor);
+}
+
+/**
+ * The usage endpoint the console's poller asks (`/api/oauth/usage`), answered
+ * from the anchor so every relative time it implies reads the same on every
+ * run: a five-hour window a fifth spent, a week a third spent, and an Opus
+ * week barely touched. Anything else — the connectivity probe's HEAD of the
+ * base — is a plain 200.
+ */
+function usageEndpoint(at: number): Promise<string> {
+  const iso = (ms: number): string => new Date(at + ms).toISOString();
+  const reading = {
+    five_hour: { utilization: 21, resets_at: iso(3 * 3_600_000) },
+    seven_day: { utilization: 34, resets_at: iso(4 * 86_400_000) },
+    seven_day_opus: { utilization: 6, resets_at: iso(4 * 86_400_000) },
+  };
+  const server = createServer((req, res) => {
+    const usage = (req.url ?? '').split('?')[0] === '/api/oauth/usage';
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(usage ? JSON.stringify(reading) : '{}');
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      server.unref();
+      resolve(`http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`);
+    });
+  });
+}
 
 // The console reads one quiet machine load, whatever the machine is doing
 // (`steady-load.mjs`): the register must measure the same pages at load 8 and 80.

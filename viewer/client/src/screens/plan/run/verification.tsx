@@ -37,7 +37,11 @@
  */
 
 import { useId, useMemo, useState, type ReactNode } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import type { OwedRed, PhaseView, RunState } from '@/data/api';
+import { runsApi, type VerifyWaiver } from '@/data/api/runs';
+import { keys } from '@/data/keys';
+import { press } from '@/data/press';
 import {
   VERIFICATIONS_PAGE,
   VERIFICATIONS_PAGE_MAX,
@@ -48,10 +52,11 @@ import {
 } from '@/data/verification';
 import { cn } from '@/lib/cn';
 import { plural } from '@/lib/format';
-import { Button, Duration, Label, Mono, RelativeTime } from '@/ui';
+import { Button, Duration, Label, Mono, RelativeTime, toast } from '@/ui';
 import { Disclosure } from '@/ui/disclosure';
 import { NativeSelect } from '@/ui/native-select';
 import { OpsStatus } from '@/ui/status';
+import { Textarea } from '@/ui/textarea';
 
 /** The ledger's mark for a red whose output named no test: the whole command (`verify-ledger.ts` `WHOLE_COMMAND`). */
 const WHOLE = '*';
@@ -86,6 +91,8 @@ interface PhaseShare {
   baselines: VerificationRow[];
   owes: Owed[];
   owedByOthers: OwedRed[];
+  /** The operator's mid-run waivers of this phase's lines (one-pool phase 21, #267). */
+  waivers: VerifyWaiver[];
 }
 
 const ms = (at: string): number => {
@@ -129,16 +136,31 @@ function sharesOf(
   rows: readonly VerificationRow[],
   proofs: readonly RunProof[],
   owed: ReadonlyMap<number, OwedRed[]>,
+  waivers: readonly VerifyWaiver[] = [],
 ): PhaseShare[] {
   const by = new Map<number, PhaseShare>();
   const share = (phase: number): PhaseShare => {
     let found = by.get(phase);
     if (!found) {
-      found = { phase, latest: 0, proofs: [], verdicts: [], baselines: [], owes: [], owedByOthers: [] };
+      found = {
+        phase,
+        latest: 0,
+        proofs: [],
+        verdicts: [],
+        baselines: [],
+        owes: [],
+        owedByOthers: [],
+        waivers: [],
+      };
       by.set(phase, found);
     }
     return found;
   };
+  for (const waiver of waivers) {
+    const one = share(waiver.phase);
+    one.waivers.push(waiver);
+    one.latest = Math.max(one.latest, ms(waiver.at));
+  }
   for (const row of rows) {
     const one = share(row.phase);
     (row.kind === 'baseline' ? one.baselines : one.verdicts).push(row);
@@ -154,7 +176,10 @@ function sharesOf(
     one.owedByOthers = reds;
     for (const red of reds) one.latest = Math.max(one.latest, ms(red.at));
   }
-  for (const one of by.values()) one.owes = stillOwed(one.verdicts, one.proofs);
+  for (const one of by.values()) {
+    const waived = new Set(one.waivers.map((waiver) => waiver.text));
+    one.owes = stillOwed(one.verdicts, one.proofs).filter((red) => !waived.has(red.chain ?? red.command));
+  }
   return [...by.values()].sort((a, b) => b.latest - a.latest || b.phase - a.phase);
 }
 
@@ -194,9 +219,13 @@ export function RunVerificationFold({
     }
     return out;
   }, [run, phase]);
+  const waivers = useMemo(
+    () => (run?.verifyWaivers ?? []).filter((one) => phase === undefined || one.phase === phase),
+    [run, phase],
+  );
   const shares = useMemo(
-    () => sharesOf(ledger.data?.rows ?? [], proofs.data?.proofs ?? [], owed),
-    [ledger.data, proofs.data, owed],
+    () => sharesOf(ledger.data?.rows ?? [], proofs.data?.proofs ?? [], owed, waivers),
+    [ledger.data, proofs.data, owed, waivers],
   );
 
   const choose = (value: string) => {
@@ -266,6 +295,7 @@ export function RunVerificationFold({
           {shares.map((share) => (
             <PhaseVerification
               key={share.phase}
+              slug={slug}
               share={share}
               title={titles.get(share.phase)}
               runId={run?.id ?? null}
@@ -298,10 +328,12 @@ export function RunVerificationFold({
 
 /** One phase: what it owes, what its session proved, the console's verdicts and its baseline. */
 function PhaseVerification({
+  slug,
   share,
   title,
   runId,
 }: {
+  slug: string;
   share: PhaseShare;
   title: string | undefined;
   runId: string | null;
@@ -329,6 +361,9 @@ function PhaseVerification({
               <Command command={red.command} chain={red.chain} />
               <span className="min-w-0 break-words text-meta text-ink">{owedWords(red.failures)}</span>
               <When at={red.at} />
+              {runId ? (
+                <WaiveLine slug={slug} runId={runId} phase={share.phase} line={red.chain ?? red.command} />
+              ) : null}
             </li>
           ))}
           {share.owedByOthers.map((red, index) => (
@@ -344,6 +379,25 @@ function PhaseVerification({
                 Found by phase <span className="tnum">{red.by}</span>: {OWED_HOW[red.how] ?? red.how}
               </span>
               <When at={red.at} />
+            </li>
+          ))}
+        </Part>
+      )}
+
+      {share.waivers.length > 0 && (
+        <Part title="Waived by the operator" testId="verification-waivers">
+          {share.waivers.map((waiver) => (
+            <li key={waiver.fp} data-testid="verification-waiver" className={LINE}>
+              <OpsStatus
+                vocab="verification-line"
+                word="skipped"
+                title="Set aside by the operator mid-run, never run"
+              />
+              <Command command={waiver.text} />
+              <span className="min-w-0 break-words text-meta text-ink">
+                {waiver.by}: {waiver.reason}
+              </span>
+              <When at={waiver.at} />
             </li>
           ))}
         </Part>
@@ -373,6 +427,79 @@ function PhaseVerification({
         </Part>
       )}
     </section>
+  );
+}
+
+/**
+ * Waive this line (one-pool phase 21, #267): the owner's word that a red is
+ * not the phase's, for this phase alone, with a reason. Pressed through the
+ * owner door; recorded as a ruling on the plan's ledger and honoured at the
+ * phase's next verification.
+ */
+function WaiveLine({
+  slug,
+  runId,
+  phase,
+  line,
+}: {
+  slug: string;
+  runId: string;
+  phase: number;
+  line: string;
+}) {
+  const client = useQueryClient();
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  if (!open) {
+    return (
+      <Button size="sm" data-testid="verification-waive" onClick={() => setOpen(true)}>
+        Waive this line
+      </Button>
+    );
+  }
+  const waive = async () => {
+    setBusy(true);
+    try {
+      const pressed = await press(() => runsApi.runVerifyWaive(slug, phase, line, reason.trim(), runId));
+      if (pressed.state === 'asked') toast(pressed.words, 'info');
+      else toast(`Phase ${phase} no longer runs this line — the waiver is on the plan's rulings.`, 'ok');
+      setOpen(false);
+      setReason('');
+    } catch (error) {
+      toast(String((error as Error)?.message || 'The waiver was refused and said nothing.'), 'error');
+    } finally {
+      setBusy(false);
+      for (const key of keys.afterRunAct(slug)) void client.invalidateQueries({ queryKey: key });
+    }
+  };
+  return (
+    <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="verification-waive-form">
+      <Label htmlFor={`${id}-reason`} className="text-meta font-normal text-ink-muted">
+        Why is this red not phase {phase}'s? It is recorded as a ruling.
+      </Label>
+      <Textarea
+        id={`${id}-reason`}
+        data-testid="verification-waive-reason"
+        value={reason}
+        rows={2}
+        onChange={(event) => setReason(event.target.value)}
+      />
+      <span className="flex min-w-0 flex-wrap gap-2">
+        <Button
+          size="sm"
+          data-testid="verification-waive-confirm"
+          disabled={busy || !reason.trim()}
+          onClick={() => void waive()}
+        >
+          Waive it for phase {phase}
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </span>
+    </div>
   );
 }
 
@@ -437,8 +564,7 @@ function ProofLine({ proof }: { proof: RunProof }) {
 
 /** One run of one line by the console — a verdict, or the baseline it was held to. */
 function RunLine({ row, runId }: { row: VerificationRow; runId: string | null }) {
-  const unjudged = Boolean(row.timedOut || row.environment);
-  const word = unjudged ? 'skipped' : row.ok ? 'green' : 'red';
+  const word = row.timedOut ? 'timed-out' : row.environment ? 'skipped' : row.ok ? 'green' : 'red';
   const own = row.own ?? [];
   const inherited = (row.failures ?? []).filter((failure) => !own.includes(failure));
   return (
@@ -450,7 +576,7 @@ function RunLine({ row, runId }: { row: VerificationRow; runId: string | null })
     >
       <span className={LINE}>
         <OpsStatus
-          vocab="verification"
+          vocab="verification-line"
           word={word}
           {...(row.timedOut
             ? { title: 'Not judged: its clock cut it, which proves only that it ran past the limit' }

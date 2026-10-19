@@ -46,7 +46,7 @@ import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
-import { EFFORTS, markFor, spawnClaude, type InputCloseCause, type SpawnFn, type SpawnHandle, type SpawnRequest, type StreamEvent, type PermissionMode } from './spawn.ts';
+import { EFFORTS, markFor, spawnClaude, type InputCloseCause, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent, type PermissionMode } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -70,6 +70,7 @@ import {
   accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
 import type { Actor, AccountChoice, AccountRequirement, ConsoleRef, ResolvedManifest, RungRecord, RunNote, RunVerifyApprovals } from './state.ts';
+import type { DecisionChange } from '../prelude.ts';
 import type { PolicyInputs } from '../../shared/policy-model.js';
 import {
   childrenOf, loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
@@ -78,7 +79,7 @@ import {
   type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
-  type RunState, type PhaseStatus, type RunStatus, type VerifySummary,
+  type RunState, type PhaseStatus, type RunStatus, type SessionMode, type VerifySummary,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
 import {
@@ -558,6 +559,30 @@ export type RunnerDeps = {
    * session.
    */
   accountEnv?: (accountId: string | undefined, trustRoots?: string[]) => Promise<NodeJS.ProcessEnv | null>;
+  /**
+   * The model a session is SENT on the run's account (one-pool phase 5): the asked model mapped
+   * to an id the account serves, the fallback chain that account's own, the effort it takes,
+   * and the window of that model as environment — or the refusal in words when nothing on the
+   * account serves the model. Asked at the spawn door for every session; absent, a session is
+   * sent exactly what it asked for.
+   */
+  sessionModel?: (
+    accountId: string | undefined,
+    ask: { model?: string; fallbackModels: readonly string[]; effort?: string; pinned?: boolean },
+  ) =>
+    | { ok: true; model?: string; fallbackModels: string[]; effort?: string; env: NodeJS.ProcessEnv; mapped: boolean }
+    | { ok: false; refusal: string };
+  /**
+   * The ledger's meter for one session (one-pool phase 6): fed every stream event the session
+   * emits and ended with its outcome, it writes the session's usage rows — at every `result`,
+   * every five minutes and at the end. Asked at the spawn door for every session; absent (the
+   * free tree, a harness), nothing is metered.
+   */
+  sessionMeter?: (facts: {
+    mode: SessionMode; phase: number; account: string; model: string | null; plan: string | null; run: string | null;
+    /** The session's environment: a bridged session's token is read from it (one-pool phase 8). */
+    env?: NodeJS.ProcessEnv;
+  }) => { onEvent(event: StreamEvent): void; end(outcome: SpawnOutcome | null): void } | null;
   /**
    * The account a limit-hit run should continue under, from cached meters.
    * Null when no other account has headroom. Sync on purpose — consulted
@@ -1200,6 +1225,13 @@ export type StartOptions = {
   acknowledgedWaivers?: string[];
   manifest?: ResolvedManifest;
   manifestOverride?: { rows: string[]; by: string };
+  /**
+   * A RESUME's manifest re-read against the plan's decisions as they stand
+   * (#226, `rereadManifest`): on a person's resume the run takes `manifest`;
+   * every resume journals `run.decisions-reread` with `changes`, whether they
+   * were `applied`, and the rows `held`. Ignored on a fresh run.
+   */
+  manifestReread?: { manifest: ResolvedManifest; changes: DecisionChange[]; held: DecisionChange[] };
   /**
    * The launch's answer to the prelude's git-strategy rows (control-tower
    * phase 11, #18): `honour` makes the plan's lines hold where the console
@@ -2499,6 +2531,8 @@ export const WAIT_PROCEDURE_RULES: readonly string[] = Object.freeze([
   'wait in ONE foreground call bounded by the Bash timeout: until <probe>; do sleep 10; done with '
     + 'timeout: 600000, at most once per ten minutes.',
   'The console allows a wait on your own job; it refuses one on somebody else\'s clock.',
+  'Never wait on pgrep -f text that is in your own command — the loop\'s shell matches it and the wait never '
+    + 'ends; wait on the job\'s pid (while kill -0 <pid>) or a sentinel it writes (until [ -f x.exit ]).',
   'Only subagents or monitors running in the background are left',
   'end your turn; the session stays alive and their notification wakes you.',
   'They are stopped ten minutes after your turn ends — dispatch a subagent that may take longer in the FOREGROUND.',
@@ -2522,7 +2556,10 @@ export function waitProcedure(outcome = 'phase-outcome.sh <slug> <N>'): string {
       + 'call returns with the answer and costs nothing while it runs.',
     '3. You need your own shell job and nothing else is left → wait in ONE foreground call bounded by the '
       + 'Bash timeout: `until <probe>; do sleep 10; done` with `timeout: 600000`, at most once per ten '
-      + 'minutes. The console allows a wait on your own job; it refuses one on somebody else\'s clock.',
+      + 'minutes. The console allows a wait on your own job; it refuses one on somebody else\'s clock. '
+      + 'Never wait on `pgrep -f` text that is in your own command — the loop\'s shell matches it and the '
+      + 'wait never ends; wait on the job\'s pid (`while kill -0 <pid>`) or a sentinel it writes '
+      + '(`until [ -f x.exit ]`).',
     '4. Only subagents or monitors running in the background are left → end your turn; the session stays '
       + 'alive and their notification wakes you. They are stopped ten minutes after your turn ends — '
       + 'dispatch a subagent that may take longer in the FOREGROUND. A background SHELL dies when your turn '
@@ -2530,6 +2567,19 @@ export function waitProcedure(outcome = 'phase-outcome.sh <slug> <N>'): string {
     '5. Somebody else\'s clock (CI, a deploy, a person) → commit, hand off `in-progress`, '
       + `\`${outcome} waiting-external --wait-minutes <M> --watch <ref>\`, stop.`,
   ].join('\n');
+}
+
+/**
+ * What the in-turn guard tells a session whose wait loop's `pgrep -f` matches
+ * the loop's own command line (one-pool phase 24, #260): the trap, and the two
+ * forms that end — the job's pid, or a sentinel its command writes.
+ */
+export function selfMatchReason(pattern: string): string {
+  return `this loop can never end: \`pgrep -f ${JSON.stringify(pattern)}\` matches the shell running the loop, `
+    + 'whose own command line carries that text. Wait on the job itself instead — its pid '
+    + '(`cmd > /tmp/job.log 2>&1 & echo $! > /tmp/job.pid`, then `while kill -0 "$(cat /tmp/job.pid)"; do sleep 10; done`) '
+    + 'or a sentinel its command writes (`cmd; echo "EXIT=$?" > /tmp/job.exit`, then '
+    + '`until [ -f /tmp/job.exit ]; do sleep 10; done`), in ONE call bounded by the Bash timeout.';
 }
 
 /**

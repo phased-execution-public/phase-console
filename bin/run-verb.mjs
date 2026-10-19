@@ -128,6 +128,15 @@ export function parseRowArgs(row, rest) {
     }
     positionalValues.push(token);
   }
+  // The last positional may take every word left (`many`) or be absent (`optional`).
+  if (row.cli.many && wanted.length && positionalValues.length >= wanted.length) {
+    const head = positionalValues.slice(0, wanted.length - 1);
+    const named = Object.fromEntries(wanted.slice(0, -1).map((name, i) => [name, head[i]]));
+    return { positionals: { ...named, [wanted[wanted.length - 1]]: positionalValues.slice(wanted.length - 1) }, flags };
+  }
+  if (row.cli.optional && positionalValues.length === wanted.length - 1) {
+    return { positionals: Object.fromEntries(wanted.slice(0, -1).map((name, i) => [name, positionalValues[i]])), flags };
+  }
   if (positionalValues.length !== wanted.length) {
     throw new Error(
       `${row.name} needs ${wanted.length ? wanted.join(' ') : 'no arguments'}`
@@ -479,7 +488,9 @@ async function runVerbInner(argv, ctx) {
   const { json, help, consoleSelector, rest } = extractGlobalFlags(argv);
   if (help) { printHelp(verbModel.OPERATOR_VERBS, ctx.edition, process.stdout); return verbModel.CLI_EXIT.ok; }
 
-  const verbWord = rest.shift();
+  let verbWord = rest.shift();
+  // `run queue check|order|revert …` (one-pool phase 39): the Queue's three are rows of their own.
+  if (verbWord === 'queue' && ['check', 'order', 'revert'].includes(rest[0])) verbWord = `queue-${rest.shift()}`;
   if (!verbWord) { printHelp(verbModel.OPERATOR_VERBS, ctx.edition, process.stderr); return verbModel.CLI_EXIT.usage; }
 
   const row = verbModel.verbNamed(verbWord);

@@ -38,7 +38,7 @@ import {
   type ReactNode,
 } from 'react';
 import { ROUTE_HEADS } from '@shared/route-meta.js';
-import { REDIRECTS, redirectTarget } from './redirects';
+import { queueRedirect, REDIRECTS, redirectTarget } from './redirects';
 import {
   CHROMELESS_HEADS,
   DEFAULT_HEAD,
@@ -133,8 +133,9 @@ export const ROUTE_TABLE: Record<string, RouteEntry> = {
 
   /* ---- redirects: a head whose new home already exists ---- */
   debug: redirect(REDIRECTS.debug!),
-  // 7.0 (quiet-console phase 7): the queue is the Queued group of the home.
-  queue: redirect(REDIRECTS.queue!),
+  // 7.0 (quiet-console phase 7): the queue is the Queued group of the home —
+  // in Free still; in Pro it is a page again (below).
+  queue: redirect(queueRedirect),
   approve: redirect(REDIRECTS.approve!),
   now: redirect(REDIRECTS.now!),
   dashboard: redirect(REDIRECTS.dashboard!),
@@ -148,6 +149,7 @@ export const ROUTE_TABLE: Record<string, RouteEntry> = {
   mcp: redirect(REDIRECTS.mcp!),
   notifications: redirect(REDIRECTS.notifications!),
 };
+
 
 /** `''` and anything unregistered land on the home (`DEFAULT_HEAD`, Runs) rather than nowhere. */
 export function resolveHead(head: string | undefined): string {

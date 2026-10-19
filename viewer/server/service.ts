@@ -44,7 +44,7 @@ import {
 } from './engine.ts';
 import { QA_DIRECTIVES } from '../shared/plan-vocab.js';
 import { QA_CONFIRM } from '../shared/run-settings.js';
-import { RELOGIN_CONFIRM } from '../shared/ops-vocab.js';
+import { MCP_LOGIN_ENDS, MCP_LOGIN_WINDOW_MS, RELOGIN_CONFIRM } from '../shared/ops-vocab.js';
 import { SearchIndex, type SearchResult } from './search.ts';
 import { listSkills, type SkillInfo } from './skills.ts';
 import { SCRIPTS_REF } from './skill-copy.ts';
@@ -79,7 +79,7 @@ import {
   type RunTimeline, type AttemptSummary, type AttemptComparison,
 } from './analysis/timeline.ts';
 import {
-  buildInbox, inboxIds, pruneAcks, readAcks, removeAck, removeAckMany, writeAck, writeAckMany,
+  buildInbox, pruneAcks, readAcks, removeAck, removeAckMany, writeAck, writeAckMany,
   INBOX_ACKS_DIR, type InboxAck, type InboxFacts, type InboxView,
 } from './inbox.ts';
 import { STALL_SIGNAL_META, inboxItemId, parseInboxItemId } from '../shared/attention-model.js';
@@ -129,7 +129,7 @@ import { environmentReport, type EnvIssue } from './env-doctor.ts';
 // The check's effort (control-tower phase 134) is free; the chat's pair reads it too.
 import { isEffort } from './runner/spawn.ts';
 // The thin read routes (quiet-console phase 25).
-import { DENSITIES, PREF_META, THEMES } from '../shared/prefs-model.js';
+import { DENSITIES, PALETTES, PREF_META, THEMES } from '../shared/prefs-model.js';
 // Retention, writable from Settings ▸ This instance (quiet-console phase 23).
 import { RETENTION_DEFAULTS, retentionPatch, sanitiseRetention } from './retention-policy.ts';
 import { listStrayConsoles } from '../../bin/stray-consoles.mjs';
@@ -158,8 +158,8 @@ import {
   FREEZE_ESCALATE_MS, escalatePersistedFreeze, runFreezeVerdict, type PersistedEscalation,
 } from './runner/freeze.ts';
 import type { BackgroundTask, LaneLiveness } from './runner/liveness.ts';
-import { inTurnWait, waitScope } from './runner/liveness.ts';
-import { backgroundExitRefusal, pollLoopNotice, waitProcedure } from './runner/runner-core.ts';
+import { inTurnWait, selfMatchingProbe, waitScope } from './runner/liveness.ts';
+import { backgroundExitRefusal, pollLoopNotice, selfMatchReason, waitProcedure } from './runner/runner-core.ts';
 import { isStatusCapable, type PollVerdict } from '../shared/poll-loop.js';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
@@ -186,8 +186,9 @@ import {
 import { realExec, type Exec } from './accounts/credentials.ts';
 import { Mcp, type McpServerView } from './mcp/index.ts';
 import {
-  bridgeDefinition, consoleConfigDir, isLoginBlock, loginEnv, planMcpLogin, unbridgeDefinition,
-  type McpLoginPlan, type McpLoginTarget,
+  authUrlOf, bridgeDefinition, consoleConfigDir, endingOf, isLoginBlock, lastLineOf, liveStep, loginEnv,
+  pastedCallbackError, planMcpLogin, unbridgeDefinition,
+  type McpLoginFlow, type McpLoginPlan, type McpLoginTarget,
 } from './mcp/login.ts';
 import { portTranscript } from './accounts/transcripts.ts';
 import { FULL_FLAGS, installDesktopLauncher, launcherPlan } from './launcher.ts';
@@ -386,6 +387,16 @@ export class Service extends ServiceRecovery {
    * ours.
    */
   private readonly pendingMcpBridges = new Map<string, McpLoginPlan>();
+
+  /**
+   * The guided sign-in per server (one-pool phase 19, #372) — what the sheet
+   * reads. In memory: a flow lives five minutes, and a console restarted
+   * inside one leaves a terminal whose exit still re-probes the server.
+   */
+  private readonly mcpLoginFlows = new Map<string, McpLoginFlow>();
+
+  /** The sign-in flows' clock — injected in tests, so a timeout is proved without five real minutes. */
+  mcpLoginNow: () => number = Date.now;
 
   /**
    * How the sign-in bridge runs `claude`. Injected in tests, exactly as `Mcp`
@@ -1053,6 +1064,7 @@ export class Service extends ServiceRecovery {
     return this.accounts.rename(id, name);
   }
 
+
   /**
    * Put a login in front of the operator for a profile account.
    *
@@ -1337,6 +1349,7 @@ export class Service extends ServiceRecovery {
       ...(record(body.headers) ? { headers: record(body.headers)! } : {}),
       ...(Array.isArray(body.secretRefs) ? { secretRefs: body.secretRefs as never } : {}),
       ...(record(body.secrets) ? { secrets: record(body.secrets)! } : {}),
+      ...(record(body.vars) ? { vars: record(body.vars)! } : {}),
       ...(body.alwaysLoad === true ? { alwaysLoad: true } : {}),
       ...(typeof body.timeoutMs === 'number' ? { timeoutMs: body.timeoutMs } : {}),
       source: body.source === 'catalog' ? 'catalog' : 'manual',
@@ -1359,6 +1372,15 @@ export class Service extends ServiceRecovery {
     }
     if (typeof body.secret === 'string' && body.secretRef && typeof body.secretRef === 'object') {
       await this.mcp.setSecret(id, body.secretRef as never, body.secret);
+    }
+    // *Fill it in* (#363): a value for each `${VAR}` the registration left
+    // unfilled, held like a secret and spliced at spawn.
+    if (body.vars && typeof body.vars === 'object' && !Array.isArray(body.vars)) {
+      if (!this.mcp.has(id)) return undefined;
+      const vars: Record<string, string> = {};
+      for (const [name, value] of Object.entries(body.vars)) if (typeof value === 'string') vars[name] = value;
+      await this.mcp.fillVars(id, vars);
+      void this.refreshMcp(true).catch((error) => log.warn('mcp.refresh-failed', { error }));
     }
     if (typeof body.label === 'string') return this.mcp.rename(id, body.label);
     return (await this.mcp.list()).find((server) => server.id === id);
@@ -1390,7 +1412,7 @@ export class Service extends ServiceRecovery {
    * three decisions the service owns: which config dir, whether a terminal may
    * open at all, and what the card is told when it may not.
    */
-  async beginMcpLogin(id: string, options: { accountId?: string } = {}): Promise<{
+  async beginMcpLogin(id: string, options: { accountId?: string; remote?: boolean } = {}): Promise<{
     id: string;
     command: string;
     mode: 'embedded' | 'external' | 'command';
@@ -1401,10 +1423,173 @@ export class Service extends ServiceRecovery {
     accountLabel?: string;
     /** Set only when no flow could start: the commands that would work by hand. */
     commands?: string[];
+    /** The guided flow the page walks (#372). */
+    flow: McpLoginFlow;
   }> {
     this.assertMcpAllowed();
     const meta = this.mcp.meta(id);
     if (!meta) throw new Error(`no MCP server called ${id}`);
+    const started = await this.startMcpLogin(id, meta, options);
+    const flow: McpLoginFlow = {
+      server: id,
+      mode: started.mode,
+      remote: started.remote,
+      step: started.mode === 'command' && started.commands ? 'failed' : 'starting',
+      startedAt: new Date(this.mcpLoginNow()).toISOString(),
+      deadline: new Date(this.mcpLoginNow() + MCP_LOGIN_WINDOW_MS).toISOString(),
+      command: started.command,
+      ...(started.terminal ? { sessionId: started.terminal.sessionId } : {}),
+      ...(started.bridged ? { bridged: true } : {}),
+      ...(started.commands ? { commands: started.commands } : {}),
+      ...(started.configDir ? { configDir: started.configDir } : {}),
+      ...(started.accountLabel ? { accountLabel: started.accountLabel } : {}),
+      ...(started.detail ? { detail: started.detail } : {}),
+    };
+    // A flow the console cannot follow — the person runs it in a terminal of
+    // their own — has no steps to read: the sheet shows its command, and the
+    // row's status, re-checked, says when it worked. One that cannot start at
+    // all (`commands`) has ended before it began, with the reason as its words.
+    this.mcpLoginFlows.set(id, flow);
+    log.info('mcp.login.started', { server: id, mode: flow.mode, remote: flow.remote });
+    const answer: Omit<typeof started, 'remote' | 'bridged'> & { remote?: boolean; bridged?: boolean } = { ...started };
+    delete answer.remote;
+    delete answer.bridged;
+    return { ...answer, flow: { ...flow } };
+  }
+
+  /** The guided flow for a server, read now — its step derived from what the terminal printed. */
+  mcpLoginFlow(id: string): McpLoginFlow | undefined {
+    const flow = this.mcpLoginFlows.get(id);
+    if (!flow) return undefined;
+    if ((MCP_LOGIN_ENDS as readonly string[]).includes(flow.step) || flow.mode !== 'embedded' || !flow.sessionId) {
+      return { ...flow };
+    }
+    if (!flow.authUrl) {
+      const url = authUrlOf(this.terminals.outputTail(flow.sessionId, 64_000));
+      if (url) flow.authUrl = url;
+    }
+    flow.step = liveStep(flow);
+    // A terminal that outlived the CLI's own clock by a minute and never
+    // exited is a flow nobody will finish: say so, naming the step.
+    if (this.mcpLoginNow() > Date.parse(flow.deadline) + 60_000 && this.terminals.isLive(flow.sessionId)) {
+      const ending = endingOf(flow, { code: 1, at: this.mcpLoginNow() });
+      Object.assign(flow, { step: ending.step, detail: ending.detail, endedAt: new Date(this.mcpLoginNow()).toISOString() });
+    }
+    return { ...flow };
+  }
+
+  /**
+   * The paste-back (#372): the address the browser landed on, typed into the
+   * CLI that waits for it. Refused, with words, when there is no flow waiting
+   * for one or the address carries no code. The address is never logged.
+   */
+  pasteMcpLogin(id: string, value: string): McpLoginFlow {
+    this.assertMcpAllowed();
+    const flow = this.mcpLoginFlow(id);
+    if (!flow || flow.mode !== 'embedded' || !flow.sessionId) {
+      throw new Error(`no sign-in for ${id} is waiting for an address — press Sign in first`);
+    }
+    if ((MCP_LOGIN_ENDS as readonly string[]).includes(flow.step)) {
+      throw new Error(`the sign-in for ${id} has already ended (${flow.step}) — press Sign in to start again`);
+    }
+    if (!flow.remote) {
+      throw new Error('this sign-in takes the browser’s answer itself — approve in the browser that opened');
+    }
+    const refusal = pastedCallbackError(value);
+    if (refusal) throw new Error(refusal);
+    if (!this.terminals.input(flow.sessionId, `${value.trim()}\r`)) {
+      throw new Error(`the sign-in terminal for ${id} is no longer running — press Sign in to start again`);
+    }
+    const held = this.mcpLoginFlows.get(id)!;
+    held.pastedAt = new Date(this.mcpLoginNow()).toISOString();
+    held.step = liveStep(held);
+    log.info('mcp.login.pasted', { server: id });
+    return { ...held };
+  }
+
+  /**
+   * A sign-in terminal exited: take the bridge back, re-probe, and end the
+   * flow — connected, or failed or timed out with the step it stopped on and
+   * the CLI's last words. The terminal goes too, once its words are kept:
+   * an exited sign-in terminal is debris on the Sessions page (#372).
+   */
+  async finishMcpLogin(
+    id: string,
+    session: { id: string; code: number; bridged: boolean; configDir?: string },
+  ): Promise<void> {
+    const flow = this.mcpLoginFlows.get(id);
+    const ours = flow?.sessionId === session.id ? flow : undefined;
+    const output = this.terminals.outputTail(session.id, 64_000);
+    // Read what the terminal showed even if nobody polled the flow, so the
+    // ending names the step it truly stopped on.
+    if (ours && !ours.authUrl) {
+      const url = authUrlOf(output);
+      if (url) ours.authUrl = url;
+    }
+    if (ours && session.code === 0) ours.step = 'checking';
+    // Take the bridged definition back BEFORE re-probing, so the probe
+    // measures the state the operator is left in rather than the temporary
+    // one this flow created. The probe reads its own `--mcp-config` and never
+    // the CLI's registry, so removing the entry cannot change the verdict.
+    if (session.bridged) await this.releaseMcpBridge(id, session.configDir);
+    const servers = await this.refreshMcp(true);
+    const view = servers.find((server) => server.id === id);
+    if (ours) {
+      if (view?.status === 'connected') {
+        Object.assign(ours, { step: 'connected', exitCode: session.code });
+      } else if (session.code === 0) {
+        Object.assign(ours, {
+          step: 'failed', exitCode: 0,
+          detail: `The Claude CLI finished the sign-in, but ${view?.label ?? id} still answers ${view?.status ?? 'nothing'}${view?.issue ? `: ${view.issue}` : ''}. Press Sign in to try again.`,
+        });
+      } else {
+        const lastLine = lastLineOf(output);
+        const ending = endingOf(ours, { code: session.code, at: this.mcpLoginNow(), ...(lastLine ? { lastLine } : {}) });
+        Object.assign(ours, { step: ending.step, detail: ending.detail, exitCode: session.code });
+      }
+      ours.endedAt = new Date(this.mcpLoginNow()).toISOString();
+      log.info('mcp.login.finished', {
+        server: id, step: ours.step, exit: session.code, ms: Math.max(0, this.mcpLoginNow() - Date.parse(ours.startedAt)),
+      });
+    }
+    this.terminals.dismiss(session.id);
+    if (view?.status === 'connected') {
+      this.announce('limits', {
+        title: 'MCP server signed in',
+        body: `${view.label} is connected and available to runs on this console.`,
+        tag: tagFor('limits', 'mcp-login', id),
+      });
+      // A run parked waiting for exactly this can now be re-armed.
+      await this.healMcpParks(id);
+    }
+  }
+
+  /** The start itself: which config dir, whether a terminal may open, and what to say when none can. */
+  private async startMcpLogin(
+    id: string,
+    meta: NonNullable<ReturnType<Mcp['meta']>>,
+    options: { accountId?: string; remote?: boolean },
+  ): Promise<{
+    id: string;
+    command: string;
+    mode: 'embedded' | 'external' | 'command';
+    terminal?: { sessionId: string; token: string; expiresAt: number };
+    detail?: string;
+    configDir?: string;
+    accountLabel?: string;
+    commands?: string[];
+    remote: boolean;
+    bridged?: boolean;
+  }> {
+    // Try again: a flow still running for this server is ended first, so two
+    // terminals never wait on one sign-in. A closed terminal never reaches the
+    // exit hook, so the definition it bridged is taken back here — or the new
+    // flow would find it, read it as somebody else's, and leave it behind.
+    const previous = this.mcpLoginFlows.get(id);
+    if (previous?.sessionId && this.terminals.isLive(previous.sessionId)) {
+      this.terminals.kill(previous.sessionId);
+      if (previous.bridged) await this.releaseMcpBridge(id, previous.configDir);
+    }
 
     // Which config dir the token must land in. The default is the console's
     // own, because that is the one the health probe reads (`health.ts` spawns
@@ -1413,7 +1598,7 @@ export class Service extends ServiceRecovery {
     // a server in for the identity their RUNS spend, which is the second hole
     // issue #8 describes — and it stays an explicit choice rather than a guess,
     // since the account a run uses is resolved per run and not console-wide.
-    const target: McpLoginTarget = { configDir: consoleConfigDir() };
+    const target: McpLoginTarget = { configDir: consoleConfigDir(), ...(options.remote ? { remote: true } : {}) };
     if (options.accountId) {
       const account = this.accounts.meta(options.accountId);
       if (!account) throw new Error(`no account called ${options.accountId}`);
@@ -1435,6 +1620,7 @@ export class Service extends ServiceRecovery {
         detail: plan.reason,
         commands: plan.commands,
         ...(target.configDir ? { configDir: target.configDir } : {}),
+        remote: options.remote === true,
       };
     }
 
@@ -1452,6 +1638,7 @@ export class Service extends ServiceRecovery {
         commands: [plan.command],
         ...(plan.configDir ? { configDir: plan.configDir } : {}),
         ...(plan.accountLabel ? { accountLabel: plan.accountLabel } : {}),
+        remote: plan.remote,
       };
     }
 
@@ -1481,6 +1668,8 @@ export class Service extends ServiceRecovery {
         terminal: { sessionId: minted.sessionId, token: minted.token, expiresAt: minted.expiresAt },
         ...(plan.configDir ? { configDir: plan.configDir } : {}),
         ...(plan.accountLabel ? { accountLabel: plan.accountLabel } : {}),
+        remote: plan.remote,
+        ...(bridged.wrote ? { bridged: true } : {}),
       };
     }
 
@@ -1499,6 +1688,7 @@ export class Service extends ServiceRecovery {
       ...(detail ? { detail } : {}),
       ...(plan.configDir ? { configDir: plan.configDir } : {}),
       ...(plan.accountLabel ? { accountLabel: plan.accountLabel } : {}),
+      remote: plan.remote,
     };
   }
 
@@ -1897,7 +2087,10 @@ export class Service extends ServiceRecovery {
         try { runner.rereadWalls('reading'); } catch (error) { log.warn('accounts.walls-reread-failed', { error }); }
       }
       void this.accounts.list()
-        .then((accounts) => this.emit('accounts', { accounts }))
+        .then((accounts) => {
+          let today: { day: string; accounts: Record<string, unknown> } | undefined;
+          this.emit('accounts', { accounts, ...(today ? { today } : {}) });
+        })
         .catch((error) => log.warn('accounts.emit-failed', { error }));
     }, 150);
     this.accountsEmitTimer.unref?.();
@@ -2067,9 +2260,15 @@ export class Service extends ServiceRecovery {
       const flight = this.inboxFlight.get(all);
       if (flight?.key === key) return flight.promise;
       if (flight) { await flight.promise.catch(() => undefined); continue; }
-      const promise = this.buildAttention(all).then((view) => {
-        const built: InboxMemo = { key, at: Date.now(), view };
+      // One fold answers both shapes (one-pool phase 26, #237): the other
+      // shape's memo is filled from the same build, at its own key, so a tab
+      // asking `?all=1` beside one asking the open list costs nothing more.
+      const otherKey = this.inboxKey(!all);
+      const promise = this.buildAttention(all).then(({ view, other }) => {
+        const at = Date.now();
+        const built: InboxMemo = { key, at, view };
         this.inboxMemo.set(all, built);
+        if (this.inboxMemo.get(!all)?.key !== otherKey) this.inboxMemo.set(!all, { key: otherKey, at, view: other });
         return built;
       }).finally(() => {
         if (this.inboxFlight.get(all)?.promise === promise) this.inboxFlight.delete(all);
@@ -2109,7 +2308,7 @@ export class Service extends ServiceRecovery {
       .finally(() => this.inboxGateFills.delete(fill));
   }
 
-  private async buildAttention(all: boolean): Promise<InboxView> {
+  private async buildAttention(all: boolean): Promise<{ view: InboxView; other: InboxView }> {
     const ok = async <T>(what: string, get: () => Promise<T> | T, fallback: T): Promise<T> => {
       try { return await get(); } catch (error) { log.warn('inbox.source-failed', { what, error }); return fallback; }
     };
@@ -2300,19 +2499,26 @@ export class Service extends ServiceRecovery {
     } as unknown as InboxFacts;
 
     const now = Date.now();
-    const view = buildInbox(facts, now, { all });
+    // ONE fold (one-pool phase 26, #237): the whole list, acknowledged items
+    // marked, from which the open list is a filter — `buildInbox` with
+    // `all: false` drops exactly the items it marks with `all: true`, in the
+    // same sorted order — and the id space the prune keeps. It was three
+    // folds per change: the view, then `inboxIds` building the whole list
+    // again, and the other shape's own build on its first request.
+    const full = buildInbox(facts, now, { all: true });
+    const open: InboxView = { ...full, items: full.items.filter((item) => !item.ack) };
     // What the heartbeat tells a fleet reader: this console's asks, unacked,
     // at their last build (FLT-6) — never a second build of its own.
     this.needsYouCount = {
-      count: view.items.filter((item) => (item.severity === 'urgent' || item.severity === 'needs-you') && !item.ack).length,
+      count: open.items.filter((item) => item.severity === 'urgent' || item.severity === 'needs-you').length,
       at: now,
     };
     // An ack for something that is no longer asking is dead weight, and — for
     // the items that have no clock of their own — pruning is the ONLY thing
     // that makes a gone-and-came-back item read as new again.
-    try { pruneAcks(INBOX_ACKS_DIR, inboxIds(facts, now)); }
+    try { pruneAcks(INBOX_ACKS_DIR, full.items.map((item) => item.id)); }
     catch (error) { log.warn('inbox.prune-failed', { error }); }
-    return view;
+    return all ? { view: full, other: open } : { view: open, other: full };
   }
 
   /**
@@ -3328,6 +3534,21 @@ export class Service extends ServiceRecovery {
     // nothing local stays external — the refusal is the default.
     if (verdict === 'allow' && toolName === 'Bash' && run) {
       const bashCommand = (input as { command?: unknown } | null)?.command;
+      // A loop whose `pgrep -f` matches its own command line waits for ever on
+      // a job that may be long done (#260): refused with the forms that end.
+      const selfMatch = verifying || typeof bashCommand !== 'string' ? null : selfMatchingProbe(bashCommand);
+      if (selfMatch) {
+        this.runnerByRunId(run.id)?.note('phase.tool-denied', {
+          tool: toolName, rule: 'in-turn-wait', matched: `pgrep -f ${selfMatch}`, selfMatch: true,
+        }, phase ?? undefined);
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: selfMatchReason(selfMatch),
+          },
+        };
+      }
       const matched = verifying || typeof bashCommand !== 'string'
         ? null
         : inTurnWait(bashCommand, loadVerifyEnv(this.flags.scriptsDir));
@@ -4206,6 +4427,8 @@ export class Service extends ServiceRecovery {
     }
     const verdict = manifestVerdict(command, row.value, {
       runBranch: run.gitMode === 'new-branch' ? `pe/${run.slug}` : null, phase, releasePhases: row.releasePhases,
+      // The branch the run was cut from is a trunk too (#276).
+      baseBranch: run.base?.ref ?? null,
     });
     // The row answers the publishing act ALONE. What else the line runs is
     // judged as if it ran on its own: one this run's policy would not simply
@@ -4725,6 +4948,7 @@ export class Service extends ServiceRecovery {
     // The words from their owner (`shared/prefs-model.js`), which the settings schema offers too.
     if (THEMES.includes(patch.theme as never)) picked.theme = patch.theme;
     if (DENSITIES.includes(patch.density as never)) picked.density = patch.density;
+    if (PALETTES.includes(patch.palette as never)) picked.palette = patch.palette;
     if (typeof patch.model === 'string') picked.model = patch.model;
     if (typeof patch.sort === 'string') picked.sort = patch.sort;
     // The Issues desk's added repositories (control-tower phase 118): an array

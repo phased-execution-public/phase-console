@@ -34,7 +34,7 @@ import { keys } from '@/data/keys';
 import { press, type Pressed } from '@/data/press';
 import { useWindowLeft } from '@/lib/clock';
 import { cn } from '@/lib/cn';
-import { toHash } from '@/shell/routes';
+import { navigate, sessionsHref, toHash } from '@/shell/routes';
 import { Button, RelativeTime, toast } from '@/ui';
 import { Checkbox } from '@/ui/checkbox';
 import { Disclosure } from '@/ui/disclosure';
@@ -42,6 +42,8 @@ import { MicField } from '@/ui/mic-field';
 // By its own path, never the family's index: it reads no status table.
 import { SeverityMark } from '@/ui/status/severity';
 import { LazyHumanStepCard } from './human-step-lazy';
+import { nextStepOf, setNextStep } from './next-step';
+import { NextStepNote } from './next-step-note';
 import { TurnRowWords } from './turn/row-words';
 
 /* ------------------------------------------------------------------ *
@@ -81,6 +83,8 @@ export function useInboxActions(): {
    * is what Undo changes back: an item acknowledged days ago stays so.
    */
   ackMany: (items: InboxItem[], onUndone?: () => void) => void;
+  /** Put acknowledged rows back in the list — the bar's *Put back*. */
+  unackMany: (ids: string[], onUndone?: () => void) => void;
   busy?: string;
   /** True while a bulk press is in flight — the bar disables itself on it. */
   bulkBusy: boolean;
@@ -115,7 +119,17 @@ export function useInboxActions(): {
           // person is needed") and `nothing-to-do` — so a blanket success
           // toast once reported a wedged run recovered when nothing happened.
           const result = pressed.result;
+          // An answer that is a next step (#368) — a sign-in's terminal, an
+          // errand tree's paths — is read the way the verb's own page reads it
+          // and kept on the card; a terminal is opened at once.
           const stalled = result?.outcome === 'errand' || result?.outcome === 'nothing-to-do';
+          const next = nextStepOf(action, result, sessionsHref);
+          setNextStep(item.id, next);
+          if (next) {
+            toast(next.words, stalled ? 'warn' : 'info', 8000);
+            if (next.href) navigate(next.href);
+            return;
+          }
           toast(
             result?.detail ?? `${action.label} — done.`,
             stalled ? 'warn' : 'ok',
@@ -217,7 +231,7 @@ export function useInboxActions(): {
     [reread, unackMany],
   );
 
-  return { perform, ack, ackMany, bulkBusy, ...(busy ? { busy } : {}) };
+  return { perform, ack, ackMany, unackMany, bulkBusy, ...(busy ? { busy } : {}) };
 }
 
 /* ------------------------------------------------------------------ *
@@ -475,6 +489,8 @@ export function InboxRow({
           "--allow-run is off" is noise, and none of them says it where a screen
           reader would reach it. */}
       {!step && reasons.length > 0 && <p className="text-meta text-ink-muted">{reasons.join(' ')}</p>}
+      {/* What the last press answered that is a next step (#368), kept on the row. */}
+      <NextStepNote id={item.id} />
     </li>
   );
 }

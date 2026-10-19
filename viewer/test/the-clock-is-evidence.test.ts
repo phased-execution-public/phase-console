@@ -445,10 +445,18 @@ test('criterion 1: rows are pruned to what is declared NOW — the cap cannot we
   assert.equal(journal.length, 1);
   assert.equal(saves, 1);
 
-  // …and it does not churn on the next passes.
+  // …and it does not churn on the next passes: nothing is journalled, and a
+  // pass that asked nothing writes nothing.
   for (let i = 0; i < 3; i += 1) { clock.time += WATCH_POLL_MS['gh-run']; await scheduler.tick(); }
   assert.equal(journal.length, 1, 'pending -> pending is still not a transition');
-  assert.equal(saves, 1, 'and an unchanged pass does not rewrite the run file');
+  // Each of those passes DID move the row's schedule, and a moved schedule is
+  // saved (one-pool phase 23, #337): a stopped run is re-loaded from disk on
+  // every pass, so a next due time that lived only in memory read as overdue
+  // again at the next pass, and a restart forgot it. One save per probe, never
+  // one per pass that asked nothing:
+  assert.equal(saves, 4, 'one save per probe that moved the clock');
+  await scheduler.tick();
+  assert.equal(saves, 4, 'a pass with nothing due rewrites nothing');
   scheduler.close();
 });
 

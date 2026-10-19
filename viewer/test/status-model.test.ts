@@ -50,6 +50,7 @@ import {
   describeRun,
   describeWord,
 } from '../shared/status-model.js';
+import { STATUS_MEANINGS } from '../shared/status-meanings.js';
 import {
   BOARD_BUCKETS,
   BOARD_OVERLAY_STATES,
@@ -74,7 +75,7 @@ import { LIVENESS } from '../shared/fleet-model.js';
 import { DECISION_STATES } from '../shared/decisions-model.js';
 import { CHECKOUT_ROLES, CHECKOUT_STATES, RADAR_STATES, SETTLE_KINDS } from '../shared/worktree-model.js';
 import { LANDING_STATES } from '../shared/landing-model.js';
-import { HANDOFF_WORDS, VERIFICATION_WORDS } from '../shared/evidence-model.js';
+import { HANDOFF_WORDS, VERIFICATION_LINE_WORDS, VERIFICATION_WORDS } from '../shared/evidence-model.js';
 import { INBOX_SEVERITIES } from '../shared/attention-model.js';
 import { ISSUE_CATEGORIES, ISSUE_PLAN_STATES, ISSUE_SEVERITY_WORDS } from '../shared/issues-model.js';
 
@@ -115,6 +116,7 @@ const OWNERS: Record<string, readonly string[]> = {
   'checkout-role': CHECKOUT_ROLES,
   landing: LANDING_STATES,
   verification: VERIFICATION_WORDS,
+  'verification-line': VERIFICATION_LINE_WORDS,
   'issue-category': ISSUE_CATEGORIES,
   'issue-severity': ISSUE_SEVERITY_WORDS,
   'issue-plan': ISSUE_PLAN_STATES,
@@ -165,6 +167,61 @@ test('every row is a precise word, an icon and a paint on the closed axes', () =
       }
       assert.ok(STATUS_ICON_NAMES.includes(row.icon), `${at} icon ${row.icon} is not in STATUS_ICON_NAMES`);
     }
+  }
+});
+
+test('every row says what it means and what comes next — never the label again (#365)', () => {
+  // A hover that repeats the label explains nothing: "Parked" said "Parked".
+  // Each row carries one sentence of meaning and one of what happens next,
+  // from `shared/status-meanings.js` (the notes from `status-notes.js`).
+  const machine = /`|cmd:|\/api\/|#\/|\bphase 0\b/;
+  for (const vocab of STATUS_VOCABS) {
+    for (const [word, row] of Object.entries(WORD_ROWS[vocab]) as [string, { label: string; meaning?: unknown; next?: unknown }][]) {
+      const at = `${vocab}:${word}`;
+      for (const key of ['meaning', 'next'] as const) {
+        const said = row[key];
+        assert.equal(typeof said, 'string', `${at} has no ${key}`);
+        const text = (said as string).trim();
+        assert.ok(text.length > 0, `${at} has an empty ${key}`);
+        assert.notEqual(text.replace(/[.!]$/, '').toLowerCase(), row.label.toLowerCase(), `${at}'s ${key} only repeats its label`);
+        assert.match(text, /^[A-Z“]/, `${at}'s ${key} is a sentence: it starts with a capital`);
+        assert.match(text, /[.!?]$/, `${at}'s ${key} is a sentence: it ends with a stop`);
+        assert.doesNotMatch(text, machine, `${at}'s ${key} carries a machine word`);
+      }
+      assert.notEqual(row.meaning, row.next, `${at} says the same thing twice`);
+    }
+  }
+  // …and no sentence is left over for a word no vocabulary has.
+  for (const [vocab, words] of Object.entries(STATUS_MEANINGS)) {
+    assert.ok(Object.hasOwn(WORD_ROWS, vocab), `status-meanings names a vocabulary the model lacks: ${vocab}`);
+    for (const word of Object.keys(words)) {
+      assert.ok(Object.hasOwn(WORD_ROWS[vocab as keyof typeof WORD_ROWS], word), `status-meanings names ${vocab}:${word}, which has no row`);
+    }
+  }
+  assert.ok(!Object.hasOwn(STATUS_MEANINGS, 'note'), 'the note rows carry their own sentences (first paint)');
+});
+
+test('every view the model builds carries a meaning and a next, the context included', () => {
+  const views = [
+    describeWord('plan', 'active'),
+    describeWord('plan', 'nope'),
+    describeWord('qa-result', null),
+    describeRun({ id: 'r', slug: 's', status: 'parked' }),
+    describeRun({ id: 'r', slug: 's', status: 'parked' }, { planClosed: true }),
+    describeRun({ id: 'r', slug: 's', status: 'halted' }, { inbox: [{ kind: 'errand', severity: 'urgent', runId: 'r' }] }),
+    describeRun({ id: 'r', slug: 's', status: 'paused', stoppedBy: 'operator' }),
+    describePhase({ status: 'running' }, { live: false }),
+    describePhase(null, { boardState: 'stuck' }),
+  ];
+  for (const view of views) {
+    assert.ok(view.meaning && view.meaning.length > 0, `${view.vocab}:${view.word} has no meaning`);
+    assert.ok(view.next && view.next.length > 0, `${view.vocab}:${view.word} has no next`);
+  }
+  // A summons says where the item that asks for you is; an overtaken run says what overtook it.
+  assert.match(describeRun({ id: 'r', slug: 's', status: 'halted' }, { inbox: [{ kind: 'errand', severity: 'needs-you', runId: 'r' }] }).next!, /Your turn/);
+  assert.match(describeRun({ id: 'r', slug: 's', status: 'parked' }, { planClosed: true }).next!, /plan is closed/);
+  for (const level of ATTENTION_LEVELS) {
+    assert.ok(ATTENTION_META[level].meaning.length > 0 && ATTENTION_META[level].next.length > 0, `${level} attention says nothing`);
   }
 });
 
@@ -526,4 +583,13 @@ test('the live plan-status values: a stray value is Unknown, a real word is pain
   }
   assert.equal(describeWord('plan', 'complete').paint, 'done');
   assert.notEqual(describeWord('plan', 'active').paint, 'skipped', 'an open plan is not grey');
+});
+
+test('a verification line its clock cut is Timed out — settled, outcome unknown, never red, never skipped (#331)', () => {
+  const row = WORD_ROWS['verification-line']['timed-out'];
+  assert.equal(row.label, 'Timed out');
+  assert.equal(row.tense, 'settled');
+  assert.equal(row.outcome, 'unknown');
+  assert.notEqual(row.paint, 'failed');
+  assert.notEqual(row.label, WORD_ROWS['verification-line'].skipped.label);
 });

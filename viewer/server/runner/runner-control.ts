@@ -64,9 +64,9 @@ import {
 } from './runner-core.ts';
 import type { RungRecord } from './state.ts';
 import { wallOfHookDenial, withWall, type RecordedWall } from '../permissions/walls.ts';
-import { accountPool, applyErrandAnswer, identityChangeWords, identityEcho, keepAccountInPool, launcherAlive, manifestEcho, rankInPool, type ErrandAnswer } from './state.ts';
+import { accountPool, applyErrandAnswer, applyVerifyWaiver, type VerifyWaiver, identityChangeWords, identityEcho, keepAccountInPool, launcherAlive, manifestEcho, rankInPool, type ErrandAnswer } from './state.ts';
 import {
-  childrenOf, endLockWait, loadRun, newRun, orphanAdvice, phaseRecord, procIdentity, retirePhaseHalt, retireSettledErrands, runDir, saveRun, pidAlive, pidHoldsWork, IN_FLIGHT, SETTLED,
+  childrenOf, consoleRunsDir, endLockWait, loadRun, newRun, orphanAdvice, phaseRecord, procIdentity, retirePhaseHalt, retireSettledErrands, runDir, saveRun, pidAlive, pidHoldsWork, IN_FLIGHT, SETTLED,
   setPhaseState, setRunState,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, resetStreak, streakPhases, clearBudgetHold, mcpReasonText, resetForRetry, consoleStoppedNote,
   settleInFlightRecords,
@@ -134,7 +134,7 @@ const RUN_ALREADY_ENDED: readonly RunStatus[] = [
 ];
 
 /** One repository's checkouts and `pe/*` branches at a moment in time. */
-type ArtefactSnapshot = { repo: string; trees: Map<string, string | undefined>; branches: Set<string> }[];
+import { artefactsMade, artefactWords, instanceSlugs, scopeAbs, type ArtefactSnapshot } from './artefacts.ts';
 
 export abstract class RunnerControl extends RunnerBase {
   /* ---------------------------------------------------------------- *
@@ -344,6 +344,10 @@ export abstract class RunnerControl extends RunnerBase {
       // What the run WAS, before this start applies anything it names — the
       // other half of `run.resume-settings`, written once the journal exists.
       resumedFrom = settingsSnapshot(this.state);
+      // Applied only on a PERSON's resume: a row in the tree is one a session
+      // can write, so a door no person pressed (converge, a watch, a boot
+      // sweep) widens nothing — it journals what it held for the next press.
+      if (options.manifestReread && isPersonsAct(actor)) this.state.manifest = options.manifestReread.manifest;
       if (options.model) this.state.model = options.model;
       if (options.effort) this.state.effort = options.effort;
       if (options.permissionMode) this.state.permissionMode = options.permissionMode;
@@ -523,6 +527,15 @@ export abstract class RunnerControl extends RunnerBase {
     // does (`configure`): it is the one setting that changes what a session
     // may DO, and "who widened this run" must be answerable without a diff.
     if (resumedFrom) {
+      // The plan's decisions as they stand now (#226) — said on every resume,
+      // so "did this run see the amendment?" is one line, `changes` empty or not.
+      if (options.manifestReread) {
+        this.record('run.decisions-reread', {
+          changes: options.manifestReread.changes, applied: isPersonsAct(actor),
+          ...(options.manifestReread.held.length ? { held: options.manifestReread.held } : {}),
+          ...actor,
+        });
+      }
       const overridden = settingsOverridden(resumedFrom, this.state);
       if (Object.keys(overridden).length) this.record('run.resume-settings', { overridden, ...actor });
       if (overridden.permissionProfile) {
@@ -1499,6 +1512,10 @@ export abstract class RunnerControl extends RunnerBase {
       // start work and is governed; a recovery is an operator's button and is
       // not. See `AdmitRequest.kind`.
       kind,
+      // A phase that declared `partial` moments ago is resuming its own work,
+      // not starting new work: the machine-load guard does not hold it
+      // (one-pool phase 26, #243 ask 2).
+      ...(kind === 'phase' && resumingOwnWork(phaseRecord(state, phase), this.now().getTime()) ? { resumed: true } : {}),
       // The scan class this admission joins the queue in. Absent reads as
       // `normal` in the scheduler, so a run that never said anything queues
       // exactly as it always did. An operator who changes the class while
@@ -1913,7 +1930,9 @@ export abstract class RunnerControl extends RunnerBase {
     // asked for. A hold cannot be here — a held entry is never admitted.
     // …and so are a pin and a kept lane (control-tower phase 100): each asked
     // for exactly this boarding. The scheduler spent its reservation at the grant.
-    if (record.queueControl?.bump || record.queueControl?.defer || record.queueControl?.pin || record.queueControl?.reserve) {
+    // …and an operator's order (one-pool phase 39): it placed this boarding.
+    if (record.queueControl?.bump || record.queueControl?.defer || record.queueControl?.pin || record.queueControl?.reserve || record.queueControl?.order) {
+      delete record.queueControl.order;
       delete record.queueControl.bump;
       delete record.queueControl.defer;
       delete record.queueControl.pin;
@@ -1976,7 +1995,9 @@ export abstract class RunnerControl extends RunnerBase {
    * wrong credentials, which is precisely the quiet kind of wrong. Resolved
    * per spawn, so an account switch lands on the very next session; a
    * resolution failure degrades to the machine login rather than blocking the
-   * phase, and says so in the journal.
+   * phase, and says so in the journal — except a refusal (`AccountEnvRefused`:
+   * an API key missing, a provider with no recipe), which is thrown, because
+   * the machine login is not the account the run was told to spend.
    */
   protected async sessionEnv(extra: Record<string, string>): Promise<NodeJS.ProcessEnv> {
     const accountId = this.state?.accountId;
@@ -1990,6 +2011,14 @@ export abstract class RunnerControl extends RunnerBase {
           this.record('run.account-env-missing', { accountId });
         }
       } catch (error) {
+        // An account the console REFUSED to compose an environment for — an API
+        // key that is missing, a provider with no recipe here (one-pool phase 5)
+        // — is never degraded to the machine login: that would spend somebody
+        // else's money under this account's name. The session is not started.
+        if ((error as Error)?.name === 'AccountEnvRefused') {
+          this.record('run.account-env-refused', { accountId, reason: (error as Error).message });
+          throw error;
+        }
         this.record('run.account-env-failed', { accountId, error: (error as Error).message });
       }
     }
@@ -2340,6 +2369,7 @@ export abstract class RunnerControl extends RunnerBase {
     this.emit('run', { state });
     return true;
   }
+
 
   /** The soonest a pool member frees up, per phase, from the last declined switch — see `soonestReset`. */
   private readonly switchWakes = new Map<number, number>();
@@ -3097,14 +3127,16 @@ export abstract class RunnerControl extends RunnerBase {
     try {
       const dirs = await this.scopeDirs(phase);
       const snapshot: ArtefactSnapshot = [];
+      // Every console-managed root, not this run's alone (#262): a tree another
+      // run's lane machinery makes in a shared repository is the console's.
+      const managed = this.managedDirs();
       for (const dir of dirs) {
-        const abs = dir === '.' ? state.root : join(state.root, dir);
         const prefix = dir === '.' ? [] : ['-C', dir];
-        const entries = await checkouts(abs, runDir(state.root, state.slug));
+        const entries = await checkouts(scopeAbs(state.root, dir), managed);
         const listed = await this.gitOrNull(
           [...prefix, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/pe/']);
-        const trees = new Map<string, string | undefined>();
-        for (const entry of entries) trees.set(entry.dir, entry.branch);
+        const trees: ArtefactSnapshot[number]['trees'] = new Map();
+        for (const entry of entries) trees.set(entry.dir, { ...(entry.branch ? { branch: entry.branch } : {}), managed: entry.managed });
         snapshot.push({
           repo: dir,
           trees,
@@ -3122,29 +3154,17 @@ export abstract class RunnerControl extends RunnerBase {
    * wall is about damage, and a worktree is not damage — so the contract is
    * that nothing it makes is INVISIBLE. Nothing here removes anything: a
    * checkout may hold uncommitted work, and deciding its fate is a person's.
+   * What is credited, and what is only said to have appeared, is
+   * `artefactsMade`'s (#262).
    */
   protected async noteArtefacts(before: ArtefactSnapshot | null, phase: number): Promise<void> {
     const state = this.state;
     if (!state || !before) return;
     const after = await this.artefactScan(phase);
     if (!after) return;
-    const at = new Date().toISOString();
-    const made: RunArtefact[] = [];
-    for (const now of after) {
-      // Matched by REPO. A scope that appeared or vanished between the two
-      // scans is compared against nothing rather than against a neighbour's
-      // refs, which would report every one of them as new.
-      const was = before.find((b) => b.repo === now.repo);
-      if (!was) continue;
-      for (const [dir, branch] of now.trees) {
-        if (was.trees.has(dir)) continue;
-        made.push({ kind: 'worktree', name: dir, repo: now.repo, ...(branch ? { branch } : {}), phase, at });
-      }
-      for (const name of now.branches) {
-        if (was.branches.has(name)) continue;
-        made.push({ kind: 'branch', name, repo: now.repo, phase, at });
-      }
-    }
+    const lane = this.lanes.get(phase)?.worktree;
+    const slugs = [...new Set([state.slug, ...instanceSlugs(consoleRunsDir(state.root))])];
+    const made = artefactsMade(before, after, { phase, at: new Date().toISOString(), laneTree: lane ?? null, slugs });
     if (!made.length) return;
     // Deduped by repo+kind+name: a branch this run's own lane machinery made and
     // then re-made is one artefact, and a register that repeated it would read
@@ -3159,8 +3179,10 @@ export abstract class RunnerControl extends RunnerBase {
     this.record('run.agent-artefacts', {
       phase,
       repos: [...new Set(fresh.map((a) => a.repo ?? '.'))],
-      worktrees: fresh.filter((a) => a.kind === 'worktree').map((a) => a.name),
+      worktrees: fresh.filter((a) => a.kind === 'worktree' && a.maker !== 'unknown').map((a) => a.name),
+      appeared: fresh.filter((a) => a.kind === 'worktree' && a.maker === 'unknown').map((a) => a.name),
       branches: fresh.filter((a) => a.kind === 'branch').map((a) => a.name),
+      words: fresh.map(artefactWords),
     }, phase);
     this.persist();
   }
@@ -4124,7 +4146,7 @@ export abstract class RunnerControl extends RunnerBase {
    * with who and why, and a move with its place before and after. The loop is
    * woken, because a bump or a re-queue may change what boards next.
    */
-  queueControl(phase: number, verb: PhaseQueueVerb, actor: Actor, opts: Pick<QueueControlOptions, 'until' | 'stamp' | 'position' | 'lane' | 'via'> = {}):
+  queueControl(phase: number, verb: PhaseQueueVerb, actor: Actor, opts: Pick<QueueControlOptions, 'until' | 'stamp' | 'position' | 'lane' | 'via' | 'order' | 'lapsed' | 'facts'> = {}):
     { ok: true; changed: boolean } | { ok: false; status: number; error: string } {
     const state = this.state;
     if (!state) return { ok: false, status: 409, error: 'no run' };
@@ -4144,7 +4166,9 @@ export abstract class RunnerControl extends RunnerBase {
     if (entry && scheduler) {
       if (verb === 'withdraw') scheduler.withdrawEntry(entry.id);
       else if (change.control.bump && (verb === 'bump' || verb === 'requeue')) scheduler.bump(entry.id, change.control.bump);
-      else scheduler.markEntry(entry.id, { hold: change.control.hold ?? null, defer: change.control.defer ?? null, pin: change.control.pin ?? null });
+      else scheduler.markEntry(entry.id, {
+        hold: change.control.hold ?? null, defer: change.control.defer ?? null, pin: change.control.pin ?? null, order: change.control.order ?? null,
+      });
     }
     // A kept lane is the scheduler's own registry — it stands with no entry at all.
     if (verb === 'reserve' || verb === 'unreserve') this.syncReservation(phase);
@@ -5547,6 +5571,23 @@ export abstract class RunnerControl extends RunnerBase {
   }
 
   /**
+   * An operator waived one §Verification line of a live run's phase (one-pool
+   * phase 21, #267): recorded on the run, journalled `phase.verify-waived`,
+   * and read by `verifyApprovalsFor` at the phase's next verification.
+   */
+  waiveVerifyLine(waiver: VerifyWaiver): VerifyWaiver | null {
+    const state = this.state;
+    if (!state?.phases[String(waiver.phase)]) return null;
+    const entry = applyVerifyWaiver(state, waiver);
+    this.record('phase.verify-waived', {
+      by: entry.by, line: entry.text, fp: entry.fp, reason: entry.reason, rulingId: entry.rulingId ?? null,
+    }, waiver.phase);
+    this.persist();
+    this.emit('run', { state });
+    return entry;
+  }
+
+  /**
    * A person answered the errand this live run's phase is parked on
    * (control-tower phase 88, #124): `applyErrandAnswer` on the live record,
    * journalled and persisted here, because only the runner writes its state.
@@ -6120,4 +6161,18 @@ export abstract class RunnerControl extends RunnerBase {
     }, record.phase);
   }
 
+}
+
+/**
+ * How recently a phase must have declared `partial` for its next admission to
+ * count as a RESUME of work that was running (one-pool phase 26, #243): a
+ * wrap-up's resume boards within a minute or two; one that waited longer than
+ * this is new work again, and the load guard governs it.
+ */
+export const RESUME_ADMISSION_GRACE_MS = 15 * 60_000;
+
+/** Is this phase's admission the resume of work it was doing moments ago? */
+export function resumingOwnWork(record: Pick<PhaseRecord, 'lastPartial'>, now: number): boolean {
+  const at = record.lastPartial?.at ? Date.parse(record.lastPartial.at) : NaN;
+  return Number.isFinite(at) && now - at >= 0 && now - at < RESUME_ADMISSION_GRACE_MS;
 }

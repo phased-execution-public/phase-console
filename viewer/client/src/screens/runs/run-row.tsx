@@ -30,6 +30,8 @@ import { useLifecycle } from '@/data/lifecycle';
 import { queueMarks } from '@/data/queue-words';
 import type { PlacedRun } from '@/data/run-groups';
 import { usePhaseReport } from '@/data/runs';
+import { useAccounts } from '@/data/accounts';
+import { accountLine } from '@/lib/account-line';
 import { useNow } from '@/lib/clock';
 import { cn } from '@/lib/cn';
 import { clockWords, money } from '@/lib/format';
@@ -73,22 +75,24 @@ export interface RunRowProps {
  * phone stacks (mark · name · fold, then the track, the clock, the action in
  * the thumb's zone); a tablet keeps one line of facts and gives the track a
  * line of its own, so no station is squeezed to its dot; a desk draws the six
- * cells on one line. As the Run view's head it keeps the tablet's two lines at
- * every width from `sm` up: the page's column narrows when the panel opens
- * beside it — a desk's viewport with a tablet's room — and one desk line there
- * squeezed the track to a letter a line.
+ * cells on one line. The desk line is chosen by the room the LIST has (its
+ * `@container/strips`, `Rows` in `groups.tsx`), never by the viewport: with the
+ * panel open beside the page at 1280 the column is a tablet's 790 px, and a
+ * viewport rule drew the desk line there and squeezed "2 done" onto two lines
+ * (#342). As the Run view's head it keeps the tablet's two lines at every width
+ * from `sm` up, for the same reason.
  */
 const CELLS = {
   row: {
-    grid: 'sm:grid-cols-[auto_minmax(var(--strip-name-floor),1fr)_auto_auto_auto] lg:grid-cols-[auto_minmax(var(--strip-name-floor),16rem)_minmax(0,1fr)_auto_auto_auto]',
-    mark: 'max-lg:order-1',
-    name: 'max-lg:order-2',
-    track: 'max-lg:col-span-full max-sm:order-4 sm:max-lg:order-6',
-    facts: 'max-sm:order-5 max-sm:col-span-full sm:max-lg:order-3',
-    action: 'max-sm:order-6 max-sm:col-span-full sm:max-lg:order-4',
-    last: 'max-sm:order-3 sm:max-lg:order-5',
-    waits: 'max-lg:order-7',
-    after: 'max-lg:order-8',
+    grid: 'sm:grid-cols-[auto_minmax(var(--strip-name-floor),1fr)_auto_auto_auto] @min-[56rem]/strips:grid-cols-[auto_minmax(var(--strip-name-floor),16rem)_minmax(var(--strip-track-floor),1fr)_auto_auto_auto]',
+    mark: '@max-[56rem]/strips:order-1',
+    name: '@max-[56rem]/strips:order-2',
+    track: '@max-[56rem]/strips:col-span-full max-sm:order-4 sm:@max-[56rem]/strips:order-6',
+    facts: 'max-sm:order-5 max-sm:col-span-full sm:@max-[56rem]/strips:order-3',
+    action: 'max-sm:order-6 max-sm:col-span-full sm:@max-[56rem]/strips:order-4',
+    last: 'max-sm:order-3 sm:@max-[56rem]/strips:order-5',
+    waits: '@max-[56rem]/strips:order-7',
+    after: '@max-[56rem]/strips:order-8',
   },
   header: {
     grid: 'sm:grid-cols-[auto_minmax(var(--strip-name-floor),1fr)_auto_auto_auto]',
@@ -106,6 +110,7 @@ const CELLS = {
 export function RunRow({ placed, allowRun, state, record, variant = 'row', onInspect, onAct }: RunRowProps) {
   const { run, lanes } = placed;
   const [prefs, setPrefs] = usePrefs();
+  const accounts = useAccounts();
   const open = prefs.stripsOpen.includes(run.id);
   const setOpen = useCallback(
     (next: boolean) => {
@@ -199,6 +204,13 @@ export function RunRow({ placed, allowRun, state, record, variant = 'row', onIns
           data-testid="strip-cost"
           title={costTitle(model)}
         />
+        <span
+          data-testid="strip-account"
+          className="min-w-0 break-words"
+          title="Who pays: account · provider · model"
+        >
+          {accountLine(run.accountId ?? null, accounts.data?.accounts, run.model)}
+        </span>
       </span>
 
       {/* The ONE action — and on a phone, the thumb's zone at the foot. */}
@@ -290,9 +302,19 @@ export function RunRow({ placed, allowRun, state, record, variant = 'row', onIns
 }
 
 /** The glance's track: a station per fold, each with its word. */
+/**
+ * The folded track. A station's words never break ("2" over "done", #342):
+ * each label keeps one line and each station is at least as wide as its dot,
+ * its words and the shortest leg, so where room runs out the legs shorten
+ * first, and below that the row gives the track a line of its own.
+ */
 function GlanceTrack({ stations }: { stations: readonly TrackStation[] }) {
   return (
-    <Track label="Phases" className="min-w-0">
+    <Track
+      label="Phases"
+      data-glance=""
+      className="min-w-0 [&>.ui-station]:min-w-max [&_.ui-station-label]:whitespace-nowrap"
+    >
       {stations.map((station) => (
         <Station
           key={station.key}

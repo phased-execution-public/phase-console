@@ -73,6 +73,7 @@ export const PhaseMark = memo(function PhaseMark({
   const mark = (
     <PhaseStatus
       board={state as WordOf<'board'>}
+      chrome="badge"
       live={Boolean(live)}
       size={size}
       title={title ?? boardStateTitle(state)}

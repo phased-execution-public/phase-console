@@ -36,6 +36,27 @@ import { join } from 'node:path';
 import '../e2e/fixture/steady-load.mjs';
 import { sweepBrokers } from './broker-sweep.ts';
 
+/**
+ * A test file's report reaches the runner whole, under `--test-force-exit`.
+ *
+ * Under `node --test` each file is a child that reports over its stdout, a pipe
+ * the runner reads, and on macOS a pipe write is asynchronous: what the pipe
+ * cannot take at once waits in the child's memory. `--test-force-exit` ends the
+ * child with `process.exit()` the moment its last test is done, and whatever is
+ * still waiting is gone — the runner reads a clean exit and simply never hears
+ * of the file's later tests. A file of synchronous tests says nothing until its
+ * end (its event loop never turns), so all of it waits: on a loaded machine
+ * `rehearsal-assert.test.ts` reported 219, 223, 225, 262 and 278 of its 281
+ * (2026-10-19, one-pool phase 33; the gate's ledger, #339, is what saw it).
+ * Blocking writes are Linux's behaviour already: a write returns once the pipe
+ * has taken it, so the exit has nothing left to drop.
+ */
+if (process.env.NODE_TEST_CONTEXT?.startsWith('child')) {
+  for (const stream of [process.stdout, process.stderr]) {
+    (stream as unknown as { _handle?: { setBlocking?: (on: boolean) => void } })._handle?.setBlocking?.(true);
+  }
+}
+
 const dir = mkdtempSync(join(tmpdir(), 'phase-console-state-'));
 
 process.env.XDG_STATE_HOME = join(dir, 'state');

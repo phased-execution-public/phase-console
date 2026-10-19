@@ -285,3 +285,30 @@ twin() {  # twin <slug> <rows…>  — write a decisions.md twin in the writer's
   [ "$status" -eq 1 ]
   assert_contains "$output" "a row this script did not write"
 }
+
+@test "decisions.sh: a value over 500 characters is refused with the limit named, never cut (#253)" {
+  setup_docs decisions decisions
+  pe_decisions decisions answer stop --value "keep-going" --by op >/dev/null
+  f="$DOCS_ROOT/docs/handoffs/decisions/decisions.md"
+  before="$(cat "$f")"
+  long="$(printf 'a%.0s' $(seq 1 501))"
+  run pe_decisions decisions answer stop --value "$long" --by op
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "--value is limited to 500 characters, got 501"
+  [ "$(cat "$f")" = "$before" ]
+  # --evidence (200) and --by (64) are refused the same way
+  run pe_decisions decisions answer stop --value x --by op --evidence "$(printf 'e%.0s' $(seq 1 201))"
+  [ "$status" -eq 2 ]; assert_contains "$output" "--evidence is limited to 200 characters, got 201"
+  run pe_decisions decisions answer stop --value x --by "$(printf 'b%.0s' $(seq 1 65))"
+  [ "$status" -eq 2 ]; assert_contains "$output" "--by is limited to 64 characters, got 65"
+  [ "$(cat "$f")" = "$before" ]
+  # characters, not bytes: 300 em dashes are 900 bytes and fit, under the C locale too
+  dashes="$(printf '\342\200\224%.0s' $(seq 1 300))"
+  LC_ALL=C run pe_decisions decisions answer stop --value "$dashes" --by op
+  [ "$status" -eq 0 ]
+  # exactly 500 is written whole
+  ok="$(printf 'z%.0s' $(seq 1 500))"
+  run pe_decisions decisions answer stop --value "$ok" --by op
+  [ "$status" -eq 0 ]
+  grep -qF "| \`stop\` | $ok | op |" "$f"
+}

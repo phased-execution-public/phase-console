@@ -27,13 +27,17 @@ import { queryClientConfig } from '@/data/keys';
 import { expectNoAxeViolations } from '@/test/axe';
 import { BellDrawer, categoryChips, deliverySummary, groupByDay } from './drawer';
 
-const { notifications, markRead, clear, inbox, inboxAckMany } = vi.hoisted(() => ({
-  notifications: vi.fn(),
-  markRead: vi.fn(),
-  clear: vi.fn(),
-  inbox: vi.fn(),
-  inboxAckMany: vi.fn(),
-}));
+const { notifications, markRead, markUnread, clear, inbox, inboxAckMany, inboxUnackMany } = vi.hoisted(
+  () => ({
+    notifications: vi.fn(),
+    markRead: vi.fn(),
+    markUnread: vi.fn(),
+    clear: vi.fn(),
+    inbox: vi.fn(),
+    inboxAckMany: vi.fn(),
+    inboxUnackMany: vi.fn(),
+  }),
+);
 
 vi.mock('@/data/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/data/api')>();
@@ -43,9 +47,11 @@ vi.mock('@/data/api', async (importOriginal) => {
       ...actual.api,
       notifications,
       markNotificationsRead: markRead,
+      markNotificationsUnread: markUnread,
       clearNotifications: clear,
       inbox,
       inboxAckMany,
+      inboxUnackMany,
     },
   };
 });
@@ -119,9 +125,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   notifications.mockResolvedValue(EMPTY);
   markRead.mockResolvedValue({ changed: 1, unread: 0 });
+  markUnread.mockResolvedValue({ changed: 1, unread: 1 });
   clear.mockResolvedValue({ ok: true });
   inbox.mockResolvedValue({ items: [], generatedAt: new Date().toISOString() });
   inboxAckMany.mockResolvedValue({ results: [], acked: 0 });
+  inboxUnackMany.mockResolvedValue({ results: [], unacked: 0 });
 });
 
 /** The address a navigation landed on, parsed — order in a query string is not a promise. */
@@ -213,15 +221,48 @@ describe('what the drawer says about a delivery', () => {
   });
 });
 
-describe('the needs-you panel — the SAME rows Now leads with', () => {
+describe('the needs-you panel — a preview of the inbox (#377)', () => {
   it('is the default panel, and it renders the inbox rather than the announcements', async () => {
     inbox.mockResolvedValue({ items: [item()], generatedAt: '' });
     mount();
     expect(await screen.findByText('demo — phase 4 needs you')).toBeTruthy();
-    // The row carries the server's own remedy, with the server's own label.
-    expect(screen.getByRole('button', { name: /Recover & continue/ })).toBeTruthy();
     // And the announcements query is not held open while its panel is closed.
     expect(notifications).not.toHaveBeenCalled();
+  });
+
+  it('leads with the door to Your turn, and a row is one line with no remedies', async () => {
+    inbox.mockResolvedValue({ items: [item()], generatedAt: '' });
+    mount();
+    const door = await screen.findByRole('link', { name: 'Open Your turn' });
+    expect(door.getAttribute('href')).toBe('#/turn');
+    // The press lives on the page and its card; the bell only previews.
+    expect(screen.queryByRole('button', { name: /Recover & continue/ })).toBeNull();
+    // One line: the title is cut by CSS, never by the text — the whole of it
+    // is the link's name and its hover.
+    const title = screen.getByRole('link', { name: 'demo — phase 4 needs you' });
+    expect(title.className).toMatch(/\btruncate\b/);
+    expect(title.getAttribute('title')).toBe('demo — phase 4 needs you');
+    expect(title.getAttribute('href')).toBe('#/plan/demo/run');
+  });
+
+  it('shows five at most, and says how many more wait on Your turn', async () => {
+    const seven = Array.from({ length: 7 }, (_, i) =>
+      item({ id: `errand:demo:${i}::x`, title: `demo — phase ${i} needs you` }),
+    );
+    inbox.mockResolvedValue({ items: seven, generatedAt: '' });
+    mount();
+    await screen.findByText('demo — phase 0 needs you');
+    expect(screen.getAllByTestId('inbox-row')).toHaveLength(5);
+    expect(screen.queryByText('demo — phase 5 needs you')).toBeNull();
+    const more = screen.getByRole('link', { name: '2 more on Your turn' });
+    expect(more.getAttribute('href')).toBe('#/turn');
+  });
+
+  it('says no overflow line when everything fits', async () => {
+    inbox.mockResolvedValue({ items: [item()], generatedAt: '' });
+    mount();
+    await screen.findByText('demo — phase 4 needs you');
+    expect(screen.queryByTestId('bell-turn-more')).toBeNull();
   });
 
   it('switching panels is a navigation, so the address says which half is open', async () => {
@@ -243,27 +284,16 @@ describe('the needs-you panel — the SAME rows Now leads with', () => {
     await expectNoAxeViolations(container);
   });
 
-  it('an action whose capability is off is offered, disabled, never hidden', async () => {
-    inbox.mockResolvedValue({
-      items: [
-        item({
-          actions: [
-            {
-              verb: 'recover',
-              label: 'Recover & continue',
-              endpoint: '/api/run/demo/recover',
-              method: 'POST',
-              flag: 'run',
-            },
-          ],
-        }),
-      ],
-      generatedAt: '',
-    });
+  it('puts back a ticked row already acknowledged — the word is the press', async () => {
+    const seen = item({ ack: { at: new Date().toISOString() } });
+    inbox.mockResolvedValue({ items: [seen], generatedAt: '' });
     mount();
-    const button = await screen.findByRole('button', { name: /Recover & continue/ });
-    expect(button).toBeDisabled();
-    expect(button.getAttribute('title')).toContain('--allow-run');
+    await screen.findByText('demo — phase 4 needs you');
+    fireEvent.click(screen.getAllByRole('checkbox')[0] as HTMLElement);
+    const bar = screen.getByTestId('selection-bar');
+    fireEvent.click(within(bar).getByRole('button', { name: 'Put back' }));
+    await waitFor(() => expect(inboxUnackMany).toHaveBeenCalledWith([seen.id]));
+    expect(inboxAckMany).not.toHaveBeenCalled();
   });
 });
 
@@ -417,6 +447,32 @@ describe('acting on more than one, from the drawer', () => {
     expect(bar.textContent).toContain('1 selected');
     expect(within(bar).queryByRole('button', { name: 'Acknowledge all' })).toBeNull();
     expect(within(bar).getByRole('button', { name: 'Acknowledge' })).toBeTruthy();
+  });
+
+  it('Put back marks the ticked announcements unread, and never deletes them (#334)', async () => {
+    notifications.mockResolvedValue({
+      ...EMPTY,
+      items: [record({ read: true })],
+      total: 1,
+      unread: 0,
+      devices: 1,
+    });
+    mount(ANNOUNCEMENTS);
+    const bar = await screen.findByTestId('selection-bar');
+    fireEvent.click(screen.getAllByRole('checkbox')[0] as HTMLElement);
+    fireEvent.click(within(bar).getByRole('button', { name: 'Put back' }));
+    await waitFor(() => expect(markUnread).toHaveBeenCalledWith(['n1']));
+    expect(clear).not.toHaveBeenCalled();
+  });
+
+  it('Delete is the ticked announcements’ delete, said as one', async () => {
+    notifications.mockResolvedValue({ ...EMPTY, items: [record()], total: 1, unread: 1, devices: 1 });
+    mount(ANNOUNCEMENTS);
+    const bar = await screen.findByTestId('selection-bar');
+    fireEvent.click(screen.getAllByRole('checkbox')[0] as HTMLElement);
+    fireEvent.click(within(bar).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(clear).toHaveBeenCalledWith({ id: 'n1' }));
+    expect(markUnread).not.toHaveBeenCalled();
   });
 
   it('gives the announcements panel the same bar, with its own vocabulary', async () => {
@@ -606,6 +662,27 @@ describe('the two pure helpers', () => {
       failed: true,
     });
   });
+
+  it('#324: reads a no-device or skipped placeholder as no device — never as a failed delivery', () => {
+    const row = (device: string, outcome: string) => ({ device, label: device, outcome, at: '' });
+    expect(deliverySummary(record({ delivery: [row('', 'no-device')] }) as never)).toEqual({
+      text: 'no device',
+      failed: false,
+    });
+    expect(deliverySummary(record({ delivery: [row('console', 'skipped')] }) as never)).toEqual({
+      text: 'no device',
+      failed: false,
+    });
+    // Beside a real handover the placeholder counts as nothing at all.
+    expect(deliverySummary(record({ delivery: [row('a', 'sent'), row('', 'no-device')] }) as never)).toEqual({
+      text: 'sent to 1',
+      failed: false,
+    });
+    expect(deliverySummary(record({ delivery: [row('a', 'failed'), row('', 'skipped')] }) as never)).toEqual({
+      text: '1/1 not delivered',
+      failed: true,
+    });
+  });
 });
 
 describe('the needs-you rows say the card’s words (turn-by-turn phase 10)', () => {
@@ -661,9 +738,8 @@ describe('the needs-you rows say the card’s words (turn-by-turn phase 10)', ()
       .closest('[data-testid="inbox-row"]') as HTMLElement;
     const laterWords = within(later).getByTestId('turn-row-words');
     expect(laterWords.getAttribute('data-readiness')).toBe('not-yet');
-    expect(within(laterWords).getByTestId('turn-readiness-when').textContent).toBe(
-      'when phase 4 of demo is done',
-    );
+    // One line: the *when* is the page's, not the preview's (#377).
+    expect(within(laterWords).queryByTestId('turn-readiness-when')).toBeNull();
     expect(within(laterWords).getByText('Task')).toBeTruthy();
   });
 

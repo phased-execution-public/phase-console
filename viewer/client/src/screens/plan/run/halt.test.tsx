@@ -46,6 +46,7 @@ import { SHUTDOWN_CONTINUES } from '@shared/orchestration-model.js';
 import type { AccountView } from '@/data/api/accounts';
 import type { InboxAction, InboxItem } from '@/data/api/inbox';
 import type { RunGitView, RunState } from '@/data/api/runs';
+import { runStopOf } from '@/data/run-stop';
 import { keys, queryClientConfig } from '@/data/keys';
 import type { TurnView } from '@/data/turn';
 import { TooltipProvider } from '@/ui/tooltip';
@@ -57,7 +58,6 @@ import {
   RunNotes,
   StaleServerNote,
   budgetApproaches,
-  runStopOf,
   type RunNoteId,
 } from './halt';
 

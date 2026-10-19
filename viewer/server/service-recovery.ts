@@ -134,7 +134,10 @@ import {
 import { GRANT_SCOPE_WORDS, RISK_TIERS, riskOf, type GrantScope } from '../shared/turn-model.js';
 import { SETTLED_WELL } from '../shared/run-lifecycle.js';
 import { EVIDENCE_DIR, EVIDENCE_PER_ATTEMPT, isEvidenceRefusal, readEvidence, screenEvidence, storeEvidence } from './turn/evidence.ts';
-import { checkRouteOf, returnedSentence, shapeVerdict, type StepVerdict } from './turn/verdict.ts';
+import { checkRouteOf, probeReadWords, returnedSentence, shapeVerdict, type StepVerdict } from './turn/verdict.ts';
+import { answerTargetOf, writeAnswer } from './turn/answer-target.ts';
+import { composePlanItem, type PlanItemWords } from './turn/plan-items.ts';
+import { proofWords } from '../shared/proof-words.js';
 import { guideCommands } from '../shared/guide-grammar.js';
 import { whyPersonWords } from '../shared/turn-model.js';
 import { CHECK_EVIDENCE_MAX, CHECK_TIMEOUT_MS, TurnChecker, type CheckResult } from './turn/checker.ts';
@@ -3037,12 +3040,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
     opts: { by: string; terminalExit?: number; byPerson?: boolean; note?: string; actor?: StartActor; resumeVia?: 'errand' },
   ): Promise<StepVerbResult> {
     const ledger = this.humanStepsNow();
+    // A plan item's proof is read from its bullet as the plan says it NOW
+    // (#345): a plan fixed after launch unsticks the item it raised.
+    const reread = this.rereadProof(step);
     // The note rides the move that starts the attempt (turn-by-turn phase 5):
     // kept for every proof type, where only a judgement once read it.
-    const begun = ledger.move(id, 'checking', { by: opts.by, verb: 'check', ...(opts.note ? { sent: opts.note } : {}) });
+    const begun = ledger.move(id, 'checking', {
+      by: opts.by, verb: 'check', ...(opts.note ? { sent: opts.note } : {}), ...(reread ? { proof: reread } : {}),
+    });
     if ('refused' in begun) return refusedMove(begun);
     const attempt = begun.attempts;
-    const ref = step.proof
+    const ref = begun.proof
       ?? (step.kind === 'secret-entry' ? secretPlace(step, { dir: this.stepSecretsDir() }).ref : undefined);
     const at = () => new Date().toISOString();
     // The check by proof type (control-tower phase 134, #211): a terminal's
@@ -3059,11 +3067,18 @@ export abstract class ServiceRecovery extends ServiceRuns {
     const route = checkRouteOf(step, { judgement: this.prefs?.checkJudgement !== false, ref: ref ?? null });
     if (route === 'probe' && ref) {
       const probed = await this.watchClock.probeNow(ref);
-      const read = ServiceRecovery.readWords(`${probed.state}${probed.detail ? ` — ${probed.detail}` : ''}`);
+      // A proof that cannot run says nothing about the act (#374): the item is
+      // never sent back on it — it goes back to where it stood, saying which
+      // file is missing and where, and nothing is decided.
+      if (probed.state === 'unrunnable') return this.unrunnableCheck(id, step, ref, probed.detail, opts);
+      // Said in words (#368): what the proof checks and what it read — never
+      // the ref, never a watch-state word.
+      const said = proofWords(ref);
+      const read = ServiceRecovery.readWords(probeReadWords(probed.state, probed.detail));
       // A miss is a rejection quoting what the proof read (TV-4).
       const verdict = shapeVerdict(probed.state === 'landed'
-        ? { state: 'passed', note: `The proof holds: ${ref}.`, read: [`${ref} — ${read}`] }
-        : { state: 'rejected', note: `The proof did not hold — ${ref} read: ${read}.`, redo: [`Finish ${step.title.replace(/[.\s]+$/, '')}, then check again — the console reads ${ref}.`], read: [`${ref} — ${read}`] },
+        ? { state: 'passed', note: `The proof holds: ${said}.`, read: [`${said} — ${read}`] }
+        : { state: 'rejected', note: `The proof did not hold: ${said} — ${read}.`, redo: [this.redoHead(begun, said), ...this.sourceSteps(begun)], read: [`${said} — ${read}`] },
       { by: 'probe', attempt, at: at() })!;
       return this.settleCheck(id, verdict, read, opts, ref);
     }
@@ -3099,6 +3114,111 @@ export abstract class ServiceRecovery extends ServiceRuns {
       read: [],
     }, { by: 'owner', attempt, at: at(), unverified: true })!;
     return this.settleCheck(id, verdict, 'it named no proof, and a person said it is done (unverified)', opts);
+  }
+
+  /**
+   * A plan item's proof as its bullet says it NOW, when that differs from the
+   * one the item was raised with (#345): `undefined` for any other item, or
+   * when nothing changed. Logged `turn.proof-reread`.
+   */
+  private rereadProof(step: HumanStep): string | undefined {
+    if (step.birth !== 'plan' || !step.proof) return undefined;
+    const now = this.planWordsOf(step)?.proof;
+    if (!now || now === step.proof) return undefined;
+    log.info('turn.proof-reread', { slug: step.slug, phase: step.phase, stepId: step.id, from: step.proof, to: now });
+    return now;
+  }
+
+  /** A plan-born item's bullet as the plan says it now — its proof, its guide (a Redo's steps). */
+  private planWordsOf(step: HumanStep): PlanItemWords | undefined {
+    if (step.birth !== 'plan') return undefined;
+    const plan = this.store?.get(step.slug)?.plan;
+    if (!plan) return undefined;
+    try { return composePlanItem(step, plan, this.root?.ok ? this.root.path : undefined); } catch { return undefined; }
+  }
+
+  /** A Redo's first line: what is missing, for a decision the answer that did not take. */
+  private redoHead(step: HumanStep, said: string): string {
+    const title = step.title.replace(/[.\s]+$/, '');
+    if (step.answer) {
+      const chose = step.answer.label ? `"${step.answer.label}"` : 'your answer';
+      return `Your decision (${chose}) was sent, but the console still cannot see that ${said}: follow the steps below, then send your decision again`;
+    }
+    return `Finish ${title}, then check again — the console checks that ${said}`;
+  }
+
+  /**
+   * The steps a Redo carries (#367): the item's own guide — its plan bullet's
+   * as the plan says it now, else the one it was raised with — each with its
+   * command, so a returned card says how, not only that.
+   */
+  private sourceSteps(step: HumanStep): string[] {
+    const guide = this.planWordsOf(step)?.guide ?? step.guide;
+    return (guide?.steps ?? []).slice(0, 8).map((one, n) => {
+      const text = String(one.text ?? '').replace(/[\u0000-\u001f]+/g, ' ').trim();
+      const code = one.code ? ` Run: ${String(one.code).replace(/[\u0000-\u001f]+/g, ' ').trim()}` : '';
+      return `${n + 1}. ${text}${code}`.slice(0, 300);
+    }).filter((line) => line.length > 3);
+  }
+
+  /**
+   * A gate opened (#371): every open item whose proof reads that gate's row
+   * (`stepGateOf`) settles as Passed — "Gate approved by … at …" — once the
+   * engine reads the gate clear, through the same verdict a check writes
+   * (`settleCheck`), so it resumes what waited on it exactly once. `phase:
+   * null` reads every gate-bound item of the plan: its `gate-status.md`
+   * changed outside the console, or the round asks. An item whose gate is
+   * still shut is left as it is.
+   */
+  protected override async gateOpened(slug: string, phase: number | null, opts: { by: string; actor?: StartActor }): Promise<string[]> {
+    const out: string[] = [];
+    const ledger = this.humanStepsNow();
+    for (const step of ledger.open()) {
+      if (step.slug !== slug || step.state === 'upcoming' || step.state === 'checking' || step.kind === 'permission') continue;
+      if (this.checksAsked.has(step.id) || this.checksInFlight.has(step.id)) continue;
+      const at = stepGateOf(step)?.phase;
+      if (at == null || (phase !== null && at !== phase)) continue;
+      let gate: Awaited<ReturnType<ServiceRecovery['gateStatus']>> = null;
+      try { gate = await this.gateStatus(slug, at); } catch { gate = null; }
+      if (!gate?.clear) continue;
+      const when = new Date().toISOString();
+      const who = opts.by && opts.by !== 'watch' ? opts.by : null;
+      const read = ServiceRecovery.readWords(`the gate on Phase ${at} reads clear${gate.detail ? ` (${gate.detail})` : ''}`);
+      const verdict = shapeVerdict({
+        state: 'passed', note: `Gate approved${who ? ` by ${who}` : ''} at ${when.slice(0, 16).replace('T', ' ')} UTC — the gate on Phase ${at} of ${slug} is open.`,
+        read: [read],
+      }, { by: 'probe', attempt: step.attempts ?? 0, at: when });
+      if (!verdict) continue;
+      const actor = opts.actor ?? doorActor('watch-landed', { by: 'watch', via: 'timer', origin: 'turn-round', trigger: `gate:${slug}/${at}`, guard: '!fleetHold' });
+      const settled = await this.settleCheck(step.id, verdict, read, { by: who ?? 'watch', actor }, step.proof);
+      if (settled.ok) {
+        out.push(step.id);
+        log.info('turn.gate-settled', { slug, phase: at, stepId: step.id, by: who ?? 'watch' });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * A check whose proof could not run (#374): exit 126 or 127, the script it
+   * names missing from the console's checkout or not executable. Not a
+   * rejection — no Redo, no rejection counted towards escalation, nothing
+   * resumed: the item goes back to where it stood (*Redo* when an earlier
+   * check sent it back, else *To do*), its `read` naming what is missing and
+   * where, and the check is journalled skipped with why.
+   */
+  private unrunnableCheck(
+    id: string, step: HumanStep, ref: string, detail: string | undefined, opts: { by: string },
+  ): StepVerbResult {
+    const read = ServiceRecovery.readWords(detail || 'the proof itself cannot run');
+    const root = this.root?.ok ? this.root.path : null;
+    const note = `${read.charAt(0).toUpperCase()}${read.slice(1)}${root ? ` (the console runs it from ${root})` : ''}. `
+      + 'Nothing was decided about the act: fix the proof, or check again once the script is on the console\'s checkout.';
+    const to = step.verdict ? 'returned' : 'notified';
+    const moved = this.humanStepsNow().move(id, to, { by: opts.by, verb: 'check', note });
+    if ('refused' in moved) return refusedMove(moved);
+    this.stepJournal(moved, 'phase.human-step-check-skipped', { attempt: moved.attempts, why: 'unrunnable', read, proof: ref });
+    return { ok: true, check: { landed: false, state: 'unrunnable', read: note, ref }, step: this.stepView(id) };
   }
 
   /** What a proof read, as one bounded, redacted line. */
@@ -3621,6 +3741,14 @@ export abstract class ServiceRecovery extends ServiceRuns {
       ...(note ? { note: redactSecrets(note) } : {}),
       at: new Date().toISOString(), by: opts.by, ...(door ? { door } : {}),
     };
+    // A decision whose proof the console reads is CHECKED, not passed on the
+    // press (#367, #368): the answer is written where the proof looks, when it
+    // names such a place, then the proof is run — To do → Checking → Passed,
+    // or Redo with the source's steps.
+    if (!runAct) {
+      const checked = await this.answerThenCheck(step, answer, note, opts);
+      if (checked) return checked;
+    }
     const moved = this.humanStepsNow().move(id, 'proven', {
       by: opts.by, verb: 'answer', note: option ? `answered ${option.label}` : 'answered with a note', answer,
     });
@@ -3646,6 +3774,62 @@ export abstract class ServiceRecovery extends ServiceRuns {
       ...(step.decisionKey ? { decision: { key: step.decisionKey, written: true } } : {}),
       step: this.stepView(id),
     };
+  }
+
+  /**
+   * A decision answered whose proof the console can read (#367, #368) — null
+   * when the item names no such proof, and the answer is the result as before.
+   * The answer is written where the proof reads it (`answer-target.ts`: a
+   * `grep '^<key>: answered' <file>` proof gains its line, a `test -f <file>`
+   * proof its file), recorded on the item as it starts its check, and the
+   * proof is run through the same check *I've done this — check* runs, so the
+   * card reads Checking, then Passed — or Redo, saying what the proof read and
+   * the steps from its source.
+   */
+  private async answerThenCheck(
+    step: HumanStep, answer: StepAnswer, note: string, opts: { by: string; actor?: StartActor },
+  ): Promise<StepVerbResult | null> {
+    const proof = this.rereadProof(step) ?? step.proof;
+    if (!proof || !parseWatchRef(proof)) return null;
+    const target = answerTargetOf(proof);
+    let wrote: string | undefined;
+    if (target) {
+      const root = this.root?.ok ? this.root.path : null;
+      if (!root) return { ok: false, status: 409, error: 'No repository is open.' };
+      if (!this.flags.allowWrites) {
+        return {
+          ok: false, status: 403,
+          error: `This decision is proven by ${target.file}, which its answer is written to first — writes are disabled. Restart with --allow-writes to enable them.`,
+        };
+      }
+      const handoffs = this.root?.ok ? (this.root.handoffsDir ?? (this.root.docsDir ? join(this.root.docsDir, 'handoffs') : join(root, 'docs', 'handoffs'))) : join(root, 'docs', 'handoffs');
+      const written = writeAnswer(target, join(handoffs, step.slug), root, { ...(answer.label ? { label: answer.label } : {}), ...(answer.note ? { note: answer.note } : {}) });
+      if (!written.ok) return { ok: false, status: 409, error: `Your decision was not sent: ${written.why}.` };
+      wrote = written.file;
+    }
+    if (this.checksInFlight.has(step.id) || this.checksAsked.has(step.id)) {
+      return { ok: false, status: 409, error: 'This item is being checked now — its verdict arrives on the item.', state: step.state };
+    }
+    const recorded = this.humanStepsNow().move(step.id, 'checking', {
+      by: opts.by, verb: 'answer', note: answer.label ? `answered ${answer.label}` : 'answered with a note', answer,
+      ...(proof !== step.proof ? { proof } : {}),
+    });
+    if ('refused' in recorded) return refusedMove(recorded);
+    this.stepJournal(recorded, 'phase.human-step-answered', {
+      option: answer.option ?? null, noted: Boolean(note), by: opts.by, door: answer.door ?? null,
+      decisionKey: step.decisionKey ?? null, checked: true, ...(wrote ? { wrote } : {}),
+    });
+    this.checksAsked.add(step.id);
+    let checked: StepVerbResult;
+    try {
+      checked = await this.runCheck(step.id, recorded, { by: opts.by, ...(opts.actor ? { actor: opts.actor } : {}) });
+    } finally {
+      this.checksAsked.delete(step.id);
+    }
+    return {
+      ...checked, answered: answer, ...(wrote ? { wrote } : {}),
+      ...(step.decisionKey ? { decision: { key: step.decisionKey, written: true } } : {}),
+    } as StepVerbResult;
   }
 
   /**
@@ -4611,9 +4795,10 @@ export abstract class ServiceRecovery extends ServiceRuns {
       const due = target ? nextDueFor(target, answer.state, now, 0) : null;
       this.turnProofNext.set(step.id, Math.max(now + HUMAN_STEP_CLOCK_MS, due ?? now + 5 * 60_000));
       if (answer.state !== 'landed') continue;
-      const read = ServiceRecovery.readWords(`landed${answer.detail ? ` — ${answer.detail}` : ''}`);
+      const said = proofWords(ref);
+      const read = ServiceRecovery.readWords(probeReadWords('landed', answer.detail));
       const verdict = shapeVerdict(
-        { state: 'passed', note: `The proof holds: ${ref}.`, read: [`${ref} — ${read}`] },
+        { state: 'passed', note: `The proof holds: ${said}.`, read: [`${said} — ${read}`] },
         { by: 'probe', attempt: step.attempts ?? 0, at: new Date(now).toISOString() },
       );
       if (!verdict) continue;
@@ -4621,6 +4806,12 @@ export abstract class ServiceRecovery extends ServiceRuns {
       const settled = await this.settleCheck(step.id, verdict, read, { by: 'watch', actor }, ref);
       if (settled.ok) out.push(step.id);
     }
+    // A gate-bound item (#371), whatever its birth or its proof's scheme,
+    // settles the round its gate reads clear — however the gate was opened.
+    const gated = new Set(ledger.open()
+      .filter((step) => step.state !== 'upcoming' && stepGateOf(step)?.phase != null && !hold?.plans?.includes(step.slug))
+      .map((step) => step.slug));
+    for (const slug of gated) out.push(...await this.gateOpened(slug, null, { by: 'watch' }));
     return out;
   }
 

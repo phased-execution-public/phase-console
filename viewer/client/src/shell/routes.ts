@@ -119,12 +119,11 @@ export function withQuery(route: Route, query: Query): string {
  */
 const DESTINATION_OF: Record<string, string> = {
   plan: 'plans',
-  // Your turn is a head under Runs (control-tower phase 137): the Runs badge
-  // and the situation line are how a person gets there, so it is what stays
-  // lit — and the old answer page's address keeps it lit while it redirects.
-  turn: 'runs',
-  approve: 'runs',
-  // The whole queue is the Runs home's Queued group, one press deeper.
+  // Your turn is a place of its own since one-pool phase 14 (#366); the old
+  // answer page's address keeps it lit while it redirects.
+  approve: 'turn',
+  // The Queue lights Runs in both editions: a head under Runs in Pro (one-pool
+  // phase 40), the Runs home's Queued group in Free.
   queue: 'runs',
   // Everything Now answered is the Runs home's since 6.0 (control-tower phase
   // 21), Now included: its head keeps Runs lit for the instant its redirect runs.
@@ -147,7 +146,7 @@ const DESTINATION_OF: Record<string, string> = {
   agent: 'sessions',
 };
 
-/** Which of the seven a head belongs to — `undefined` for the chromeless picker. */
+/** Which of the eight a head belongs to — `undefined` for the chromeless picker. */
 export function destinationFor(head: string | undefined): string | undefined {
   if (!head) return DEFAULT_HEAD;
   if (head === 'source') return undefined;
@@ -267,8 +266,19 @@ export function runsBayOf(route: Route): RunsBay | undefined {
 export const runsBayHref = (bay: RunsBay): string => `#/runs?group=${enc(bay)}`;
 export const runsHref = (view?: RunsView): string => (view ? `#/runs?view=${enc(view)}` : '#/runs');
 export const plansHref = (): string => '#/plans';
-/** The whole queue of this console (control-tower phase 99, #135) — the Queued group of the home since 7.0. */
-export const queueHref = (): string => runsBayHref('queued');
+/**
+ * Whether `#/queue` is a page (Pro, one-pool phase 40) or the Runs home's Queued
+ * group (Free, as since 7.0). One switch, so every caller builds the same address.
+ */
+const QUEUE = { page: false };
+/**
+ * The whole queue of this console (control-tower phase 99, #135): in Pro the
+ * Queue page, with its view, group, sort and filters (`screens/queue/model.ts`
+ * names them; `at` points at one row); in Free the Queued group of the home,
+ * where the query has nothing to say.
+ */
+export const queueHref = (query?: Query): string =>
+  QUEUE.page ? hrefOf('queue', query) : runsBayHref('queued');
 /** Your turn (control-tower phase 137) — the page, or one item on it, expanded. */
 export const turnHref = (item?: string | null): string => (item ? `#/turn/${enc(item)}` : '#/turn');
 export const insightsHref = (plan?: string): string => (plan ? `#/insights?plan=${enc(plan)}` : '#/insights');
@@ -322,11 +332,11 @@ export const sessionsNewHref = (kind: 'shell' | 'agent'): string => `#/sessions?
  * and the ledger of every claim since (Pro) — `?view=history`, an address and
  * never a tab held in component state. Anything else reads as the claims.
  */
-export type LocksView = 'held' | 'history';
+export type LocksView = 'held' | 'map' | 'history';
 export const sessionsLocksHref = (view?: LocksView): string =>
-  hrefOf('sessions/locks', view === 'history' ? { view } : undefined);
+  hrefOf('sessions/locks', view === 'history' || view === 'map' ? { view } : undefined);
 export const locksViewOf = (route: Pick<Route, 'query'>): LocksView =>
-  route.query.view === 'history' ? 'history' : 'held';
+  route.query.view === 'history' ? 'history' : route.query.view === 'map' ? 'map' : 'held';
 
 /* ---------------- the three overlays ---------------- */
 

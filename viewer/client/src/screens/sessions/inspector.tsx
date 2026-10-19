@@ -23,11 +23,19 @@ import { ActionsTab } from '@/shell/panel/actions-tab';
 import { HistoryTab } from '@/shell/panel/history-tab';
 import { RawTab } from '@/shell/panel/raw-tab';
 import { inspect } from '@/shell/panel/inspector-host';
-import { Duration, KeyValue, Mono, RelativeTime, SectionHeading } from '@/ui';
+import { duration, weight } from '@/lib/format';
+import { Duration, KeyValue, Money, Mono, RelativeTime, SectionHeading } from '@/ui';
 import { SessionStatus } from '@/ui/status';
 import { SessionActions } from './controls';
 import { MODE_TITLE, modeName } from './modes';
-import { KIND_LABEL, SESSION_GROUPS, attentionWords, terminalWord, type SessionRow } from './model';
+import {
+  KIND_LABEL,
+  SESSION_BADGES,
+  SESSION_GROUPS,
+  attentionWords,
+  terminalWord,
+  type SessionRow,
+} from './model';
 import { SessionVitals } from './vitals';
 
 /** A task list in words: "3 of 7 done, Wiring the runner" — the doing task in its own words. */
@@ -83,6 +91,47 @@ function Section({ heading, children }: { heading: string; children: ReactNode }
   );
 }
 
+/**
+ * What the session runs on and what it has cost (#369) — the row's own
+ * facts, folded once in `model.ts`; nothing drawn where nothing says it.
+ */
+function RunsOn({ row }: { row: SessionRow }) {
+  const items: [string, ReactNode][] = [];
+  if (row.account) {
+    items.push([
+      'Account',
+      row.account.name === row.account.id ? (
+        <Mono key="account" value={row.account.id} />
+      ) : (
+        `${row.account.name} (${row.account.id})`
+      ),
+    ]);
+  }
+  if (row.model) items.push(['Model', <Mono key="model" value={row.model} />]);
+  if (row.effort) items.push(['Effort', row.effort]);
+  if (row.spendUsd != null) items.push(['Spend', <Money key="spend" usd={row.spendUsd} />]);
+  if (row.context) {
+    const { tokens, window, stage } = row.context;
+    items.push([
+      'Context',
+      `${weight(tokens)}${window ? ` of ${weight(window)} (${Math.round((tokens / window) * 100)} %)` : ''}${stage ? `, past the ${stage} line` : ''}`,
+    ]);
+  }
+  if (row.progress) items.push(['Tasks', `${row.progress.done} of ${row.progress.total} done`]);
+  if (row.workedMs != null) items.push(['Worked', duration(row.workedMs)]);
+  if (row.estimateMs != null) items.push(['Estimate', `about ${duration(row.estimateMs)}`]);
+  if (row.attempts != null) items.push(['Attempts', String(row.attempts)]);
+  if (row.turns != null) items.push(['Turns', String(row.turns)]);
+  if (row.worktree)
+    items.push(['Worktree', <Mono key="tree" value={row.worktree} className="wrap-anywhere" />]);
+  if (!items.length) return null;
+  return (
+    <Section heading="What it runs on">
+      <KeyValue items={items} />
+    </Section>
+  );
+}
+
 /** Every fact of a row, by what it answers. */
 export function RowOverview({ row }: { row: SessionRow }) {
   const qa = qaOf(row);
@@ -95,6 +144,7 @@ export function RowOverview({ row }: { row: SessionRow }) {
         <KeyValue
           items={[
             ['Kind', blurb ? `${KIND_LABEL[row.kind]}: ${blurb}` : KIND_LABEL[row.kind]],
+            row.badge !== row.kind ? ['Session', SESSION_BADGES[row.badge].blurb] : null,
             // Not "where": three kinds put a directory here, a lane its phase title.
             ['Working on', row.detail],
             ['Standing', row.view.label],
@@ -109,13 +159,15 @@ export function RowOverview({ row }: { row: SessionRow }) {
             ['Terminal', row.id ? <Mono key="id" value={row.id} copyable /> : null],
             [
               'Conversation',
-              row.sessionId && row.sessionId !== row.id ? (
-                <Mono key="conversation" value={row.sessionId} copyable />
+              (row.conversation ?? row.sessionId) && (row.conversation ?? row.sessionId) !== row.id ? (
+                <Mono key="conversation" value={row.conversation ?? row.sessionId ?? ''} copyable />
               ) : null,
             ],
           ]}
         />
       </Section>
+
+      <RunsOn row={row} />
 
       <Section heading="Clocks">
         {/* `startedAt` is the LAST thing that happened, `createdAt` when it began. */}

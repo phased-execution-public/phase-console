@@ -288,3 +288,86 @@ describe('a press goes through the owner door', () => {
     expect(readFileSync(join(src, 'cards', 'inbox-row.tsx'), 'utf8')).toMatch(/from '@\/data\/press'/);
   });
 });
+
+describe('a projected press whose answer is a next step (one-pool phase 13, #368)', () => {
+  function Pressing({ row }: { row: InboxItem }) {
+    const { perform, busy } = useInboxActions();
+    return (
+      <ul>
+        <InboxRow item={row} perform={perform} {...(busy ? { busy } : {})} />
+      </ul>
+    );
+  }
+  const mountPressing = (row: InboxItem) =>
+    render(
+      <QueryClientProvider client={new QueryClient(queryClientConfig)}>
+        <MemoryRouterProvider initial="#/runs">
+          <Pressing row={row} />
+        </MemoryRouterProvider>
+      </QueryClientProvider>,
+    );
+
+  beforeEach(() => {
+    inboxAct.mockReset();
+    toast.mockReset();
+  });
+
+  it('a sign-in that could not start keeps its commands on the card, not in a toast', async () => {
+    const login: InboxAction = {
+      verb: 'login',
+      label: 'Sign this server in',
+      endpoint: '/api/mcp/linear/login',
+      method: 'POST',
+    };
+    inboxAct.mockResolvedValue({
+      mode: 'command',
+      command: 'claude mcp login linear',
+      commands: ['claude mcp login linear'],
+    });
+    mountPressing(
+      item({
+        id: 'mcp-auth::::linear',
+        kind: 'mcp-auth',
+        severity: 'needs-you',
+        title: 'Linear needs signing in',
+        actions: [login],
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Sign this server in' }));
+    const note = await screen.findByTestId('next-step');
+    expect(note.textContent).toMatch(/run this in a terminal on the machine/);
+    expect(screen.getByTestId('next-step-command').textContent).toContain('claude mcp login linear');
+    expect(toast.mock.calls.flat().join(' ')).not.toMatch(/— done\./);
+  });
+
+  it('an errand tree says where it stands and what comes next, and keeps the paths on the card', async () => {
+    const tree: InboxAction = {
+      verb: 'errand-tree',
+      label: 'Open a merge errand tree',
+      endpoint: '/api/run/demo/errand-tree',
+      method: 'POST',
+      body: { phase: 15 },
+    };
+    inboxAct.mockResolvedValue({
+      tree: {
+        dir: '/w/hub/.worktrees/hand/demo/p15-errand',
+        mounts: [{ dir: '/w/hub/.worktrees/hand/demo/p15-errand/aws' }],
+      },
+    });
+    mountPressing(
+      item({
+        id: 'errand:demo:15',
+        kind: 'errand',
+        severity: 'needs-you',
+        title: 'pe/demo holds changes origin/main does not hold',
+        actions: [tree],
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Open a merge errand tree' }));
+    const note = await screen.findByTestId('next-step');
+    expect(note.textContent).toMatch(
+      /The errand tree is ready at \/w\/hub\/\.worktrees\/hand\/demo\/p15-errand\. Next: merge origin\/main there, land the result, then press Recover & continue\./,
+    );
+    expect(note.textContent).toContain('/w/hub/.worktrees/hand/demo/p15-errand/aws');
+  });
+});

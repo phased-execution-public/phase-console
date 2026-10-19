@@ -45,7 +45,7 @@ import {
 import { DEFAULT_MESSAGING, MESSAGING_WORDS } from '../shared/message-model.js';
 import { planEffortOf } from '../shared/run-settings.js';
 import { CAPABILITY_WORDS } from '../shared/capability-model.js';
-import { DENSITIES, PREF_META, THEMES, type PrefSource } from '../shared/prefs-model.js';
+import { DENSITIES, PALETTES, PREF_META, THEMES, type PrefSource } from '../shared/prefs-model.js';
 import { DEFAULT_ISSUES, ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
 import { sanitiseCategories, type CategoryId } from './push/catalogue.ts';
 import { parseQuietHours, type QuietHours } from './push/quiet.ts';
@@ -1012,6 +1012,8 @@ export type Prefs = {
   lastRoot?: string;
   theme?: (typeof THEMES)[number];
   density?: (typeof DENSITIES)[number];
+  /** The room — Quiet or Departures (#362), person-wide like the theme. */
+  palette?: (typeof PALETTES)[number];
   model?: string;
   sort?: string;
   /**
@@ -1451,7 +1453,7 @@ export const CHECK_DEFAULTS = Object.freeze({
 });
 
 const DEFAULT_PREFS: Prefs = {
-  recentRoots: [], theme: 'system', density: 'comfortable', sort: 'activity',
+  recentRoots: [], theme: 'system', density: 'comfortable', palette: 'quiet', sort: 'activity',
   attachDefaultSkills: false, qaByDefault: false, gitMode: 'default-branch', openPrOnComplete: true, repoGuard: true,
   isolation: 'queue', settle: DEFAULT_SETTLE, ...WORKTREE_DEFAULTS,
   maxConcurrentPerRepo: DEFAULT_MAX_PER_REPO, worktreeRetention: DEFAULT_RETENTION,
@@ -1795,7 +1797,7 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
  * one project — which repositories are recent, whether QA is on, which
  * notifications matter — and belongs to the instance.
  */
-const USER_GLOBAL_KEYS = ['theme', 'density', 'sort', 'model'] as const;
+const USER_GLOBAL_KEYS = ['theme', 'density', 'palette', 'sort', 'model'] as const;
 
 /**
  * Where this instance's own preferences live.

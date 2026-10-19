@@ -93,7 +93,7 @@ export const MECHANISM_LEGEND =
 /**
  * A halt kind, as a type — the array below is the one truth and this is the only
  * way to name it in a type position. Without it every consumer had to
- * retype the thirty words, which is exactly what `server/runner/state.ts`
+ * retype the thirty-two words, which is exactly what `server/runner/state.ts`
  * and `client/src/lib/api/runs.ts` both did. (The count in that sentence is held
  * to the array by `test/docs-parity.test.ts`: it read "seventeen" for months
  * while the array held eighteen — LFC-10.)
@@ -197,6 +197,15 @@ export const HALT_KINDS = Object.freeze(
     // (control-tower phase 112, #184): RUN-level, a park with one errand — a
     // merge errand tree, then a landing — never `finished` over unlanded work.
     'unlanded',
+    // A session planted a git configuration in its tree that could make the
+    // console's own git run a command — a hook path, an fsmonitor, a driver, a
+    // credential helper (one-pool phase 2, #272). PHASE-level: the lane parks
+    // with the key named before any verification or landing git runs there.
+    'run-tree-config',
+    // An `index.lock` no git command is writing blocks every index write in a
+    // run tree (one-pool phase 20, #328). PHASE-level: the lane halts with the
+    // path named at boarding or before its verification, rather than wedging.
+    'run-tree-locked',
   ]),
 );
 
@@ -254,6 +263,8 @@ export const PHASE_HALT_KINDS = Object.freeze(
     'worktree-merge',
     'landing-conflict',
     'verify-timeout',
+    'run-tree-config',
+    'run-tree-locked',
   ]),
 );
 
@@ -558,6 +569,14 @@ export const KIND_PROFILE = {
   // PARK, and a person's at once — Repair checkout, or Drop isolation to run
   // in the shared tree. No session or agent briefing applies; nothing boarded.
   'isolation-refused': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
+  // A planted git configuration (one-pool phase 2, #272): a person's, at once.
+  // A session that planted it is the last thing to send back into that tree,
+  // and no rung may decide the key is harmless — the person removes it (or
+  // finds it was theirs) and presses Retry.
+  'run-tree-config': { sessionShaped: false, humanClass: null, autoClass: null },
+  // An orphaned index.lock (#328): only a person can say no git of theirs is
+  // mid-write there — they remove the lock and press Retry.
+  'run-tree-locked': { sessionShaped: false, humanClass: null, autoClass: null },
   // Every phase done, the work not on its trunk (control-tower phase 112,
   // #184): a PARK and a person's — a merge errand tree, a landing, then
   // Recover & continue proves it again. No session is briefed for it: a
@@ -661,7 +680,7 @@ export const RECOVERY_LABELS = {
 const AGENT_COST =
   " Opens a fresh interactive session — a new conversation, not the phase's " +
   'own — briefed with the evidence. Costs a full session; you choose model ' +
-  'and skills next, and watch it in the Agent tab.';
+  'and skills next, and watch it on Sessions.';
 
 /**
  * What each agent class will actually do — the tooltip contract: exactly what

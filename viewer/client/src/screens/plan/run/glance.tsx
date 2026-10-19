@@ -19,6 +19,7 @@
  * head moves with every `run:*` event the view is re-read on.
  */
 
+import { payerProvider } from '@/lib/account-line';
 import { useMemo } from 'react';
 import { PHASE_CLOCK_LABELS } from '@shared/phase-clocks.js';
 import { waitNote } from '@shared/status-model.js';
@@ -176,8 +177,8 @@ function RunFacts({
           {resolved?.from ? `, moved from ${resolved.from}` : ''}
           {run.modelPolicy === 'pinned' ? ', pinned' : ''}
         </span>
-        <span data-testid="run-account" title="Which account this run's sessions spend">
-          Pays: {account}
+        <span data-testid="run-account" title="Which account this run's sessions spend: account · provider">
+          Pays: {account} · {payerProvider(run.accountId ?? null, accountsState?.accounts)}
         </span>
         {lanes.length > 1 ? (
           <span>

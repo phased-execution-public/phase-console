@@ -11,14 +11,21 @@
  * instruction and orders in front of the one before it.
  */
 
-import type { Actor, PhaseRecord, QueueControl, QueueMark, RunState } from './state.ts';
+import type { Actor, PhaseRecord, QueueControl, QueueMark, QueueOrder, RunState } from './state.ts';
 import type { LaneMarkVerb, QueueVerb } from '../../shared/orchestration-model.js';
 
 /**
  * The verbs that act on ONE phase — `QUEUE_VERBS` less the run-level `reorder`,
  * and the lane marks (control-tower phase 100): a pin and a reservation.
  */
-export type PhaseQueueVerb = Exclude<QueueVerb, 'reorder'> | LaneMarkVerb;
+export type PhaseQueueVerb = Exclude<QueueVerb, 'reorder'> | LaneMarkVerb | OrderMarkVerb;
+
+/**
+ * An operator's ORDER on one phase (one-pool phase 39, #380): written by
+ * the Queue's order press once its check said it holds, lifted by its revert
+ * or when its anchor settles. Not a route of its own — the Queue's.
+ */
+export type OrderMarkVerb = 'order' | 'unorder';
 
 /**
  * The journal line each verb writes on the phase's run — literals, one per
@@ -35,7 +42,13 @@ export const QUEUE_CONTROL_EVENTS: Readonly<Record<PhaseQueueVerb, string>> = Ob
   unpin: 'phase.lane-unpinned',
   reserve: 'phase.lane-reserved',
   unreserve: 'phase.lane-unreserved',
+  // The Queue's override (one-pool phase 39): its `queue.*` log line is beside it.
+  order: 'phase.queue-ordered',
+  unorder: 'phase.queue-order-reverted',
 });
+
+/** The line an override writes when its anchor settles and it lapses to policy (one-pool phase 39). */
+export const QUEUE_ORDER_LAPSED_EVENT = 'phase.queue-order-lapsed';
 
 /** The line a yield writes on the YIELDING phase's run (control-tower phase 100, #135 D.15). */
 export const LANE_YIELDED_EVENT = 'phase.lane-yielded';
@@ -70,6 +83,12 @@ export type QueueControlOptions = {
   stamp?: number;
   /** `requeue`: `front` also bumps it. */
   position?: 'front';
+  /** `order`: the override to write (one-pool phase 39). */
+  order?: QueueOrder;
+  /** `unorder`: the override lapsed (its anchor settled) rather than being reverted by a person. */
+  lapsed?: string;
+  /** More facts for the journal line (`order`: the whole move, its verdict, the order before and after). */
+  facts?: Record<string, unknown>;
   /** The stamp source when none is given — the scheduler's `nextStamp`. */
   nextStamp?: () => number;
   now?: () => Date;
@@ -111,7 +130,7 @@ export function applyQueueControl(
   const mark = queueMark(actor, at);
   const before: QueueControl = { ...record.queueControl };
   const next: QueueControl = { ...before };
-  const facts: Record<string, unknown> = {};
+  const facts: Record<string, unknown> = { ...opts.facts };
   switch (verb) {
     case 'bump': {
       const stamp = opts.stamp ?? opts.nextStamp?.() ?? at.getTime();
@@ -170,12 +189,26 @@ export function applyQueueControl(
       if (!before.reserve) return { ok: true, changed: false };
       delete next.reserve;
       break;
+    case 'order':
+      if (!opts.order) return { ok: false, status: 400, error: 'an order needs its place: {anchor, side}' };
+      next.order = { ...opts.order };
+      facts.order = { anchor: opts.order.anchor, side: opts.order.side };
+      break;
+    case 'unorder':
+      if (!before.order) return { ok: true, changed: false };
+      delete next.order;
+      facts.lifted = { anchor: before.order.anchor, side: before.order.side };
+      if (opts.lapsed) facts.why = opts.lapsed;
+      break;
   }
   if (Object.keys(next).length) record.queueControl = next; else delete record.queueControl;
   return {
     ok: true,
     changed: true,
-    change: { verb, event: QUEUE_CONTROL_EVENTS[verb], data: { ...actor, ...facts }, control: next },
+    change: {
+      verb, event: verb === 'unorder' && opts.lapsed ? QUEUE_ORDER_LAPSED_EVENT : QUEUE_CONTROL_EVENTS[verb],
+      data: { ...actor, ...facts }, control: next,
+    },
   };
 }
 

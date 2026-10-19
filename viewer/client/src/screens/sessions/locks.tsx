@@ -19,8 +19,10 @@
  * reason), then a live one holding something up, then a live one holding up
  * nothing — narrowed BY THE SERVER to the held claims, the lapsed ones or one
  * repository's (`?held`, `?lapsed`, `?scope`), with the one Release every
- * other surface uses. The ledger of every claim since (Pro) is the section's
- * second view, at its own address.
+ * other surface uses. The same claims drawn as one lane per repository with
+ * their leases (`?view=map`, one-pool phase 16, #364, `./lock-map.tsx`) is the
+ * section's second view, and the ledger of every claim since (Pro) its third,
+ * each at its own address.
  */
 
 import { useMemo, useState } from 'react';
@@ -36,7 +38,15 @@ import { NativeSelect } from '@/ui/native-select';
 import { RadioGroup, RadioItem } from '@/ui/radio-group';
 import { OpsStatus } from '@/ui/status';
 import { Toolbar, type ToolbarSlot, type ToolbarVerb } from '@/ui/toolbar';
-import { locksViewOf, phaseHref, sessionsHref, sessionsLocksHref, type Route } from '@/shell/routes';
+import {
+  locksViewOf,
+  phaseHref,
+  sessionsHref,
+  sessionsLocksHref,
+  type LocksView,
+  type Route,
+} from '@/shell/routes';
+import { LockMap } from './lock-map';
 import { SessionsSections, useSessionRows } from './sections';
 
 /* ------------------------------------------------------------------ *
@@ -353,12 +363,16 @@ function lockColumns(allowWrites: boolean): Column<LockRow>[] {
  * ------------------------------------------------------------------ */
 
 /** What the section can show: the claims now and — Pro — the ledger of every claim since. */
-function viewsOf(): { id: 'held' | 'history'; label: string }[] {
-  const views: { id: 'held' | 'history'; label: string }[] = [{ id: 'held', label: 'Held now' }];
+function viewsOf(): { id: LocksView; label: string }[] {
+  const views: { id: LocksView; label: string }[] = [
+    { id: 'held', label: 'Held now' },
+    // The same claims drawn by repository, with their leases (#364).
+    { id: 'map', label: 'Map' },
+  ];
   return views;
 }
 
-function ViewLinks({ current }: { current: 'held' | 'history' }) {
+function ViewLinks({ current }: { current: LocksView }) {
   return (
     <nav
       aria-label="What the locks show"
@@ -508,7 +522,7 @@ export default function LocksSection({ route }: { route: Route }) {
           placeholder: 'Find a claim',
           label: 'Find a claim by plan, phase, holder, host, branch or scope',
         }}
-        {...(view === 'held' ? { filter: filterSlot } : {})}
+        {...(view === 'held' || view === 'map' ? { filter: filterSlot } : {})}
         {...(views.length > 1
           ? {
               view: {
@@ -523,7 +537,7 @@ export default function LocksSection({ route }: { route: Route }) {
         note={
           <>
             {!allowWrites && <span className="min-w-0">{releaseRefusal(false)}</span>}
-            {view === 'held' && (filtering || query.trim()) && hidden > 0 ? (
+            {view !== 'history' && (filtering || query.trim()) && hidden > 0 ? (
               <>
                 <span className="min-w-0" data-testid="locks-filtered">
                   Showing {rows.length} of {plural(allRows.length, 'claim')}: {hidden} hidden by the filters.
@@ -536,6 +550,14 @@ export default function LocksSection({ route }: { route: Route }) {
           </>
         }
       />
+      {view === 'map' &&
+        (source.error ? (
+          <Empty title={`The claims could not be read: ${source.error.message}`} />
+        ) : source.isLoading && !rows.length ? (
+          <Skeleton className="h-24" />
+        ) : (
+          <LockMap rows={rows} release={(row) => <Release row={row} allowWrites={allowWrites} />} />
+        ))}
       {view === 'held' && (
         <Claims
           loading={source.isLoading}

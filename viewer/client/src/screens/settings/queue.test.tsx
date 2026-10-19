@@ -113,7 +113,36 @@ describe('the words', () => {
       'Holding new work now: the 5-minute load is 30.2, over 21 (1.5 times 14 cores). Live lanes carry on.',
     );
     expect(loadGuardWords({ avg5: 0.2, cores: 1, factor: 2, threshold: 2, holding: false })).toBe(
-      'The 5-minute load is 0.2; new work waits above 2 (2 times 1 core).',
+      'The 5-minute load is 0.2; new work waits at a load over 2 (2 times 1 core).',
+    );
+    // One-pool phase 26 (#243): the CPU beside the load, the average a ceiling.
+    expect(
+      loadGuardWords({
+        avg5: 12,
+        cores: 14,
+        factor: 1.5,
+        threshold: 42,
+        busy: 0.93,
+        busyLimit: 0.85,
+        holding: true,
+        cause: 'cpu',
+      }),
+    ).toBe(
+      'Holding new work now: the CPU is 93 % busy over the last 30 s, at or over 85 %; the 5-minute load is 12. Live lanes carry on.',
+    );
+    expect(
+      loadGuardWords({
+        avg5: 36,
+        cores: 14,
+        factor: 1.5,
+        threshold: 42,
+        busy: 0.3,
+        busyLimit: 0.85,
+        holding: false,
+        cause: null,
+      }),
+    ).toBe(
+      'CPU 30 % over the last 30 s, 5-minute load 36; new work waits at 85 % CPU or a load over 42 (1.5 times 14 cores, times 2).',
     );
   });
 });
@@ -138,7 +167,7 @@ describe('<QueueGroup>', () => {
       ).toEqual(['trade']),
     );
     expect(screen.getByTestId('load-reading')).toHaveTextContent(
-      'The 5-minute load is 8.1; new work waits above 21 (1.5 times 14 cores).',
+      'The 5-minute load is 8.1; new work waits at a load over 21 (1.5 times 14 cores).',
     );
     expect((screen.getByLabelText('Load guard') as HTMLInputElement).value).toBe('1.5');
     for (const key of ['schedulingPolicy', 'schedulingPolicies', 'loadGuardFactor']) {
@@ -196,7 +225,7 @@ describe('<QueueGroup>', () => {
     await waitFor(() => expect(posted()).toEqual([{ loadFactor: 2 }]));
     await waitFor(() =>
       expect(screen.getByTestId('load-reading')).toHaveTextContent(
-        'new work waits above 28 (2 times 14 cores)',
+        'new work waits at a load over 28 (2 times 14 cores)',
       ),
     );
     fireEvent.change(factor, { target: { value: '0' } });

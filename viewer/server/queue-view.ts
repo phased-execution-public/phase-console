@@ -97,7 +97,19 @@ const AUDIT_VERBS: Readonly<Record<string, string>> = Object.freeze({
   'phase.lane-reserved': 'reserve',
   'phase.lane-unreserved': 'unreserve',
   'phase.lane-yielded': 'yield',
+  // The Queue's override (one-pool phase 39).
+  'phase.queue-ordered': 'order',
+  'phase.queue-order-reverted': 'revert',
+  'phase.queue-order-lapsed': 'lapse',
 });
+
+/** An order's place in words: `first`, `last`, `before alpha P3`. */
+const placeWords = (value: unknown): string => {
+  const order = value as { anchor?: unknown; side?: unknown } | null | undefined;
+  if (!order) return 'somewhere';
+  if (order.anchor === 'first' || order.anchor === 'last') return order.anchor;
+  return `${String(order.side ?? 'before')} ${laneOf(order.anchor) ?? 'another phase'}`;
+};
 
 /** Is this journal event one the audit strip shows? */
 export function isQueueAuditEvent(event: string): boolean {
@@ -144,6 +156,9 @@ export function queueAuditRows(lines: readonly QueueAuditLine[], limit = 50): Qu
                     : verb === 'reserve' ? `kept the next lane for ${target}${laneOf(data.lane) ? ` when ${laneOf(data.lane)} ends` : ''}`
                       : verb === 'unreserve' ? `lifted the lane kept for ${target}`
                         : verb === 'yield' ? `asked ${target} to yield its lane${laneOf(data.to) ? ` to ${laneOf(data.to)}` : ''}`
+                          : verb === 'order' ? `put ${target} ${placeWords(data.order)} in the queue`
+                            : verb === 'revert' ? `gave ${target} back to the console's order`
+                              : verb === 'lapse' ? `${target}'s place lapsed to the console's order${typeof data.why === 'string' ? `: ${data.why}` : ''}`
                           : `reordered ${line.slug}: ${(Array.isArray(data.phases) ? data.phases : []).map((p) => `P${p}`).join(', ')}`;
     rows.push({
       at: line.at ?? null, slug: line.slug, runId: line.runId, phase, verb, by,

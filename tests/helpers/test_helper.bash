@@ -14,9 +14,13 @@ PE_SCRIPTS="$PE_DIR/scripts"
 # console` turns every `--git` claim file-only (five locking-git tests went red
 # under a supervised run — control-tower phase 31), and the owner, session,
 # scope, branch, worktree and channel files would stand in for the ones a test
-# means to exercise. A test sets what it needs; nothing leaks in.
+# means to exercise. A test sets what it needs; nothing leaks in. The issue
+# words too: a test that sets `PE_ISSUES_MODE` and inherits the session's
+# `PE_ISSUES_SOURCE=console` read "from the console" (#230). `tests/run-tests.sh`
+# scrubs every `PE_*` before bats starts; this list is the belt for a bare `bats`.
 unset PE_LOCK_MIRROR PE_OWNER PE_SESSION_ID PE_SCOPE PE_BRANCH PE_WORKTREE \
   PE_OUTCOME_FILE PE_TASKS_FILE PE_RULINGS_FILE PE_PROOFS_FILE PE_ISSUES_FILE \
+  PE_ISSUES_MODE PE_ISSUES_SOURCE PE_ISSUES_SUGGEST PE_ISSUE_REPOS PE_HANDLED_FILE \
   PE_VERIFY_DIR PE_RUN_ROOT \
   PE_MESSAGES_FILE PE_MSG_TOKEN PE_TRACE_ID PE_SPAN_ID \
   PE_MCP_SERVERS PE_ACCOUNTS PE_CREDENTIALS CLAUDE_CODE_SESSION_ID \

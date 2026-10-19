@@ -33,6 +33,7 @@ import {
   isTraceId,
 } from './sources.ts';
 import type { NotificationRecord } from '../notifications.ts';
+import { isDeliveryPlaceholder } from '../../shared/ops-vocab.js';
 
 /* ------------------------------------------------------------------ *
  * What this module needs from the console
@@ -427,7 +428,9 @@ export function tallyDelivery(records: readonly NotificationRecord[]): DeliveryT
     let reached = false;
     for (const row of rows) {
       outcomes[row.outcome] = (outcomes[row.outcome] ?? 0) + 1;
-      devices.add(row.device);
+      // A placeholder row (`no-device`, `skipped`) names no device: counted
+      // as one, a console with nothing subscribed read `devices: 1` (#314).
+      if (row.device && !isDeliveryPlaceholder(row.outcome)) devices.add(row.device);
       if (row.outcome === 'sent') reached = true;
     }
     // Every row was `quiet` ⇒ nothing was attempted, so nothing failed to

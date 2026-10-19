@@ -103,7 +103,7 @@ prescribing a lint that is already passing.
 into `PHASE_HALT_KINDS` (`verify-failed` · `no-handoff` · `phase-blocked` · `needs-human` ·
 `plan-approval` · `awaiting-person` · `waiting-external-timeout` · `verification-preflight` · `mcp-preflight` ·
 `recovery-failed` · `orphaned-session` · `phase-crashed` · `worktree-merge` · `landing-conflict` ·
-`verify-timeout`) and `RUN_HALT_KINDS` (`budget` ·
+`verify-timeout` · `run-tree-config` · `run-tree-locked`) and `RUN_HALT_KINDS` (`budget` ·
 `failure-streak` · `models-exhausted` · `run-preflight` · `plan-unreadable` · `plan-lint` ·
 `runner-crashed` · `plan-deadlocked` · `nothing-ready` · `interrupted-by-restart` · `operator-stop` ·
 `credential-refused` · `identity-changed` · `isolation-refused` · `unlanded`).
@@ -361,7 +361,17 @@ the verdict of every automatic gate on those phases — read fresh each pass, so
 clearing when ANOTHER plan lands is a change. A boarded phase parked `gated` whose gate now reads clear
 is relaunched by name (`reboard`, counted under the `gate-cleared` resume path); a run whose plan is
 closed is settled once (`run.closed-plan`) and never woken, whatever its gates say (control-tower
-phase 51, #48). The pass is journalled as `run.converge {trigger,
+phase 51, #48). That is the STOPPED run's half; a LIVE run re-reads its own held gates (one-pool
+phase 23, #239): every drive tick asks `--gate-status` again for each phase it holds `gated` on a
+gate (not a review hold), at most once a minute per phase (`GATE_REREAD_MS`) and at once after a docs
+change in any OTHER plan (`noteForeignDocs`, at most once per `GATE_DIRTY_MIN_MS`, 10 s) — what a
+`plan <slug>:<N>` gate reads; a clear one puts
+the phase back to `pending` (`phase.gate-cleared {gate, was, by}`) and its boarding reads the gate as
+always. And nothing is admitted ahead of its own dependency (#288): a candidate the board puts in
+`stuck` or `in-progress` by its handoff's word, whose dependencies the board's `blocked:` line names
+as unmet (the line names such phases since this phase), is held — `phase.dependency-held {reason:
+dependency, unmet, board}` once per unmet set — and the dependency boards first. A person's own
+re-board (Retry, *Resume the phase*: the hint's person slot) is a person's word and is not held. The pass is journalled as `run.converge {trigger,
 action: relaunch|heal, why, reboard[], rearm[], launched, phase, situation, rung}` (or
 `run.converge-failed`), and the flattened report rides the event stream as **`run:converge`** and
 answers `GET /api/converge` (`{automatic, everyMs, pending[], running[], reports[]}`) — the Pulse's
@@ -420,12 +430,32 @@ first — the session's own testimony — else `record.watch`), plus a `lock:` r
 | `gh:` pr | `gh:owner/repo#pr/<n>` | the PR leaves `OPEN` (merged **or** closed) | 5 min | same |
 | `date:` / `until:` | `date:<ISO8601>` | `now ≥ t` | **once**, at its instant | arithmetic; nothing executes |
 | `lock:` | `lock:<slug>/<phase>` — somebody ELSE's: one naming the declaring phase is refused at the script and at ingest (`phase.watch-refused {why: own-lock}`), and retired if it was armed before that | nothing holds that phase's scope — no lock, a lapsed lease, or a holder whose session **ended** | 1 min | the console's own lock store (a GRANT is not seen — see the phase-2 handoff) |
+| `phase:` | `phase:<slug>/<N>` — a sibling phase, the way to wait on one (never a `cmd:` grep of its handoff) | the console's RECORD of phase N reads `done`, after its own §Verification — and it UN-lands if that phase is re-opened | 1 min, and at once whenever the board moves (`WatchScheduler.boardMoved`) | the console's own run state; nothing executes |
+| `verify:` | `verify:<slug>/<N>` — the declaring phase's OWN, for "my blocker is a sibling's red" | its red §Verification lines all pass on one branch head; they are re-run only when the head moves | 2 min (a `git rev-parse`; the lines run only on a new head, `verify-watch.ts`) | the policy §Verification gets |
 | `cmd:` | `cmd:<command>` or `cmd:"<command>"` | the command exits 0 | 5 min, 15 min, 1 h, then **6 h until the phase's wait budget ends** | the policy §Verification gets (NOT read-only — `npm ci` passes it), 60 s, `watchCmdRefs` |
 | `unit:` | `unit:<host>/<unit>` — a systemd unit on another machine; the host is a name in the machine profile's `hosts.<name>` (`address`, `user`, `key`, `port`), and a host the profile lacks is refused | the unit is no longer `activating`, `active`, `reloading`, `deactivating` or `refreshing` — its `Result=` and exit time go into the wait history; a unit the host reports `LoadState=not-found` is refused | 5 min | `ssh -o BatchMode=yes` with fixed argv, one shared `ControlMaster` connection per host (`server/watch-unit.ts`); ssh's failure told in fixed words of its class, never its text |
+| `credential:` | `credential:<id>` — `credential:gh`, `credential:claude`, `credential:env:<NAME>`, `credential:keychain:<service>`, `credential:file:<path>`; the proof a `secret-entry` step names (control-tower phase 132) | the credential is PRESENT — read by name, never its value | 1 min | a presence read (a `security` lookup, an env read, a stat); the value is never read back |
 
 The scheduler's own timer fires at `min(nextDueAt)` with a **60 s floor**, so a ref due in thirty
-seconds does not buy a wake in thirty seconds. One probe per ref per pass, however many plans
-declared it.
+seconds does not buy a wake in thirty seconds — and a **60 s ceiling** (`WATCH_CEILING_MS`, one-pool
+phase 23, #337 #303): a declaration has no row until it is first asked, so the soonest stored row
+cannot speak for it, and a timer that slept until another run's six-hour `cmd:` step left a new
+declaration unasked for hours (the hub's `mt5-data-sync` P10 and `ai-builder-v8` P21 woke on their
+own clocks, with no `phase.watch-checked` in either window). A parked declaration also POKES the
+clock (`phase.waiting` → a pass now). One probe per ref per pass, however many plans declared it;
+passes never overlap (a poke during one is folded into one more), a pass that throws re-arms the
+timer in its `finally` (`watch.pass-failed`, `watch.run-failed` — one run's broken record starves
+no other), a probe holds a pass at most `WATCH_PROBE_BOUND_MS` (75 s) and the healer's answer to a
+landing at most `WATCH_LANDING_BOUND_MS` (30 s, then `deferred`). **The pending set is the run
+record's own `watchState`**: a row whose SCHEDULE moved (`runs`, `nextDueAt`) is saved even when its
+verdict did not, so a restarted console — or a stopped run re-loaded from disk on every pass —
+continues from the row's own last read. **A person's Resume resets the watch** (#245): every row of
+a wait it leaves standing is due at once, and the post-window back-off counts from the press
+(`watchResetAt`), not from the step a pause had reached; a wait its clock SETTLED to `pending` is
+re-asked by the Resume like a live window — landed, it is put back as an expired wait the loop
+resumes in its own session; not landed, the Resume is refused naming the ref and *Resume the phase*.
+Recheck answers a `waiting-external` wall that names a ref by asking its refs too
+(`isRecheckableWall`, #264), never the done-checks.
 
 **A `cmd:` ref backs off; it does not run out** (control-tower phase 6, #19).
 `WATCH_CMD_BACKOFF_MS` is `[5 min, 15 min, 1 h, 6 h]`, indexed by how many times the command has
@@ -438,11 +468,15 @@ watching. The measured case was an organisation's plan restored after a day: the
 after its last run, before the fix arrived. A wall is measured in days, and at this cadence a day
 costs seven runs.
 
-**Four states, and one of them is not a state.** `pending` · `landed` · `unknown` (could not ask —
+**Five states, and one of them is not a state.** `pending` · `landed` · `unknown` (could not ask —
 no `gh`, no auth, a deleted run, no oracle wired; the caller behaves exactly as it did before this
 existed) · `refused`, which is terminal: the read-only policy or the operator's switch said this
 console will never run this command, so it is journalled once (`phase.watch-refused`) and dropped
-from the rotation rather than argued with every minute.
+from the rotation rather than argued with every minute · `unrunnable` (#374): a `cmd:` ref that ran
+and could not start — exit 126 or 127, its script missing from the console's checkout or not
+executable. The proof itself cannot run, which says nothing about the thing it proves: it is polled
+again like `pending`, and a person's check that reads it is never a rejection — the item says which
+file is missing and where.
 
 **`cmd:` is an execution surface**, and the only one here. The command goes through the same policy
 and the same spawn a plan's §Verification gets (`runSingleCommand`) — a denylist of mutating verbs,

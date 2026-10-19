@@ -339,7 +339,7 @@ export function lastRunOn(rows: readonly LedgerRow[], command: string, tree: str
   return undefined;
 }
 
-type BaselineLine = Pick<VerifyBaseline['commands'][number], 'command' | 'ok' | 'code' | 'failures' | 'chain'>;
+type BaselineLine = Pick<VerifyBaseline['commands'][number], 'command' | 'ok' | 'code' | 'failures' | 'chain' | 'unreached'>;
 
 /**
  * A red command's share of the phase's reds: its own, or inherited. `chain`
@@ -348,7 +348,7 @@ type BaselineLine = Pick<VerifyBaseline['commands'][number], 'command' | 'ok' | 
 export type RedShare = { command: string; chain?: string; failures: string[] };
 
 /** A red to split: a verdict row, or a chain's member run alone (`chain` set). */
-export type RedRow = Pick<VerifyRun, 'command' | 'failures'> & { chain?: string };
+export type RedRow = Pick<VerifyRun, 'command' | 'failures' | 'unreached'> & { chain?: string };
 
 /**
  * Which of a verification's reds are the phase's OWN and which it INHERITED.
@@ -373,6 +373,12 @@ export function splitReds(
     const base = baseline?.find((line) => line.command === foldCommand(row.command))
       ?? (row.chain ? baseline?.find((line) => !line.chain && line.command === foldCommand(row.chain!)) : undefined);
     if (!base || base.ok) { own.push(share(failures)); continue; }
+    // A red that never reached the files it names checked nothing (one-pool
+    // phase 20, #357): it cannot have come with the base tree — the line is
+    // the phase's own until it reads what it names.
+    // …and a base-tree red that never reached them inherits nothing: the base
+    // line read no file, so whatever this one reads now is the phase's.
+    if (row.unreached?.length || base.unreached?.length) { own.push(share(failures)); continue; }
     const before = base.failures ?? [];
     if (!failures.length || !before.length) { inherited.push(share(failures)); continue; }
     const mine = failures.filter((id) => !before.includes(id));

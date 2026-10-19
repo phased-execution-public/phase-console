@@ -14,6 +14,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -223,7 +224,7 @@ test('subKindOfNeed: a class is its own sub-kind, a key answers through its clas
   const { CLASSIFIER_ONLY_SUB_KINDS, SUB_KINDS } = await import('../shared/situation-model.js');
   // `human-acts` (control-tower phase 53, #54) is the classifier's reading of
   // the KEY of the same spelling — a class and a key must never share a word.
-  assert.deepEqual([...CLASSIFIER_ONLY_SUB_KINDS], ['unknown', 'protected-path', 'human-acts']);
+  assert.deepEqual([...CLASSIFIER_ONLY_SUB_KINDS], ['unknown', 'protected-path', 'human-acts', 'issues']);
   assert.equal(subKindOfNeed('human-acts'), 'human-acts', 'the key a session names lands on its own sub-kind, never unknown');
   assert.ok(!(NEED_CLASSES as readonly string[]).includes('human-acts'), 'and it is no --needs class: the key is');
   assert.deepEqual(
@@ -242,6 +243,21 @@ test('subKindOfNeed: a class is its own sub-kind, a key answers through its clas
   assert.equal(subKindOfNeed('budgets'), null, 'no class points at budgets — prose decides');
   assert.equal(subKindOfNeed('unknown'), null);
   assert.equal(subKindOfNeed(undefined), null);
+});
+
+test('#349: `--needs issues` is the `issues` key read as its own sub-kind — never unknown, and no --needs class', async () => {
+  const model = await import('../shared/decisions-model.js');
+  const { SUB_KINDS, CLASSIFIER_ONLY_SUB_KINDS } = await import('../shared/situation-model.js');
+  assert.ok((model.DECISION_KEYS as readonly string[]).includes('issues'));
+  assert.equal(model.isNeedWord('issues'), true, 'phase-outcome.sh accepts it, as a key');
+  assert.equal(model.subKindOfNeed('issues'), 'issues');
+  assert.ok(SUB_KINDS['blocked-declared'].includes('issues'));
+  assert.ok((CLASSIFIER_ONLY_SUB_KINDS as readonly string[]).includes('issues'));
+  assert.ok(!(model.NEED_CLASSES as readonly string[]).includes('issues'), 'a key and a class never share a word');
+  // The bash twin is untouched: the key list already carries it, the class list never does.
+  const env = readFileSync(join(SCRIPTS, 'decisions.env'), 'utf8');
+  assert.match(env, /^DECISION_KEYS="[^"]*\bissues\b/m);
+  assert.doesNotMatch(env.match(/^NEED_CLASSES="([^"]*)"/m)![1], /\bissues\b/);
 });
 
 test('turn-by-turn phase 6: `run` is a need class — a run request, the RUN\'s act, nobody\'s decision row', async () => {

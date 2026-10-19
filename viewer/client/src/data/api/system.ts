@@ -393,7 +393,10 @@ export interface InstancesView {
 }
 
 export interface FleetProfileView {
+  /** The machine profile, its `secret` fields withheld (#319): a webhook as origin + masked tail, the rest `[withheld]`. */
   profile: Record<string, unknown>;
+  /** Whether each withheld field is set. */
+  secrets?: Record<string, { hasValue: boolean }>;
   console: {
     id: string;
     name: string;

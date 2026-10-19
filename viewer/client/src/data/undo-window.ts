@@ -39,6 +39,12 @@ export interface HeldPress {
   undo: () => boolean;
   /** Send it now rather than at the window's end — once; a sent or undone press stays as it is. */
   sendNow: () => void;
+  /**
+   * The page is going away (#368): send it the way that outlives the page —
+   * its `leave` sender (a keepalive request) when it has one, else as
+   * `sendNow` would — once, exactly like `sendNow`.
+   */
+  leave: () => void;
   /** Resolves once, with what became of it. */
   readonly settled: Promise<HeldOutcome>;
 }
@@ -50,7 +56,11 @@ export interface HeldPress {
  */
 export function holdPress(
   send: () => unknown,
-  { ms = UNDO_WINDOW_MS, timers = REAL_TIMERS }: { ms?: number; timers?: UndoTimers } = {},
+  {
+    ms = UNDO_WINDOW_MS,
+    timers = REAL_TIMERS,
+    leave,
+  }: { ms?: number; timers?: UndoTimers; leave?: (() => unknown) | undefined } = {},
 ): HeldPress {
   let state: 'held' | HeldOutcome = 'held';
   let settle: (outcome: HeldOutcome) => void = () => undefined;
@@ -58,13 +68,14 @@ export function holdPress(
     settle = resolve;
   });
   let handle: unknown = null;
-  const fire = () => {
+  const go = (how: () => unknown) => {
     if (state !== 'held') return;
     state = 'sent';
     timers.clear(handle);
     settle('sent');
-    send();
+    how();
   };
+  const fire = () => go(send);
   handle = timers.set(fire, ms);
   return {
     get state() {
@@ -78,6 +89,7 @@ export function holdPress(
       return true;
     },
     sendNow: fire,
+    leave: () => go(leave ?? send),
     settled,
   };
 }
@@ -89,23 +101,34 @@ export type HeldView = { label: string; ms: number };
  * One card's held press. A second terminal press while one is held sends the
  * first at once — two held presses on one item would be two answers to one
  * question — and a card that leaves the page sends what it holds, because the
- * person pressed it and did not take it back.
+ * person pressed it and did not take it back. So does a PAGE that goes away
+ * inside the window (#368) — a reload, a closed tab, a phone that hides the
+ * browser: `pagehide`, and `visibilitychange` to hidden, send it through its
+ * `leave` sender (a keepalive request, `data/http.ts` `sendOnLeave`), so the
+ * press survives the page that held it.
  */
 export function useHeldPress(ms: number = UNDO_WINDOW_MS) {
   const current = useRef<HeldPress | null>(null);
   const [held, setHeld] = useState<HeldView | null>(null);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    const leave = () => current.current?.leave();
+    const hidden = () => {
+      if (document.visibilityState === 'hidden') leave();
+    };
+    window.addEventListener('pagehide', leave);
+    document.addEventListener('visibilitychange', hidden);
+    return () => {
+      window.removeEventListener('pagehide', leave);
+      document.removeEventListener('visibilitychange', hidden);
       current.current?.sendNow();
-    },
-    [],
-  );
+    };
+  }, []);
 
   const hold = useCallback(
-    (label: string, send: () => unknown) => {
+    (label: string, send: () => unknown, leave?: () => unknown) => {
       current.current?.sendNow();
-      const press = holdPress(send, { ms });
+      const press = holdPress(send, { ms, leave });
       current.current = press;
       setHeld({ label, ms });
       void press.settled.then(() => {

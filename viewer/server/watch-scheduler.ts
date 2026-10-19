@@ -48,7 +48,7 @@ import { holdBinds } from './fleet-hold.ts';
 import { type ConvergeClock, REAL_CLOCK } from './converge.ts';
 import type { RunState, PhaseRecord } from './runner/state.ts';
 import {
-  pollableRefs, probeWatchRef, nextDueFor, declaredWindowOf, WATCH_FLOOR_MS, WATCH_CMD_TIMEOUT_MS,
+  pollableRefs, probeWatchRef, nextDueFor, declaredWindowOf, WATCH_FLOOR_MS, WATCH_CEILING_MS, WATCH_CMD_TIMEOUT_MS,
   MAX_CMD_RUNS_PER_PHASE, MAX_WATCH_REFS, watchEligible, cmdRefProblem, notRunDetail,
   type WatchProbeDeps, type WatchRefTarget, type WatchState, backstopVerdict,
 } from './watch-refs.ts';
@@ -70,6 +70,34 @@ export { MAX_WATCH_REFS };
  * every minute.
  */
 export const MAX_LANDING_DELIVERIES = 3;
+
+/**
+ * How long one probe may hold a pass (one-pool phase 23, #337 #245). A pass is
+ * sequential and the timer is re-armed only when it ends, so one probe that
+ * never settled — a `gh` that hung, a command past its own kill — used to take
+ * the whole clock with it: no ref of any run was asked again for as long as the
+ * process lived (#245 read `health.watches.passes` unchanged across minutes).
+ * Past this the probe reads `unknown` for this pass and is asked again on its
+ * cadence; the command's own timeout still kills what it started.
+ */
+export const WATCH_PROBE_BOUND_MS = WATCH_CMD_TIMEOUT_MS + 15_000;
+
+/** How long the healer may take to answer one landing before the pass moves on (`deferred`). */
+export const WATCH_LANDING_BOUND_MS = 30_000;
+
+/** A promise raced against a bound: `fallback()` when it has not settled by then. */
+async function bounded<T>(work: Promise<T>, ms: number, fallback: () => T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const late = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback()), ms);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([work, late]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export type WatchSchedulerDeps = {
   /** The runs worth scanning: live or parked, never finished. */
@@ -232,6 +260,18 @@ export class WatchScheduler {
   private boardDue = new Set<string>();
   /** The runs the current pass loaded — a sibling's record is read from here. */
   private passRuns: { slug: string; state: RunState }[] = [];
+  /**
+   * A pass is running. A second one asked for meanwhile — a poke, a board
+   * move — is folded into ONE pass fired the moment this one ends (`again`),
+   * never run beside it: two passes share `asked` and `boardDue`, and the
+   * second one's clear would wipe the first one's dedupe mid-sweep.
+   */
+  private inPass = false;
+  /** `<slug>:<message>` failures already logged (`watch.run-failed`). */
+  private runFailures = new Set<string>();
+  private again = false;
+  /** When the last pass ENDED — what `snapshot` and the stall check read. */
+  private lastPassAt: number | null = null;
 
   constructor(deps: WatchSchedulerDeps) {
     this.deps = deps;
@@ -241,11 +281,55 @@ export class WatchScheduler {
   /** A harness seam: swap the clock BEFORE `open()`. */
   setClock(clock: ConvergeClock): void { this.clock = clock; }
 
-  /** Arm the timer (idempotent). */
+  /**
+   * Arm the timer (idempotent) — and, on an open clock, make sure it IS armed
+   * (one-pool phase 23): every caller that opens it is a moment worth asking at
+   * (a boot, a resume, a recovery), and a clock whose timer was lost must not
+   * stay lost because `open()` once returned early for it.
+   */
   open(): void {
-    if (!this.closed) return;
+    if (!this.closed) {
+      if (this.handle == null && !this.inPass) this.arm();
+      return;
+    }
     this.closed = false;
     this.arm();
+  }
+
+  /**
+   * Something new may be worth asking NOW — a declaration was just ingested
+   * (`phase.waiting`), a run was resumed. A pass is fired at once; one already
+   * running is followed by another. The ingest probe asked the refs while the
+   * session waited, so this is the first STORED reading, not a duplicate.
+   */
+  poke(): void {
+    if (this.closed) return;
+    if (this.inPass) { this.again = true; return; }
+    if (this.handle != null) this.clock.clearTimeout(this.handle);
+    this.handle = this.clock.setTimeout(() => { void this.tick(); }, 0);
+  }
+
+  /**
+   * A person resumed `slug` (one-pool phase 23, #245): each named phase's watch
+   * starts over — every row is due now, and a `cmd:` ref's post-window back-off
+   * counts from this instant (`watchResetAt`) instead of the step a pause had
+   * reached. Writes the records it is handed; the caller saves them. Answers
+   * how many rows it made due.
+   */
+  reset(state: RunState, phases: readonly number[], at: number = this.clock.now()): number {
+    let rows = 0;
+    const stamp = new Date(at).toISOString();
+    for (const phase of phases) {
+      const record = state.phases?.[String(phase)];
+      if (!record) continue;
+      record.watchResetAt = stamp;
+      for (const row of record.watchState?.refs ?? []) {
+        if (row.state === 'refused' || row.state === 'landed') continue;
+        row.nextDueAt = at;
+        rows += 1;
+      }
+    }
+    return rows;
   }
 
   close(): void {
@@ -266,11 +350,13 @@ export class WatchScheduler {
    * scheduler's own armed timer instead, or split the prune out first
    * (Outstanding 8).
    */
-  snapshot(): { passes: number; asked: string[]; open: boolean } {
+  snapshot(): { passes: number; asked: string[]; open: boolean; lastPassAt: string | null; armed: boolean } {
     return {
       passes: this.passes,
       asked: [...this.asked.keys()],
       open: !this.closed,
+      lastPassAt: this.lastPassAt === null ? null : new Date(this.lastPassAt).toISOString(),
+      armed: this.handle != null || this.inPass,
     };
   }
 
@@ -280,12 +366,38 @@ export class WatchScheduler {
    */
   async tick(): Promise<void> {
     if (this.closed) return;
+    if (this.inPass) { this.again = true; return; }
+    this.inPass = true;
+    if (this.handle != null) { this.clock.clearTimeout(this.handle); this.handle = null; }
+    let runs: { slug: string; state: RunState }[] | undefined;
+    try {
+      runs = await this.pass();
+    } catch (error) {
+      // A pass that throws must never take the clock with it (one-pool phase
+      // 23, #337): the timer is re-armed below whatever happened in here.
+      log.warn('watch.pass-failed', { error });
+    } finally {
+      this.inPass = false;
+      this.lastPassAt = this.clock.now();
+      if (this.again && !this.closed) {
+        this.again = false;
+        this.handle = this.clock.setTimeout(() => { void this.tick(); }, 0);
+      } else {
+        // Re-armed from the SAME snapshot this pass acted on — the records were
+        // mutated in place, so their fresh `nextDueAt` values are already here.
+        this.arm(runs);
+      }
+    }
+  }
+
+  /** The body of one pass. Answers the runs it read, for the re-arm. */
+  private async pass(): Promise<{ slug: string; state: RunState }[] | undefined> {
     let hold: { by?: string; plans?: readonly string[] } | null | undefined;
     try { hold = this.deps.fleetHold?.(); } catch { hold = null; }
     // A hold on every plan skips the pass. One that binds only some — a
     // restart waiting for its lanes (control-tower phase 48, #70) — skips
     // just their runs below, and every other plan's refs are still asked.
-    if (hold && !hold.plans) { this.arm(); return; }
+    if (hold && !hold.plans) return undefined;
     this.passes += 1;
     this.asked.clear();
     // The board moves this pass acts on; one arriving while it runs waits for the next.
@@ -299,28 +411,37 @@ export class WatchScheduler {
     const now = this.clock.now();
     for (const { slug, state } of runs) {
       if (holdBinds(hold, slug)) continue;
-      let changed = false;
-      // The rotation's own writes — a terminal row's retired due time, a pruned
-      // row — must reach the save exactly like a verdict: production re-loads
-      // the run from disk on every pass, so a delete that lives only in this
-      // object protects nothing (QA round 3, M2).
-      const sink = { changed: false };
-      const landings: { phase: number; landed: WatchState }[] = [];
-      for (const record of Object.values(state.phases ?? {})) {
-        const due = this.dueFor(slug, record, now, sink, poked);
-        if (!due.length) continue;
-        const asked = await this.askRecord(slug, state, record, due, now, (target) => this.ask(target));
-        if (asked.changed) changed = true;
-        landings.push(...asked.landings);
-      }
-      if ((await this.offerLandings(slug, state, landings)).changed) changed = true;
-      if (changed || sink.changed) {
-        try { this.deps.save?.(slug, state); } catch { /* the verdict matters more than the write */ }
+      // One run's malformed record must not starve every other run's refs:
+      // each run is its own try, and the failure is said with its slug.
+      try {
+        let changed = false;
+        // The rotation's own writes — a terminal row's retired due time, a pruned
+        // row — must reach the save exactly like a verdict: production re-loads
+        // the run from disk on every pass, so a delete that lives only in this
+        // object protects nothing (QA round 3, M2).
+        const sink = { changed: false };
+        const landings: { phase: number; landed: WatchState }[] = [];
+        for (const record of Object.values(state.phases ?? {})) {
+          const due = this.dueFor(slug, record, now, sink, poked);
+          if (!due.length) continue;
+          const asked = await this.askRecord(slug, state, record, due, now, (target) => this.ask(target));
+          if (asked.changed) changed = true;
+          landings.push(...asked.landings);
+        }
+        if ((await this.offerLandings(slug, state, landings)).changed) changed = true;
+        if (changed || sink.changed) {
+          try { this.deps.save?.(slug, state); } catch { /* the verdict matters more than the write */ }
+        }
+      } catch (error) {
+        // Said once per run and message, not every minute it stays broken.
+        const said = `${slug}:${String((error as Error)?.message ?? error)}`;
+        if (!this.runFailures.has(said)) {
+          this.runFailures.add(said);
+          log.warn('watch.run-failed', { slug, error });
+        }
       }
     }
-    // Re-armed from the SAME snapshot this pass acted on — the records were
-    // mutated in place, so their fresh `nextDueAt` values are already here.
-    this.arm(runs);
+    return runs;
   }
 
   /**
@@ -477,7 +598,13 @@ export class WatchScheduler {
     for (const { phase, landed } of landings) {
       let outcome: WatchLandingOutcome = 'deferred';
       try {
-        outcome = (await this.deps.onLanded?.(slug, state, phase, landed)) ?? 'deferred';
+        // Bounded: the healer STARTS a drive and answers; one that does not
+        // answer in time is a deferral, never a pass held for the drive.
+        const answer = this.deps.onLanded?.(slug, state, phase, landed);
+        outcome = (await bounded(Promise.resolve(answer), WATCH_LANDING_BOUND_MS, () => {
+          log.warn('watch.landed-slow', { slug, phase, ref: landed.ref, boundMs: WATCH_LANDING_BOUND_MS });
+          return 'deferred' as WatchLandingOutcome;
+        })) ?? 'deferred';
       } catch (error) {
         // A throwing healer is a DEFERRAL, not a delivery: the landing was
         // not acted on, so it must not be charged as though it had been.
@@ -661,8 +788,7 @@ export class WatchScheduler {
     }
     if (!named) return 0;
     this.boardDue.add(`${slug}/${phase}`);
-    if (this.handle != null) this.clock.clearTimeout(this.handle);
-    this.handle = this.clock.setTimeout(() => { void this.tick(); }, 0);
+    this.poke();
     return named;
   }
 
@@ -681,7 +807,12 @@ export class WatchScheduler {
     const now = this.clock.now();
     for (const { slug, state } of runs) {
       for (const record of Object.values(state.phases ?? {})) {
-        if (this.dueFor(slug, record, now).length) return now;
+        // A record the rotation cannot read is skipped here exactly as the
+        // pass skips its run: arming the timer must never throw, or the clock
+        // is lost with the throw (one-pool phase 23).
+        try {
+          if (this.dueFor(slug, record, now).length) return now;
+        } catch { continue; }
         for (const row of record.watchState?.refs ?? []) {
           if (row.nextDueAt === undefined) continue;
           if (soonest === null || row.nextDueAt < soonest) soonest = row.nextDueAt;
@@ -702,7 +833,10 @@ export class WatchScheduler {
       this.handle = this.clock.setTimeout(() => { void this.tick(); }, WATCH_FLOOR_MS);
       return;
     }
-    const delay = Math.max(WATCH_FLOOR_MS, due - this.clock.now());
+    // Never longer than the ceiling (one-pool phase 23, #337 #303): a
+    // declaration that arrives while the soonest row is hours off has no row
+    // yet, so the soonest row cannot speak for it — the next pass must.
+    const delay = Math.min(WATCH_CEILING_MS, Math.max(WATCH_FLOOR_MS, due - this.clock.now()));
     this.handle = this.clock.setTimeout(() => { void this.tick(); }, delay);
   }
 
@@ -827,25 +961,28 @@ export class WatchScheduler {
   private ask(target: WatchRefTarget): Promise<WatchState> {
     const already = this.asked.get(target.ref);
     if (already) return already;
-    const probe = this.probeOf(target, WATCH_CMD_TIMEOUT_MS);
-    const settled = probe.catch((error): WatchState => ({
+    let probe: Promise<WatchState>;
+    try { probe = this.probeOf(target, WATCH_CMD_TIMEOUT_MS); } catch (error) { probe = Promise.reject(error); }
+    const settled = bounded(probe, WATCH_PROBE_BOUND_MS, (): WatchState => ({
+      ref: target.ref, state: 'unknown', detail: `not answered within ${Math.round(WATCH_PROBE_BOUND_MS / 1000)} s — asked again on its cadence`,
+    })).catch((error): WatchState => ({
       ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160),
     }));
     this.asked.set(target.ref, settled);
     return settled;
   }
 
-  /**
-   * Fold one verdict into the record. Answers whether anything changed, which
-   * is what decides a save — a pass that learned nothing must not rewrite the
-   * run file.
-   */
   /** Is this a console-minted `cmd:` ref the operator has not enabled? */
   private mintedHeld(record: PhaseRecord, ref: string): boolean {
     if (!record.declared?.minted?.includes(ref)) return false;
     return !this.deps.mintedCmdRefsEnabled?.();
   }
 
+  /**
+   * Fold one verdict into the record. Answers whether anything changed — the
+   * verdict, or the row's schedule — which is what decides a save: a pass that
+   * learned nothing and moved no clock must not rewrite the run file.
+   */
   private apply(
     slug: string, state: RunState, record: PhaseRecord,
     target: WatchRefTarget, verdict: WatchState, now: number,
@@ -862,7 +999,7 @@ export class WatchScheduler {
     // the budget on twelve non-events — after which the ref read `refused` for
     // ever, which is precisely what this phase's own F12 ruling says must not
     // happen ("turning the pref back on would never resume watching").
-    const ran = target.kind === 'cmd' && (verdict.state === 'landed' || verdict.state === 'pending') ? 1 : 0;
+    const ran = target.kind === 'cmd' && (verdict.state === 'landed' || verdict.state === 'pending' || verdict.state === 'unrunnable') ? 1 : 0;
     const runs = (before?.runs ?? 0) + ran;
     const row = {
       ref: verdict.ref,
@@ -878,7 +1015,8 @@ export class WatchScheduler {
         // ever advance it, and a row with a past clock churns the fingerprint.
         // A `cmd:` ref's clock backs off with the runs it has made — once the
         // declared window is over; inside it, a sixth of the window (#87).
-        const next = opts.terminal ? null : nextDueFor(target, verdict.state, now, runs, declaredWindowOf(record));
+        const resetAt = record.watchResetAt ? Date.parse(record.watchResetAt) : null;
+        const next = opts.terminal ? null : nextDueFor(target, verdict.state, now, runs, declaredWindowOf(record), resetAt);
         return next === null ? {} : { nextDueAt: next };
       })(),
     };
@@ -910,6 +1048,17 @@ export class WatchScheduler {
 
     const transitioned = stored
       && (!before || before.state !== verdict.state || before.detail !== verdict.detail);
+    // The SCHEDULE moved — a run counted, a next due time set — without the
+    // verdict moving (one-pool phase 23, #337). Not a transition: nothing is
+    // journalled. But it is saved: production re-loads a stopped run from disk
+    // on every pass, so a pending row's new clock that lived only in memory
+    // was gone by the next pass — the ref read overdue again, its back-off
+    // never advanced past the first step, and a restart forgot where it was.
+    // A landed row re-offered to a healer that deferred is not a schedule worth
+    // a write: its clock is the re-offer cadence, and the landing itself is
+    // already on disk.
+    const rescheduled = stored && Boolean(before) && verdict.state !== 'landed'
+      && (before!.nextDueAt !== row.nextDueAt || (before!.runs ?? 0) !== (row.runs ?? 0));
     if (transitioned) {
       // The legacy single-ref field, kept in step so a reader written before
       // `watchState` existed still sees the newest verdict.
@@ -933,6 +1082,6 @@ export class WatchScheduler {
         try { this.deps.onNotRun?.(slug, state, record.phase, verdict); } catch { /* the errand must never break the poll */ }
       }
     }
-    return transitioned;
+    return transitioned || rescheduled;
   }
 }

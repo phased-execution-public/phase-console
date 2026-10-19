@@ -490,3 +490,60 @@ test('turn-by-turn 2: a guide: file becomes the guide; outside the root, a symli
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * #351 — a reminder keeps a returned step returned
+ * ------------------------------------------------------------------ */
+
+test('#351 — a reminder on a returned step leaves it returned, still Redo, and counts the reminder', async () => {
+  const { personStatusOf } = await import('../shared/turn-model.js');
+  const s = scratch();
+  try {
+    let now = Date.parse('2026-10-17T08:00:00Z');
+    const ledger = new HumanStepLedger(join(s.dir, 'human-steps.ndjson'), () => new Date(now));
+    const clean = sanitiseStep(STEP, 'session')!;
+    const step = ledger.declare({ slug: 'demo', phase: 4, birth: 'session', runId: 'run-1', clean: clean.step });
+    ledger.move(step.id, 'notified', { by: 'console', verb: 'notify', pushed: true });
+    ledger.move(step.id, 'checking', { by: 'owner', verb: 'check' });
+    ledger.move(step.id, 'returned', { by: 'console', verb: 'return', read: 'pending — exit 1' });
+    assert.equal(personStatusOf(ledger.get(step.id)!), 'redo');
+    now += 2 * 60 * 60_000;
+    const pass = humanStepsModule.tickHumanSteps({ ledger, now, remind: () => true });
+    assert.deepEqual(pass.reminded, [step.id], 'the reminder went out');
+    const after = ledger.get(step.id)!;
+    assert.equal(after.state, 'returned', 'a reminder never turns a Redo into a To do');
+    assert.equal(personStatusOf(after), 'redo');
+    assert.equal(after.reminders, 1);
+    assert.equal(after.read, 'pending — exit 1', 'what the check read stays on the card');
+    // The ledger re-read from disk folds the same line the same way.
+    const reread = new HumanStepLedger(join(s.dir, 'human-steps.ndjson'), () => new Date(now)).get(step.id)!;
+    assert.equal(reread.state, 'returned');
+    // An open step that was never checked is still re-notified.
+    const other = ledger.declare({ slug: 'demo', phase: 5, birth: 'session', runId: 'run-1', clean: clean.step });
+    ledger.move(other.id, 'opened', { by: 'owner', verb: 'open' });
+    now += 2 * 60 * 60_000;
+    humanStepsModule.tickHumanSteps({ ledger, now, remind: () => true });
+    assert.equal(ledger.get(other.id)!.state, 'notified');
+  } finally { s.cleanup(); }
+});
+
+test('#346 — a Human step bullet inside an HTML comment is no step, on one line, across lines or never closed; nor does it bind an errand row', async () => {
+  const { parsePlan, humanStepsFor } = await import('../server/parse/plan.ts');
+  const path = join(SKILL_DIR, 'tests', 'fixtures', 'plans', 'commented-human-step.md');
+  const plan = parsePlan(readFileSync(path, 'utf8'), 'commented-human-step', path);
+  // Phase 1: the template's commented example is gone; the real bullet is read
+  // whole, its trailing comment cut — `why: identity`, not a reason carrying
+  // the note.
+  assert.deepEqual(humanStepsFor(plan, 1), [{
+    kind: 'browser-login', what: 'sign the gh CLI in to the org', where: 'host', open: 'gh auth login --web',
+    proof: 'cmd:"gh auth status"', why: 'identity',
+  }]);
+  // Phase 2: three commented bullets across lines, one real one after them.
+  assert.deepEqual(humanStepsFor(plan, 2).map((step) => step.what), ['rotate the deploy key (E-1)']);
+  // Phase 0: a one-line comment and one never closed leave the section no step.
+  assert.deepEqual(humanStepsFor(plan, 0), []);
+  assert.equal(plan.operatorErrands, undefined);
+  // E-2 is named only by commented bullets, so it binds nothing (F43's twin).
+  assert.deepEqual(plan.errandsTable?.unbound, ['E-2']);
+  assert.deepEqual(plan.errandsTable?.rows.filter((row) => row.bound).map((row) => row.id), ['E-1']);
+});

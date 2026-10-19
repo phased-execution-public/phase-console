@@ -61,6 +61,7 @@
  * refs are WRITTEN by a session rather than read by one.
  */
 
+import { cmdOfRef } from '../shared/proof-words.js';
 import type { WatchStateWord } from '../shared/run-lifecycle.js';
 import { budgetClause } from '../shared/ci-refusal.js';
 import { waitBudgetEndOf } from './runner/wait-budget.ts';
@@ -268,6 +269,22 @@ export function redeliverAfter(rejections: number, now: number, until?: number |
 /** The floor the scheduler's own timer never goes below, however near a ref is due. */
 export const WATCH_FLOOR_MS = 60_000;
 
+/**
+ * The CEILING on the scheduler's own timer: however far off the soonest stored
+ * row is, a pass runs at least this often (one-pool phase 23, #337 #303).
+ *
+ * The timer used to sleep until the soonest `nextDueAt` of any row it held. A
+ * row is written only once a ref has been asked, so a declaration that arrived
+ * while the timer slept on someone else's six-hour `cmd:` step had no row and
+ * no say: measured on the hub console, a phase parked on `cmd:"test -f …"` and
+ * a release phase parked on a `gh:` run were never asked once — no
+ * `phase.watch-checked` in either window — and woke on their own clocks, 70
+ * minutes and 1 h 36 min after what they waited on had landed. A pass that
+ * finds nothing due costs a read of the run records and nothing else, which is
+ * what the timer already paid every minute when it tracked nothing at all.
+ */
+export const WATCH_CEILING_MS = 60_000;
+
 /** How long a `cmd:` ref's command may run before it is killed and read as unknown. */
 export const WATCH_CMD_TIMEOUT_MS = 60_000;
 
@@ -372,9 +389,16 @@ export function declaredWindowOf(record: {
  * the back-off, counted from the window's end. With no window, the run-count
  * back-off phase 6 wrote.
  */
-export function cmdStepMs(command: string, runs: number, now: number, window?: DeclaredWindow | null): number {
-  if (!window) return cmdBackoffMs(runs);
-  if (now >= window.until) return cmdBackoffAfterMs(now - window.until);
+export function cmdStepMs(
+  command: string, runs: number, now: number, window?: DeclaredWindow | null, resetAt?: number | null,
+): number {
+  // A person's resume RESETS the back-off (one-pool phase 23, #245): past the
+  // window, the steps count from the later of the window's end and the reset,
+  // so a ref whose window passed while the run was paused is asked five
+  // minutes after the resume, not on the hour step the pause had reached.
+  const reset = typeof resetAt === 'number' && Number.isFinite(resetAt) ? resetAt : null;
+  if (!window) return reset !== null && now >= reset ? cmdBackoffAfterMs(now - reset) : cmdBackoffMs(runs);
+  if (now >= window.until) return cmdBackoffAfterMs(now - Math.max(window.until, reset ?? window.until));
   const sixth = Math.max(WATCH_FLOOR_MS, Math.floor((window.until - window.from) / 6));
   const step = Math.min(cmdBackoffMs(runs), sixth);
   return cmdWrapsGh(command) ? Math.min(step, WATCH_CMD_GH_MS) : step;
@@ -446,6 +470,14 @@ function parseInstant(text: string): number {
   return at;
 }
 
+/**
+ * The command a `cmd:` ref's body runs — the ONE reader of the ref's quoting
+ * (#345), owned by `shared/proof-words.js` so the words a person reads and the
+ * probe that runs it read one command; `scripts/cmd-ref.sh` `_cmd_body` is its
+ * bash twin.
+ */
+export { cmdOfRef };
+
 /** One declared ref, parsed — or null for anything this console will not poll. */
 export function parseWatchRef(ref: string): WatchRefTarget | null {
   if (typeof ref !== 'string') return null;
@@ -485,8 +517,7 @@ export function parseWatchRef(ref: string): WatchRefTarget | null {
     // The conventional spelling quotes the command (`cmd:"npm test"`), because
     // that is what reads well in a `--watch` argument; the quotes are the
     // ref's punctuation and never part of what runs.
-    let command = ref.slice(4).trim();
-    if (command.length >= 2 && /^(["']).*\1$/.test(command)) command = command.slice(1, -1).trim();
+    const command = cmdOfRef(ref.slice(4));
     return command ? { kind: 'cmd', command, ref } : null;
   }
   return null;
@@ -571,10 +602,34 @@ export const WATCH_REF_MAX = 1000;
 export function relativePathIn(command: string): string | null {
   const words = command.replace(/["']/g, ' ').split(/\s+/).filter(Boolean);
   let prev = '';
-  for (const word of words) {
+  // Where each command of a chain stands (#350): its lead (`git`, `gh`), and
+  // whether it is anchored — `git -C /abs` names files from that directory,
+  // and so does everything after `cd /abs`, never the console's root.
+  let lead = '';
+  let anchored = false;
+  for (const raw of words) {
+    // A chain's separator ends a command, spaced or stuck to its word.
+    const word = raw.replace(/(;|&&|\|\|)+$/, '');
+    const ends = word !== raw;
     const after = prev;
     prev = word;
-    if (after === '-R' || after === '--repo') { prev = word; continue; }
+    if (!word || word === '|') { lead = ''; continue; }
+    // The lead is the command's first word; it is still read as a path below.
+    const first = !lead;
+    if (first) lead = word;
+    const of = lead;
+    if (ends) lead = '';
+    if (!first) {
+      if (after === 'cd' && word.startsWith('/')) { anchored = true; continue; }
+      if (after === '-C' && of === 'git' && word.startsWith('/')) { anchored = true; continue; }
+      if (after === '-R' || after === '--repo') continue;
+      // A git ref is a name, not a file: `refs/heads/<branch>`, `+refs/…:refs/…`,
+      // `:refs/heads/x` (a push that deletes), `origin/main:path` (a blob).
+      if (of === 'git' && (/^[+:]?refs\//.test(word) || word.includes(':'))) continue;
+      // `gh api repos/<owner>/<repo>/…` is a route, not a path.
+      if (of === 'gh' && /^\/?(repos|orgs|users|user|teams|search|gists|enterprises|notifications|graphql)(\/|$)/.test(word)) continue;
+    }
+    if (anchored) continue;
     if (word.startsWith('./') || word.startsWith('../')) return word;
     if (/^(\/|~|-)/.test(word) || word.includes('://') || word.includes('=') || /^[sy]\//.test(word)) continue;
     if (!word.includes('/') || /[^A-Za-z0-9._/@+-]/.test(word)) continue;
@@ -610,6 +665,35 @@ export function cmdRefProblem(command: string): string | null {
   if (quote) return 'its quoting does not balance (a quote never closes) — the console would refuse it as unreadable';
   const rel = relativePathIn(command);
   return rel ? `it names a relative path (${rel}) — the console runs a cmd: ref from its own root, not the session's working directory` : null;
+}
+
+/**
+ * The program a command runs FROM A FILE — the first absolute path after an
+ * interpreter (`bash`, `sh`, `zsh`, `python3`, `node`, …), else the command's
+ * own first word when it is one — or null. What an `unrunnable` proof names
+ * as missing, and what the plan lint F46 looks for on `main` (#374).
+ */
+export function scriptOfCommand(command: string): string | null {
+  const words = command.replace(/["']/g, ' ').split(/\s+/).filter(Boolean);
+  if (!words.length) return null;
+  if (words[0].startsWith('/')) return words[0];
+  if (/^(ba|z|k|da)?sh$|^python[0-9.]*$|^node$|^ruby$|^perl$|^deno$|^bun$|^tsx$/.test(words[0])) {
+    for (const word of words.slice(1)) {
+      if (word.startsWith('-')) continue;
+      return word.startsWith('/') ? word : null;
+    }
+  }
+  return null;
+}
+
+/** An `unrunnable` proof in words: what is missing, and where (#374). */
+export function unrunnableDetail(command: string, code: number, detail?: string): string {
+  const script = scriptOfCommand(command);
+  const what = code === 127
+    ? (script ? `${script} does not exist on the console's checkout` : 'its program was not found')
+    : (script ? `${script} cannot be executed` : 'its program cannot be executed');
+  const tail = detail ? ` (${detail.replace(/^exit \d+ — /, '').slice(0, 100)})` : '';
+  return `the proof itself cannot run — ${what}; exit ${code}${tail}`.slice(0, 240);
 }
 
 /** The declared refs nothing will poll, each with why — in declaration order, deduped. */
@@ -816,11 +900,12 @@ export function pollableRefs(refs: readonly string[] | undefined | null): WatchR
  */
 export function nextDueFor(
   target: WatchRefTarget, state: WatchState['state'], now: number, runs = 0, window?: DeclaredWindow | null,
+  resetAt?: number | null,
 ): number | null {
   if (state === 'refused') return null;
   if (state === 'landed') return now + WATCH_REDELIVER_MS;
   if (target.kind === 'date') return Math.max(now, target.at);
-  if (target.kind === 'cmd') return now + cmdStepMs(target.command, runs, now, window);
+  if (target.kind === 'cmd') return now + cmdStepMs(target.command, runs, now, window, resetAt);
   return now + WATCH_POLL_MS[target.kind];
 }
 
@@ -910,7 +995,7 @@ export type WatchProbeDeps = {
    * wired — `unknown`, never `refused`: the console has not judged the
    * command, it simply did not ask.
    */
-  runCommand?: (command: string) => Promise<{ refused?: string; ok: boolean; detail?: string }>;
+  runCommand?: (command: string) => Promise<{ refused?: string; ok: boolean; code?: number; detail?: string }>;
   /**
    * `phase:<slug>/<N>` — what the console's own RECORD of that phase says
    * (control-tower phase 88, #129): `landed` once it reads `done`, which a phase
@@ -979,11 +1064,16 @@ export async function probeWatchRef(
   }
   if (target.kind === 'cmd') {
     if (!opts.runCommand) return { ref: target.ref, state: 'unknown', detail: 'cmd refs are not being run' };
-    let answer: { refused?: string; ok: boolean; detail?: string };
+    let answer: { refused?: string; ok: boolean; code?: number; detail?: string };
     try { answer = await opts.runCommand(target.command); } catch (error) {
       return { ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160) };
     }
     if (answer.refused) return { ref: target.ref, state: 'refused', detail: answer.refused.slice(0, 160) };
+    // 126 is a file the shell could not execute, 127 one it could not find:
+    // the proof itself cannot run, which says nothing about the act (#374).
+    if (!answer.ok && (answer.code === 126 || answer.code === 127)) {
+      return { ref: target.ref, state: 'unrunnable', detail: unrunnableDetail(target.command, answer.code, answer.detail) };
+    }
     return {
       ref: target.ref,
       state: answer.ok ? 'landed' : 'pending',

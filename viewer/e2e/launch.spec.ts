@@ -14,6 +14,7 @@
 
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
+import { passThrough } from './lib/fetch.ts';
 import { still } from './lib/probes.ts';
 import { fixture, shotPath, visit } from './lib/shots.ts';
 
@@ -174,7 +175,7 @@ test('the launch door lists the run’s items — done, Do it now opening the it
     (url) => url.pathname.endsWith('/prelude'),
     async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
-      const response = await route.fetch();
+      const response = await passThrough(route);
       const body = (await response.json()) as { prelude?: Record<string, unknown> } & Record<string, unknown>;
       const prelude = body.prelude ?? body;
       prelude.humanSteps = [
@@ -214,7 +215,7 @@ test('the launch door lists the run’s items — done, Do it now opening the it
     (url) => url.pathname.endsWith('/api/run/quiet'),
     async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
-      const response = await route.fetch();
+      const response = await passThrough(route);
       const body = (await response.json()) as { run?: Record<string, unknown> | null };
       if (body.run) body.run.status = 'finished';
       await route.fulfill({ response, json: body });

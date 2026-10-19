@@ -159,3 +159,4 @@ test('sizing.env keys carrying a digit are parsed — BUDGET_1M was not, once', 
   assert.equal(sizing.budget1m, Number(declared[1]),
     'the JS reader must honour the file, not its own fallback');
 });
+

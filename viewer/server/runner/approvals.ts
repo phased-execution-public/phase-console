@@ -188,10 +188,37 @@ function executesDetach(command: string): boolean {
   });
 }
 
-/** Where a shell segment runs: `git -C <dir>` beats the cwd the segment inherited. */
-function gitDirOf(words: string[], cwd: string): string {
+/**
+ * A word the shell would EXPAND before git ever saw it — `$NAME`, `${…}`,
+ * `$(…)` or a backtick (one-pool phase 20, #283). Measured: `git -C $S switch
+ * --detach` was denied for leaving `<mirror>/integration/$S` detached, a path
+ * no shell would use. The guard has no shell, so such a word is unresolvable,
+ * never a path.
+ */
+function shellExpansionOf(word: string): string | null {
+  const match = /\$\{[^}]*\}?|\$\([^)]*\)?|\$[A-Za-z_][A-Za-z0-9_]*|`[^`]*`?/.exec(word);
+  return match ? match[0] : null;
+}
+
+/**
+ * Where a shell segment runs: `git -C <dir>` beats the cwd the segment
+ * inherited. `null` when the place is unresolvable — the `-C` value, or the
+ * cwd a `cd $VAR` left, holds a shell expansion (#283).
+ */
+function gitDirOf(words: string[], cwd: string | null): string | null {
   const at = words.indexOf('-C');
-  return at >= 0 && words[at + 1] ? resolve(cwd, words[at + 1]!) : cwd;
+  if (at >= 0 && words[at + 1]) {
+    const value = words[at + 1]!;
+    if (shellExpansionOf(value)) return null;
+    return cwd === null && !isAbsolute(value) ? null : resolve(cwd ?? '/', value);
+  }
+  return cwd;
+}
+
+/** The expansion that made a segment's place unresolvable, for the reason's words. */
+function expansionIn(words: string[], cdExpansion: string | null): string {
+  const at = words.indexOf('-C');
+  return (at >= 0 && words[at + 1] ? shellExpansionOf(words[at + 1]!) : null) ?? cdExpansion ?? 'a shell expansion';
 }
 
 /** `git clone` options that take a separate value — skipped when finding the URL and the target. */
@@ -241,17 +268,63 @@ export function treeGuard(
   const root = ctx.runRoot ? resolve(ctx.runRoot) : null;
   const ownTree = ctx.ownTree && !ctx.detached ? resolve(ctx.ownTree) : null;
   const branch = ctx.runBranch ? `\`${ctx.runBranch}\`` : 'the run branch';
-  let cwd = resolve(ctx.cwd);
+  let cwd: string | null = resolve(ctx.cwd);
+  let cdExpansion: string | null = null;
   let submodule: 'ask' | 'allow' | null = null;
   let where = '';
   for (const segment of command.split(/&&|\|\||[;\n|]/).map((part) => part.trim().replace(/^\(+|\)+$/g, '')).filter(Boolean)) {
     const words = segment.split(/\s+/).filter(Boolean);
-    if (words[0] === 'cd' && words[1]) { cwd = resolve(cwd, words[1]); continue; }
+    if (words[0] === 'cd' && words[1]) {
+      const expansion = shellExpansionOf(words[1]);
+      if (expansion) { cwd = null; cdExpansion = expansion; } else if (cwd !== null || isAbsolute(words[1])) cwd = resolve(cwd ?? '/', words[1]);
+      continue;
+    }
     const gitAt = words[0] === 'git' ? 0 : -1;
     if (gitAt === 0) {
       const dir = gitDirOf(words, cwd);
       const verbAt = words.findIndex((word, i) => i > 0 && !word.startsWith('-') && words[i - 1] !== '-C' && words[i - 1] !== '-c');
       const verb = verbAt > 0 ? words[verbAt] : undefined;
+      if (dir === null) {
+        // Unresolvable (#283): the guard never judges, or prints, a path the
+        // shell would not use. Where a rule WOULD speak — a detach while the
+        // run's own checkout is known, a clone into a relative target — the
+        // line is refused naming the expansion, so the session respells it.
+        const expansion = expansionIn(words, cdExpansion);
+        const detach = (verb === 'switch' || verb === 'checkout') && ownTree
+          && detaches(verb, words.slice(verbAt + 1)) && executesDetach(command);
+        if (detach) {
+          return {
+            verdict: 'deny', rule: RUN_TREE_DETACH_RULE,
+            reason: `\`git ${verb}\` runs where \`${expansion}\` points, and the guard cannot expand a shell variable to tell `
+              + `whether that is the run's own checkout (${ownTree}). Spell the directory as a literal absolute path `
+              + '(`git -C /abs/path …`) and run the line again.',
+          };
+        }
+        if (verb === 'clone') {
+          const positional = words.slice(verbAt + 1).filter((word, i, all) => !word.startsWith('-') && !CLONE_VALUED.has(all[i - 1] ?? ''));
+          const target = positional[1] ?? (positional[0] ? basename(positional[0]).replace(/\.git$/, '') : undefined);
+          if (target && !isAbsolute(target)) {
+            return {
+              verdict: 'deny', rule: RUN_TREE_CLONE_RULE,
+              reason: `a clone into \`${target}\` lands where \`${expansion}\` points, which the guard cannot expand — it may be `
+                + 'a run worktree. Spell the target as a literal absolute path and run the line again.',
+            };
+          }
+          // An absolute target is where it says, whatever the variable holds.
+          const tree = target ? inRunTree(resolve(target)) : undefined;
+          if (target && tree) {
+            return {
+              verdict: 'deny', rule: RUN_TREE_CLONE_RULE,
+              reason: `a clone into ${resolve(target)} lands inside a run worktree (${tree}), which is the console's own checkout — `
+                + 'a clone at a mount path breaks the run\'s isolation. Read another repository at the shared root'
+                + `${root ? ` (${root}/<repo>)` : ''}, read-only; never clone into a run tree.`,
+            };
+          }
+        }
+        // `git submodule` where the guard cannot tell whether it is a run tree: a person decides.
+        if (verb === 'submodule' && submodule !== 'ask') { submodule = 'ask'; where = `\`${expansion}\``; }
+        continue;
+      }
       if (verb === 'clone') {
         const positional: string[] = [];
         for (let i = verbAt + 1; i < words.length; i++) {
@@ -297,8 +370,15 @@ export function treeGuard(
     if (words[0] === 'gh' && words[1] === 'repo' && words[2] === 'clone') {
       const positional = words.slice(3).filter((word) => !word.startsWith('-'));
       const target = positional[1] ?? (positional[0] ? basename(positional[0]).replace(/\.git$/, '') : undefined);
+      if (target && cwd === null && !isAbsolute(target)) {
+        return {
+          verdict: 'deny', rule: RUN_TREE_CLONE_RULE,
+          reason: `\`gh repo clone\` into \`${target}\` lands where \`${cdExpansion ?? 'a shell expansion'}\` points, which the `
+            + 'guard cannot expand — it may be a run worktree. Spell the target as a literal absolute path and run the line again.',
+        };
+      }
       if (target) {
-        const at = isAbsolute(target) ? resolve(target) : resolve(cwd, target);
+        const at = isAbsolute(target) ? resolve(target) : resolve(cwd!, target);
         const tree = inRunTree(at);
         if (tree) {
           return {
@@ -313,8 +393,10 @@ export function treeGuard(
   if (submodule === 'ask') {
     return {
       verdict: 'ask', rule: 'Bash(git submodule:*)',
-      reason: `\`git submodule\` in ${where} runs inside a run worktree — \`update --init\` there turns its mounts into `
-        + 'clones the next rebuild cannot use. A person decides.',
+      reason: (where.startsWith('`')
+        ? `\`git submodule\` runs where ${where} points, which the guard cannot expand — it may be a run worktree, where `
+        : `\`git submodule\` in ${where} runs inside a run worktree — `)
+        + '`update --init` turns its mounts into clones the next rebuild cannot use. A person decides.',
     };
   }
   if (submodule === 'allow') {
@@ -1215,8 +1297,12 @@ const API_PATH_IN_TEXT = /(?:\/c\/[^\s/'"`]+)?\/api\/[^\s'"`<>)\]},;]*/g;
  * (`echo curl …`), never a program it runs.
  */
 const DATA_LEADS: ReadonlySet<string> = new Set(['echo', 'printf', 'grep', 'egrep', 'fgrep', 'cat', 'which', 'type', 'whereis']);
-/** A CLI press as text writes it: the program, then `run`'s flags or none, then the verb. */
-const CLI_IN_TEXT = /phase-console(?:\.mjs)?\b[^\n]*?\b(run|supervisor)\b(?:\s+--(?:json|console\s+\S+))*\s+([a-z][\w-]*)/g;
+/**
+ * A CLI press as text writes it: the program, then `run`'s flags or none, then
+ * the verb — and the word after it, flags between, since a three-word form
+ * names its own row (`run queue revert`, one-pool phase 39).
+ */
+const CLI_IN_TEXT = /phase-console(?:\.mjs)?\b[^\n]*?\b(run|supervisor)\b(?:\s+--(?:json|console\s+\S+))*\s+([a-z][\w-]*)(?:(?:\s+--(?:json|console\s+\S+))*\s+([a-z][\w-]*))?/g;
 /** A command line inside one argument word: optionally after `key=` or `--opt=`, and a git alias's `!`. */
 const EMBEDDED = /^\s*(?:-{0,2}[\w.-]+=)?!?((\S+)\s[\s\S]*)$/;
 /** Options whose value is prose — a commit message, a reason, a body — and never a command. */
@@ -1642,7 +1728,7 @@ function pressesInText(text: string, ports: ReadonlySet<number>): ConsoleForge[]
     }
   }
   for (const m of text.matchAll(CLI_IN_TEXT)) {
-    const form = cliFormOf([m[1] ?? '', m[2] ?? '']);
+    const form = cliFormOf([m[1] ?? '', m[2] ?? '', ...(m[3] ? [m[3]] : [])]);
     const row = form ? AUTHORITY_ROUTES.find((r) => r.cli.includes(form)) : undefined;
     if (row && form) out.push(routeForge(row, { cli: form }));
   }
@@ -3259,6 +3345,23 @@ export class Approvals {
       }
       this.settle(id, 'deny', 'run ended', 'the run ended before this was decided');
     }
+  }
+
+  /**
+   * A session ended (one-pool phase 24, #220): the tool cards its hook held open
+   * can never be answered to anyone, so they are settled now — `session ended`,
+   * never `timeout` — and a later clock cannot park the run on a dead session's
+   * call while the phase's next attempt works. A standing offer and a relayed
+   * question are not a session's hook, and stay (`disarm`'s rule).
+   */
+  retireSession(runId: string, phase: number): string[] {
+    const settled: string[] = [];
+    for (const [id, entry] of [...this.waiting]) {
+      const card = entry.approval;
+      if (card.runId !== runId || card.phase !== phase || card.kind !== 'tool' || card.standing) continue;
+      if (this.settle(id, 'deny', 'session ended', 'the session that asked ended before this was decided')) settled.push(id);
+    }
+    return settled;
   }
 
   /**

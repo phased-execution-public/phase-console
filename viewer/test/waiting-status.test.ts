@@ -327,7 +327,16 @@ test('WT-5: the Tower bays and the pushes read the same wait — the waiting bay
   assert.equal(waitSentence({ id: 'r', slug: 's', status: 'running' } as never, NOW), null);
 });
 
-test('WT-5: the push a waiting run sends is that sentence — the ref, the phase and the clock', () => {
+/**
+ * The hour WT-5 used to fail in (#246, #256): a park an hour out, made between
+ * 23:00 and 00:00 UTC, resumes on the next UTC day, and the sentence names that
+ * day. The clock is a fake one pinned there — `Date` alone, so the service's
+ * timers stay real — and the sentence is held to its exact words.
+ */
+const FORCED_LATE = Date.parse('2026-10-06T23:30:00.000Z');
+
+test('WT-5: the push a waiting run sends is that sentence — the ref, the phase and the clock', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: FORCED_LATE });
   const sv = new Service({
     port: 0, host: '127.0.0.1', open: false, allowWrites: false,
     scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
@@ -343,9 +352,9 @@ test('WT-5: the push a waiting run sends is that sentence — the ref, the phase
   };
   inner.notifications.clear('all');
   try {
-    // A live park an hour out: the clock is the real one here, because the
-    // service arms its resume from it.
+    // A live park an hour out, on the fake clock the service arms its resume from.
     const until = new Date(Date.now() + 3_600_000).toISOString();
+    assert.equal(until, '2026-10-07T00:30:00.000Z', 'the fake clock is not the one the test reads');
     const run = p28();
     const state = {
       ...run, status: 'waiting', waitUntil: until, lifecycle: undefined, spentUsd: 0, halt: null,
@@ -355,7 +364,9 @@ test('WT-5: the push a waiting run sends is that sentence — the ref, the phase
     assert.equal(pushed.length, 1);
     assert.equal(pushed[0]!.category, 'parked');
     assert.equal(pushed[0]!.message.title, 'observability-plane is waiting');
-    assert.match(pushed[0]!.message.body, /^Waiting on phase 28 · gh:acme\/web#run\/17843290511 · resumes \d\d:\d\dZ$/);
+    // The resume may fall on another UTC day, and then the clock carries it.
+    assert.match(pushed[0]!.message.body, /^Waiting on phase 28 · gh:acme\/web#run\/17843290511 · resumes (?:[A-Z][a-z]{2} \d{1,2} )?\d\d:\d\dZ$/);
+    assert.equal(pushed[0]!.message.body, 'Waiting on phase 28 · gh:acme/web#run/17843290511 · resumes Oct 7 00:30Z');
   } finally {
     sv.close();
   }
@@ -380,4 +391,150 @@ test('WT-5: a paused run is a wait exactly when its clock resumes it by itself �
   // `waitOnOf` names nothing for a run no phase waits in, and the first waiting phase otherwise.
   assert.equal(waitOnOf({ phases: {} } as never, 'external'), null);
   assert.match(waitOnOf(p28(), 'external') ?? '', /^phase 28 · gh:acme/);
+});
+
+/* ------------------------------------------------------------------ *
+ * #245 — a wait its clock SETTLED is still a wait (one-pool phase 23)
+ * ------------------------------------------------------------------ */
+
+const SETTLED_PLAN = `---
+slug: omega
+created: 2026-10-05
+status: active
+phases: 1
+---
+
+# omega
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | release | — | — | app | it ships |
+
+## Phases
+
+### Phase 1 — release
+- **Size:** S
+`;
+
+const ANA = { by: 'ana', via: 'api', origin: 'local', remoteUser: null, door: 'operator' } as never;
+
+async function settledHarness() {
+  const { newRun: mk, phaseRecord: rec, saveRun: save, loadRun: load, runDir: dir, settleWaitingRecords: settle } = await import('../server/runner/state.ts');
+  const { mkdirSync, existsSync } = await import('node:fs');
+  const root = mkdtempSync(join(tmpdir(), 'pc-settled-'));
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'omega.md'), SETTLED_PLAN, 'utf8');
+  const svc = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: true, allowRun: true,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  svc.push.announce = (() => {}) as typeof svc.push.announce;
+  assert.equal(svc.open(root).ok, true);
+  const starts: Record<string, unknown>[] = [];
+  (svc as never as Record<string, unknown>).startRun = async (slug: string, options: Record<string, unknown>) => {
+    starts.push({ slug, ...options });
+    return load(root, 'omega', String(options.resumeRunId), null);
+  };
+  const flag = join(root, 'p124-gate1.done');
+  // P124's shape: declared, the run paused by a person, the clock passed while
+  // it stood — settled to `pending` with the declaration kept.
+  const state = mk({ slug: 'omega', root });
+  const declaredAt = Date.now() - 3 * 3_600_000;
+  const clock = new Date(Date.now() - 3_600_000).toISOString();
+  Object.assign(state, { status: 'paused', stoppedBy: 'operator' });
+  Object.assign(rec(state, 1), {
+    status: 'waiting', attempts: 1, sessionId: 'sess-124', parkedUntil: clock,
+    declared: {
+      status: 'waiting-external', by: 'session', reason: 'its own detached gate', watch: [`cmd:"test -f ${flag}"`],
+      at: new Date(declaredAt).toISOString(), requested: clock,
+    },
+    watchState: { at: clock, refs: [{ ref: `cmd:"test -f ${flag}"`, scheme: 'cmd', state: 'pending', detail: 'exit 1', checkedAt: clock, runs: 14, nextDueAt: Date.now() + 40 * 60_000 }] },
+  });
+  const settled = settle(state, { journal: () => {} });
+  assert.equal(settled[0]?.to, 'pending', 'the clock settled it to pending');
+  save(state);
+  const journal = () => {
+    const file = join(dir(root, 'omega'), `run-${state.id}.jsonl`);
+    return existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  };
+  return {
+    root, svc, starts, flag, state, journal, load: () => load(root, 'omega', state.id, null)!,
+    cleanup: async () => { await svc.close(); rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+test('WT-245a: the settled note names the acts that move the phase — the watch and the phase\'s own Resume, never a relaunch', async () => {
+  const h = await settledHarness();
+  try {
+    const note = h.load().phases['1'].note ?? '';
+    assert.match(note, /its refs are still watched and a landing resumes the session/);
+    assert.match(note, /Resume the phase to board its own session now/);
+    assert.doesNotMatch(note, /a relaunch resumes/, 'a relaunch never boards a phase the board reads in progress');
+    assert.ok(h.load().phases['1'].declared, 'the declaration stands');
+  } finally { await h.cleanup(); }
+});
+
+test('WT-245b: a person\'s Resume re-asks a settled wait\'s ref — pending, it refuses naming the ref and the door; never a 200 that re-parks', async () => {
+  const h = await settledHarness();
+  try {
+    const answer = await h.svc.resumeRun('omega', ANA);
+    assert.equal(answer.ok, false, 'not a 200: the relaunch could only re-park the run nothing-ready');
+    assert.equal(!answer.ok && answer.status, 409);
+    assert.match(!answer.ok ? answer.error : '', /phase 1 waits on cmd:"test -f .*\(pending: exit 1\), which has not landed/);
+    assert.match(!answer.ok ? answer.error : '', /Resume the phase to board its own session now/);
+    assert.equal(h.starts.length, 0);
+  } finally { await h.cleanup(); }
+});
+
+test('WT-245c: landed, the settled wait is cut — back to an expired wait the loop resumes in its own session', async () => {
+  const h = await settledHarness();
+  try {
+    writeFileSync(h.flag, 'exit=1\n');
+    const answer = await h.svc.resumeRun('omega', ANA);
+    assert.equal(answer.ok, true, answer.ok ? '' : answer.error);
+    assert.equal(h.starts.length, 1);
+    const record = h.load().phases['1'];
+    assert.equal(record.status, 'waiting', 'an expired wait, which the loop admits and resumes');
+    assert.ok(record.parkedUntil && Date.parse(record.parkedUntil) <= Date.now());
+    assert.equal(record.resumeSessionId ?? record.sessionId, 'sess-124', 'its own session');
+    const cut = h.journal().filter((e) => e.event === 'phase.wait-cut');
+    assert.equal(cut.length, 1);
+    assert.match(String(cut[0].data.ref), /test -f/);
+  } finally { await h.cleanup(); }
+});
+
+test('WT-245d: a Resume that leaves a wait standing resets its watch — the row due now, the back-off from the press', async () => {
+  const h = await settledHarness();
+  try {
+    // Another phase is ready, so the Resume goes through with phase 1 still waiting.
+    const board = (h.svc as never as { board: (slug: string) => Promise<unknown> });
+    board.board = async () => ({ ready: [2], error: undefined });
+    const before = Date.now();
+    const answer = await h.svc.resumeRun('omega', ANA);
+    assert.equal(answer.ok, true, answer.ok ? '' : answer.error);
+    const record = h.load().phases['1'];
+    assert.equal(record.status, 'pending', 'still the settled wait — its ref has not landed');
+    assert.ok(record.watchResetAt && Date.parse(record.watchResetAt) >= before - 1000, 'the reset is stamped');
+    const row = record.watchState!.refs[0]!;
+    assert.ok(row.nextDueAt! <= Date.now(), 'its row is due now, not in forty minutes');
+  } finally { await h.cleanup(); }
+});
+
+test('WT-245e: a Resume never runs a cmd: ref the CONSOLE minted unless the operator allowed minted refs (SLF-8)', async () => {
+  const h = await settledHarness();
+  try {
+    const { loadRun: load, saveRun: save } = await import('../server/runner/state.ts');
+    const run = load(h.root, 'omega', h.state.id, null)!;
+    const marker = join(h.root, 'minted-ran');
+    const minted = `cmd:"touch ${marker}"`;
+    run.phases['1'].declared = { ...run.phases['1'].declared!, watch: [minted], minted: [minted] } as never;
+    save(run);
+    const answer = await h.svc.resumeRun('omega', ANA);
+    assert.equal(answer.ok, false);
+    assert.match(!answer.ok ? answer.error : '', /names no ref the console may check/);
+    const { existsSync } = await import('node:fs');
+    assert.equal(existsSync(marker), false, 'the minted command was never run');
+  } finally { await h.cleanup(); }
 });

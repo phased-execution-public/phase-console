@@ -410,6 +410,12 @@ const ROUTES: readonly SurfaceRow[] = [
     '/api/notifications/read',
     at(shell('bell'), 'api/notifications#notificationsApi.markNotificationsRead'),
   ),
+  // The Announcements bar's *Put back* (#334): unread again, never a delete.
+  route(
+    'POST',
+    '/api/notifications/unread',
+    at(shell('bell'), 'api/notifications#notificationsApi.markNotificationsUnread'),
+  ),
   route(
     'DELETE',
     '/api/notifications',
@@ -447,14 +453,18 @@ const ROUTES: readonly SurfaceRow[] = [
   route('POST', '/api/mcp', at(settings('mcp'), 'api/mcp#mcpApi.mcpAdd'), mcpFlag),
   route('DELETE', '/api/mcp/:id', at(settings('mcp'), 'api/mcp#mcpApi.mcpDelete'), mcpFlag),
   // A rename is the patch's `label`; a sign-in for a profile account names it (phase 23).
+  // `vars` is the row's *Fill it in* and the verb's `mcp fill` (one-pool phase 19, #363).
   route('PATCH', '/api/mcp/:id', at(settings('mcp'), 'api/mcp#mcpApi.mcpPatch'), {
     ...mcpFlag,
-    options: ['label'],
+    options: ['label', 'vars'],
   }),
   route('POST', '/api/mcp/:id/login', at(settings('mcp'), 'api/mcp#mcpApi.mcpLogin'), {
     ...mcpFlag,
     options: ['accountId'],
   }),
+  // The guided sign-in (one-pool phase 19, #372): its steps, and the paste-back.
+  route('GET', '/api/mcp/:id/login', at(settings('mcp'), 'mcp#useMcpLoginFlow')),
+  route('POST', '/api/mcp/:id/login/paste', at(settings('mcp'), 'api/mcp#mcpApi.mcpLoginPaste'), mcpFlag),
   route('POST', '/api/mcp/:id/acknowledge', at(settings('mcp'), 'api/mcp#mcpApi.mcpAcknowledge')),
 
   /* Claude accounts. The breaker's two verbs and the credits switch are Settings ▸ Accounts' in both editions (phase 22). */
@@ -781,6 +791,10 @@ const ROUTES: readonly SurfaceRow[] = [
   route('POST', '/api/run/:slug/isolate', at(runView, 'api/runs#runsApi.runIsolate'), runFlag),
   route('POST', '/api/run/:slug/isolate-phase', at(runView, 'api/runs#runsApi.runIsolatePhase'), runFlag),
   route('POST', '/api/run/:slug/errand-tree', at(runView, 'api/runs#runsApi.runErrandTree'), runFlag),
+  route('POST', '/api/run/:slug/verify-waive', at(runView, 'api/runs#runsApi.runVerifyWaive'), {
+    ...runFlag,
+    authority: 'override',
+  }),
   route('POST', '/api/run/:slug/delegate', at(runView, 'api/runs#runsApi.runDelegate'), {
     ...runFlag,
     authority: 'trust',
@@ -874,11 +888,12 @@ const PREFS: readonly SurfaceRow[] = [
       'viewer/server/config.ts',
     ),
   ),
-  // The four person-wide keys (`config.json`): the browser keeps its own theme and density
+  // The five person-wide keys (`config.json`): the browser keeps its own theme, density and palette
   // (`browser.*`), so Everything is the server's pair's one door; Appearance writes the model
   // a session plan is sized for and the library's order, which the library writes too.
   everything('theme'),
   everything('density'),
+  everything('palette'),
   setting('model', at(settings('appearance'), SAVE_PREFS)),
   setting('sort', at(settings('appearance'), SAVE_PREFS)),
   automationKey('attachDefaultSkills'),
@@ -1060,6 +1075,7 @@ const RUN_FIELDS: readonly SurfaceRow[] = [
 const BROWSER: readonly SurfaceRow[] = [
   setting('browser.theme', at(settings('appearance'))),
   setting('browser.density', at(settings('appearance'))),
+  setting('browser.palette', at(settings('appearance'))),
   // The right panel's width, mode and whether it stands (7.0): set by the panel
   // itself — its edge, its segmented control, its close — never from a page.
   setting('browser.panel', at(shell('panel'))),
@@ -1201,6 +1217,7 @@ const VERBS: readonly SurfaceRow[] = [
   verb('isolate-phase', at(runView, 'api/runs#runsApi.runIsolatePhase'), runFlag),
   verb('errand-tree', at(runView, 'api/runs#runsApi.runErrandTree'), runFlag),
   verb('delegate', at(runView, 'api/runs#runsApi.runDelegate'), { ...runFlag, authority: 'trust' }),
+  verb('verify-waive', at(runView, 'api/runs#runsApi.runVerifyWaive'), { ...runFlag, authority: 'override' }),
   verb('errand-answered', at(runView, 'api/runs#runsApi.runErrandAnswered'), runFlag),
   verb('plan-approval', at(runView, 'api/runs#runsApi.runPlanDecision'), {
     ...runFlag,

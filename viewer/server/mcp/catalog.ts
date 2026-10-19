@@ -7,8 +7,9 @@
  *     package was verified reachable when it was added. It works offline, which
  *     matters because the console is a localhost tool and the catalog is most
  *     useful exactly when somebody is setting a machine up.
- *  2. **The official registry** at `registry.modelcontextprotocol.io`, searched
- *     on demand. Thousands of servers, published by anyone. Results are marked
+ *  2. **The official registry** at `registry.modelcontextprotocol.io`, read
+ *     whole into a cached copy in the background and searched locally
+ *     (`RegistryCatalog`, #363). Thousands of servers, published by anyone. Results are marked
  *     as such and never merged into the curated set, because "in the registry"
  *     is a statement about publication, not about trust.
  *
@@ -23,8 +24,11 @@
  * by being the ones a coding agent actually reaches for.
  */
 
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+
 import { log } from '../log.ts';
-import type { McpSecretRef, McpTransport } from './store.ts';
+import { MCP_DIR, type McpSecretRef, type McpTransport } from './store.ts';
 
 export type CatalogEntry = {
   /** The id this would register under, and the token a plan would name. */
@@ -207,62 +211,240 @@ export function searchCurated(query: string): CatalogEntry[] {
     || entry.description.toLowerCase().includes(needle));
 }
 
+/** Where the registry half of the catalog stands, said with the answer. */
+export type RegistryState = {
+  /**
+   * `fresh` — read within `REGISTRY_TTL_MS`; `stale` — older, a refresh is
+   * running behind; `refreshing` — no copy yet, the first read is running;
+   * `unavailable` — no copy, and the last read failed (`error` says why).
+   */
+  state: 'fresh' | 'stale' | 'refreshing' | 'unavailable';
+  /** When the copy searched was read from the registry. */
+  fetchedAt?: string;
+  /** How many servers the copy holds. */
+  count: number;
+  /** The last read's failure, when it failed. */
+  error?: string;
+};
+
 export type CatalogResult = {
   entries: CatalogEntry[];
-  /** Set when the registry could not be reached — the entries are curated only. */
+  /** The registry copy this answer searched, and whether it is being read again. */
+  registry?: RegistryState;
+  /** Set when there is no registry copy to search — the entries are curated only. */
   registryError?: string;
 };
 
 const REGISTRY_URL = 'https://registry.modelcontextprotocol.io/v0/servers';
-const REGISTRY_TIMEOUT_MS = 8_000;
 
 /**
- * Curated matches first, then whatever the official registry adds.
+ * The registry is read whole, a page at a time, and searched HERE (#363).
  *
- * `version=latest` matters: without it the registry returns every published
- * version of every server and the list reads as duplicates.
+ * Its own search (`?search=`) is slow at the registry — 13.7 to 29.8 s
+ * measured on 2026-10-14 — while a bare page answers in well under three, so
+ * the 8 s timeout the search ran under failed every query and the catalog
+ * never found anything outside the curated list. Paging the list into a cache
+ * costs a minute in the background once a day, and a search is then a read of
+ * a local file: no network, no timeout, on the request path never.
+ */
+export const REGISTRY_CACHE_FILE = join(MCP_DIR, 'registry.json');
+/** A copy younger than this is searched as it is; an older one is read again behind. */
+export const REGISTRY_TTL_MS = 24 * 60 * 60_000;
+/** One page's wall clock — a page, never a search, so a slow one is a slow registry. */
+export const REGISTRY_PAGE_TIMEOUT_MS = 30_000;
+/** Servers per page: the registry's own ceiling. */
+const REGISTRY_PAGE_LIMIT = 100;
+/** A bound on the walk, so a cursor that never ends cannot read for ever. */
+const REGISTRY_MAX_PAGES = 400;
+/** How many registry matches one answer carries. */
+const REGISTRY_RESULT_LIMIT = 50;
+
+type RegistryCacheFile = {
+  version: 1;
+  fetchedAt: string;
+  /** False when the walk stopped at its page bound. */
+  complete: boolean;
+  entries: CatalogEntry[];
+};
+
+/**
+ * The registry, cached at `<instance state>/mcp/registry.json`.
+ *
+ * Single-flight: one read of the registry at a time, whoever asks. A read
+ * that fails keeps the copy it would have replaced, so a registry that is down
+ * today costs a day-old answer rather than none. A cache that cannot be read
+ * is no copy at all, never an error.
+ */
+export class RegistryCatalog {
+  private readonly file: string;
+  private readonly fetchFn: typeof fetch;
+  private readonly now: () => number;
+  private readonly ttlMs: number;
+  private copy: RegistryCacheFile | null | undefined;
+  private inFlight: Promise<void> | null = null;
+  private lastError: string | undefined;
+
+  constructor(opts: { file?: string; fetchFn?: typeof fetch; now?: () => number; ttlMs?: number } = {}) {
+    this.file = opts.file ?? REGISTRY_CACHE_FILE;
+    this.fetchFn = opts.fetchFn ?? ((...args) => fetch(...args));
+    this.now = opts.now ?? Date.now;
+    this.ttlMs = opts.ttlMs ?? REGISTRY_TTL_MS;
+  }
+
+  /** The copy on disk, read once and kept. */
+  private read(): RegistryCacheFile | null {
+    if (this.copy !== undefined) return this.copy;
+    try {
+      const parsed = JSON.parse(readFileSync(this.file, 'utf8')) as RegistryCacheFile;
+      this.copy = parsed?.version === 1 && Array.isArray(parsed.entries) && typeof parsed.fetchedAt === 'string'
+        ? parsed : null;
+    } catch {
+      this.copy = null;
+    }
+    return this.copy;
+  }
+
+  /** Where the copy stands — what every answer says beside its entries. */
+  state(): RegistryState {
+    const copy = this.read();
+    if (!copy) {
+      return this.inFlight
+        ? { state: 'refreshing', count: 0 }
+        : { state: 'unavailable', count: 0, ...(this.lastError ? { error: this.lastError } : {}) };
+    }
+    const stale = this.now() - Date.parse(copy.fetchedAt) >= this.ttlMs;
+    return {
+      state: stale ? 'stale' : 'fresh',
+      fetchedAt: copy.fetchedAt,
+      count: copy.entries.length,
+      ...(this.lastError ? { error: this.lastError } : {}),
+    };
+  }
+
+  /**
+   * Start a read of the registry behind the caller when the copy is missing
+   * or old, and return at once. True when one was started.
+   */
+  ensureFresh(): boolean {
+    if (this.inFlight) return false;
+    const copy = this.read();
+    if (copy && this.now() - Date.parse(copy.fetchedAt) < this.ttlMs) return false;
+    void this.refresh();
+    return true;
+  }
+
+  /** Read the whole registry, page by page, and replace the copy. Shared by concurrent callers. */
+  refresh(): Promise<void> {
+    this.inFlight ??= this.walk().finally(() => { this.inFlight = null; });
+    return this.inFlight;
+  }
+
+  private async walk(): Promise<void> {
+    const started = this.now();
+    // Seeded from the WHOLE curated list. `known` is a collision guard on the
+    // id a server would register under: a registry row never takes a name out
+    // of the curated namespace (a third party's server published as `github`
+    // would otherwise resolve every plan naming `github` to somebody else's
+    // command), and the first row to claim any other id keeps it.
+    const known = new Set(CURATED.map((entry) => entry.id));
+    const entries: CatalogEntry[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    try {
+      do {
+        // `version=latest` matters: without it the registry returns every
+        // published version of every server and the list reads as duplicates.
+        const url = `${REGISTRY_URL}?version=latest&limit=${REGISTRY_PAGE_LIMIT}`
+          + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+        const response = await this.fetchFn(url, { signal: AbortSignal.timeout(REGISTRY_PAGE_TIMEOUT_MS) });
+        if (!response.ok) throw new Error(`the registry answered ${response.status}`);
+        const body = await response.json() as { servers?: unknown; metadata?: { nextCursor?: unknown } };
+        for (const row of Array.isArray(body?.servers) ? body.servers : []) {
+          const entry = fromRegistry(row);
+          if (entry && !known.has(entry.id)) {
+            known.add(entry.id);
+            entries.push(entry);
+          }
+        }
+        const next = body?.metadata?.nextCursor;
+        cursor = typeof next === 'string' && next && next !== cursor ? next : undefined;
+        pages += 1;
+      } while (cursor && pages < REGISTRY_MAX_PAGES);
+    } catch (error) {
+      // Degrade, never fail: the copy we have stays, and the curated list is
+      // the answer to most questions anyway.
+      this.lastError = (error as Error).message;
+      log.warn('mcp.catalog.refresh-failed', { error: this.lastError, pages, servers: entries.length });
+      return;
+    }
+    const copy: RegistryCacheFile = {
+      version: 1,
+      fetchedAt: new Date(this.now()).toISOString(),
+      complete: !cursor,
+      entries,
+    };
+    try {
+      mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
+      const tmp = `${this.file}.tmp`;
+      writeFileSync(tmp, `${JSON.stringify(copy)}\n`, { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmp, this.file);
+    } catch (error) {
+      // The copy is still good in memory; the next console start reads again.
+      log.warn('mcp.catalog.write-failed', { error: (error as Error).message });
+    }
+    this.copy = copy;
+    this.lastError = undefined;
+    log.info('mcp.catalog.refreshed', { pages, servers: entries.length, ms: Math.max(0, this.now() - started), complete: copy.complete });
+  }
+
+  /** The copy's matches for a query, best first. Empty when there is no copy or no query. */
+  search(query: string, limit = REGISTRY_RESULT_LIMIT): CatalogEntry[] {
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const copy = this.read();
+    if (!copy || !words.length) return [];
+    const scored: { entry: CatalogEntry; score: number }[] = [];
+    for (const entry of copy.entries) {
+      const id = entry.id;
+      const label = entry.label.toLowerCase();
+      const name = (entry.registryName ?? '').toLowerCase();
+      const text = `${id} ${label} ${name} ${entry.description.toLowerCase()}`;
+      if (!words.every((word) => text.includes(word))) continue;
+      const first = words[0]!;
+      const score = id === first || label === first ? 0
+        : id.startsWith(first) || label.startsWith(first) ? 1
+          : id.includes(first) || label.includes(first) || name.includes(first) ? 2 : 3;
+      scored.push({ entry, score });
+    }
+    scored.sort((a, b) => a.score - b.score || a.entry.id.localeCompare(b.entry.id));
+    return scored.slice(0, limit).map((item) => item.entry);
+  }
+}
+
+/** The console's one copy of the registry. */
+export const registryCatalog = new RegistryCatalog();
+
+/**
+ * Curated matches first, then the registry copy's.
+ *
+ * Never waits on the network: the registry half is the cached copy, and a
+ * missing or old copy is read again BEHIND this answer — the answer says so
+ * (`registry.state`), and the page asks again once the read is done.
  */
 export async function searchCatalog(
   query: string,
-  opts: { limit?: number; fetchFn?: typeof fetch; includeRegistry?: boolean } = {},
+  opts: { limit?: number; includeRegistry?: boolean; registry?: RegistryCatalog } = {},
 ): Promise<CatalogResult> {
   const curated = searchCurated(query);
-  if (opts.includeRegistry === false || !query.trim()) return { entries: curated };
-
-  // Seeded from the WHOLE curated list, not from the entries this query
-  // matched. `known` is a collision guard on the id a server would register
-  // under, and an id collides whether or not the current search happened to
-  // surface the curated entry it collides with. Seeding it from `curated` meant
-  // a search for anything that did not match a curated row let a registry
-  // result claim that row's id: search "issues", get a third party's server
-  // published as `github`, register it, and every plan on this machine whose
-  // §Session budget names `github` now resolves to somebody else's command.
-  // The curated list is the trusted namespace; the registry never takes a name
-  // out of it, whatever was typed.
-  const known = new Set(CURATED.map((entry) => entry.id));
-  try {
-    const doFetch = opts.fetchFn ?? fetch;
-    const url = `${REGISTRY_URL}?search=${encodeURIComponent(query.trim())}`
-      + `&version=latest&limit=${Math.min(opts.limit ?? 20, 50)}`;
-    const response = await doFetch(url, { signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS) });
-    if (!response.ok) throw new Error(`the registry answered ${response.status}`);
-    const body = await response.json() as { servers?: unknown };
-    const found = Array.isArray(body?.servers) ? body.servers : [];
-    const entries: CatalogEntry[] = [];
-    for (const row of found) {
-      const entry = fromRegistry(row);
-      if (entry && !known.has(entry.id)) {
-        known.add(entry.id);
-        entries.push(entry);
-      }
-    }
-    return { entries: [...curated, ...entries] };
-  } catch (error) {
-    // Degrade, never fail: the curated list is the answer to most questions and
-    // the operator's own reason for opening this page does not need the network.
-    log.warn('mcp.catalog.registry-unreachable', { error: (error as Error).message });
-    return { entries: curated, registryError: (error as Error).message };
-  }
+  if (opts.includeRegistry === false) return { entries: curated };
+  const registry = opts.registry ?? registryCatalog;
+  registry.ensureFresh();
+  const state = registry.state();
+  const found = query.trim() ? registry.search(query, Math.min(opts.limit ?? REGISTRY_RESULT_LIMIT, 100)) : [];
+  return {
+    entries: [...curated, ...found],
+    registry: state,
+    ...(state.state === 'unavailable' && state.error ? { registryError: state.error } : {}),
+  };
 }
 
 type RegistryRow = {
@@ -271,6 +453,7 @@ type RegistryRow = {
     title?: unknown;
     description?: unknown;
     websiteUrl?: unknown;
+    repository?: unknown;
     remotes?: unknown;
     packages?: unknown;
   };
@@ -295,7 +478,10 @@ function fromRegistry(row: unknown): CatalogEntry | null {
 
   const label = typeof server.title === 'string' && server.title.trim() ? server.title : id;
   const description = typeof server.description === 'string' ? server.description : '';
-  const homepage = typeof server.websiteUrl === 'string' ? server.websiteUrl : undefined;
+  // Many registry rows carry only a repository; it is the docs link then (#363).
+  const repository = (server.repository as { url?: unknown } | undefined)?.url;
+  const homepage = typeof server.websiteUrl === 'string' ? server.websiteUrl
+    : typeof repository === 'string' && /^https:\/\//.test(repository) ? repository : undefined;
 
   const remotes = Array.isArray(server.remotes) ? server.remotes : [];
   for (const remote of remotes as { type?: unknown; url?: unknown; headers?: unknown }[]) {

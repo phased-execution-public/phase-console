@@ -8,7 +8,7 @@
  */
 
 import { useSyncExternalStore } from 'react';
-import type { DENSITIES, THEMES } from '@shared/prefs-model.js';
+import type { DENSITIES, PALETTES, THEMES } from '@shared/prefs-model.js';
 
 const KEY = 'phase-console.ui';
 
@@ -16,6 +16,7 @@ const KEY = 'phase-console.ui';
 export type Theme = (typeof THEMES)[number];
 /** How much room a row takes — the owner is the same file. */
 export type Density = (typeof DENSITIES)[number];
+export type Palette = (typeof PALETTES)[number];
 
 /**
  * What an operator made of one grid table, kept by its `tableId`
@@ -65,6 +66,8 @@ export const PANEL_WIDTH = { min: 320, initial: 400, max: 640 } as const;
 export interface Prefs {
   theme: Theme;
   density: Density;
+  /** The room — Quiet or Departures (#362); see `applyPalette`. */
+  palette: Palette;
   /** See `PanelPref`. */
   panel: PanelPref;
   /** How the plan list is ordered — see `views/plans/model.ts` `SORTS`. */
@@ -262,6 +265,7 @@ export interface Prefs {
 const DEFAULTS: Prefs = {
   theme: 'system',
   density: 'comfortable',
+  palette: 'quiet',
   // Closed until something is inspected: a page is one calm column, and an
   // empty panel beside it is chrome.
   panel: { open: false, width: PANEL_WIDTH.initial, mode: 'details' },
@@ -332,6 +336,7 @@ export function setPrefs(patch: Partial<Prefs>): void {
   }
   if (patch.theme) applyTheme(state.theme);
   if (patch.density) applyDensity(state.density);
+  if (patch.palette) applyPalette(state.palette);
   for (const notify of listeners) notify();
 }
 
@@ -378,4 +383,16 @@ export function applyDensity(density: Prefs['density']): void {
   const root = document.documentElement;
   if (density === 'compact') root.setAttribute('data-density', 'compact');
   else root.removeAttribute('data-density');
+}
+
+/**
+ * The palette switch (#362) — the third twin of `applyTheme`. `departures`
+ * sets `data-palette` on the root, which re-declares only the room tokens
+ * (`styles/departures.css`); `quiet` is the absence of the attribute, so the
+ * shipped room needs no rule to win. Anything else stored reads as `quiet`.
+ */
+export function applyPalette(palette: Prefs['palette']): void {
+  const root = document.documentElement;
+  if (palette === 'departures') root.setAttribute('data-palette', 'departures');
+  else root.removeAttribute('data-palette');
 }

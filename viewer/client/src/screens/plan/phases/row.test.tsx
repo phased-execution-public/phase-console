@@ -244,4 +244,10 @@ describe('<PhaseMark>', () => {
     render(<PhaseMark slug="demo" phase={4} state="in-progress" live={{ via: 'run' }} />);
     expect(screen.getByRole('link')).toHaveAttribute('href', '#/plan/demo/run?lane=p4');
   });
+  it('draws the phase status as a badge — the headline of its row (#361)', () => {
+    const { container } = render(<PhaseMark slug="demo" phase={4} state="stuck" />);
+    const mark = container.querySelector<HTMLElement>('[data-status="stuck"]')!;
+    expect(mark.dataset.chrome).toBe('badge');
+    expect(mark.querySelector('svg[data-icon]')).not.toBeNull();
+  });
 });

@@ -13,7 +13,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { VERIFY_STATES } from '@shared/console-model.js';
@@ -323,7 +323,11 @@ describe('the verification, while it runs', () => {
         })}
       />,
     );
-    expect(screen.getByTitle('It started, and no result was recorded')).toHaveTextContent('Unknown');
+    // The status's own sentence is in its tooltip (#365), said on focus as on hover.
+    const unknown = screen.getByText('Unknown').closest<HTMLElement>('[data-status]')!;
+    fireEvent.keyDown(window, { key: 'Tab' }); // a keyboard reader's focus follows a key
+    fireEvent.focus(unknown);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('It started, and no result was recorded');
   });
 
   it('draws on its own, with no session activity at all', () => {

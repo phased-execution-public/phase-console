@@ -5,20 +5,17 @@
  * the fleet's merged list compose their sentence the same way.
  */
 
-/** What the headline is composed from — counts, the oldest open item, and how many were handled. */
+/** What the headline is composed from — counts only (#377): it never quotes an item's title. */
 export type HeadlineFacts = {
-  /** Items that need the person now: *Do now* and *Decide*. */
+  /** Items that are the person's to do now: *Approve*, *Do now* and *Decide*. */
   open: number;
   checking: number;
   upcoming: number;
+  /** Items settled in the last day — *Done*. */
+  done: number;
   handled: number;
   /** Is `handled` counted since the person's last look (`seen`) or over the last day? */
   handledSince: 'seen' | 'day';
-  /** The oldest open item: its title, since when, and the lanes it holds. */
-  oldest: { title: string; since: string; holds: readonly { slug: string; phase: number }[] } | null;
-  now: number;
-  /** Name the plan of every lane, even when there is one — the fleet's list, where lanes span consoles. */
-  namePlans?: boolean;
 };
 
 /** "3 h", "12 min", "2 days" — how long something has waited, in one unit. */
@@ -45,28 +42,22 @@ export function holdsWords(lanes: readonly { slug: string; phase: number }[], na
 
 /**
  * The headline, by RULES (§Architecture 19; the fourth addendum's ruling on
- * summaries — nothing on the page is written by a model):
- *   1. how many need the person now, and the oldest — its title, how long it
- *      has waited and what it holds; "Nothing needs you now" when none does;
+ * summaries — nothing on the page is written by a model). It COUNTS, and never
+ * quotes a title (#377: a quoted title was cut mid-word and repeated what the
+ * card below already says):
+ *   1. how many are the person's to do now — "Nothing needs you now" when none is;
  *   2. how many are being checked;
  *   3. how many are coming up;
- *   4. how many were handled since the person last looked (or in the last day).
- * Parts with nothing to say are left out; the parts are joined by " · ".
+ *   4. how many were done today;
+ *   5. how many the AI handled since the person last looked (or in the last day).
+ * Parts with nothing to say are left out; the parts are joined by " · ":
+ * "1 to do now · 5 coming up · 6 done today."
  */
 export function headlineOf(facts: HeadlineFacts): string {
-  const parts: string[] = [];
-  if (!facts.open) parts.push('Nothing needs you now');
-  else {
-    const oldest = facts.oldest;
-    const title = oldest ? (oldest.title.length > 60 ? `${oldest.title.slice(0, 59)}…` : oldest.title) : '';
-    const holds = oldest ? holdsWords(oldest.holds, facts.namePlans) : '';
-    const waited = oldest ? `has waited ${waitedWords(facts.now - Date.parse(oldest.since))}${holds ? ` and holds ${holds}` : ''}` : '';
-    if (facts.open === 1) parts.push(oldest ? `1 needs you now: ${title} ${waited}` : '1 needs you now');
-    else parts.push(oldest ? `${facts.open} need you now — the oldest (${title}) ${waited}` : `${facts.open} need you now`);
-  }
-  if (facts.checking) parts.push(`${facts.checking} ${facts.checking === 1 ? 'is' : 'are'} being checked`);
+  const parts: string[] = [facts.open ? `${facts.open} to do now` : 'Nothing needs you now'];
+  if (facts.checking) parts.push(`${facts.checking} being checked`);
   if (facts.upcoming) parts.push(`${facts.upcoming} coming up`);
+  if (facts.done) parts.push(`${facts.done} done today`);
   if (facts.handled) parts.push(`${facts.handled} handled ${facts.handledSince === 'seen' ? 'since you last looked' : 'in the last day'}`);
   return `${parts.join(' · ')}.`;
 }
-

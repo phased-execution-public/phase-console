@@ -25,6 +25,7 @@ import { ActionsTab } from '@/shell/panel/actions-tab';
 import { inspect } from '@/shell/panel/inspector-host';
 import { KeyValue, Mono, Skeleton, type KeyValueItem } from '@/ui';
 import { OpsStatus } from '@/ui/status';
+import { PanelCard } from './panel-card';
 
 const link = 'tap-row text-ink underline decoration-rule-strong underline-offset-2 hover:decoration-ink';
 
@@ -207,10 +208,12 @@ export function approvalIdOf(item: Pick<TurnItem, 'actions' | 'permission'>): st
 /**
  * Show the item in the panel. `open: false` hands the panel the record without
  * opening it — what `#/turn/<id>` does where the panel would cover the card.
+ * `card: true` is the list's selection (one-pool phase 14, #377): the panel's
+ * Overview is the item's whole card, live, with its record folded under it.
  */
 export function inspectItem(
   { item, record }: { item: TurnItem; record: HumanStepRecord | undefined },
-  options: { open?: boolean } = {},
+  options: { open?: boolean; card?: boolean } = {},
 ): void {
   const state = record?.state ?? item.step?.state ?? item.humanStep?.state ?? 'notified';
   const risk = item.permission?.risk ?? item.step?.permission?.risk ?? record?.permission?.risk;
@@ -229,11 +232,11 @@ export function inspectItem(
           <Mono value={item.item} chars={16} copyable />
         </>
       ),
-      overview: <ExplainOverview item={item} record={record} />,
+      overview: options.card ? <PanelCard id={item.item} /> : <ExplainOverview item={item} record={record} />,
       ...(card ? { actions: <ActionsTab kind="approval" args={{ id: card }} /> } : {}),
       ...(record ? { history: <ItemHistory record={record} /> } : {}),
       raw: JSON.stringify(record ?? item, null, 2),
     },
-    options,
+    options.open === undefined ? {} : { open: options.open },
   );
 }

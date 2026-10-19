@@ -77,7 +77,9 @@ test('every class has a title, a label naming the mechanism, and a blurb naming 
     assert.match(RECOVERY_LABELS[cls], /new agent/, `${cls} label must say it is a NEW agent`);
     assert.ok(RECOVERY_BLURBS[cls].length > 60, cls);
     assert.match(RECOVERY_BLURBS[cls], /Costs a full session/, `${cls} blurb must state the cost`);
-    assert.match(RECOVERY_BLURBS[cls], /Agent tab/, `${cls} blurb must say where to watch it`);
+    // 7.0 has no Agent tab: the session opens on Sessions (#334).
+    assert.match(RECOVERY_BLURBS[cls], /watch it on Sessions\./, `${cls} blurb must say where to watch it`);
+    assert.doesNotMatch(RECOVERY_BLURBS[cls], /Agent tab/, `${cls} blurb names a tab 7.0 does not have`);
   }
 });
 

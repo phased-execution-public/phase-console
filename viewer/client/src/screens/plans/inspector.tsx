@@ -32,7 +32,14 @@ function overviewOf(row: PlanRow) {
       <PlanLine row={row} />
       <KeyValue
         items={[
-          ['Status', row.isPlan ? <PlanStatus status={row.status as WordOf<'plan'>} /> : kindWord(row)],
+          [
+            'Status',
+            row.isPlan ? (
+              <PlanStatus status={row.status as WordOf<'plan'>} chrome="badge" data-testid="plan-status" />
+            ) : (
+              kindWord(row)
+            ),
+          ],
           row.isClosed && (['Closed', closedTitle(row).split('\n\n').slice(0, 2).join(' ')] as const),
           Boolean(row.run) && (['Run', <RunLink key="run" row={row} />] as const),
           row.phases > 0 && (['Phases', reading.text] as const),

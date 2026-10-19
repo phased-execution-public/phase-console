@@ -183,9 +183,18 @@ const EDITED_UNDER: readonly (readonly [string, { href: string; where: string; r
   ['retention.', { href: settingsHref('instance'), where: 'This instance' }],
 ];
 
+/**
+ * Keys a section draws though their schema group belongs to another (one-pool
+ * phase 9): the pool's policy and the catalog's price corrections are the pool
+ * desk's, Settings ▸ Accounts. Linked as where each is changed; each stays
+ * editable here as its type allows.
+ */
+const DRAWN_IN: Readonly<Record<string, { href: string; where: string }>> = {
+};
+
 /** Where a key's own section draws it, if one does. */
 function editedIn(key: string): { href: string; where: string; readOnly?: true } | undefined {
-  return EDITED_IN[key] ?? EDITED_UNDER.find(([prefix]) => key.startsWith(prefix))?.[1];
+  return EDITED_IN[key] ?? DRAWN_IN[key] ?? EDITED_UNDER.find(([prefix]) => key.startsWith(prefix))?.[1];
 }
 
 /** Whether the row's own control can edit it here: a writable plain value. */

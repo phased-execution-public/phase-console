@@ -274,6 +274,8 @@ export const CAUSE_SENTENCE = Object.freeze({
   'verify-timeout': 'A verification command ran past its time limit twice.',
   'isolation-refused': 'The run asked for a checkout of its own and could not have one.',
   unlanded: 'Every phase is done, but the run’s branch is not on its trunk yet.',
+  'run-tree-config': 'A session changed its tree’s git configuration in a way the console will not run.',
+  'run-tree-locked': 'A git lock file nothing is writing blocks the run’s tree.',
 });
 
 /**
@@ -514,6 +516,9 @@ export function haltReasonOf(halt) {
  */
 export function haltSentence(halt) {
   if (!halt) return undefined;
+  // A reached spend cap is told in the composer's own line (one-pool phase 11), whatever the kind's sentence.
+  const capLine = /** @type {{ cap?: { line?: unknown } }} */ (halt).cap?.line;
+  if (typeof capLine === 'string' && capLine) return capLine;
   if (halt.kind && isHaltKind(halt.kind)) return CAUSE_SENTENCE[halt.kind];
   return haltReasonOf(halt) ?? UNKINDED_SENTENCE;
 }

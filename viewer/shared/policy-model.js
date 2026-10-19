@@ -212,10 +212,12 @@ export const POLICY_TABLE = Object.freeze([
     class: 'carve-out',
     decisionKey: 'permission.destructive',
     journal: 'phase.tool-denied',
-    situations: [],
+    // The other outward write (one-pool phase 14, #349): a session blocked on
+    // what the run may file, label or comment — its errand carries `issues`.
+    situations: [['blocked-declared:issues', 'issues']],
     automatic: [],
     blurb:
-      'git push, gh pr create and gh pr merge: a card for a person that auto-grant never answers — unless this row names the command, or the branch pushed, for the running phase, and then the grant is announced. A push the row allows in another shape is refused at once, naming the bare form.',
+      'git push, gh pr create and gh pr merge: a card for a person that auto-grant never answers — unless this row names the command, or the branch pushed, for the running phase, and then the grant is announced. A push the row allows in another shape is refused at once, naming the bare form. A session blocked on what it may file on an issue asks the issues row, as an errand.',
   },
   {
     class: 'verification-prose',
@@ -589,14 +591,17 @@ export function sanitisePolicyPrefs(value) {
  * @property {string[]} options
  * @property {number[] | null} phases
  * @property {string[]} sets
+ * @property {{ phases: number[]; sets: string[] }} [except]  what the clause refused beside its grant (#275)
  */
 
 /**
  * The phases a clause is qualified for, as written: the numbers, and the named
- * sets. `phases: null` with no set is every phase.
+ * sets. `phases: null` with no set is every phase; `except`, the phases and
+ * sets its refusal names, which `exceptionPhases` takes away (#275).
  * @typedef {object} PhaseScope
  * @property {number[] | null} phases
  * @property {string[]} sets
+ * @property {{ phases: number[]; sets: string[] }} [except]
  */
 
 /**
@@ -671,10 +676,15 @@ export function destructiveCommandExceptions(value) {
     }
     if (region !== null) {
       // The clause's own leading qualifier, else one leading the list after
-      // the opener ("allow rows: Phase 1 — …"), else one written in it.
+      // the opener ("allow rows: Phase 1 — …"), else one written in it, else
+      // one written before a classic `allow` ("In Phase 4, allow …", #275).
       const qualifier = continuing ? lead : leadingPhases(region);
-      const scope = qualifier ? qualifier.scope : (writtenPhases(region) ?? EVERY_PHASE);
-      const body = continuing || !qualifier ? region : region.slice(qualifier.length);
+      const prefix = classic ? plain.slice(0, classic.index) : '';
+      const scope = qualifier ? qualifier.scope : (grantScope(region) ?? grantScope(prefix) ?? EVERY_PHASE);
+      const listed = continuing || !qualifier ? region : region.slice(qualifier.length);
+      // A token after the clause's first refusal is refused, not granted
+      // ("allow `gh pr create`, never `gh pr merge`", #275).
+      const body = listed.slice(0, refusalAt(listed));
       for (const [, raw] of body.matchAll(/`([^`]+)`/g)) {
         const entry = exceptionOf(raw.trim(), scope, Boolean(classic));
         if (entry) out.push(entry);
@@ -733,12 +743,17 @@ function resolvedSet(set, ctx) {
   return [];
 }
 
+/** Did the caller resolve this named set at all (to no phase counts)? */
+function setResolvable(set, ctx) {
+  return set === 'release' && Array.isArray(ctx.releasePhases);
+}
+
 /**
  * The phases an exception holds for, resolved: the numbers it writes joined
  * with each named set the caller resolved (`ctx.releasePhases`); `null` is
  * every phase. A set the caller cannot resolve contributes nothing — an
  * unreadable qualifier narrows, it never widens.
- * @param {Pick<DestructiveException, 'phases' | 'sets'>} entry
+ * @param {Pick<DestructiveException, 'phases' | 'sets' | 'except'>} entry
  * @param {ExceptionContext} [ctx]
  * @returns {number[] | null}
  */
@@ -746,12 +761,20 @@ export function exceptionPhases(entry, ctx = {}) {
   if (entry.phases === null) return null;
   const out = new Set(entry.phases);
   for (const set of entry.sets ?? []) for (const n of resolvedSet(set, ctx)) out.add(n);
+  // What the clause refused beside its grant (#275). An excluded set this
+  // context cannot resolve might cover any granted phase: then nothing holds.
+  const except = entry.except;
+  if (except) {
+    if (except.sets.some((set) => !setResolvable(set, ctx))) return [];
+    for (const n of except.phases) out.delete(n);
+    for (const set of except.sets) for (const n of resolvedSet(set, ctx)) out.delete(n);
+  }
   return [...out].sort((a, b) => a - b);
 }
 
 /**
  * Does an exception hold for this phase under this context?
- * @param {Pick<DestructiveException, 'phases' | 'sets'>} entry
+ * @param {Pick<DestructiveException, 'phases' | 'sets' | 'except'>} entry
  * @param {number} phase
  * @param {ExceptionContext} [ctx]
  */
@@ -867,6 +890,66 @@ function writtenPhases(text) {
   return { phases: [...new Set(phases)], sets };
 }
 
+/** The scope of a clause that grants NO phase: written only beside a refusal (`except in phases 30, 31`, `phases !3`). */
+const NO_PHASE = Object.freeze({ phases: Object.freeze([]), sets: Object.freeze([]) });
+
+/** A `!` before a phase list — `phases !3`, `!3–5` — which reads as `except`. */
+const BANG_LIST = /!\s*(?=\d)/;
+
+/**
+ * Where a clause's REFUSAL starts (#275): its first negation word
+ * (`LIST_NEGATION`) or `!` list, read outside backticks — a rule's own
+ * `--no-verify` is part of the rule — or the text's length when it refuses
+ * nothing. What follows it is refused, never granted.
+ * @param {string} text
+ */
+function refusalAt(text) {
+  const masked = text.replace(/`[^`]*`/g, (span) => ' '.repeat(span.length));
+  const word = LIST_NEGATION.exec(masked);
+  const bang = BANG_LIST.exec(masked);
+  return Math.min(word ? word.index : text.length, bang ? bang.index : text.length);
+}
+
+/**
+ * The phases and named sets a refusal names, loosely — `never in the release
+ * phases`, `except in phases 30, 31`, `!3` — or null when it names none.
+ * @param {string} text
+ * @returns {PhaseScope | null}
+ */
+function refusedPhases(text) {
+  /** @type {number[]} */
+  const phases = [];
+  for (const found of text.matchAll(
+    new RegExp(String.raw`(?:\bphases?\s+!?\s*|!\s*)(${PHASE_LIST})`, 'gi'),
+  )) {
+    phases.push(...phaseNumbers(found[1]));
+  }
+  /** @type {string[]} */
+  const sets = [];
+  for (const found of text.matchAll(new RegExp(String.raw`\b(${SET_WORDS})\b`, 'gi'))) {
+    const set = setOf(found[1]);
+    if (set && !sets.includes(set)) sets.push(set);
+  }
+  return phases.length || sets.length ? { phases: [...new Set(phases)], sets } : null;
+}
+
+/**
+ * The scope a clause GRANTS (one-pool phase 2, #275): the phases written
+ * before its refusal, less the phases the refusal names (`except`). A clause
+ * whose only phases are refused grants NOTHING — never "every phase but
+ * those", because a negation this reader misplaces must narrow a grant and
+ * never widen one. Null when it writes no phase at all (every phase).
+ * @param {string} text
+ * @returns {PhaseScope | null}
+ */
+function grantScope(text) {
+  const at = refusalAt(text);
+  const granted = writtenPhases(text.slice(0, at));
+  const refused = refusedPhases(text.slice(at));
+  if (!granted) return refused ? NO_PHASE : null;
+  return refused ? { ...granted, except: refused } : granted;
+}
+
 /**
  * One backticked token as an exception, or null. `classic` keeps TRS-4's
  * reading for a list the word `allow` opened: any token, `git push` included,
@@ -898,6 +981,7 @@ function exceptionOf(token, scope, classic) {
     options: whole && whole[1] !== 'Bash' ? [] : options,
     phases: scope.phases === null ? null : [...scope.phases],
     sets: [...scope.sets],
+    ...(scope.except ? { except: { phases: [...scope.except.phases], sets: [...scope.except.sets] } } : {}),
   };
 }
 
@@ -982,10 +1066,11 @@ export function destructivePushBranches(value, ctx = {}) {
   for (const clause of clausesOf(value)) {
     const plain = clause.replace(/\*\*/g, '');
     if (phase !== null) {
-      const scope = leadingPhases(plain)?.scope ?? writtenPhases(plain);
+      const scope = leadingPhases(plain)?.scope ?? grantScope(plain);
       if (scope && !exceptionHolds(scope, phase, ctx)) continue;
     }
-    const phrase = /\bpush(?:es)?`?\s+(?:to|of)\s+/gi;
+    // `Bash(git push:*)` of `pe/x` names its branch as `git push` of it does (#276).
+    const phrase = /\bpush(?:es)?(?::\*\))?`?\s+(?:to|of)\s+/gi;
     for (let hit = phrase.exec(plain); hit; hit = phrase.exec(plain)) {
       if (PUSH_NEGATION.test(plain.slice(0, hit.index))) continue;
       const rest = plain.slice(hit.index + hit[0].length);
@@ -999,6 +1084,52 @@ export function destructivePushBranches(value, ctx = {}) {
         const name = raw.trim().replace(/^refs\/heads\//, '');
         if (BRANCH_NAME.test(name) && !TRUNK_BRANCHES.includes(/** @type {never} */ (name))) out.add(name);
       }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Is this branch a trunk — one of `TRUNK_BRANCHES`, or the run's base branch?
+ * @param {string} name
+ * @param {string | null} [baseBranch]
+ */
+export function isTrunkBranch(name, baseBranch = null) {
+  return TRUNK_BRANCHES.includes(/** @type {never} */ (name)) || (Boolean(baseBranch) && name === baseBranch);
+}
+
+/** The phases written right after a named branch: `` `main` by phase 34``, `` `main` in phases 35 and 144``, `` `main` by 35 and 38``. */
+const TRUNK_QUALIFIER = new RegExp(
+  String.raw`^(?:\s*(?:\+|,|&|\band\b|\bor\b)\s*\x60[^\x60]+\x60)*\s*\(?\s*(?:(?:by|in|for|during)\s+(?:phases?\s+)?|[—–]\s*phases?\s+)(${PHASE_LIST})`,
+  'i',
+);
+
+/**
+ * The trunks a `permission.destructive` value lets a session push to IN THIS
+ * PHASE (one-pool phase 2, #276). A trunk (`TRUNK_BRANCHES`, and the run's base
+ * branch, `ctx.baseBranch`) is answered from a row only by a clause about
+ * pushing that NAMES it, backticked, with its phases right after it — this
+ * plan's "`main` by phase 34", the issue's "push `main` in phases 35 and 144" —
+ * and before the clause's refusal. Never by a whole `Bash(git push:*)` rule, a
+ * branch-scoped one or a trunk written without phases, and never without a
+ * phase: the trunk push is the one publish nothing quietly undoes.
+ * @param {string | null | undefined} value
+ * @param {ExceptionContext & { baseBranch?: string | null }} [ctx]
+ * @returns {string[]}
+ */
+export function destructiveTrunkPushes(value, ctx = {}) {
+  if (typeof value !== 'string' || !value || typeof ctx.phase !== 'number') return [];
+  /** @type {Set<string>} */
+  const out = new Set();
+  for (const clause of clausesOf(value)) {
+    const plain = clause.replace(/\*\*/g, '');
+    if (!/\bpush/i.test(plain)) continue;
+    const granted = plain.slice(0, refusalAt(plain));
+    for (const found of granted.matchAll(/`([^`]+)`/g)) {
+      const name = found[1].trim().replace(/^refs\/heads\//, '');
+      if (!isTrunkBranch(name, ctx.baseBranch)) continue;
+      const qualifier = TRUNK_QUALIFIER.exec(granted.slice((found.index ?? 0) + found[0].length));
+      if (qualifier && phaseNumbers(qualifier[1]).includes(ctx.phase)) out.add(name);
     }
   }
   return [...out];

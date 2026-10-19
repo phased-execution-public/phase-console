@@ -39,7 +39,7 @@
  * each fold their table under the key.
  */
 
-import { useId, useMemo, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, type ReactNode } from 'react';
 import type {
   BarKind,
   RunState,
@@ -57,6 +57,7 @@ import { FigureNumbers } from '@/ui/figures/numbers';
 import { linear } from '@/ui/figures/scales';
 import { ROW, Swimlane, type SwimlaneRow } from '@/ui/figures/swimlane';
 import { useFigure } from '@/ui/figures/use-figure';
+import { ZoomControls, zoomWindowOf } from '@/ui/figures/zoom-controls';
 
 /**
  * What each bar kind means, and the one CLASS that decides its colour — never a
@@ -234,6 +235,8 @@ export function RunGantt({
   run,
   onCompare,
   emptyAction,
+  zoom,
+  onZoom,
   className,
 }: {
   timeline: RunTimeline;
@@ -247,6 +250,10 @@ export function RunGantt({
   onCompare?: (phase: number) => void;
   /** Where an empty axis sends you — the caller knows the plan, this does not. */
   emptyAction?: ReactNode;
+  /** The window the address asks for — `?zoom=` (`ui/figures/zoom-controls`). */
+  zoom?: string | undefined;
+  /** Writes the window to the address; absent, the zoom stays the figure's own. */
+  onZoom?: (param: string | null) => void;
   className?: string;
 }) {
   const { lanes, marks } = timeline;
@@ -322,6 +329,18 @@ export function RunGantt({
     },
   });
   const cursorMs = figure.cursor !== null ? (stops[figure.cursor] ?? null) : null;
+
+  // The window the address names, taken once the axis has a span (#376).
+  const hasSpan = spanMs > 0;
+  const { zoomTo, reset } = figure;
+  useEffect(() => {
+    if (!hasSpan) return;
+    const window = zoomWindowOf(zoom, spanMs);
+    if (window) zoomTo(window);
+    else if (!zoom) reset();
+    // The span grows under a live run; the address is read when it changes, not on every frame.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoom, hasSpan, zoomTo, reset]);
 
   const rows: SwimlaneRow[] = useMemo(
     () =>
@@ -439,6 +458,14 @@ export function RunGantt({
             </p>
           )}
 
+          <ZoomControls
+            figure={figure}
+            spanMs={spanMs}
+            quick
+            current={zoom}
+            {...(onZoom ? { onZoom } : {})}
+          />
+
           <Swimlane
             rows={rows}
             spanMs={spanMs}
@@ -487,7 +514,15 @@ export function RunGantt({
                   : `${duration(spanMs)} end to end`}
             </span>
             {figure.zoomed ? (
-              <Button variant="ghost" size="sm" className="tnum" onClick={figure.reset}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="tnum"
+                onClick={() => {
+                  figure.reset();
+                  onZoom?.(null);
+                }}
+              >
                 Reset zoom (×{figure.zoom.toFixed(1)})
               </Button>
             ) : null}

@@ -64,7 +64,7 @@ export const VERB_EDITIONS = Object.freeze(/** @type {const} */ (['free', 'pro']
  *   name: string, kind: (typeof VERB_KINDS)[number], route: string,
  *   edition: (typeof VERB_EDITIONS)[number], actor: VerbActorClass,
  *   method: string|null, trigger: boolean, inSwitch?: boolean,
- *   cli: null | { args: readonly string[], flags: Readonly<Record<string, string|true>> },
+ *   cli: null | { args: readonly string[], flags: Readonly<Record<string, string|true>>, many?: true, optional?: true },
  *   summary: string,
  * }} OperatorVerb
  */
@@ -91,12 +91,28 @@ function verb(name, kind, route, rest = {}) {
   });
 }
 
-/** A CLI shape: positional words, then `--flag` → body field. */
-const cli = (args = [], flags = {}) =>
-  Object.freeze({ args: Object.freeze(args), flags: Object.freeze(flags) });
+/**
+ * A CLI shape: positional words, then `--flag` → body field. `many` lets the
+ * last positional take every word left (one or more, as a list); `optional`
+ * lets it be absent (one-pool phase 39's `run queue …`).
+ * @param {string[]} [args]
+ * @param {Record<string, string|true>} [flags]
+ * @param {{ many?: true, optional?: true }} [shape]
+ */
+const cli = (args = [], flags = {}, shape = {}) =>
+  Object.freeze({ args: Object.freeze(args), flags: Object.freeze(flags), ...shape });
 
 /** The reason every act may carry (control-tower phase 96, #142). */
 const WHY = { '--reason': 'reason' };
+
+/**
+ * The reads the table marks Pro: `wait`, priced like the acts it can block a
+ * terminal for, and — in Pro — the Queue's check (one-pool phase 39), which
+ * replays the forecast. Every other read is free in both editions.
+ */
+export const PRO_READS = Object.freeze([
+  'wait',
+]);
 
 /**
  * Every operator verb. Order: the reads a terminal needs, the acts #144 asked
@@ -111,8 +127,11 @@ export const OPERATOR_VERBS = Object.freeze([
     summary: "one plan's latest run: status, halt, lanes, liveness (the slim projection)",
   }),
   verb('queue', 'read', 'GET /api/queue', {
-    cli: cli(),
-    summary: 'the admission queue, with what each entry waits on',
+    // `--all` (Pro, one-pool phase 39): every phase of every open plan in
+    // boarding order — the queue forecast; `--plan <slug>` shows one plan's.
+    cli: cli([], { '--all': true, '--plan': 'plan' }),
+    summary:
+      'the admission queue, with what each entry waits on (--all: every phase of every open plan, in boarding order)',
   }),
   verb('accounts', 'read', 'GET /api/accounts', { cli: cli(), summary: 'the accounts and their headroom' }),
   verb('approvals', 'read', 'GET /api/approvals', {
@@ -336,6 +355,12 @@ export const OPERATOR_VERBS = Object.freeze([
     summary: "a checkout at the pushed run branch for a phase's errand, which no prune takes",
   }),
   verb('delegate', 'act', 'POST /api/run/:slug/delegate', { actor: 'press', method: 'delegatePhase' }),
+  verb('verify-waive', 'act', 'POST /api/run/:slug/verify-waive', {
+    actor: 'press',
+    method: 'waiveVerifyLine',
+    summary:
+      'waive one §Verification line for one phase, mid-run, with a reason — recorded as a ruling (#267)',
+  }),
   verb('errand-answered', 'act', 'POST /api/run/:slug/phase/:n/errand-answered', {
     // Dispatched by its own `if` before `switch (verb)` even runs (routes.ts,
     // right after `guardRun`) — its first path segment is `phase`, not a run

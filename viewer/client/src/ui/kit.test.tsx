@@ -348,3 +348,23 @@ describe('the primitives mount, and read right to a screen reader', () => {
     expect(alone.querySelector('[data-copy]')!.className).toMatch(/(?:^|\s)items-center(?:\s|$)/);
   });
 });
+
+describe('a menu fits the screen it opens on (#315)', () => {
+  it('caps its width at the space Radix measures beside its trigger, not at its own width', async () => {
+    const { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } =
+      await import('./dropdown');
+    render(
+      <DropdownMenu open>
+        <DropdownMenuTrigger>Open</DropdownMenuTrigger>
+        <DropdownMenuContent>
+          <DropdownMenuItem>{'A very long console name '.repeat(12)}</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>,
+    );
+    const menu = await screen.findByRole('menu');
+    // `100%` inside Radix's content-sized wrapper is the menu's own width, so
+    // it never capped anything; the measured available width does.
+    expect(menu.className).toContain('max-w-(--radix-dropdown-menu-content-available-width)');
+    expect(menu.className).not.toContain('calc(100%');
+  });
+});

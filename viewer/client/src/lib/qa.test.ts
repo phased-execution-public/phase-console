@@ -26,9 +26,9 @@ describe('the report address', () => {
   });
 
   it('is a query on the QA view of the phase table, carrying the round only when it is not the first', () => {
-    expect(qaReportHref('alpha', 7)).toBe('#/plan/alpha/phases?view=qa&report=7');
-    expect(qaReportHref('alpha', 7, 1)).toBe('#/plan/alpha/phases?view=qa&report=7');
-    expect(qaReportHref('alpha', 7, 3)).toBe('#/plan/alpha/phases?view=qa&report=7:3');
+    expect(qaReportHref('alpha', 7)).toBe('#/plan/alpha/phases?view=handoffs&report=7');
+    expect(qaReportHref('alpha', 7, 1)).toBe('#/plan/alpha/phases?view=handoffs&report=7');
+    expect(qaReportHref('alpha', 7, 3)).toBe('#/plan/alpha/phases?view=handoffs&report=7:3');
     expect(parseReportParam('7')).toEqual({ phase: 7 });
     expect(parseReportParam('7:3')).toEqual({ phase: 7, round: 3 });
     for (const bad of ['', 'x', '0', '7:0', '7:x', undefined, null]) expect(parseReportParam(bad)).toBeNull();

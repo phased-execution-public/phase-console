@@ -50,6 +50,8 @@ import {
   endedOnEnvironment,
   LADDER_CAP_PREFS,
   PERSON_SLOT_BY,
+  ownerRung,
+  routesToOwner,
 } from '../../shared/ladder-model.js';
 
 /**
@@ -64,6 +66,7 @@ import {
 export {
   countedRungs, triedRungKeys, untriedRungs, rungWasWithdrawn, personRetryOwed, RUNG_DRIVERS, RUNG_DRIVER_LABELS, VEHICLE_DRIVERS, drivableBy,
   operatorOnlyTables, RUNG_FAILURE_CAUSES, MAX_ENV_RETRIES_PER_RUNG, endedOnEnvironment, PERSON_SLOT_BY,
+  ownerRung, routesToOwner,
 };
 export type RungCause = (typeof RUNG_FAILURE_CAUSES)[number];
 export type RungDriver = (typeof RUNG_DRIVERS)[number];
@@ -236,6 +239,23 @@ export type NextRungInput = {
   qaMaxRounds?: number;
   /** Which vehicles this console can drive right now. Absent = every vehicle. */
   available?: (rung: Rung) => boolean;
+  /**
+   * The phase the failure names as its owner, with the verdict of the ONE
+   * resume gate on its session (measured-console phase 25). Absent = the
+   * failure names no owner (or the caller cannot judge one): the `resume-owner`
+   * rung is not offered and the table climbs exactly as before.
+   */
+  owner?: OwnerInput;
+};
+
+/** What `nextRung` needs to know of a failure's owner — the claim, judged. */
+export type OwnerInput = {
+  /** The phase that owns the failure. */
+  phase: number;
+  /** The failing phase, when it is another phase than the owner. */
+  from?: number;
+  /** The gate's verdict (`resumableSession`): announced, not cold, not over-size, not checkpointed, on the paying account. */
+  resumable: boolean;
 };
 
 /**
@@ -358,6 +378,17 @@ export function nextRung(input: NextRungInput): NextRung {
   // Same rule as the caps above, from the same helper: an `interrupted` rung
   // never effectively ran — until it has been cut short twice in a row.
   const tried = triedRungKeys(input.history);
+  // The owner rung stands BEFORE the table's first row (measured-console
+  // phase 25): a failure that names a phase whose session is worth resuming
+  // goes back to that session before any generic fixer boards. Once per
+  // failure — the rung's key carries the owner (and the failing phase), so the
+  // same-rung-once rule holds it like any other — then the table climbs as ever.
+  if (input.owner?.resumable && routesToOwner(key)) {
+    const rung = ownerRung(input.owner.phase, input.owner.from) as Rung;
+    if (!tried.has(rungKey(key, rung)) && (!input.available || input.available(rung))) {
+      return { ok: true, rung, index: -1, key };
+    }
+  }
   let sawUnavailable = false;
   for (let index = 0; index < table.length; index += 1) {
     const rung = table[index];
@@ -371,6 +402,26 @@ export function nextRung(input: NextRungInput): NextRung {
       ? `no rung for ${key} is available on this console yet`
       : `every rung for ${key} has been tried on this phase`,
   };
+}
+
+/**
+ * The instruction a `resume-owner` continue carries (measured-console phase
+ * 25): what failed, the lines that say so, and the owner's job — fix the cause
+ * in its own work, re-verify, hand off again, and leave the other phase's
+ * files alone. A pure builder so the brief is held by a test, not by a read of
+ * the runner.
+ */
+export function ownerInstruction(claim: {
+  owner: number; from: number; failure: string; evidence: readonly string[];
+}): string {
+  const lines = claim.evidence.map((line) => `- ${line.replace(/\s+/g, ' ').trim().slice(0, 300)}`);
+  return [
+    `A failure belongs to YOUR phase (${claim.owner}), not to phase ${claim.from}, which found it: ${claim.failure}.`,
+    ...(lines.length ? ['Evidence:', ...lines] : []),
+    `Read \`git status\` and \`git diff\` FIRST — anything uncommitted is your own earlier work; never stash, checkout or reset it away.`,
+    `Fix the cause in the work you own, re-run your §Verification until it is green, commit with explicit paths and write the handoff \`complete\`.`,
+    `Do not edit phase ${claim.from}'s files: it re-verifies on its own once yours is green.`,
+  ].join('\n');
 }
 
 /* ------------------------------------------------------------------ *
@@ -1109,7 +1160,7 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     need: 'What the session said it is blocked on — read its Outstanding section.',
     how: 'Clear the blocker, then Retry (or Resume the session with an instruction).',
     title: 'Clear what the session is blocked on',
-    steps: ['Read the Outstanding section of the phase\'s handoff.', 'Clear the blocker it names, then tell the console you are done.'],
+    steps: ['Clear the blocker the phase stopped on.', 'Then choose Done — continue, with a note of what you did.'],
     check: 'Your word is the check: the phase boards again with your note.',
     options: [ANSWERED],
   },
@@ -1125,7 +1176,7 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     need: 'The credential the session named and no session holds (a sign-in, a key, a token).',
     how: 'Provide it where the handoff says, then Resume the session with an instruction or Retry.',
     title: 'Provide the credential the session named',
-    steps: ['Read where the handoff says the credential goes.', 'Store it there — never in a note — then tell the console you are done.'],
+    steps: ['Store the credential where the phase needs it — never in a note.', 'Then choose Done — continue.'],
     check: 'Your word is the check: the phase boards again and its session reads the credential.',
     options: [ANSWERED],
   },
@@ -1154,7 +1205,7 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     need: 'The acts the plan keeps for a person — the session named them (a merge, a sign-off, a production step) and stopped rather than do them.',
     how: "Do them by hand and Retry; or press Delegate to the session, which records that you handed them over and resumes the session with your words — the run's permission policy still applies to every act.",
     title: 'Do the acts the plan keeps for a person',
-    steps: ['Read the acts the session named in its handoff.', 'Do them by hand, then tell the console you are done.'],
+    steps: ['Do the acts the phase named, by hand.', 'Then choose Done — continue, with a note of what you did — or hand them to the AI.'],
     check: 'Your word is the check: the phase boards again with your note.',
     options: [ANSWERED],
   },
@@ -1166,8 +1217,8 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     how: "Answer the plan's `issues` decision (its `## Decisions` row or its `Issues:` line), or Settings ▸ Issues for this console, then Retry — the phase boards again under your answer.",
     title: 'Say what the run may file on issues',
     steps: [
-      'Read what the session wanted to file, label or comment, in its handoff.',
-      "Answer the plan's issues decision, or set Settings ▸ Issues, then tell the console you are done.",
+      "Answer the plan's issues decision — what this run may file, label or comment — or set Settings ▸ Issues.",
+      'Then choose Done — continue.',
     ],
     check: 'Your word is the check: the phase boards again under your answer.',
     options: [ANSWERED],
@@ -1208,7 +1259,7 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     need: 'A reading of the session\'s Outstanding section — the blocker it named fits no machine category and one unblock session did not clear it.',
     how: 'Clear what it names, then Resume the session with an instruction or Retry; or split the remaining work into a new phase.',
     title: 'Read what the session is blocked on and clear it',
-    steps: ['Read the Outstanding section of the phase\'s handoff.', 'Clear what it names, or split the remaining work into a new phase, then tell the console you are done.'],
+    steps: ['Clear what the phase stopped on, or split the remaining work into a new phase.', 'Then choose Done — continue, with a note of what you did.'],
     check: 'Your word is the check: the phase boards again with your note.',
     options: [ANSWERED],
   },
@@ -1241,6 +1292,14 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     how: 'Resume the session with an instruction, or boot the phase by hand from its boot prompt; commit and hand off when done.',
     title: 'Finish the phase',
     steps: ['Resume the session with an instruction, or boot the phase by hand from its boot prompt.', 'Commit and hand off when it is done.'],
+    check: READS_AGAIN,
+    options: LOOK_AGAIN,
+  },
+  'spawn-sdk-failed': {
+    need: 'The phase to be run — its Agent SDK session ended before its first event, and the subprocess re-attempt did not carry it.',
+    how: 'Press Retry: the phase boards on the subprocess. If the SDK door keeps failing, set the run\'s spawnBackend to subprocess.',
+    title: 'Start the phase on the subprocess',
+    steps: ['Press Recover & continue — the phase boards on the subprocess.', 'If the SDK door keeps failing, set the run\'s door to the subprocess.'],
     check: READS_AGAIN,
     options: LOOK_AGAIN,
   },

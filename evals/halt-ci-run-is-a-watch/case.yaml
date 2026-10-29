@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: halt-ci-run-is-a-watch
+description: 'the record: waiting-external on somebody else''s clock (CI) — 10 + 8 + 2 waits in the last three plans.'
+tags: [halt, unattended]
+context:
+  scaffold_script: fixture.sh

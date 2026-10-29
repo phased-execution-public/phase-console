@@ -54,11 +54,13 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import { log } from './log.ts';
+import { isOpenStep, readLedger } from './human-steps.ts';
 import { runSidecarId } from './runner/run-paths.ts';
 import { RETENTION_DEFAULTS, type RetentionPolicy, type RetentionSink, sanitiseRetention } from './retention-policy.ts';
 
@@ -95,6 +97,8 @@ export type InventoryFile = {
   record?: boolean;
   /** A kept run worktree whose size is not known yet — counted as 0 bytes until it is. */
   unmeasured?: boolean;
+  /** An append-only ledger pruned row by row: its oldest row's time (ms), read off its first line. */
+  oldestAt?: number;
 };
 
 export type RetentionInventory = { files: InventoryFile[] };
@@ -421,12 +425,14 @@ export function collectRetention(scan: RetentionScan): RetentionInventory {
  * ------------------------------------------------------------------ */
 
 export type RetentionAction = {
-  kind: 'delete' | 'rotate' | 'truncate' | 'oversized';
+  kind: 'delete' | 'rotate' | 'truncate' | 'oversized' | 'prune';
   sink: RetentionSink;
   path: string;
   bytes: number;
   /** `truncate` only — how much of the tail survives. */
   keepBytes?: number;
+  /** `prune` only — the rows at or after this instant (ms) are kept. */
+  keepAfter?: number;
   /** One line an operator can read on the card. */
   why: string;
 };
@@ -665,8 +671,9 @@ export function planRetention(
   }
 
 
-  // ---- the human-step ledger: rotated past its cap, exactly as the lock ledger
-  // is; the rotated copy is replaced by the next rotation.
+  // ---- the human-step ledger: rotated past its cap like the lock ledger; the
+  // rotated copy is replaced by the next rotation, so every OPEN step's lines
+  // the old copy holds are carried into the new one (EI-6).
   for (const file of of('human-steps')) {
     if (file.path.endsWith('.1') || file.bytes <= policy.humanStepsRotateBytes) continue;
     actions.push({
@@ -778,6 +785,31 @@ export function planRetention(
   return actions.sort((a, b) => a.sink.localeCompare(b.sink) || a.path.localeCompare(b.path));
 }
 
+/**
+ * Rotate the human-step ledger past its cap (EI-6): the live file becomes `.1`,
+ * and every line of a step still OPEN whose birth only the old `.1` holds — the
+ * birth and each move after it, in order — is carried to the head of the new
+ * `.1`, so a second rotation never orphans a live step. The live file is renamed
+ * first, so a declare racing the sweep lands in a fresh live file. Here, not in
+ * `human-steps.ts`, whose one file read is its own ledger's (HS-5).
+ */
+export function rotateHumanStepLedger(file: string): void {
+  const open = new Set([...readLedger(file).steps.values()].filter(isOpenStep).map((step) => step.id));
+  const moving = `${file}.rotating`;
+  renameSync(file, moving);
+  let older = '';
+  try { older = readFileSync(`${file}.1`, 'utf8'); } catch { /* no rotated copy yet */ }
+  const carried = older.split('\n').filter((line) => {
+    if (!line.trim()) return false;
+    try { return open.has(String((JSON.parse(line) as { id?: unknown }).id)); } catch { return false; }
+  });
+  const head = carried.length ? `${carried.join('\n')}\n` : '';
+  writeFileSync(`${file}.1.tmp`, head + readFileSync(moving, 'utf8'));
+  renameSync(`${file}.1.tmp`, `${file}.1`);
+  rmSync(moving, { force: true });
+  if (!existsSync(file)) writeFileSync(file, '');
+}
+
 /* ------------------------------------------------------------------ *
  * The executor
  * ------------------------------------------------------------------ */
@@ -836,7 +868,8 @@ export function applyRetention(actions: readonly RetentionAction[]): RetentionRe
         rmSync(action.path, { recursive: true, force: true });
       } else if (action.kind === 'rotate') {
         if (!existsSync(action.path)) continue;
-        renameSync(action.path, `${action.path}.1`);
+        if (action.sink === 'human-steps') rotateHumanStepLedger(action.path);
+        else renameSync(action.path, `${action.path}.1`);
       } else {
         if (!existsSync(action.path)) continue;
         copyTruncate(action.path, action.keepBytes ?? RETENTION_DEFAULTS.supervisorLogKeepBytes);

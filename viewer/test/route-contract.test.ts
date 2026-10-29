@@ -33,7 +33,7 @@ import assert from 'node:assert/strict';
 import { CATEGORIES, routeFor } from '../server/push/catalogue.ts';
 import type { RouteContext } from '../server/push/catalogue.ts';
 import {
-  DEFAULT_HEAD, DESTINATIONS, ROUTE_HEADS, PLAN_TABS, LEGACY_PLAN_TABS, PLAN_PHASE_VIEWS, PLAN_RUN_VIEWS, isRouteHead,
+  DEFAULT_HEAD, DESTINATIONS, PLAN_TABS, LEGACY_PLAN_TABS, PLAN_PHASE_VIEWS, PLAN_RUN_VIEWS, isRouteHead,
 } from '../shared/route-meta.js';
 import {
   parseHash, toHash, planHref, phaseHref, handoffHref, laneHref, phaseSessionHref, sessionsHref,
@@ -86,13 +86,14 @@ test('a server-emitted plan URL names a tab the plan view actually registers', (
 test('the route the server still mints lands on the phase table, carrying its view', () => {
   // `server/push/catalogue.ts` writes `/#/plan/<slug>/route` into every plan
   // push. The tab left in 6.0; the address must not. It becomes the phases
-  // tab's `map` view — and `qa` and `handoffs` become their views of the same
-  // table — so a redirect keeps what the address MEANT, not only where it went.
+  // tab's `map` view — and `qa` and `handoffs` become their view of the same
+  // table, one reading of each phase's record since 2026-10-20 (Tower strips)
+  // — so a redirect keeps what the address MEANT, not only where it went.
   const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
   // Four since one-pool phase 14 (#366): Your turn scoped to the plan.
   assert.deepEqual(PLAN_TABS, ['phases', 'run', 'turn', 'source']);
   assert.deepEqual(legacy.route, { tab: 'phases', view: 'map' });
-  assert.deepEqual(legacy.qa, { tab: 'phases', view: 'qa' });
+  assert.deepEqual(legacy.qa, { tab: 'phases', view: 'handoffs' });
   assert.deepEqual(legacy.handoffs, { tab: 'phases', view: 'handoffs' });
   const minted = CATEGORIES.flatMap((category) =>
     CONTEXTS.map((context) => parseHash(toHash(routeFor(category.id, context))).segments),
@@ -111,7 +112,9 @@ test('each plan view names its readings, and the live run is the run view with n
   // 7.0 (quiet-console phase 10): the Run view gains a history reading beside
   // the live run. `live` leads, so `#/plan/<slug>/run` — the address every
   // in-flight push carries — still opens on the run as it is now.
-  assert.deepEqual(PLAN_PHASE_VIEWS, ['table', 'map', 'qa', 'handoffs', 'schedule', 'burnup']);
+  // Five since 2026-10-20 (Tower strips): `qa` and `handoffs` are one reading, `handoffs`.
+  const phaseViews = ['table', 'map', 'handoffs', 'schedule', 'burnup'];
+  assert.deepEqual(PLAN_PHASE_VIEWS, phaseViews);
   assert.deepEqual(PLAN_RUN_VIEWS, ['live', 'history']);
   const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
   for (const [id, to] of Object.entries(legacy)) {

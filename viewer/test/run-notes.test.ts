@@ -18,6 +18,7 @@
 
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
 import './state-sandbox.ts';
+import { readStoredRun } from '../server/runner/state.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -30,7 +31,7 @@ process.env.PHASE_CONSOLE_LOG = '';
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
-const { journalFile, runFile } = await import('../server/runner/run-paths.ts');
+const { journalFile } = await import('../server/runner/run-paths.ts');
 const { projectTimeline } = await import('../server/analysis/timeline.ts');
 const { pinnedNotesBlock } = await import('../server/runner/runner-core.ts');
 const { Runner } = await import('../server/runner/runner.ts');
@@ -133,7 +134,7 @@ function journal(root: string, runId: string): JournalEntry[] {
 }
 
 function stored(root: string, runId: string): RunState {
-  return JSON.parse(readFileSync(runFile(root, 'alpha', runId), 'utf8')) as RunState;
+  return readStoredRun(root, 'alpha', runId)!;
 }
 
 /* ------------------------------------------------------------------ *

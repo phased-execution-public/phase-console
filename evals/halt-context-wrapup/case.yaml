@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: halt-context-wrapup
+description: 'the record: quiet-console''s 26 partials, every one `--reason context` — the 0.6x wrap-up notice.'
+tags: [halt, unattended]
+context:
+  scaffold_script: fixture.sh

@@ -7,6 +7,7 @@
  * headers are ever sent, so another site cannot drive this server.
  */
 
+import { isPluginKind } from '../../shared/plugin-sets.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 
@@ -18,7 +19,12 @@ import { withWallReadings } from '../../shared/situation-model.js';
 import { parseLockFilter } from '../locks.ts';
 import { DECISION_KEYS } from '../../shared/decisions-model.js';
 import type { AccountRequirement, PressAnswer } from '../runner/state.ts';
+import type {
+  BootHoldView, LockRows, PhaseActivity, PhaseAttempts, PreludeAnswer, RulingList, RunDetail, RunJournal, RunLedger,
+  RunProofs, RunScopes, RunTimeline, RunTranscript, RunVerifications, TriggerList,
+} from '../../shared/wire/runs.js';
 import { classify as classifyAccess, hostnameOf, isLoopbackHost } from './access.ts';
+import { isLoopbackRequest } from './loopback.ts';
 import { ACTOR_LABEL_MAX, actorOfRequest } from './actor.ts';
 import {
   SSE_MAX_RUN_ID_CHARS, SSE_MAX_STREAMS, createSseWriter, dropSseConnection, registerSseConnection, replayCursorOf,
@@ -51,7 +57,11 @@ import { EFFORTS, isEffort, PERMISSION_MODES } from '../runner/spawn.ts';
 import {
   DEFAULT_PERMISSION_PROFILE, isPermissionProfile, type PolicyScope,
 } from '../runner/approvals.ts';
-import { QA_FIX_STRATEGIES, type QaFixStrategy } from '../../shared/run-settings.js';
+import {
+  BASH_MAX_OUTPUT_MAX, BASH_MAX_OUTPUT_MIN, CACHE_TTL_AB_MODES, KEEP_WARM_MAX_SEC, QA_FIX_STRATEGIES,
+  COMPACTION_MODES, COMPACTION_WINDOW_MAX, COMPACTION_WINDOW_MIN, HUMAN_STEP_MODES, type CompactionMode, type HumanStepMode,
+  type CacheTtlAb, type QaFixStrategy,
+} from '../../shared/run-settings.js';
 import { PUSH_ACTION_TTL_MS, readActionToken } from '../push/actions.ts';
 import { MODEL_FALLBACK as MODELS } from '../runner/errors.ts';
 import { isKnownModel } from '../runner/models.ts';
@@ -61,6 +71,10 @@ import { planWrite, runWrite, openInEditor, WriteError, type WriteRequest } from
 import { TERMINAL_PATH, type LaunchSpec } from '../terminal.ts';
 import { tailscaleStatus } from '../tailscale.ts';
 import { ACCOUNT_ID_RE, DEFAULT_ACCOUNT_ID, ProbeInFlightError } from '../accounts/index.ts';
+import type {
+  AccountAnswer, AccountLoginStart, AccountProbeResult, AccountRefreshAnswer, AccountRemoved, AccountsState,
+  AuthLoginStart, SpendView,
+} from '../../shared/wire/accounts.js';
 import { searchCatalog } from '../mcp/index.ts';
 import { MCP_ID_RE } from '../mcp/store.ts';
 import { isMcpPolicy, isModelPolicy, isOnLimitPolicy, type PhaseOptions } from '../runner/state.ts';
@@ -76,6 +90,29 @@ import {
   AUTONOMY_MODES, SWITCH_WHEN, ULTRA_REVIEW_MODES, undrivenPhases, type SwitchWhen, type UltraReviewMode,
 } from '../../shared/run-lifecycle.js';
 import { PLAN_INCLUDES, STATE_INCLUDES, parseInclude } from '../../shared/projection.js';
+import type {
+  GateApprovalOutcome, GateRead, HandoffDetail, IsolationPreflight, LandingComposeOutcome, LandingView, LintRead,
+  PhaseNotes, PhaseReview, PlanDetail, PlanList, PlanWork, QaModeAnswer, QaReportView, QaWaiveOutcome,
+  ReviewOutcome, SendBackOutcome, SessionPlanRead, VerifyPreflight,
+} from '../../shared/wire/plans.js';
+import type {
+  BootResumeAnswer, ConsoleState as WireConsoleState, EventsSubscribeAnswer, PrefsSchemaAnswer,
+} from '../../shared/wire/state.js';
+import type {
+  DirListing as WireDirListing, InstancesView, LauncherPlanView, OwnerView, Portfolio as WirePortfolio,
+  RestartReadiness as WireRestartReadiness, RootCheck as WireRootCheck, SearchResult as WireSearchResult,
+  ShutdownReadiness as WireShutdownReadiness, SkillInfoList, StartCeilingCounters, StrayConsoles,
+  TailscaleStatus as WireTailscaleStatus,
+} from '../../shared/wire/system.js';
+import type { PolicyAdvisoryAck, PolicyView as WirePolicyView } from '../../shared/wire/policy.js';
+import type {
+  DebugIndex as WireDebugIndex, DebugLevelState, DebugRuns, DoctorReport as WireDoctorReport,
+  HealthSeriesView as WireHealthSeriesView, RetentionReport as WireRetentionReport,
+} from '../../shared/wire/debug.js';
+import type {
+  RepoBranches, RepoCheckouts, RepoDiff, RepoGraph, RepoSettles, RepoTargets,
+} from '../../shared/wire/repo.js';
+import type { IssuesPayload } from '../../shared/wire/issues.js';
 import {
   ISOLATED, ISOLATION_MODES, SETTLE_STRATEGIES, retentionOf,
   type IsolationMode, type SettleStrategy,
@@ -87,6 +124,24 @@ import {
   branchExists, issuesModeLoosens, lockedSettingRefusals, type RefusedSetting, type RunSettingsPatch,
 } from '../runner/runner-core.ts';
 import { QA_DIRECTIVES } from '../../shared/plan-vocab.js';
+import type {
+  McpAcknowledgeAnswer, McpCatalogResult, McpFlowAnswer, McpLoginStart, McpRemoveAnswer, McpServerAnswer,
+  McpServersAnswer, McpState,
+} from '../../shared/wire/mcp.js';
+import type {
+  PushActionAnswer, PushDeviceAnswer, PushSubscribeAnswer, PushUnsubscribeAnswer, WebhookAnswer,
+  WebhookRemoveAnswer,
+} from '../../shared/wire/notifications.js';
+import type { FleetFreezeAnswer, FleetFreezeView } from '../../shared/wire/fleet.js';
+import type {
+  GrantsList, HooksView, SessionEventsAnswer, SessionHookAnswer,
+  SessionRegistryView, SessionReleaseAnswer, TerminalDeleteAnswer, TerminalState, TerminalVerbAnswer,
+} from '../../shared/wire/sessions.js';
+import type {
+  BulkAckResult, HumanStepsList, InboxAckOne, StepVerbAnswer, TurnAnswer as WireTurnAnswer,
+  TurnCannotAnswer, TurnExplainAnswer, TurnHandOffAnswer, TurnNoteAnswer,
+} from '../../shared/wire/turn.js';
+import type { QueueActAnswer, QueuePolicyAnswer } from '../../shared/wire/queue.js';
 import { withLiveErrands } from '../watch-refs.ts';
 
 export type ApiContext = { service: Service };
@@ -264,6 +319,26 @@ async function readBodyOnce(req: IncomingMessage): Promise<Record<string, unknow
   }
   if (!chunks.length) return {};
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return {}; }
+}
+
+/** The largest OpenTelemetry export `/otel/v1/*` reads (`server/otel/receiver.ts` `OTEL_MAX_BODY`). */
+const OTEL_BODY_LIMIT = 1024 * 1024;
+
+/**
+ * A request's raw body, or null past `limit` bytes — the read stops there and the rest is
+ * drained unread, so an oversized export costs no more memory than the bound.
+ */
+async function readRawBody(req: IncomingMessage, limit: number): Promise<Buffer | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let over = false;
+  for await (const chunk of req) {
+    if (over) continue;
+    size += (chunk as Buffer).length;
+    if (size > limit) { over = true; chunks.length = 0; continue; }
+    chunks.push(chunk as Buffer);
+  }
+  return over ? null : Buffer.concat(chunks);
 }
 
 /** A write must come from this app, in this browser, with writes enabled. */
@@ -621,6 +696,33 @@ function intProblem(value: unknown, field: string, min: number, max: number): st
   return null;
 }
 
+/**
+ * The session's environment from a browser (measured-console phase 6), or the
+ * reason it is not one — the four judged on `start` and `settings` alike.
+ * Silence (`undefined`, `null`, `''`) is never a problem: on `settings` it
+ * clears the field back to its default, on `start` it is the default. Each
+ * door reads the four off the body inline (`run-settings-parity.test.ts`
+ * reads the case blocks as text).
+ */
+function sessionEnvProblem(body: Record<string, unknown>): string | null {
+  const ab = body.cacheTtlAb;
+  if (ab !== undefined && ab !== null && ab !== '' && !(CACHE_TTL_AB_MODES as readonly unknown[]).includes(ab)) {
+    return `cacheTtlAb must be one of: ${CACHE_TTL_AB_MODES.join(', ')}.`;
+  }
+  return intProblem(body.keepWarmSec, 'keepWarmSec', 0, KEEP_WARM_MAX_SEC)
+    ?? modelProblem(body.subagentModel, 'subagentModel')
+    ?? intProblem(body.bashMaxOutput, 'bashMaxOutput', BASH_MAX_OUTPUT_MIN, BASH_MAX_OUTPUT_MAX)
+    ?? wordProblem(body.humanStepMode, 'humanStepMode', HUMAN_STEP_MODES)
+    ?? wordProblem(body.compaction, 'compaction', COMPACTION_MODES)
+    ?? intProblem(body.compactionWindow, 'compactionWindow', COMPACTION_WINDOW_MIN, COMPACTION_WINDOW_MAX);
+}
+
+/** A word off its vocabulary, or silence (measured-console phase 12). */
+function wordProblem(value: unknown, field: string, words: readonly string[]): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  return words.includes(value as string) ? null : `${field} must be one of: ${words.join(', ')}.`;
+}
+
 /** The most links a launch sends back as shown (control-tower phase 139), and the longest one. */
 const AUTO_OPEN_LINKS_MAX = 20;
 const AUTO_OPEN_LINK_MAX = 2048;
@@ -748,6 +850,11 @@ function onePhaseOptions(raw: unknown, service: Service): PhaseOptions {
   // this phase" has to be distinguishable from "nobody said anything", which
   // would fall through to a plan that says require.
   if (isMcpPolicy(item.mcpPolicy)) option.mcpPolicy = item.mcpPolicy;
+  // Plugin kinds (measured-console phase 27): the owner's words only, once each.
+  if (Array.isArray(item.plugins)) {
+    const kinds = [...new Set(item.plugins.filter(isPluginKind))];
+    if (kinds.length) option.plugins = kinds;
+  }
   // Both values stored, same reasoning as `mcpPolicy` one line up: the phase
   // is the one level that can overrule the plan's and the console's answer,
   // so "ask me in this phase" (false) is a choice, never silence.
@@ -906,9 +1013,7 @@ async function pressConfirmed(
  * Host, and nothing a proxy or the fleet vouched for — a door of `local`.
  */
 function atTheMachine(req: IncomingMessage, reading: DoorReading): boolean {
-  const address = req.socket?.remoteAddress ?? '';
-  const loopback = address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-  return loopback && reading.door === 'local' && isLoopbackHost(hostnameOf(req.headers.host));
+  return isLoopbackRequest(req) && reading.door === 'local' && isLoopbackHost(hostnameOf(req.headers.host));
 }
 
 /**
@@ -930,7 +1035,7 @@ async function routeApi(
 ): Promise<boolean> {
   const { service } = ctx;
   const path = url.pathname;
-  if (!path.startsWith('/api/') && path !== '/events' && !path.startsWith('/hooks/')) return false;
+  if (!path.startsWith('/api/') && path !== '/events' && !path.startsWith('/hooks/') && !path.startsWith('/otel/')) return false;
 
   /* ---------------- the approval hook ---------------- */
   if (path === '/hooks/pre-tool-use') {
@@ -970,8 +1075,7 @@ async function routeApi(
     // proxy is refused before the token is looked at, because a Serve handler
     // pointed at the wrong console must not expose a permission-deciding POST.
     if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
-    const remote = req.socket?.remoteAddress ?? '';
-    const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1' || remote === '';
+    const loopback = isLoopbackRequest(req, { inProcess: true });
     // A harness's flags may carry no remote hosts at all, which is a local-only
     // console — the same reading `classify` gives an empty list.
     const access = Array.isArray(service.flags.remoteHosts)
@@ -1014,6 +1118,40 @@ async function routeApi(
     return true;
   }
 
+  /* ---------------- the compaction hooks (measured-console phase 12, A10) ---------------- */
+  if (path === '/hooks/compact') {
+    // The Stop hook's trust model: a `claude` child, the per-run bearer token.
+    if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
+    if (!service.approvals.verify(req.headers.authorization)) {
+      log.warn('hook.rejected', { reason: service.approvals.armed() ? 'bad token' : 'no run is armed', hook: 'compact' });
+      json(res, 401, { error: 'bad or expired run token' });
+      return true;
+    }
+    json(res, 200, service.noteCompaction(await readBody(req), service.approvals.runIdFor(req.headers.authorization)));
+    return true;
+  }
+
+  /* ---------------- the OpenTelemetry receiver (measured-console phase 19) ---------------- */
+  if (path === '/otel/v1/logs' || path === '/otel/v1/metrics') {
+    // A session's OTLP/HTTP JSON exporter, pointed here by `childEnv`. Its
+    // credential is the run's telemetry bearer, which the receiver checks; the
+    // socket must be this machine's, and the body is read to 1 MB and no more.
+    if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
+    if (!isLoopbackRequest(req)) { json(res, 403, { error: 'the telemetry receiver answers this machine only' }); return true; }
+    // A declared length past the bound is refused unread; an undeclared one is read to the bound.
+    const declared = Number(req.headers['content-length']);
+    const body = Number.isFinite(declared) && declared > OTEL_BODY_LIMIT ? null : await readRawBody(req, OTEL_BODY_LIMIT);
+    if (!body) { json(res, 413, { error: 'an export is at most 1 MB' }); return true; }
+    const encoding = req.headers['content-encoding'];
+    const answer = service.otelExport(
+      path.endsWith('/logs') ? 'logs' : 'metrics', req.headers.authorization, req.headers['content-type'], body,
+      Array.isArray(encoding) ? encoding.join(',') : encoding,
+    );
+    json(res, answer.status, answer.body);
+    return true;
+  }
+  if (path.startsWith('/otel/')) { json(res, 404, { error: 'OTLP traces are not received here' }); return true; }
+
   /* ---------------- the ingest probe (control-tower phase 50, #86) ---------------- */
   if (path === '/hooks/declaration') {
     // The caller is `phase-outcome.sh`, run by a session on this machine,
@@ -1024,8 +1162,7 @@ async function routeApi(
     // never from this body (`declared-probe.ts`): the door makes the console
     // ask sooner what its timer would have asked anyway.
     if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
-    const remote = req.socket?.remoteAddress ?? '';
-    const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1' || remote === '';
+    const loopback = isLoopbackRequest(req, { inProcess: true });
     const access = Array.isArray(service.flags.remoteHosts)
       ? classifyAccess(req, service.flags)
       : { ok: true as const, scope: 'local' as const };
@@ -1051,7 +1188,7 @@ async function routeApi(
     // real session holds. Then the service caps the body and the rate.
     if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
     const remote = req.socket?.remoteAddress ?? '';
-    const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1' || remote === '';
+    const loopback = isLoopbackRequest(req, { inProcess: true });
     const verdict = classifyAccess(req, service.flags);
     if (!loopback || !verdict.ok || verdict.scope !== 'local') {
       log.warn('hook.session-rejected', { reason: !loopback ? 'not loopback' : 'not local', remote });
@@ -1071,7 +1208,7 @@ async function routeApi(
         session: { sessionId: record.sessionId, presence: service.sessions.presence(record.sessionId) },
         ...(peers ? { peers } : {}),
         ...(notice ? { notice } : {}),
-      });
+      } satisfies SessionHookAnswer);
     } catch (error) {
       if (error instanceof HookPayloadError) json(res, 400, { error: error.message });
       else if (error instanceof HookRateError) json(res, 429, { error: error.message });
@@ -1235,7 +1372,7 @@ async function routeApi(
           return true;
         }
         writer.subscribeMany(runIds);
-        json(res, 200, { ok: true, connection, streams: writer.streams });
+        json(res, 200, { ok: true, connection, streams: writer.streams } satisfies EventsSubscribeAnswer);
         return true;
       }
       json(res, 405, { error: 'POST /api/events/subscribe — the stream itself is GET /events' });
@@ -1265,7 +1402,7 @@ async function routeApi(
           session: ownSession,
           requests: owner.requests.open().map(requestView),
           relyingParty: rp.ok ? { id: rp.rpId, origin: rp.origin } : { refused: rp.reason },
-        });
+        } satisfies OwnerView);
         return true;
       }
       if (req.method !== 'POST' && req.method !== 'DELETE') { json(res, 405, { error: 'GET /api/owner; the rest are POST, and a key is removed with DELETE' }); return true; }
@@ -1294,7 +1431,7 @@ async function routeApi(
       // The owner door as THIS request sees it (phase 148): `unlocked` when it
       // carries a live owner session.
       const state = service.state(parseInclude(url.searchParams.get('include'), STATE_INCLUDES));
-      json(res, 200, state && typeof state === 'object' ? { ...state, ownerDoor: ownerDoorState(reading) } : state);
+      json(res, 200, (state && typeof state === 'object' ? { ...state, ownerDoor: ownerDoorState(reading) } : state) satisfies WireConsoleState);
       return true;
     }
     // `GET /api/engine`: the engine pool now — reads running, reads queued behind
@@ -1310,7 +1447,7 @@ async function routeApi(
     // this instance, with its presence and the plan+phase it works. Reading it
     // needs no flag — seeing who is in your repository is display.
     if (head === 'sessions' && rest[0] === 'registry' && req.method === 'GET') {
-      json(res, 200, { sessions: service.sessionViews() });
+      json(res, 200, { sessions: service.sessionViews() } satisfies SessionRegistryView);
       return true;
     }
 
@@ -1324,7 +1461,7 @@ async function routeApi(
       json(res, 200, {
         sessionId: rest[0],
         events: service.sessionEvents(rest[0] ?? '', Number.isFinite(limit) && limit > 0 ? limit : undefined),
-      });
+      } satisfies SessionEventsAnswer);
       return true;
     }
     // `POST /api/sessions/<id>/release` {hours?}: an operator says a terminal
@@ -1338,7 +1475,7 @@ async function routeApi(
       const hours = typeof body?.hours === 'number' ? body.hours : undefined;
       const record = service.releaseSessionHold(rest[0] ?? '', { hours, by: actorOfRequest(req, service.flags, body).by });
       if (!record) { json(res, 404, { error: `no session ${rest[0] ?? ''} in this console's registry` }); return true; }
-      json(res, 200, { ok: true, sessionId: record.sessionId, holdReleased: record.holdReleased });
+      json(res, 200, { ok: true, sessionId: record.sessionId, holdReleased: record.holdReleased } satisfies SessionReleaseAnswer);
       return true;
     }
     // `GET /api/converge`: the convergence loop's standing — on or off for this
@@ -1370,8 +1507,18 @@ async function routeApi(
       return true;
     }
 
+    // `GET /api/hooks` (measured-console phase 28, D3): every hook the console
+    // knows — the plugin's, the user's, the project's and a run's own — with
+    // its event, source, `onFailure` and timeout, and each plan's hookify
+    // rules as its row writes them and as they stand on disk. Display only:
+    // reading what is installed needs no flag, and nothing here writes.
+    if (head === 'hooks' && req.method === 'GET' && rest.length === 0) {
+      json(res, 200, service.hooksInventory() satisfies HooksView);
+      return true;
+    }
+
     if (head === 'fs' && req.method === 'GET') {
-      json(res, 200, listDirs(url.searchParams.get('path') ?? ''));
+      json(res, 200, listDirs(url.searchParams.get('path') ?? '') satisfies WireDirListing);
       return true;
     }
 
@@ -1411,7 +1558,7 @@ async function routeApi(
       };
 
       if (surface === 'targets') {
-        json(res, 200, { targets: await service.repoTargets() });
+        json(res, 200, { targets: await service.repoTargets() } satisfies RepoTargets);
         return true;
       }
 
@@ -1431,14 +1578,14 @@ async function routeApi(
         // DEFAULT graph would be a picture of something the caller did not ask
         // about. Partial resolution is a 200 — see `commitGraph`.
         if (!graph) { json(res, 400, { error: 'no such ref here' }); return true; }
-        json(res, 200, graph);
+        json(res, 200, graph satisfies RepoGraph);
         return true;
       }
 
       if (surface === 'branches') {
         const branches = await service.repoBranches(repo);
         if (!branches) { json(res, 404, { error: 'unknown repository' }); return true; }
-        json(res, 200, branches);
+        json(res, 200, branches satisfies RepoBranches);
         return true;
       }
 
@@ -1448,7 +1595,7 @@ async function routeApi(
       if (surface === 'checkouts') {
         const checkouts = await service.repoCheckouts();
         if (!checkouts) { json(res, 404, { error: 'no source directory' }); return true; }
-        json(res, 200, checkouts);
+        json(res, 200, checkouts satisfies RepoCheckouts);
         return true;
       }
 
@@ -1469,7 +1616,7 @@ async function routeApi(
         // does not resolve here — on purpose: telling a caller WHICH of its
         // guesses had the right shape is an oracle for the next guess.
         if (!diff) { json(res, 400, { error: 'unusable range or path' }); return true; }
-        json(res, 200, diff);
+        json(res, 200, diff satisfies RepoDiff);
         return true;
       }
 
@@ -1479,7 +1626,7 @@ async function routeApi(
           slug: query.get('slug') ?? undefined,
           runs: count('runs'),
           entries: count('entries'),
-        }));
+        }) satisfies RepoSettles);
         return true;
       }
 
@@ -1504,7 +1651,7 @@ async function routeApi(
     // flighted downstream, so two browsers pressing Refresh is one `gh` call.
     if (head === 'issues') {
       if (req.method === 'GET') {
-        json(res, 200, service.issues.list());
+        json(res, 200, service.issues.list() satisfies IssuesPayload);
         return true;
       }
       if (req.method === 'POST' && rest[0] === 'refresh') {
@@ -1519,7 +1666,7 @@ async function routeApi(
         const key = typeof body.repo === 'string' && body.repo ? body.repo : undefined;
         const payload = await service.issues.refresh(key);
         if (payload === 'unknown-repo') { json(res, 404, { error: 'unknown repository' }); return true; }
-        json(res, 200, payload);
+        json(res, 200, payload satisfies IssuesPayload);
         return true;
       }
       json(res, 405, { error: 'GET /api/issues or POST /api/issues/refresh' });
@@ -1528,7 +1675,7 @@ async function routeApi(
 
     if (head === 'root') {
       if (req.method === 'GET') {
-        json(res, 200, checkRoot(url.searchParams.get('path') ?? ''));
+        json(res, 200, checkRoot(url.searchParams.get('path') ?? '') satisfies WireRootCheck);
         return true;
       }
       if (req.method === 'POST') {
@@ -1553,7 +1700,7 @@ async function routeApi(
     // shipped default, the value the console runs with, where that came from,
     // whether a page can write it and the line that changes it. A read.
     if (head === 'prefs' && rest.length === 1 && rest[0] === 'schema' && req.method === 'GET') {
-      json(res, 200, service.prefsSchema());
+      json(res, 200, service.prefsSchema() satisfies PrefsSchemaAnswer);
       return true;
     }
 
@@ -1629,7 +1776,7 @@ async function routeApi(
           void service.converger.converge(slug, 'button').catch(() => { /* reported on the run */ });
         }
       }
-      json(res, 200, { answered: asks.map((a) => a.runId), decision });
+      json(res, 200, { answered: asks.map((a) => a.runId), decision } satisfies BootResumeAnswer);
       return true;
     }
 
@@ -1678,22 +1825,49 @@ async function routeApi(
     // one item — what it asks, its guide, its attempts, why it is a person's.
     if (head === 'turn') {
       if (req.method === 'GET' && rest.length === 0) {
-        json(res, 200, await service.turnAnswer({ seen: url.searchParams.get('seen') }));
+        json(res, 200, (await service.turnAnswer({ seen: url.searchParams.get('seen') })) satisfies WireTurnAnswer);
         return true;
       }
       if (req.method === 'GET' && rest.length === 1) {
         const answer = await service.turnItemExplain(rest[0]!);
-        if (answer.ok) json(res, 200, answer);
+        // The service types the item loosely (`Record<string, unknown>`), so this names the wire, unchecked.
+        if (answer.ok) json(res, 200, answer as TurnExplainAnswer);
         else json(res, answer.status, { error: answer.error });
         return true;
       }
-      json(res, 405, { error: 'GET /api/turn · GET /api/turn/:id' });
+      // A person's word on any open item (2026-10-20): *I can't do this*
+      // `{reason}`, *Hand it to the AI* `{note?}`, a comment to the AI `{text}`.
+      // A person's only — a session or the supervisor raises an item and is
+      // told how it ended; neither speaks for the person who would answer it.
+      if (req.method === 'POST' && rest.length === 2 && (rest[1] === 'cannot' || rest[1] === 'hand-off' || rest[1] === 'note')) {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const reading = stampedDoor(req) ?? transportDoor(req, service.flags ?? {});
+        if (isAgentDoor(reading.door)) {
+          json(res, 403, {
+            error: `This is the person's word on an item — this request proves it is a `
+              + `${reading.door === 'session' ? "session's" : "supervisor's"}, which raises an item and is told how it ended.`,
+            door: reading.door,
+          });
+          return true;
+        }
+        const body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+        const actor = actorOfRequest(req, service.flags, body);
+        const opts = { by: actor.by, actor: pressActor(actor) };
+        const result = rest[1] === 'cannot' ? await service.cannotTurnItem(rest[0]!, body, opts)
+          : rest[1] === 'hand-off' ? await service.handOffTurnItem(rest[0]!, body, opts)
+            : await service.noteTurnItem(rest[0]!, body, opts);
+        if (result.ok) { json(res, 200, result satisfies TurnCannotAnswer | TurnHandOffAnswer | TurnNoteAnswer); return true; }
+        json(res, result.status, { error: result.error });
+        return true;
+      }
+      json(res, 405, { error: 'GET /api/turn · GET /api/turn/:id · POST /api/turn/:id/cannot|hand-off|note' });
       return true;
     }
 
     if (head === 'human-steps') {
       if (req.method === 'GET' && rest.length === 0) {
-        json(res, 200, service.humanStepsView({ open: url.searchParams.get('open') === '1' }));
+        json(res, 200, service.humanStepsView({ open: url.searchParams.get('open') === '1' }) satisfies HumanStepsList);
         return true;
       }
       if (req.method === 'POST' && rest.length === 1 && rest[0] === 'suspected') {
@@ -1701,7 +1875,7 @@ async function routeApi(
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
         const result = service.convertSuspectedStep(body, { by: actorOfRequest(req, service.flags, body).by });
-        if (result.ok) { json(res, 200, result); return true; }
+        if (result.ok) { json(res, 200, result satisfies StepVerbAnswer); return true; }
         const { status, ...rest2 } = result;
         json(res, status, rest2);
         return true;
@@ -1754,7 +1928,7 @@ async function routeApi(
                                     ...moves, door: reading.door, ...(typeof reading.fresh === 'boolean' ? { fresh: reading.fresh } : {}),
                                   })
                                     : { ok: false as const, status: 404, error: `a step has no verb ${verb}` };
-        if (result.ok) { json(res, 200, result); return true; }
+        if (result.ok) { json(res, 200, result satisfies StepVerbAnswer); return true; }
         const { status, ...rest2 } = result;
         json(res, status, rest2);
         return true;
@@ -1770,7 +1944,7 @@ async function routeApi(
     // and the owner decline — and it undoes exactly what the row says.
     if (head === 'permissions' && rest[0] === 'grants') {
       if (req.method === 'GET' && rest.length === 1) {
-        json(res, 200, service.grantsView());
+        json(res, 200, service.grantsView() satisfies GrantsList);
         return true;
       }
       if (req.method === 'POST' && (rest.length === 2 && rest[1] === 'revoke-all' || rest.length === 3 && rest[2] === 'revoke')) {
@@ -1809,17 +1983,19 @@ async function routeApi(
         if (action === 'subscribe') {
           const result = service.push.subscribe(body.subscription, body.categories, body.label);
           if ('error' in result) { json(res, 400, result); return true; }
-          json(res, 200, { device: result, state: service.push.state() });
+          json(res, 200, { device: result, state: service.push.state() } satisfies PushSubscribeAnswer);
           return true;
         }
         if (action === 'unsubscribe') {
-          json(res, 200, { removed: service.push.unsubscribe(body.id ?? body.endpoint), state: service.push.state() });
+          json(res, 200, {
+            removed: service.push.unsubscribe(body.id ?? body.endpoint), state: service.push.state(),
+          } satisfies PushUnsubscribeAnswer);
           return true;
         }
         if (action === 'categories') {
           const device = service.push.setCategories(body.id, body.categories);
           if (!device) { json(res, 404, { error: 'no such device' }); return true; }
-          json(res, 200, { device, state: service.push.state() });
+          json(res, 200, { device, state: service.push.state() } satisfies PushDeviceAnswer);
           return true;
         }
         if (action === 'quiet') {
@@ -1829,7 +2005,7 @@ async function routeApi(
           const device = service.push.setQuiet(body.id, body.quiet);
           if (!device) { json(res, 404, { error: 'no such device' }); return true; }
           if ('error' in device) { json(res, 400, device); return true; }
-          json(res, 200, { device, state: service.push.state() });
+          json(res, 200, { device, state: service.push.state() } satisfies PushDeviceAnswer);
           return true;
         }
         if (action === 'test') {
@@ -1881,7 +2057,7 @@ async function routeApi(
           const outcome = await service.performInboxAction(
             grant.item, verb, 'notification', actorOfRequest(req, service.flags, { by: 'notification' }),
           );
-          if (outcome.ok) { json(res, 200, outcome); return true; }
+          if (outcome.ok) { json(res, 200, outcome satisfies PushActionAnswer); return true; }
           json(res, outcome.status, { error: outcome.error });
           return true;
         }
@@ -1905,20 +2081,20 @@ async function routeApi(
         if (action === 'add') {
           const result = service.webhooks.add(body.url, body.label, body.categories);
           if ('error' in result) { json(res, 400, result); return true; }
-          json(res, 200, { hook: result, state: service.webhooks.state() });
+          json(res, 200, { hook: result, state: service.webhooks.state() } satisfies WebhookAnswer);
           return true;
         }
         if (action === 'remove') {
           json(res, 200, {
             removed: service.webhooks.remove(body.id),
             state: service.webhooks.state(),
-          });
+          } satisfies WebhookRemoveAnswer);
           return true;
         }
         if (action === 'categories') {
           const hook = service.webhooks.setCategories(body.id, body.categories);
           if (!hook) { json(res, 404, { error: 'no such webhook' }); return true; }
-          json(res, 200, { hook, state: service.webhooks.state() });
+          json(res, 200, { hook, state: service.webhooks.state() } satisfies WebhookAnswer);
           return true;
         }
         if (action === 'test') {
@@ -2010,7 +2186,7 @@ async function routeApi(
 
     /* ---------------- restarting the console itself ---------------- */
     if (head === 'restart') {
-      if (req.method === 'GET') { json(res, 200, service.restartReadiness()); return true; }
+      if (req.method === 'GET') { json(res, 200, service.restartReadiness() satisfies WireRestartReadiness); return true; }
       if (req.method === 'POST') {
         // Run-class, not write-class: this ends a process that may be
         // supervising agent sessions.
@@ -2029,9 +2205,14 @@ async function routeApi(
         // `session` is the id of the run session asking, when a session asks —
         // the CLI sends `$PE_SESSION_ID` — so the restart is attributed to it
         // and written onto its run (control-tower phase 48, #69).
+        // `requireUpdate` (measured-console phase 13, #414): the update is
+        // what was asked for (`phase-console update` sends it) — a fetch that
+        // cannot reach the remote restarts nothing. Unsaid, `whenIdle` implies
+        // it; `false` restarts on what the copy has whatever the fetch did.
         const outcome = service.restart(actor, body.force === true, {
           update: body.update !== false,
           ...(body.whenIdle === true ? { whenIdle: true } : {}),
+          ...(typeof body.requireUpdate === 'boolean' ? { requireUpdate: body.requireUpdate } : {}),
           ...(typeof body.session === 'string' && body.session ? { session: body.session.slice(0, 128) } : {}),
         });
         json(res, outcome.ok ? (outcome.updating || outcome.waiting ? 202 : 200) : 409, outcome);
@@ -2041,7 +2222,7 @@ async function routeApi(
 
     /* ---------------- stopping the console itself ---------------- */
     if (head === 'shutdown') {
-      if (req.method === 'GET') { json(res, 200, service.shutdownReadiness()); return true; }
+      if (req.method === 'GET') { json(res, 200, service.shutdownReadiness() satisfies WireShutdownReadiness); return true; }
       if (req.method === 'POST') {
         // Deliberately `guardCsrf` and NOT `guardRun`, unlike restart. Turning
         // a process off is the one verb every console must have: gating it on
@@ -2074,7 +2255,7 @@ async function routeApi(
       // Deliberately above the "no source directory is open" wall below: a
       // shell is exactly what you want on a machine where there is nothing to
       // open yet.
-      if (req.method === 'GET') { json(res, 200, service.terminalState()); return true; }
+      if (req.method === 'GET') { json(res, 200, service.terminalState() satisfies TerminalState); return true; }
 
       // Freeze / continue / stop one session — the runner's lane verbs at
       // session size, so a recovery agent mid-flight can be held or ended
@@ -2088,7 +2269,7 @@ async function routeApi(
         const outcome = rest[1] === 'freeze' ? service.terminals.freeze(rest[0], by)
           : rest[1] === 'thaw' ? service.terminals.thaw(rest[0])
           : service.terminals.stop(rest[0], by);
-        json(res, outcome.ok ? 200 : 409, { ...outcome, state: service.terminalState() });
+        json(res, outcome.ok ? 200 : 409, { ...outcome, state: service.terminalState() } satisfies TerminalVerbAnswer);
         return true;
       }
 
@@ -2265,7 +2446,7 @@ async function routeApi(
           json(res, outcome.ok ? 200 : 409, { ...outcome, state: service.terminalState() });
           return true;
         }
-        json(res, 200, { closed: service.terminals.kill(id), state: service.terminalState() });
+        json(res, 200, { closed: service.terminals.kill(id), state: service.terminalState() } satisfies TerminalDeleteAnswer);
         return true;
       }
     }
@@ -2280,7 +2461,7 @@ async function routeApi(
      * not something an unauthenticated caller can ask for. It shells out, so it
      * can take a moment; Settings polls it only while it is open. */
     if (head === 'tailscale' && req.method === 'GET') {
-      json(res, 200, await tailscaleStatus(service.flags.port));
+      json(res, 200, (await tailscaleStatus(service.flags.port)) satisfies WireTailscaleStatus);
       return true;
     }
 
@@ -2292,7 +2473,7 @@ async function routeApi(
      * an instance fact, read on Settings before any root is open. Behind the
      * access gate like every read; it names roots, never a secret. */
     if (head === 'instances' && req.method === 'GET' && rest.length === 0) {
-      json(res, 200, service.instancesView());
+      json(res, 200, service.instancesView() satisfies InstancesView);
       return true;
     }
 
@@ -2317,7 +2498,9 @@ async function routeApi(
         json(res, 200, {
           servers: await service.listMcp(),
           allowMcp: service.flags.allowMcp,
-        });
+          // What one attached server costs every turn, `scripts/mcp.env` (measured-console phase 27, D8).
+          contextTokens: service.mcpSizing.surcharge,
+        } satisfies McpState);
         return true;
       }
       // The catalog is a read, and deliberately ungated: browsing what exists
@@ -2326,7 +2509,7 @@ async function routeApi(
         const query = url.searchParams.get('q') ?? '';
         const registry = url.searchParams.get('registry') !== '0';
         try {
-          json(res, 200, await searchCatalog(query, { includeRegistry: registry }));
+          json(res, 200, (await searchCatalog(query, { includeRegistry: registry })) satisfies McpCatalogResult);
         } catch (error) {
           json(res, 502, { error: (error as Error).message });
         }
@@ -2339,7 +2522,7 @@ async function routeApi(
         const refusal = guardCsrf(req);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         try {
-          json(res, 200, { servers: await service.refreshMcp(true) });
+          json(res, 200, { servers: await service.refreshMcp(true) } satisfies McpServersAnswer);
         } catch (error) {
           json(res, 500, { error: (error as Error).message });
         }
@@ -2350,7 +2533,7 @@ async function routeApi(
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = await readBody(req);
         try {
-          json(res, 200, { server: await service.addMcpServer(body) });
+          json(res, 200, { server: await service.addMcpServer(body) } satisfies McpServerAnswer);
         } catch (error) {
           json(res, 400, { error: (error as Error).message });
         }
@@ -2363,7 +2546,7 @@ async function routeApi(
         if (req.method === 'DELETE' && rest.length === 1) {
           const refusal = guardMcp(req, service);
           if (refusal) { json(res, 403, { error: refusal }); return true; }
-          json(res, 200, { removed: await service.removeMcpServer(id) });
+          json(res, 200, { removed: await service.removeMcpServer(id) } satisfies McpRemoveAnswer);
           return true;
         }
         if (req.method === 'PATCH' && rest.length === 1) {
@@ -2373,7 +2556,7 @@ async function routeApi(
           try {
             const server = await service.patchMcpServer(id, body);
             if (!server) { json(res, 404, { error: `no MCP server called ${id}` }); return true; }
-            json(res, 200, { server });
+            json(res, 200, { server } satisfies McpServerAnswer);
           } catch (error) {
             json(res, 400, { error: (error as Error).message });
           }
@@ -2394,7 +2577,7 @@ async function routeApi(
               // `--no-browser` only for a person who is not at this machine
               // (#372): a browser the CLI opened would open here, unseen.
               remote: !atThisMachine(req, service),
-            }));
+            }) satisfies McpLoginStart);
           } catch (error) {
             json(res, 400, { error: (error as Error).message });
           }
@@ -2405,7 +2588,7 @@ async function routeApi(
         if (req.method === 'GET' && rest[1] === 'login' && rest.length === 2) {
           const flow = service.mcpLoginFlow(id);
           if (!flow) { json(res, 404, { error: `no sign-in for ${id} has been started on this console` }); return true; }
-          json(res, 200, { flow });
+          json(res, 200, { flow } satisfies McpFlowAnswer);
           return true;
         }
         // The paste-back: the address the browser landed on, typed into the
@@ -2415,7 +2598,9 @@ async function routeApi(
           if (refusal) { json(res, 403, { error: refusal }); return true; }
           const body = await readBody(req);
           try {
-            json(res, 200, { flow: service.pasteMcpLogin(id, typeof body.url === 'string' ? body.url : '') });
+            json(res, 200, {
+              flow: service.pasteMcpLogin(id, typeof body.url === 'string' ? body.url : ''),
+            } satisfies McpFlowAnswer);
           } catch (error) {
             json(res, 400, { error: (error as Error).message });
           }
@@ -2424,7 +2609,7 @@ async function routeApi(
         if (req.method === 'POST' && rest[1] === 'acknowledge') {
           const refusal = guardCsrf(req);
           if (refusal) { json(res, 403, { error: refusal }); return true; }
-          json(res, 200, { acknowledged: service.mcp.acknowledgeDrift(id) });
+          json(res, 200, { acknowledged: service.mcp.acknowledgeDrift(id) } satisfies McpAcknowledgeAnswer);
           return true;
         }
       }
@@ -2448,7 +2633,7 @@ async function routeApi(
           // The removed registrations the learned store still answers for
           // (phase 15). Read defensively: an older service has no such method.
           tombstones: typeof service.accountTombstones === 'function' ? service.accountTombstones() : [],
-        });
+        } satisfies AccountsState);
         return true;
       }
       if (req.method === 'POST' && rest[0] === 'login') {
@@ -2464,7 +2649,7 @@ async function routeApi(
             ...(name ? { name } : {}),
             // The person's answer to the machine-login warning (phase 13, #131).
             ...(body.confirm !== undefined ? { confirm: body.confirm } : {}),
-          }));
+          }) satisfies AccountLoginStart);
         } catch (error) {
           json(res, 400, { error: (error as Error).message });
         }
@@ -2503,7 +2688,7 @@ async function routeApi(
         // and asking per-account in a loop is how a five-account console
         // spends its courtesy budget on a rate limit.
         if (body.accountId === undefined || body.accountId === null || body.accountId === '') {
-          json(res, 200, { accounts: await service.refreshAllAccounts() });
+          json(res, 200, { accounts: await service.refreshAllAccounts() } satisfies AccountRefreshAnswer);
           return true;
         }
         const id = typeof body.accountId === 'string' && ACCOUNT_ID_RE.test(body.accountId)
@@ -2547,7 +2732,7 @@ async function routeApi(
         try {
           const out = await service.probeAccountEntitlement(id, actorOfRequest(req, service.flags, body));
           if (!out) { json(res, 404, { error: 'No such account.' }); return true; }
-          json(res, 200, out);
+          json(res, 200, out satisfies AccountProbeResult);
         } catch (error) {
           json(res, error instanceof ProbeInFlightError ? 409 : 400, { error: (error as Error).message });
         }
@@ -2562,7 +2747,7 @@ async function routeApi(
         if (!name) { json(res, 400, { error: 'Name the account — a token has no email to show.' }); return true; }
         if (!token) { json(res, 400, { error: 'Paste the token from `claude setup-token`.' }); return true; }
         try {
-          json(res, 200, { account: await service.addTokenAccount(name, token) });
+          json(res, 200, { account: await service.addTokenAccount(name, token) } satisfies AccountAnswer);
         } catch (error) {
           // 409 for a name an account already has, pointing at it (phase 13,
           // #33): a re-paste minted a second account for one identity.
@@ -2580,7 +2765,7 @@ async function routeApi(
         if (!ACCOUNT_ID_RE.test(id)) { json(res, 400, { error: 'Not an account id.' }); return true; }
         try {
           const removed = await service.removeAccount(id);
-          json(res, removed ? 200 : 404, removed ? { removed: true } : { error: 'No such account.' });
+          json(res, removed ? 200 : 404, removed ? ({ removed: true } satisfies AccountRemoved) : { error: 'No such account.' });
         } catch (error) {
           // 409 when the request is fine and the moment is not — a live run
           // paying as this account, or a live session signed into its config
@@ -2637,7 +2822,7 @@ async function routeApi(
      * the launcher carries no root and picks its console when it runs. */
     if (head === 'launcher') {
       if (req.method === 'GET') {
-        json(res, 200, service.launcherPlan());
+        json(res, 200, service.launcherPlan() satisfies LauncherPlanView);
         return true;
       }
       if (req.method === 'POST') {
@@ -2666,7 +2851,7 @@ async function routeApi(
      * honestly (the plan list is empty until a root opens). */
     if (head === 'policy') {
       if (req.method === 'GET') {
-        json(res, 200, service.policy(url.searchParams.get('slug')));
+        json(res, 200, service.policy(url.searchParams.get('slug')) satisfies WirePolicyView);
         return true;
       }
       // `POST /api/policy/advisory/acknowledge {kind}` — the operator has read
@@ -2683,7 +2868,7 @@ async function routeApi(
         }
         const acknowledged = service.acknowledgePolicyAdvisory(kind);
         json(res, acknowledged ? 200 : 404, acknowledged
-          ? { ok: true, kind, advisory: service.policyAdvisories() }
+          ? ({ ok: true, kind, advisory: service.policyAdvisories() } satisfies PolicyAdvisoryAck)
           : { error: `no ${kind} advisory stands right now` });
         return true;
       }
@@ -2777,7 +2962,7 @@ async function routeApi(
     // inbox: a console with no plan directory open has spent nothing, and
     // "nothing" is a true and renderable answer. A 409 here would put an error
     // in a header widget that is meant to be quietly correct.
-    if (head === 'spend' && req.method === 'GET') { json(res, 200, service.spend()); return true; }
+    if (head === 'spend' && req.method === 'GET') { json(res, 200, service.spend() satisfies SpendView); return true; }
 
     // Every open plan's newest runs, their ledgers per plan and per account
     // (phase 19) — Insights. Above the wall for `spend`'s reason: no plan
@@ -2786,6 +2971,14 @@ async function routeApi(
       json(res, 200, service.ledgerSummary());
       return true;
     }
+
+    // Logs ▸ Health over time (measured-console phase 31, F2): the bounded series per measure —
+    // gate time, load, persist time and (Pro) the reconciliation's delta. A read, above the wall.
+    if (head === 'health' && req.method === 'GET' && rest.length === 1 && rest[0] === 'series') {
+      json(res, 200, service.healthSeriesView() satisfies WireHealthSeriesView);
+      return true;
+    }
+
 
     // The scrape endpoint. Above the wall for the same reason as `spend`: a
     // console with no plan directory open still has a version, an instance and
@@ -2819,7 +3012,7 @@ async function routeApi(
     // dollars in the sliding hour, the limits, the doors, the limit the next
     // automatic start would meet and when it frees — and the MCP probe's own.
     if (head === 'ceiling' && rest.length === 0 && req.method === 'GET') {
-      json(res, 200, service.startCeilingView());
+      json(res, 200, service.startCeilingView() satisfies StartCeilingCounters);
       return true;
     }
     // `GET /api/credentials`: every credential id this machine is asked about
@@ -2850,7 +3043,7 @@ async function routeApi(
     // the CLI's (`phase-console doctor --stop-strays`). Before `doctor`, whose
     // GET answers any path under its head.
     if (head === 'doctor' && rest.length === 1 && rest[0] === 'strays' && req.method === 'GET') {
-      json(res, 200, await service.strayConsoles());
+      json(res, 200, (await service.strayConsoles()) satisfies StrayConsoles);
       return true;
     }
 
@@ -2861,7 +3054,7 @@ async function routeApi(
     // runs `phase-console doctor` against, and the CLI prefers this answer to
     // its own off-line reading whenever a console is up. A read; no guard.
     if (head === 'doctor' && req.method === 'GET') {
-      json(res, 200, await service.doctor());
+      json(res, 200, (await service.doctor()) satisfies WireDoctorReport);
       return true;
     }
 
@@ -2893,13 +3086,13 @@ async function routeApi(
      * so the card can promise it rather than describing a second computation.
      */
     if (head === 'debug' && rest[0] === 'retention' && req.method === 'GET') {
-      json(res, 200, service.retentionNow());
+      json(res, 200, service.retentionNow() satisfies WireRetentionReport);
       return true;
     }
 
     if (head === 'debug' && rest[0] === 'level') {
       if (req.method === 'GET') {
-        json(res, 200, { ...levelState(), levels: LEVELS });
+        json(res, 200, { ...levelState(), levels: LEVELS } satisfies DebugLevelState);
         return true;
       }
       if (req.method === 'DELETE') {
@@ -2961,7 +3154,7 @@ async function routeApi(
 
       // The log explorer's read: every source, merged and filtered.
       if (rest[0] === 'index') {
-        json(res, 200, debug.index(parseDebugQuery(url.searchParams)));
+        json(res, 200, debug.index(parseDebugQuery(url.searchParams)) satisfies WireDebugIndex);
         return true;
       }
 
@@ -2970,7 +3163,7 @@ async function routeApi(
       // when the row cap dropped the older ones' entries.
       if (rest[0] === 'runs') {
         if (!slugParam) { json(res, 400, { error: 'a slug is required' }); return true; }
-        json(res, 200, { slug: slugParam, runs: debug.runIds(slugParam) });
+        json(res, 200, { slug: slugParam, runs: debug.runIds(slugParam) } satisfies DebugRuns);
         return true;
       }
 
@@ -3196,7 +3389,7 @@ async function routeApi(
             .map((v: string) => v.slice(0, 256));
           if (!ids.length) { json(res, 400, { error: 'pass {"ids": ["<inbox item id>", …]}' }); return true; }
           const results = service.ackInboxMany(ids, by);
-          json(res, 200, { results, acked: results.filter((r) => r.ok).length });
+          json(res, 200, { results, acked: results.filter((r) => r.ok).length } satisfies BulkAckResult);
           return true;
         }
 
@@ -3211,7 +3404,7 @@ async function routeApi(
         if (ok && typeof body.answer === 'string' && body.answer && !isAgentDoor(door.door)) {
           await service.settleAnsweredRow(id, body.answer.slice(0, 80), by);
         }
-        json(res, 200, { ok });
+        json(res, 200, { ok } satisfies InboxAckOne);
         return true;
       }
 
@@ -3225,9 +3418,9 @@ async function routeApi(
         // No id means no clear-everything. The most destructive reading must
         // never be the default — the notification inbox pins the same rule.
         if (!many.length) { json(res, 400, { error: 'pass ?id=<inbox item id>' }); return true; }
-        if (many.length === 1) { json(res, 200, { ok: service.unackInbox(many[0]) }); return true; }
+        if (many.length === 1) { json(res, 200, { ok: service.unackInbox(many[0]) } satisfies InboxAckOne); return true; }
         const results = service.unackInboxMany(many.map((v) => v.slice(0, 256)));
-        json(res, 200, { results, unacked: results.filter((r) => r.ok).length });
+        json(res, 200, { results, unacked: results.filter((r) => r.ok).length } satisfies BulkAckResult);
         return true;
       }
     }
@@ -3264,14 +3457,14 @@ async function routeApi(
     }
 
     /* ---------------- portfolio ---------------- */
-    if (head === 'plans' && rest.length === 0) { json(res, 200, await service.summaries()); return true; }
-    if (head === 'stats') { json(res, 200, await service.portfolio()); return true; }
+    if (head === 'plans' && rest.length === 0) { json(res, 200, (await service.summaries()) satisfies PlanList); return true; }
+    if (head === 'stats') { json(res, 200, (await service.portfolio()) satisfies WirePortfolio); return true; }
 
     if (head === 'search') {
-      json(res, 200, service.searchAll(url.searchParams.get('q') ?? ''));
+      json(res, 200, service.searchAll(url.searchParams.get('q') ?? '') satisfies WireSearchResult);
       return true;
     }
-    if (head === 'skills' && req.method === 'GET') { json(res, 200, service.skills()); return true; }
+    if (head === 'skills' && req.method === 'GET') { json(res, 200, service.skills() satisfies SkillInfoList); return true; }
 
     /* ---------------- one plan ---------------- */
     if (head === 'plans' && rest.length >= 1) {
@@ -3286,7 +3479,7 @@ async function routeApi(
           parseInclude(url.searchParams.get('include'), PLAN_INCLUDES),
         );
         if (!detail) { json(res, 404, { error: `No plan named ${slug}` }); return true; }
-        json(res, 200, detail);
+        json(res, 200, detail satisfies PlanDetail);
         return true;
       }
 
@@ -3299,7 +3492,7 @@ async function routeApi(
       if (sub === 'handoff' && arg) {
         const handoff = service.handoff(slug, Number(arg));
         if (!handoff) { json(res, 404, { error: 'No handoff for that phase' }); return true; }
-        json(res, 200, handoff);
+        json(res, 200, handoff satisfies HandoffDetail);
         return true;
       }
 
@@ -3316,7 +3509,7 @@ async function routeApi(
         }
         const report = service.qaReport(slug, phase, round);
         if (!report) { json(res, 404, { error: 'No QA report on file for that phase and round' }); return true; }
-        json(res, 200, report);
+        json(res, 200, report satisfies QaReportView);
         return true;
       }
 
@@ -3343,7 +3536,7 @@ async function routeApi(
           json(res, 400, { error: 'the notes route needs a phase number' });
           return true;
         }
-        json(res, 200, { slug, phase, notes: await service.notes(slug, phase) });
+        json(res, 200, { slug, phase, notes: await service.notes(slug, phase) } satisfies PhaseNotes);
         return true;
       }
       // Read-only: what boarding will find before any money is spent —
@@ -3352,7 +3545,7 @@ async function routeApi(
       if (sub === 'verify-preflight') {
         const report = await service.verifyPreflightReport(slug);
         if (!report) { json(res, 404, { error: `No phased plan named ${slug}` }); return true; }
-        json(res, 200, report);
+        json(res, 200, report satisfies VerifyPreflight);
         return true;
       }
       // Read-only: what "Give this run its own checkout" would DO — granted
@@ -3362,7 +3555,7 @@ async function routeApi(
       if (sub === 'isolation-preflight') {
         const report = await service.isolationPreflight(slug);
         if (!report) { json(res, 404, { error: `No phased plan named ${slug}` }); return true; }
-        json(res, 200, report);
+        json(res, 200, report satisfies IsolationPreflight);
         return true;
       }
       if (sub === 'board') { text(res, 200, await service.boardText(slug)); return true; }
@@ -3395,7 +3588,7 @@ async function routeApi(
             ...(typeof body.by === 'string' ? { by: body.by } : {}),
             ...(typeof body.base === 'string' ? { base: body.base } : {}),
             ...(typeof body.tip === 'string' ? { tip: body.tip } : {}),
-          });
+          }) satisfies ReviewOutcome;
           // On refusal `error` carries the detail, so ApiError.message says WHY
           // rather than "Request failed (409)" — the same shape as the gate.
           json(res, outcome.ok ? 200 : 409, outcome.ok ? outcome : { ...outcome, error: outcome.detail });
@@ -3407,7 +3600,7 @@ async function routeApi(
           ...(url.searchParams.get('tip') ? { tip: String(url.searchParams.get('tip')) } : {}),
         });
         if (!view) { json(res, 404, { error: `No plan named ${slug}` }); return true; }
-        json(res, 200, view);
+        json(res, 200, view satisfies PhaseReview);
         return true;
       }
       /* A phase's inline comments. Split from the verdict route rather than
@@ -3442,7 +3635,7 @@ async function routeApi(
             ...(typeof body.code === 'string' ? { code: body.code } : {}),
             ...(typeof body.by === 'string' ? { by: body.by } : {}),
           }
-          : { action, id: String(body.id ?? '') });
+          : { action, id: String(body.id ?? '') }) satisfies ReviewOutcome;
         json(res, outcome.ok ? 200 : 409, outcome.ok ? outcome : { ...outcome, error: outcome.detail });
         return true;
       }
@@ -3466,7 +3659,7 @@ async function routeApi(
         const body = await readBody(req);
         const outcome = await service.sendBackReview(slug, phase, {
           ...(typeof body.by === 'string' ? { by: body.by } : {}),
-        });
+        }) satisfies SendBackOutcome;
         json(res, outcome.ok ? 200 : 409, outcome.ok ? outcome : { ...outcome, error: outcome.detail });
         return true;
       }
@@ -3493,7 +3686,7 @@ async function routeApi(
           const outcome = await service.composeLandingPacket(slug, {
             ...(typeof body.base === 'string' ? { base: body.base } : {}),
             ...(typeof body.tip === 'string' ? { tip: body.tip } : {}),
-          });
+          }) satisfies LandingComposeOutcome;
           json(res, outcome.ok ? 200 : 409, outcome.ok ? outcome : { ...outcome, error: outcome.detail });
           return true;
         }
@@ -3511,7 +3704,7 @@ async function routeApi(
         }
         const view = await service.landing(slug);
         if (!view) { json(res, 404, { error: `No plan named ${slug}` }); return true; }
-        json(res, 200, view);
+        json(res, 200, view satisfies LandingView);
         return true;
       }
 
@@ -3539,21 +3732,21 @@ async function routeApi(
             continueRun: body.continueRun === true,
             actor,
             door: pressDoorOf(actor),
-          });
+          }) satisfies GateApprovalOutcome;
           // On refusal, `error` carries the detail so ApiError.message says
           // WHY rather than "Request failed (409)".
           json(res, outcome.ok ? 200 : 409, outcome.ok ? outcome : { ...outcome, error: outcome.detail });
           return true;
         }
-        json(res, 200, await service.gateStatus(slug, Number(arg)));
+        json(res, 200, (await service.gateStatus(slug, Number(arg))) satisfies GateRead);
         return true;
       }
       if (sub === 'session-plan') {
-        json(res, 200, await service.sessionPlan(slug, url.searchParams.get('model') ?? undefined));
+        json(res, 200, (await service.sessionPlan(slug, url.searchParams.get('model') ?? undefined)) satisfies SessionPlanRead);
         return true;
       }
-      if (sub === 'lint') { json(res, 200, await service.lint(slug)); return true; }
-      if (sub === 'work') { json(res, 200, await service.work(slug)); return true; }
+      if (sub === 'lint') { json(res, 200, (await service.lint(slug)) satisfies LintRead); return true; }
+      if (sub === 'work') { json(res, 200, (await service.work(slug)) satisfies PlanWork); return true; }
 
       /* Turn QA on for a plan that has it off. Write-class — it creates
        * `test-status.md` and backfills the already-complete phases — so it sits
@@ -3579,7 +3772,7 @@ async function routeApi(
           }
           const outcome = await service.setQaMode(slug, {
             mode: mode as (typeof QA_DIRECTIVES)[number], ...(phase !== undefined ? { phase } : {}),
-          });
+          }) satisfies QaModeAnswer;
           json(res, outcome.ok ? 200 : 409, outcome);
           return true;
         }
@@ -3587,7 +3780,7 @@ async function routeApi(
           json(res, 400, { error: 'pass {mode, phase?} to set the QA regime, or {phase} to activate QA — activation records that phase and waives the rest' });
           return true;
         }
-        const outcome = await service.activateQa(slug, phase);
+        const outcome = (await service.activateQa(slug, phase)) satisfies QaModeAnswer;
         json(res, outcome.ok ? 200 : 409, outcome);
         return true;
       }
@@ -3609,7 +3802,7 @@ async function routeApi(
         const outcome = await service.qaWaive(slug, phase, {
           reason: typeof body.reason === 'string' ? body.reason.slice(0, 280) : '',
           by: actorOfRequest(req, service.flags, body).by,
-        });
+        }) satisfies QaWaiveOutcome;
         json(res, outcome.ok ? 200 : 409, outcome);
         return true;
       }
@@ -3641,7 +3834,7 @@ async function routeApi(
       // `hinted` and `withdrawn` each with the press that moves it; `audit`,
       // every queue change with who and why. Everything the queue page draws,
       // so the CLI and the supervisor read what a person sees.
-      json(res, 200, { ...service.queueView(), advice: await service.queueAdvice() });
+      json(res, 200, { ...service.queueView(), advice: await service.queueAdvice() } satisfies import('../../shared/wire/state.js').QueueView);
       return true;
     }
 
@@ -3684,9 +3877,9 @@ async function routeApi(
       });
       if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
       json(res, 200, {
-        ...service.queueSnapshot(), change: { verb: rest[0], slug: out.slug, phase: out.phase, changed: out.changed },
+        ...service.queueSnapshot(), change: { verb: rest[0]!, slug: out.slug, phase: out.phase, changed: out.changed },
         ...(verdict ? { verdict } : {}),
-      });
+      } satisfies Omit<QueueActAnswer, 'verdict'>);
       return true;
     }
 
@@ -3705,7 +3898,7 @@ async function routeApi(
         ...(body.loadFactor !== undefined ? { loadFactor: typeof body.loadFactor === 'string' ? Number(body.loadFactor) : body.loadFactor as number } : {}),
       }, actorOfRequest(req, service.flags, body));
       if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
-      json(res, 200, { policy: service.schedulingPolicies(), load: service.loadGuard() });
+      json(res, 200, { policy: service.schedulingPolicies(), load: service.loadGuard() } satisfies QueuePolicyAnswer);
       return true;
     }
 
@@ -3777,7 +3970,7 @@ async function routeApi(
      * Run-class, like the thaw it mirrors: releasing the hold re-adopts and
      * converges, and both end in spawned sessions. */
     if (head === 'automation' && rest[0] === 'hold') {
-      if (req.method === 'GET') { json(res, 200, { bootHold: service.bootHold() }); return true; }
+      if (req.method === 'GET') { json(res, 200, { bootHold: service.bootHold() } satisfies BootHoldView); return true; }
       if (req.method === 'POST' && rest[1] === 'release') {
         const refusal = guardRun(req, service);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
@@ -3792,7 +3985,7 @@ async function routeApi(
 
     if (head === 'fleet') {
       if (req.method === 'GET' && rest.length === 0) {
-        json(res, 200, { fleet: service.fleetState(), allowRun: service.flags.allowRun });
+        json(res, 200, { fleet: service.fleetState(), allowRun: service.flags.allowRun } satisfies FleetFreezeView);
         return true;
       }
       if (req.method === 'POST' && (rest[0] === 'freeze' || rest[0] === 'thaw')) {
@@ -3804,7 +3997,7 @@ async function routeApi(
           ? service.freezeFleet(by)
           : await service.thawFleet(by);
         json(res, outcome.ok ? 200 : 409, outcome.ok
-          ? { fleet: service.fleetState(), runs: outcome.runs }
+          ? ({ fleet: service.fleetState(), runs: outcome.runs } satisfies FleetFreezeAnswer)
           : { error: outcome.reason, fleet: service.fleetState() });
         return true;
       }
@@ -3819,7 +4012,7 @@ async function routeApi(
     // #24: every lock claim this console can see, one row each, worst-first —
     // `?held=1`, `?lapsed=1`, `?scope=<repo>` narrow it (`server/locks.ts`).
     if (head === 'locks' && req.method === 'GET' && rest.length === 0) {
-      json(res, 200, { rows: service.lockRows(parseLockFilter(url.searchParams)) });
+      json(res, 200, { rows: service.lockRows(parseLockFilter(url.searchParams)) } satisfies LockRows);
       return true;
     }
     if (head === 'locks' && req.method === 'POST' && rest[0] === 'release') {
@@ -3896,7 +4089,7 @@ async function routeApi(
       if (req.method === 'POST' && rest[0] === 'login') {
         const refusal = guardRun(req, service);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
-        json(res, 200, await service.startLogin());
+        json(res, 200, (await service.startLogin()) satisfies AuthLoginStart);
         return true;
       }
     }
@@ -3946,14 +4139,14 @@ async function routeApi(
       if (req.method === 'GET') {
         if (verb === 'journal') {
           const id = rest[2] ?? service.runIdFor(slug);
-          json(res, 200, id ? service.runJournal(slug, id, Number(url.searchParams.get('limit') ?? 500)) : []);
+          json(res, 200, (id ? service.runJournal(slug, id, Number(url.searchParams.get('limit') ?? 500)) : []) satisfies RunJournal);
           return true;
         }
         // The run on a time axis. Read from the journal rather than the
         // checkpoint: the checkpoint holds one row per phase and cannot say
         // when attempt 2 started, which is the whole question a Gantt answers.
         if (verb === 'timeline') {
-          json(res, 200, service.runTimeline(slug, rest[2]));
+          json(res, 200, service.runTimeline(slug, rest[2]) satisfies RunTimeline);
           return true;
         }
         // One phase's boardings, with each consecutive pair diffed. `?run=` to
@@ -3961,13 +4154,13 @@ async function routeApi(
         if (verb === 'attempts') {
           const phase = Number(rest[2] ?? url.searchParams.get('phase'));
           if (!Number.isFinite(phase)) { json(res, 400, { error: 'a phase number is required' }); return true; }
-          json(res, 200, service.phaseAttempts(slug, phase, url.searchParams.get('run') ?? undefined));
+          json(res, 200, service.phaseAttempts(slug, phase, url.searchParams.get('run') ?? undefined) satisfies PhaseAttempts);
           return true;
         }
         // Why each start happened, what every session cost and ran, what each
         // rung spent — the journal's ledger, held to the run's spend (phase 19).
         if (verb === 'ledger') {
-          json(res, 200, service.runLedger(slug, rest[2]));
+          json(res, 200, service.runLedger(slug, rest[2]) satisfies RunLedger);
           return true;
         }
         // One phase, read live (control-tower phase 95). `activity`: the last
@@ -3983,7 +4176,7 @@ async function routeApi(
             return true;
           }
           if (rest[3] === 'activity') {
-            json(res, 200, service.phaseActivity(slug, phase, activityQuery(url.searchParams)));
+            json(res, 200, service.phaseActivity(slug, phase, activityQuery(url.searchParams)) satisfies PhaseActivity);
           } else {
             const { run } = activityQuery(url.searchParams);
             const report = service.phaseReport(slug, phase, run ? { run } : {});
@@ -3996,7 +4189,7 @@ async function routeApi(
         // END, with a bounded `limit` — `?limit=abc` used to mean the whole file.
         if (verb === 'transcript') {
           const { limit, phase } = transcriptQuery(url.searchParams);
-          json(res, 200, service.runTranscript(slug, rest[2], limit, phase));
+          json(res, 200, service.runTranscript(slug, rest[2], limit, phase) satisfies RunTranscript);
           return true;
         }
         // Why a phase is not done, in one payload: the command output, the
@@ -4015,7 +4208,7 @@ async function routeApi(
         // admission uses, so the page cannot show one answer while the
         // scheduler acts on another.
         if (verb === 'scopes') {
-          json(res, 200, { scopes: service.phaseScopes(slug) });
+          json(res, 200, { scopes: service.phaseScopes(slug) } satisfies RunScopes);
           return true;
         }
         // What this plan's sessions DECIDED, oldest first. Read from the
@@ -4060,14 +4253,14 @@ async function routeApi(
               ...(q.get('gitMode') ? { gitMode: q.get('gitMode')! } : {}),
               ...(q.get('isolation') ? { isolation: q.get('isolation')! } : {}),
             });
-            json(res, 200, { prelude });
+            json(res, 200, { prelude } satisfies PreludeAnswer);
           } catch (error) {
             json(res, 404, { error: String((error as Error)?.message ?? error) });
           }
           return true;
         }
         if (verb === 'rulings') {
-          json(res, 200, { rulings: service.runRulings(slug) });
+          json(res, 200, { rulings: service.runRulings(slug) } satisfies RulingList);
           return true;
         }
         // The long poll (control-tower phase 98, #137 item 4, #144): answers
@@ -4095,7 +4288,7 @@ async function routeApi(
         }
         // The plan's stored triggers, armed first (control-tower phase 98, #137).
         if (verb === 'triggers') {
-          json(res, 200, { triggers: service.listTriggers(slug) });
+          json(res, 200, { triggers: service.listTriggers(slug) } satisfies TriggerList);
           return true;
         }
         // What the plan's sessions proved (`proofs.ndjson`, the last proof of
@@ -4119,7 +4312,7 @@ async function routeApi(
           }
           const which = phase ? Number(phase) : undefined;
           if (verb === 'proofs') {
-            json(res, 200, service.runProofs(slug, which));
+            json(res, 200, service.runProofs(slug, which) satisfies RunProofs);
             return true;
           }
           const limit = q.get('limit');
@@ -4130,7 +4323,7 @@ async function routeApi(
           const run = (q.get('run') ?? '').slice(0, 200);
           json(res, 200, service.runVerifications(slug, {
             ...(which !== undefined ? { phase: which } : {}), ...(run ? { run } : {}), ...(limit ? { limit: Number(limit) } : {}),
-          }));
+          }) satisfies RunVerifications);
           return true;
         }
         // `eta` rides along rather than getting an endpoint of its own: it is
@@ -4158,7 +4351,7 @@ async function routeApi(
           // it is `null` far more often than not (every shared run), and an
           // endpoint that mostly 404s teaches a client to stop asking.
           git: service.runGit(slug),
-        });
+        } satisfies RunDetail);
         return true;
       }
 
@@ -4206,7 +4399,9 @@ async function routeApi(
             return true;
           }
           const note = typeof body.note === 'string' ? body.note.slice(0, 8_000) : '';
-          answerPress(res, await service.answerErrand(slug, phase, note, pressActor(actorOfRequest(req, service.flags, body))));
+          // The option of the step the errand names, when the card offered its options (2026-10-20).
+          const choice = typeof body.choice === 'string' && body.choice ? body.choice.slice(0, 64) : undefined;
+          answerPress(res, await service.answerErrand(slug, phase, note, pressActor(actorOfRequest(req, service.flags, body)), choice));
           return true;
         }
 
@@ -4238,6 +4433,8 @@ async function routeApi(
               // behaviour this budget exists to end.
               ?? intProblem(body.qaMaxRounds, 'qaMaxRounds', 1, 20)
               ?? intProblem(body.approvalTimeoutMinutes, 'approvalTimeoutMinutes', 1, 59)
+              // The session's environment (measured-console phase 6).
+              ?? sessionEnvProblem(body)
               // The per-repository threshold (phase 15): a whole number, and
               // a ceiling that is merely finite — the console's own cap clamps
               // it at admission, so the door need not know that number.
@@ -4417,6 +4614,18 @@ async function routeApi(
               qaEffort: isEffort(body.qaEffort) ? body.qaEffort : undefined,
               ...(body.approvalTimeoutMinutes === undefined || body.approvalTimeoutMinutes === null
                 || body.approvalTimeoutMinutes === '' ? {} : { approvalTimeoutMinutes: Number(body.approvalTimeoutMinutes) }),
+              // The session's environment (measured-console phase 6): named, it
+              // is the run's; `null` on a Continue clears it, on a fresh run it
+              // is silence — the defaults are stored as no key either way.
+              ...('cacheTtlAb' in body ? { cacheTtlAb: body.cacheTtlAb ? body.cacheTtlAb as CacheTtlAb : null } : {}),
+              ...('keepWarmSec' in body ? { keepWarmSec: numberOrNull(body.keepWarmSec) } : {}),
+              ...('subagentModel' in body
+                ? { subagentModel: typeof body.subagentModel === 'string' && body.subagentModel ? body.subagentModel : null } : {}),
+              ...('bashMaxOutput' in body ? { bashMaxOutput: numberOrNull(body.bashMaxOutput) } : {}),
+              // The platform's pieces (measured-console phase 12): the same rule.
+              ...('humanStepMode' in body ? { humanStepMode: body.humanStepMode ? body.humanStepMode as HumanStepMode : null } : {}),
+              ...('compaction' in body ? { compaction: body.compaction ? body.compaction as CompactionMode : null } : {}),
+              ...('compactionWindow' in body ? { compactionWindow: numberOrNull(body.compactionWindow) } : {}),
               qaMaxRounds: body.qaMaxRounds === undefined || body.qaMaxRounds === null || body.qaMaxRounds === ''
                 ? undefined
                 : Number(body.qaMaxRounds),
@@ -4757,12 +4966,19 @@ async function routeApi(
             const actor = actorOfRequest(req, service.flags, body);
             // The act it caused, or a refusal (control-tower phase 53, #56):
             // `launched` names the run and the fresh session boarding in the
-            // person slot, outside the automatic ladder.
-            answerPress(res, await service.pressRetry(slug, Number(body.phase), {
+            // person slot, outside the automatic ladder. A LIVE phase's
+            // addendum is delivered to its session instead, answered
+            // `{delivered: 'message'}` (measured-console phase 13, #424).
+            const retried = await service.pressRetry(slug, Number(body.phase), {
               ...(addendum ? { addendum } : {}),
               options: onePhaseOptions(body.options, service),
               by: actor.by,
-            }, pressActor(actor)));
+            }, pressActor(actor));
+            if (retried.ok && 'delivered' in retried) {
+              json(res, 200, { run: retried.run, delivered: retried.delivered, message: retried.message });
+              return true;
+            }
+            answerPress(res, retried);
             return true;
           }
           // One verb rather than "set the policy, then retry these three
@@ -5033,6 +5249,8 @@ async function routeApi(
               // behaviour this budget exists to end.
               ?? intProblem(body.qaMaxRounds, 'qaMaxRounds', 1, 20)
               ?? intProblem(body.approvalTimeoutMinutes, 'approvalTimeoutMinutes', 1, 59)
+              // The session's environment (measured-console phase 6).
+              ?? sessionEnvProblem(body)
               ?? intProblem(body.maxConcurrentPerRepo, 'maxConcurrentPerRepo', 1, 99)
               ?? intProblem(body.ladderPerRunRungs, 'ladderPerRunRungs', 0, 1000)
               ?? intProblem(body.ladderPerPhaseRungs, 'ladderPerPhaseRungs', 0, 100)
@@ -5201,6 +5419,17 @@ async function routeApi(
               // `null` or '' puts the card back on the hook call's hour (#140).
               ...('approvalTimeoutMinutes' in body
                 ? { approvalTimeoutMinutes: body.approvalTimeoutMinutes ? Number(body.approvalTimeoutMinutes) : null } : {}),
+              // The session's environment (measured-console phase 6): `null` or
+              // '' puts a field back to its default; each lands on the next spawn.
+              ...('cacheTtlAb' in body ? { cacheTtlAb: body.cacheTtlAb ? body.cacheTtlAb as CacheTtlAb : null } : {}),
+              ...('keepWarmSec' in body ? { keepWarmSec: numberOrNull(body.keepWarmSec) } : {}),
+              ...('subagentModel' in body
+                ? { subagentModel: typeof body.subagentModel === 'string' && body.subagentModel ? body.subagentModel : null } : {}),
+              ...('bashMaxOutput' in body ? { bashMaxOutput: numberOrNull(body.bashMaxOutput) } : {}),
+              // The platform's pieces (measured-console phase 12): the same rule.
+              ...('humanStepMode' in body ? { humanStepMode: body.humanStepMode ? body.humanStepMode as HumanStepMode : null } : {}),
+              ...('compaction' in body ? { compaction: body.compaction ? body.compaction as CompactionMode : null } : {}),
+              ...('compactionWindow' in body ? { compactionWindow: numberOrNull(body.compactionWindow) } : {}),
               // Both directions mid-run, like `qaModel`/`qaEffort` above: a
               // value off the vocabulary clears the override rather than
               // setting one, and `null` on the round budget is a real value

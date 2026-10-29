@@ -823,3 +823,30 @@ describe('a BarList’s numbers table is headed by its caller (#339)', () => {
     ]);
   });
 });
+
+describe('a Series whose values do not add up (measured-console phase 31)', () => {
+  const props = {
+    buckets: [
+      { start: '2026-10-12T09:00:00.000Z', end: '2026-10-12T09:00:00.000Z' },
+      { start: '2026-10-14T09:00:00.000Z', end: '2026-10-14T09:00:00.000Z' },
+    ],
+    rows: [{ name: 'pass^3', values: [60, 80] }],
+    format: (value: number) => `${value}%`,
+    timeText: (start: string) => start.slice(5, 10),
+    label: 'pass^3 per run',
+  };
+
+  it('sums by default, as dollars and tokens do', () => {
+    const { container } = render(<Series {...props} />);
+    expect(container.textContent).toContain('140% in all');
+    expect(container.textContent).toContain('pass^3  140%');
+  });
+
+  it('names no total for a rate: the strip carries its newest value and the line says only the tallest', () => {
+    const { container } = render(<Series {...props} summed={false} />);
+    expect(container.textContent).not.toContain('in all');
+    expect(container.textContent).not.toContain('140%');
+    expect(container.textContent).toContain('pass^3  80%');
+    expect(container.textContent).toContain('the tallest column, on every strip, is 80%');
+  });
+});

@@ -2,7 +2,7 @@
 
 > The autopilot's specification. How a plan runs itself, how a stopped phase is *read* rather than
 > guessed at, what the machine tries before it asks you, how sessions see each other, and what is
-> still — deliberately — a person's. The hand-driven procedure is `SKILL.md`; the console's controls
+> still — deliberately — a person's. The hand-driven procedure is `SKILL.md` and its mode files (`references/mode-*.md`); the console's controls
 > are [What you control](controls.md) and [`viewer/README.md`](../viewer/README.md) §The autopilot.
 > Everything below names the code that does it, so a claim can be checked against the thing.
 
@@ -53,7 +53,7 @@ the session. A session tells the runner how it ended through the **outcome proto
 (`scripts/phase-outcome.sh` → one JSON file at `PE_OUTCOME_FILE`: `complete` · `blocked` ·
 `needs-human` · `waiting-external` · `partial` · `no-defect`); prose never counts. The runner verifies, re-reads the
 board, and boards whatever is ready next under the scheduler's admission (scopes, locks, usage). Every
-automatic act is a journal line on the run (`runs/<instance>/<slug>/run-<id>.jsonl`), bounded by count
+automatic act is a journal line on the run (`runs/<instance>/<slug>/run-<id>.jsonl`, a chain past 32 MB), bounded by count
 **and dollars**, and yields to an operator's Stop. The CONVERGENCE loop never dispatches a reviewer; the
 ladder does, as a rung inside a run — `qa-pending` resumes the phase's own session and asks it to
 dispatch the fresh-context subagent the gate requires, and `qa-failed` asks for a fresh one and a new
@@ -68,7 +68,7 @@ true before 2.3.0; what follows is what it does when a phase does **not** simply
 owner, host, lease, `session=`, and the registry's presence for it), work in the tree (dirty files,
 commits since the attempt), the transcript (turns, cost), a declared outcome, the gate kind, the MCP
 preflight, health issues, a live-session hit — and `classifySituation(evidence)` (pure) answers with
-**one** of sixteen words. The vocabulary is `viewer/shared/situation-model.js`, imported by the server,
+**one** of seventeen words. The vocabulary is `viewer/shared/situation-model.js`, imported by the server,
 the client and the tests by identity, so a chip, a journal line and an errand can never disagree.
 
 | id | actor | label | it means |
@@ -87,6 +87,7 @@ the client and the tests by identity, so a chip, a journal line and an errand ca
 | `verify-red` | machine | Verification red | the work is there; §Verification is not green |
 | `done-unrecorded` | machine | Done, unrecorded | verification green, no complete handoff |
 | `work-in-progress` | machine | Work in progress | started, not finished (an `in-progress` handoff, a dirty tree, a `partial`) |
+| `spawn-sdk-failed` | machine | Agent SDK door failed | a session sent through the Agent SDK's door ended before its first event (measured-console phase 21). The spawn door reads it the moment the session returns (`spawnSdkFailure`) and climbs the one rung at once; the classifier meets it only on a record whose subprocess re-attempt never ran (`spawnFallback.done: false` — a console that died between the two) |
 | `never-started` | machine | Never started | no work, no handoff — the session died in bootstrap. **Sub-kinds read from the exit's own words** (`classifyExitSaid`): `sleep`, `refusal`, `skill-missing` — 40 of 226 sessions exited `turns: 0, costUsd: 0`, and their `said` named three different causes that all took the one rung `reboard-fresh`. An exit naming none of the three keeps the bare situation and the old path |
 | `unknown` | person | Unclassified | fits nothing above — a person reads the evidence |
 
@@ -224,8 +225,22 @@ stopped run is what `phase.ladder-deferred` still means. `test/ladder.test.ts` h
 table to one of these: some rung drivable, or `nextRung(available)` exhausted, or operator-only
 with a reason; and holds every label below verbatim to the model's.
 
+**The owner rung (`resume-owner`, measured-console phase 25).** It is in no table: whether a failure names an owner, and
+whether that owner's session is worth resuming, is the failure's fact. For `verify-red`, `verify-red:reopened` and
+`qa-failed`, `nextRung` offers it BEFORE the table's first row when the failure names a phase other than the failing one
+(`ownerClaimOf` in `shared/situation-model.js`: a §Verification red attributed to another phase — one owner only, never a
+guess among candidates — or a dependency the evaluator found `not met`) AND that phase's session passes the one resume
+gate (`resumableSession`: announced, not gone, not live, not cold, not over its window, not checkpointed, on the paying
+account) AND the phase is not itself at work. The runner then re-boards the OWNER with a `continue` hint carrying the
+failure and its evidence lines, hands the failing phase's rung off (`work-in-progress`; the owner's session books its own
+spend) and journals `phase.routed-to-owner`; the failing phase waits while the owner is in flight. The rung's params carry
+`owner` (and `from`), so the same-rung-once rule makes it once per failure: the next climb for that failure is the table.
+A phase that passed with only inherited reds never reaches the ladder, so the runner makes the same offer when it settles.
+No resumable owner (cold, over-size, checkpointed, other account, no session): the table climbs as it always did.
+
 | situation | rungs, in climb order (→ an errand at the end) | driver |
 |---|---|---|
+| `spawn-sdk-failed` | **Re-attempt on the subprocess** (once, by the spawn door itself — `phase.spawn-fallback`; the record's `spawnFallback` keeps every later session of the phase on `claude -p`) | console |
 | `never-started` | **Re-board fresh** (the engine's boot prompt; the record resets to pending) | console |
 | `never-started:sleep` | **Resume the same session** (`--resume` — the machine slept mid-response, so the transcript is intact and a fresh board would throw it away) → **Re-board fresh** | console · console |
 | `never-started:refusal` | *(no rungs — an errand at once)* the same prompt gets the same refusal, so re-boarding is spending to learn nothing; the cause rides the errand's `why` and `said` (`REFUSAL_CAUSES`: `aup` · `org-policy` · `org-subscription` · `certificate`), and none of them changes on a re-board | — |
@@ -291,7 +306,7 @@ an operator pressed. Full account: `docs/qa-gating.md` §Three ways past a recor
 
 **Briefs.** A rung that re-boards sets a `boardingHint {situation, rung, brief, sessionId?,
 instruction?, escalate?}` on the record; boarding reads it once and assembles the prompt: `fresh` is
-the engine's boot prompt alone; `resume` appends the resume brief (SKILL.md Mode 2 "RESUMING" plus the
+the engine's boot prompt alone; `resume` appends the resume brief (`references/mode-phase-start.md` §Resuming plus the
 evidence — the handoff's status, the uncommitted paths, the last verification, the session's last
 words); `unblock` appends the handoff's Outstanding text and the permission to do the work; `continue`
 and `closeout` are instructions to the phase's **own** session (`claude -p --resume`). The engine's
@@ -934,7 +949,7 @@ from presence alone — the ladder waits rather than climbing into a tree a pers
 
 **Human sessions' outcomes.** `phase-outcome.sh` in a session nobody supervises (no `PE_OUTCOME_FILE`)
 writes the same declaration into the console's inbox — `~/.local/state/phase-console/runs/<instance>/
-<slug>/outcomes/phase-NN.json` (the instance id `sha256(root)[:8]-basename`, `scripts/instance.sh`) —
+<slug>/outcomes/phase-NN-<stamp>.json` (the instance id `sha256(root)[:8]-basename`, `scripts/instance.sh`) —
 and a running console with `--allow-run` picks it up: a live runner for the plan declares it through
 `Runner.declareOutcome` (`phase.outcome {by:'unsupervised'}`); with no live runner the service edits
 the plan's latest run (or creates one — `run.start` through the `outcome-inbox` door, `{by: 'unsupervised',
@@ -1041,7 +1056,7 @@ journalling an answer nobody enacted. What the table answers today:
   `run.permission-prompts-skipped {version, floor, relay}` per run; an unknown version still gets it, so
   an old CLI fails loudly at spawn instead of dropping the floor with nobody told.
 
-The manifest itself — the 17 keys, their states, the run-start prelude that refuses a start on an
+The manifest itself — the 19 keys, their states, the run-start prelude that refuses a start on an
 `outstanding` blocking row (`MANIFEST_BLOCKING`) with a 409 listing every entry, the one recorded way
 past it (`run.manifest-override`) — is [Decisions](decisions.md) and `viewer/server/prelude.ts`.
 

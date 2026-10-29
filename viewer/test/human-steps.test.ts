@@ -111,6 +111,30 @@ test('HS-1 — a torn last line is dropped; a garbage line is skipped; the rotat
   } finally { s.cleanup(); }
 });
 
+test('HS-1b (EI-6) — a second rotation keeps every OPEN step: its birth and moves are carried into the rotated file', async () => {
+  const s = scratch();
+  try {
+    const { applyRetention } = await import('../server/retention.ts');
+    const file = join(s.dir, 'human-steps.ndjson');
+    const ledger = new HumanStepLedger(file);
+    const clean = sanitiseStep(STEP, 'session')!.step;
+    const open = ledger.declare({ slug: 'demo', phase: 1, birth: 'session', clean });
+    const settled = ledger.declare({ slug: 'demo', phase: 2, birth: 'session', clean });
+    assert.ok(!('refused' in ledger.move(open.id, 'notified')));
+    assert.ok(!('refused' in ledger.move(settled.id, 'cannot')));
+    const rotate = () => applyRetention([{ kind: 'rotate', sink: 'human-steps', path: file, bytes: 1, why: 'test' }]);
+    rotate();
+    ledger.move(open.id, 'opened');
+    // The second rotation replaces `.1` — the file that held the open step's birth.
+    rotate();
+    const read = readLedger(file);
+    assert.equal(read.steps.get(open.id)?.state, 'opened', 'the open step and its every move survive the second rotation');
+    assert.equal(read.steps.has(settled.id), false, 'a settled step is not carried');
+    assert.equal(read.skipped, 0, 'nothing is read out of order');
+    assert.equal(readFileSync(file, 'utf8'), '', 'the live file starts empty');
+  } finally { s.cleanup(); }
+});
+
 /* ------------------------------------------------------------------ *
  * HS-2 — ONE push, ONE inbox row, through the real Service
  * ------------------------------------------------------------------ */
@@ -546,4 +570,29 @@ test('#346 — a Human step bullet inside an HTML comment is no step, on one lin
   // E-2 is named only by commented bullets, so it binds nothing (F43's twin).
   assert.deepEqual(plan.errandsTable?.unbound, ['E-2']);
   assert.deepEqual(plan.errandsTable?.rows.filter((row) => row.bound).map((row) => row.id), ['E-1']);
+});
+
+test('B2 — a deferral on the runner: noted with its call, answered once, spent by its own re-fire and by no other call', async () => {
+  const { Runner } = await import('../server/runner/runner.ts');
+  const lines: { event: string; data: Record<string, unknown> }[] = [];
+  const runner = new Runner({
+    scriptsDir: '/nonexistent',
+    onEvent: (name: string, data: { event: string; data: Record<string, unknown> }) => { if (name === 'run:journal') lines.push(data); },
+  } as never);
+  const state = { id: 'r-b2', slug: 'demo', root: '/nonexistent', status: 'running', phases: { 8: { status: 'running', sessionId: 's1' } } };
+  (runner as unknown as { state: unknown }).state = state;
+  assert.equal(runner.answerDeferred(8, 'x'), false, 'nothing deferred, nothing to answer');
+  runner.noteDeferred(8, { toolUseId: 'toolu_1', sessionId: 's1', command: 'bash phase-outcome.sh demo 8 needs-human', exit: 0 });
+  assert.equal(lines.at(-1)?.event, 'phase.deferred');
+  assert.deepEqual(lines.at(-1)?.data, { toolUseId: 'toolu_1', sessionId: 's1', exit: 0 });
+  assert.equal(runner.takeDeferred(8, 'toolu_other'), null, 'another call is not the deferred one');
+  assert.equal(runner.answerDeferred(8, 'proven', 'hs-1'), true);
+  assert.deepEqual(runner.takeDeferred(8, 'toolu_1'), { answer: 'proven' });
+  const resumed = lines.find((l) => l.event === 'phase.deferred-resumed')!;
+  assert.equal(resumed.data.answered, true);
+  assert.equal(resumed.data.stepId, 'hs-1');
+  assert.equal(runner.takeDeferred(8, 'toolu_1'), null, 'spent once');
+  // A re-fire with no answer (a resume for another reason) runs the call as written.
+  runner.noteDeferred(8, { toolUseId: 'toolu_2', sessionId: 's1', command: 'c', exit: 0 });
+  assert.deepEqual(runner.takeDeferred(8, 'toolu_2'), {});
 });

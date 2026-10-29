@@ -1,6 +1,7 @@
 /**
- * The Phases view (7.0, quiet-console phase 10): the one grid in its three
- * readings — the table, QA by phase, handoffs by phase — or the route map, or
+ * The Phases view (7.0, quiet-console phase 10): the one grid in its two
+ * readings — the table, and Handoffs & QA (each phase's record: its handoff
+ * and its QA side by side, one reading since 2026-10-20) — or the route map, or
  * (one-pool phase 16, #376) the plan's schedule or its burn-up,
  * then the foot, where everything about the plan rather than one phase waits
  * folded with a count: the boot prompts, the end-of-phase banner, what is
@@ -13,6 +14,7 @@
  */
 
 import { Suspense, lazy, useMemo } from 'react';
+import { ChartNoAxesGantt, ClipboardCheck, Network, Rows3, TrendingUp, type LucideIcon } from 'lucide-react';
 import type { PlanDetail } from '@/data/api';
 import { useConsoleState } from '@/data/console';
 import { isLive } from '@/data/lanes';
@@ -36,11 +38,19 @@ const MapView = lazy(() => import('../map/map-view').then((m) => ({ default: m.M
 const ScheduleView = lazy(() => import('./progress').then((m) => ({ default: m.ScheduleView })));
 const BurnupView = lazy(() => import('./progress').then((m) => ({ default: m.BurnupView })));
 
+/** Each reading's glyph in the bay: rows, the route, the record checked, the Gantt, the burn-up's climb. */
+const READING_ICONS: Record<PhasesViewId, LucideIcon> = {
+  table: Rows3,
+  map: Network,
+  handoffs: ClipboardCheck,
+  schedule: ChartNoAxesGantt,
+  burnup: TrendingUp,
+};
+
 /** Which reading of the one grid each view is. The map, the schedule and the burn-up draw no grid. */
-const READING: Record<Exclude<PhasesViewId, 'map' | 'schedule' | 'burnup'>, PhaseTableContext> = {
+const READING: Record<Exclude<PhasesViewId, 'map' | 'schedule' | 'burnup' | 'trend'>, PhaseTableContext> = {
   table: 'plan',
-  qa: 'plan-qa',
-  handoffs: 'plan-handoffs',
+  handoffs: 'plan-record',
 };
 
 export function PhasesView({
@@ -79,51 +89,65 @@ export function PhasesView({
     [state?.allowAgent, state?.allowWrites, terminals?.sessions, detail.summary.qaMode, detail.plan],
   );
 
+  // The record's reading counts what in it went wrong: the phases whose QA
+  // failed, in the failed hue — a glance from any reading says one is red.
+  const qaFails = detail.phases.filter((p) => p.qa?.result === 'fail').length;
   const sections = PHASES_VIEW_IDS.map((id) => ({
     id,
     label: PHASES_VIEW_LABELS[id],
     href: planViewHref(slug, id),
+    icon: READING_ICONS[id],
+    ...(id === 'handoffs' && qaFails > 0
+      ? {
+          count: qaFails,
+          paint: 'failed' as const,
+          countLabel: `${qaFails} QA ${qaFails === 1 ? 'fail' : 'fails'}`,
+        }
+      : {}),
   }));
+  // The address's reading as a word: the free tree's union has no Trend to compare it against.
+  const reading: string = view;
   const reportPhase = open ? detail.phases.find((p) => p.phase === open.phase) : undefined;
 
   return (
     <div className="flex min-w-0 flex-col gap-4" data-testid="phases-view">
       <SectionNav sections={sections} current={view} label="Readings of the phases" />
-      {view === 'schedule' || view === 'burnup' ? (
-        <Suspense fallback={<Skeleton className="h-96 w-full" />}>
-          {view === 'schedule' ? (
-            <ScheduleView detail={detail} run={run} />
-          ) : (
-            <BurnupView detail={detail} run={run} />
-          )}
-        </Suspense>
-      ) : view === 'map' ? (
-        <Suspense fallback={<Skeleton className="h-96 w-full" />}>
-          <MapView
-            detail={detail}
+      {reading !== 'trend' &&
+        (view === 'schedule' || view === 'burnup' ? (
+          <Suspense fallback={<Skeleton className="h-96 w-full" />}>
+            {view === 'schedule' ? (
+              <ScheduleView detail={detail} run={run} />
+            ) : (
+              <BurnupView detail={detail} run={run} />
+            )}
+          </Suspense>
+        ) : view === 'map' ? (
+          <Suspense fallback={<Skeleton className="h-96 w-full" />}>
+            <MapView
+              detail={detail}
+              run={run}
+              {...(query ? { query } : {})}
+              allowRun={Boolean(state?.allowRun)}
+            />
+          </Suspense>
+        ) : (
+          <PhaseTable
+            context={READING[view as keyof typeof READING]}
+            slug={slug}
             run={run}
-            {...(query ? { query } : {})}
+            planPhases={detail.phases}
+            live={isLive(run?.status ?? '')}
             allowRun={Boolean(state?.allowRun)}
+            recovery={recovery}
+            phaseEta={detail.eta?.perPhase}
+            liveness={runDetail?.liveness}
+            qaHeld={detail.qaHeld}
+            handoffs={detail.handoffs}
+            index={detail.index}
+            inspectable
+            everything={everything}
           />
-        </Suspense>
-      ) : (
-        <PhaseTable
-          context={READING[view]}
-          slug={slug}
-          run={run}
-          planPhases={detail.phases}
-          live={isLive(run?.status ?? '')}
-          allowRun={Boolean(state?.allowRun)}
-          recovery={recovery}
-          phaseEta={detail.eta?.perPhase}
-          liveness={runDetail?.liveness}
-          qaHeld={detail.qaHeld}
-          handoffs={detail.handoffs}
-          index={detail.index}
-          inspectable
-          everything={everything}
-        />
-      )}
+        ))}
       <PhasesFoot detail={detail} everything={everything.on} />
       {open && (
         <QaReportSheet

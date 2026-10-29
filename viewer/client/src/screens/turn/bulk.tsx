@@ -16,7 +16,7 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { HUMAN_STEP_SETTLED_STATES } from '@shared/human-step-model.js';
-import { errorWords } from '@/cards/human-step-card';
+import { errorWords } from '@/cards/turn/step-words';
 import { humanStepsApi, type StepVerbAnswer } from '@/data/human-steps';
 import { keys } from '@/data/keys';
 import { press, type Pressed } from '@/data/press';

@@ -48,6 +48,7 @@ import {
   WordSetting,
   originWords,
 } from './setting';
+import { formatUsd } from '@/ui/money';
 
 /* ---------------- a value, in words ---------------- */
 
@@ -105,7 +106,7 @@ export function numberWords(n: number, unit?: string): string {
     case 'bytes':
       return byteWords(n);
     case 'usd':
-      return `$${n.toLocaleString()}`;
+      return formatUsd(n, 'grouped');
     case 'percent':
       return `${n}%`;
     case 'factor':

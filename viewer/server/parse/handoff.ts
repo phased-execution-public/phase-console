@@ -42,6 +42,8 @@ export type Handoff = {
   blocks: number[];
   parallelSafe: number[];
   skillsUsed: string[];
+  /** The skills this handoff suggests the NEXT session call (measured-console phase 4). */
+  suggestedSkills: string[];
   keyFiles: string[];
   memoryKey?: string;
   frontMatter: FrontMatter;
@@ -212,6 +214,7 @@ export function parseHandoff(
     blocks: fmPhaseList(frontMatter, 'blocks'),
     parallelSafe: fmPhaseList(frontMatter, 'parallel_safe'),
     skillsUsed: fmList(frontMatter, 'skills_used'),
+    suggestedSkills: fmList(frontMatter, 'suggested_skills'),
     keyFiles: fmList(frontMatter, 'key_files'),
     memoryKey: fmString(frontMatter, 'memory'),
     frontMatter,

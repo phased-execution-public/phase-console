@@ -37,7 +37,7 @@ conversation prefix, so a warm session is roughly **linear** in turns. The thing
 |---|---|---|
 | **Context rot** | quality degrades as the window fills — usually bites long before cost does | sizes every session to ~60% of the window, so no session runs into the bad zone |
 | **Cache-busting** | switching model, changing effort, `/compact`, a >5-min idle gap — each forces a full-price re-read | makes a model switch an explicit session boundary; discourages mid-phase `/compact` |
-| **Bootstrap tax** | each fresh session re-reads plan + handoff + code before it can do anything | batches adjacent work into one session so the tax is paid once, not five times |
+| **Bootstrap tax** | each fresh session re-reads plan + handoff + code before it can do anything | runs one phase per session under the console and keeps the boot small; by hand, adjacent phases may share a session so the tax is paid once |
 
 ---
 

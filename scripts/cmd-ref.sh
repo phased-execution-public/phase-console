@@ -72,8 +72,14 @@ _quotes_balanced() {  # _quotes_balanced <text>
 # (#350): after `git`, `refs/…` (and `+refs/…`, `:refs/…`) and any word with a
 # `:` is a ref; after `gh`, `repos/…` and its kin are API routes; and
 # `git -C /abs`, or anything after `cd /abs`, names files from that directory.
+# After `gh api` the first word that is neither a flag nor a flag's value is an
+# ENDPOINT (`marketplace_listing/plans/x`, `rate_limit`), never a path, whatever
+# its first segment: a route's roots are GitHub's to add, so no list of them
+# can be complete. A header's value may hold a space (`-H 'Accept: x'`) and so
+# reads as two words. Twin: `relativePathIn` in server/watch-refs.ts.
 _relative_path_in() {  # _relative_path_in <command>
   local words raw word prev="" after found="" lead="" anchored=0 first of ends
+  local api=0 api_ep=0 api_pend="" was
   words="$(printf '%s' "$1" | tr "\"'" '  ')"
   set -f
   for raw in $words; do
@@ -90,10 +96,30 @@ _relative_path_in() {  # _relative_path_in <command>
     after="$prev"; prev="$word"
     if [ -z "$word" ] || [ "$word" = '|' ]; then lead=""; continue; fi
     first=0
-    if [ -z "$lead" ]; then first=1; lead="$word"; fi
+    if [ -z "$lead" ]; then first=1; lead="$word"; api=0; api_ep=0; api_pend=""; fi
     of="$lead"
     [ "$ends" -eq 1 ] && lead=""
     if [ "$first" -eq 0 ]; then
+      if [ "$of" = gh ]; then
+        if [ "$api" -eq 0 ]; then
+          [ "$word" = api ] && [ "$after" = gh ] && api=1
+        elif [ -n "$api_pend" ]; then
+          was="$api_pend"
+          if [ "$was" = h ] && [ "${word%:}" != "$word" ]; then api_pend=v; else api_pend=""; fi
+          # `--input <file>` names a file of the session's cwd: read it as a path.
+          [ "$was" = p ] || continue
+        else
+          case "$word" in
+            -H|--header) api_pend=h; continue ;;
+            # gh's flag, not this script's: quoted, so the readers of a script's
+            # own `--flag)` arms (docs-parity, script-flags.ts) never take it for one.
+            '--input') api_pend=p; continue ;;
+            -X|--method|-f|-F|--field|--raw-field|-q|--jq|-t|--template|--cache|--hostname|-p|--preview) api_pend=v; continue ;;
+            -*) continue ;;
+          esac
+          if [ "$api_ep" -eq 0 ]; then api_ep=1; continue; fi
+        fi
+      fi
       if [ "$after" = cd ]; then case "$word" in /*) anchored=1; continue ;; esac; fi
       if [ "$after" = -C ] && [ "$of" = git ]; then case "$word" in /*) anchored=1; continue ;; esac; fi
       case "$after" in -R|--repo) continue ;; esac

@@ -17,6 +17,9 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+// The runner's preflight asks `claude auth status`; under the gate's `env -i` the real CLI
+// cannot read the keychain (no USER) and answers signed-out — `signed-in.ts` answers it.
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -58,12 +61,13 @@ const { Scheduler } = await import('../server/runner/scheduler.ts');
 const { SHARED_CHECKOUT_TOKEN } = await import('../shared/scope.js');
 // Dynamic for the same reason as the two above: `runDir` resolves through
 // `STATE_DIR`, which config.ts reads at import time from the env set just above.
-const { runDir, consoleRunsDir } = await import('../server/runner/state.ts');
-const { ensureIntegration, holdsBranch, isRegistered, laneNames, worktreeHome } = await import('../server/runner/worktree.ts');
+const { runDir, consoleRunsDir, readStoredRun } = await import('../server/runner/state.ts');
+const { ensureIntegration, isRegistered, laneNames, worktreeHome } = await import('../server/runner/worktree.ts');
 const { printedCommits } = await import('../server/runner/scope-drift.ts');
 import type { LockView } from '../server/runner/scheduler.ts';
 import type { StreamEvent } from '../server/runner/spawn.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 // Dynamic, for exactly the reason the four above are: a STATIC import hoists
 // over the `XDG_STATE_HOME` assignment at the top of this file, and
 // `config.ts` resolves `STATE_DIR` at module load — so the belt in
@@ -74,17 +78,11 @@ const { runTraceId } = await import('../server/trace.ts');
 
 type Repo = { root: string; scripts: string; state: string; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-gitstrat-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-gitstrat-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 shift
@@ -104,13 +102,14 @@ case "$mode" in
   --repos) echo "demo-repo" ;;
   *) echo "" ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  write(join(scripts, 'next-phase-prompt.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'new-handoff.sh'), '#!/usr/bin/env bash\nexit 0\n');
-
-  return { root, scripts, state, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+`,
+      'phase-lock.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'validate.sh': VALIDATE_OK_SH,
+      'next-phase-prompt.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'new-handoff.sh': '#!/usr/bin/env bash\nexit 0\n',
+    }),
+  });
+  return made;
 }
 
 function write(path: string, body: string): void {
@@ -259,7 +258,7 @@ async function driveOn(
 test.after(() => rmSync(STATE_HOME, { recursive: true, force: true }));
 
 test('a default-branch run composes the prompt it always composed — not one byte more', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts = await promptsFor(r, { onlyPhases: [1], skills: ['graph-tool'] });
     assert.doesNotMatch(prompts[0]!, /Git strategy/);
@@ -269,7 +268,7 @@ test('a default-branch run composes the prompt it always composed — not one by
 });
 
 test('#322: a default-branch run launched OVER the plan\'s branch is told so — and works where it stands', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts = await promptsFor(r, {
       onlyPhases: [1],
@@ -285,7 +284,7 @@ test('#322: a default-branch run launched OVER the plan\'s branch is told so —
 });
 
 test('a new-branch run states the branch rule between the plan and the directive', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts = await promptsFor(r, {
       onlyPhases: [1], gitMode: 'new-branch', skills: ['graph-tool'],
@@ -298,7 +297,8 @@ test('a new-branch run states the branch rule between the plan and the directive
     // before the skill directive, the directive last.
     const boot = text.indexOf('BOOT phase 1');
     const git = text.indexOf('Git strategy');
-    const directive = text.indexOf('/graph-tool');
+    // The directive's spelling since measured-console phase 11 (what loads).
+    const directive = text.indexOf('Call the Skill tool with "graph-tool"');
     assert.ok(boot >= 0 && boot < git, 'the plan speaks first');
     assert.ok(git < directive, 'the directive keeps the last word');
     // A scoped run is not the plan finishing, so no PR is asked for.
@@ -309,7 +309,7 @@ test('a new-branch run states the branch rule between the plan and the directive
 });
 
 test('the mismatch note appears exactly when the plan names a real branch', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const quiet = await promptsFor(r, { onlyPhases: [1], gitMode: 'new-branch' },
       { planBranch: () => 'current branch (no new branch).' });
@@ -339,7 +339,7 @@ test('a cross-run holder in a shared repository warns and offers the QUEUE — n
   // permanent behind (five under /private/tmp, plus branches nobody could
   // attribute). What survives is the true half of the warning and an exit that
   // costs nothing — declare the block, name the lock, let admission queue.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // The real guard-off shape: a foreign lock shares the scope, admission is
     // allowed anyway, and the honesty probe reports the neighbour.
@@ -363,7 +363,7 @@ test('a cross-run holder in a shared repository warns and offers the QUEUE — n
 });
 
 test('the PR block lands on the last phase and only there', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts = await promptsFor(r, { gitMode: 'new-branch' },
       { planTitle: () => 'Demo: the whole feature' });
@@ -377,7 +377,7 @@ test('the PR block lands on the last phase and only there', async () => {
 });
 
 test('openPr: false keeps the branch and drops the PR ask', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts = await promptsFor(r, { gitMode: 'new-branch', openPr: false });
     assert.match(prompts[1]!, /ONE plan-wide branch/);
@@ -386,7 +386,7 @@ test('openPr: false keeps the branch and drops the PR ask', async () => {
 });
 
 test('a scoped run finishing the board\'s last open phase still opens no PR', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // Phase 2 is already done; the run is scoped to phase 1. Every OTHER phase
     // is done and this is the sole lane — but the run was never the plan.
@@ -409,7 +409,7 @@ test('a scoped run finishing the board\'s last open phase still opens no PR', as
  * ------------------------------------------------------------------ */
 
 test('a lane phase is told it ALREADY has its tree — never to check out or add one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(
@@ -436,7 +436,7 @@ test('a lane phase is told it ALREADY has its tree — never to check out or add
 });
 
 test('a lane phase is told where work-state goes, and CAN write there', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(
@@ -475,7 +475,7 @@ test('a lane phase is told where work-state goes, and CAN write there', async ()
  * ------------------------------------------------------------------ */
 
 test('a dead run\'s wedged integration no longer costs the next run its lanes', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
 
@@ -511,7 +511,7 @@ test('a dead run\'s wedged integration no longer costs the next run its lanes', 
 });
 
 test('DOCS_ROOT is set for EVERY session, and a shared-root one asks for no extra directory', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // No worktrees: the overwhelmingly common run. The environment still says
     // where work-state goes — it is simply the directory the session is in —
@@ -555,7 +555,8 @@ function runStateAfter(r: Repo): Record<string, unknown> {
   const newest = files
     .map((f) => ({ f, at: statSync(join(dir, f)).mtimeMs }))
     .sort((a, b) => b.at - a.at)[0]!.f;
-  return JSON.parse(readFileSync(join(dir, newest), 'utf8')) as Record<string, unknown>;
+  // Base and delta folded (measured-console phase 17): the record as a reader reads it.
+  return readStoredRun(r.root, 'demo', newest.slice('run-'.length, -'.json'.length)) as unknown as Record<string, unknown>;
 }
 
 /**
@@ -622,7 +623,7 @@ function isolationEvents(r: Repo): Record<string, unknown>[] {
 const ISOLATED_RUN = { onlyPhases: [1], gitMode: 'new-branch', isolation: 'worktree' } as const;
 
 test('EC1 — an isolated run spawns in the managed tree, on the run branch', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(r, { ...ISOLATED_RUN });
@@ -668,7 +669,7 @@ test('EC1 — an isolated run spawns in the managed tree, on the run branch', as
 });
 
 test('P6 — a CLEAN root sitting on the run branch is reclaimed, and the run takes it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The wedge itself, and the console is what creates it: the work-branch
@@ -700,7 +701,7 @@ test('P6 — a CLEAN root sitting on the run branch is reclaimed, and the run ta
 });
 
 test('P6 — a DIRTY root is never moved, and the refusal names the files', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     git(r.root, 'switch', '-q', '-c', 'pe/demo');
@@ -726,7 +727,7 @@ test('P6 — a DIRTY root is never moved, and the refusal names the files', asyn
 });
 
 test('P6 — isolationReclaim: never leaves the tree exactly as it was', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     git(r.root, 'switch', '-q', '-c', 'pe/demo');
@@ -742,7 +743,7 @@ test('P6 — isolationReclaim: never leaves the tree exactly as it was', async (
 });
 
 test('P6 — a plan that says `Checkout: main` boards DETACHED, and its lock says so', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(r, { ...ISOLATED_RUN }, {
@@ -772,9 +773,9 @@ test('P6 — a plan that says `Checkout: main` boards DETACHED, and its lock say
     // impossible order here: the tree owns no branch, and `pe/demo` may not
     // exist at all.
     const prompt = requests[0]!.prompt;
-    assert.match(prompt, /DETACHED at\n  `detached@/, 'the cwd bullet names the detached state');
+    assert.match(prompt, /DETACHED at\n {2}`detached@/, 'the cwd bullet names the detached state');
     assert.match(prompt, /no branch to commit to/, 'the commit rule matches the cwd bullet');
-    assert.doesNotMatch(prompt, /already on\n  `pe\/demo`/, 'the branch-tree bullet is the wrong story');
+    assert.doesNotMatch(prompt, /already on\n {2}`pe\/demo`/, 'the branch-tree bullet is the wrong story');
     assert.doesNotMatch(prompt, /Commit only to `pe\/demo`/, 'no impossible order');
 
     const strategy = journalEvents(r, 'phase.git-strategy');
@@ -784,7 +785,7 @@ test('P6 — a plan that says `Checkout: main` boards DETACHED, and its lock say
 });
 
 test('P6 — a run whose branch has not been created yet does NOT detach', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The defect this guards: a brand-new run's `pe/demo` is absent too — it is
@@ -799,7 +800,7 @@ test('P6 — a run whose branch has not been created yet does NOT detach', async
 });
 
 test('P6 — a refusal after the detach decision clears detachAt with the tree', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The phase-1 "session" takes a branch in the detached tree and leaves
@@ -845,7 +846,7 @@ test('P6 — a refusal after the detach decision clears detachAt with the tree',
 });
 
 test('P6 — turning isolation OFF clears detachAt too, the second door out', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r, { detachRequested: () => true });
@@ -873,7 +874,7 @@ test('P6 — turning isolation OFF clears detachAt too, the second door out', as
 });
 
 test('P6 — the drive sweep reads EVERY plan managed dir, not this run own', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A sibling plan's lane under the console's own runs dir. `managed` is what
@@ -891,7 +892,7 @@ test('P6 — the drive sweep reads EVERY plan managed dir, not this run own', as
 });
 
 test('P6 — an unmanaged tree is journalled once per decision, not once per drive', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A genuinely hand-made tree on a pe/* branch, outside every managed dir.
@@ -914,7 +915,7 @@ test('P6 — an unmanaged tree is journalled once per decision, not once per dri
 });
 
 test('EC1 — verification and the closeout run in the managed tree too', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // `pwd` is the one verification command whose OUTPUT answers the question:
@@ -950,7 +951,7 @@ test('EC1 — verification and the closeout run in the managed tree too', async 
 /* Each refusal row: degrades to shared, names its reason, journals once. */
 
 test('EC2 — cap-reached: the console already holds as many trees as it may', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     await parkedFor(r, { ...ISOLATED_RUN }, {
@@ -972,7 +973,7 @@ test('EC2 — cap-reached: the console already holds as many trees as it may', a
 });
 
 test('EC2 — scope-outside-root: a plan whose work is not in this repository', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The hub shape: a run rooted at one repository, phases declaring another.
@@ -992,7 +993,7 @@ test('EC2 — scope-outside-root: a plan whose work is not in this repository', 
 });
 
 test('EC2 — branch-in-use: somebody else has `pe/demo` checked out', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // Deliberately OUTSIDE the state directory, so the drive preamble's sweep
@@ -1022,7 +1023,7 @@ test('EC2 — branch-in-use: somebody else has `pe/demo` checked out', async () 
 });
 
 test('EC2 — setup-failed: the tree is REMOVED, not left half-prepared', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const names = laneNames({
@@ -1055,7 +1056,7 @@ test('EC2 — setup-failed: the tree is REMOVED, not left half-prepared', async 
 });
 
 test('EC2 — not-a-repo and has-submodules both degrade, and both say so', async () => {
-  const bare = repo();
+  const bare = stubbedPlan();
   try {
     // No `makeGitRepo`: there is nothing to make a worktree of.
     const requests = await requestsFor(bare, { ...ISOLATED_RUN });
@@ -1065,7 +1066,7 @@ test('EC2 — not-a-repo and has-submodules both degrade, and both say so', asyn
     assert.equal(state.isolationRefusal, 'not-a-repo');
   } finally { bare.cleanup(); }
 
-  const sub = repo();
+  const sub = stubbedPlan();
   try {
     makeGitRepo(sub);
     // A superproject no longer refuses OUTRIGHT — it takes a MIRROR of the
@@ -1084,7 +1085,7 @@ test('EC2 — not-a-repo and has-submodules both degrade, and both say so', asyn
 });
 
 test('EC2 — a default-branch run never asks, so it never refuses', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // `newRun` refuses to STORE isolation without a branch (P5): a run with no
@@ -1103,7 +1104,7 @@ test('EC2 — a default-branch run never asks, so it never refuses', async () =>
 });
 
 test('a queue run is byte-identical to what it was: `shared`, no tree, no line', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(r, { onlyPhases: [1], gitMode: 'new-branch' });
@@ -1118,7 +1119,7 @@ test('a queue run is byte-identical to what it was: `shared`, no tree, no line',
 });
 
 test('EC3 — a clean settle removes the tree; a second run then starts cleanly', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const first = await requestsFor(r, { ...ISOLATED_RUN });
@@ -1146,7 +1147,7 @@ test('EC3 — a clean settle removes the tree; a second run then starts cleanly'
 });
 
 test('EC3 — a DIRTY run tree is kept, and the run says where it is', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The session leaves a file it never committed — what a killed session
@@ -1182,7 +1183,7 @@ test('EC3 — a DIRTY run tree is kept, and the run says where it is', async () 
  * ------------------------------------------------------------------ */
 
 test('an isolated run tells its session the branch its lock must name', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(r, { ...ISOLATED_RUN });
@@ -1204,7 +1205,7 @@ test('an isolated run tells its session the branch its lock must name', async ()
 });
 
 test('a shared-checkout run writes a QUALIFIED lock — its branch, plus the shared tree', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The claim now says what the session actually does: it commits on
@@ -1221,7 +1222,7 @@ test('a shared-checkout run writes a QUALIFIED lock — its branch, plus the sha
 });
 
 test('a REFUSED run claims NOTHING in the shared tree — it parks (control-tower phase 90)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // This used to be the subtle one: the run ASKED for isolation, did not get
@@ -1236,7 +1237,7 @@ test('a REFUSED run claims NOTHING in the shared tree — it parks (control-towe
 });
 
 test('the lease refresh names the same branch the session was given', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The defect to fear is not a wrong verdict but the field FALLING OFF a
@@ -1268,7 +1269,7 @@ test('the lease refresh names the same branch the session was given', async () =
  * ------------------------------------------------------------------ */
 
 test('isolation is STICKY across a resume that does not mention it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // ONE Runner, driven twice — this file's own rule for any test about a
@@ -1318,7 +1319,7 @@ test('isolation is STICKY across a resume that does not mention it', async () =>
 });
 
 test('a resume that DROPS isolation moves the run back to the shared checkout', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     await requestsFor(r, { ...ISOLATED_RUN });
@@ -1336,7 +1337,7 @@ test('a resume that DROPS isolation moves the run back to the shared checkout', 
 });
 
 test('an isolated run SUPPRESSES the DIY-worktree CAUTION a neighbour would trigger', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // 🔴 Written this way because the obvious version proves nothing. `EC1`
@@ -1370,7 +1371,7 @@ test('an isolated run SUPPRESSES the DIY-worktree CAUTION a neighbour would trig
 });
 
 test('an isolated run does not journal `phase.shared-checkout` — it is not in one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The `overlaps` guard's own job, which is NOT the suppression above: the
@@ -1413,7 +1414,7 @@ test('an isolated run does not journal `phase.shared-checkout` — it is not in 
  * ------------------------------------------------------------------ */
 
 test('F-1 — a resumed run does not claim a carve-out whose tree the settle removed', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // ONE Runner, driven twice — the whole point. With a fresh Runner per drive
@@ -1455,7 +1456,7 @@ test('F-1 — a resumed run does not claim a carve-out whose tree the settle rem
 });
 
 test('F-1 — a resume that DROPS isolation really moves, on a pooled Runner', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r);
@@ -1483,7 +1484,7 @@ test('F-1 — a resume that DROPS isolation really moves, on a pooled Runner', a
 });
 
 test('F-1 — a second drive does NOT re-run the setup command', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const marker = join(r.state, 'setup-runs');
@@ -1520,7 +1521,7 @@ test('F-1 — a second drive does NOT re-run the setup command', async () => {
 });
 
 test('F-2 — a setup command that leaves FILES still gets its tree discarded', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const names = laneNames({
@@ -1552,7 +1553,7 @@ test('F-2 — a setup command that leaves FILES still gets its tree discarded', 
 });
 
 test('F-2 — and the NEXT run of the plan is not wedged by it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The consequence, executed rather than reasoned about: a leftover tree
@@ -1577,7 +1578,7 @@ test('F-2 — and the NEXT run of the plan is not wedged by it', async () => {
 });
 
 test('F-4 — an isolated run\'s durable child record names its tree and branch', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // `ChildRef.worktree` is the DURABLE handle on a session that outlived its
@@ -1599,7 +1600,7 @@ test('F-4 — an isolated run\'s durable child record names its tree and branch'
       const dir = runDir(r.root, 'demo');
       const file = readdirSync(dir).find((f) => /^run-.*\.json$/.test(f));
       if (file) {
-        const live = JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>;
+        const live = readStoredRun(r.root, 'demo', file.slice('run-'.length, -'.json'.length)) as unknown as Record<string, unknown>;
         const children = (live.children ?? {}) as Record<string, Record<string, unknown>>;
         for (const child of Object.values(children)) seen.push(child);
       }
@@ -1624,7 +1625,7 @@ test('F-4 — an isolated run\'s durable child record names its tree and branch'
 });
 
 test('P15 — a LANE\'s durable child record says its tree is locked, and the run its base', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // Two facts a person reading the Now page asks of a lane, both decided
@@ -1643,7 +1644,7 @@ test('P15 — a LANE\'s durable child record says its tree is locked, and the ru
         const dir = runDir(r.root, 'demo');
         const file = readdirSync(dir).find((f) => /^run-.*\.json$/.test(f));
         if (file) {
-          const live = JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>;
+          const live = readStoredRun(r.root, 'demo', file.slice('run-'.length, -'.json'.length)) as unknown as Record<string, unknown>;
           const children = (live.children ?? {}) as Record<string, Record<string, unknown>>;
           for (const child of Object.values(children)) seen.push(child);
         }
@@ -1668,7 +1669,7 @@ test('P15 — a LANE\'s durable child record says its tree is locked, and the ru
 });
 
 test('F-3 — the cap counts a run that is still ACQUIRING, not just one that finished', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The race, made deterministic. Everything after the cap check awaits — a
@@ -1717,7 +1718,7 @@ test('F-3 — the cap counts a run that is still ACQUIRING, not just one that fi
 });
 
 test('F-1a — after the settle the run claims NOTHING, though `checkout` still says worktree', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The divergent window `branchFor`'s pair rule exists for, pinned directly.
@@ -1767,7 +1768,7 @@ test('F-1a — after the settle the run claims NOTHING, though `checkout` still 
  * ------------------------------------------------------------------ */
 
 test('Q-2 — the `.env*` copy seeds a NEW tree and never overwrites an edit in one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     writeFileSync(join(r.root, '.env'), 'FROM=root\n');
@@ -1797,7 +1798,7 @@ test('Q-2 — the `.env*` copy seeds a NEW tree and never overwrites an edit in 
 });
 
 test('Q-3 — a resume journals no SECOND `run.isolation` line', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The plan asks for one line. The preamble re-runs on every drive by
@@ -1818,7 +1819,7 @@ test('Q-3 — a resume journals no SECOND `run.isolation` line', async () => {
 });
 
 test('EC3 — a second run after a DIRTY settle degrades honestly, and says which', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // After a dirty settle the tree is KEPT — deliberately, it holds
@@ -1878,7 +1879,7 @@ function stealTheBranch(r: Repo, tree: string): string {
 }
 
 test('R4-1 — a resume REFUSED `branch-in-use` clears the tree it can no longer have', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r, { worktreePrefs: () => ({ setup: 'touch .keep-me-dirty' }) });
@@ -1914,7 +1915,7 @@ test('R4-1 — a resume REFUSED `branch-in-use` clears the tree it can no longer
 });
 
 test('R4-2 — a permanently-refused run journals its reason ONCE, not once per resume', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // `scope-outside-root` is the refusal every hub-rooted plan gets, for ever.
@@ -1933,7 +1934,7 @@ test('R4-2 — a permanently-refused run journals its reason ONCE, not once per 
 });
 
 test('R4-3 — a CHANGED refusal is still journalled, so the gate is not simply silence', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The other side of R4-2. Gating on the decision must not mean "say nothing
@@ -1959,7 +1960,7 @@ test('R4-3 — a CHANGED refusal is still journalled, so the gate is not simply 
 });
 
 test('R4-4 — a registration whose directory an operator deleted is rebuilt, not adopted', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r, { worktreePrefs: () => ({ setup: 'touch .keep-me-dirty' }) });
@@ -1999,7 +2000,7 @@ test('R4-4 — a registration whose directory an operator deleted is rebuilt, no
  * ------------------------------------------------------------------ */
 
 test('R6-1 — a refusal on a resume does NOT take the checkout away from a run holding it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // Drive once with the scope confined so the run really gets a tree, then
@@ -2043,7 +2044,7 @@ test('R6-1 — a refusal on a resume does NOT take the checkout away from a run 
 });
 
 test('R6-1 — the override is journalled ONCE, not once per drive', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     let scope = ['all'];
@@ -2068,7 +2069,7 @@ test('R6-1 — the override is journalled ONCE, not once per drive', async () =>
 });
 
 test('R6-2 — a refusal on a resume never deletes a LANE checkout', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The regression QA round 6 demonstrated end-to-end. Round 5's release
@@ -2105,7 +2106,7 @@ test('R6-2 — a refusal on a resume never deletes a LANE checkout', async () =>
 });
 
 test('R7-3 — a tree switched to ANOTHER branch is not adopted, and the run does not claim it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r, {}, (request) => {
@@ -2146,7 +2147,7 @@ test('R7-3 — a tree switched to ANOTHER branch is not adopted, and the run doe
 });
 
 test('R7-1 — turning isolation OFF gives the tree back, and never leaves the branch held silently', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A CLEAN tree: the drop can release it outright, so the branch is free and
@@ -2161,9 +2162,11 @@ test('R7-1 — turning isolation OFF gives the tree back, and never leaves the b
       git(r.root, 'worktree', 'add', '-q', tree, 'pe/demo');
       const dir = runDir(r.root, 'demo');
       const file = readdirSync(dir).filter((f) => /^run-.*\.json$/.test(f))[0]!;
-      const raw = JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>;
+      const raw = readStoredRun(r.root, 'demo', file.slice('run-'.length, -'.json'.length)) as unknown as Record<string, unknown>;
       raw.workRoot = tree; raw.checkout = 'worktree';
+      // A hand edit is a whole write: the record's delta log (measured-console phase 17) goes with it.
       writeFileSync(join(dir, file), JSON.stringify(raw));
+      rmSync(join(dir, `${file}.delta`), { force: true });
     }
 
     const before = driver.requests.length;
@@ -2181,7 +2184,7 @@ test('R7-1 — turning isolation OFF gives the tree back, and never leaves the b
 });
 
 test('R7-1 — a DIRTY tree is kept, and the prompt stops telling the session to check the branch out', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r, {}, (request) => {
@@ -2215,7 +2218,7 @@ test('R7-1 — a DIRTY tree is kept, and the prompt stops telling the session to
     // current branch and then "Commit only to `pe/demo`" is two incompatible
     // orders in one prompt, with the root standing on `main`.
     assert.doesNotMatch(prompt, /Commit only to `pe\/demo`/);
-    assert.match(prompt, /commit on the branch this checkout\n  is already on/);
+    assert.match(prompt, /commit on the branch this checkout\n {2}is already on/);
   } finally { r.cleanup(); }
 });
 
@@ -2236,7 +2239,7 @@ function stageNextRun(r: Repo): void {
 }
 
 test('QA8-3 — a NEW run meeting the previous run\'s kept tree is told the truth, not "check it out"', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A killed session leaves the integration tree dirty; the settle keeps it
@@ -2276,7 +2279,7 @@ test('QA8-3 — a NEW run meeting the previous run\'s kept tree is told the trut
 });
 
 test('QA9-1 — a HELD branch outranks the neighbour CAUTION, and the prompt never contradicts itself', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The previous run leaves a dirty tree the settle keeps — round 8's
@@ -2309,7 +2312,7 @@ test('QA9-1 — a HELD branch outranks the neighbour CAUTION, and the prompt nev
       'the neighbour CAUTION won, and its advice is a command git refuses');
     assert.doesNotMatch(prompt, /git worktree add \.\.\//);
     assert.doesNotMatch(prompt, /Commit only to `pe\/demo`/);
-    assert.match(prompt, /commit on the branch this checkout\n  is already on/);
+    assert.match(prompt, /commit on the branch this checkout\n {2}is already on/);
     // The neighbour still matters — it rides along rather than being replaced.
     assert.match(prompt, /A live session also shares a repository with this phase/);
     assert.ok(prompt.includes('other-plan P3'), 'the neighbour is not named');
@@ -2324,7 +2327,7 @@ test('QA9-1 — a HELD branch outranks the neighbour CAUTION, and the prompt nev
 });
 
 test('QA9-2 — the held bullet says only what is true of ANY holder', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The holder is the OPERATOR's own worktree, not a console-managed one, and
@@ -2348,7 +2351,7 @@ test('QA9-2 — the held bullet says only what is true of ANY holder', async () 
 });
 
 test('QA8-2 — once the operator frees the branch, the very next prompt says so', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A dirty tree the settle keeps, exactly as QA8-3 stages it.
@@ -2399,7 +2402,7 @@ test('QA8-2 — once the operator frees the branch, the very next prompt says so
 });
 
 test('R7-6 — a run whose repository gains submodules degrades, and does not keep an empty tree', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r);
@@ -2411,9 +2414,11 @@ test('R7-6 — a run whose repository gains submodules degrades, and does not ke
       git(r.root, 'worktree', 'add', '-q', tree, 'pe/demo');
       const dir = runDir(r.root, 'demo');
       const file = readdirSync(dir).filter((f) => /^run-.*\.json$/.test(f))[0]!;
-      const raw = JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>;
+      const raw = readStoredRun(r.root, 'demo', file.slice('run-'.length, -'.json'.length)) as unknown as Record<string, unknown>;
       raw.workRoot = tree; raw.checkout = 'worktree';
+      // A hand edit is a whole write: the record's delta log (measured-console phase 17) goes with it.
       writeFileSync(join(dir, file), JSON.stringify(raw));
+      rmSync(join(dir, `${file}.delta`), { force: true });
     }
 
     // A linked worktree of a superproject has EMPTY submodule directories, so
@@ -2433,7 +2438,7 @@ test('R7-6 — a run whose repository gains submodules degrades, and does not ke
 });
 
 test('R5-1 — a run that already HOLDS its tree does not re-compete for a cap slot', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     let others = 0;
@@ -2464,7 +2469,7 @@ test('R5-1 — a run that already HOLDS its tree does not re-compete for a cap s
 });
 
 test('R5-3 — a git failure that is not a setup command says so', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // `setup-failed` used to be the catch-all for ANY non-branch `worktree add`
@@ -2522,7 +2527,7 @@ function makeSuperRepo(r: Repo): void {
 }
 
 test('EC1-mirror — a superproject run gets a MIRROR: per-repo worktrees, the mirror boot arm, a mounts journal, adoption, and a clean drop', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeSuperRepo(r);
     const driver = makeRunner(r, { planScope: () => ['app', 'web'] });
@@ -2583,7 +2588,7 @@ test('EC1-mirror — a superproject run gets a MIRROR: per-repo worktrees, the m
 });
 
 test('EC1-root — a plan naming the superproject ITSELF mounts the root, and the boot arm says so instead of printing a bare slash', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeSuperRepo(r);
     // The shape that could not have isolation at all before the root mount:
@@ -2620,7 +2625,7 @@ test('EC1-root — a plan naming the superproject ITSELF mounts the root, and th
  * ================================================================== */
 
 test('P1/W1 — the reclaim leaves a tree a LIVE lock names alone, and the refusal names the holder', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // Clean and on the branch: by every git read, reclaimable. A hand session
@@ -2643,7 +2648,7 @@ test('P1/W1 — the reclaim leaves a tree a LIVE lock names alone, and the refus
 });
 
 test('P1/W2 — the resume reader can never RAISE isolation on a run that never had it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r);
@@ -2665,7 +2670,7 @@ test('P1/W2 — the resume reader can never RAISE isolation on a run that never 
 });
 
 test('P1/W2 — giving up the branch on a resume gives up isolation with it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r);
@@ -2688,7 +2693,7 @@ test('P1/W2 — giving up the branch on a resume gives up isolation with it', as
 });
 
 test('P1/W5 — a scope the run root does not contain makes the claim UNQUALIFIED: no branch, no tree', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const scheduler = new Scheduler({ max: 8 });
@@ -2713,7 +2718,7 @@ test('P1/W5 — a scope the run root does not contain makes the claim UNQUALIFIE
 });
 
 test('P1/W5 — …and a confined scope keeps the exact pair a shared run states', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const scheduler = new Scheduler({ max: 8 });
@@ -2732,7 +2737,7 @@ test('P1/W5 — …and a confined scope keeps the exact pair a shared run states
 });
 
 test("P1/W6 — a finished detached run's detachAt goes with its tree", async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r, { detachRequested: () => true });
@@ -2749,7 +2754,7 @@ test("P1/W6 — a finished detached run's detachAt goes with its tree", async ()
 });
 
 test("P1/QA-F1 — a tree-less live claim on the plan's scope refuses the reclaim, asked with the PLAN scope", async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     git(r.root, 'switch', '-q', '-c', 'pe/demo');
@@ -2773,7 +2778,7 @@ test("P1/QA-F1 — a tree-less live claim on the plan's scope refuses the reclai
 });
 
 test("P1/QA-F1 — the run's OWN claim is never a reason to refuse it its checkout", async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     git(r.root, 'switch', '-q', '-c', 'pe/demo');
@@ -2809,7 +2814,7 @@ test('S10 — a settle session that ends badly leaves the run PENDING, never "pu
   // non-null, and `settleSession` returned it — so the caller answered "the
   // last phase's session was asked to push and open the pull request" and the
   // run FINISHED. The branch was never pushed and nothing anywhere said so.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests: SpawnRequest[] = [];
@@ -2854,7 +2859,7 @@ test('S10 — a settle session that ends badly leaves the run PENDING, never "pu
 });
 
 test('BASE-1/S12 — run.isolation names the base the run branch forked from', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // The root stands on ANOTHER plan's branch, which is the ordinary state of
@@ -2879,7 +2884,7 @@ test('S12 — phase.admitted is journalled even when nothing blocked', async () 
   // It sat inside `if (blockers.length)`, so the ordinary case — an admission
   // that waited for nothing, which is where the CARVE-OUT does its work — left
   // no record at all.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A scheduler, because `admit()` is what journals this and it returns null
@@ -2899,7 +2904,7 @@ test('S11-c — two shared-root new-branch runs serialise, however disjoint thei
   // Both are told to stand the ONE shared checkout on their own `pe/<slug>`,
   // and git allows a branch one working tree. Disjoint SCOPES do not make two
   // branches fit in one directory, and nothing in the vocabulary said so.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const scheduler = new Scheduler({ max: 8 });
@@ -2919,7 +2924,7 @@ test('S11-c — two shared-root new-branch runs serialise, however disjoint thei
 });
 
 test('S11-c — a run with its own checkout does NOT claim it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const scheduler = new Scheduler({ max: 8 });
@@ -2937,7 +2942,7 @@ test('S6 — a phase that commits OUTSIDE its Repos cell is journalled', async (
   // Nothing detected this at all. The Repos cell is what admission carves on,
   // what the lock records, and what two plans are allowed to run concurrently
   // on the strength of — and it was enforced nowhere.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A submodule the phase's scope does NOT name, and a scoped directory it does.
@@ -2985,7 +2990,7 @@ test('S6 — a phase that commits OUTSIDE its Repos cell is journalled', async (
 test('S6 — a commit in an unscoped repository that the phase did NOT make journals nothing (#88)', async () => {
   // Somebody else — another plan's lane, a person — commits in `web` while
   // this phase runs. The HEAD moves; the phase did nothing wrong.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const web = join(r.root, 'web');
@@ -3009,7 +3014,7 @@ test('S6 — a commit in an unscoped repository that the phase did NOT make jour
 });
 
 test('S6 — a phase that stays inside its scope journals nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const web = join(r.root, 'web');
@@ -3037,7 +3042,7 @@ test('S6 — a phase that stays inside its scope journals nothing', async () => 
  * ------------------------------------------------------------------ */
 
 test('TRC-1 — a drive stamps ONE derived trace on its journal and on what it logs', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const logFile = join(r.root, 'console.ndjson');
   configureLog(logFile);
   const wasDebug = process.env.PHASE_CONSOLE_DEBUG;
@@ -3092,7 +3097,7 @@ test('TRC-1 — a drive stamps ONE derived trace on its journal and on what it l
 });
 
 test('TRC-2 — a RESUMED drive rejoins the same trace, because it recomputes rather than remembers', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const driver = makeRunner(r);
@@ -3111,7 +3116,7 @@ test('TRC-2 — a RESUMED drive rejoins the same trace, because it recomputes ra
  * ------------------------------------------------------------------ */
 
 test('P7 — a phase saying `worktree` gets a lane on a plan whose Worktrees directive is off', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(
@@ -3127,7 +3132,7 @@ test('P7 — a phase saying `worktree` gets a lane on a plan whose Worktrees dir
 });
 
 test('P7 — a phase saying `shared` declines a lane the PLAN turned on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     const requests = await requestsFor(
@@ -3143,7 +3148,7 @@ test('P7 — a phase saying `shared` declines a lane the PLAN turned on', async 
 });
 
 test('P7 — the run branch is cut from the base the PLAN names, and the prompt says which', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     makeGitRepo(r);
     // A branch the plan names as its base, holding a commit `main` lacks.
@@ -3268,7 +3273,7 @@ test('EC7 — an automatic door answers override for itself, and the run journal
   assert.equal(recorded.ack, 'automatic', 'a door no person pressed never waits on one');
 
   // The runner writes the journal line the moment the run exists.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const driver = await driveOn(makeRunner(r, { planBranch: () => 'feature/checkout' }), r, {
       onlyPhases: [1], gitMode: 'new-branch',
@@ -3283,7 +3288,7 @@ test('EC7 — an automatic door answers override for itself, and the run journal
 });
 
 test('EC8 — under an override the session gets the concrete branch, never "record the discrepancy"', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const lines = [
       BRANCH_LINE,

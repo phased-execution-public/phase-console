@@ -11,6 +11,7 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';

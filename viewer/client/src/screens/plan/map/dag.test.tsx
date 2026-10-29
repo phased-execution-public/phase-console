@@ -516,11 +516,82 @@ describe('<RouteMap>', () => {
   });
 
   it('is a GROUP of buttons, not an image that happens to contain forty of them', () => {
+    render(<RouteMap route={ROUTE} />);
+    const group = screen.getByRole('group', { name: /4 stations/ });
+    expect(within(group).getAllByRole('button')).toHaveLength(4);
+  });
+
+  it('makes each station a real HTML button over a drawing that is paint only', () => {
     const { container } = render(<RouteMap route={ROUTE} />);
+    const stations = screen.getAllByRole('button', { name: /^Phase \d/ });
+    for (const station of stations) {
+      expect(station.tagName).toBe('BUTTON');
+      expect(station).toHaveAttribute('type', 'button');
+    }
+    // In phase order — what a screen reader's virtual cursor reads them in.
+    expect(stations.map((station) => station.getAttribute('data-phase'))).toEqual(['1', '2', '3', '4']);
+    // One tab stop into the map.
+    expect(stations.filter((station) => station.tabIndex === 0)).toHaveLength(1);
+    // The SVG holds nothing to focus or press, and is hidden from the reader.
     const svg = container.querySelector('svg.route-svg')!;
-    expect(svg.getAttribute('role')).toBe('group');
-    expect(svg.getAttribute('aria-label')).toMatch(/4 stations/);
-    expect(within(svg as unknown as HTMLElement).getAllByRole('button')).toHaveLength(4);
+    expect(svg.getAttribute('aria-hidden')).toBe('true');
+    expect(svg.querySelectorAll('[tabindex], [role], a, button')).toHaveLength(0);
+    expect(svg.querySelector('.route-station-hit')).toBeNull();
+    // …and no button is inside it.
+    for (const station of stations) expect(svg.contains(station)).toBe(false);
+  });
+
+  it('walks the buttons with the arrow keys, carrying the one tab stop', () => {
+    render(<RouteMap route={ROUTE} />);
+    const button = (phase: number) => screen.getByRole('button', { name: new RegExp(`^Phase ${phase}:`) });
+    button(1).focus();
+    fireEvent.keyDown(button(1), { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(button(2));
+    expect(button(2).tabIndex).toBe(0);
+    expect(button(1).tabIndex).toBe(-1);
+    fireEvent.keyDown(button(2), { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(button(3));
+    fireEvent.keyDown(button(3), { key: 'End' });
+    expect(document.activeElement).toBe(button(4));
+    fireEvent.keyDown(button(4), { key: 'Home' });
+    expect(document.activeElement).toBe(button(1));
+    expect(screen.getAllByRole('button', { name: /^Phase \d/ }).filter((b) => b.tabIndex === 0)).toHaveLength(
+      1,
+    );
+  });
+
+  it('a pointer on a button lights its station and its neighbours, as a hover on the mark did', () => {
+    const { container } = render(<RouteMap route={ROUTE} />);
+    const mark = (phase: number) => container.querySelector(`.route-station[data-phase="${phase}"]`)!;
+    fireEvent.mouseEnter(screen.getByRole('button', { name: /^Phase 2:/ }));
+    expect(mark(2).classList.contains('hovered')).toBe(true);
+    // 2's neighbours are 1 and 4; 3 is not one.
+    expect(mark(3).classList.contains('dim')).toBe(true);
+    expect(mark(1).classList.contains('dim')).toBe(false);
+    fireEvent.mouseLeave(screen.getByRole('button', { name: /^Phase 2:/ }));
+    expect(mark(2).classList.contains('hovered')).toBe(false);
+    expect(mark(3).classList.contains('dim')).toBe(false);
+  });
+
+  it('a drag that starts on a station pans the map and is not a press on it', () => {
+    setPrefs({ mapPanZoom: true });
+    const picked: number[] = [];
+    const { container } = render(<RouteMap route={ROUTE} onSelect={(phase) => picked.push(phase)} />);
+    const viewBox = () => container.querySelector('svg.route-svg')!.getAttribute('viewBox');
+    const before = viewBox();
+    const station = screen.getByRole('button', { name: /^Phase 4:/ });
+    fireEvent.pointerDown(station, { pointerId: 1, clientX: 100, clientY: 100, button: 0 });
+    fireEvent.pointerMove(station, { pointerId: 1, clientX: 160, clientY: 150 });
+    fireEvent.pointerUp(station, { pointerId: 1 });
+    fireEvent.click(station);
+    expect(viewBox()).not.toBe(before);
+    expect(picked).toEqual([]);
+    // A press with no drag in it is still a press.
+    fireEvent.pointerDown(station, { pointerId: 2, clientX: 100, clientY: 100, button: 0 });
+    fireEvent.pointerUp(station, { pointerId: 2 });
+    fireEvent.click(station);
+    expect(picked).toEqual([4]);
+    setPrefs({ mapPanZoom: false });
   });
 
   it('paints each station with its own state class, so no two states look alike', () => {
@@ -695,10 +766,10 @@ describe('who is driving', () => {
 
   it('says the vehicle in words too — the icon is not the whole answer', () => {
     const { container } = render(<RouteMap route={RUNNING} drivers={drivers()} />);
-    const station = container.querySelector('.route-station.state-running')!;
-    expect(station.querySelector('title')?.textContent).toContain(
-      'Autopilot session, held by autopilot/1a2b3c4d',
-    );
+    const phase = container.querySelector('.route-station.state-running')!.getAttribute('data-phase');
+    // The native tooltip is the station's BUTTON's — the pointer never reaches the drawing.
+    const station = container.querySelector(`.route-station-button[data-phase="${phase}"]`)!;
+    expect(station.getAttribute('title')).toContain('Autopilot session, held by autopilot/1a2b3c4d');
   });
 });
 
@@ -1057,11 +1128,25 @@ describe('route-map.css keeps its side of the token bargain', () => {
     // A focused station is not a summons: the halo a focus lights is `--focus`
     // (ink), whatever state the station is in — a needs-you station's own hue
     // would be an amber focus mark.
-    expect(code).toMatch(/\.route-station:focus-visible \.halo \{ stroke: var\(--focus\);/);
+    // `focused` is the button's keyboard focus, lent to the drawn station.
+    expect(code).toMatch(/\.route-station\.focused \.halo \{ stroke: var\(--focus\);/);
     const tinted =
       code.match(/([^{}]*)\{ stroke: color-mix\(in oklab, var\(--state, var\(--ink\)\) 55%/)?.[1] ?? '';
-    expect(tinted).toMatch(/:hover/);
+    expect(tinted).toMatch(/\.hovered/);
     expect(tinted).not.toMatch(/focus/);
+    // The focus rule comes after the hover's, so it wins on a station both are on.
+    expect(code.indexOf('.route-station.focused .halo')).toBeGreaterThan(
+      code.indexOf('.route-station.hovered .halo'),
+    );
+  });
+
+  it('the halo is the only focus mark: the button draws no second outline', () => {
+    expect(code).toMatch(/\.route-station-button:focus-visible \{ outline: none; \}/);
+    expect(code).not.toMatch(/\.route-station:focus-visible/);
+    // The drawing takes no pointer: every press is its button's.
+    expect(code).toMatch(/\.route-station \{ pointer-events: none; \}/);
+    // The layer cannot be scrolled out of register with the drawing.
+    expect(code).toMatch(/\.route-stations \{[^}]*overflow: clip;/);
   });
 });
 

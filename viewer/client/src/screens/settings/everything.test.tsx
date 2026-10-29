@@ -8,6 +8,7 @@
 
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { HEAVY_CASE_TIMEOUT } from '@/test-heavy';
 import type { Call } from './test-kit';
 
 const server = vi.hoisted(() => ({ reads: {} as Record<string, unknown>, calls: [] as Call[] }));
@@ -156,14 +157,18 @@ describe('Settings ▸ Everything', () => {
     expect(document.body.textContent).not.toContain('…a1b2');
   });
 
-  it('shows only the keys that are set when asked, and says how many are shown', async () => {
-    await mount();
-    fireEvent.change(screen.getAllByRole('combobox', { name: 'Show' })[0]!, { target: { value: 'set' } });
-    await waitFor(() => expect(rowOf('repoGuard')).toBeFalsy());
-    expect(rowOf('ladderPerRunUsd')).toBeTruthy();
-    expect(rowOf('theme')).toBeTruthy();
-    expect(screen.getByText(/keys, 4 set here or elsewhere; 4 shown/)).toBeTruthy();
-  });
+  it(
+    'shows only the keys that are set when asked, and says how many are shown',
+    async () => {
+      await mount();
+      fireEvent.change(screen.getAllByRole('combobox', { name: 'Show' })[0]!, { target: { value: 'set' } });
+      await waitFor(() => expect(rowOf('repoGuard')).toBeFalsy());
+      expect(rowOf('ladderPerRunUsd')).toBeTruthy();
+      expect(rowOf('theme')).toBeTruthy();
+      expect(screen.getByText(/keys, 4 set here or elsewhere; 4 shown/)).toBeTruthy();
+    },
+    HEAVY_CASE_TIMEOUT,
+  );
 
   it('narrows to what the place was asked for', async () => {
     renderWithClient(<EverythingSection query="run usd" />);

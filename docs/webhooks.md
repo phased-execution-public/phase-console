@@ -14,8 +14,9 @@ is registered.
 
 ## Why it is a separate flag
 
-The other six capability switches widen what may happen *on this machine*. This one sends what
-happened here somewhere else, unattended, from a laptop that usually sits inside a private network.
+The other seven capability switches widen what may happen *on this machine*, or in the repositories
+the console already works on. This one sends what happened here somewhere else, unattended, from a
+laptop that usually sits inside a private network.
 That is a different kind of decision, so it is a different switch — and it is why the console
 refuses a URL that points back inside: no `http:`, no `localhost` or `127.0.0.1`, no link-local
 (where the cloud metadata address lives), no RFC 1918 range, no bare IP, no dotless intranet name.
@@ -34,10 +35,32 @@ name for changing a secret. It also clears any backoff, so a re-paste is how you
 Each destination has its own category choices, exactly as a push device does. `Test` sends one
 `health` payload immediately, whatever the categories say.
 
+Each destination also gets a **signing secret** (`whsec_` and 48 hex characters) the moment it is
+added. The add shows it **once**, with a Copy button — give it to whatever receives the POSTs; after
+that the row shows only its last four characters (`signed with …1a2b`). A row added before 9.0 is
+given its secret on the console's first boot of 9.0 and shows the hint; remove and re-add it to see a
+secret whole. A machine-profile row (`fleet.json` `webhooks[]`) signs only when its entry names a
+`secret` of 16 characters or more.
+
 ## What a payload looks like
 
 `POST`, `content-type: application/json`, plus two headers so a relay can filter without
 parsing: `x-phase-console-category` and `x-phase-console-instance`.
+
+### The signature
+
+Every delivery carries **`X-Phase-Console-Signature: sha256=<hex>`** — the HMAC-SHA256 of the exact
+body bytes, keyed by the destination's secret (measured-console phase 17). Check it over the RAW body,
+before any JSON parse re-serialises it, and compare in constant time:
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+const expected = `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+const given = req.headers['x-phase-console-signature'] ?? '';
+const ok = given.length === expected.length && timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+```
+
+A body that does not match was not sent by this console, or was changed on the way.
 
 ```json
 {
@@ -100,7 +123,11 @@ ids and titles rather than content.
 ## When a destination is down
 
 A failed POST backs off — 30 seconds, then a minute, then two, doubling to a ceiling of half an
-hour — and the row **stays registered**. Push drops a dead device after fifteen failures because
+hour — and the row **stays registered**. **Nothing is dropped while it backs off:** each destination
+has its own queue, so the failed announcement and every one after it wait, and when the backoff ends
+they are delivered in the order they happened, before anything newer (the row says how many are
+waiting). A queue holds up to 1,000 announcements — far past a weekend's traffic — and lives in
+memory, so a console restart starts it empty. Push drops a dead device after fifteen failures because
 that is the push service saying the app is gone; a webhook URL is something you typed, and losing
 the row means re-issuing a secret. A relay that is down for a weekend costs 48 requests a day and
 nothing else. The card shows the failure count and the last rejection; a success clears both.

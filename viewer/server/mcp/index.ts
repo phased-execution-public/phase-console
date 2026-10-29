@@ -35,7 +35,8 @@ import {
   type McpSecretRef, type McpServerMeta, type McpTransport,
 } from './store.ts';
 
-export { CURATED, searchCatalog, searchCurated, type CatalogEntry } from './catalog.ts';
+export { CURATED, pinOf, searchCatalog, searchCurated, untrustedOutputOf, type CatalogEntry } from './catalog.ts';
+import { pinOf, untrustedOutputOf } from './catalog.ts';
 export { blocksBoarding, type McpHealth, type McpStatus } from './health.ts';
 export { MCP_TRANSPORTS, type McpServerMeta, type McpTransport } from './store.ts';
 
@@ -61,6 +62,10 @@ export type McpServerView = {
   /** Why it failed, when the CLI said. Already redacted by the CLI itself. */
   issue?: string;
   toolCount?: number;
+  /** The catalog's pin for this id, and whether the registered command holds it (measured-console phase 27). */
+  pin?: { min: string; held: boolean };
+  /** Its output is third-party text — the catalog marks it (Context7). */
+  untrustedOutput?: boolean;
   /** Tools that can never be approved in an unattended run. */
   interactiveTools?: string[];
   /** Set when the advertised tools changed since we last looked. */
@@ -665,6 +670,8 @@ export class Mcp {
       ...(held ? { checkedAt: new Date(held.at).toISOString() } : {}),
       ...(held?.row.error ? { issue: held.row.error.message } : {}),
       ...(held?.row.tools.length ? { toolCount: held.row.tools.length } : {}),
+      ...(pinOf(meta.id, meta.args) ? { pin: pinOf(meta.id, meta.args)! } : {}),
+      ...(untrustedOutputOf(meta.id) ? { untrustedOutput: true } : {}),
       ...(interactive.length ? { interactiveTools: interactive } : {}),
       ...(drift ? { toolsChanged: drift } : {}),
       ...(unresolvedVars(meta).length ? { needsConfig: unresolvedVars(meta) } : {}),

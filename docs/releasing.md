@@ -23,23 +23,46 @@ design — Claude Code refreshes installed plugins from `main` in the background
 pushing `main` is "this is releasable", always; `scripts/gates.sh` exists to hold that bar, and the
 pre-push hook runs it for you.
 
-**The gates — `scripts/gates.sh`.** In this order: `tests/run-tests.sh` (shellcheck + bats), the
-engine-parity test, the server suite serially, the three timing-sensitive files with one retry
-each, the client suite, both typechecks, lint, the format check, the build gate (`verify:dist`, a
-scratch build — `--build` builds `client/dist` for real), the real-browser tour (`npm run
-test:e2e` in `viewer/`: a sandboxed console toured in Chromium over four viewports and held to
-`viewer/e2e/baseline.json`; its preflight exits 2, naming the install line, when the pinned
-Playwright's browser revision is missing), the scrub, and the tarball assertions.
-`--quick` is typechecks + lint + format + scrub, under a minute; `--list` prints what a call would
-run; `--ci` reinstalls `viewer/node_modules` first; `--keep-going` runs past a failure. A green full
-run records the sha it verified in `.git/phase-console-gates-ok`. Every `node --test` the gates run,
-like `npm test`, carries `--test-timeout=600000 --test-force-exit`: a test still running after ten
-minutes fails by name, and its file exits instead of waiting on a handle nothing will close.
-The server suite runs under `PHASE_CONSOLE_GATE_STAGE=server-suite`: it runs long before the e2e
-stage re-shoots the tour, so `dist-dir.test.ts` may skip, naming why, on pictures from a tour of
-another route table, and the e2e stage asks it again (#353). The tour runs on a scratch HOME — a
-fixture login, meter, unit and tailnet — so no picture carries the operator's email or live meter;
-`PHASE_CONSOLE_E2E_REAL_MACHINE=1` tours this machine as it is instead, and says so on stderr.
+**The gates — `scripts/gates.sh`.** Every suite once, in this order: the client build (one scratch
+build per commit, `viewer/client/.dist-<sha>` — `--build` builds `client/dist` for real instead —
+which every later stage that reads a build reads: the tour, the server suite's package test and the
+tarball), `tests/run-tests.sh` (shellcheck + bats, four bats processes at once — `RUN_TESTS_JOBS`), the
+engine-parity test, the server suite serially (without `engine-parity.test.ts`, its own stage, and
+`dist-dir.test.ts`, which the tour's stage runs on the pictures it has just left), the three
+timing-sensitive files with one retry each, the client suite, both typechecks, lint, the format check
+(those four through `tsc --incremental`, `eslint --cache` and `prettier --cache`, their caches in the
+gitignored .cache directory under `viewer/`), the real-browser tour (`npm run test:e2e` in `viewer/`: a sandboxed console toured in
+Chromium over four viewports and held to `viewer/e2e/baseline.json`; its preflight exits 2, naming the
+install line, when the pinned Playwright's browser revision is missing), the scrub, and the tarball
+assertions — which hold the packed `.build-rev` to HEAD (#358's shape). `--quick` is typechecks + lint
++ format + scrub, under a minute; `--list` prints what a call would run; `--ci` reinstalls
+`viewer/node_modules` first; `--keep-going` runs past a failure. A stage prints at most three lines:
+green is its name and seconds, red adds the failing ids its log names (capped) and the log's path —
+never the log, which `--verbose` restores as a red stage's last 40 lines. Every `node --test` the gates
+run, like `npm test`, carries `--test-timeout=600000 --test-force-exit`: a test still running after ten
+minutes fails by name, and its file exits instead of waiting on a handle nothing will close. And every
+one carries the suite ledger (`viewer/server/runner/suite-ledger.mjs`, re-exported as
+`viewer/test/suite-ledger.mjs`): a file whose process stops part way — which `node --test` reads as
+green — fails the run, naming the file and how many of its tests reported (`suite gap: …`, #339). The
+console carries the same reporter into every §Verification node line through `NODE_OPTIONS`. The tour
+runs on a scratch HOME — a fixture login, meter, unit and tailnet — so no picture carries the
+operator's email or live meter; `PHASE_CONSOLE_E2E_REAL_MACHINE=1` tours this machine as it is
+instead, and says so on stderr.
+
+**The record of a green run.** The full matrix verifies a COMMIT: it reads HEAD and refuses a tree
+that is not clean before stage one (exit 2, naming what is dirty). When every stage is green, HEAD
+did not move and the tree is still clean, it writes two files into the repository's COMMON gitdir
+(`git rev-parse --git-common-dir`), so a run in any linked worktree — a console run's mirror — counts
+for every checkout of the repository: `phase-console-gates-ok`, the sha, and
+`phase-console-gates-ok.json` — `head`, `head_at_start`, `head_now`, `clean`, `full`, `stages` (each
+`{name, seconds}`), `total_s`, `started_at`, `ended_at`, `options` (`ci`, `build`), `versions` (node,
+npm, bats, the `claude` CLI, bash), `env_keys` and `env_digest` (sixteen hex characters over those
+variables), `load` (`start` and `end`: the 1/5/15-minute averages and the CPUs), `drained` and
+`drain`. A HEAD that moved or a tree that changed leaves no record, and says which. The pre-push hook
+and the release script's `--gates-passed` accept the record only for HEAD, on a clean tree, and only when the
+JSON names every stage `gates.sh --list` prints — a bare sha, the record before 9.0, is refused
+(`scripts/gates-marker.sh` is the one reader).
+
 
 
 **The hook — `scripts/git-hooks/pre-push`.** Once per clone, `scripts/gates.sh --install-hook`
@@ -49,11 +72,46 @@ gates (a recorded green run for the same sha on a clean tree stands in for it); 
 emergency door, not a habit.
 
 
+### Two tiers: what a phase verifies, and what a release verifies
+
+**The release verifies everything; a phase verifies what it changed** (measured-console phase 15).
+`scripts/gates.sh` with no flag is the release tier — every suite, once — and it ALONE writes the
+marker (`scripts/gates-marker.sh`) that a release and the pre-push hook accept. A plan that says
+`**Verification tier:** impact` runs each phase's heavy §Verification lines in their selected form
+(`scripts/verify-select.env`, read by `viewer/server/runner/verify-select.ts`): `bash
+tests/run-tests.sh` becomes `RUN_TESTS_ONLY='<files>' bash tests/run-tests.sh` over the bats files
+that name the scripts the diff changed; the node suite becomes `node --test` over the test files
+that name the changed server and shared modules, plus `state-isolation`, `engine-parity` and
+`invariants`; `test:client` becomes `vitest related --run` over the changed client sources; the tour
+becomes `--only-changed=<base>`. Each adds a sample of three files seeded by the phase's boarding sha,
+so its baseline and its verdict draw the same ones. Selected forms run under `PE_VERIFY_TIER=phase`,
+and `gates.sh` under it records nothing. Which lines are heavy is measured: phase 8's `p8-gate.json`
+(server suite 1,889 s, engine parity 1,761 s, bash engine 1,157 s, the tour 426 s, the client suite
+128 s; every other stage under 30 s). Playwright retries a failed test once in both tiers; the release
+also fails a test that only passed on its retry (`failOnFlakyTests`).
+
+**Three ratchets ride the gate.** The quarantine (`scripts/quarantine.env`, stage `quarantine`, in
+`--quick` too): a flaky test is set aside by name with an owner, an expiry and a reason; the phase
+tier leaves it out and the client suite excludes it, and a row past its day fails the gate. The known
+reds (`viewer/known-reds.json`, read by `viewer/scripts/reds-ratchet.mjs` in `report_stage`): a stage
+whose every failing test is listed, each with its issue, passes and says so; a red not listed fails
+it; `reds-ratchet.mjs lower <stage> <log>` takes out the ones that passed. The test types
+(`npm run typecheck:test`, stage `typecheck-test`): `viewer/test` against the server's strict
+program, each file held to its count in `viewer/test/typecheck-ratchet.json` (1,570 at the start) — a
+new file must be clean, `--write` lowers the counts. `npm run lint:test` (stage `lint-test`) is green
+outright. Two runs are nightly and never a gate: `npm run test:mutation` (Stryker through `npx`,
+`viewer/stryker.config.mjs`, incremental, over the modules a diff touched) and `npm run coverage:diff`
+(the changed lines' coverage under node's own lcov, held to the floor in
+`viewer/test/coverage-ratchet.json`).
+
 ## What a change must carry with it
 
 | If you change… | You must also update, in the same commit |
 |---|---|
 | Anything the server needs at runtime (a new `server/` import, a new `scripts/*.sh` it shells, a new `templates/`/`references/` file a prompt names) | the root `package.json` `files` allowlist **and** `.github/scripts/assert-tarball.sh` — the tarball assertions are the backstop, never trust the allowlist alone |
+| A session-facing flag, a `usage()` word or an engine mode of a script (any `scripts/*.sh` but the ones `references/scripts.md` lists under §For maintainers) | **the stamp**: raise `PE_API` in `scripts/skill-api.env` — a new flag is a bump — and re-record the digests `viewer/test/skill-api-ratchet.test.ts` prints; raise `PE_API_MIN` only when this copy starts relying on something an older half's scripts would reject. The ratchet fails, naming the script, while a digest moves and `PE_API` does not. One bump covers a release series: while `PE_API` is above the stamp the last release shipped (`RELEASED_API` in the test), a moved digest asks only for the re-record, and the release that ships the series moves `RELEASED_API` |
+| The skill's text (`SKILL.md`, `references/mode-*.md`, `references/scripts.md`) | the byte ceilings `viewer/test/skill-sync.test.ts` holds: the core at most 16,384 bytes and 500 lines, each mode file at most 20,480 bytes (the size Claude Code keeps whole when it re-attaches a skill after compaction), and every script and flag named in the script index |
+| What the plugin tree carries (`scripts/build-plugin-tree.mjs` `TREE_PATHS`, `hooks/hooks.json`) | `viewer/test/plugin-tree.test.ts` (the 5 MB ceiling, the file list) and `hooks-install.test.ts` (the four entries at their timeouts); the repository root keeps NO `plugin.json` — only the materialized tree has one |
 | A setup prompt in `viewer/shared/setup-prompts.js` | its verbatim carriers (README.md, docs/install.md, the in-app guide) — `viewer/test/setup-prompts.test.ts` fails otherwise |
 | The Node floor | every gate: root + viewer `package.json` engines, `viewer/run`, `bin/phase-console.mjs` — plus the docs that state it. `viewer/test/node-floor.test.ts` lifts each gate's own predicate and RUNS it either side of every boundary, so they can no longer disagree silently, and it asserts the SIZE of that set so a gate cannot be dropped from the list quietly |
 | English docs | the Persian mirror (`README.fa.md`, `USAGE.fa.md`, `viewer/README.fa.md`) — **gated** since 3.1 by `viewer/test/docs-parity.test.ts`: heading counts per level, the flag set, and the images must match. Titles are translated, so it asserts structure and the tokens that survive translation, never prose |
@@ -74,8 +132,11 @@ wrapper does the two things `prepack` does that the assertions need (the pack `t
 `.ts` sibling, because `viewer/server/fallback-sw.js` is real tracked source sitting among the ~148
 emitted files. `--keep` leaves the tarball in place and prints its path, and `--tree DIR` packs
 another checkout of this repository, which is how a tag behind `HEAD` is released.
-The tarball is **10.2 MB** — 1254 entries, 27.5 MB unpacked, measured at **7.0.0** with the pack
-`tsc` emit in place, which is what a release actually packs (6.2.0 was 9.7 MB and 1072 entries, 6.1.0
+The tarball is **12.7 MB** — 1622 entries, 34.5 MB unpacked, measured at **9.0.0** with the pack
+`tsc` emit in place, which is what a release actually packs (8.0.0 was 11.3 MB and 1339 entries, 7.1.0
+10.9 MB and 1273, 7.0.0 10.2 MB and 1254; 9.0 added the mode files, the plugin tree's builder and
+`hooks/`, the seed, the wire families under `viewer/shared/wire/`, OpenTelemetry's receiver and the
+Agent SDK package; 6.2.0 was 9.7 MB and 1072 entries, 6.1.0
 9.2 MB and 1011, 6.0.0 8.8 MB and 973, 5.1.0 7.1 MB and 693, 5.0.0 5.9 MB and 599, 4.0.0 4.7 MB and
 503; 6.0 added the status model and its shared vocabularies, the person's-turn, queue, lock, clock and
 budget models, the run's new probes, ledgers and reports, and the emitted `.js` beside each, 6.1 the
@@ -83,18 +144,75 @@ issue, door and CI-refusal vocabularies, the unit watch and the shell reader, 6.
 `turn/`, `owner/` and `permissions/` — its two shared vocabularies and the `owner` and `grants` verbs,
 and 7.0 the rebuilt client's sources and build, the settings schema and the stray-console reader; the
 free tarball was 755 entries at 6.0.0).
-`assert-tarball.sh` prints the same 1254: this
+`assert-tarball.sh` prints the same 1622: this
 tarball carries no directory entries, so the older note about `tar -tzf` counting them no longer
 applies, and the two numbers agreeing is now the expected answer rather than a discrepancy to
 explain. It was ~36 MB until 3.1 shipped the screencast from a
-hosted URL instead of `assets/console.gif`, which is now on the never-ship list so the regression
-cannot come back quietly. It grew from 2.2 MB at 3.1 because 3.2's `precompress` step writes a
+hosted URL instead of the screencast in `assets/`, which is now on the never-ship list so the regression
+cannot come back quietly (measured-console phase 10 took the GIF out of the tree altogether). It grew from 2.2 MB at 3.1 because 3.2's `precompress` step writes a
 `.br`/`.gz` sibling beside every compressible file in `client/dist` — those are load-bearing, not
 slack: `server/http/static.ts` serves them and never compresses at request time, and
 `check-dist.mjs` gates first paint — the entry and every modulepreload, at most 170 KB — on the bytes
 that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
+
+## Upgrading to 9.0.0
+
+9.0.0 is a major version (plan `measured-console`) because the skill changes shape (`PE_API` 3), the
+plugin changes layout, an unattended session no longer loads the operator's personal plugins and
+hooks, the run's hooks block on failure, the gate's marker changes shape and place, and the journal
+and the run record migrate on-disk state. Nothing an 8.x plan says changes meaning: every new plan line
+is optional and read by both engines. `CHANGELOG.md` §Migration is the full list, each entry with the
+file that owns it; what follows is what an operator, a script or a plan author will notice first.
+
+### The skill and the sessions
+
+- **`PE_API` 3, `PE_API_MIN` 2** (`scripts/skill-api.env`). `SKILL.md` is a core under 16 KB with
+  three mode files (`references/mode-plan.md`, `mode-phase-start.md`, `mode-phase-finish.md`) and
+  `references/scripts.md`; the engine prints `--help`, `--explain`, `--section` and `--brief`. A
+  console at 3 runs a skill at 2 and the other way round, so the plugin and the console may move apart
+  for one roll-out.
+- **The plugin is a materialized tree** with `hooks/hooks.json`; `phase-console update-plugin`
+  installs it and `install-hooks` stops splicing the presence hooks into a config dir whose plugin
+  carries them (`--splice` keeps the old way).
+- **An unattended session loads the console's set** (`autopilotLoads: console-set`): set
+  `operator-config` to load the operator's own plugins and hooks as 8.0 did.
+- **Every hook the console registers blocks on failure**, and the Stop hook's refusal takes effect: a
+  session ending on red fast lines is held once (`- **Fast gate:** off` on a phase turns it off).
+- **A person's step defers in place** on a CLI at 2.1.306 or later (`humanStepMode: park` keeps 8.0's
+  park-and-resume); **compaction** stays the console's until a run picks `native` or `alternate`.
+- **A phase session boots on 55K tokens** where 8.0's booted on 111K, and `scripts/sizing.env` ships
+  55K + 183K + 1.91 × weight (`reports/p33-after.json`): `--session-plan` batches more into a session.
+
+### The gate and the marker
+
+The gate runs every suite once and took 6,443 s where 8.0.0's took 12,611 s. Its marker is now
+`phase-console-gates-ok` plus `phase-console-gates-ok.json` in the common gitdir, written only by a
+green full-matrix run on a clean, unmoved HEAD; the pre-push hook and the release's `--gates-passed`
+check refuse a bare sha left by 8.0. A phase verifies what it changed (`**Verification tier:** impact`);
+a release still runs the full matrix (§Two tiers above).
+
+### On-disk state
+
+- **The journal is a chain** past 32 MB (`run-<id>.jsonl.<n>`, `run-<id>.jsonl.index`,
+  `journal.rotated`); a tool that read one file reads the index's segments first.
+- **The run record persists incrementally** (`persistModel` 2, `run-<id>.json.delta`); the first 9.0
+  boot rewrites every stored run once (`run.persist-v2`).
+- **Runs that never finished age out** after `runRetainDays` (30); **webhooks are signed**
+  (`X-Phase-Console-Signature`) and queued while a destination backs off.
+
+### Packaging: what the tarball gained
+
+- The root `package.json` `files` allowlist gained `hooks/`, the seventeen wire families under
+  `viewer/shared/wire/` and `price-book.js`, `money-model.js`, `installed-plugins.js`,
+  `plugin-sets.js`, `outcome-schema.js` and `quarantine-model.js` under `viewer/shared/`, and so did
+  the free tree's own `package.json`. `.github/scripts/assert-tarball.sh` asserts them with the mode
+  files, `references/scripts.md`, `hooks/hooks.json`, the plugin tree's and the seed's builders, the
+  hook guard, `amend-plan.sh`, `lints.env`, `plugin-sets.env`, the suite ledger's reporter and the new
+  runner, OpenTelemetry and analysis modules.
+- The tarball is 12.7 MB (12,680,434 B), 1622 entries, 34.5 MB of files unpacked, measured at 9.0.0
+  with `pack-and-assert.sh --keep`. First paint is 140.6 KB served of 170.
 
 ## Upgrading to 8.0.0
 

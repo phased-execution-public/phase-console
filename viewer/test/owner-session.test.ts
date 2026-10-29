@@ -134,3 +134,39 @@ test('OS-4: a HIGH-risk press needs a touch inside five minutes; a medium one do
     service.close();
   }
 });
+
+test('OS-9 (EI-7c, measured-console phase 17): two confirms of one request press it ONCE — the first marks it in flight before it presses', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { ownerStateAt } = await import('../server/owner/door.ts');
+  const { answerRequest } = await import('../server/owner/presses.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'owner-confirm-'));
+  try {
+    const state = ownerStateAt(dir);
+    const recorded = state.requests.record({
+      door: 'supervisor', label: 'supervisor', proof: 'pass', row: { verb: 'approve-gate', summary: 'approve a gate — once' },
+      authority: 'gate-approve', risk: 'medium', method: 'POST', path: '/api/plans/demo/gate/3', body: { approve: true },
+    });
+    assert.ok(recorded.ok);
+    let presses = 0;
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const deps = {
+      state,
+      press: async () => { presses += 1; await held; return { status: 200, answer: { ok: true } }; },
+      note: () => {},
+    };
+    const input = { id: recorded.request.id, answer: 'confirm', reading: { door: 'owner', fresh: true } as never, by: 'owner' };
+    const both = [answerRequest(deps, input), answerRequest(deps, input)];
+    await new Promise((resolve) => setImmediate(resolve));
+    release();
+    const [first, second] = await Promise.all(both);
+    assert.equal(presses, 1, 'the request was pressed once');
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 409, 'the second confirm is refused while the first presses');
+    assert.equal((await answerRequest(deps, input)).status, 409, 'and a confirm after it reads the settled request');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

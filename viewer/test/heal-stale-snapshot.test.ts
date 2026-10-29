@@ -28,7 +28,7 @@ import { join } from 'node:path';
 
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
-const { clearRunFileCache, flushRunSaves, loadRun, newRun, phaseRecord, runDir, saveRun } = await import('../server/runner/state.ts');
+const { clearRunFileCache, flushRunSaves, loadRun, newRun, phaseRecord, readStoredRun, runDir, saveRun } = await import('../server/runner/state.ts');
 type RunState = import('../server/runner/state.ts').RunState;
 
 const SCRIPTS = join(SKILL_DIR, 'scripts');
@@ -142,7 +142,7 @@ function lines(root: string, id: string): Line[] {
 
 function disk(root: string, id: string): RunState {
   flushRunSaves();
-  return JSON.parse(readFileSync(join(runDir(root, 'gamma'), `run-${id}.json`), 'utf8')) as RunState;
+  return readStoredRun(root, 'gamma', id)!;
 }
 
 function session(): ChildProcess {

@@ -138,9 +138,10 @@ describe('the QA line', () => {
     expect(within(group).getByRole('button', { name: 'On' })).toHaveAttribute('aria-pressed', 'true');
     expect(within(card).getByTestId('qa-rollup').textContent).toBe('2 failing, 1 pending');
     expect(card.textContent).toContain('holding P4 (by P1)');
-    expect(within(card).getByRole('link', { name: 'QA by phase' })).toHaveAttribute(
+    // The reading of every phase's record — its QA and its handoff, side by side.
+    expect(within(card).getByRole('link', { name: 'Handoffs & QA' })).toHaveAttribute(
       'href',
-      '#/plan/alpha/phases?view=qa',
+      '#/plan/alpha/phases?view=handoffs',
     );
     expect(sent).toEqual([]);
   });

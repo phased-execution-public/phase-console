@@ -12,7 +12,7 @@
 
 import type { TerminalSession } from '@/data/api';
 import { usePlan } from '@/data/plans';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { elapsed } from '@/lib/format';
 import { runHref } from '@/shell/routes';
 import { KeyValue, type KeyValueItem } from '@/ui';

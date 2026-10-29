@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: supervisor-load-is-not-a-halt
+description: '#381: the supervisor held a run for machine load and never released it; a session keeps working and never presses the console.'
+tags: [halt, supervisor, unattended]
+context:
+  scaffold_script: fixture.sh

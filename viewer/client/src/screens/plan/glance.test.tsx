@@ -162,7 +162,14 @@ describe('the glance — which plan, and how far along', () => {
     expect(
       screen.getByRole('img', { name: 'demo plan, 3 phases: 1 done, 1 next up, 1 waiting, 33 %' }),
     ).toBeInTheDocument();
-    expect(screen.getByTestId('plan-legend')).toHaveTextContent('1 done · 1 next up · 1 waiting · 33 %');
+    // The legend is the family's badges, one per share, and the percentage a badge of its own.
+    const legend = screen.getByTestId('plan-legend');
+    expect([...legend.querySelectorAll('[data-share]')].map((badge) => badge.textContent)).toEqual([
+      '1 done',
+      '1 next up',
+      '1 waiting',
+    ]);
+    expect(screen.getByTestId('plan-percent')).toHaveTextContent('33 %');
   });
 
   it('says what is left in sessions, with the estimate and what it has cost', () => {
@@ -234,5 +241,62 @@ describe('the one act', () => {
     mount(detail({ status: 'abandoned', closed: true }));
     await waitFor(() => expect(sent).toContain('/api/runs?view=slim'));
     expect(screen.queryByTestId('glance-start')).toBeNull();
+  });
+});
+
+describe('the glance’s forecast against actual (measured-console phase 23)', () => {
+  it('reads the actual, the delta, the cost per verified phase, failed attempts and what is left', async () => {
+    const { PlanMoney } = await import('./glance');
+    const detail = {
+      phases: [
+        { phase: 1, state: 'done' },
+        { phase: 2, state: 'done' },
+        { phase: 3, state: 'ready' },
+      ],
+      cost: {
+        actuals: {
+          actualUsd: 44,
+          verifiedPhases: 2,
+          costPerVerifiedPhaseUsd: 22,
+          costOfFailedAttemptsUsd: 9,
+          failedAttempts: 1,
+          forecastUsd: 36.32,
+          forecastActualUsd: 44,
+          deltaUsd: 7.68,
+          deltaPct: 21.1,
+          forecastPhases: 2,
+        },
+      },
+      forecastUsd: {
+        usd: 60,
+        word: 'estimated',
+        source: 'forecast',
+        unpricedPhases: 0,
+        phases: [
+          { phase: 1, usd: 24.32 },
+          { phase: 2, usd: 12 },
+          { phase: 3, usd: 24.42 },
+        ],
+      },
+    } as unknown as PlanDetail;
+    render(<PlanMoney detail={detail} />);
+    expect(screen.getByTestId('plan-actuals-delta')).toHaveTextContent(
+      'Forecast $36.32 estimated for 2 verified phases, actual $44.00 — $7.68 over (21.1 %).',
+    );
+    expect(screen.getByTestId('plan-actuals-per-verified')).toHaveTextContent(
+      '$22.00 per verified phase over 2 phases',
+    );
+    expect(screen.getByTestId('plan-actuals-failed')).toHaveTextContent('$9.00 on 1 failed attempt.');
+    expect(screen.getByTestId('plan-actuals-left')).toHaveTextContent(
+      'What is left will likely cost $24.42 estimated over 1 phase.',
+    );
+  });
+
+  it('draws nothing before a forecast or a verified phase exists', async () => {
+    const { PlanMoney } = await import('./glance');
+    const { container } = render(
+      <PlanMoney detail={{ phases: [{ phase: 1, state: 'ready' }] } as unknown as PlanDetail} />,
+    );
+    expect(container).toBeEmptyDOMElement();
   });
 });

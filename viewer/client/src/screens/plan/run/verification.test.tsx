@@ -287,6 +287,73 @@ describe('the Verification fold', () => {
     await waitFor(() => expect(request).toHaveBeenCalledWith('/api/run/demo/verifications?limit=400'));
   });
 
+  it('draws the independent evaluator: the dot, both judges apart, each criterion and its evidence (measured-console phase 22)', async () => {
+    held = { rows: [], proofs: [] };
+    const run = {
+      id: 'run-1',
+      phases: {
+        '7': {
+          phase: 7,
+          status: 'done',
+          evaluation: {
+            attempt: 1,
+            at: '2026-10-27T10:00:00.000Z',
+            mode: 'advisory',
+            verdict: 'not-met',
+            criteria: [
+              { id: '1', text: 'a' },
+              { id: '2', text: 'b' },
+            ],
+            ran: true,
+            costUsd: 0.42,
+            model: 'claude-sonnet-5-5',
+            account: 'anthropic-api',
+            browser: { url: 'http://127.0.0.1:5123', used: true },
+            dimensions: {
+              spec: {
+                criteria: [
+                  { id: '1', verdict: 'met', evidence: 'server/widget.ts:1' },
+                  { id: '2', verdict: 'not-met', evidence: 'README.md is untouched' },
+                ],
+                summary: '',
+                words: 6,
+              },
+              standards: {
+                criteria: [
+                  { id: '1', verdict: 'met', evidence: 'CLAUDE.md rule kept' },
+                  { id: '2', verdict: 'unknown', evidence: 'no rule names it' },
+                ],
+                summary: '',
+                words: 7,
+              },
+            },
+          },
+        },
+      },
+    } as unknown as RunState;
+    mount(run);
+    const part = await screen.findByTestId('verification-evaluation');
+    expect(within(part).getByTestId('evaluation-verdict')).toHaveAttribute('data-verdict', 'not-met');
+    expect(within(part).getByTestId('evaluation-verdict')).toHaveTextContent('Advisory — it holds nothing');
+    expect(
+      within(part)
+        .getAllByTestId('evaluation-judge')
+        .map((j) => j.getAttribute('data-judge')),
+    ).toEqual(['spec', 'standards']);
+    const lines = within(part)
+      .getAllByTestId('evaluation-criterion')
+      .map((li) => li.textContent);
+    expect(lines).toEqual([
+      'MetCriterion 1server/widget.ts:1',
+      'Not metCriterion 2README.md is untouched',
+      'MetCriterion 1CLAUDE.md rule kept',
+      'UnknownCriterion 2no rule names it',
+    ]);
+    expect(within(part).getByTestId('evaluation-browser')).toHaveTextContent(
+      'Judged in a browser against the seeded console at http://127.0.0.1:5123.',
+    );
+  });
+
   it('nothing on file says so in one line', async () => {
     held = { rows: [], proofs: [] };
     mount(null);

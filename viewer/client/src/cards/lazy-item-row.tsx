@@ -3,9 +3,9 @@
  * 139, #216).
  *
  * A surface that may hold a person's ask draws it through `item-row.tsx`,
- * which carries the human-step card's glyphs, verbs and terminal sheet — so it
- * reaches the row through this door, and a page with no ask on it never
- * downloads them. While the row loads it says what it is and where it lives:
+ * which carries the step's glyphs, verbs and terminal sheet
+ * (`turn/step-parts.tsx`) — so it reaches the row through this door, and a
+ * page with no ask on it never downloads them. While the row loads it says what it is and where it lives:
  * the link is the one thing a reader needs from it at once.
  */
 

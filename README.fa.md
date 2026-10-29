@@ -9,7 +9,7 @@
 
 [English](README.md) · **فارسی**
 
-![Console ](https://raw.githubusercontent.com/phased-execution-public/phase-console/main/assets/console.gif)
+![Console ](https://raw.githubusercontent.com/phased-execution-public/phase-console/v8.0.0/assets/console.gif)
 
 </div>
 
@@ -176,9 +176,10 @@ header is trustworthy only because nothing but the proxy can reach the port.
 [Phase Console](docs/console.md) · [متریک‌ها](docs/metrics.md) · [نصبِ دستی](docs/install.md) ·
 [نسخه‌بندی و انتشار](docs/releasing.md) · [مرجع](docs/reference.md)
 
-۸.۰ **Your turn** (<span dir="ltr">`#/turn`</span>) را مقصدی از آنِ خودش و نمای چهارمِ هر طرح می‌کند، ابزارهای
-نقشه‌ی طرح، یک Schedule و یک Burn-up را به آن می‌دهد، و gitِ خودِ کنسول را از آنچه یک نشست در درختش می‌نویسد جدا
-می‌کند. آنچه ۷.۱ و ۶.۲ و ۶.۱ افزودند در **[docs/console.md](docs/console.md)** آمده است، در بخشِ
+۹.۰ نشستِ هر فاز را **ارزان‌تر، و سنجیده** می‌کند: مهارت یک هسته و سه فایلِ حالت است، به نشستی که زیرِ نظارت
+اجرا می‌شود همان آغازِ کار گفته می‌شود از کجا شروع می‌کند، گیت هر مجموعه‌آزمون را یک بار اجرا می‌کند و هر فاز همان را
+وارسی می‌کند که تغییر داده، و نشستِ یک فاز با ۵۵ هزار توکن بالا می‌آید، جایی که در ۸.۰ با ۱۱۱ هزار بالا می‌آمد. ۸.۰
+**Your turn** (<span dir="ltr">`#/turn`</span>) را مقصدی از آنِ خودش کرد؛ آنچه آن و ۷.۱ و ۶.۲ و ۶.۱ افزودند در **[docs/console.md](docs/console.md)** آمده است، در بخشِ
 <span dir="ltr">*What each release added*</span> (به انگلیسی).
 
 </div>

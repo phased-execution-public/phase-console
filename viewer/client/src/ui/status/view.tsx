@@ -27,9 +27,12 @@ export interface Chrome extends Omit<HTMLAttributes<HTMLSpanElement>, 'children'
    * a bordered pill — the status's icon and word in its hue, never a fill —
    * for the status of a plan or a phase where it is the row's headline
    * (#361, design.md §1 rule 4). A settled badge keeps its hue, muted, so
-   * Done and Complete do not read as grey text.
+   * Done and Complete do not read as grey text. `tint` is the LEAD badge of a
+   * strip or a card (2026-10-20, Tower strips): the same pill on its state's
+   * tint, its icon in the vivid hue, its word in the state's own — one per row
+   * or card, the thing the row is about (design.md §3.2).
    */
-  chrome?: 'dot' | 'badge';
+  chrome?: 'dot' | 'badge' | 'tint';
 }
 
 /** The tooltip's first line: the word, its fact, and whether it asks for you. */

@@ -46,7 +46,7 @@ vi.mock('@/data/human-steps', async (importOriginal) => {
 });
 
 import { humanStepView } from '@shared/human-step-model.js';
-import { HumanStepCard } from '@/cards/human-step-card';
+import { StepCard } from '@/cards/item-card';
 import type { ConsoleState, InboxItem, RunState, TurnAnswer, TurnItem } from '@/data/api';
 import { queryClientConfig } from '@/data/keys';
 import { nowLanes } from '@/data/lanes';
@@ -129,7 +129,7 @@ beforeEach(() => {
 
 describe('OA-C1 a due act leads with its command', () => {
   it('opens in the terminal, and the command is there to copy', () => {
-    withClient(<HumanStepCard item={act('notified')} />);
+    withClient(<StepCard item={act('notified')} />);
     const card = screen.getByTestId('human-step-card');
     expect(within(card).getByTestId('step-primary').getAttribute('data-act')).toBe('terminal');
     const command = within(card).getByTestId('step-command-block');
@@ -141,7 +141,7 @@ describe('OA-C1 a due act leads with its command', () => {
 
 describe('OA-C2 an upcoming act is shown, never pressed', () => {
   it('the card says what it waits on, and offers only what the ledger allows', () => {
-    withClient(<HumanStepCard item={act('upcoming')} />);
+    withClient(<StepCard item={act('upcoming')} />);
     const card = screen.getByTestId('human-step-card');
     expect(card.getAttribute('data-state')).toBe('upcoming');
     expect(within(card).getByTestId('step-state').textContent).toContain('Coming up');
@@ -155,7 +155,7 @@ describe('OA-C2 an upcoming act is shown, never pressed', () => {
   });
 
   it('the row says it too, with no primary', () => {
-    withClient(<HumanStepCard item={act('upcoming')} variant="row" />);
+    withClient(<StepCard item={act('upcoming')} variant="row" />);
     const row = screen.getByTestId('human-step-row');
     expect(row.getAttribute('data-state')).toBe('upcoming');
     expect(within(row).getByTestId('step-due').textContent).toBe(`Due when ${DUE_WHEN} lands.`);

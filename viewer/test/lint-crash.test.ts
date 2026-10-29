@@ -35,6 +35,7 @@ const {
 const { Runner } = await import('../server/runner/runner.ts');
 type EngineResult = import('../server/engine.ts').EngineResult;
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo } from './fixtures/repo.ts';
 
 /** An engine result with only the fields a reading actually looks at. */
 function result(partial: Partial<EngineResult> = {}): EngineResult {
@@ -146,22 +147,14 @@ test('LC-5: lint reads get 180 s (#44); every other engine read keeps 45 s', () 
  * that reads it done once the session says so, and a `validate.sh` that dies
  * the way the allocator killed the real one.
  */
-function repo(): { root: string; scripts: string; state: string; crashLint: () => void } {
-  const root = mkdtempSync(join(tmpdir(), 'pc-lintcrash-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n', 'utf8');
-  writeFileSync(join(state, 'done'), '', 'utf8');
-
-  const write = (path: string, body: string) => {
-    writeFileSync(path, body, 'utf8');
-    chmodSync(path, 0o755);
-  };
-
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): { root: string; scripts: string; state: string; crashLint: () => void } {
+  // The crash, as a real process death: no output on either stream, and a
+  // signal to name it. `crash-lint` is what turns it on, so the same harness
+  // proves the ordinary green path first.
+  const made = stubRepo({
+    prefix: 'pc-lintcrash-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -178,28 +171,21 @@ case "$mode" in
   --size) echo S ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
+`,
+      'phase-lock.sh': `#!/usr/bin/env bash
 set -u
 [ "\${2:-}" = "status" ] && { echo "phase \${3:-?}: free"; exit 0; }
 exit 0
-`);
-
-  // The crash, as a real process death: no output on either stream, and a
-  // signal to name it. `crash-lint` is what turns it on, so the same harness
-  // proves the ordinary green path first.
-  write(join(scripts, 'validate.sh'), `#!/usr/bin/env bash
+`,
+      'validate.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 [ -f "$S/crash-lint" ] && kill -TRAP $$
 echo "VALIDATE OK"
-`);
-
-  return {
-    root, scripts, state,
-    crashLint: () => writeFileSync(join(state, 'crash-lint'), '', 'utf8'),
-  };
+`,
+    }),
+  });
+  return { ...made, crashLint: () => writeFileSync(join(made.state, 'crash-lint'), '', 'utf8') };
 }
 
 function session(r: { state: string }): SpawnFn {
@@ -221,7 +207,7 @@ const journalled = (
   .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
 
 test('LC-4: a crashed lint after a complete phase neither halts, charges, nor withdraws', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.crashLint();
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const instance = new Runner({
@@ -254,7 +240,7 @@ test('LC-4: a crashed lint after a complete phase neither halts, charges, nor wi
 test('LC-4: a genuinely failing lint after a complete phase still halts', async () => {
   // The guard on the guard: the halt exists for a reason, and this change must
   // not be a way to stop hearing about a plan that really is broken.
-  const r = repo();
+  const r = stubbedPlan();
   writeFileSync(join(r.scripts, 'validate.sh'),
     '#!/usr/bin/env bash\necho "phase 3: undefined dependency 9" >&2\necho "VALIDATE FAIL: demo" >&2\nexit 1\n', 'utf8');
   chmodSync(join(r.scripts, 'validate.sh'), 0o755);
@@ -305,7 +291,7 @@ function scaffoldLint(r: { scripts: string }): void {
 }
 
 test('LC-6: a LIVE sibling\'s half-written handoff neither halts nor charges the phase that finished — and is named', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   scaffoldLint(r);
   halfWrittenSibling(r.root, { leaseFromNow: 3600 });
   const events: { event: string; data: Record<string, unknown> }[] = [];
@@ -328,7 +314,7 @@ test('LC-6: a LIVE sibling\'s half-written handoff neither halts nor charges the
 });
 
 test('LC-6: the same scaffold with its lock LAPSED is a plan problem, and the halt stands', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   scaffoldLint(r);
   halfWrittenSibling(r.root, { leaseFromNow: -60 });
   const events: { event: string; data: Record<string, unknown> }[] = [];

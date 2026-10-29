@@ -21,27 +21,21 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
 import type { SpawnFn, SpawnOutcome, StreamEvent } from '../server/runner/spawn.ts';
 import type { LaneLiveness } from '../server/runner/liveness.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-attempt-liveness-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-attempt-liveness-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -53,14 +47,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(stub, 'done'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: (phase) => writeFileSync(join(made.state, 'done'), `${phase}\n`) };
 }
 
 const journalled = (events: { event: string; data: Record<string, unknown> }[], name: string) => events
@@ -108,7 +100,7 @@ function harness(r: Repo, spawn: (instance: Runner, clock: { ms: number }) => Sp
 }
 
 test('AL-1: each attempt starts its own liveness — the dead session\'s clocks and tokens are gone, and the lane is stamped with the attempt and its procStartedAt', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: { live: LaneLiveness; child?: string }[] = [];
   let calls = 0;
   const { instance } = harness(r, (runner, clock) => async (request) => {
@@ -147,7 +139,7 @@ test('AL-1: each attempt starts its own liveness — the dead session\'s clocks 
 });
 
 test('AL-1: the reset keeps what belongs to the PHASE — the stalemate count and the tree — and the record\'s own snapshot moves with it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let calls = 0;
   let recordAtBoot: LaneLiveness | undefined;
   const { instance } = harness(r, (runner, clock) => async (request) => {
@@ -177,7 +169,7 @@ test('AL-1: the reset keeps what belongs to the PHASE — the stalemate count an
 });
 
 test('AL-2: a new attempt booted 102 minutes after the last output is not silent, and the dead session\'s stall is cleared rather than inherited', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let calls = 0;
   const stallAt: { attempt: number; signal: string | null }[] = [];
   const { instance, events } = harness(r, (runner, clock) => async (request) => {

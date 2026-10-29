@@ -37,6 +37,7 @@ import { ensureDetachedIntegration, uncommittedPaths } from '../server/runner/wo
 import { Runner } from '../server/runner/runner.ts';
 import { journalFile } from '../server/runner/run-paths.ts';
 import { PHASE_HALT_KINDS } from '../shared/recovery-model.js';
+import { repo } from './fixtures/repo.ts';
 
 const TRASH: string[] = [];
 process.on('exit', () => { for (const dir of TRASH) rmSync(dir, { recursive: true, force: true }); });
@@ -53,14 +54,9 @@ const sh = (cwd: string, ...args: string[]) => execFileSync('git', args, {
 });
 
 /** A repository with one commit, and a script that leaves a marker when anything runs it. */
-function repo(): { dir: string; marker: string; script: string } {
-  const dir = scratch('pc-wg-');
-  sh(dir, 'init', '-q', '-b', 'main');
-  sh(dir, 'config', 'user.email', 'wg@example.invalid');
-  sh(dir, 'config', 'user.name', 'wg');
-  writeFileSync(join(dir, 'f.txt'), 'one\n');
-  sh(dir, 'add', 'f.txt');
-  sh(dir, 'commit', '-qm', 'one');
+function plantedRepo(): { dir: string; marker: string; script: string } {
+  const dir = repo({ dir: scratch('pc-wg-'), files: { 'f.txt': 'one\n' }, message: 'one' });
+  sh(dir, 'config', '--unset', 'commit.gpgsign'); // the tests read the tree's own config keys: leave only the planted ones
   const marker = join(scratch('pc-wg-marker-'), 'ran');
   const script = join(scratch('pc-wg-script-'), 'planted.sh');
   writeFileSync(script, `#!/bin/sh\necho "$0 $*" >> '${marker}'\nexit 0\n`, { mode: 0o755 });
@@ -79,7 +75,7 @@ function plant(dir: string, script: string): void {
 }
 
 test('WG-1 (#272): a planted core.fsmonitor and core.hooksPath run under no console git call', async () => {
-  const { dir, marker, script } = repo();
+  const { dir, marker, script } = plantedRepo();
   // Red-proof: the plant really fires for git run the way the console ran it before.
   plant(dir, script);
   writeFileSync(join(dir, 'f.txt'), 'two\n');
@@ -104,7 +100,7 @@ test('WG-1 (#272): a planted core.fsmonitor and core.hooksPath run under no cons
 });
 
 test('WG-2 (#272): a planted credential helper never runs; the operator\'s own global helper still does', async () => {
-  const { dir, marker, script } = repo();
+  const { dir, marker, script } = plantedRepo();
   sh(dir, 'config', 'credential.helper', `!'${script}' local`);
   sh(dir, 'config', 'credential.https://x.example.invalid.helper', `!'${script}' url-scoped`);
   const global = join(scratch('pc-wg-global-'), 'gitconfig');
@@ -138,7 +134,7 @@ test('WG-3 (#272): a caller\'s own command-scope keys survive, ahead of the hard
 });
 
 test('WG-4 (#272): the reader finds what was planted — through an include, a gitfile, a URL-scoped helper, a driver — and nothing that was there before', () => {
-  const { dir, script } = repo();
+  const { dir, script } = plantedRepo();
   sh(dir, 'config', 'core.hooksPath', 'scripts/git-hooks');
   const before = treeConfigBaseline(configTreesOf(dir, []));
   assert.deepEqual(before.get(dir), ['core.hookspath=scripts/git-hooks'], 'a key the repository already had is the baseline');
@@ -160,7 +156,7 @@ test('WG-4 (#272): the reader finds what was planted — through an include, a g
   sh(dir, 'config', 'core.fsmonitor', script);
   assert.deepEqual(plantedSince(linked).map((p) => p.key), ['core.fsmonitor'], 'planted in the common config, seen from the lane');
   // A comment's trailing backslash does not continue it — the key on the next line is git's, so it is ours.
-  const hidden = repo();
+  const hidden = plantedRepo();
   const configFile = join(hidden.dir, '.git', 'config');
   writeFileSync(configFile, `${readFileSync(configFile, 'utf8')}[core]\n\t# a note \\\n\tfsmonitor = ${hidden.script}\n`);
   assert.equal(sh(hidden.dir, 'config', '--get', 'core.fsmonitor').trim(), hidden.script, 'git reads the key after the comment');
@@ -181,7 +177,7 @@ test('WG-4 (#272): the reader finds what was planted — through an include, a g
 
 test('WG-5 (#272): a lane whose session plants core.hooksPath halts run-tree-config, naming the key, before verification — and the hook never ran', async () => {
   assert.ok((PHASE_HALT_KINDS as readonly string[]).includes('run-tree-config'), 'a phase-level halt');
-  const { dir: root, marker, script } = repo();
+  const { dir: root, marker, script } = plantedRepo();
   const scriptsDir = join(root, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   mkdirSync(join(root, 'docs', 'plans'), { recursive: true });

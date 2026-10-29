@@ -39,6 +39,7 @@ export const SOURCE_LABEL: Readonly<Record<PhaseChoiceSource, string>> = Object.
   run: 'set here',
   plan: 'plan',
   default: 'run default',
+  account: 'account default',
 });
 
 /** One sentence about one field of one phase where the plan and this run disagree. */

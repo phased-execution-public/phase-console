@@ -14,6 +14,7 @@
 
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
 import './state-sandbox.ts';
+import { readStoredRun } from '../server/runner/state.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -35,7 +36,7 @@ const { Service } = await import('../server/service.ts');
 const { Runner } = await import('../server/runner/runner.ts');
 const { applySettings } = await import('../server/runner/runner-core.ts');
 const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
-const { journalFile, runFile } = await import('../server/runner/run-paths.ts');
+const { journalFile } = await import('../server/runner/run-paths.ts');
 const { warmPids } = await import('../server/pid.ts');
 type RunState = import('../server/runner/state.ts').RunState;
 
@@ -128,7 +129,7 @@ function storedRun(root: string, shape: Partial<RunState> = {}, lane?: number): 
 }
 
 const readRun = (root: string, id: string): RunState =>
-  JSON.parse(readFileSync(runFile(root, 'alpha', id), 'utf8')) as RunState;
+  readStoredRun(root, 'alpha', id)!;
 
 const journal = (root: string, id: string) =>
   readFileSync(journalFile(root, 'alpha', id), 'utf8').split('\n').filter(Boolean)
@@ -362,3 +363,103 @@ test('SL-8: the settings door names the `switch-account` verb for `accountId`, a
   } finally { cleanup(); }
 });
 
+
+/* ------------------------------------------------------------------ *
+ * The platform's pieces (measured-console phase 12, B2 A10)
+ * ------------------------------------------------------------------ */
+
+test('SL-10: humanStepMode, compaction and compactionWindow — words and bounds held, defaults stored as no key, null clears', async () => {
+  const { applySessionEnvSettings } = await import('../server/runner/runner-core.ts');
+  const { humanStepModeFor, DEFER_CLI_FLOOR, SETTING_EFFECTS, RUN_SETTINGS_FIELDS, RUN_START_FIELDS } = await import('../shared/run-settings.js');
+  for (const field of ['humanStepMode', 'compaction', 'compactionWindow']) {
+    assert.ok(RUN_SETTINGS_FIELDS.includes(field as never) && RUN_START_FIELDS.includes(field as never), field);
+    assert.equal((SETTING_EFFECTS as Record<string, string>)[field], 'next-phase');
+  }
+  const state = {} as RunState;
+  applySessionEnvSettings(state, { humanStepMode: 'park', compaction: 'alternate', compactionWindow: 400_000 });
+  assert.deepEqual([state.humanStepMode, state.compaction, state.compactionWindow], ['park', 'alternate', 400_000]);
+  applySessionEnvSettings(state, { compaction: 'console', compactionWindow: 350_000 });
+  assert.equal(state.compaction, undefined, '`console` is the default — stored as no key');
+  assert.equal(state.compactionWindow, undefined, 'so is the shipped window');
+  applySessionEnvSettings(state, { humanStepMode: 'sometimes' as never, compactionWindow: 10 });
+  assert.equal(state.humanStepMode, undefined, 'a word off the list clears');
+  assert.equal(state.compactionWindow, undefined, 'a window out of bounds clears');
+  // Absent, the CLI decides: defer at the floor, park below it or unknown.
+  assert.equal(humanStepModeFor(undefined, `${DEFER_CLI_FLOOR} (Claude Code)`), 'defer');
+  assert.equal(humanStepModeFor(undefined, '2.1.305'), 'park');
+  assert.equal(humanStepModeFor(undefined, undefined), 'park');
+  assert.equal(humanStepModeFor('park', '2.1.400'), 'park');
+});
+
+
+test('SL-11: the compaction arms — native carries the window, alternate gives odd phases native, the 0.8 checkpoint is off under native', async () => {
+  const { compactionArm } = await import('../shared/run-settings.js');
+  const { compactionEnv } = await import('../server/runner/errors.ts');
+  const { contextStageFor } = await import('../server/runner/usage.ts');
+  assert.deepEqual([1, 2, 3, 4].map((phase) => compactionArm({ mode: 'alternate', phase })), ['native', 'console', 'native', 'console']);
+  assert.equal(compactionArm({ mode: 'native', phase: 2 }), 'native');
+  assert.equal(compactionArm({ mode: undefined, phase: 3 }), 'console');
+  assert.deepEqual(compactionEnv('native', 350_000), { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '350000' });
+  assert.ok('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in compactionEnv('console', 350_000) && compactionEnv('console', 350_000).CLAUDE_CODE_AUTO_COMPACT_WINDOW === undefined,
+    'console clears an inherited window');
+  assert.equal(contextStageFor(850_000, 1_000_000, 'console'), 'checkpoint');
+  assert.equal(contextStageFor(850_000, 1_000_000, 'native'), 'wrap-up', 'native: no checkpoint, the notice instead');
+  assert.equal(contextStageFor(100_000, 1_000_000, 'native'), 'ok');
+});
+
+test('SL-12: the compaction hooks ride a native-capable run’s settings, and journal phase.compaction with before, after and the re-cache', async () => {
+  const { buildSettings, HOOK_ON_FAILURE } = await import('../server/runner/approvals.ts');
+  const off = buildSettings({ runId: 'r1', token: 't', origin: 'http://x' }).hooks as Record<string, unknown>;
+  assert.ok(!('PreCompact' in off) && !('PostCompact' in off), 'a console-arm run registers neither');
+  const on = buildSettings({ runId: 'r1', token: 't', origin: 'http://x', compactionHooks: true }).hooks as
+    Record<string, { hooks: { type: string; url: string; onFailure: string; headers: Record<string, string> }[] }[]>;
+  for (const event of ['PreCompact', 'PostCompact']) {
+    const [hook] = on[event]![0]!.hooks;
+    assert.deepEqual([hook.type, hook.url, hook.onFailure, hook.headers.Authorization], ['http', 'http://x/hooks/compact', HOOK_ON_FAILURE, 'Bearer t'], event);
+  }
+  const { contextCompactionNotice } = await import('../server/runner/runner-core.ts');
+  assert.match(contextCompactionNotice(610_000, 1_000_000, 350_000, { push: { branch: 'pe/demo', allowed: true } }),
+    /compaction arm is native: the CLI compacts this session at 350k tokens and the console does not checkpoint it, so carry on.*git push origin pe\/demo/);
+  // The runner measures a compaction from the stream around its two hooks.
+  const lines: { event: string; data: Record<string, unknown> }[] = [];
+  const runner = new Runner({
+    scriptsDir: join(SKILL_DIR, 'scripts'),
+    onEvent: (name: string, data: { event: string; data: Record<string, unknown> }) => { if (name === 'run:journal') lines.push(data); },
+  } as never);
+  const state = { id: 'r-c', slug: 'demo', root: '/nonexistent', status: 'running', compaction: 'native', phases: { 3: { status: 'running', sessionId: 's3', model: 'claude-opus-5-5[1m]' } } };
+  const bag = runner as unknown as { state: unknown; lanes: Map<number, unknown>; noteContext: (phase: number, event: unknown) => void };
+  bag.state = state;
+  bag.lanes.set(3, { phase: 3, signals: {} });
+  const usage = (context: number, cacheWrite = 0) => ({ kind: 'usage', call: { input: 1, cacheWrite, cacheRead: 0, output: 1, context }, rebuild: false, totals: { lastContext: context } });
+  bag.noteContext(3, usage(340_000));
+  runner.noteCompactionHook(3, 'PreCompact', 'auto');
+  runner.noteCompactionHook(3, 'PostCompact', 'auto');
+  bag.noteContext(3, usage(41_000, 39_500));
+  const compaction = lines.find((l) => l.event === 'phase.compaction');
+  assert.deepEqual(
+    { ...compaction?.data, at: undefined },
+    { trigger: 'auto', before: 340_000, after: 41_000, recacheTokens: 39_500, at: undefined, sessionId: 's3', arm: 'native' },
+  );
+});
+
+test('SL-13: a resumed session’s own resume cost reaches its phase — record.resumeCost, phase.resume-cost, and the next brief’s words', async () => {
+  const { resumeCostOf } = await import('../server/service-runs.ts');
+  const { resumeCostWords } = await import('../server/runner/session-record.ts');
+  const cost = resumeCostOf({ seconds_since_last_response: 5400, context_tokens: 182340, prompt_cache_likely_expired: true, estimated_cache_write_usd: 1.1396, extra: 'x' });
+  assert.deepEqual(cost, { secondsSinceLastResponse: 5400, contextTokens: 182340, cacheLikelyExpired: true, estimatedCacheWriteUsd: 1.1396 });
+  assert.equal(resumeCostOf({ context_tokens: 'many' }), null);
+  assert.equal(resumeCostOf(undefined), null);
+  assert.equal(resumeCostWords(cost),
+    "This phase's last resume reported its own cost: 90 min after its last response, re-sending 182,340 tokens, its prompt cache likely expired, ≈ $1.14 to write the cache again.");
+  const lines: { event: string; data: Record<string, unknown> }[] = [];
+  const runner = new Runner({
+    scriptsDir: join(SKILL_DIR, 'scripts'),
+    onEvent: (name: string, data: { event: string; data: Record<string, unknown> }) => { if (name === 'run:journal') lines.push(data); },
+  } as never);
+  const state = { id: 'r-rc', slug: 'demo', root: '/nonexistent', status: 'running', phases: { 5: { status: 'running', sessionId: 's5' } } } as unknown as RunState;
+  (runner as unknown as { state: RunState }).state = state;
+  assert.equal(runner.noteResumeCost('someone-else', cost!), false);
+  assert.equal(runner.noteResumeCost('s5', cost!), true);
+  assert.equal(state.phases['5'].resumeCost?.contextTokens, 182340);
+  assert.deepEqual(lines.find((l) => l.event === 'phase.resume-cost')?.data, { sessionId: 's5', ...cost });
+});

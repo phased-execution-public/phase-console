@@ -2,9 +2,9 @@
 
 **English** · [فارسی](USAGE.fa.md)
 
-`phased-execution` **plans** large multi-phase work and **runs** it in right-sized sessions — several
-phases usually share a session (sized to ~0.2 × the model's window in phase weight; ~200K for 1M-class
-models), each phase still gets its own handoff, and a copy-pasteable boot prompt chains the sessions.
+`phased-execution` **plans** large multi-phase work and **runs** it in right-sized sessions — the console
+runs one phase per session, and a person driving by hand may let adjacent phases share one (sized to
+~0.2 × the model's window in phase weight; ~200K for 1M-class models); each phase gets its own handoff, and a copy-pasteable boot prompt chains the sessions.
 Phases whose **scopes are disjoint** (the repos each touches, from the plan's Repos column) may run as
 separate sessions at the same time; anything sharing a repo runs one at a time. Every phase-finish runs
 the phase's own **Verification commands green** before handing off.
@@ -28,7 +28,10 @@ failed, or a `plan:<slug>` issue is open, the script refuses and lists each item
 and records the exception.
 
 This file is a human-facing orientation. The executable procedure — the three modes, the helper scripts,
-and the guardrails — lives in `SKILL.md` + `references/`; that is what Claude loads and follows.
+and the guardrails — lives in `SKILL.md` + `references/`; that is what Claude loads and follows. Since 9.0
+`SKILL.md` is a core and each mode a file of its own (`references/mode-plan.md`, `mode-phase-start.md`,
+`mode-phase-finish.md`), read whole in its mode; the helpers are catalogued in `references/scripts.md`, and
+the engine prints its own (`phase-graph.sh --help`, `--explain <F-code>`, `--section N`).
 
 ## Seeing it all at once — the console
 
@@ -325,7 +328,7 @@ lanes, one word per phase); `run runs`, `run queue`, `run accounts`,
   enabled, and `gate-status.md` once any gate is cleared) — committed + pushed, so any account or
   machine can pull and continue a partially-finished plan.
 
-Full procedure: `SKILL.md` and its `references/`.
+Full procedure: `SKILL.md`, its three mode files and the rest of `references/`.
 
 ## Licensing
 

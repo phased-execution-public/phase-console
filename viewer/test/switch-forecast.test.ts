@@ -26,9 +26,9 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const accountsModule = await import('../server/accounts/index.ts');
 const { Accounts, carriesUntil } = accountsModule;
@@ -107,14 +107,14 @@ test('SW-2: the picker weighs a target at its own burn plus the burn the moving 
   const target = await accounts.addToken('target', 'sk-ant-oat01-p92targetaccount00');
   try {
     const until = now + 2 * HOUR;
-    // The target: 90 % weekly, flat — nobody spends it. 10 % left.
-    plant(accounts, target.id, now, { five_hour: { utilization: 5, resetsAt: at(now + 4 * HOUR) }, seven_day: { utilization: 90, resetsAt: at(now + 60 * HOUR) } });
-    // The work being moved burned the account it leaves at 6 %/h weekly: 10 % lasts 1 h 40 min.
-    plant(accounts, from.id, now, { five_hour: { utilization: 100, resetsAt: at(until) }, seven_day: { utilization: 50, resetsAt: at(now + 90 * HOUR) } }, { five_hour: 30, seven_day: 6 });
+    // The target: 84 % weekly, flat — nobody spends it. 16 % left, under the spill's 85 % line (phase 24).
+    plant(accounts, target.id, now, { five_hour: { utilization: 5, resetsAt: at(now + 4 * HOUR) }, seven_day: { utilization: 84, resetsAt: at(now + 60 * HOUR) } });
+    // The work being moved burned the account it leaves at 10 %/h weekly: 16 % lasts 1 h 36 min.
+    plant(accounts, from.id, now, { five_hour: { utilization: 100, resetsAt: at(until) }, seven_day: { utilization: 50, resetsAt: at(now + 90 * HOUR) } }, { five_hour: 30, seven_day: 10 });
     const hot = accounts.switchCandidates(from.id, undefined, { until, nowMs: now });
     assert.deepEqual(hot.ranked, [], 'it would wall before the current wall resets');
     assert.equal(hot.declined.find((row) => row.id === target.id)?.bucket, 'seven_day');
-    // The same work at 2 %/h: 10 % is five hours.
+    // The same work at 2 %/h: 16 % is eight hours.
     plant(accounts, from.id, now, { five_hour: { utilization: 100, resetsAt: at(until) }, seven_day: { utilization: 50, resetsAt: at(now + 90 * HOUR) } }, { five_hour: 30, seven_day: 2 });
     assert.deepEqual(accounts.switchCandidates(from.id, undefined, { until, nowMs: now }).ranked, [target.id]);
   } finally {
@@ -162,15 +162,16 @@ test('SW-4: a target under the run\'s own minHeadroomPct in EITHER window is pas
   const accounts = newAccounts(now);
   const target = await accounts.addToken('target', 'sk-ant-oat01-p92flooraccount000');
   try {
-    // #100's 12:36Z move: `default minHeadroomPct: 15`, and info@ at 90 % of its week.
-    plant(accounts, target.id, now, { five_hour: { utilization: 10, resetsAt: at(now + 4 * HOUR) }, seven_day: { utilization: 90, resetsAt: at(now + 60 * HOUR) } });
-    const weekly = accounts.switchCandidates('default', undefined, { nowMs: now, floors: { [target.id]: 15 } });
+    // #100's 12:36Z move was `default minHeadroomPct: 15` and info@ at 90 % of its week; since
+    // phase 24 a spill never lands above 85 % at all, so the floor is read here at 20 % and 84 %.
+    plant(accounts, target.id, now, { five_hour: { utilization: 10, resetsAt: at(now + 4 * HOUR) }, seven_day: { utilization: 84, resetsAt: at(now + 60 * HOUR) } });
+    const weekly = accounts.switchCandidates('default', undefined, { nowMs: now, floors: { [target.id]: 20 } });
     assert.deepEqual(weekly.ranked, []);
-    assert.match(weekly.declined.find((row) => row.id === target.id)?.why ?? '', /15 % floor/);
+    assert.match(weekly.declined.find((row) => row.id === target.id)?.why ?? '', /20 % floor/);
     assert.deepEqual(accounts.switchCandidates('default', undefined, { nowMs: now, floors: { [target.id]: 5 } }).ranked, [target.id]);
     // The five-hour window counts exactly the same.
-    plant(accounts, target.id, now, { five_hour: { utilization: 88, resetsAt: at(now + 4 * HOUR) }, seven_day: { utilization: 20, resetsAt: at(now + 60 * HOUR) } });
-    const five = accounts.switchCandidates('default', undefined, { nowMs: now, floors: { [target.id]: 15 } });
+    plant(accounts, target.id, now, { five_hour: { utilization: 82, resetsAt: at(now + 4 * HOUR) }, seven_day: { utilization: 20, resetsAt: at(now + 60 * HOUR) } });
+    const five = accounts.switchCandidates('default', undefined, { nowMs: now, floors: { [target.id]: 20 } });
     assert.deepEqual(five.ranked, []);
     assert.equal(five.declined.find((row) => row.id === target.id)?.bucket, 'five_hour');
   } finally {
@@ -217,21 +218,11 @@ test('SW-7: two profiles of one login are one account — leaving one never land
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-forecast-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-forecast-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -253,17 +244,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -299,7 +285,7 @@ const wall = (resetMs: number): SpawnOutcome =>
  * ------------------------------------------------------------------ */
 
 test('SW-5: when the account a run was moved off resets, the next boarding moves it back — even though the horizon rule would decline it against the new wall', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let clock = Date.now();
   const fiveReset = Math.floor((clock + HOUR) / 1000) * 1000;
   const spawned: string[] = [];
@@ -346,7 +332,7 @@ test('SW-5: when the account a run was moved off resets, the next boarding moves
 });
 
 test('SW-5: a run that walls again on the account it was moved to waits for the ORIGIN\'s reset, not the new wall\'s 51 hours', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const now = Date.now();
   const fiveReset = Math.floor((now + HOUR) / 1000) * 1000;
   const weeklyReset = Math.floor((now + 51 * HOUR) / 1000) * 1000;
@@ -400,7 +386,7 @@ function streamingSession(r: Repo) {
 }
 
 test('SW-6: a 95 % warning with an account that carries the work ENACTS the switch at the lanes\' boundary — the live lane finishes where it is', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const asked: { until: number | null; floors?: Record<string, number> }[] = [];
@@ -440,7 +426,7 @@ test('SW-6: a 95 % warning with an account that carries the work ENACTS the swit
 });
 
 test('SW-6: with nothing that carries the work, the decision says why it was not enacted', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const instance = new Runner({
@@ -476,7 +462,7 @@ test('SW-6: with nothing that carries the work, the decision says why it was not
 
 test('CR-4: a 95 % warning on an account credits carry decides nothing — no switch is asked, no brake, and run.usage-carried says so once per window', async () => {
   const { Scheduler } = await import('../server/runner/scheduler.ts');
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const events: { event: string; data: Record<string, unknown> }[] = [];
   let asked = 0;

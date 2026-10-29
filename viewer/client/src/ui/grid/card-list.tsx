@@ -1,5 +1,6 @@
 import { ArrowDown, ArrowUp, ChevronRight } from 'lucide-react';
 import { useId, type MouseEvent, type ReactNode, type Ref } from 'react';
+import type { UiState } from '@shared/status-vocab.js';
 import { cn } from '@/lib/cn';
 import { Button } from '../button';
 import { Checkbox } from '../checkbox';
@@ -158,6 +159,7 @@ export function CardList<T>({
   label,
   detail,
   rowClassName,
+  rowPaint,
   rowProps,
   rowHref,
   activeSort,
@@ -180,6 +182,8 @@ export function CardList<T>({
   label: string;
   detail?: (row: T) => ReactNode;
   rowClassName?: (row: T) => string | undefined;
+  /** The grid's `rowPaint`: a record in a state is a strip here too — its edge, its tint while open. */
+  rowPaint?: (row: T) => UiState | undefined;
   rowProps?: (row: T) => Record<string, unknown>;
   rowHref?: (row: T) => string | undefined;
   activeSort?: string;
@@ -233,8 +237,20 @@ export function CardList<T>({
   ) => {
     const href = rowHref?.(row);
     const open = isOpen(key);
+    const paint = rowPaint?.(row);
     const body = (
       <div className="flex min-w-0 items-start gap-2">
+        {/* A strip's leading edge, down the record's start side (the grid's header). */}
+        {paint && (
+          <span
+            aria-hidden
+            data-strip-edge=""
+            className={cn(
+              'pointer-events-none absolute inset-y-0 start-0 w-1 bg-state-vivid',
+              `state-${paint}`,
+            )}
+          />
+        )}
         {pick && (
           <span className="flex h-6 shrink-0 items-center">
             <PickBox
@@ -294,6 +310,7 @@ export function CardList<T>({
               open={open}
               onOpenChange={() => onToggle(key)}
               label="Details"
+              variant="inline"
               openLabel="Hide details"
               {...(inFold.length ? { count: inFold.length } : {})}
               className="mt-1"
@@ -310,9 +327,13 @@ export function CardList<T>({
       className: cn(
         'min-w-0 px-(--tile-pad-x) py-(--tile-pad-y)',
         !first && 'border-t border-rule',
+        paint && 'relative',
+        // An open strip sits on its state's tint.
+        paint && open && cn(`state-${paint}`, 'bg-state-tint'),
         rowClassName?.(row),
       ),
       'data-open': open ? '' : undefined,
+      ...(paint ? { 'data-strip': paint } : {}),
       ...(href ? { 'data-row-href': href, onClick: followRowLink } : {}),
       // A caller's `rowProps` still wins over everything before it.
       ...(rowProps?.(row) ?? {}),

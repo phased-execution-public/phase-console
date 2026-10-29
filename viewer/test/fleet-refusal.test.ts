@@ -107,7 +107,7 @@ test('the free bin answers the same way, and by the same shape', () => {
   const src = read(FREE_BIN);
   const m = src.match(/const isAgentFlag = \(arg\) => (\/.*\/)\.test\(arg \?\? ''\);/);
   assert.ok(m, `${FREE_BIN}: no isAgentFlag predicate found`);
-  // eslint-disable-next-line no-new-func
+   
   const isAgentFlag = new Function('arg', `return ${m![1]}.test(arg ?? '');`) as (a: string) => boolean;
 
   for (const flag of AGENT_FLAGS) assert.equal(isAgentFlag(flag), true, `the free bin must refuse ${flag}`);

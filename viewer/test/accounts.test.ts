@@ -1794,13 +1794,13 @@ test('BA-5: …then clears it — the contradiction standing half an hour, a che
     assert.deepEqual(accounts.learned.noteProof(fpB, { at: iso(now + 1_000), by: 'runner', reason: 'a session spent under it' }),
       { from: 'suspect', to: 'entitled' });
 
-    // (3) A refusal meanwhile retires it again — suspect → retired is on the table.
+    // (3) A refusal meanwhile retires it again — and a second credential refusal inside a day
+    // quarantines it (measured-console phase 24): no read argues it out of `retired` any more.
     accounts.retire(b.id, undefined, BILLING_REASON, 'classifier', 'billing');
     now += 60_000;
     accounts.learned.noteRead(fpB, { successAt: iso(now) });
-    assert.equal(accounts.entitlementOf(b.id, now).state, 'suspect');
-    accounts.retire(b.id, undefined, BILLING_REASON, 'classifier', 'billing');
-    assert.equal(accounts.entitlementOf(b.id, now).state, 'retired');
+    assert.equal(accounts.entitlementOf(b.id, now).state, 'retired', 'quarantined: the read is no contradiction');
+    assert.equal(accounts.learned.quarantineOf(fpB)?.strikes, 2);
   } finally {
     for (const id of [a.id, b.id]) await accounts.remove(id);
     accounts.stop();

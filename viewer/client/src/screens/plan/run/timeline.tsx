@@ -43,7 +43,7 @@
 
 import { useId, useMemo, type ReactNode } from 'react';
 import type { BarKind, PhaseRecord } from '@/data/api';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { duration, plural } from '@/lib/format';
 import { Button, Empty, SectionHeading } from '@/ui';

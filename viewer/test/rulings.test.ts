@@ -7,7 +7,7 @@
  * is content-derived (so re-reading the file ingests nothing twice).
  *
  * The bash half — the exact line `phase-outcome.sh <slug> <N> ruling` writes,
- * supervised and unsupervised — is pinned in `tests/unit/outcome.bats`; this
+ * supervised and unsupervised — is pinned in `tests/unit/outcome-rulings.bats`; this
  * file reads what that one writes.
  */
 

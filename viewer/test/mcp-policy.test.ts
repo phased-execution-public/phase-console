@@ -23,9 +23,10 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -40,29 +41,19 @@ const { Runner } = await import('../server/runner/runner.ts');
 const { runDir } = await import('../server/runner/state.ts');
 import type { McpPolicy } from '../server/runner/state.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 /** Where this run's checkpoints land — keyed by root, like the real thing. */
 const runsDir = (root: string): string => runDir(root, 'demo');
 
 type Repo = { root: string; scripts: string; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /** A one-phase board with a stub engine, as `default-skills.test.ts` builds it. */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-mcppolicy-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-mcppolicy-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 shift
@@ -82,13 +73,14 @@ case "$mode" in
   --repos) echo "demo-repo" ;;
   *) echo "" ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  write(join(scripts, 'next-phase-prompt.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'new-handoff.sh'), '#!/usr/bin/env bash\nexit 0\n');
-
-  return { root, scripts, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+`,
+      'phase-lock.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'validate.sh': VALIDATE_OK_SH,
+      'next-phase-prompt.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'new-handoff.sh': '#!/usr/bin/env bash\nexit 0\n',
+    }),
+  });
+  return made;
 }
 
 function outcome(): SpawnOutcome {
@@ -197,7 +189,7 @@ async function drive(r: Repo, options: DriveOptions = {}) {
  * ------------------------------------------------------------------ */
 
 test('a phase whose servers are signed out still runs, and is told which are missing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, { mcpServers: ['ctx7', 'gh', 'fs'] });
     assert.ok(out.ran, 'the phase boarded — this is the whole point of the release');
@@ -216,7 +208,7 @@ test('a phase whose servers are signed out still runs, and is told which are mis
 });
 
 test('only the reachable servers are attached, and the missing ones are not', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, { mcpServers: ['ctx7', 'gh', 'fs'] });
     assert.deepEqual(out.configFiles.at(-1), ['ctx7'], 'the config holds what actually connects');
@@ -236,7 +228,7 @@ test('losing every server still closes the set, rather than inheriting the machi
   // whatever `~/.claude.json` and the project's `.mcp.json` hold — so a
   // degraded phase would silently gain servers nobody chose. Determinism here
   // is a safety property, not a tidiness one.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, { mcpServers: ['gh', 'fs'] });
     assert.ok(out.ran);
@@ -248,7 +240,7 @@ test('losing every server still closes the set, rather than inheriting the machi
 });
 
 test('the operator hears about it once, with the servers named', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, { mcpServers: ['ctx7', 'gh', 'fs'] });
     assert.deepEqual(out.degraded, [{ phase: 1, ids: ['gh', 'fs'] }]);
@@ -258,7 +250,7 @@ test('the operator hears about it once, with the servers named', async () => {
 });
 
 test('a phase whose servers all connect is told nothing about degradation', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, { mcpServers: ['ctx7'] });
     assert.doesNotMatch(out.prompts[0], /UNAVAILABLE/);
@@ -274,7 +266,7 @@ test('a phase whose servers all connect is told nothing about degradation', asyn
  * ------------------------------------------------------------------ */
 
 test('require still parks before the spawn, and the halt now names a door', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, { mcpServers: ['ctx7', 'gh'], mcpPolicy: 'require' });
     assert.equal(out.ran, false, 'nothing was spent');
@@ -299,7 +291,7 @@ test('the plan outranks the run, unlike model and effort', async () => {
   // A run-wide "carry on regardless" is an operator's convenience, usually
   // clicked for an unrelated reason. A phase whose plan says it requires a
   // server is a versioned statement about the work, and must survive it.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, {
       mcpServers: ['gh'], mcpPolicy: 'continue', planMcpPolicy: 'require',
@@ -316,7 +308,7 @@ test('the phase option outranks the plan — the operator can still say so, once
   // looking at a parked phase knows something the versioned document cannot,
   // which is whether THIS attempt can proceed without the server. They say it
   // at the level where they mean it, not in bulk.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, {
       mcpServers: ['gh'],
@@ -331,14 +323,14 @@ test('the phase option outranks the plan — the operator can still say so, once
 });
 
 test('a plan that says nothing lets the run answer', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const parked = await drive(r, { mcpServers: ['gh'], mcpPolicy: 'require' });
     assert.equal(parked.ran, false);
   } finally {
     r.cleanup();
   }
-  const second = repo();
+  const second = stubbedPlan();
   try {
     const ran = await drive(second, { mcpServers: ['gh'] });
     assert.ok(ran.ran, 'and with the run silent too, the shipped default is continue');
@@ -351,7 +343,7 @@ test('a plan-declared server is degraded like any other — mcpOff does not reac
   // `mcpOff` drops the RUN's servers and deliberately leaves the plan's, so a
   // plan naming an unreachable server must still resolve to a degradation
   // rather than to nothing at all.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, {
       planMcp: ['gh'],
@@ -373,7 +365,7 @@ test('a plan-declared server is degraded like any other — mcpOff does not reac
 test('the degradation is written to the phase record, not only the journal', async () => {
   // A phase that quietly did without half its tools and a phase that had all of
   // them look identical afterwards. The run page reads this.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const out = await drive(r, { mcpServers: ['ctx7', 'gh', 'fs'] });
     const rows = out.state.phases['1'].mcpDegraded ?? [];
@@ -395,7 +387,7 @@ test('the degradation is written to the phase record, not only the journal', asy
  * ------------------------------------------------------------------ */
 
 test('a require park has a clock: past it the phase continues without its servers — errand recorded, operator told once — and boards with the session told', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts: string[] = [];
     const configFiles: string[][] = [];

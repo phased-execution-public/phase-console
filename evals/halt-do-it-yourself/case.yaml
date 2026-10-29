@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: halt-do-it-yourself
+description: 'the record: turn-by-turn phase 17 (E-4) declared a human step for a release-asset upload the run''s own policy allowed; the guard refused it (G4).'
+tags: [halt, unattended, errand]
+context:
+  scaffold_script: fixture.sh

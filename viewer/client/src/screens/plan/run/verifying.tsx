@@ -26,7 +26,7 @@
 import type { VerifyingLane } from '@/data/api';
 import { CHECK_PURPOSE_WORDS } from '@/data/check-words';
 import { checksOf, type NowLane, type RunLike } from '@/data/lanes';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { clockTime, clockWords } from '@/lib/format';
 import { Mono, isoDuration } from '@/ui';

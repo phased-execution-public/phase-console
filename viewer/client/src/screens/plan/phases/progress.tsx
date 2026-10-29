@@ -10,7 +10,7 @@
 
 import { useMemo } from 'react';
 import type { PlanDetail, RunState } from '@/data/api';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { BurnupFigure, type BurnupInput } from '@/ui/figures/burnup';
 import { ScheduleFigure, type ScheduleInput } from '@/ui/figures/schedule';
 
@@ -40,7 +40,7 @@ export function recordsOf(
 }
 
 export function scheduleInputOf(
-  detail: Pick<PlanDetail, 'phases' | 'route' | 'eta' | 'cost'>,
+  detail: Pick<PlanDetail, 'phases' | 'route' | 'eta' | 'cost' | 'forecastUsd'>,
   run: Pick<RunState, 'phases'> | null | undefined,
   now: number,
 ): ScheduleInput {
@@ -49,6 +49,17 @@ export function scheduleInputOf(
     edges: detail.route.edges,
     estimates: new Map((detail.eta?.perPhase ?? []).map((e) => [e.phase, e.estMs])),
     records: recordsOf(detail, run),
+    // What each phase will likely cost, and did (measured-console phase 23).
+    ...(detail.forecastUsd?.phases.length
+      ? {
+          forecasts: new Map(
+            detail.forecastUsd.phases.filter((f) => f.phase !== undefined).map((f) => [f.phase!, f.usd]),
+          ),
+        }
+      : {}),
+    ...(detail.cost?.phases.length
+      ? { costs: new Map(detail.cost.phases.map((c) => [c.phase, c.usd])) }
+      : {}),
     now,
   };
 }

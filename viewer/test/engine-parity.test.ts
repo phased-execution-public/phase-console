@@ -29,6 +29,7 @@ import assert from 'node:assert/strict';
 import {
   copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -39,10 +40,11 @@ import { loadGateVocab, gateKindOf } from '../server/analysis/gates.ts';
 import { parseQaRounds, parseTestStatus } from '../server/parse/folder.ts';
 import { nextQaRound } from '../server/qa-round.ts';
 import {
-  parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor, verifyTimeoutFor,
+  parsePlan, mcpServersFor, skillsFor, pluginsFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor, verifyTimeoutFor,
   humanStepsFor, humanStepLine, waitCountFor,
   landFor, gitlinkFor, issuesFor, isolationFor, baseBranchOf, conflictPolicyOf, messagingOf, clashZonesOf,
-  permissionModeFor, modelPolicyFor, phaseModelFor, type Plan,
+  permissionModeFor, modelPolicyFor, phaseModelFor, phaseSection, type Plan,
+  subagentModelFor, fastGateFor, mayDeleteTestsFor,
 } from '../server/parse/plan.ts';
 import { mergeDecisions, formatDecisionsTsv, parseDecisionsTsv } from '../shared/decisions-model.js';
 import { readDecisions, readCredentials, readWaitBudget, readWaitsOn } from '../server/engine.ts';
@@ -538,6 +540,36 @@ test('the two parsers agree about a phase\'s MCP servers', async () => {
   });
 });
 
+test('the two parsers agree about a phase\'s skills — the plan\'s line unioned with its bullet (measured-console phase 11)', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const fromEngine = await engine(corpus, [slug, '--skills', String(phase)], `${slug} p${phase} --skills`);
+      const fromJs = skillsFor(plan, phase).join(', ');
+      if (fromEngine !== fromJs) problems.push(`${slug} p${phase}: skills JS "${fromJs}" vs engine "${fromEngine}"`);
+    });
+    assert.deepEqual(problems, [], `${corpus.name} skills mismatches:\n  ${problems.join('\n  ')}`);
+  });
+});
+
+test('the two parsers agree about a phase\'s plugin set — the plan\'s kinds unioned with its bullet\'s (measured-console phase 27)', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    const planLines = new Set<string>();
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const fromEngine = await engine(corpus, [slug, '--plugins', String(phase)], `${slug} p${phase} --plugins`);
+      const fromJs = pluginsFor(plan, phase).join(', ');
+      if (fromEngine !== fromJs) problems.push(`${slug} p${phase}: plugins JS "${fromJs}" vs engine "${fromEngine}"`);
+      if (planLines.has(slug)) return;
+      planLines.add(slug);
+      const lineEngine = await engine(corpus, [slug, '--plugins'], `${slug} --plugins`);
+      const lineJs = pluginsFor(plan).join(', ');
+      if (lineEngine !== lineJs) problems.push(`${slug}: the plan line's plugins JS "${lineJs}" vs engine "${lineEngine}"`);
+    });
+    assert.deepEqual(problems, [], `${corpus.name} plugin-set mismatches:\n  ${problems.join('\n  ')}`);
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * The decision manifest (zero-touch-console P3, chapter 13 §1.1): the plan's
  * `## Decisions` table with the `decisions.md` twin merged over it. Compared
@@ -831,6 +863,56 @@ test('the two engines agree about a phase\'s wall-clock floor, per phase and in 
       assert.ok(carrying >= 2, 'the fixture corpus must carry the wall-clock-floor fixture, or this proves nothing');
     }
   });
+});
+
+test('the two parsers agree about a phase\'s Out of scope, the plan\'s Not yet specified, and an amendment (measured-console phase 30)', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    let carrying = 0;
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const bash = await engine(corpus, [slug, '--out-of-scope', String(phase)], `${slug} p${phase} --out-of-scope`);
+      const js = plan.phases[phase]?.outOfScope ?? '';
+      if (bash !== js) problems.push(`${slug} p${phase}: out-of-scope JS "${js}" vs engine "${bash}"`);
+      if (js) carrying += 1;
+    });
+    for (const record of samplePlans(corpus)) {
+      const { slug } = record;
+      const plan = record.plan!;
+      const bash = await engine(corpus, [slug, '--not-yet-specified'], `${slug} --not-yet-specified`);
+      const js = plan.notYetSpecified.join('\n');
+      if (bash !== js) problems.push(`${slug}: not-yet-specified JS "${js}" vs engine "${bash}"`);
+    }
+    assert.deepEqual(problems, [], `${corpus.name} out-of-scope / not-yet-specified mismatches:\n  ${problems.join('\n  ')}`);
+    if (!corpus.live) {
+      assert.ok(carrying >= 2, 'the fixture corpus must carry the out-of-scope fixture, or this proves nothing');
+    }
+  });
+});
+
+test('an amendment reads alike in both parsers: the phase\'s bullet, the plan\'s notes, and a section not yet written fails closed (#416)', async () => {
+  const fixtures = fixtureCorpus();
+  try {
+    const store = new Store(checkRoot(fixtures.root));
+    store.scan();
+    const plan = store.list().find((r) => r.slug === 'amended')!.plan!;
+    assert.deepEqual(plan.phases[3]!.amendment, { number: 1, date: '2026-10-28', from: 'D-7' });
+    assert.equal(plan.phases[1]!.amendment, undefined);
+    assert.deepEqual(plan.amendments, [{ number: 1, date: '2026-10-28', phase: 3, text: 'Phase 3 — Gamma: cover the gap (from deferred D-7)' }]);
+    assert.deepEqual(plan.notYetSpecified, ['- Phase 3\'s exit criteria are a placeholder.', '-   the retry policy for Gamma']);
+    assert.equal(plan.phases[2]!.outOfScope, 'the queue screens\n- nothing under `client/`\nthe release scripts');
+    // A gated row with no `### Phase 4` section: human in both, never the `ai` default.
+    const vocab = loadGateVocab(SCRIPTS);
+    assert.equal(plan.phases[4]!.sectionMissing, true);
+    assert.equal(gateKindOf(plan.phases[4]!.gateCheck, plan.phases[4]!.gated, vocab), 'human');
+    assert.equal(await engine(fixtures, ['amended', '--gate-kind', '4'], 'amended p4 --gate-kind'), 'human');
+    const status = await run(optsFor(fixtures), 'phase-graph.sh', ['amended', '--gate-status', '4']);
+    assert.match(status.stdout, /^manual: phase 4's section is not written yet/);
+    // F49 stays quiet on a well-formed amendment.
+    const lint = await run(optsFor(fixtures), 'phase-graph.sh', ['amended', '--lint']);
+    assert.doesNotMatch(lint.stderr, /F49/);
+  } finally {
+    fixtures.cleanup();
+  }
 });
 
 test('the two parsers agree about a phase\'s MCP policy — including silence', async () => {
@@ -1146,7 +1228,7 @@ test('a session-plan group never adopts the phases it is waiting on', async () =
         }
         // Whatever a line's flags say, the numbers inside them are not members.
         const line = plan.raw.split('\n').find((l) => new RegExp(`Session ${group.index}\\b`).test(l)) ?? '';
-        const waiting = /⚠ waiting on:([^⚠🔒]*)/.exec(line)?.[1] ?? '';
+        const waiting = /⚠ waiting on:([^⚠🔒]*)/u.exec(line)?.[1] ?? '';
         for (const dep of waiting.trim().split(/\s+/).filter(Boolean).map(Number)) {
           if (group.phases.includes(dep)) {
             problems.push(
@@ -1265,6 +1347,12 @@ test('the two parsers agree about landing, isolation and issues — the word AND
     ['--permission-mode', (plan, phase) => permissionModeFor(plan, phase)],
     // control-tower phase 54 (#91): the third — silence leaves it to the run.
     ['--model-policy', (plan, phase) => modelPolicyFor(plan, phase)],
+    // measured-console phase 6: the subagents' model (silence leaves it to the
+    // session), and the two phase-only switches, which always answer — their
+    // own word or the default.
+    ['--subagent-model', (plan, phase) => ((r) => r && { value: r.model, source: r.source })(subagentModelFor(plan, phase))],
+    ['--fast-gate', (plan, phase) => fastGateFor(plan, phase)],
+    ['--may-delete-tests', (plan, phase) => mayDeleteTestsFor(plan, phase)],
   ];
   await forEachCorpus(async (corpus) => {
     const problems: string[] = [];
@@ -1317,6 +1405,7 @@ test('the two parsers agree about the plan-wide directives — base branch, conf
         ['--clash-zones', clashZonesOf(plan).join(', ')],
         ['--permission-mode', ((r) => (r ? `${r.value}\t${r.source}` : ''))(permissionModeFor(plan))],
         ['--model-policy', ((r) => (r ? `${r.value}\t${r.source}` : ''))(modelPolicyFor(plan))],
+        ['--subagent-model', ((r) => (r ? `${r.model}\t${r.source}` : ''))(subagentModelFor(plan))],
       ];
       for (const [flag, fromJs] of cases) {
         const fromEngine = await engine(corpus, [slug, flag], `${slug} ${flag}`);
@@ -1342,13 +1431,20 @@ test('the fixture corpus is real, and covers the divergences this suite exists f
     'mcp.md', 'mcp-policy.md',    // the MCP directives, including silence
     'qa-per-phase.md',            // the per-phase QA regime
     'skilled.md', 'unbolded.md',  // the skills line, bolded and not
+    'plugged.md',                 // the plugins line and bullets: union, silence, a typo, F48 (measured-console phase 27)
     'nested-verification.md', 'sibling-verification.md',  // both §Verification shapes
     'decisions.md', 'credentials.md',  // the decision manifest (with an undeclared gate) and the credential directives
     'landing.md', 'messaging.md', 'issues.md',  // the 5.1.0 directives: plan-only, phase-only, both, and silence
     'permission-mode.md',         // the permission-mode line and bullets: override, a typo, camelCase in any case
     'model-policy.md',            // the model-policy line and bullets: override, a typo, bold and case (#91)
+    'subagent-model.md',          // the subagent-model line and bullets, fast gate, may delete tests: override, defaults, typos, bold and case (measured-console phase 6)
     'human-steps.md',             // the Human step bullet: every field, defaults, case and bold (phase 41)
     'model-provider.md',          // provider model ids in the target line and the bullets, a prose window (one-pool phase 4)
+    'section.md',                 // `--section N`: the section, its row, the budget lines that bind it (measured-console phase 2)
+    'directive-mid-line.md',      // several §Session budget directives on one ' · ' line, and F50's misses (#419)
+    'nbsp-fence.md',              // no-break spaces read as text under every locale (#410)
+    'path-no-dir.md',             // Repos and Verify in: paths that name no directory, F51 (#402)
+    'amended.md',                 // Out of scope, Not yet specified, an amendment, and a gated row with no section (measured-console phase 30)
   ]) {
     assert.ok(files.includes(required), `fixture ${required} is missing from the parity corpus`);
   }
@@ -1401,4 +1497,56 @@ test('a repeated ### Phase N fails F21 in the engine, the parser names the same 
       assert.equal(await engine(corpus, ['duplicate-phase', '--permission-mode', '1'], 'dup --permission-mode 1'), 'acceptEdits\tphase');
     }
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * measured-console phase 2: `--section N`, and one reading under every locale.
+ * ------------------------------------------------------------------ */
+
+test('the two engines agree about a phase\'s section — `--section N`, byte for byte', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    const refs = corpus.live
+      ? samplePlans(corpus).flatMap((r) => r.plan!.graph.map((row) => ({ slug: r.slug, plan: r.plan!, phase: row.phase })))
+      : everyPhase(corpus);
+    const texts = new Map<string, string>();
+    const textOf = (slug: string) => {
+      if (!texts.has(slug)) texts.set(slug, readFileSync(join(corpus.root, 'docs', 'plans', `${slug}.md`), 'utf8'));
+      return texts.get(slug)!;
+    };
+    await forEachPhase(refs, async ({ slug, phase }) => {
+      const out = await engine(corpus, [slug, '--section', String(phase)], `${slug} --section ${phase}`);
+      const js = phaseSection(textOf(slug), phase).trim();
+      if (out !== js) problems.push(`${slug} p${phase}: --section differs (engine ${out.length} B, JS ${js.length} B)`);
+    });
+    assert.deepEqual(problems, [], `${corpus.name} --section mismatches:\n  ${problems.join('\n  ')}`);
+    if (!corpus.live) {
+      const two = phaseSection(textOf('section'), 2);
+      assert.match(two, /^### Phase 2 — The one read whole/);
+      assert.ok(!two.includes('Phase 3 — After'), 'the section carries nothing of the next phase');
+    }
+  });
+});
+
+test('the engine reads the nbsp fixture the same under LANG=C and LC_ALL=en_US.UTF-8 (#410), and as the JS readers do', () => {
+  const fixtures = fixtureCorpus();
+  try {
+    const under = (locale: Record<string, string>, args: string[]) => {
+      const env: Record<string, string | undefined> = { ...process.env, DOCS_ROOT: fixtures.root, ...locale };
+      if (!('LC_ALL' in locale)) delete env.LC_ALL;
+      delete env.LC_CTYPE;
+      const r = spawnSync('bash', [join(SCRIPTS, 'phase-graph.sh'), 'nbsp-fence', ...args], { env, encoding: 'utf8' });
+      return `${r.status}\n${r.stdout}\n${r.stderr}`;
+    };
+    for (const args of [['--memory-block'], ['--lint'], ['--verify-timeout', '1'], ['--model-policy', '2'], ['--size', '1'], ['--section', '1']]) {
+      assert.equal(under({ LANG: 'C' }, args), under({ LC_ALL: 'en_US.UTF-8' }, args), `nbsp-fence ${args.join(' ')} differs by locale`);
+    }
+    const plan = parsePlan(readFileSync(join(fixtures.root, 'docs', 'plans', 'nbsp-fence.md'), 'utf8'), 'nbsp-fence', 'nbsp-fence.md');
+    // A label joined by a no-break space is text to both readers.
+    assert.equal(verifyTimeoutFor(plan, 1), undefined);
+    assert.equal(modelPolicyFor(plan, 2), undefined);
+    assert.equal(under({ LC_ALL: 'en_US.UTF-8' }, ['--verify-timeout', '1']), '0\n\n');
+  } finally {
+    fixtures.cleanup();
+  }
 });

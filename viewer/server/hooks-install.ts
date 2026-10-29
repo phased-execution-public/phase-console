@@ -26,6 +26,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { fleetProfile } from '../shared/instances.mjs';
+import { readSkillCopy } from './skill-copy.ts';
 
 // Notification appended 2026-08-23: it is what tells the console a session is
 // stopped waiting on a person (permission prompt, idle input) — the session-ask
@@ -43,6 +44,20 @@ export const HOOK_MARKER = 'session-hook.sh';
  * costs a session at most when the console is unreachable.
  */
 export const HOOK_TIMEOUT_SECONDS = 3;
+/**
+ * SessionStart's own patience (measured-console phase 4): a supervised
+ * session's SessionStart also prints the engine's brief (`phase-graph.sh
+ * --brief N`, about two seconds over a large plan) after the presence POST's
+ * two, so three would cut the brief — and with it the presence line — on a
+ * slow machine. A SessionStart entry with less reads `brief: false`, and the
+ * console then keeps the boot prompt whole (`PE_BRIEF` is left unset).
+ */
+export const HOOK_BRIEF_TIMEOUT_SECONDS = 15;
+
+/** The timeout an entry of ours carries for one event. */
+export function hookTimeoutFor(event: HookEvent): number {
+  return event === 'SessionStart' ? HOOK_BRIEF_TIMEOUT_SECONDS : HOOK_TIMEOUT_SECONDS;
+}
 
 type HookCommand = { type: 'command'; command: string; timeout?: number; [key: string]: unknown };
 type HookGroup = { matcher?: string; hooks?: HookCommand[]; [key: string]: unknown };
@@ -62,6 +77,19 @@ export type HooksStatus = {
   command: string;
   /** An entry of ours points at a script other than this checkout's. */
   stale: boolean;
+  /**
+   * Installed, and the SessionStart entry waits long enough for the brief
+   * (`HOOK_BRIEF_TIMEOUT_SECONDS`) — what lets the runner set `PE_BRIEF=hook`
+   * and leave out of the boot prompt what the brief carries.
+   */
+  brief: boolean;
+  /**
+   * The config dir's INSTALLED plugin carries the four entries in its own
+   * `hooks/hooks.json` (measured-console phase 10) — presence is answered
+   * whatever the settings file says. With the splice there too, the plugin's
+   * copy steps aside for it (`session-hook.sh`), so `brief` stays the splice's.
+   */
+  viaPlugin: boolean;
   /** The file could not be parsed; nothing will be written to it. */
   parseError?: string;
 };
@@ -77,6 +105,15 @@ export type HooksOptions = {
    * like everything under the accounts dir. An existing file keeps its own.
    */
   mode?: number;
+  /**
+   * Write the four entries into the settings file even when the config dir's
+   * installed plugin carries them in its own `hooks/hooks.json` (measured-
+   * console phase 10). Off, an install over such a dir writes nothing: the
+   * plugin's hooks ARE the presence hooks, and a spliced copy would answer
+   * every event twice. The splice is for a user with no plugin — `install-hooks
+   * --splice`, or a plugin from before hooks shipped in it.
+   */
+  splice?: boolean;
 };
 
 /** Claude Code's user-scope settings file, honouring `CLAUDE_CONFIG_DIR` the way the CLI does. */
@@ -105,8 +142,8 @@ export function hookCommand(skillDir: string, env: NodeJS.ProcessEnv = process.e
   return `bash "${hookScriptPath(skillDir, env)}"`;
 }
 
-export function hookEntry(skillDir: string, env: NodeJS.ProcessEnv = process.env): HookCommand {
-  return { type: 'command', command: hookCommand(skillDir, env), timeout: HOOK_TIMEOUT_SECONDS };
+export function hookEntry(skillDir: string, env: NodeJS.ProcessEnv = process.env, event: HookEvent = 'Stop'): HookCommand {
+  return { type: 'command', command: hookCommand(skillDir, env), timeout: hookTimeoutFor(event) };
 }
 
 function isOurs(command: unknown): boolean {
@@ -310,6 +347,7 @@ function statusOf(file: ReadSettings, path: string, skillDir: string, env: NodeJ
   const events = {} as Record<HookEvent, boolean>;
   let stale = false;
   let current = 0;
+  let briefWait = false;
   const hooks = (file.json.hooks && typeof file.json.hooks === 'object' ? file.json.hooks : {}) as Record<string, unknown>;
   for (const event of HOOK_EVENTS) {
     const groups = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
@@ -318,13 +356,21 @@ function statusOf(file: ReadSettings, path: string, skillDir: string, env: NodeJ
     const exact = ours.some((group) => (group.hooks ?? []).some((hook) => hook.command === command));
     if (exact) current++;
     else if (ours.length) stale = true;
+    if (event === 'SessionStart') {
+      briefWait = ours.some((group) => (group.hooks ?? []).some((hook) => hook.command === command
+        && typeof hook.timeout === 'number' && hook.timeout >= HOOK_BRIEF_TIMEOUT_SECONDS));
+    }
   }
   const have = HOOK_EVENTS.filter((event) => events[event]).length;
   const installed = current === HOOK_EVENTS.length && !stale;
+  const partial = !installed && (have > 0 || stale);
+  const plugin = installedPluginHooks(dirname(path));
+  const viaPlugin = plugin?.carries === true;
   return {
-    path, exists: file.exists, installed,
-    partial: !installed && (have > 0 || stale),
+    path, exists: file.exists, installed, partial,
     events, command, stale,
+    brief: (installed && briefWait) || (viaPlugin && !installed && !partial && plugin!.brief),
+    viaPlugin,
     ...(file.parseError ? { parseError: file.parseError } : {}),
   };
 }
@@ -335,7 +381,11 @@ export function hooksStatus(options: HooksOptions): HooksStatus {
   return statusOf(readSettingsFile(path), path, options.skillDir, options.env);
 }
 
-export type HooksWrite = { ok: true; path: string; changed: boolean; status: HooksStatus };
+export type HooksWrite = {
+  ok: true; path: string; changed: boolean; status: HooksStatus;
+  /** Nothing was spliced because the dir's installed plugin carries the hooks itself (`splice` off). */
+  pluginCarries?: boolean;
+};
 
 function refuseUnparsed(path: string, file: ReadSettings): void {
   if (file.parseError) {
@@ -354,12 +404,15 @@ export function installHooks(options: HooksOptions): HooksWrite {
   const path = options.settingsPath ?? defaultSettingsPath(options.env);
   const file = readSettingsFile(path);
   refuseUnparsed(path, file);
+  if (!options.splice && installedPluginHooks(dirname(path))?.carries) {
+    return { ok: true, path, changed: false, pluginCarries: true, status: statusOf(file, path, options.skillDir, options.env) };
+  }
   const hooks = (file.json.hooks && typeof file.json.hooks === 'object' && !Array.isArray(file.json.hooks)
     ? { ...(file.json.hooks as Record<string, unknown>) }
     : {}) as Record<string, unknown>;
-  const wanted = hookEntry(options.skillDir, options.env);
   let changed = false;
   for (const event of HOOK_EVENTS) {
+    const wanted = hookEntry(options.skillDir, options.env, event);
     const groups = Array.isArray(hooks[event]) ? [...(hooks[event] as unknown[])] : [];
     let placed = false;
     for (let i = 0; i < groups.length; i++) {
@@ -408,4 +461,158 @@ export function uninstallHooks(options: HooksOptions): HooksWrite {
     if (changed) writeAtomic(path, spliceHooks(file, Object.keys(hooks).length ? hooks : null), file.mode);
   }
   return { ok: true, path, changed, status: statusOf(readSettingsFile(path), path, options.skillDir, options.env) };
+}
+
+/* ------------------------------------------------------------------ *
+ * The plugin's own hooks — the verifier (measured-console phase 10)
+ * ------------------------------------------------------------------ */
+
+/** Where a plugin tree carries its hooks; Claude Code loads the file by its place. */
+export const PLUGIN_HOOKS_REL = 'hooks/hooks.json';
+/** The command every presence entry of the plugin runs — the plugin's own script, wherever the CLI cached it. */
+export const PLUGIN_HOOK_COMMAND = 'bash "${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh"';
+
+export type PluginHooksStatus = {
+  /** The `hooks/hooks.json` consulted. */
+  path: string;
+  exists: boolean;
+  /** Every event has the plugin's presence entry, at the timeout this console ships. */
+  carries: boolean;
+  events: Record<HookEvent, boolean>;
+  /** SessionStart waits long enough for the brief. */
+  brief: boolean;
+  /** What is wrong, one line each, when `carries` is false. */
+  problems: string[];
+};
+
+/**
+ * Does a plugin tree carry the presence hooks — the four events, each running
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh` at its shipped timeout, under
+ * the file's top-level `hooks` key (a file of the bare event map does not load).
+ */
+export function pluginHooksStatus(pluginRoot: string): PluginHooksStatus {
+  const path = join(pluginRoot, PLUGIN_HOOKS_REL);
+  const events = Object.fromEntries(HOOK_EVENTS.map((event) => [event, false])) as Record<HookEvent, boolean>;
+  const problems: string[] = [];
+  if (!existsSync(path)) {
+    return { path, exists: false, carries: false, events, brief: false, problems: [`${path} does not exist`] };
+  }
+  let doc: unknown;
+  try { doc = JSON.parse(readFileSync(path, 'utf8')); } catch (error) {
+    return { path, exists: true, carries: false, events, brief: false, problems: [`${path} does not parse (${(error as Error).message})`] };
+  }
+  const hooks = (doc as { hooks?: unknown })?.hooks;
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) {
+    return { path, exists: true, carries: false, events, brief: false, problems: [`${path} has no top-level "hooks" object`] };
+  }
+  let brief = false;
+  for (const event of HOOK_EVENTS) {
+    const groups = (hooks as Record<string, unknown>)[event];
+    const entries = (Array.isArray(groups) ? groups : [])
+      .flatMap((group) => (group && typeof group === 'object' && Array.isArray((group as HookGroup).hooks) ? (group as HookGroup).hooks! : []));
+    const ours = entries.filter((hook) => hook?.type === 'command' && hook.command === PLUGIN_HOOK_COMMAND);
+    const timed = ours.some((hook) => hook.timeout === hookTimeoutFor(event));
+    events[event] = ours.length > 0;
+    if (!ours.length) problems.push(`${event}: no entry runs ${PLUGIN_HOOK_COMMAND}`);
+    else if (!timed) problems.push(`${event}: the entry's timeout is not ${hookTimeoutFor(event)} s`);
+    if (event === 'SessionStart') brief = ours.some((hook) => typeof hook.timeout === 'number' && hook.timeout >= HOOK_BRIEF_TIMEOUT_SECONDS);
+  }
+  return { path, exists: true, carries: problems.length === 0, events, brief, problems };
+}
+
+/** The hooks of the skill plugin one config dir has INSTALLED (its user-scope copy); null when none is installed. */
+export function installedPluginHooks(configDir: string): PluginHooksStatus | null {
+  let installPath: string | null = null;
+  try { installPath = readSkillCopy(configDir).install?.installPath ?? null; } catch { installPath = null; }
+  return installPath ? pluginHooksStatus(installPath) : null;
+}
+
+export type ConfigDirHooks = {
+  configDir: string;
+  /** The installed plugin's hooks; null when the plugin is not installed in this dir. */
+  plugin: PluginHooksStatus | null;
+  /** The settings file's spliced entries. */
+  settings: HooksStatus;
+  /**
+   * `plugin` — the plugin carries the hooks and nothing is spliced (the
+   * target) · `both` — the plugin carries them and the settings still have
+   * the splice: the plugin's copy steps aside, and `uninstall-hooks` is the
+   * tidy-up · `spliced` — only the settings carry them (a plugin from before
+   * the hooks shipped in it, or none) · `missing` — neither does.
+   */
+  verdict: 'plugin' | 'both' | 'spliced' | 'missing';
+};
+
+/** What answers the presence events in one config dir — the plugin, the splice, both or neither. */
+export function verifyHooks(configDir: string, skillDir: string, env: NodeJS.ProcessEnv = process.env): ConfigDirHooks {
+  const plugin = installedPluginHooks(configDir);
+  const settings = hooksStatus({ skillDir, settingsPath: join(configDir, 'settings.json'), env });
+  const spliced = settings.installed || settings.partial;
+  const verdict = plugin?.carries ? (spliced ? 'both' : 'plugin') : (settings.installed ? 'spliced' : 'missing');
+  return { configDir, plugin, settings, verdict };
+}
+
+/* ------------------------------------------------------------------ *
+ * Every hook, read-only (measured-console phase 28, D3)
+ * ------------------------------------------------------------------ */
+
+/** Where a hook comes from: the console's plugin, the user's settings, the project's, or a run's own `--settings`. */
+export const HOOK_SOURCES = ['plugin', 'user', 'project', 'run'] as const;
+export type HookSource = (typeof HOOK_SOURCES)[number];
+
+/** One hook as Settings ▸ Hooks draws it. */
+export type HookRow = {
+  source: HookSource;
+  /** The file it was read from (`~`-relative is the page's business). */
+  file: string;
+  event: string;
+  matcher?: string;
+  type: string;
+  /** The command or URL it runs — a bearer is never carried, only its header's name. */
+  runs: string;
+  /** Seconds; absent is the CLI's own default. */
+  timeout?: number;
+  /** `block` — a hook that cannot start, times out or answers garbage blocks the call; absent is the CLI's default (it carries on). */
+  onFailure?: string;
+  /** When it is there at all — a run's conditional hooks say which runs carry them. */
+  when?: string;
+};
+
+/**
+ * The hooks one settings-shaped document names, flattened to rows — a
+ * `settings.json`, a plugin's `hooks/hooks.json`, or a run's settings.
+ * Read-only: nothing here writes, and an `Authorization` value never leaves.
+ */
+export function hookRowsOf(doc: unknown, source: HookSource, file: string, when?: (event: string, hook: Record<string, unknown>) => string | undefined): HookRow[] {
+  const hooks = (doc as { hooks?: unknown } | null)?.hooks;
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return [];
+  const rows: HookRow[] = [];
+  for (const [event, groups] of Object.entries(hooks as Record<string, unknown>)) {
+    for (const group of Array.isArray(groups) ? groups : []) {
+      if (!group || typeof group !== 'object') continue;
+      const matcher = (group as { matcher?: unknown }).matcher;
+      for (const raw of Array.isArray((group as HookGroup).hooks) ? (group as HookGroup).hooks! : []) {
+        const hook = raw as unknown as Record<string, unknown>;
+        const type = typeof hook.type === 'string' ? hook.type : 'command';
+        const runs = typeof hook.command === 'string' ? hook.command
+          : typeof hook.url === 'string' ? hook.url
+            : typeof hook.prompt === 'string' ? hook.prompt.slice(0, 200) : '';
+        const said = when?.(event, hook);
+        rows.push({
+          source, file, event, type, runs,
+          ...(typeof matcher === 'string' && matcher ? { matcher } : {}),
+          ...(typeof hook.timeout === 'number' ? { timeout: hook.timeout } : {}),
+          ...(typeof hook.onFailure === 'string' ? { onFailure: hook.onFailure } : {}),
+          ...(said ? { when: said } : {}),
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+/** A settings file's hooks, or none — a file that does not parse is no hooks, said by its absence. */
+export function hookRowsOfFile(file: string, source: HookSource): HookRow[] {
+  if (!existsSync(file)) return [];
+  try { return hookRowsOf(JSON.parse(readFileSync(file, 'utf8')), source, file); } catch { return []; }
 }

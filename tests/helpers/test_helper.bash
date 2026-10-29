@@ -21,7 +21,7 @@ PE_SCRIPTS="$PE_DIR/scripts"
 unset PE_LOCK_MIRROR PE_OWNER PE_SESSION_ID PE_SCOPE PE_BRANCH PE_WORKTREE \
   PE_OUTCOME_FILE PE_TASKS_FILE PE_RULINGS_FILE PE_PROOFS_FILE PE_ISSUES_FILE \
   PE_ISSUES_MODE PE_ISSUES_SOURCE PE_ISSUES_SUGGEST PE_ISSUE_REPOS PE_HANDLED_FILE \
-  PE_VERIFY_DIR PE_RUN_ROOT \
+  PE_VERIFY_DIR PE_RUN_ROOT PE_SDK PE_SDK_SOCKET \
   PE_MESSAGES_FILE PE_MSG_TOKEN PE_TRACE_ID PE_SPAN_ID \
   PE_MCP_SERVERS PE_ACCOUNTS PE_CREDENTIALS CLAUDE_CODE_SESSION_ID \
   PE_SESSION_KIND PE_GATE_DOOR PE_GATE_DELEGATE CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ATTENDED
@@ -59,6 +59,9 @@ pe_msg()      {                                                "$SYS_BASH" "$PE_
 pe_issue()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/phase-issue.sh"       "$@"; }
 # session-hook.sh reads the hook payload on stdin; it needs no DOCS_ROOT either.
 pe_hook()     {                                                "$SYS_BASH" "$PE_SCRIPTS/session-hook.sh"      "$@"; }
+# amend-plan.sh: the one writer of a plan amendment (measured-console phase 30).
+pe_amend()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TODAY:-2026-10-28}" \
+                "$SYS_BASH" "$PE_SCRIPTS/amend-plan.sh" "$@"; }
 # PE_TODAY keeps closure dates off the wall clock so assertions stay stable.
 pe_close()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TODAY:-2026-01-02}" \
                 "$SYS_BASH" "$PE_SCRIPTS/close-plan.sh" "$@"; }
@@ -221,3 +224,20 @@ setup_super_lane() {
 pe_lane()     { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/phase-lane.sh"        "$@"; }
 pe_decisions() { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TODAY:-2026-09-14}" \
                 "$SYS_BASH" "$PE_SCRIPTS/decisions.sh" "$@"; }
+
+# record_gates_green <repo> [stage…] — what a green full run of scripts/gates.sh
+# leaves in <repo>'s COMMON gitdir (scripts/gates-marker.sh): HEAD's sha, and the
+# JSON naming the stages it ran (default: the two a stub `gates.sh --list`
+# prints in these tests). A test that wants a record of a partial run names
+# fewer stages than the stub lists.
+record_gates_green() {
+  local repo=$1 dir head stages="" s
+  shift
+  [ $# -gt 0 ] || set -- build bash-engine
+  dir="$(cd "$repo" && cd "$(git rev-parse --git-common-dir)" && pwd)"
+  head="$(git -C "$repo" rev-parse HEAD)"
+  for s in "$@"; do stages="$stages${stages:+,}{\"name\":\"$s\",\"seconds\":1}"; done
+  printf '{"version":1,"full":true,"head":"%s","head_at_start":"%s","head_now":"%s","stages":[%s]}\n' \
+    "$head" "$head" "$head" "$stages" > "$dir/phase-console-gates-ok.json"
+  printf '%s\n' "$head" > "$dir/phase-console-gates-ok"
+}

@@ -32,7 +32,7 @@ import type { PlacedRun } from '@/data/run-groups';
 import { usePhaseReport } from '@/data/runs';
 import { useAccounts } from '@/data/accounts';
 import { accountLine } from '@/lib/account-line';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { clockWords, money } from '@/lib/format';
 import { usePrefs } from '@/lib/prefs';

@@ -11,7 +11,8 @@
  *   TP-5 `#/turn/<id>` opens that item (aria-current) — even one folded under Coming up;
  *        an id the turn no longer holds says so;
  *   TP-6 the handled log is the last section, folded with its count;
- *   TP-7 Everything unfolds Done and the handled log and opens every folded card;
+ *   TP-7 Everything unfolds Done and the handled log and opens every folded card — and
+ *        every card's record folds (Tower strips, 2026-10-20);
  *   TP-8 Inspect hands the panel the item, and its Overview reads `GET /api/turn/:id`;
  *   TP-9 *Withdraw* posts the console's dismiss through the owner door, and the
  *        item is HELD on the page until the server's `turn` event (#270).
@@ -419,6 +420,10 @@ describe('TP-7 Everything', () => {
     const coming = within(section('upcoming')).getByTestId('turn-item');
     expect(within(coming).queryByTestId('turn-item-toggle')).toBeNull();
     expect(within(coming).getByTestId('turn-body').className).toContain('flex');
+    // And every card's record (Tower strips): each fold of it open — the timing grid, the history.
+    expect(within(coming).getByTestId('turn-timing-fold').getAttribute('aria-expanded')).toBe('true');
+    expect(within(coming).getByTestId('turn-timing')).toBeTruthy();
+    expect(within(coming).getByTestId('turn-history')).toBeTruthy();
   });
 });
 
@@ -433,6 +438,8 @@ describe('TP-8 Inspect', () => {
     expect(record.key).toBe('turn:now-1');
     expect(record.title).toBe('Item now-1');
     expect(record.overview).toBeTruthy();
+    // A Your turn item is a form: the panel may grow to a form's measure for it.
+    expect((record as { measure?: string }).measure).toBe('form');
   });
 
   it('its Overview reads the explain view, GET /api/turn/:id, and says why only a person fits it', async () => {
@@ -828,9 +835,23 @@ describe('TP-14 the list, the board, the tabs and the chips (one-pool phase 14)'
     const row = screen.getAllByTestId('turn-row').find((el) => el.getAttribute('data-item') === 'now-2')!;
     expect(row.hasAttribute('data-selected')).toBe(true);
     await waitFor(() => expect(inspected).toHaveBeenCalled());
-    const record = inspected.mock.calls.at(-1)![0] as { key: string; overview: { type: { name: string } } };
+    const record = inspected.mock.calls.at(-1)![0] as {
+      key: string;
+      title: string;
+      headless?: boolean;
+      meta?: unknown;
+      description?: unknown;
+      overview: { type: { name: string } };
+    };
     expect(record.key).toBe('turn:now-2');
     expect(record.overview.type.name).toBe('PanelCard');
+    // ONE title and ONE status (Tower strips): the card's head is the panel's
+    // only one — the frame draws no heading, and no step word beside the
+    // person's status; the region is named by the card's own title.
+    expect(record.headless).toBe(true);
+    expect(record.meta).toBeUndefined();
+    expect(record.description).toBeUndefined();
+    expect(record.title).toBe('Item now-2');
   });
 
   it('?view=board&group=plan draws a lane per plan, in columns by the person’s status', async () => {

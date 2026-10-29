@@ -345,7 +345,7 @@ if (args[0] === 'mcp') {
 // runs this predicate against every agent flag and every capability flag.
 const FLEET_VERBS = new Set([
   'list', 'open', 'stop', 'restart', 'status', 'log', 'logs', 'update', 'remove',
-  'autostart', 'profile', 'fleet', 'capability', 'accounts',
+  'autostart', 'profile', 'fleet', 'capability', 'accounts', 'eval',
 ]);
 const isAgentFlag = (arg) => /^--(?:un)?install-agent$|^--agent-[a-z][a-z-]*$/.test(arg ?? '');
 if (args[0] === 'start') args.shift();
@@ -353,7 +353,9 @@ if (FLEET_VERBS.has(args[0]) || isAgentFlag(args[0])) {
   process.stderr.write(
     (args[0] === 'accounts'
       ? `phase-console: '${args[0]}' registers API-key accounts and their settings, which is Phase Console Pro.\n`
-      : `phase-console: '${args[0]}' manages a fleet of consoles, which is Phase Console Pro.\n`)
+      : args[0] === 'eval'
+        ? `phase-console: '${args[0]}' runs the skill's eval suite, which is Phase Console Pro.\n`
+        : `phase-console: '${args[0]}' manages a fleet of consoles, which is Phase Console Pro.\n`)
     + 'This build runs one console for one repository:  phase-console [<repo>]\n',
   );
   process.exit(2);

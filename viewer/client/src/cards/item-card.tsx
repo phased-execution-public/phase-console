@@ -6,23 +6,30 @@
  * A card, because an item is acted on as a unit, and a quiet one: the server
  * decided what the item is (`GET /api/turn` — its type, the person's status,
  * whether it is due, where a press goes, every word); this file only draws it,
- * top to bottom in the order a person needs it:
+ * top to bottom in the order a person needs it. Since Tower strips
+ * (2026-10-20) it is a STRIP — a 4 px leading edge in the person's status's
+ * hue, one tinted lead badge, outlined chips for the rest — and a container:
+ * it lays itself out by its own width, in a drawer, the panel or the page.
  *
- *   1. the head (`turn/head.tsx`): NOW, or NOT YET with its *when*; the type's
- *      mark; the person's status as a dot and a word; the title; the meta;
- *   2. the timing grid on the one page clock (`turn/timing.tsx`);
- *   3. why only the person fits it — once;
- *   4. the verdict BEFORE the steps (`turn/verdict.tsx`): Redo with its numbered
- *      fixes, or the check still running, or how it ended;
- *   5. *From the AI*, the numbered steps on the line, the plan/session link,
- *      *How it's checked*, *Goes to* and *Checked by* (`turn/steps.tsx`);
- *   6. ONE act form per type (`turn/act.tsx`, `decision-card.tsx`), its primary
- *      chosen by the move table (`turn/moves.ts`, IC-v2) — and *Undo: I'm not
- *      finished* while a check runs; an action the console's flags switch off
- *      is drawn disabled with the flag that turns it on;
- *   7. one press in, the history — who raised it and when, every move, every
- *      attempt side by side with its evidence, the questions, the answer — and
- *      one more, the raw record.
+ *   1. the head (`turn/head.tsx`): the type as a neutral plate; NOW, or NOT
+ *      YET with its *when*; the person's status as the lead badge; the
+ *      errand's ref; the title; the meta as chips;
+ *   2. the verdict, right after the head and BEFORE the steps
+ *      (`turn/verdict.tsx`): Redo with what the check found and its numbered
+ *      fixes, or the check still running, or how it ended; *From the AI*;
+ *   3. THE ACT, before the record of it: why only the person fits it — once —
+ *      then what they need to do it (a Task's and a Heads-up's steps first, a
+ *      Decision's guide paragraph, an Approval's block) and ONE act form per
+ *      type (`turn/act.tsx`, `decision-card.tsx`), its primary chosen by the
+ *      move table (`turn/moves.ts`, IC-v2) — and *Undo: I'm not finished*
+ *      while a check runs; an action the console's flags switch off is drawn
+ *      disabled with the flag that turns it on. In the panel its act bar holds
+ *      to the foot of the scroller (`inPanel`);
+ *   4. THE RECORD, as fold strips (`turn/record.tsx`): *How it's checked*,
+ *      *Where it goes*, *Timing* on the one page clock, a Decision's or an
+ *      Approval's *Steps* (open at first), and the *History* — who raised it
+ *      and when, every move, every attempt side by side with its evidence, the
+ *      questions, the answer — and one more press, the raw record.
  *
  * Never a field for a secret: a `secret-entry` item says where the value goes,
  * and its check takes no note. Every press goes through `data/press.ts` (the
@@ -31,14 +38,31 @@
  * pieces a screen draws INSIDE an item — a permission item's own card, the
  * owner's pending requests, the supervisor's card, a link's QR — are lent by
  * the screen (`parts`), and the card says what it can without them.
+ *
+ * It is the ONE human-step card (measured-console phase 32 folded
+ * `human-step-card.tsx` into it). A surface that holds a step only as its
+ * inbox row — the bell's row, a run strip's expansion — draws it through
+ * `StepCard` below, from the row's own `humanStep` view: whole, folded to a
+ * line that opens in place (`variant="row"`), or its one action alone
+ * (`variant="primary"`). Such a surface reaches this file through
+ * `lazy-step-card.tsx`, so a page with no person's turn never downloads it.
+ * The pieces both draw from — the kind's mark, a device code, the step's verbs
+ * and its one primary — are `turn/step-parts.tsx`; its words and clocks
+ * `turn/step-words.ts`.
  */
 
 import { useEffect, useId, useState, type ComponentType, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { ChevronDown } from 'lucide-react';
 
-import { humanStepView, type HumanStepState, type HumanStepView } from '@shared/human-step-model.js';
 import {
+  KIND_META,
+  humanStepView,
+  type HumanStepState,
+  type HumanStepView,
+} from '@shared/human-step-model.js';
+import {
+  HAND_OFF_OPTION_ID,
   personStatusOf,
   readinessOf,
   readinessShown,
@@ -47,7 +71,7 @@ import {
   type PersonStatus,
   type Readiness,
 } from '@shared/turn-model.js';
-import { actionBody, type InboxAction, type InboxItem, type TurnOption } from '@/data/api';
+import { actionBody, splitActions, type InboxAction, type InboxItem, type TurnOption } from '@/data/api';
 import { sendOnLeave } from '@/data/http';
 import {
   humanStepsApi as api,
@@ -60,9 +84,20 @@ import { keys } from '@/data/keys';
 import { patchHumanStep } from '@/data/live';
 import type { AuthorityRequest } from '@/data/owner';
 import { press, type Pressed } from '@/data/press';
-import { giveBack, pressOption, undoCheck, type TurnItem } from '@/data/turn';
+import {
+  cannotItem,
+  giveBack,
+  handOffItem,
+  noteItem,
+  noteOnLeave,
+  pressOption,
+  undoCheck,
+  useHumanSteps,
+  type TurnItem,
+} from '@/data/turn';
 import { useHeldPress } from '@/data/undo-window';
 import { cn } from '@/lib/cn';
+import { useRoute } from '@/shell/router';
 import { toHash } from '@/shell/routes';
 import { Button, Input, KeyValue, toast, type KeyValueItem } from '@/ui';
 import { CodeBlock } from '@/ui/code-block';
@@ -70,25 +105,26 @@ import { Disclosure } from '@/ui/disclosure';
 import { MicField } from '@/ui/mic-field';
 import { OpsStatus } from '@/ui/status';
 import { DecisionCard, type DecisionAnswer, type DecisionOption } from './decision-card';
-import { guideOf } from './guide';
+import { GuideSummary, guideOf } from './guide';
 import { NextStepNote } from './next-step-note';
-import {
-  BIRTH_WORDS,
-  DeviceCode,
-  KindMark,
-  MoveLine,
-  RawRecord,
-  SecretWhere,
-  WhereWord,
-  errorWords,
-  stamp,
-  useStepVerbs,
-} from './human-step-card';
 import { primaryActOf, primaryLabel } from './human-step-words';
 import { StepTerminalSheet } from './step-terminal-sheet';
-import { ApprovalAct, FlaggedActions, HeadsUpAct, HeldLine, TaskAct, UndoAct } from './turn/act';
-import { Head, Meta, WhyLine } from './turn/head';
 import {
+  ActBar,
+  ApprovalAct,
+  CannotAct,
+  FlaggedActions,
+  HeadsUpAct,
+  HeldLine,
+  SentAct,
+  TaskAct,
+  UndoAct,
+  formBox,
+  type SentPress,
+} from './turn/act';
+import { Head, Meta, WhyLine, edgeOf } from './turn/head';
+import {
+  MOVE_LABEL,
   NONE_WORDS,
   approveLabelOf,
   cardMoveOf,
@@ -98,11 +134,43 @@ import {
   saysYes,
   type CardMove,
 } from './turn/moves';
-import { CoverLinks, FromTheAI, HowChecked, Routing, Steps } from './turn/steps';
+import { RecordFolds, TimingSummary, plainStep, type RecordFold } from './turn/record';
+import {
+  DeviceCode,
+  DueLine,
+  KindMark,
+  MoveLine,
+  RawRecord,
+  SecretWhere,
+  StepCommand,
+  StepPrimary,
+  StepPrimaryButton,
+  WhereWord,
+  useStepVerbs,
+  type Perform as StepPerform,
+} from './turn/step-parts';
+import { BIRTH_WORDS, errorWords, isOpenState, stamp, statusParts } from './turn/step-words';
+import {
+  CheckedBy,
+  CoverLinks,
+  FromTheAI,
+  GoesTo,
+  HowChecked,
+  Steps,
+  checkedByOf,
+  composedGuide,
+  goesToOf,
+  stepsOf,
+} from './turn/steps';
 import { TimingGrid, timingOf } from './turn/timing';
 import { CheckingLine, SettledLine, Verdict } from './turn/verdict';
 
-type Perform = (item: InboxItem, action: InboxAction, says?: string) => void;
+/**
+ * Presses a row action verbatim. A screen whose press reports back
+ * (`useInboxActions().perform`) resolves `true` once the server did it — the
+ * card then holds itself as sent (`SentAct`) — and `false` when it did not.
+ */
+type Perform = (item: InboxItem, action: InboxAction, says?: string) => void | Promise<boolean>;
 
 /* ------------------------------------------------------------------ *
  * The item's facts, as the card reads them
@@ -167,6 +235,18 @@ const NO_NOTE_KINDS: ReadonlySet<string> = new Set(['secret-entry', 'one-time-co
 
 /** The row verbs that END an item — a yes or a no — held for the undo window before they are sent. */
 const HELD_VERBS: ReadonlySet<string> = new Set(['approve', 'allow', 'deny', 'grant']);
+
+/**
+ * The act's section, named by what each type asks of the person (Tower strips,
+ * 2026-10-20) — the line that tells the act apart from the verdict above it
+ * and the record below it.
+ */
+const ACT_LABEL: Readonly<Record<ItemType, string>> = Object.freeze({
+  approve: 'What you approve',
+  do: 'What you do',
+  decide: 'What you decide',
+  know: 'What to know',
+});
 
 /** A run request's act, when the item is one (turn-by-turn phase 6). */
 function runActOf(item: TurnItem): string | null {
@@ -265,7 +345,10 @@ function useItemVerbs(id: string | undefined) {
 /** What stopped the AI, why the phase needs it, and what a grant would do — a permission item's own facts. */
 function PermissionFacts({ permission }: { permission: PermissionRecord }) {
   return (
-    <div data-testid="turn-permission" className="flex min-w-0 max-w-prose flex-col gap-2 text-body text-ink">
+    <div
+      data-testid="turn-permission"
+      className="flex min-w-0 max-w-(--measure) flex-col gap-2 text-body text-ink"
+    >
       <p>
         <span className="font-medium">What stopped the AI. </span>
         {permission.tool ? <code className="font-mono text-meta">{permission.tool}</code> : 'A tool'}
@@ -300,19 +383,35 @@ function PermissionFacts({ permission }: { permission: PermissionRecord }) {
   );
 }
 
-/** An approval's block: what is asked, who asked, and what each answer does. */
+/**
+ * An approval's block: what is asked, who asked, and what each answer does —
+ * a two-column grid where the card has the room, each label over its value
+ * where it has not (Tower strips, 2026-10-20), on the record's ground so the
+ * facts read as one thing before Approve and Deny.
+ */
 function ApprovalBlock({ approval }: { approval: NonNullable<TurnItem['approval']> }) {
-  const rows: KeyValueItem[] = [
-    ['What', approval.what],
-    ['Asked by', approval.askedBy],
-    ['If you approve', approval.ifApproved],
-    ['If you deny', approval.ifDenied],
-    approval.scopes?.length ? ['Scopes', approval.scopes.join(', ')] : null,
-  ];
+  const rows = (
+    [
+      ['What', approval.what],
+      ['Asked by', approval.askedBy],
+      ['If you approve', approval.ifApproved],
+      ['If you deny', approval.ifDenied],
+      ['Scopes', approval.scopes?.length ? approval.scopes.join(', ') : undefined],
+    ] as const
+  ).filter(([, value]) => value != null && value !== '');
+  if (!rows.length) return null;
   return (
-    <div data-testid="turn-approval" className="max-w-prose">
-      <KeyValue items={rows} />
-    </div>
+    <dl
+      data-testid="turn-approval"
+      className="grid min-w-0 max-w-(--measure) grid-cols-1 items-baseline gap-x-4 gap-y-0.5 rounded-md bg-ground px-3 py-2.5 @md/card:grid-cols-[max-content_minmax(0,1fr)] @md/card:gap-y-1.5 [&>div:last-child>dd]:pb-0"
+    >
+      {rows.map(([label, value]) => (
+        <div key={label} className="contents">
+          <dt className="min-w-0 text-meta text-ink-muted">{label}</dt>
+          <dd className="min-w-0 pb-1.5 text-body break-words text-ink @md/card:pb-0">{value}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
@@ -337,7 +436,7 @@ function Escalation({
   return (
     <div
       data-testid="turn-escalation"
-      className="flex min-w-0 max-w-prose flex-col gap-2.5 rounded-md bg-ground px-3 py-3 text-body text-ink"
+      className="flex min-w-0 max-w-(--measure) flex-col gap-2.5 rounded-md bg-ground px-3 py-3 text-body text-ink"
     >
       <p>{attempts} attempts have not passed. Choose how this ends.</p>
       <ul className="flex list-none flex-col gap-2 p-0">
@@ -478,7 +577,34 @@ function Attempts({ record }: { record: HumanStepRecord }) {
   );
 }
 
-/** One press in: who raised it and when, its kind and where, every move and attempt, the questions, the answer — and the raw record. */
+/** Who raised it, in words — the session's id beside its word where the record has one. */
+function raisedBy(item: TurnItem, record: HumanStepRecord | undefined, withSession = true): string {
+  const birth = record?.birth ?? item.step?.birth;
+  if (!birth) return item.source;
+  if (withSession && birth === 'session' && record?.sessionId)
+    return `${BIRTH_WORDS.session} (${record.sessionId})`;
+  return BIRTH_WORDS[birth] ?? birth;
+}
+
+/** The History fold's one line: who raised it and when, and how much happened since. */
+function historyWords(item: TurnItem, record: HumanStepRecord | undefined): string {
+  const declared = record?.declaredAt ?? item.step?.declaredAt ?? item.since;
+  const attempts = record?.attempts ?? item.step?.attempts ?? 0;
+  const moves = record?.moves?.length ?? 0;
+  return [
+    `Raised by ${raisedBy(item, record, false)}, ${stamp(declared)}`,
+    attempts ? `${attempts} ${attempts === 1 ? 'attempt' : 'attempts'}` : null,
+    moves ? `${moves} ${moves === 1 ? 'move' : 'moves'}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+/**
+ * The History fold's body (one press in): who raised it and when, its kind and
+ * where, every move and attempt, the questions, the answer — and, one more
+ * press, the raw record.
+ */
 function History({
   item,
   record,
@@ -491,12 +617,6 @@ function History({
   const moves = record?.moves ?? [];
   const questions = record?.question ?? [];
   const answer = record?.answer;
-  const birth = record?.birth ?? item.step?.birth;
-  const who = birth
-    ? birth === 'session' && record?.sessionId
-      ? `${BIRTH_WORDS.session} (${record.sessionId})`
-      : (BIRTH_WORDS[birth] ?? birth)
-    : item.source;
   const source = record?.source ?? item.step?.source;
   const declared = record?.declaredAt ?? item.step?.declaredAt ?? item.since;
   const proof = record?.proof ?? item.step?.proof;
@@ -504,7 +624,7 @@ function History({
     [
       'Raised by',
       <span data-testid="turn-raised-by">
-        {who}, {stamp(declared)}
+        {raisedBy(item, record)}, {stamp(declared)}
       </span>,
     ],
     ['What it is', <KindMark kind={item.kind} />],
@@ -529,57 +649,48 @@ function History({
     record?.provenBy ? ['Proven by', record.provenBy] : null,
   ];
   return (
-    <div data-print="hide">
-      <Disclosure
-        testId="turn-history-toggle"
-        label="The history: who raised it, every move and attempt"
-        openLabel="Hide the history"
-        bodyClassName="pt-2"
-      >
-        <div
-          data-testid="turn-history"
-          className="flex min-w-0 flex-col gap-3 rounded-md bg-ground px-3 py-3 text-meta"
-        >
-          <KeyValue items={facts} />
-          {record && <Attempts record={record} />}
-          {moves.length > 0 && (
-            <div className="flex min-w-0 flex-col gap-1">
-              <p className="font-medium text-ink">Every move</p>
-              <ol className="flex list-none flex-col gap-0.5 p-0">
-                {moves.map((move, index) => (
-                  <MoveLine key={`${move.at}-${index}`} move={move} />
-                ))}
-              </ol>
-            </div>
-          )}
-          {questions.length > 0 && (
-            <div data-testid="turn-questions" className="flex min-w-0 flex-col gap-1">
-              <p className="font-medium text-ink">Asked about it</p>
-              <ul className="flex list-none flex-col gap-0.5 p-0">
-                {questions.map((question, index) => (
-                  <li key={`${question.at}-${index}`} className="text-ink">
-                    <span className="text-ink-muted tabular-nums">{stamp(question.at)} </span>
-                    {question.text}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-          {answer && (
-            <p data-testid="turn-answer" className="text-ink">
-              <span className="font-medium">Answered: </span>
-              {[answer.label ?? answer.option, answer.note].filter(Boolean).join(' — ')}
-              <span className="text-ink-muted">
-                {' '}
-                ({answer.by ? `${answer.by}, ` : ''}
-                {stamp(answer.at)})
-              </span>
-            </p>
-          )}
-          <Disclosure testId="turn-raw-toggle" label="The raw record" openLabel="Hide the raw record">
-            <RawRecord testId="turn-raw" value={record ?? item} />
-          </Disclosure>
+    <div
+      data-testid="turn-history"
+      className="flex min-w-0 flex-col gap-3 rounded-md bg-ground px-3 py-3 text-meta"
+    >
+      <KeyValue items={facts} />
+      {record && <Attempts record={record} />}
+      {moves.length > 0 && (
+        <div className="flex min-w-0 flex-col gap-1">
+          <p className="font-medium text-ink">Every move</p>
+          <ol className="flex list-none flex-col gap-0.5 p-0">
+            {moves.map((move, index) => (
+              <MoveLine key={`${move.at}-${index}`} move={move} />
+            ))}
+          </ol>
         </div>
+      )}
+      {questions.length > 0 && (
+        <div data-testid="turn-questions" className="flex min-w-0 flex-col gap-1">
+          <p className="font-medium text-ink">Asked about it</p>
+          <ul className="flex list-none flex-col gap-0.5 p-0">
+            {questions.map((question, index) => (
+              <li key={`${question.at}-${index}`} className="text-ink">
+                <span className="text-ink-muted tabular-nums">{stamp(question.at)} </span>
+                {question.text}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {answer && (
+        <p data-testid="turn-answer" className="text-ink">
+          <span className="font-medium">Answered: </span>
+          {[answer.label ?? answer.option, answer.note].filter(Boolean).join(' — ')}
+          <span className="text-ink-muted">
+            {' '}
+            ({answer.by ? `${answer.by}, ` : ''}
+            {stamp(answer.at)})
+          </span>
+        </p>
+      )}
+      <Disclosure testId="turn-raw-toggle" label="The raw record" openLabel="Hide the raw record">
+        <RawRecord testId="turn-raw" value={record ?? item} />
       </Disclosure>
     </div>
   );
@@ -590,7 +701,7 @@ function PhoneLink({ url, children }: { url: string; children?: ReactNode }) {
   return (
     <div data-testid="turn-qr" className="flex min-w-0 flex-wrap items-center gap-3">
       {children}
-      <p className="min-w-0 max-w-prose text-body text-ink">
+      <p className="min-w-0 max-w-(--measure) text-body text-ink">
         Open it on the device in your hand: <code className="font-mono text-meta wrap-anywhere">{url}</code>
       </p>
     </div>
@@ -639,6 +750,8 @@ export interface ItemCardParts {
     perform: Perform;
     busy?: string | undefined;
     live?: boolean;
+    /** The card is the panel's: its act row is pinned to the foot of the scroller, as every type's is. */
+    pinned?: boolean;
   }>;
   /** What other doors asked the owner to press on this item — each confirmed or refused once. */
   OwnerRequests?: ComponentType<{ requests: readonly AuthorityRequest[] | undefined }>;
@@ -669,6 +782,14 @@ export interface ItemCardProps {
   onInspect?: (() => void) | undefined;
   /** The screen's own moves on this item (*Withdraw*), drawn after the card's. */
   moves?: ReactNode;
+  /**
+   * The card is the panel's whole subject (`screens/turn/panel-card.tsx`):
+   * its title takes the title size, and its act bar is pinned to the foot of
+   * the panel's scroller, so the primary is always in reach.
+   */
+  inPanel?: boolean;
+  /** *Everything* is on for the page: the card's record folds all open. */
+  everything?: boolean;
 }
 
 const NO_PARTS: ItemCardParts = {};
@@ -683,12 +804,15 @@ export function ItemCard({
   parts = NO_PARTS,
   onInspect,
   moves,
+  inPanel = false,
+  everything = false,
 }: ItemCardProps) {
   const [open, setOpen] = useState(!folded || focused);
   useEffect(() => {
     if (focused) setOpen(true);
   }, [focused]);
   const titleId = useId();
+  const actLabelId = useId();
   const state: HumanStepState = record?.state ?? item.step?.state ?? item.humanStep?.state ?? 'notified';
   const view = viewOf(item, record, state);
   const verbs = useStepVerbs(view);
@@ -700,17 +824,28 @@ export function ItemCard({
   const [optionBusy, setOptionBusy] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [said, setSaid] = useState('');
+  // A terminal press the server did, and the status the item read when it was pressed.
+  const [sent, setSent] = useState<(SentPress & { was: PersonStatus }) | null>(null);
+  const [cannotBusy, setCannotBusy] = useState(false);
   const [seen, markSeen] = useSeen(item.item);
   const { PermissionCard, OwnerRequests, CheckOutcome } = parts;
 
   const ledger = item.record === 'ledger';
   const words = cardWordsOf(item, record, state);
-  const card: TurnItem = { ...item, ...words };
-  const status = words.personStatus;
+  // A press that went through holds the card as sent — Being checked, nothing
+  // to press again — while the server still reads the item as it was when it
+  // was pressed; the server's next move of the item ends the hold (2026-10-20:
+  // an approved gate's card stayed open, and was pressed four times).
+  const sentNow = sent !== null && sent.was === words.personStatus;
+  useEffect(() => {
+    if (sent && sent.was !== words.personStatus) setSent(null);
+  }, [sent, words.personStatus]);
+  const status: PersonStatus = sentNow ? 'checking' : words.personStatus;
+  const card: TurnItem = { ...item, ...words, personStatus: status };
   const settled = status === 'passed' || status === 'not-doing' || status === 'closed';
   const live = !settled;
   const notYet = words.readiness === 'not-yet' && readinessShown(status);
-  const checking = status === 'checking';
+  const checking = words.personStatus === 'checking';
   const proofType = record?.proofType ?? item.step?.proofType ?? item.proofType;
   const why = record?.why ?? item.step?.why ?? item.why;
   const inferred = (record?.whySource ?? item.step?.whySource) === 'inferred';
@@ -728,12 +863,22 @@ export function ItemCard({
   // The ways on. A ledger decision's options are answered through its own
   // verb; a projected item's are each bound to the verb that takes them
   // (turn-by-turn phase 5), and the row buttons the server derived from them
-  // are the same presses, so they are not drawn twice.
-  const ledgerOptions: readonly DecisionOption[] = ledger
-    ? (record?.options ?? item.step?.options ?? [])
-    : [];
+  // are the same presses, so they are not drawn twice. A ledger item the
+  // server bound ELSEWHERE — a gate-bound one, whose one way on is its gate's
+  // Approve (`optionsOf`) — is pressed as bound: its own options would be
+  // answers, and the server refuses an answer to an item only its gate opens.
+  // *Hand it to the AI* (2026-10-20) is the server's own last option on an
+  // open decision the AI can take, pressed through the turn's verb in every
+  // mode — so it is set apart from the options it follows.
+  const ownAnswer = `/api/human-steps/${encodeURIComponent(item.item)}/answer`;
+  const handOff = live ? item.options?.find((o) => o.id === HAND_OFF_OPTION_ID) : undefined;
+  const serverOptions = (item.options ?? []).filter((o) => o.id !== HAND_OFF_OPTION_ID);
+  const boundElsewhere =
+    ledger && serverOptions.length > 0 && !serverOptions.some((o) => o.verb.endpoint === ownAnswer);
+  const ledgerOptions: readonly DecisionOption[] =
+    ledger && !boundElsewhere ? (record?.options ?? item.step?.options ?? []) : [];
   const bound: readonly TurnOption[] =
-    live && !item.supervisor && !(ledger && ledgerOptions.length) ? (item.options ?? []) : [];
+    live && !item.supervisor && !(ledger && ledgerOptions.length) ? serverOptions : [];
   const boundTo = (action: InboxAction) =>
     bound.some(
       (option) =>
@@ -744,10 +889,14 @@ export function ItemCard({
   // its own form — only a permission's grant, deny and convert are its row's.
   const grantItem = isGrantItem({ kind: item.kind, proofType, record: item.record });
   const rowActions = ledger && !grantItem ? [] : item.actions.filter((action) => !boundTo(action));
-  const options: readonly DecisionOption[] = ledgerOptions.length ? ledgerOptions : bound;
+  const options: readonly DecisionOption[] = [
+    ...(ledgerOptions.length ? ledgerOptions : bound),
+    ...(handOff ? [handOff] : []),
+  ];
+  const ledgerMode = ledgerOptions.length > 0 || (ledger && !bound.length);
   const move: CardMove = cardMoveOf({
     type: words.type,
-    personStatus: status,
+    personStatus: words.personStatus,
     readiness: words.readiness,
     record: item.record,
     kind: item.kind,
@@ -757,6 +906,8 @@ export function ItemCard({
     supervisor: Boolean(item.supervisor),
   });
   const pressable = rowActions.filter((action) => !action.flag);
+  // One of the row's own presses is on its way (`busy` is `${rowId}:${verb}`).
+  const rowTravelling = Boolean(busy?.startsWith(`${row.id}:`));
   const runAct = runActOf(item);
   const escalated = Boolean(record?.escalatedAt) && live && !notYet;
   // The composer's title (#377): sentence case, at most 80 characters, no
@@ -783,34 +934,70 @@ export function ItemCard({
     return { label: view.openUrl ? 'Open the link' : 'Open in terminal', onOpen: () => verbs.open() };
   })();
 
+  /** A terminal press the server did: the card holds itself as sent until the server moves the item. */
+  function markSent(label: string) {
+    setSent({ label, at: new Date().toISOString(), was: words.personStatus });
+  }
+
   /** A row action: a yes or a no waits out the undo window; anything else goes at once. */
-  function pressRow(action: InboxAction, words?: string) {
+  function pressRow(action: InboxAction, typed?: string) {
     if (HELD_VERBS.has(action.verb)) {
       held.hold(
         action.label,
-        () => perform(row, action, words),
-        () => sendOnLeave(action.endpoint, actionBody(action, words), action.method),
+        () =>
+          void Promise.resolve(perform(row, action, typed)).then((done) => {
+            if (done === true) markSent(action.label);
+          }),
+        () => sendOnLeave(action.endpoint, actionBody(action, typed), action.method),
       );
-    } else perform(row, action, words);
+    } else perform(row, action, typed);
   }
 
-  /** A bound option, sent through the undo window — a refusal said on the item, in the server's sentence. */
-  function sendOption(option: TurnOption, typed: string | undefined) {
+  /**
+   * A comment the chosen way on carries no field for (2026-10-20): it goes to
+   * whoever the item goes to, before the press, so the AI has read it when it
+   * acts. A refusal is said and never stops the press.
+   */
+  async function sendComment(text: string) {
+    try {
+      const noted = await noteItem(item.item, text);
+      if (noted.state === 'asked') toast(noted.words, 'info', 8000);
+    } catch (cause) {
+      toast(`Your note was not sent — ${errorWords(cause)}`, 'warn', 8000);
+    }
+  }
+
+  /**
+   * A bound option, sent through the undo window — a refusal said on the item,
+   * in the server's sentence; a comment the option takes no words for goes
+   * first. `through` presses it by its own typed verb (*Hand it to the AI*).
+   */
+  function sendOption(
+    option: TurnOption,
+    typed: string | undefined,
+    { comment, through }: { comment?: string | undefined; through?: () => Promise<Pressed<unknown>> } = {},
+  ) {
     setRefusal(null);
-    const leave = () =>
-      sendOnLeave(
+    const leave = () => {
+      if (comment) noteOnLeave(item.item, comment);
+      return sendOnLeave(
         option.verb.endpoint,
         actionBody({ body: option.verb.body, ...(option.says ? { says: option.says } : {}) }, typed),
         option.verb.method,
       );
+    };
     held.hold(
       option.label,
       async () => {
         setOptionBusy(true);
         try {
-          const pressed = await pressOption(option, typed);
+          if (comment) await sendComment(comment);
+          const pressed = await (through ? through() : pressOption(option, typed));
           if (pressed.state === 'asked') toast(pressed.words, 'info', 8000);
-          else toast(`${option.label} — done.`, 'ok');
+          else {
+            toast(`${option.label} — done.`, 'ok');
+            markSent(option.label);
+          }
         } catch (cause) {
           // A stale run, a door that may not press, a rule: the server's sentence, where the press was made.
           setRefusal(errorWords(cause));
@@ -823,18 +1010,74 @@ export function ItemCard({
     );
   }
 
-  /** A decision sent: a ledger answer, or the chosen bound option with its typed words. */
-  function sendDecision(answer: DecisionAnswer) {
-    if (ledgerOptions.length || (ledger && !bound.length)) {
-      held.hold(
-        'Your decision',
-        () => void extra.answer(answer),
-        () => extra.answerOnLeave(answer),
+  /**
+   * *I can't do this* on an item the console projects (2026-10-20): the
+   * reason goes with it, the item to Done as Not doing, whoever it goes to told.
+   */
+  async function cannotProjected(reason: string) {
+    setCannotBusy(true);
+    try {
+      const pressed = await cannotItem(item.item, reason);
+      if (pressed.state === 'asked') {
+        toast(pressed.words, 'info', 8000);
+        return;
+      }
+      const told = pressed.result.told;
+      toast(
+        told.note || told.chat
+          ? 'Handed back with your reason — whoever takes it from here has it.'
+          : 'Handed back — your reason is kept on the item.',
+        'ok',
       );
+      markSent(MOVE_LABEL.cannot);
+    } catch (cause) {
+      toast(errorWords(cause), 'warn', 8000);
+    } finally {
+      setCannotBusy(false);
+      for (const queryKey of keys.afterInboxAct()) void client.invalidateQueries({ queryKey });
+    }
+  }
+
+  // *I can't do this*, one press from every open item's card: a ledger item's
+  // through its step's own verb, a projected one's through the turn's — never
+  // the owner's request or the supervisor's card, which end by their own press.
+  const cannotAct =
+    !live || notYet || checking || item.supervisor || item.record === 'request' ? null : ledger ? (
+      <CannotAct busy={verbs.busy === 'cannot'} onCannot={verbs.cannot} />
+    ) : (
+      <CannotAct busy={cannotBusy} onCannot={(reason) => void cannotProjected(reason)} />
+    );
+
+  /** A ledger answer, sent once the undo window ends — and the card held as sent when the server took it. */
+  function holdAnswer(label: string, answer: DecisionAnswer) {
+    held.hold(
+      label,
+      () =>
+        void extra.answer(answer).then((got) => {
+          if (got) markSent(label);
+        }),
+      () => extra.answerOnLeave(answer),
+    );
+  }
+
+  /**
+   * A decision sent: *Hand it to the AI* through the turn's verb, a ledger
+   * answer, or the chosen bound option — its field carrying the words when it
+   * takes them, else the words sent beside it as a note for the AI.
+   */
+  function sendDecision(answer: DecisionAnswer) {
+    if (handOff && answer.option === HAND_OFF_OPTION_ID) {
+      sendOption(handOff, answer.note, { through: () => handOffItem(item.item, answer.note) });
+      return;
+    }
+    if (ledgerMode) {
+      holdAnswer('Your decision', answer);
       return;
     }
     const option = bound.find((candidate) => candidate.id === answer.option);
-    if (option) sendOption(option, answer.note);
+    if (!option) return;
+    if (option.says) sendOption(option, answer.note);
+    else sendOption(option, undefined, { comment: answer.note });
   }
 
   /** The approval's two presses, from whichever source the item carries them in. */
@@ -849,11 +1092,7 @@ export function ItemCard({
     if (yesOption || noOption) {
       const send = (option: DecisionOption) => (note: string | undefined) => {
         if (ledgerOptions.length) {
-          held.hold(
-            option.label,
-            () => void extra.answer({ option: option.id, ...(note ? { note } : {}) }),
-            () => extra.answerOnLeave({ option: option.id, ...(note ? { note } : {}) }),
-          );
+          holdAnswer(option.label, { option: option.id, ...(note ? { note } : {}) });
           return;
         }
         const boundOption = bound.find((candidate) => candidate.id === option.id);
@@ -885,18 +1124,8 @@ export function ItemCard({
     if (ledger) {
       // A check by eye with no options: the answer is the note, said as a yes or a no.
       return {
-        onApprove: (note) =>
-          held.hold(
-            'Approve',
-            () => void extra.answer({ note: note ? `Approved: ${note}` : 'Approved.' }),
-            () => extra.answerOnLeave({ note: note ? `Approved: ${note}` : 'Approved.' }),
-          ),
-        onDeny: (note) =>
-          held.hold(
-            'Deny',
-            () => void extra.answer({ note: note ? `Denied: ${note}` : 'Denied.' }),
-            () => extra.answerOnLeave({ note: note ? `Denied: ${note}` : 'Denied.' }),
-          ),
+        onApprove: (note) => holdAnswer('Approve', { note: note ? `Approved: ${note}` : 'Approved.' }),
+        onDeny: (note) => holdAnswer('Deny', { note: note ? `Denied: ${note}` : 'Denied.' }),
       };
     }
     return {};
@@ -925,9 +1154,9 @@ export function ItemCard({
   function actForm(): ReactNode {
     switch (move.move) {
       case 'undo':
-        return <UndoAct busy={extra.busy === 'undo'} onUndo={() => void extra.undo()} />;
+        return <UndoAct busy={extra.busy === 'undo'} onUndo={() => void extra.undo()} pinned={inPanel} />;
       case 'got-it':
-        return <HeadsUpAct done={seen} onGotIt={markSeen} />;
+        return <HeadsUpAct done={seen} onGotIt={markSeen} pinned={inPanel} />;
       case 'check':
         return (
           <TaskAct
@@ -939,7 +1168,10 @@ export function ItemCard({
               decline: (reason) =>
                 held.hold(
                   'Not doing this',
-                  () => void extra.decline(reason),
+                  () =>
+                    void extra.decline(reason).then((got) => {
+                      if (got) markSent('Not doing this');
+                    }),
                   () => extra.declineOnLeave(reason),
                 ),
               ask: extra.ask,
@@ -956,6 +1188,8 @@ export function ItemCard({
             allowDecline={Boolean(record?.allowDecline ?? item.step?.allowDecline)}
             giveBackPhase={giveBackPhase}
             opener={opener}
+            cannotHere={!escalated}
+            pinned={inPanel}
             onError={(words) => toast(words, 'warn', 8000)}
           />
         );
@@ -964,17 +1198,17 @@ export function ItemCard({
           <>
             <DecisionCard
               options={options}
-              mode={ledgerOptions.length || (ledger && !bound.length) ? 'ledger' : 'bound'}
+              mode={ledgerMode ? 'ledger' : 'bound'}
               busy={extra.busy === 'answer' || optionBusy}
               disabled={holding}
               refusal={refusal}
               onSend={sendDecision}
+              // The row's own presses no option stands for, beside the primary on its bar.
+              more={pressable.length > 0 ? restButtons(pressable) : undefined}
+              pinned={inPanel}
             />
-            {pressable.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5" data-testid="turn-moves" data-print="hide">
-                {restButtons(pressable)}
-              </div>
-            )}
+            {/* *Hand it to the AI* is the decision's own way out; only a choice the AI cannot take keeps *I can't do this*. */}
+            {handOff ? null : cannotAct}
           </>
         );
       case 'grant':
@@ -982,37 +1216,40 @@ export function ItemCard({
         return (
           <ApprovalAct
             {...grantPresses()}
-            busy={holding}
+            busy={holding || rowTravelling}
+            sending={rowTravelling}
             noteLabel="Why, if you want to say. The session reads it."
+            pinned={inPanel}
           />
         );
       case 'approve': {
         const presses = approvalPresses();
         const taken = pressable.filter((action) => saysYes(action) || saysNo(action));
+        const sending = rowTravelling || optionBusy || extra.busy === 'answer';
         return (
-          <ApprovalAct
-            {...presses}
-            more={restButtons(restOf(taken))}
-            busy={holding || optionBusy || extra.busy === 'answer'}
-            noteHint={
-              runAct === 'raise-budget'
-                ? 'To approve, write only how many dollars to add — for example 10 or $12.50.'
-                : undefined
-            }
-            noteRequired={runAct === 'raise-budget'}
-          >
-            {item.approval && <ApprovalBlock approval={item.approval} />}
-          </ApprovalAct>
+          <>
+            <ApprovalAct
+              {...presses}
+              more={restButtons(restOf(taken))}
+              busy={holding || sending}
+              sending={sending}
+              noteHint={
+                runAct === 'raise-budget'
+                  ? 'To approve, write only how many dollars to add — for example 10 or $12.50.'
+                  : undefined
+              }
+              noteRequired={runAct === 'raise-budget'}
+              pinned={inPanel}
+            >
+              {item.approval && <ApprovalBlock approval={item.approval} />}
+            </ApprovalAct>
+            {cannotAct}
+          </>
         );
       }
       case 'row':
         return (
-          <div
-            data-testid="turn-act"
-            data-type={words.type}
-            className="flex min-w-0 flex-col gap-3"
-            data-print="hide"
-          >
+          <div data-testid="turn-act" data-type={words.type} className={formBox(inPanel)} data-print="hide">
             {move.action.says && (
               <MicField
                 label={move.action.says.label}
@@ -1022,7 +1259,7 @@ export function ItemCard({
                 disabled={Boolean(busy)}
               />
             )}
-            <div className="flex flex-wrap items-center gap-1.5" data-testid="turn-moves">
+            <ActBar pinned={inPanel}>
               <Button
                 variant="primary"
                 data-testid="turn-primary"
@@ -1038,13 +1275,18 @@ export function ItemCard({
                 {busy === `${row.id}:${move.action.verb}` ? 'Working…' : move.action.label}
               </Button>
               {restButtons(restOf([move.action]))}
-            </div>
+            </ActBar>
+            {cannotAct}
           </div>
         );
       case 'none':
         if (move.why === 'checking') return null;
         return (
-          <p data-testid="turn-nothing" data-why={move.why} className="max-w-prose text-meta text-ink-muted">
+          <p
+            data-testid="turn-nothing"
+            data-why={move.why}
+            className="max-w-(--measure) text-meta text-ink-muted"
+          >
             {NONE_WORDS[move.why]}
           </p>
         );
@@ -1086,6 +1328,124 @@ export function ItemCard({
 
   const flagged = rowActions.filter((action) => action.flag);
 
+  // The act's section, named: what this type asks of the person while it is
+  // theirs — what it asked, once it is over.
+  const actLabel = settled
+    ? 'What it asked'
+    : notYet
+      ? 'What it will ask'
+      : checking
+        ? 'What you sent to be checked'
+        : ACT_LABEL[words.type];
+  // A Task's and a Heads-up's steps ARE the act: drawn first, before the form.
+  // A Decision's and an Approval's are the console's own, short: the record's.
+  const stepsFirst = words.type === 'do' || words.type === 'know';
+  // A decision's guide says its why under *What you decide*; its steps, then, do not again.
+  const summaryHere = !(words.type === 'decide' && guide?.summary);
+  const fallbackCommand = Boolean(view.openCommand && !permission);
+  const howShown =
+    !guide &&
+    !item.steps?.length &&
+    !view.lines.length &&
+    item.record !== 'ledger' &&
+    !item.supervisor &&
+    Boolean(item.how);
+  const drawnGuide = guide ?? composedGuide(item);
+  // Is there anything for the steps to draw — a fold of the record is never empty.
+  const stepsShown =
+    (drawnGuide
+      ? drawnGuide.steps.length > 0 ||
+        drawnGuide.trouble.length > 0 ||
+        (summaryHere && Boolean(drawnGuide.summary))
+      : view.lines.length > 0 || fallbackCommand) ||
+    howShown ||
+    Boolean(item.step?.coveredBy || item.step?.covers?.length);
+  const stepsPart = (
+    <>
+      <CoverLinks coveredBy={item.step?.coveredBy} covers={item.step?.covers} />
+      <Steps
+        item={item}
+        guide={guide}
+        lines={view.lines}
+        withSummary={summaryHere}
+        fallback={
+          fallbackCommand && view.openCommand ? (
+            <CodeBlock code={view.openCommand} testId="guide-command" />
+          ) : undefined
+        }
+      />
+      {howShown && <p className="max-w-(--measure) text-body text-ink-muted">{item.how}</p>}
+    </>
+  );
+
+  const checkedBy = checkedByOf(item.checkedBy, proofType);
+  const goes = goesToOf(item.route);
+  const steps = stepsOf(item, guide, view.lines);
+  const howChecked = ledger || Boolean(proofType) || Boolean(item.check);
+  const recordFolds: RecordFold[] = [
+    ...(howChecked || item.checkedBy
+      ? [
+          {
+            value: 'check' as const,
+            label: 'How it’s checked',
+            summary: checkedBy,
+            testId: 'turn-check-fold',
+            body: (
+              <>
+                {howChecked && (
+                  <HowChecked
+                    check={item.check}
+                    proofType={proofType}
+                    proof={record?.proof ?? item.step?.proof}
+                    proofWords={record?.proofWords ?? item.step?.proofWords}
+                    kind={item.kind}
+                  />
+                )}
+                <CheckedBy checkedBy={item.checkedBy} />
+              </>
+            ),
+          },
+        ]
+      : []),
+    ...(goes
+      ? [
+          {
+            value: 'route' as const,
+            label: 'Where it goes',
+            summary: goes.label,
+            testId: 'turn-route-fold',
+            body: <GoesTo route={item.route} />,
+          },
+        ]
+      : []),
+    {
+      value: 'timing',
+      label: 'Timing',
+      summary: <TimingSummary timing={timing} live={live} />,
+      testId: 'turn-timing-fold',
+      body: <TimingGrid timing={timing} notYet={notYet} live={live} />,
+    },
+    ...(!stepsFirst && stepsShown
+      ? [
+          {
+            value: 'steps' as const,
+            label: 'Steps',
+            ...(steps.count ? { count: steps.count } : {}),
+            ...(steps.first ? { summary: `First: ${plainStep(steps.first)}` } : {}),
+            testId: 'turn-steps-fold',
+            body: stepsPart,
+          },
+        ]
+      : []),
+    {
+      value: 'history',
+      label: 'History',
+      summary: historyWords(item, record),
+      testId: 'turn-history-toggle',
+      body: <History item={item} record={record} view={view} />,
+    },
+  ];
+
   return (
     <article
       id={`turn-item-${item.item}`}
@@ -1101,169 +1461,180 @@ export function ItemCard({
       aria-current={focused ? 'true' : undefined}
       aria-labelledby={titleId}
       className={cn(
-        'flex min-w-0 flex-col gap-4 rounded-lg border bg-surface p-4 sm:p-5',
+        // A container (Tower strips, 2026-10-20): the card lays itself out by
+        // its OWN width — in a drawer, the panel's column or the page — never
+        // the viewport's. Contained, its content no longer says how wide it
+        // would like to be, so it says so itself: the measure and its padding,
+        // which a drawer that fits its record reads (`.sheet-fit`).
+        '@container/card min-w-0 rounded-lg border bg-surface',
+        '[contain-intrinsic-inline-size:calc(var(--measure)+2.5rem)]',
         focused ? 'border-ink' : 'border-rule',
+        // A strip: the 4 px leading edge in the hue of the person's status —
+        // the lead badge's own paint, so the two never disagree.
+        edgeOf(status),
+        'border-s-4 border-s-state-vivid',
       )}
     >
-      <Head item={card} titleId={titleId} title={title} when={timing.startWhen} onInspect={onInspect}>
-        {risk && <OpsStatus vocab="risk" word={risk} />}
-      </Head>
-
-      <Meta item={item} record={record} />
-
-      <TimingGrid timing={timing} notYet={notYet} live={live} />
-
-      <WhyLine item={item} why={why} inferred={inferred} />
-
-      {folded && (
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-expanded={open}
-          data-testid="turn-item-toggle"
-          data-print="hide"
-          className="self-start"
-          onClick={() => setOpen((was) => !was)}
+      <div className="flex min-w-0 flex-col gap-4 p-4 @xl/card:p-5">
+        <Head
+          item={card}
+          titleId={titleId}
+          title={title}
+          when={timing.startWhen}
+          attempt={verdict?.attempt}
+          size={inPanel ? 'title' : 'section'}
+          facts={<Meta item={item} record={record} timing={timing} live={live} />}
+          onInspect={onInspect}
         >
-          <ChevronDown
-            size={14}
-            aria-hidden
-            className={cn('transition-transform duration-fast ease-transit', open && 'rotate-180')}
-          />
-          {open ? 'Fold it' : notYet ? 'What it will ask' : 'What it asked, and how it ended'}
-        </Button>
-      )}
+          {risk && <OpsStatus vocab="risk" word={risk} chrome="badge" />}
+        </Head>
 
-      <div
-        data-testid="turn-body"
-        data-print="open"
-        className={cn('min-w-0 flex-col gap-4', open ? 'flex' : 'hidden')}
-      >
-        {item.request && (
-          <p data-testid="turn-request" className="max-w-prose text-body text-ink">
-            {item.request.ask}
-          </p>
-        )}
-        {!ownCard && OwnerRequests && <OwnerRequests requests={item.requests} />}
-
-        {/* The verdict, BEFORE the steps — it changes what they are for. */}
-        {fresh && CheckOutcome && <CheckOutcome answer={fresh} record={record} />}
-        {verdict && verdict.state !== 'passed' && live && !checking && !echoed && (
-          <Verdict verdict={verdict} />
-        )}
-        {checking && <CheckingLine attempts={attempts} ledger={ledger} />}
-        {item.settled && <SettledLine settled={item.settled} />}
-        {verdict && verdict.state === 'passed' && !echoed && <Verdict verdict={verdict} />}
-        {settled && record?.answer && !verdict && (
-          <p className="max-w-prose text-body text-ink">
-            <span className="font-medium">Answered: </span>
-            {[record.answer.label ?? record.answer.option, record.answer.note].filter(Boolean).join(' — ')}
-          </p>
-        )}
-
-        <FromTheAI
-          tried={record?.tried}
-          note={record?.note ?? item.step?.note}
-          overruled={record?.overruled}
-        />
-
-        {permission && !ownCard && <PermissionFacts permission={permission} />}
-
-        {view.code && <DeviceCode code={view.code} />}
-        {view.act && view.path && (
-          <p className="max-w-prose text-body text-ink-muted" data-testid="step-protected">
-            The edit is to <code className="font-mono text-meta text-ink">{view.path}</code>: {view.act}
-          </p>
-        )}
-        <CoverLinks coveredBy={item.step?.coveredBy} covers={item.step?.covers} />
-        <Steps
-          item={item}
-          guide={guide}
-          lines={view.lines}
-          fallback={
-            view.openCommand && !permission ? (
-              <CodeBlock code={view.openCommand} testId="guide-command" />
-            ) : undefined
-          }
-        />
-        {!guide &&
-          !item.steps?.length &&
-          !view.lines.length &&
-          item.record !== 'ledger' &&
-          !item.supervisor &&
-          item.how && <p className="max-w-prose text-body text-ink-muted">{item.how}</p>}
-        {view.qr && live && (
-          <PhoneLink url={view.qr}>
-          </PhoneLink>
-        )}
-        {item.kind === 'secret-entry' && live && <SecretWhere where={record?.secretWhere} />}
-        {(ledger || proofType || item.check) && (
-          <HowChecked
-            check={item.check}
-            proofType={proofType}
-            proof={record?.proof ?? item.step?.proof}
-            proofWords={record?.proofWords ?? item.step?.proofWords}
-            kind={item.kind}
-          />
-        )}
-        <Routing route={item.route} checkedBy={item.checkedBy} />
-        {lastNote && (
-          <p data-testid="turn-check-note" className="max-w-prose text-body text-ink">
-            <span className="font-medium">Your note with attempt {lastNote.attempt}: </span>
-            {lastNote.text}
-          </p>
-        )}
-
-        {/* ONE act form, by the move table — a permission's is the card the screen lends, an approval at a scope. */}
-        {ownCard && PermissionCard && permission ? (
-          <PermissionCard
-            item={item}
-            permission={permission}
-            row={row}
-            perform={perform}
-            busy={busy}
-            live={live && !notYet && !checking}
-          />
-        ) : (
-          actForm()
-        )}
-        {live && flagged.length > 0 && <FlaggedActions actions={flagged} />}
-        {held.held && <HeldLine held={held.held} onUndo={held.undo} onSendNow={held.sendNow} />}
-        {/* What the last press answered that is a next step (#368) — a sign-in's terminal, an errand tree's paths. */}
-        {live && <NextStepNote id={row.id} />}
-
-
-
-        {moves && (
-          <div
-            data-testid="turn-more-moves"
+        {folded && (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-expanded={open}
+            data-testid="turn-item-toggle"
             data-print="hide"
-            className="flex flex-wrap items-center gap-1.5"
+            className="self-start"
+            onClick={() => setOpen((was) => !was)}
           >
-            {moves}
-          </div>
+            <ChevronDown
+              size={14}
+              aria-hidden
+              className={cn('transition-transform duration-fast ease-transit', open && 'rotate-180')}
+            />
+            {open ? 'Fold it' : notYet ? 'What it will ask' : 'What it asked, and how it ended'}
+          </Button>
         )}
 
-        {escalated && (
-          <Escalation
-            attempts={attempts}
-            busy={extra.busy !== null}
-            onRewrite={() => void extra.rewrite()}
-            onCannot={verbs.cannot}
-            onOverride={() => void extra.override()}
+        <div
+          data-testid="turn-body"
+          data-print="open"
+          className={cn('min-w-0 flex-col gap-4', open ? 'flex' : 'hidden')}
+        >
+          {item.request && (
+            <p data-testid="turn-request" className="max-w-(--measure) text-body text-ink">
+              {item.request.ask}
+            </p>
+          )}
+          {!ownCard && OwnerRequests && <OwnerRequests requests={item.requests} />}
+
+          {/* The verdict, right after the head and BEFORE the steps — it changes what they are for. */}
+          {fresh && CheckOutcome && <CheckOutcome answer={fresh} record={record} />}
+          {verdict && verdict.state !== 'passed' && live && !checking && !echoed && (
+            <Verdict verdict={verdict} />
+          )}
+          {checking && <CheckingLine attempts={attempts} ledger={ledger} />}
+          {item.settled && <SettledLine settled={item.settled} />}
+          {verdict && verdict.state === 'passed' && !echoed && <Verdict verdict={verdict} />}
+          {settled && record?.answer && !verdict && (
+            <p className="max-w-(--measure) text-body text-ink">
+              <span className="font-medium">Answered: </span>
+              {[record.answer.label ?? record.answer.option, record.answer.note].filter(Boolean).join(' — ')}
+            </p>
+          )}
+          {lastNote && (
+            <p data-testid="turn-check-note" className="max-w-(--measure) text-body text-ink">
+              <span className="font-medium">Your note with attempt {lastNote.attempt}: </span>
+              {lastNote.text}
+            </p>
+          )}
+
+          <FromTheAI
+            tried={record?.tried}
+            note={record?.note ?? item.step?.note}
+            overruled={record?.overruled}
           />
-        )}
 
-        {!ledger && (
-          <a
-            href={toHash(item.href)}
-            className="tap-row w-fit text-meta text-ink-muted underline underline-offset-2"
+          {/* THE ACT, before the record of it (Tower strips): why only the person fits it, what they
+              need to do it — a Task's and a Heads-up's steps first — and ONE act form, by the move table. */}
+          <div
+            data-testid="turn-act-section"
+            data-type={words.type}
+            role="group"
+            aria-labelledby={actLabelId}
+            className="flex min-w-0 flex-col gap-3"
           >
-            Open where it lives
-          </a>
-        )}
+            <p id={actLabelId} data-testid="turn-act-label" className="text-meta font-medium text-ink-muted">
+              {actLabel}
+            </p>
+            <WhyLine item={item} why={why} inferred={inferred} />
+            {words.type === 'decide' && guide && <GuideSummary guide={guide} />}
 
-        <History item={item} record={record} view={view} />
+            {permission && !ownCard && <PermissionFacts permission={permission} />}
+
+            {view.code && <DeviceCode code={view.code} />}
+            {view.act && view.path && (
+              <p className="max-w-(--measure) text-body text-ink-muted" data-testid="step-protected">
+                The edit is to <code className="font-mono text-meta text-ink">{view.path}</code>: {view.act}
+              </p>
+            )}
+            {stepsFirst && stepsPart}
+            {view.qr && live && (
+              <PhoneLink url={view.qr}>
+              </PhoneLink>
+            )}
+            {item.kind === 'secret-entry' && live && <SecretWhere where={record?.secretWhere} />}
+
+            {/* ONE act form, by the move table — a permission's is the card the screen lends, an approval at a scope;
+              a press that went through, what was sent, until the server moves the item. */}
+            {ownCard && PermissionCard && permission ? (
+              <PermissionCard
+                item={item}
+                permission={permission}
+                row={row}
+                perform={perform}
+                busy={busy}
+                live={live && !notYet && !checking}
+                pinned={inPanel}
+              />
+            ) : sentNow && sent ? (
+              <SentAct sent={sent} onShowAgain={() => setSent(null)} />
+            ) : (
+              actForm()
+            )}
+            {live && flagged.length > 0 && <FlaggedActions actions={flagged} />}
+            {held.held && <HeldLine held={held.held} onUndo={held.undo} onSendNow={held.sendNow} />}
+            {/* What the last press answered that is a next step (#368) — a sign-in's terminal, an errand tree's paths. */}
+            {live && <NextStepNote id={row.id} />}
+
+
+
+            {moves && (
+              <div
+                data-testid="turn-more-moves"
+                data-print="hide"
+                className="flex flex-wrap items-center gap-1.5"
+              >
+                {moves}
+              </div>
+            )}
+
+            {escalated && (
+              <Escalation
+                attempts={attempts}
+                busy={extra.busy !== null}
+                onRewrite={() => void extra.rewrite()}
+                onCannot={verbs.cannot}
+                onOverride={() => void extra.override()}
+              />
+            )}
+
+            {!ledger && (
+              <a
+                href={toHash(item.href)}
+                className="tap-row w-fit text-meta text-ink-muted underline underline-offset-2"
+              >
+                Open where it lives
+              </a>
+            )}
+          </div>
+
+          {/* THE RECORD, after the act, as fold strips: how it is checked, where it goes, its clocks,
+              a decision's or an approval's steps (open at first), and its history. */}
+          <RecordFolds folds={recordFolds} everything={everything} />
+        </div>
       </div>
 
       {view.openCommand && (
@@ -1275,5 +1646,402 @@ export function ItemCard({
         />
       )}
     </article>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * The card from an inbox row — a step a surface holds only as its row
+ * ------------------------------------------------------------------ *
+ *
+ * When a run needs an act only a person can do, a surface that holds the
+ * row and not the turn's item — the bell, a run strip — says so in one place
+ * and one shape: what to do, where, the ONE action for that kind, *Open again*
+ * whenever they want it, and the proof when it lands. Every row that is a
+ * person's turn carries the same view (`humanStepView`) — a ledger step and
+ * each card the console folds into the family (a sign-in, an MCP sign-in, the
+ * verification card, a plan to approve, a gate, a relayed question, a QA
+ * verdict, a protected edit):
+ *
+ *   1. its state as a dot and a word, the kind's glyph and plain label — read
+ *      from `KIND_META`, the ONE place a kind is named — and where it is done;
+ *   2. the step's own words, and its numbered lines;
+ *   3. a device code, large, mono, selectable and copyable;
+ *   4. ONE primary action chosen by kind (`PRIMARY_ACT`), then *Open again*,
+ *      *Check now*, *Snooze* and *I can't do this*;
+ *   5. a quiet status line — opened, last checked, next reminder, expiry —
+ *      and the proof's own words when a check did not land;
+ *   6. one press away, every datum: who declared it and when, each open, each
+ *      check and what it read, the proof ref, the window — and the raw record
+ *      one more.
+ *
+ * A folded card (no ledger step behind it) keeps the actions its row carries:
+ * its primary is the row's recommended verb, performed exactly as the server
+ * spelled it. A `secret-entry` card has no field for its value.
+ */
+
+/** The datums of a step — one press away, and the raw record one more. */
+function StepDatums({ view, record }: { view: HumanStepView; record: HumanStepRecord | undefined }) {
+  const rows: KeyValueItem[] = [];
+  if (record) {
+    const who =
+      record.birth === 'session' && record.sessionId
+        ? `${BIRTH_WORDS.session} (${record.sessionId})`
+        : (BIRTH_WORDS[record.birth] ?? record.birth);
+    rows.push(['Declared by', `${who}, ${stamp(record.declaredAt)}`]);
+    rows.push([
+      'For',
+      // Phase 0 is the plan's own act, under its `## Operator errands`.
+      `${record.slug}, ${record.phase ? `phase ${record.phase}` : 'the plan itself'}${record.runId ? ` (run ${record.runId})` : ''}`,
+    ]);
+  }
+  const proof = record?.proof ?? view.proof;
+  rows.push(['What proves it', proof ? <code className="font-mono wrap-anywhere">{proof}</code> : '—']);
+  const dueWhen = record?.dueWhen ?? view.dueWhen;
+  if (dueWhen)
+    rows.push([
+      'Due when',
+      <>
+        <code className="font-mono wrap-anywhere">{dueWhen}</code>
+        {record?.dueAt ? ` landed, ${stamp(record.dueAt)}` : ' lands'}
+      </>,
+    ]);
+  if (record)
+    rows.push([
+      'The window',
+      record.state === 'upcoming'
+        ? 'starts when it is due'
+        : `${stamp(record.dueAt ?? record.declaredAt)} until ${stamp(record.windowEnd ?? record.until)}`,
+    ]);
+  if (record?.provenBy) rows.push(['Proven by', record.provenBy]);
+  if (record?.note) rows.push(['Last word', record.note]);
+  const moves = record?.moves ?? [];
+  return (
+    <div data-testid="step-datums" className="flex min-w-0 flex-col gap-3 rounded-md bg-ground px-3 py-2.5">
+      <KeyValue items={rows} />
+      {view.stepId && !record && <p className="text-meta text-ink-muted">Reading the ledger…</p>}
+      {moves.length > 0 && (
+        <div className="flex min-w-0 flex-col gap-1">
+          <p className="text-meta font-medium text-ink">Every open and every check</p>
+          <ol className="flex flex-col gap-0.5">
+            {moves.map((move, index) => (
+              <MoveLine key={`${move.at}-${index}`} move={move} />
+            ))}
+          </ol>
+        </div>
+      )}
+      <Disclosure testId="step-raw-toggle" label="The raw record" openLabel="Hide the raw record">
+        <RawRecord testId="step-raw" value={record ? { ...record } : view} />
+      </Disclosure>
+    </div>
+  );
+}
+
+export interface StepCardProps {
+  /** The inbox row that is a person's turn — its `humanStep` view, and its actions. */
+  item: InboxItem;
+  /** `row` folds the card to a line that expands in place; `primary` is its one action alone (a strip's). */
+  variant?: 'full' | 'row' | 'primary';
+  /** Performs a folded card's row actions, exactly as the server spelled them. */
+  perform?: StepPerform | undefined;
+  /** `${item.id}:${verb}` of whatever row action is in flight. */
+  busy?: string | undefined;
+  className?: string | undefined;
+  /** The primary's test id — a strip names its one action `strip-action`. */
+  testId?: string | undefined;
+}
+
+/** A person's step from its inbox row — whole, folded to a line, or its one action alone. */
+export function StepCard({ variant = 'full', ...props }: StepCardProps) {
+  const view = props.item.humanStep;
+  if (!view) return null;
+  if (variant === 'primary') return <StepPrimary {...props} view={view} />;
+  return variant === 'row' ? <StepRow {...props} view={view} /> : <StepWhole {...props} view={view} />;
+}
+
+function StepRow({ item, view, perform, busy, className }: StepCardProps & { view: HumanStepView }) {
+  const [open, setOpen] = useState(false);
+  // An act born before it is due is shown, never pressed: the ledger refuses an
+  // open or a check until its due-when ref lands.
+  const upcoming = view.state === 'upcoming';
+  return (
+    <div
+      data-testid="human-step-row"
+      data-kind={view.kind}
+      data-state={view.state}
+      className={cn('flex min-w-0 flex-col gap-2', className)}
+    >
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+        {/* The row's title is the composer's — the act, as the card heads it
+            (turn-by-turn phase 10); the step's own words are the fallback. */}
+        <span data-testid="step-title" className="min-w-0 flex-1 basis-48 text-body font-medium text-ink">
+          {(item.kind === 'human-step' && item.title) || view.title}
+        </span>
+        <KindMark kind={view.kind} />
+        <WhereWord where={view.where} />
+        {item.slug && (
+          <span className="text-meta text-ink-muted" data-testid="step-scope">
+            {item.slug}
+            {item.phase != null ? `, phase ${item.phase}` : ''}
+          </span>
+        )}
+      </div>
+      {view.code && <DeviceCode code={view.code} />}
+      {upcoming && !open && <DueLine dueWhen={view.dueWhen} />}
+      {view.kind === 'operator-act' && view.openCommand && !open && (
+        <StepCommand command={view.openCommand} />
+      )}
+      {/* `relative`: in a row with a pick box, the box's touch overlay overhangs
+          its box past the row's gap, and this line starts flush under it — an
+          unpositioned primary would lose its corner to the box. */}
+      <div className="relative flex flex-wrap items-center gap-1.5">
+        {!open && !upcoming && <StepPrimary item={item} view={view} perform={perform} busy={busy} />}
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-expanded={open}
+          data-testid="step-expand"
+          onClick={() => setOpen((was) => !was)}
+        >
+          <ChevronDown
+            size={14}
+            aria-hidden
+            className={cn('transition-transform duration-fast ease-transit', open && 'rotate-180')}
+          />
+          {open ? 'Fold the step' : 'The whole step'}
+        </Button>
+      </div>
+      {open && (
+        <div className="expand-region">
+          <div>
+            <StepWhole item={item} view={view} perform={perform} busy={busy} embedded />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StepWhole({
+  item,
+  view,
+  perform,
+  busy,
+  className,
+  embedded = false,
+}: StepCardProps & { view: HumanStepView; embedded?: boolean }) {
+  const verbs = useStepVerbs(view);
+  const { data: list } = useHumanSteps(Boolean(view.stepId));
+  const record = view.stepId ? list?.steps.find((step) => step.id === view.stepId) : undefined;
+  const [asking, setAsking] = useState(false);
+  const [reason, setReason] = useState('');
+  const state = record?.state ?? view.state;
+  const live = isOpenState(state);
+  // Coming up: open, but not yet a person's turn — nothing to open, check or
+  // snooze until its due-when ref lands.
+  const upcoming = state === 'upcoming';
+  const due = live && !upcoming;
+  const opened = Math.max(record?.opened ?? 0, verbs.answer?.opened?.n ?? 0);
+  const act = primaryActOf(view);
+  const canOpen = Boolean(view.stepId && (view.openUrl || view.openCommand));
+  const read = verbs.answer?.check && !verbs.answer.check.landed ? verbs.answer.check.read : record?.read;
+  const unlanded =
+    live && Boolean(read) && (verbs.answer?.check ? !verbs.answer.check.landed : (record?.checks ?? 0) > 0);
+  const { rest } = splitActions(item);
+  const now = Date.now();
+  // The card a push pointed at (`#/approve?step=<id>`) says so to a screen reader.
+  const pointed = useRoute().query.step === view.stepId && Boolean(view.stepId);
+
+  return (
+    <section
+      data-testid="human-step-card"
+      data-kind={view.kind}
+      data-state={state}
+      data-fold={view.fold ?? undefined}
+      aria-current={pointed ? 'true' : undefined}
+      aria-label={`${upcoming ? 'Coming up' : 'Your turn'}: ${KIND_META[view.kind].label}`}
+      className={cn('flex min-w-0 flex-col gap-3', className)}
+    >
+      {!embedded && (
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+          <span data-testid="step-state">
+            <OpsStatus vocab="step" word={state as HumanStepState} />
+          </span>
+          <KindMark kind={view.kind} />
+          <WhereWord where={view.where} />
+          <span className="text-meta text-ink-muted" data-testid="step-scope">
+            {item.slug ?? 'no plan named'}
+            {item.phase != null ? `, phase ${item.phase}` : ''}
+          </span>
+        </div>
+      )}
+      {!embedded && (
+        <p data-testid="step-title" className="max-w-prose text-section font-semibold text-ink">
+          {view.title}
+        </p>
+      )}
+      {upcoming && <DueLine dueWhen={record?.dueWhen ?? view.dueWhen} />}
+      {view.kind === 'operator-act' && view.openCommand && <StepCommand command={view.openCommand} />}
+      {view.lines.length > 0 && (
+        <ol
+          data-testid="step-lines"
+          className="flex max-w-prose list-decimal flex-col gap-1 ps-5 text-body text-ink"
+        >
+          {view.lines.map((line, index) => (
+            <li key={`${index}-${line}`}>{line}</li>
+          ))}
+        </ol>
+      )}
+      {view.act && view.path && (
+        <p className="max-w-prose text-meta text-ink-muted" data-testid="step-protected">
+          The edit is to <code className="font-mono text-ink">{view.path}</code>: {view.act}
+        </p>
+      )}
+      {!embedded && view.code && <DeviceCode code={view.code} />}
+      {view.kind === 'secret-entry' && live && <SecretWhere where={record?.secretWhere} />}
+      {verbs.confirm && (
+        <div
+          data-testid="step-confirm"
+          className="flex min-w-0 flex-col gap-2 rounded-md bg-ground px-3 py-2.5"
+        >
+          <p className="text-body text-ink">Open this on the machine the console runs on?</p>
+          <code dir="ltr" className="font-mono text-meta wrap-anywhere text-ink">
+            {verbs.confirm}
+          </code>
+          <div className="flex flex-wrap gap-1.5">
+            <Button variant="primary" onClick={verbs.openOnMachine}>
+              Open it there
+            </Button>
+            <Button variant="ghost" onClick={verbs.cancelConfirm}>
+              Not now
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-1.5" data-testid="step-actions">
+        {!upcoming && (
+          <StepPrimaryButton
+            item={item}
+            view={{ ...view, state }}
+            verbs={verbs}
+            perform={perform}
+            busy={busy}
+            size="md"
+          />
+        )}
+        {canOpen && due && (
+          <Button data-testid="step-open-again" disabled={verbs.busy === 'open'} onClick={() => verbs.open()}>
+            Open again
+          </Button>
+        )}
+        {view.stepId && due && view.where === 'host' && view.openUrl && list?.can.openHost && (
+          <Button variant="ghost" data-testid="step-open-host" onClick={verbs.openOnMachine}>
+            Open on the machine
+          </Button>
+        )}
+        {view.stepId && due && act !== 'check' && (
+          <Button data-testid="step-check" disabled={verbs.busy === 'check'} onClick={() => verbs.check()}>
+            Check now
+          </Button>
+        )}
+        {view.stepId && due && (
+          <Button
+            variant="ghost"
+            data-testid="step-snooze"
+            disabled={verbs.busy === 'snooze'}
+            onClick={() => verbs.snooze()}
+          >
+            Snooze
+          </Button>
+        )}
+        {view.stepId && live && (
+          <Button
+            variant="ghost"
+            data-testid="step-cannot"
+            aria-expanded={asking}
+            onClick={() => setAsking((was) => !was)}
+          >
+            I can’t do this
+          </Button>
+        )}
+        {!view.stepId &&
+          perform &&
+          rest.map((action) => (
+            <Button
+              key={action.verb}
+              data-verb={action.verb}
+              disabled={Boolean(action.flag) || busy === `${item.id}:${action.verb}`}
+              onClick={() => perform(item, action)}
+            >
+              {action.label}
+            </Button>
+          ))}
+      </div>
+
+      {asking && (
+        <form
+          className="flex max-w-prose flex-wrap items-end gap-1.5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            verbs.cannot(reason);
+            setAsking(false);
+            setReason('');
+          }}
+        >
+          <label className="flex min-w-48 flex-1 flex-col gap-1 text-meta text-ink-muted">
+            Why not? It becomes an errand with your words.
+            <Input
+              data-testid="step-cannot-reason"
+              block
+              value={reason}
+              placeholder="Who can do it, or what is in the way"
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </label>
+          <Button type="submit" disabled={!reason.trim()}>
+            Hand it back
+          </Button>
+        </form>
+      )}
+
+      {view.stepId && !upcoming && (
+        <p data-testid="step-status" className="flex flex-wrap gap-x-3 gap-y-0.5 text-meta text-ink-muted">
+          {statusParts(record ?? { opened }, opened, now).map((part, index) => (
+            <span key={part.key} data-part={part.key}>
+              {index > 0 && <span className="sr-only">, </span>}
+              {part.text}
+            </span>
+          ))}
+        </p>
+      )}
+      {unlanded && read && (
+        <p data-testid="step-read" className="max-w-prose text-meta text-ink">
+          The check did not land. The proof read: <span className="text-ink-muted">{read}</span>
+        </p>
+      )}
+      {!live && state === 'proven' && (
+        <p data-testid="step-proven" className="text-meta text-ink">
+          Proven{record?.provenBy ? ` by ${record.provenBy}` : ''} — the phase carries on.
+        </p>
+      )}
+
+      <Disclosure
+        testId="step-details-toggle"
+        label="Details: who asked, each open and check, the proof, the window"
+        openLabel="Hide the details"
+        bodyClassName="pt-2"
+      >
+        <StepDatums view={view} record={record} />
+      </Disclosure>
+
+      {view.openCommand && (
+        <StepTerminalSheet
+          ticket={verbs.ticket}
+          command={view.openCommand}
+          title={view.title}
+          onClose={verbs.closeTerminal}
+        />
+      )}
+    </section>
   );
 }

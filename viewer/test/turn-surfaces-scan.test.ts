@@ -47,9 +47,8 @@ const FAMILY = (rel: string): boolean =>
     'cards/lazy-item-row.tsx',
     'cards/decision-card.tsx',
     'cards/guide.tsx',
-    'cards/human-step-card.tsx',
     'cards/human-step-words.ts',
-    'cards/human-step-lazy.tsx',
+    'cards/lazy-step-card.tsx',
     'cards/step-terminal-sheet.tsx',
   ].includes(rel);
 
@@ -130,6 +129,12 @@ test('TS-2 each older surface draws the item through the row variant, which link
   assert.match(lazyDoor, /lazy\(\(\) => import\('\.\/item-row'\)\)/);
   for (const { rel, source } of files) {
     assert.doesNotMatch(source, /from '@\/cards\/item-row'/, `${rel} imports the row statically`);
+  }
+  // So is the one card, where a surface draws a step from its inbox row (measured-console phase 32).
+  assert.match(read('cards/lazy-step-card.tsx'), /lazy\(\(\) => import\('\.\/item-card'\)/);
+  for (const rel of ['cards/inbox-row.tsx', 'screens/runs/run-detail.tsx']) {
+    assert.doesNotMatch(read(rel), /from '(@\/cards|\.)\/item-card'/, `${rel} imports the card statically`);
+    assert.match(read(rel), /\bLazyStepCard\b/, `${rel} draws a step through LazyStepCard`);
   }
 });
 

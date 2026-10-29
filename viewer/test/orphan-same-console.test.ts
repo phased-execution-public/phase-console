@@ -24,9 +24,10 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
@@ -193,17 +194,11 @@ test('OR-9: a child whose console is gone — another pid, or this pid on an ear
 
 type Repo = { root: string; scripts: string; markDone: () => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-orphan-runner-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-orphan-runner-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"
 case "\${2:-}" in
   --memory-block)
@@ -214,14 +209,12 @@ case "\${2:-}" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: () => writeFileSync(join(stub, 'done'), '1\n'),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: () => writeFileSync(join(made.state, 'done'), '1\n') };
 }
 
 function ok(): SpawnOutcome {
@@ -237,7 +230,7 @@ test('OR-10: every child is stamped at launch with the console that launched it 
   assert.equal(live.pid, process.pid);
   assert.ok(Math.abs(Date.parse(live.bootedAt) - Date.parse(BOOTED_AT)) < 2_000, 'its boot is this process\'s start');
 
-  const r = repo();
+  const r = stubbedPlan();
   let seen: unknown;
   let instance!: InstanceType<typeof Runner>;
   const spawnFn: SpawnFn = async (request) => {
@@ -259,7 +252,7 @@ test('OR-10: every child is stamped at launch with the console that launched it 
 });
 
 test('OR-11: a start beside a session this console launched is refused — never parked as an earlier console\'s orphan', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { child, pid, procStartedAt } = session();
   try {
     const stored = newRun({ slug: 'demo', root: r.root });

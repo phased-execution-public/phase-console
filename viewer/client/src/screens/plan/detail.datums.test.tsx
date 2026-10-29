@@ -435,7 +435,8 @@ describe('every datum of the 6.2 plan page is within two presses', () => {
     await screen.findByRole('link', { name: 'Cutover' });
     // On the row itself…
     await expectWithinTwo([
-      '03',
+      // The strip's plate (Tower strips) — the phase number, on the row.
+      'P3',
       'Cutover',
       'retire the old client',
       'qa:fail',
@@ -458,15 +459,15 @@ describe('every datum of the 6.2 plan page is within two presses', () => {
     expect(screen.getByRole('button', { name: 'Inspect phase 3' })).toBeInTheDocument();
   });
 
-  it('QA: the regime and its level, the verdict and its round, what it holds, the actions — on the QA reading', async () => {
+  it('QA: the regime and its level, the verdict and its round, what it holds, the actions — on the Handoffs & QA reading', async () => {
     openPlan();
     await screen.findByRole('table', { name: 'Phases' });
-    follow(within(readings()).getByRole('link', { name: 'QA' })); // the reading's link is the first press
-    await screen.findByRole('table', { name: 'QA by phase' });
+    follow(within(readings()).getByRole('link', { name: /^Handoffs & QA/ })); // the reading's link is the first press
+    await screen.findByRole('table', { name: 'Handoffs and QA by phase' });
     await expectWithinTwo(['round 2', 'holds P3', 'on, phase directive', 'on, plan']);
     expect(screen.getByRole('link', { name: /QA fail — open the report/ })).toHaveAttribute(
       'href',
-      '#/plan/alpha/phases?view=qa&report=2:2',
+      '#/plan/alpha/phases?view=handoffs&report=2:2',
     );
     openRow('Surface');
     await expectWithinTwo([
@@ -475,6 +476,12 @@ describe('every datum of the 6.2 plan page is within two presses', () => {
       'P3 — until this verdict changes',
     ]);
     expect(screen.getByRole('link', { name: 'Open the report' })).toBeInTheDocument();
+    // The opened row LEADS with the record: the QA card, its verdict the card's lead badge.
+    const card = screen.getByTestId('record-qa');
+    expect(card.querySelector('[data-vocab="qa-result"][data-chrome="tint"]')).toHaveAttribute(
+      'data-status',
+      'fail',
+    );
   });
 
   it('QA: the same facts from the table — unfold Done, open the row', async () => {
@@ -486,11 +493,11 @@ describe('every datum of the 6.2 plan page is within two presses', () => {
     await expectWithinTwo(['decided by the phase’s own QA bullet', 'round 2 of 2']);
   });
 
-  it('Handoffs: status, completed, title, size, skills and the INDEX row — on the Handoffs reading', async () => {
+  it('Handoffs: status, completed, title, size, skills and the INDEX row — on the Handoffs & QA reading', async () => {
     openPlan();
     await screen.findByRole('table', { name: 'Phases' });
-    follow(within(readings()).getByRole('link', { name: 'Handoffs' }));
-    await screen.findByRole('table', { name: 'Handoffs by phase' });
+    follow(within(readings()).getByRole('link', { name: /^Handoffs & QA/ }));
+    await screen.findByRole('table', { name: 'Handoffs and QA by phase' });
     await expectWithinTwo(['2026-09-01', 'no index row']);
     expect(
       document.querySelectorAll('[data-vocab="handoff"][data-status="complete"]').length,
@@ -511,14 +518,14 @@ describe('every datum of the 6.2 plan page is within two presses', () => {
   it('the plan’s own folds are under every reading, with no press', async () => {
     openPlan();
     await screen.findByRole('table', { name: 'Phases' });
-    for (const name of ['Table', 'Map', 'QA', 'Handoffs']) {
+    for (const name of [/^Table/, /^Map/, /^Handoffs & QA/]) {
       rerenderAt(
         parseHash(within(readings()).getByRole('link', { name }).getAttribute('href') ?? '') as Route,
       );
       const foot = await screen.findByTestId('phases-foot');
-      expect(within(foot).getByTestId('foot-left'), name).toBeInTheDocument();
-      expect(within(foot).getByTestId('landing-card'), name).toBeInTheDocument();
-      expect(within(foot).getByTestId('foot-banner'), name).toBeInTheDocument();
+      expect(within(foot).getByTestId('foot-left'), String(name)).toBeInTheDocument();
+      expect(within(foot).getByTestId('landing-card'), String(name)).toBeInTheDocument();
+      expect(within(foot).getByTestId('foot-banner'), String(name)).toBeInTheDocument();
     }
   });
 });

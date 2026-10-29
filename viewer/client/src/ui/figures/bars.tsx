@@ -56,6 +56,7 @@ import {
   SERIES,
   seriesHeight,
   textWidth,
+  unclashed,
   useWidth,
 } from './paint';
 import { linear, valueTicks, valueTicksWithin, type AxisWindow } from './scales';
@@ -581,7 +582,9 @@ export function BarListDrawing({
               // already see. The numbers are the same answer for everyone else.
               title={`${item.name}: ${valueText(item.value)}`}
             >
-              <span className="truncate text-meta text-ink-muted">{item.name}</span>
+              {/* Wrapped, never cut (#415): at 390 px a model id truncated to
+                  `claude-haik…` named nothing; the whole name breaks where it must. */}
+              <span className="min-w-0 text-meta text-ink-muted [overflow-wrap:anywhere]">{item.name}</span>
               <span
                 ref={i === 0 ? track : undefined}
                 className="relative h-1.5 overflow-hidden rounded-full bg-track"
@@ -725,6 +728,7 @@ export function SeriesDrawing({
   valueText,
   timeText,
   label,
+  summed = true,
 }: {
   buckets: readonly SeriesBucket[];
   rows: readonly SeriesRow[];
@@ -733,6 +737,12 @@ export function SeriesDrawing({
   /** A bucket's start as the axis and the readout write it. */
   timeText: (start: string) => string;
   label: string;
+  /**
+   * Whether the values add up. Dollars and tokens do; a rate, a load or a delta does not, and
+   * naming a total for them ("140% in all") would be a number nobody measured. Unsummed, a strip
+   * is named with its newest value and the figure's line says the newest and the tallest.
+   */
+  summed?: boolean;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const svg = useRef<SVGSVGElement>(null);
@@ -769,7 +779,15 @@ export function SeriesDrawing({
   const gap = Math.min(2, (x(1) - x(0)) * 0.2);
   const pitch = Math.max(0, ...buckets.map((b) => textWidth(timeText(b.start)))) + FIGURE_TYPE;
   const every = Math.max(1, Math.ceil((figure.view[1] - figure.view[0]) / Math.max(1, plotW / pitch)));
-  const labelled = buckets.map((_, i) => i).filter((i) => i % every === (count - 1) % every);
+  const timeWide = (i: number) => textWidth(timeText(buckets[i]?.start ?? ''));
+  // Thinned by pitch, then by what is actually drawn (#415): a label pulled
+  // inside the frame at an edge can still land on its neighbour at 390 px.
+  const labelled = unclashed(
+    buckets.map((_, i) => i).filter((i) => i % every === (count - 1) % every),
+    (i) => x(i + 0.5),
+    timeWide,
+    width,
+  );
   const cursor = figure.cursor;
   const axisAt = height - SERIES.times;
   const sum = rows.reduce((total, row) => total + row.values.reduce((a, b) => a + b, 0), 0);
@@ -780,7 +798,9 @@ export function SeriesDrawing({
       figure={figure}
       idle={
         max > 0
-          ? `${valueText(sum)} in all; the tallest column, on every strip, is ${valueText(max)}`
+          ? summed
+            ? `${valueText(sum)} in all; the tallest column, on every strip, is ${valueText(max)}`
+            : `the tallest column, on every strip, is ${valueText(max)}`
           : 'Nothing was spent in this window'
       }
       readout={cursor !== null && buckets[cursor] ? figure.sliderProps['aria-valuetext'] : null}
@@ -798,7 +818,7 @@ export function SeriesDrawing({
             const y0 = r * (SERIES.name + SERIES.strip + SERIES.gap);
             const base = y0 + SERIES.name + SERIES.strip;
             const total = row.values.reduce((a, b) => a + b, 0);
-            const name = `${row.name}  ${valueText(total)}`;
+            const name = `${row.name}  ${valueText(summed ? total : (row.values[count - 1] ?? 0))}`;
             return (
               <g key={row.name} data-row={row.name}>
                 <text
@@ -853,11 +873,7 @@ export function SeriesDrawing({
             tickLabelProps={(value) => ({
               ...AXIS_PAINT.tickLabelProps,
               dy: 0,
-              ...inside(
-                x(Number(value)),
-                textWidth(timeText(buckets[Math.floor(Number(value))]?.start ?? '')),
-                width,
-              ),
+              ...inside(x(Number(value)), timeWide(Math.floor(Number(value))), width),
             })}
           />
           {cursor !== null && buckets[cursor] ? (

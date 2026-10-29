@@ -79,7 +79,8 @@ export function togglePanel(mode: PanelMode): void {
   else openPanel(mode);
 }
 
-export function setPanelWidth(width: number): void {
-  patchPanel({ width: clampWidth(width) });
+/** A width a person set, clamped — or `auto`, the column that fits its record. */
+export function setPanelWidth(width: number | 'auto'): void {
+  patchPanel({ width: width === 'auto' ? 'auto' : clampWidth(width) });
 }
 

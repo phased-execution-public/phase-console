@@ -34,8 +34,8 @@ names below are the `source` values on every row and in `?source=`.
 |---|---|---|
 | `console` | `~/.local/state/phase-console/console.log` (+ a 200-entry in-memory ring) | The console's own NDJSON log: every degradation, refusal and exit reason. Rotated at 8 MB to a single `.1`. |
 | `supervisor` | `~/.local/state/phase-console/console.{out,err}.log` | A supervisor's raw stdout and stderr. **The only place a crash BEFORE the logger opened its file lands.** Present only when something supervises this console; the row says so when there is none. |
-| `journal` | `runs/<instance>/<slug>/run-<id>.jsonl` | The run's own journal — every event kind is catalogued in [journal-events.md](journal-events.md). One line per thing a lane did. |
-| `outcome` | `runs/<instance>/<slug>/outcomes/phase-NN.json` | What an **unsupervised** session declared about how it ended. A file here that the console will not act on shows up as `outcome.unreadable`, which is worth knowing. A declaration the console set aside — stale, unparseable, or one whose act threw — is kept under `outcomes/ignored/<name>.<reason>`, never deleted, and journalled `phase.outcome-ignored` (WAI-7). |
+| `journal` | `runs/<instance>/<slug>/run-<id>.jsonl` | The run's own journal — every event kind is catalogued in [journal-events.md](journal-events.md). One line per thing a lane did. At 32 MB it rotates: the full file becomes `run-<id>.jsonl.<n>`, `run-<id>.jsonl.index` lists the segments (`{n, file, firstSeq, lastSeq, bytes, offset}`), and the fresh file opens with `journal.rotated`; `seq` runs on unbroken, so read the index's segments first. |
+| `outcome` | `runs/<instance>/<slug>/outcomes/phase-NN-<stamp>.json` | What an **unsupervised** session declared about how it ended. A file here that the console will not act on shows up as `outcome.unreadable`, which is worth knowing. A declaration the console set aside — stale, unparseable, or one whose act threw — is kept under `outcomes/ignored/<name>.<reason>`, never deleted, and journalled `phase.outcome-ignored` (WAI-7). |
 | `ruling` | `runs/<instance>/<slug>/rulings.ndjson` | What sessions **decided** — ambiguities, deviations, deferrals. Per plan, append-only. |
 | `delivery` | `~/.local/state/phase-console/notifications/notifications.jsonl` | One row per device per announcement. Vocabulary below. |
 | `health` | in memory, from `env-doctor.ts` | The environment doctor's findings, each carrying its own fix. |
@@ -44,7 +44,11 @@ Two more per-run files are not in the index because neither is a log:
 
 - `runs/<instance>/<slug>/run-<id>.json` — the **checkpoint**: one record per
   phase, its status, its session id, its worktree and branch. This is the file
-  to read when you want state rather than history.
+  to read when you want state rather than history — with its delta: since 9.0
+  (`persistModel` 2) a save appends the records it changed to
+  `run-<id>.json.delta` and rewrites the base at most every minute, on a status
+  change or past 4 MB, so fold the delta's lines past the base's `persistGen`
+  (`GET /api/state` has already done it).
 - `runs/<instance>/<slug>/run-<id>-p<N>-tasks.ndjson` — a phase's published
   task list (`phase-tasks.sh`), which the console renders as *"What it is
   doing"*.

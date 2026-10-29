@@ -138,3 +138,125 @@ load ../helpers/test_helper
   run pg credentials --lint
   [[ "$output" != *"F15"* ]]
 }
+
+# --------------------------------------------------------------------------
+# §Session budget directives that share a line (measured-console phase 2, #419)
+# --------------------------------------------------------------------------
+
+@test "§Session budget: every directive after ' · ' is read — verify timeout, wait count, gitlink, issues, messaging" {
+  setup_docs directive-mid-line directive-mid-line
+  run pg directive-mid-line --verify-timeout 1
+  [ "$output" = "$(printf '90\tplan')" ]
+  run pg directive-mid-line --wait-count 1
+  [ "$output" = "$(printf '8\tplan')" ]
+  run pg directive-mid-line --wait-budget 1
+  [ "$output" = "$(printf '480\tplan')" ]
+  run pg directive-mid-line --gitlink 1
+  [ "$output" = "$(printf 'leave\tplan')" ]
+  run pg directive-mid-line --issues 1
+  [ "$output" = "$(printf 'draft\tplan')" ]
+  run pg directive-mid-line --messaging
+  [ "$output" = "$(printf 'off\tplan')" ]
+  # a phase's own bullet still wins
+  run pg directive-mid-line --verify-timeout 3
+  [ "$output" = "$(printf '30\tphase')" ]
+}
+
+@test "§Session budget: the first directive of a shared line keeps its value — a target model before ' · **Budget:**'" {
+  setup_docs directive-mid-line directive-mid-line
+  run pg directive-mid-line --model
+  [ "$output" = "claude-opus-5" ]
+}
+
+# --------------------------------------------------------------------------
+# The three bullets measured-console phase 6 adds: `Subagent model:` (a plan
+# line and a phase bullet over it), `Fast gate:` and `May delete tests:` (a
+# phase bullet only, each with a default of its own).
+# --------------------------------------------------------------------------
+
+@test "--subagent-model: the plan's quoted line, a phase's bullet over it, its first word only" {
+  setup_docs subagent-model subagent-model
+  run pg subagent-model --subagent-model
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'claude-sonnet-5-5\tplan')" ]
+  run pg subagent-model --subagent-model 1
+  [ "$output" = "$(printf 'claude-sonnet-5-5\tplan')" ]
+  run pg subagent-model --subagent-model 2
+  [ "$output" = "$(printf 'claude-haiku-4-5\tphase')" ]
+  # a bullet naming nothing falls through to the plan's line
+  run pg subagent-model --subagent-model 3
+  [ "$output" = "$(printf 'claude-sonnet-5-5\tplan')" ]
+  # bold and backticks stripped, the [1m] suffix kept, the prose after it dropped
+  run pg subagent-model --subagent-model 4
+  [ "$output" = "$(printf 'claude-opus-5-5[1m]\tphase')" ]
+}
+
+@test "--subagent-model: a plan that never says answers NOTHING — the session decides" {
+  setup_docs model-policy model-policy
+  run pg model-policy --subagent-model 1
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run pg model-policy --subagent-model
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "--fast-gate N: the phase's word, else on from the default — a typo is silence" {
+  setup_docs subagent-model subagent-model
+  run pg subagent-model --fast-gate 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'on\tdefault')" ]
+  run pg subagent-model --fast-gate 2
+  [ "$output" = "$(printf 'off\tphase')" ]
+  run pg subagent-model --fast-gate 3
+  [ "$output" = "$(printf 'on\tdefault')" ]
+  run pg subagent-model --fast-gate 4
+  [ "$output" = "$(printf 'off\tphase')" ]
+  run pg subagent-model --fast-gate 5
+  [ "$output" = "$(printf 'on\tphase')" ]
+}
+
+@test "--may-delete-tests N: the phase's word, else no from the default — a typo is silence" {
+  setup_docs subagent-model subagent-model
+  run pg subagent-model --may-delete-tests 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'no\tdefault')" ]
+  run pg subagent-model --may-delete-tests 2
+  [ "$output" = "$(printf 'yes\tphase')" ]
+  run pg subagent-model --may-delete-tests 3
+  [ "$output" = "$(printf 'no\tdefault')" ]
+  run pg subagent-model --may-delete-tests 4
+  [ "$output" = "$(printf 'yes\tphase')" ]
+  run pg subagent-model --may-delete-tests 5
+  [ "$output" = "$(printf 'no\tphase')" ]
+}
+
+@test "--subagent-model, --fast-gate, --may-delete-tests: an unknown phase is a usage error; the two phase-only modes need N" {
+  setup_docs subagent-model subagent-model
+  for mode in --subagent-model --fast-gate --may-delete-tests; do
+    run pg subagent-model "$mode" 9
+    [ "$status" -eq 2 ]
+    assert_contains "$output" "phase 9 is not in this plan"
+  done
+  for mode in --fast-gate --may-delete-tests; do
+    run pg subagent-model "$mode"
+    [ "$status" -eq 2 ]
+    assert_contains "$output" "usage: phase-graph.sh <slug> $mode N"
+  done
+}
+
+@test "the three new labels are F50-anchored: written mid-line, the lint names them" {
+  setup_docs subagent-model subagent-model
+  run pg subagent-model --lint
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"F50"* ]]
+  plan="$DOCS_ROOT/docs/plans/subagent-model.md"
+  sed -e 's/^- \*\*Size:\*\* S$/- **Size:** S · **Fast gate:** off · **May delete tests:** yes · **Subagent model:** x/' \
+    -e 's/^A sentence here that says the subagent model/A sentence, **Subagent model:** y, that says the subagent model/' \
+    "$plan" > "$plan.new" && mv "$plan.new" "$plan"
+  run pg subagent-model --lint
+  assert_contains "$output" 'F50 phase 1: directive-mid-line — `**Fast gate:**` sits mid-line in a bullet'
+  assert_contains "$output" 'F50 phase 1: directive-mid-line — `**May delete tests:**` sits mid-line in a bullet'
+  assert_contains "$output" 'F50 phase 1: directive-mid-line — `**Subagent model:**` sits mid-line in a bullet'
+  assert_contains "$output" 'F50 §Session budget: directive-mid-line — `**Subagent model:**` sits mid-line'
+}

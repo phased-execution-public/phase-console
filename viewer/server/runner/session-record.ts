@@ -29,6 +29,7 @@
  */
 
 import type { CapSource, EndedBy, SessionMode } from '../../shared/run-lifecycle.js';
+import type { ResumeCost } from './state.ts';
 import { PERMISSION_PROMPTS_CLI_FLOOR, RELAY_CLI_FLOOR, versionAtLeast, type RelayMode } from '../../shared/run-settings.js';
 import { PHASE_WORK_MODES, addSessionWindow, phaseClocks } from '../../shared/phase-clocks.js';
 import type { SpawnOutcome, SpawnRequest } from './spawn.ts';
@@ -405,6 +406,24 @@ export function resolveCaps(request: Pick<SpawnRequest, 'caps' | 'maxTurns' | 'b
  * would drop the floor with nobody told. A run with no relay answer reads as
  * `off`, which is what every run before 5.0.0 was.
  */
+/**
+ * The last resume's own price, for the next brief (measured-console phase 12,
+ * A10): what the phase's newest resumed session said its `SessionStart` cost —
+ * how stale it was, what it re-sent and the CLI's estimate of the cache write —
+ * so the session boarding now knows what a resume of this phase costs. Empty
+ * when no resume has reported one.
+ */
+export function resumeCostWords(cost: ResumeCost | null | undefined): string {
+  if (!cost) return '';
+  const parts = [
+    typeof cost.secondsSinceLastResponse === 'number' ? `${Math.round(cost.secondsSinceLastResponse / 60)} min after its last response` : '',
+    typeof cost.contextTokens === 'number' ? `re-sending ${cost.contextTokens.toLocaleString('en-US')} tokens` : '',
+    cost.cacheLikelyExpired === true ? 'its prompt cache likely expired' : cost.cacheLikelyExpired === false ? 'its prompt cache likely warm' : '',
+    typeof cost.estimatedCacheWriteUsd === 'number' ? `≈ $${cost.estimatedCacheWriteUsd.toFixed(2)} to write the cache again` : '',
+  ].filter(Boolean);
+  return parts.length ? `This phase's last resume reported its own cost: ${parts.join(', ')}.` : '';
+}
+
 export function permissionPromptsFor(
   relay: RelayMode | null | undefined, version: string | null | undefined,
 ): { flag: 'none' | null; refused?: { reason: 'below-floor'; version: string; floor: string } } {

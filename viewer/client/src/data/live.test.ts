@@ -35,7 +35,7 @@ describe('SSE → Query bridge', () => {
     expect(extra, `phantom events: ${extra.join(', ')}`).toEqual([]);
   });
 
-  it('carries every wire name, run events included — 35 free, five more Pro', () => {
+  it('carries every wire name, run events included — 35 free, six more Pro', () => {
     // 28 since 2026-09-18: `restart`, a restart's update moving — every tab's
     // Restart card and banner hear it, not only the tab that pressed.
     expect(SSE_EVENTS).toContain('restart');

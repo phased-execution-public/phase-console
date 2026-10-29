@@ -138,3 +138,129 @@ describe('<HooksGroup>', () => {
     expect(toast).not.toHaveBeenCalledWith(expect.stringMatching(/installed/), 'ok');
   });
 });
+
+/* ---------------- Settings ▸ Hooks: every hook, and the hookify rules (measured-console phase 28) ---------------- */
+
+const route = vi.hoisted(() => ({ query: {} as Record<string, string> }));
+vi.mock('@/shell/router', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/shell/router')>()),
+  useRoute: () => ({ segments: ['settings', 'hooks'], query: route.query }),
+}));
+
+const { HooksSection, onFailureWords } = await import('./hooks');
+
+const HOOKS = {
+  hooks: [
+    {
+      source: 'plugin',
+      file: '/opt/skill/hooks/hooks.json',
+      event: 'SessionStart',
+      type: 'command',
+      runs: 'bash "${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh"',
+      timeout: 15,
+    },
+    {
+      source: 'run',
+      file: 'run-<id>.json',
+      event: 'PreToolUse',
+      matcher: 'Bash|Write',
+      type: 'http',
+      runs: '<console>/hooks/pre-tool-use',
+      timeout: 3600,
+      onFailure: 'block',
+    },
+    {
+      source: 'run',
+      file: 'run-<id>.json',
+      event: 'PermissionRequest',
+      matcher: '*',
+      type: 'http',
+      runs: '<console>/hooks/permission-request',
+      timeout: 3600,
+      onFailure: 'block',
+      when: 'a run whose relay is armed',
+    },
+  ],
+  hookify: [
+    {
+      slug: 'demo',
+      rules: [
+        {
+          rule: 'publish',
+          name: 'pe-demo-publish',
+          file: 'hookify.pe-demo-publish.local.md',
+          event: 'bash',
+          action: 'block',
+          pattern: 'git\\s+push',
+          source: 'permission.destructive',
+          words: 'This plan (demo) denies publishing.',
+        },
+        {
+          rule: 'host',
+          name: 'pe-demo-host',
+          file: 'hookify.pe-demo-host.local.md',
+          event: 'bash',
+          action: 'block',
+          pattern: 'sudo',
+          source: 'never',
+          words: 'On the never list.',
+        },
+      ],
+      onDisk: [
+        {
+          file: 'hookify.pe-demo-publish.local.md',
+          name: 'pe-demo-publish',
+          event: 'bash',
+          action: 'block',
+          enabled: true,
+          words: 'x',
+          current: true,
+        },
+      ],
+    },
+  ],
+};
+
+describe('<HooksSection>', () => {
+  it('draws the presence hook first, then every hook of a source with its onFailure and timeout', async () => {
+    serve(INSTALLED);
+    server.reads['/api/hooks'] = HOOKS;
+    route.query = { source: 'run' };
+    renderWithClient(<HooksSection />);
+    await waitFor(() => expect(words()).toHaveTextContent('Installed'));
+    const list = await screen.findByTestId('hooks-list');
+    const pre = list.querySelector('[data-hook-event="PreToolUse"]') as HTMLElement;
+    expect(pre).toHaveTextContent('3600 s');
+    expect(pre).toHaveTextContent('blocks the call if it fails');
+    expect(pre).toHaveTextContent('on Bash|Write');
+    expect(list.querySelector('[data-hook-event="PermissionRequest"]')).toHaveTextContent(
+      'Only on a run whose relay is armed.',
+    );
+    expect(list.querySelector('[data-hook-event="SessionStart"]')).toBeNull();
+    expect(screen.getByRole('link', { name: 'Run (2)' })).toBeTruthy();
+  });
+
+  it("draws each plan's hookify rules with their words and whether they are written", async () => {
+    serve(INSTALLED);
+    server.reads['/api/hooks'] = HOOKS;
+    route.query = {};
+    renderWithClient(<HooksSection />);
+    const plan = await waitFor(() => {
+      const found = document.querySelector('[data-hookify-plan="demo"]') as HTMLElement | null;
+      expect(found).toBeTruthy();
+      return found!;
+    });
+    const publish = plan.querySelector('[data-hookify-rule="publish"]') as HTMLElement;
+    expect(publish).toHaveTextContent('Blocks');
+    expect(publish).toHaveTextContent('permission.destructive · written');
+    expect(publish).toHaveTextContent('denies publishing');
+    expect(plan.querySelector('[data-hookify-rule="host"]')).toHaveTextContent(
+      'the never list · not written yet',
+    );
+  });
+
+  it('a hook with no onFailure carries on', () => {
+    expect(onFailureWords({})).toBe('carries on if it fails');
+    expect(onFailureWords({ onFailure: 'block' })).toBe('blocks the call if it fails');
+  });
+});

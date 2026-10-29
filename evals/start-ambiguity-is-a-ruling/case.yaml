@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: start-ambiguity-is-a-ruling
+description: 'mode-phase-start, It''s working if: every judgement call has a ruling (the plan''s `ambiguity` row says ruling).'
+tags: [phase-start, working-if, unattended]
+context:
+  scaffold_script: fixture.sh

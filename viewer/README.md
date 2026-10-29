@@ -358,6 +358,10 @@ session and then the errand. Exhaustion parks the phase with the errand — one 
 `phase.ladder-deferred` (a rung remains that only the healer can drive, on a stopped run; it names that
 rung as `next`). A situation whose table holds no rung this console can drive is spent at once — the
 phase parks with its errand, whose *how* says so — rather than waiting on a rung nothing will climb.
+A failure that names its **owner** — a red the phase's verification attributed to another phase, or a dependency the
+evaluator found `not met` — climbs `resume-owner` before the table's first row: when the owner's session passes the one
+resume gate it is resumed with the failure and its evidence (`phase.routed-to-owner`), once per failure, and only then
+does the generic fixer board.
 Each vehicle has a driver (`VEHICLE_DRIVERS`: `console`, `writes` for what needs `--allow-writes`,
 `agent` for a fresh session or pty agent, `never`). A tool call a deny rule refused
 (`blocked-declared:permission`) has one rung, `widen-rule`: a card, *Phase N: widen `<rule>`?*, whose
@@ -515,6 +519,12 @@ phase would then be reviewed twice at about $7–10 a phase. It is advice, never
 every installed plugin's — and appends the ones you pick to the boot prompt, per run or per phase.
 The plan's own `Skills (every session)` line still comes from the engine and is shown as fixed.
 
+**The plugin tree.** At boot the console materializes its own skill — `SKILL.md`, `references/`,
+`scripts/`, `templates/` and `hooks/hooks.json`, under 5 MB — at `<instance state>/plugin/<rev>/`
+(`server/plugin-tree.ts`, `scripts/build-plugin-tree.mjs`), so a session can load the skill of the
+console that launched it rather than whichever commit a config dir installed.
+
+
 **Talking to a running phase.** The session's stdin stays open, so a message is one more turn in the
 same conversation rather than a reason to stop it:
 
@@ -627,6 +637,23 @@ rest of this console, there is nothing to install — `node:crypto` has every pr
 that holds with this console dead — measured, not assumed. The `ask` list goes through an HTTP hook
 that **fails open**, so it carries workflow and never safety. Settings shows both, and says which is
 which.
+
+### How a session lives: compaction, a person's step, what it loads
+
+Four settings, new in 9.0, decide how a run's sessions live; each is on the launch form and under
+Settings ▸ Automation's defaults, and `docs/controls.md` says the whole of each.
+
+- **`compaction`** — `console` (the default) wraps a session up at 0.6× of its window and checkpoints
+  it at 0.8×; `native` lets Claude Code compact at `compactionWindow` (350,000), journalled
+  `phase.compaction`; `alternate` gives odd phases `native`.
+- **`humanStepMode`** — `defer` (the default on a CLI at 2.1.306 or later) pauses the session at its
+  `needs-human` call and carries the SAME session on from that call once the person's check passes;
+  `park` ends the turn and resumes the phase, as 8.0 did.
+- **`autopilotLoads`** — `console-set` (the default) loads the console's own skill tree and the
+  plugins switched on for autopilot, under `--setting-sources project,local`; `operator-config` loads
+  the session's config dir as it stands.
+- **Every hook the console registers blocks on failure**, and the Stop hook runs a phase's fast lines
+  once and holds a red exit (`- **Fast gate:** off` on a phase turns that off).
 
 ### Permissions: how much a run may do
 
@@ -1115,6 +1142,21 @@ lease; a live session's lock is a queue to wait in; a lock nobody reports keeps 
 `runs/<instance>/<slug>/outcomes/`, where the console picks it up: a `waiting-external` parks the
 phase and resumes that very session at the window, a `partial` boards it again with a resume. Off by
 default — installing the hook is the operator's choice.
+
+**The brief** (measured-console phase 4). At SessionStart the hook also briefs a session the console
+supervises (`PE_OUTCOME_FILE` set): it prints `phase-graph.sh <slug> --brief <N>` — the mode file to
+read, the phase's section head, the decisions still open, the notes, the scope and lock lines, the
+previous handoff's `## Summary`, the plan's errands and the first 40 lines of
+`docs/memory/<slug>/index.md` — cut from the END so the whole context stays within 10,000 characters,
+with the peers and the presence line (the session id) LAST, so two sessions of one phase share a
+byte-stable prefix. The plan and phase come from `PE_SLUG`/`PE_PHASE` (the runner's claim
+environment), else the outcome file's name; a resumed session is not briefed again. The SessionStart
+entry waits `HOOK_BRIEF_TIMEOUT_SECONDS` (15) where the other three wait 3, and `HooksStatus.brief`
+says an install is patient enough: only then does the runner ask for the boot prompt under
+`PE_BRIEF=hook`, which leaves out the decisions, the notes and the lock lines the brief carries
+(`install-hooks` refreshes an older 3-second entry in place). The run's settings file also names
+`autoMemoryDirectory` = `<docs root>/docs/memory/<slug>/`, so a run's sessions keep one memory under
+version control whatever config dir or lane they spawn in.
 
 A presence is a claim the console settles against the process: an end the hook reported is
 `endedBy: 'hook'`, and one the probe found — the process gone with no `SessionEnd` — is

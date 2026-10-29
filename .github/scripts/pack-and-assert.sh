@@ -5,6 +5,14 @@
 #   bash .github/scripts/pack-and-assert.sh
 #   bash .github/scripts/pack-and-assert.sh --keep        leave the tarball in place; print `tarball: <path>`
 #   bash .github/scripts/pack-and-assert.sh --tree DIR    pack another checkout of this repository
+#   bash .github/scripts/pack-and-assert.sh --dist DIR    pack HEAD with DIR as its client build
+#
+# `--dist` is how scripts/gates.sh packs the run's one client build,
+# `client/.dist-<sha>` (measured-console phase 7, the audit's C1): HEAD's files
+# — `git archive`, so exactly the commit; the gate refuses a dirty tree, so they
+# are the tree's too — are staged under $TMPDIR with DIR as their
+# `viewer/client/dist`, and packed there. The live client/dist is never read or
+# touched, and assert-tarball.sh holds the packed `.build-rev` to HEAD.
 #
 # `--tree` (and running this file from inside one) works on a materialized tree
 # as well as a checkout: nothing here needs a `.git` directory.
@@ -37,7 +45,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-KEEP=0
+KEEP=0; DIST=""; STAGE=
 while [ $# -gt 0 ]; do
   case "$1" in
     --keep) KEEP=1 ;;
@@ -45,11 +53,32 @@ while [ $# -gt 0 ]; do
       [ -n "${2:-}" ] || { echo "pack-and-assert: --tree needs a directory" >&2; exit 2; }
       ROOT="$(cd "$2" && pwd)" || { echo "pack-and-assert: no such directory: $2" >&2; exit 2; }
       shift ;;
+    --dist)
+      [ -n "${2:-}" ] || { echo "pack-and-assert: --dist needs a directory" >&2; exit 2; }
+      DIST="$(cd "$2" && pwd)" || { echo "pack-and-assert: no such directory: $2" >&2; exit 2; }
+      shift ;;
     *) echo "pack-and-assert: unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
 cd "$ROOT" || exit 2
+ORIG_ROOT="$ROOT"
+
+if [ -n "$DIST" ] && [ "$DIST" != "$ROOT/viewer/client/dist" ]; then
+  [ -f "$DIST/index.html" ] || { echo "pack-and-assert: --dist $DIST holds no build (no index.html)" >&2; exit 2; }
+  # The packed client must be HEAD's — the stage has no .git to ask.
+  PC_EXPECT_BUILD_REV="${PC_EXPECT_BUILD_REV:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)}"
+  export PC_EXPECT_BUILD_REV
+  STAGE="$(mktemp -d "${TMPDIR:-/tmp}/phase-console-pack.XXXXXX")" || exit 2
+  if ! git -C "$ROOT" archive --format=tar HEAD | tar -x -C "$STAGE"; then
+    rm -rf "$STAGE"; echo "pack-and-assert: could not stage HEAD (git archive)" >&2; exit 2
+  fi
+  ln -s "$ROOT/viewer/node_modules" "$STAGE/viewer/node_modules"
+  mkdir -p "$STAGE/viewer/client"
+  cp -R "$DIST" "$STAGE/viewer/client/dist"
+  ROOT="$STAGE"
+  cd "$ROOT" || exit 2
+fi
 
 if [ ! -f viewer/client/dist/index.html ]; then
   echo "pack-and-assert: viewer/client/dist is not built — the tarball assertions read it." >&2
@@ -89,6 +118,7 @@ cleanup() {
   done < <(find $EMIT_DIRS -name '*.js' -type f 2>/dev/null)
   rm -f "$pre_emit"
   if [ "$KEEP" -eq 0 ] && [ -n "$emitted" ]; then rm -f "$emitted"; fi
+  [ -z "$STAGE" ] || rm -rf "$STAGE"
 }
 trap cleanup EXIT
 
@@ -99,6 +129,8 @@ emitted="$(npm pack --ignore-scripts 2>/dev/null | tail -1)"
 
 bash "$ROOT/.github/scripts/assert-tarball.sh" "$emitted" || exit 1
 if [ "$KEEP" -eq 1 ]; then
-  printf 'tarball: %s/%s\n' "$ROOT" "$emitted"
+  # A staged pack's tarball leaves the stage before the stage is removed.
+  if [ -n "$STAGE" ]; then mv "$emitted" "$ORIG_ROOT/" || exit 1; fi
+  printf 'tarball: %s/%s\n' "$ORIG_ROOT" "$emitted"
 fi
 exit 0

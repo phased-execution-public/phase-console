@@ -170,3 +170,55 @@ test('a path and a capability switch still reach ../start in both editions', () 
     }
   }
 });
+
+/**
+ * `./start` itself (measured-console phase 13, #385's residual). The wrapper
+ * above hands every verb to the bin, but `./start` is also run directly — from
+ * a clone, from a launcher, from a Your-turn card a person copies — and there a
+ * bare first argument was read as a REPOSITORY PATH whatever it was:
+ * `./start run clear-streak …` booted a console on `<cwd>/run`, held the
+ * terminal and registered an instance called `run`. A bare first argument that
+ * is not a directory is now refused, naming every verb, and boots nothing.
+ */
+function startBox(startSrc: string) {
+  const dir = mkdtempSync(join(tmpdir(), 'start-bare-'));
+  mkdirSync(join(dir, 'viewer'));
+  mkdirSync(join(dir, 'a-repo'));
+  writeFileSync(join(dir, 'start'), startSrc);
+  chmodSync(join(dir, 'start'), 0o755);
+  writeFileSync(join(dir, 'viewer', 'run'), '#!/bin/bash\necho "RUN $*"\n');
+  chmodSync(join(dir, 'viewer', 'run'), 0o755);
+  return {
+    dir,
+    run(...args: string[]): Reached {
+      const r = spawnSync('/bin/bash', [join(dir, 'start'), ...args], { cwd: dir, encoding: 'utf8' });
+      return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+    },
+    done() { rmSync(dir, { recursive: true, force: true }); },
+  };
+}
+
+test('./start refuses a bare first argument that is no directory, naming the verbs — it boots nothing (#385)', () => {
+  const editions: Array<[string, string]> = IS_PRO_TREE
+    ? [[read('start'), 'bin/phase-console.mjs'], [stripPro(read('start')), FREE_BIN]]
+    : [[read('start'), 'bin/phase-console.mjs']];
+  for (const [src, bin] of editions) {
+    const box = startBox(src);
+    try {
+      const r = box.run('run', 'clear-streak', 'demo');
+      assert.equal(r.status, 2, `./start run … exited ${r.status}: ${r.stdout}${r.stderr}`);
+      assert.equal(r.stdout, '', 'nothing reached viewer/run');
+      assert.match(r.stderr, /'run' is not a directory/);
+      // Every word verb of this edition's bin is named, so a person finds the one they meant.
+      const missing = verbsOf(read(bin)).filter((verb) => !verb.startsWith('-') && !new RegExp(`(^|\\s)${verb}(\\s|$)`, 'm').test(r.stderr));
+      assert.deepEqual(missing, [], `./start's refusal (against ${bin}) does not name: ${missing.join(' ')}`);
+      // A directory, a path and a switch still start the console.
+      assert.equal(box.run('a-repo').stdout.trim(), 'RUN --root a-repo');
+      assert.equal(box.run(box.dir, '--no-open').stdout.trim(), `RUN --root ${box.dir} --no-open`);
+      assert.equal(box.run('--allow-writes').stdout.trim(), 'RUN --allow-writes');
+      assert.equal(box.run().stdout.trim(), 'RUN');
+    } finally {
+      box.done();
+    }
+  }
+});

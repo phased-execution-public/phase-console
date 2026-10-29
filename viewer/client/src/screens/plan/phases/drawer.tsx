@@ -38,13 +38,14 @@ import { useIssues } from '@/data/repo';
 import { useDiagnosis, useRulings } from '@/data/runs';
 import { useSessions } from '@/data/sessions';
 import { cn } from '@/lib/cn';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { clockTime, clockWords, countdown, plural, relativeTime } from '@/lib/format';
 import { canQa, isVerdict, liveQa, phaseQaMode, qaReportHref, qaReportRound } from '@/lib/qa';
 import { qaResultTitle } from '@/lib/status-vocab';
 import { Button, KeyValue, RelativeTime, SectionHeading, toast } from '@/ui';
+import { Accordion, AccordionItem } from '@/ui/accordion';
 import { Disclosure } from '@/ui/disclosure';
-import { QaStatus, type WordOf } from '@/ui/status';
+import { OpsStatus, QaStatus, type WordOf } from '@/ui/status';
 import { RecoveryActions } from '@/cards/recovery-actions';
 import { TreeLine, verdictTree } from '@/cards/verify-tree';
 import { handoffHref, laneHref, navigate, sessionsHref } from '@/shell/routes';
@@ -98,6 +99,12 @@ export interface PhaseDrawerProps {
   index?: string | undefined;
   planQaMode?: string;
   planSkills?: readonly string[];
+  /**
+   * `record` when the reading the drawer opens from IS the phase's record
+   * (Handoffs & QA): the handoff and the QA lead the row's detail as two
+   * cards (`PhaseRecord`), so the drawer leaves them out below.
+   */
+  lead?: 'record' | undefined;
 }
 
 export function PhaseDrawer({
@@ -112,12 +119,14 @@ export function PhaseDrawer({
   index,
   planQaMode,
   planSkills,
+  lead,
 }: PhaseDrawerProps) {
   const r = record ?? run?.phases?.[String(phase)];
+  const recordLeads = lead === 'record';
   return (
     <div className="flex min-w-0 flex-col gap-4" data-testid={`phase-drawer-${phase}`}>
       {r && <RunnerWords record={r} />}
-      {view && (
+      {view && !recordLeads && (
         <QaSection
           slug={slug}
           view={view}
@@ -128,12 +137,122 @@ export function PhaseDrawer({
         />
       )}
       {r && <PhaseClocks record={r} />}
-      <Disclosure label="Why is this not done?" openLabel="Hide the diagnosis" testId={`why-${phase}`}>
-        <Diagnosis slug={slug} phase={phase} run={run ?? null} />
-      </Disclosure>
-      {view && <HandoffFacts slug={slug} view={view} handoff={handoff} index={index} />}
+      {/* A fold strip: its one line says what the drawer already knows, and
+          opening it is the request (the diagnosis is fetched only then). */}
+      <Accordion>
+        <AccordionItem
+          value="why"
+          label="Why is this not done?"
+          summary={whySummary(r, view)}
+          testId={`why-${phase}`}
+          bodyClassName="pt-1"
+        >
+          <Diagnosis slug={slug} phase={phase} run={run ?? null} />
+        </AccordionItem>
+      </Accordion>
+      {view && !recordLeads && <HandoffFacts slug={slug} view={view} handoff={handoff} index={index} />}
       {view && <PhaseProse slug={slug} phase={view} eta={eta} />}
     </div>
+  );
+}
+
+/** The diagnosis fold's one line, from what the drawer holds already — opening the fold is what costs. */
+function whySummary(record: PhaseRecord | undefined, view: PhaseView | undefined): string {
+  if (view?.state === 'done') return 'the board reads it done';
+  if (record?.verification && !record.verification.ok) return 'a verification command failed';
+  if (record?.halt) return `the run halted${record.halt.kind ? `, ${record.halt.kind}` : ''}`;
+  if (record?.status) return `this run reads it ${record.status}`;
+  return 'the situation, what failed and every way forward';
+}
+
+/* ---------------- the record, as two cards ---------------- */
+
+const RECORD_CARD = 'flex min-w-0 flex-col gap-2 rounded-lg border border-rule bg-surface px-3 py-2.5';
+
+/**
+ * A phase's record — what its session said it did, and what the review found
+ * — as two cards that lead the row's detail on the Handoffs & QA reading
+ * (2026-10-20, Tower strips): side by side once the detail has 40 rem to give
+ * (a container query, so a row in the panel or on a narrow page stacks them),
+ * stacked below that. Each card's status is its one LEAD badge: the handoff's
+ * word, the verdict.
+ */
+export function PhaseRecord({
+  slug,
+  view,
+  run,
+  holds,
+  handoff,
+  index,
+  planQaMode,
+  planSkills,
+}: {
+  slug: string;
+  view: PhaseView;
+  run?: RunState | null | undefined;
+  holds?: readonly number[] | undefined;
+  handoff?: HandoffRow | undefined;
+  index?: string | undefined;
+  planQaMode?: string | undefined;
+  planSkills?: readonly string[] | undefined;
+}) {
+  return (
+    <div className="@container/record min-w-0" data-testid={`phase-record-${view.phase}`}>
+      <div className="grid min-w-0 gap-3 @min-[40rem]/record:grid-cols-2">
+        <div className={RECORD_CARD} data-testid="record-handoff">
+          <HandoffRecord slug={slug} view={view} handoff={handoff} index={index} />
+        </div>
+        <div className={RECORD_CARD} data-testid="record-qa">
+          <QaSection
+            slug={slug}
+            view={view}
+            holds={holds ?? view.qaHeld ?? []}
+            run={run ?? null}
+            {...(planQaMode ? { planQaMode } : {})}
+            planSkills={planSkills ?? []}
+            lead
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The handoff card: its word as the card's lead badge, then the file's own facts — or that none was written yet. */
+function HandoffRecord({
+  slug,
+  view,
+  handoff,
+  index,
+}: {
+  slug: string;
+  view: PhaseView;
+  handoff?: HandoffRow | undefined;
+  index?: string | undefined;
+}) {
+  const status = view.handoff?.status ?? handoff?.status;
+  const completed = view.handoff?.completed ?? handoff?.completed;
+  return (
+    <section aria-label={`Handoff — phase ${view.phase}`} className="flex min-w-0 flex-col gap-2">
+      <SectionHeading
+        as="h4"
+        aside={
+          status ? <OpsStatus vocab="handoff" word={status as WordOf<'handoff'>} chrome="tint" /> : undefined
+        }
+      >
+        Handoff
+      </SectionHeading>
+      {status ? (
+        <>
+          {completed && <p className="text-meta text-ink-muted tabular-nums">Completed {completed}</p>}
+          <HandoffFacts slug={slug} view={view} handoff={handoff} index={index} />
+        </>
+      ) : (
+        <p className="text-meta text-ink-muted">
+          No handoff yet — the session writes one when it signs the phase off.
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -313,6 +432,7 @@ function QaSection({
   run,
   planQaMode,
   planSkills,
+  lead = false,
 }: {
   slug: string;
   view: PhaseView;
@@ -320,6 +440,8 @@ function QaSection({
   run: RunState | null;
   planQaMode?: string;
   planSkills: readonly string[];
+  /** A record card's QA: the verdict is the card's lead badge. */
+  lead?: boolean;
 }) {
   const { data: state } = useConsoleState();
   const { data: terminals } = useSessions(state);
@@ -362,7 +484,11 @@ function QaSection({
             'Verdict',
             isVerdict(result) ? (
               <span className="inline-flex flex-wrap items-center gap-x-2">
-                <QaStatus result={result as WordOf<'qa-result'>} title={qaResultTitle(result!)} />
+                <QaStatus
+                  result={result as WordOf<'qa-result'>}
+                  title={qaResultTitle(result!)}
+                  {...(lead ? { chrome: 'tint' as const } : {})}
+                />
                 {rounds ? `round ${rounds.latest.round} of ${rounds.count}` : ''}
               </span>
             ) : result === 'pending' ? (

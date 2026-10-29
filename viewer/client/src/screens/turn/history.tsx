@@ -8,7 +8,7 @@
  * settled. Nothing here is acted on, so nothing here is a card.
  */
 
-import { stamp } from '@/cards/human-step-card';
+import { stamp } from '@/cards/turn/step-words';
 import type { HumanStepRecord } from '@/data/human-steps';
 import { OpsStatus } from '@/ui/status';
 

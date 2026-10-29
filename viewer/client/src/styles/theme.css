@@ -123,6 +123,30 @@
   --status-failed: light-dark(oklch(48% 0.08 25), oklch(75% 0.12 25));
   --status-skipped: light-dark(oklch(48% 0.012 230), oklch(75% 0.012 230));
 
+  /* ---- Tower strips (2026-10-20): each state's edge and its tint ----
+     The SAME hue as its state, never a new one. `-vivid` is a strip's 4 px
+     edge and a lead badge's icon — a mark, held to 3:1 on every surface; each
+     takes the most chroma its hue holds in sRGB at that lightness, to 0.16.
+     `-tint` is the ground of the ONE lead badge a row or card carries, and of
+     an OPEN strip; the state's own word sits on it at AA (contrast.test.ts
+     measures both, in both lights and both rooms). */
+  --status-done-vivid: light-dark(oklch(56% 0.132 155), oklch(76% 0.16 155));
+  --status-running-vivid: light-dark(oklch(56% 0.159 252), oklch(76% 0.12 252));
+  --status-verifying-vivid: light-dark(oklch(56% 0.091 205), oklch(76% 0.123 205));
+  --status-queued-vivid: light-dark(oklch(56% 0.035 245), oklch(76% 0.035 245));
+  --status-waiting-vivid: light-dark(oklch(56% 0.16 300), oklch(76% 0.138 300));
+  --status-needs-you-vivid: light-dark(oklch(56% 0.114 72), oklch(76% 0.155 72));
+  --status-failed-vivid: light-dark(oklch(56% 0.16 25), oklch(76% 0.136 25));
+  --status-skipped-vivid: light-dark(oklch(56% 0.012 230), oklch(76% 0.012 230));
+  --status-done-tint: light-dark(oklch(95.5% 0.04 155), oklch(27% 0.055 155));
+  --status-running-tint: light-dark(oklch(95.5% 0.02 252), oklch(27% 0.055 252));
+  --status-verifying-tint: light-dark(oklch(95.5% 0.04 205), oklch(27% 0.042 205));
+  --status-queued-tint: light-dark(oklch(95.5% 0.012 245), oklch(27% 0.02 245));
+  --status-waiting-tint: light-dark(oklch(95.5% 0.023 300), oklch(27% 0.055 300));
+  --status-needs-you-tint: light-dark(oklch(95.5% 0.031 72), oklch(27% 0.052 72));
+  --status-failed-tint: light-dark(oklch(95.5% 0.02 25), oklch(27% 0.055 25));
+  --status-skipped-tint: light-dark(oklch(95.5% 0.006 230), oklch(27% 0.01 230));
+
   /* ---- The one accent, and the ink that is not it ----
      Amber is a summons: `--accent` is the one door to it, and it is the
      needs-you state. `--action` (the primary button) and `--focus` (the ring)
@@ -247,6 +271,10 @@
      station can then paint itself `text-state` / `bg-state` / `border-state`
      without knowing which state it is showing. */
   --color-state: var(--state, var(--status-queued));
+  /* A strip's edge and an open strip's or a lead badge's ground, set by the
+     same classes: `border-state-vivid`, `bg-state-tint`. */
+  --color-state-vivid: var(--state-vivid, var(--status-queued-vivid));
+  --color-state-tint: var(--state-tint, var(--status-queued-tint));
 
   --font-sans: 'Instrument Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
@@ -359,6 +387,27 @@
   min-height: 0;
   overflow: clip;
   overflow-clip-margin: 4px;
+}
+
+/* A drawer that fits its content (2026-10-20) — `ui/sheet.tsx`'s end drawer
+   and the panel's column in auto. The box is as wide as its content asks,
+   inside the bounds of its measure (`data-sheet-size`), never narrower than it
+   has already been while open (`--sheet-settled`, `ui/sheet-width.ts`), and
+   never wider than its cap: the viewport less 2 rem for a drawer, a share of
+   the screen for the column, which sets its own. */
+[data-sheet-size='narrow'] { --sheet-min: 20rem; --sheet-max: 28rem; }
+[data-sheet-size='reading'] { --sheet-min: 30rem; --sheet-max: 44rem; }
+[data-sheet-size='form'] { --sheet-min: 34rem; --sheet-max: 52rem; }
+[data-sheet-size='wide'] { --sheet-min: 44rem; --sheet-max: 72rem; }
+
+.sheet-fit {
+  inline-size: max-content;
+  min-inline-size: min(
+    max(var(--sheet-min, 30rem), var(--sheet-settled, 0px)),
+    var(--sheet-max, 44rem),
+    var(--sheet-cap, calc(100% - 2rem))
+  );
+  max-inline-size: min(var(--sheet-max, 44rem), var(--sheet-cap, calc(100% - 2rem)));
 }
 
 /* Tabular figures on demand — for a number that sits in a column or ticks. The
@@ -580,14 +629,14 @@
  * hue is read.
  * ------------------------------------------------------------------ */
 
-.state-done { --state: var(--status-done); }
-.state-running { --state: var(--status-running); }
-.state-verifying { --state: var(--status-verifying); }
-.state-queued { --state: var(--status-queued); }
-.state-waiting { --state: var(--status-waiting); }
-.state-needs-you { --state: var(--status-needs-you); }
-.state-failed { --state: var(--status-failed); }
-.state-skipped { --state: var(--status-skipped); }
+.state-done { --state: var(--status-done); --state-vivid: var(--status-done-vivid); --state-tint: var(--status-done-tint); }
+.state-running { --state: var(--status-running); --state-vivid: var(--status-running-vivid); --state-tint: var(--status-running-tint); }
+.state-verifying { --state: var(--status-verifying); --state-vivid: var(--status-verifying-vivid); --state-tint: var(--status-verifying-tint); }
+.state-queued { --state: var(--status-queued); --state-vivid: var(--status-queued-vivid); --state-tint: var(--status-queued-tint); }
+.state-waiting { --state: var(--status-waiting); --state-vivid: var(--status-waiting-vivid); --state-tint: var(--status-waiting-tint); }
+.state-needs-you { --state: var(--status-needs-you); --state-vivid: var(--status-needs-you-vivid); --state-tint: var(--status-needs-you-tint); }
+.state-failed { --state: var(--status-failed); --state-vivid: var(--status-failed-vivid); --state-tint: var(--status-failed-tint); }
+.state-skipped { --state: var(--status-skipped); --state-vivid: var(--status-skipped-vivid); --state-tint: var(--status-skipped-tint); }
 
 /* ------------------------------------------------------------------ *
  * Safe areas — the phone shell's floor and ceiling

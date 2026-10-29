@@ -19,9 +19,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const { Accounts, carriesUntil: carriesAt } = await import('../server/accounts/index.ts');
 const { withSample } = await import('../server/accounts/usage.ts');
@@ -123,9 +121,10 @@ test('SH-1: switchCandidates ranks only accounts that carry the work past the cu
 
     // No wall to weigh against: the rank as it always was — the worse shared meter.
     assert.deepEqual(accounts.rankAccounts('default', undefined, now), [roomy.id, nearly.id]);
+    // …but a spill never lands above `SPILL_LAND_MAX_PCT` (measured-console phase 24, #420).
     const open = accounts.switchCandidates('default', undefined, { nowMs: now });
-    assert.deepEqual(open.ranked, [roomy.id, nearly.id]);
-    assert.deepEqual(open.declined, []);
+    assert.deepEqual(open.ranked, [roomy.id]);
+    assert.deepEqual(open.declined.map((row) => [row.id, row.bucket]), [[nearly.id, 'seven_day']]);
 
     // Walled until +2 h: the nearly spent account walls weekly before then.
     const plan = accounts.switchCandidates('default', undefined, { until: now + 2 * HOUR, nowMs: now });
@@ -171,21 +170,11 @@ test('SH-2: the facade names the soonest reset — a pool member whose wall lift
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-horizon-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-horizon-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -207,17 +196,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -274,7 +258,7 @@ function walledOnce(r: Repo, resetEpochS: number, spawned: string[]): SpawnFn {
  * ------------------------------------------------------------------ */
 
 test('SH-1/SH-2: onLimit switch with only a nearly spent account to go to does not move — it waits on the wall\'s own reset, and says what it declined', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const resetMs = Math.floor((Date.now() + 2 * HOUR) / 1000) * 1000;
   const spawned: string[] = [];
   const { instance, events } = runner(r, walledOnce(r, resetMs / 1000, spawned), {
@@ -315,7 +299,7 @@ test('SH-1/SH-2: onLimit switch with only a nearly spent account to go to does n
 });
 
 test('SH-2: a pool member whose wall lifts sooner wakes the wait sooner — the run looks again at the soonest reset, not the latest', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const resetMs = Math.floor((Date.now() + 2 * HOUR) / 1000) * 1000;
   const wakeIso = new Date(Date.now() + 30 * 60_000).toISOString();
   const { instance } = runner(r, walledOnce(r, resetMs / 1000, []), {
@@ -334,7 +318,7 @@ test('SH-2: a pool member whose wall lifts sooner wakes the wait sooner — the 
 });
 
 test('SH-1: with a candidate that carries the work, the switch still happens — the rule declines, it does not forbid', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const resetMs = Math.floor((Date.now() + 2 * HOUR) / 1000) * 1000;
   const spawned: string[] = [];
   const { instance, events } = runner(r, walledOnce(r, resetMs / 1000, spawned), {
@@ -362,7 +346,7 @@ test('SH-1: with a candidate that carries the work, the switch still happens —
  * ------------------------------------------------------------------ */
 
 test('SH-3: a run started on an account its pool leaves out has it in the pool — at launch, on a Continue that names another, and after a switch', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, async (request) => {
     r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)?.[1] ?? '1'));
     return ok();
@@ -388,7 +372,7 @@ test('SH-3: a run started on an account its pool leaves out has it in the pool �
 });
 
 test('SH-3: a person\'s switch keeps the invariant too — the pool names the account the record names', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let release: () => void = () => {};
   const held = new Promise<void>((resolve) => { release = resolve; });
   const { instance } = runner(r, async (request) => {

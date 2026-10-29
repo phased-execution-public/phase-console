@@ -1,6 +1,6 @@
 /**
  * Where a decision's answer is written so its proof can read it (one-pool
- * phase 13, #368).
+ * phase 13, #368; every `^<key>:` shape since 2026-10-20).
  *
  * A plan-born decision with options whose proof reads a FILE — the shape every
  * plan's "the owner answers in owner-answers.md" errand takes — could never
@@ -9,15 +9,23 @@
  * file, still read "pending". The answer press now writes the answer where
  * the proof looks, then runs the proof (`ServiceRecovery.answerHumanStep`):
  *
- *   - `cmd:"grep [-flags] '^<key>: answered' <file>"` — one line appended,
- *     `<key>: answered — <option label>[: <note>]`;
+ *   - `cmd:"grep [-flags] '^<key>: …' <file>"` — one line appended, the first
+ *     of these the proof's OWN pattern accepts (`answerLineFor`): `<key>:
+ *     <option id>`, a plan's own convention ("one `key: value` line each",
+ *     the value a lower-case word that a plan's gate tool reads whole), then
+ *     `<key>: answered — <option label>[: <note>]` (#368's line);
  *   - `cmd:"test -f|-e|-s <file>"` and `credential:file:<file>` — the file
  *     written with the answer.
  *
- * Anything else names no place an answer can go, and the proof is simply run
- * (a decision whose proof the answer cannot satisfy comes back Redo, saying
- * what it read). The file must be in the plan's own handoffs folder, reached
- * through no link — the console writes nowhere else on a press.
+ * A pattern is read through `grepMatcher`, a deliberately small translation of
+ * grep's BRE and ERE into a JS RegExp; a construct it does not know names no
+ * place an answer can go. Anything else names no place either, and the proof
+ * is simply run (a decision whose proof the answer cannot satisfy comes back
+ * Redo, saying what it read). The file must be in the plan's own handoffs
+ * folder, reached through no link — the console writes nowhere else on a
+ * press. A value line never carries the person's note: a plan's tools read
+ * the value whole, so the note goes to the AI another way
+ * (`ServiceRecovery.tellPlanDecision`).
  */
 
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, writeSync } from 'node:fs';
@@ -25,10 +33,13 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { cmdOfRef } from '../../shared/proof-words.js';
 import { redactSecrets } from '../../shared/human-step-model.js';
 
-/** Where an answer goes, and how. */
+/** Where an answer goes, and how — a line its proof's pattern `accepts`, or a whole file. */
 export type AnswerTarget =
-  | { file: string; mode: 'append-line'; key: string }
+  | { file: string; mode: 'append-line'; key: string; accepts: (line: string) => boolean }
   | { file: string; mode: 'write' };
+
+/** The words an answer is written from. */
+export type AnswerWords = { option?: string; label?: string; note?: string };
 
 /**
  * A command split into words as the shell reads them — quotes removed,
@@ -69,13 +80,101 @@ export function shellWords(command: string): string[] | null {
   return out;
 }
 
+/** What may sit between a pattern's words: a space, `\s`, `[[:space:]]`, each maybe starred. */
+const GAP = String.raw`(?: |\s|\\s\*?|\[\[:space:\]\]\*?| \*)*`;
+
 /** A grep pattern that looks for `<key>: answered` at a line's start — the key, or null. */
 export function answeredKeyOf(pattern: string): string | null {
-  const gap = String.raw`(?: |\s|\\s\*?|\[\[:space:\]\]\*?| \*)*`;
-  const shape = new RegExp(String.raw`^\^?${gap}([A-Za-z0-9_.-]+)${gap}:${gap}answered\b`, 'i');
+  const shape = new RegExp(String.raw`^\^?${GAP}([A-Za-z0-9_.-]+)${GAP}:${GAP}answered\b`, 'i');
   const m = shape.exec(pattern);
   return m ? m[1]! : null;
 }
+
+/** The key a grep pattern looks for at a line's start — `^<key>:` — or null. */
+export function keyOf(pattern: string): string | null {
+  const m = new RegExp(String.raw`^\^?${GAP}([A-Za-z0-9_.-]+)${GAP}:`).exec(pattern);
+  return m ? m[1]! : null;
+}
+
+/** The POSIX classes a bracket may name, as a JS class body — the rest are not known here. */
+const POSIX_CLASSES: Readonly<Record<string, string>> = Object.freeze({
+  space: String.raw`\s`, blank: ' \\t', alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9',
+  upper: 'A-Z', lower: 'a-z', xdigit: '0-9A-Fa-f',
+});
+
+/** A bracket expression from `at` (its `[`), as a JS class — and where it ends — or null. */
+function bracketOf(src: string, at: number): { out: string; next: number } | null {
+  let i = at + 1;
+  let out = '[';
+  if (src[i] === '^') { out += '^'; i++; }
+  // A `]` first is a member, never the end.
+  if (src[i] === ']') { out += '\\]'; i++; }
+  while (i < src.length && src[i] !== ']') {
+    if (src.startsWith('[:', i)) {
+      const end = src.indexOf(':]', i + 2);
+      const named = end < 0 ? undefined : POSIX_CLASSES[src.slice(i + 2, end)];
+      if (named === undefined) return null;
+      out += named;
+      i = end + 2;
+      continue;
+    }
+    if (src.startsWith('[=', i) || src.startsWith('[.', i)) return null;
+    const c = src[i]!;
+    // A backslash is a member of a POSIX bracket; in a JS class it escapes.
+    out += c === '\\' || c === '[' ? `\\${c}` : c;
+    i++;
+  }
+  return i < src.length ? { out: `${out}]`, next: i + 1 } : null;
+}
+
+/**
+ * A grep pattern as a JS RegExp, matched against one line — or null for any
+ * construct this does not know (then no answer is written: the proof decides
+ * alone). BRE by default, ERE with `-E`/`egrep`, a fixed string with
+ * `-F`/`fgrep`; `-i` folds case, `-w` matches whole words, `-x` whole lines.
+ */
+export function grepMatcher(
+  pattern: string, how: { ere?: boolean; fixed?: boolean; ignoreCase?: boolean; word?: boolean; line?: boolean } = {},
+): RegExp | null {
+  let src = '';
+  if (how.fixed) {
+    src = pattern.replace(/[\\^$.*+?()[\]{}|/]/g, '\\$&');
+  } else {
+    for (let i = 0; i < pattern.length; i++) {
+      const c = pattern[i]!;
+      if (c === '\\') {
+        const next = pattern[i + 1];
+        if (next === undefined) return null;
+        i++;
+        // In a BRE these are the operators; in an ERE, escaped, they are literals.
+        if (!how.ere && '(){}|+?'.includes(next)) { src += next; continue; }
+        if ('.*[]^$\\/(){}|+?'.includes(next)) { src += `\\${next}`; continue; }
+        if ('sSwWbB'.includes(next) || /[1-9]/.test(next)) { src += `\\${next}`; continue; }
+        return null;
+      }
+      if (c === '[') {
+        const bracket = bracketOf(pattern, i);
+        if (!bracket) return null;
+        src += bracket.out;
+        i = bracket.next - 1;
+        continue;
+      }
+      // A BRE's `( ) { } | + ?` are plain characters.
+      if (!how.ere && '(){}|+?'.includes(c)) { src += `\\${c}`; continue; }
+      src += c;
+    }
+  }
+  if (how.line) src = `^(?:${src})$`;
+  else if (how.word) src = `(?<![A-Za-z0-9_])(?:${src})(?![A-Za-z0-9_])`;
+  try {
+    return new RegExp(src, how.ignoreCase ? 'i' : '');
+  } catch {
+    return null;
+  }
+}
+
+/** grep's flags this reads: quiet, case, the dialect, words, lines and what changes no match. */
+const KNOWN_FLAGS = /^[qsiyEFGwxnHhlaIo]*$/;
 
 /** The place a proof reads an answer from, or null when it names none. */
 export function answerTargetOf(proof: string | undefined | null): AnswerTarget | null {
@@ -94,14 +193,24 @@ export function answerTargetOf(proof: string | undefined | null): AnswerTarget |
     if (rest.length > (lead === '[' ? 3 : 2)) return null;
     return isAbsolute(file) ? { file, mode: 'write' } : null;
   }
-  if (lead !== 'grep' && lead !== 'egrep') return null;
+  if (lead !== 'grep' && lead !== 'egrep' && lead !== 'fgrep') return null;
   let pattern: string | null = null;
+  let flags = '';
   const operands: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const word = rest[i]!;
     if (pattern === null && operands.length === 0 && word === '-e') { pattern = rest[++i] ?? null; continue; }
     if (operands.length === 0 && /^-[A-Za-z]+$/.test(word)) {
-      if (/[fmABCd]/.test(word.slice(1))) return null;
+      let letters = word.slice(1);
+      // `-qe <pattern>`: the pattern is the next word.
+      if (letters.endsWith('e') && pattern === null) {
+        letters = letters.slice(0, -1);
+        pattern = rest[++i] ?? null;
+      }
+      // An inverted, counted or listed-absent match, a pattern file, a
+      // context or a dialect not read here: no answer line can be known.
+      if (!KNOWN_FLAGS.test(letters)) return null;
+      flags += letters;
       continue;
     }
     operands.push(word);
@@ -109,15 +218,48 @@ export function answerTargetOf(proof: string | undefined | null): AnswerTarget |
   if (pattern === null) pattern = operands.shift() ?? null;
   if (!pattern || operands.length !== 1) return null;
   const file = operands[0]!;
-  const key = answeredKeyOf(pattern);
-  return key && isAbsolute(file) ? { file, mode: 'append-line', key } : null;
+  if (!isAbsolute(file)) return null;
+  const key = keyOf(pattern);
+  if (!key) return null;
+  const matcher = grepMatcher(pattern, {
+    ere: flags.includes('E') || lead === 'egrep',
+    fixed: flags.includes('F') || lead === 'fgrep',
+    ignoreCase: /[iy]/.test(flags),
+    word: flags.includes('w'),
+    line: flags.includes('x'),
+  });
+  if (matcher) return { file, mode: 'append-line', key, accepts: (line) => matcher.test(line) };
+  // #368's own shape, read by its own grammar where the translation knows less.
+  const answered = answeredKeyOf(pattern);
+  return answered
+    ? { file, mode: 'append-line', key: answered, accepts: (line) => line.toLowerCase().startsWith(`${answered.toLowerCase()}: answered`) }
+    : null;
 }
 
-/** The line an answer is written as. */
+/** The line an answer is written as, in #368's shape. */
 export function answerLine(key: string | null, answer: { label?: string; note?: string }): string {
   const said = [answer.label, answer.note].filter((part) => typeof part === 'string' && part.trim())
     .map((part) => redactSecrets(String(part)).replace(/[\u0000-\u001f]+/g, ' ').trim()).join(': ');
   return `${key ? `${key}: ` : ''}answered${said ? ` — ${said}` : ''}`.slice(0, 500);
+}
+
+/** A value as a plan's answer file spells one: a lower-case word. */
+const VALUE_WORD = /^[a-z0-9][a-z0-9._-]*$/;
+
+/**
+ * The line an answer is written as — the first the proof's pattern accepts:
+ * `<key>: <option id>` (the plan's own convention, read whole by its tools),
+ * then `<key>: answered — <label>[: <note>]`. Null when the proof accepts
+ * neither: then nothing is written, and the proof decides alone. A `write`
+ * target's file holds the answer itself.
+ */
+export function answerLineFor(target: AnswerTarget, answer: AnswerWords): string | null {
+  if (target.mode === 'write') return answerLine(null, answer);
+  const candidates = [
+    ...(answer.option && VALUE_WORD.test(answer.option) ? [`${target.key}: ${answer.option}`] : []),
+    answerLine(target.key, answer),
+  ];
+  return candidates.find((line) => target.accepts(line)) ?? null;
 }
 
 /**
@@ -131,7 +273,7 @@ export function answerLine(key: string | null, answer: { label?: string; note?: 
  * Answers the file written, relative to `root`, or why nothing was.
  */
 export function writeAnswer(
-  target: AnswerTarget, dir: string, root: string, answer: { label?: string; note?: string },
+  target: AnswerTarget, dir: string, root: string, answer: AnswerWords,
 ): { ok: true; file: string } | { ok: false; why: string } {
   const file = resolve(target.file);
   let allowed: string;
@@ -145,8 +287,9 @@ export function writeAnswer(
   }
   const name = basename(file);
   if (!name || name === '.' || name === '..') return { ok: false, why: `${target.file} names no file` };
+  const line = answerLineFor(target, answer);
+  if (line === null) return { ok: false, why: `${target.file}'s check looks for a line this answer cannot say` };
   const at = join(real, name);
-  const line = target.mode === 'append-line' ? answerLine(target.key, answer) : answerLine(null, answer);
   let fd: number | null = null;
   try {
     const flags = target.mode === 'append-line'
@@ -171,4 +314,10 @@ export function writeAnswer(
     if (fd !== null) closeSync(fd);
   }
   return { ok: true, file: relative(realpathSync(root), at) || at };
+}
+
+/** An answer file in words a person reads — `docs/handoffs/<slug>/<file>` where it is one, else its name. */
+export function answerFileWords(file: string): string {
+  const at = file.lastIndexOf('/docs/handoffs/');
+  return at >= 0 ? file.slice(at + 1) : basename(file);
 }

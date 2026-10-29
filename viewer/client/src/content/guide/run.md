@@ -63,6 +63,8 @@ flat.
 | **MCP servers** / **If an MCP server will not connect** | Which servers each phase runs with, and whether an unreachable one parks the phase or is merely reported. The plan's own line outranks the run's. |
 | **Max parallel**, **Stop after N failures**, **Queue priority**, **Start after (optional)**, **Only these phases**, **Per-phase overrides** | How much runs at once, what stops it, when it begins, and what it is allowed to touch. |
 | **Auto-recover halts** | Whether the ladder climbs by itself when a phase stops. |
+| **When a phase needs a person** | *Defer* keeps the session waiting at its call and carries it on with your answer, the same session; *Park* ends it and resumes the phase once the step is done. Left empty, it defers on a CLI that can (2.1.306 or later), else parks. |
+| **Who compacts a long session** and **The CLI compacts at (tokens)** | The console checkpoints a session as its context fills (the default); or the CLI compacts it in place at the window (350,000 unless you say); or odd phases take the CLI's way, so one run compares the two. |
 
 Settings ▸ Automation holds the defaults these forms open with; each launch can override them for
 itself.

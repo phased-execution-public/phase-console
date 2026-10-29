@@ -34,6 +34,10 @@ import { fileURLToPath } from 'node:url';
 import { judgeProofs } from '../server/runner/proofs.ts';
 import { workingTreeOf } from '../server/runner/worktree.ts';
 import { Runner } from '../server/runner/runner.ts';
+import { repo } from './fixtures/repo.ts';
+
+/** A repository with one commit (`base`) holding `files`, on git's default branch. */
+const baseRepo = (dir: string, files: Record<string, string>): string => repo({ dir, files, branch: null, message: 'base' });
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const OUTCOME = join(REPO_ROOT, 'scripts', 'phase-outcome.sh');
@@ -53,20 +57,11 @@ function git(cwd: string, ...args: string[]): string {
   ], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
-function repo(dir: string, files: Record<string, string>): string {
-  mkdirSync(dir, { recursive: true });
-  git(dir, 'init', '-q');
-  for (const [path, text] of Object.entries(files)) writeFileSync(join(dir, path), text);
-  git(dir, 'add', '-A');
-  git(dir, 'commit', '-q', '-m', 'base');
-  return dir;
-}
-
 /** A superproject mounting `sub` — the mirror's shape. */
 function superproject(): { root: string; sub: string; ledger: string } {
   const base = scratch('pc-vp5-');
-  const origin = repo(join(base, 'origin'), { 'app.txt': 'the frontend\n' });
-  const root = repo(join(base, 'root'), { 'README.md': '# root\n' });
+  const origin = baseRepo(join(base, 'origin'), { 'app.txt': 'the frontend\n' });
+  const root = baseRepo(join(base, 'root'), { 'README.md': '# root\n' });
   git(root, 'submodule', 'add', '-q', origin, 'sub');
   git(root, 'commit', '-q', '-m', 'mount');
   return { root, sub: join(root, 'sub'), ledger: join(base, 'proofs.ndjson') };

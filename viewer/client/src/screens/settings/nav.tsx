@@ -58,6 +58,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = Object.freeze([
   },
   { id: 'mcp', title: 'MCP servers', blurb: 'The servers a session may reach, and the catalog to add from.' },
   {
+    id: 'hooks',
+    title: 'Hooks',
+    blurb: 'Every hook a session runs, where it came from, and the rules each plan writes.',
+  },
+  {
     id: 'permissions',
     title: 'Permissions',
     blurb: 'Every grant and what it changed, the owner keys, and what a session may run unasked.',
@@ -99,13 +104,15 @@ export const SECTION_TERMS: Readonly<Record<string, string>> = Object.freeze({
   appearance:
     'theme dark light night paper density comfortable compact terminal webgl renderer screen reader plan list documents session plan model sort order',
   automation: [
-    'autopilot converge convergence ladder rungs budget dollars spend cap attempts ceiling starts per hour sweep repo guard worktrees isolation delegated gates boarding schedule quiet hours stalled thresholds resume at boot session hook presence policy answers relay rules queue scheduling seniority blocker critical path load factor check judgement defaults launch model effort asking less',
+    'autopilot converge convergence ladder rungs budget dollars spend cap attempts ceiling starts per hour sweep repo guard worktrees isolation delegated gates boarding schedule quiet hours stalled thresholds resume at boot policy answers relay rules queue scheduling seniority blocker critical path load factor check judgement defaults launch model effort asking less',
   ].join(' '),
   notifications:
     'announce alerts routing kinds categories urgent silence mute push devices subscribe quiet hours do not disturb webhooks channels destinations bell inbox delivery reminders your turn human step snooze cadence',
   accounts:
     'claude account login usage meter limit wall switch register rename remove sign in token credits tombstones overage entitlement',
   mcp: 'mcp servers registry catalog tools credentials add remove rename unreachable policy require',
+  hooks:
+    'hooks session hook presence install remove plugin user project run pretooluse stop onfailure timeout matcher hookify rules permission destructive never list block warn',
   permissions:
     'permissions policy allow ask deny wall rules strike shipped defaults restore profile guarded trusted bypass auto approve grants granted revoke scope owner key passkey enrol lock sign in',
   instance: [

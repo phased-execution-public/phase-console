@@ -24,6 +24,7 @@ import { OUTCOME_STATUSES } from '../../shared/run-lifecycle.js';
 import type { OutcomeStatus } from '../../shared/run-lifecycle.js';
 import { humanStepKindOf, redactSecrets } from '../../shared/human-step-model.js';
 import { isRunAct, type RunAct } from '../../shared/verb-model.js';
+import { OUTCOME_NONE, OUTCOME_SESSION_SCHEMA, validateOutcome } from '../../shared/outcome-schema.js';
 import type { DeclaredStep } from '../human-steps.ts';
 
 /**
@@ -89,6 +90,13 @@ export type PhaseOutcome = {
    * that named nobody else's lock from one queued behind a holder.
    */
   refused?: string[];
+  /**
+   * `console` on a declaration the session never wrote: the exit-time check
+   * read it from the session's closing words (measured-console phase 29 — its
+   * prose questions, a gstack gate). Memory only, never read from a file, so
+   * the item it raises is the console's (birth `console`), not the session's.
+   */
+  raisedBy?: 'console';
   written_at: string;
   /**
    * The session that declared it, when it knew its own id (`$PE_SESSION_ID`,
@@ -190,6 +198,13 @@ export function readOutcome(
   } catch {
     return null;
   }
+  return screenOutcomeObject(parsed, expect);
+}
+
+/** `readOutcome`'s screen over a parsed object — the file's, or a session's structured output. */
+function screenOutcomeObject(
+  parsed: Partial<PhaseOutcome>, expect: { slug: string; phase: number; notBefore?: string },
+): PhaseOutcome | null {
   if (parsed.version !== 1) return null;
   if (parsed.slug !== expect.slug) return null;
   if (parsed.phase !== expect.phase) return null;
@@ -242,6 +257,63 @@ export function readOutcome(
       ? { session_id: parsed.session_id }
       : {}),
   };
+}
+
+/**
+ * A session's `structured_output` (measured-console phase 12, B4) — the
+ * outcome it returned through `--json-schema` — as the record a file would
+ * have been: the runner stamps the four fields it owns (`version`, `slug`,
+ * `phase`, `written_at`), and the result goes through `readOutcome`'s own
+ * screen field by field, so nothing a model returns can carry more than the
+ * script's file could. `'none'` is the session saying it declared nothing;
+ * null is a value the schema would not have produced.
+ */
+export function outcomeFromStructured(
+  value: unknown, expect: { slug: string; phase: number; at: string },
+): PhaseOutcome | 'none' | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const given = value as Record<string, unknown>;
+  if (given.status === OUTCOME_NONE) return 'none';
+  if (validateOutcome(given, OUTCOME_SESSION_SCHEMA).length) return null;
+  return screenOutcomeObject({ ...given, version: 1, slug: expect.slug, phase: expect.phase, written_at: expect.at }, expect);
+}
+
+/** Where the outcome a reader acted on came from. */
+export type OutcomeSource = 'structured' | 'file' | 'both';
+
+/**
+ * Structured first, the file second (B4): the one rule for a session that
+ * returned an outcome AND left a file.
+ *
+ *   - Only one of them holds a word → that one (`structured` or `file`). The
+ *     file alone is every hand session and every CLI that never saw the schema;
+ *     the structured output alone is a declaration whose file write was lost.
+ *   - Both, agreeing on the status and the key (`needs`, `run_act`) → the FILE's
+ *     copy (`both`): the script validated it, ran the guard and the ingest
+ *     probe, and carries the whole step — a model's restatement of the same
+ *     word is a witness, not a better record.
+ *   - Both, differing → the structured one, and `disagreed` names both words
+ *     for `phase.outcome-disagreed`.
+ *
+ * `none` is the absence of a word, never a word: it outranks nothing, so a
+ * file beside it is read as the file alone and the disagreement is still named.
+ */
+export function reconcileOutcome(
+  structured: PhaseOutcome | 'none' | null, file: PhaseOutcome | null,
+): { outcome: PhaseOutcome | null; via: OutcomeSource | null; disagreed?: { structured: string; file: string } } {
+  const said = structured && structured !== 'none' ? structured : null;
+  if (!said && !file) return { outcome: null, via: null };
+  if (!file) return { outcome: said, via: 'structured' };
+  if (!said) {
+    return { outcome: file, via: 'file', ...(structured === 'none' ? { disagreed: { structured: OUTCOME_NONE, file: wordOf(file) } } : {}) };
+  }
+  if (wordOf(said) === wordOf(file)) return { outcome: file, via: 'both' };
+  return { outcome: said, via: 'structured', disagreed: { structured: wordOf(said), file: wordOf(file) } };
+}
+
+/** The part of a declaration two witnesses must agree on: the status, its key and its act. */
+function wordOf(outcome: PhaseOutcome): string {
+  return [outcome.status, outcome.needs ?? '', outcome.run_act ?? ''].join(':').replace(/:+$/, '');
 }
 
 /** A `step` worth keeping: an object with a known kind and a non-empty title. */

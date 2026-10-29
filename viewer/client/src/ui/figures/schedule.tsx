@@ -23,12 +23,18 @@
  * The drawing is the run's own swimlane (`./swimlane`): a done bar painted
  * done, an open one hatched, an expected one queued, and a thin rail beside a
  * finished bar for what it was expected to take.
+ *
+ * Its numbers table carries each phase's money too (measured-console phase 23):
+ * what it will likely cost, `estimated` — its size's sessions × dollars per
+ * session — beside what it did cost, both through `ui/money.tsx`.
  */
 
 import { useId, useMemo } from 'react';
 
 import { cn } from '@/lib/cn';
 import { clockTime, duration, plural } from '@/lib/format';
+
+import { moneyText } from '@/ui/money';
 
 import { FigureNumbers } from './numbers';
 import { Swimlane, type SwimlaneBar, type SwimlaneRow } from './swimlane';
@@ -48,6 +54,10 @@ export interface ScheduleInput {
   estimates: ReadonlyMap<number, number>;
   /** What the run record says each phase did. */
   records: ReadonlyMap<number, { startedAt?: string | undefined; endedAt?: string | undefined }>;
+  /** What each phase will likely cost, USD `estimated` — null when nothing prices it (`PlanDetail.forecastUsd`). */
+  forecasts?: ReadonlyMap<number, number | null>;
+  /** What each phase did cost, USD (`PlanDetail.cost.phases`). */
+  costs?: ReadonlyMap<number, number>;
   now: number;
 }
 
@@ -63,6 +73,10 @@ export interface ScheduleRow {
   estimateMs?: number;
   /** On the chain that sets the plan's expected finish. */
   critical: boolean;
+  /** What it will likely cost (null: nothing prices it); absent when no forecast was made. */
+  forecastUsd?: number | null;
+  /** What it did cost, when it cost anything. */
+  costUsd?: number;
 }
 
 export interface Schedule {
@@ -128,6 +142,8 @@ export function scheduleOf(input: ScheduleInput): Schedule {
       state: p.state,
       critical: false,
       ...(estimate && estimate > 0 ? { estimateMs: estimate } : {}),
+      ...(input.forecasts?.has(p.phase) ? { forecastUsd: input.forecasts.get(p.phase) ?? null } : {}),
+      ...(input.costs?.get(p.phase) ? { costUsd: input.costs.get(p.phase)! } : {}),
     };
     if (p.state === 'done') {
       if (Number.isFinite(started) && Number.isFinite(ended)) {
@@ -354,6 +370,25 @@ export function ScheduleFigure({ input, className }: { input: ScheduleInput; cla
               row.actual && !row.actual.open ? duration(row.actual.end - row.actual.start) : '—',
             align: 'end',
           },
+          ...(input.forecasts?.size
+            ? [
+                {
+                  head: 'Forecast',
+                  cell: (row: ScheduleRow) =>
+                    row.forecastUsd === undefined ? '—' : moneyText(row.forecastUsd, 'forecast'),
+                  align: 'end' as const,
+                },
+              ]
+            : []),
+          ...(input.costs?.size
+            ? [
+                {
+                  head: 'Cost',
+                  cell: (row: ScheduleRow) => (row.costUsd ? moneyText(row.costUsd, 'cli') : '—'),
+                  align: 'end' as const,
+                },
+              ]
+            : []),
         ]}
       />
     </section>

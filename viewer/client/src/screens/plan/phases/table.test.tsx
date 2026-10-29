@@ -691,7 +691,7 @@ describe('PhaseTable — the lane says what it did last (control-tower phase 95,
  * ------------------------------------------------------------------------- */
 
 const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
-const CONTEXTS = ['run', 'plan', 'plan-qa', 'plan-handoffs'] as const satisfies readonly PhaseTableContext[];
+const CONTEXTS = ['run', 'plan', 'plan-record'] as const satisfies readonly PhaseTableContext[];
 
 describe('the one phase table — both pages, one column array', () => {
   it('exit 1: every context is PHASE_COLUMNS, in its order — a context only marks what it hides as Everything', () => {
@@ -760,7 +760,7 @@ describe('the one phase table — both pages, one column array', () => {
   it('exit 4 (#27): the QA column keeps the round and the three-state regime with its deciding level', async () => {
     mount(
       <PhaseTable
-        context="plan-qa"
+        context="plan-record"
         slug="demo"
         run={null}
         planPhases={[
@@ -794,7 +794,7 @@ describe('the one phase table — both pages, one column array', () => {
     // The verdict IS the way to its report — the sheet keeps its address.
     expect(within(reviewed).getByRole('link', { name: /QA fail — open the report/ })).toHaveAttribute(
       'href',
-      '#/plan/demo/phases?view=qa&report=2:2',
+      '#/plan/demo/phases?view=handoffs&report=2:2',
     );
     expect(reviewed.querySelector('[data-status="fail"]')).toBeInTheDocument();
     expect(screen.getByTestId('qa-3').textContent).toContain('waived, plan');
@@ -982,6 +982,148 @@ describe('the one phase table — both pages, one column array', () => {
     await waitFor(() => expect(table.querySelectorAll('tr[data-phase]')).toHaveLength(1));
     expect(screen.getByRole('link', { name: 'Step 33' })).toBeInTheDocument();
     expect(table.hasAttribute('aria-rowcount')).toBe(false);
+  });
+});
+
+describe('the phases as strips (Tower strips)', () => {
+  it('each row is a strip in its board hue, its plate before its name, its state the ONE lead badge', async () => {
+    setPrefs({ tables: { 'phases.plan': { collapsed: [] } } });
+    mount(
+      <PhaseTable
+        context="plan"
+        slug="demo"
+        run={null}
+        planPhases={[
+          phase({
+            phase: 1,
+            state: 'done',
+            title: 'Laid',
+            qa: { result: 'pass' },
+            handoff: { status: 'complete', skillsUsed: [], prompts: 0 } as never,
+          }),
+          phase({ phase: 2, state: 'stuck', title: 'Blocked one' }),
+          phase({ phase: 3, state: 'ready', title: 'Behind a gate', gated: true }),
+          phase({ phase: 4, state: 'ready', title: 'Next' }),
+          phase({ phase: 17, state: 'waiting', title: 'Later' }),
+        ]}
+        live={false}
+        allowRun
+      />,
+    );
+    await screen.findByRole('link', { name: 'Laid' });
+    // The edge is the lead badge's own hue — the word beside it — so a stuck
+    // phase is violet like its "Stuck": amber is never derived from a status
+    // word (design.md §3.1), and a gate says so in its own badge.
+    expect(rowOf('Laid')).toHaveAttribute('data-strip', 'done');
+    expect(rowOf('Blocked one')).toHaveAttribute('data-strip', 'waiting');
+    expect(rowOf('Behind a gate')).toHaveAttribute('data-strip', 'queued');
+    expect(rowOf('Next')).toHaveAttribute('data-strip', 'queued');
+    expect(rowOf('Later')).toHaveAttribute('data-strip', 'waiting');
+    expect(rowOf('Blocked one').querySelector('td [data-strip-edge]')).toHaveClass('state-waiting');
+    for (const name of ['Laid', 'Blocked one', 'Behind a gate', 'Next', 'Later']) {
+      const lead = rowOf(name).querySelector('[data-chrome="tint"]');
+      expect(lead, `${name}: the edge and the lead badge are one colour`).toHaveAttribute(
+        'data-paint',
+        rowOf(name).getAttribute('data-strip'),
+      );
+    }
+    // The plate: the phase number, tabular, before the name.
+    const plate = rowOf('Later').querySelector('[data-plate]')!;
+    expect(plate).toHaveTextContent(/^P17$/);
+    expect(plate).toHaveClass('tabular-nums', 'font-semibold', 'bg-ground-deep');
+    expect(
+      plate.compareDocumentPosition(within(rowOf('Later')).getByRole('link', { name: 'Later' })) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // ONE lead badge per strip — the state — and the record's badges outlined.
+    const laid = rowOf('Laid');
+    expect(laid.querySelectorAll('[data-chrome="tint"]')).toHaveLength(1);
+    expect(laid.querySelector('[data-chrome="tint"]')).toHaveAttribute('data-vocab', 'board');
+    expect(laid.querySelector('[data-vocab="qa-result"]')).toHaveAttribute('data-chrome', 'badge');
+  });
+
+  it('opens a strip onto its state’s tint, the edge running down its detail', async () => {
+    setPrefs({ tables: { 'phases.plan': { collapsed: [] } } });
+    mount(
+      <PhaseTable
+        context="plan"
+        slug="demo"
+        run={null}
+        planPhases={[phase({ phase: 2, state: 'stuck', title: 'Blocked one' })]}
+        live={false}
+        allowRun
+      />,
+    );
+    await screen.findByRole('link', { name: 'Blocked one' });
+    openRow('Blocked one');
+    const row = rowOf('Blocked one');
+    expect(row).toHaveClass('state-waiting', 'bg-state-tint');
+    const detail = row.nextElementSibling!.querySelector('td')!;
+    expect(detail).toHaveClass('bg-state-tint', 'state-waiting');
+    expect(detail.querySelector('[data-strip-edge]')).toHaveClass('state-waiting');
+  });
+});
+
+describe('Handoffs & QA — an opened row leads with the record', () => {
+  it('draws the handoff and the QA as two cards, before the verbs, each with its one lead badge', async () => {
+    mount(
+      <PhaseTable
+        context="plan-record"
+        slug="demo"
+        run={null}
+        planPhases={[
+          phase({
+            phase: 2,
+            state: 'done',
+            title: 'Reviewed',
+            qa: { result: 'fail', report: 'reports/phase-02-qa.md' },
+            qaMode: { mode: 'on', source: 'plan' },
+            handoff: { status: 'complete', completed: '2026-10-01', skillsUsed: [], prompts: 0 } as never,
+          }),
+        ]}
+        live={false}
+        allowRun
+        recovery={{ allowAgent: false, qaMode: 'on' }}
+      />,
+    );
+    await screen.findByRole('link', { name: 'Reviewed' });
+    openRow('Reviewed');
+    const cards = await screen.findByTestId('phase-record-2');
+    // Side by side from 40 rem of room — a container query, so the panel and a narrow page stack them.
+    expect(cards).toHaveClass('@container/record');
+    expect(cards.firstElementChild).toHaveClass('@min-[40rem]/record:grid-cols-2');
+    const handoff = within(cards).getByTestId('record-handoff');
+    const qa = within(cards).getByTestId('record-qa');
+    expect(handoff.compareDocumentPosition(qa) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(handoff).getByRole('heading', { name: 'Handoff' })).toBeInTheDocument();
+    expect(handoff.querySelector('[data-chrome="tint"]')).toHaveAttribute('data-vocab', 'handoff');
+    expect(handoff.querySelector('[data-chrome="tint"]')).toHaveAttribute('data-status', 'complete');
+    expect(handoff).toHaveTextContent('Completed 2026-10-01');
+    expect(qa.querySelectorAll('[data-chrome="tint"]')).toHaveLength(1);
+    expect(qa.querySelector('[data-chrome="tint"]')).toHaveAttribute('data-status', 'fail');
+    // The record leads; the rest of the drawer follows and does not draw the two again.
+    const drawer = screen.getByTestId('phase-drawer-2');
+    expect(cards.compareDocumentPosition(drawer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByTestId('drawer-qa')).toHaveLength(1);
+    expect(within(drawer).queryByTestId('drawer-qa')).toBeNull();
+  });
+
+  it('the table reading opens a row onto the drawer as before — no record cards', async () => {
+    mount(
+      <PhaseTable
+        context="plan"
+        slug="demo"
+        run={null}
+        planPhases={[phase({ phase: 2, state: 'ready', title: 'Plain' })]}
+        live={false}
+        allowRun
+      />,
+    );
+    await screen.findByRole('link', { name: 'Plain' });
+    openRow('Plain');
+    await screen.findByTestId('phase-drawer-2');
+    expect(screen.queryByTestId('phase-record-2')).toBeNull();
+    expect(within(screen.getByTestId('phase-drawer-2')).getByTestId('drawer-qa')).toBeInTheDocument();
   });
 });
 

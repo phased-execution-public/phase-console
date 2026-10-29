@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: stays-quiet
+description: 'the description''s trigger: an ordinary one-line fix in a project that mentions phases must not load the skill.'
+tags: [stays-quiet]
+context:
+  scaffold_script: fixture.sh

@@ -22,10 +22,11 @@ import { MANIFEST_BLOCKING } from '../shared/policy-model.js';
 import {
   PreludeRefusal, manifestRows, preludeFor, probeAccounts, probeCredentials, probeDelivery, probeMcp, probeTrees, resolvedManifest,
   gitStrategyLines, probeGitStrategy, readPlanBranch, gitOverrideInstruction, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps, doorOpens, doorSteps, itemOf, planStepInput,
-  type AccountFacts, type PreludeDeps, type PreludeStep,
+  doorPolicyFacts,
+  type AccountFacts, type PreludeDeps, type PreludeOptions, type PreludeStep,
 } from '../server/prelude.ts';
 import { HumanStepLedger, sanitiseStep } from '../server/human-steps.ts';
-import { parseHumanStepBody } from '../server/parse/plan.ts';
+import { parseHumanStepBody, parsePlan } from '../server/parse/plan.ts';
 import {
   credentialsHeld, forgetCredentialProbes, heldIdsCached, knownCredentialId, probeCredential,
 } from '../server/credentials-probe.ts';
@@ -294,6 +295,111 @@ test('PreludeRefusal names the first open decision, counts the rest, and carries
   assert.equal(refusal.prelude, prelude);
   const manifest = manifestRows(written, {}, deps(), [{ id: 'default', minHeadroomPct: 0 }]);
   assert.equal(manifest.filter((r) => r.state === 'outstanding').length, 2);
+});
+
+/* ------------------------------------------------------------------ *
+ * #379 — the start door honours each phase's own credential and MCP policy
+ * (measured-console phase 13)
+ * ------------------------------------------------------------------ */
+
+/** A credentials verdict per id: `missing` ids are absent, the rest held. */
+function heldBut(...missing: string[]): PreludeDeps['credentials'] {
+  return {
+    held: async (ids) => ids.map((id) => (missing.includes(id)
+      ? { id, status: 'fail' as const, reason: `${id} does not exist` }
+      : { id, status: 'ok' as const, reason: 'held' })),
+  };
+}
+
+test('#379: a credential only a continue phase declares never blocks the start under the plan\'s require — the plan\'s own ids still do', async () => {
+  // The one-pool shape: the plan's line says require for gh and claude-login,
+  // phase 8's own bullets name an OpenAI key file with policy continue.
+  const facts = {
+    ids: ['gh', 'claude-login', 'file:openai.md'], policy: 'require',
+    planIds: ['gh', 'claude-login'],
+    phases: [
+      { phase: 1, ids: [], policy: null },
+      { phase: 8, ids: ['file:openai.md'], policy: 'continue' },
+    ],
+  };
+  const optional = await preludeFor('one-pool', { resumeOnRestart: true, relay: 'off' }, deps({
+    planCredentials: () => facts, credentials: heldBut('file:openai.md'),
+  }));
+  assert.deepEqual(optional.blocking, [], 'an optional key on a continue phase does not block the launch');
+  assert.equal(optional.probes.credentials.status, 'ok');
+  assert.match(optional.probes.credentials.reason, /file:openai\.md not held; policy its phase's continue runs and reports the gap/);
+  assert.deepEqual(optional.probes.credentials.warnings, ["file:openai.md — file:openai.md does not exist (its phase's credential policy is continue)"]);
+  assert.deepEqual(optional.credentials.missing, ['file:openai.md'], 'still reported as missing — a note, not a refusal');
+  // The plan's own id still refuses under the plan's require.
+  const planWide = await preludeFor('one-pool', { resumeOnRestart: true, relay: 'off' }, deps({
+    planCredentials: () => facts, credentials: heldBut('gh', 'file:openai.md'),
+  }));
+  assert.deepEqual(planWide.blocking.map((b) => b.key), ['credentials']);
+  assert.match(planWide.probes.credentials.reason, /credential policy is require and gh is not held/);
+  assert.doesNotMatch(planWide.probes.credentials.reason, /openai/, 'the optional key is a warning beside the refusal, not part of it');
+  // A phase that is silent inherits the plan's require for its own id; one that
+  // says require holds its own id even under a plan that says continue.
+  const silent = await preludeFor('one-pool', { resumeOnRestart: true, relay: 'off' }, deps({
+    planCredentials: () => ({ ...facts, phases: [{ phase: 8, ids: ['file:openai.md'], policy: null }] }),
+    credentials: heldBut('file:openai.md'),
+  }));
+  assert.deepEqual(silent.blocking.map((b) => b.key), ['credentials']);
+  const strictPhase = await preludeFor('one-pool', { resumeOnRestart: true, relay: 'off' }, deps({
+    planCredentials: () => ({ ...facts, policy: 'continue', phases: [
+      { phase: 5, ids: ['file:openai.md'], policy: 'continue' },
+      { phase: 8, ids: ['file:openai.md'], policy: 'require' },
+    ] }),
+    credentials: heldBut('file:openai.md'),
+  }));
+  assert.deepEqual(strictPhase.blocking.map((b) => b.key), ['credentials'], 'any declaring phase that requires it requires it');
+  // A caller that does not say who declared what keeps the old reading.
+  const legacy = await preludeFor('one-pool', { resumeOnRestart: true, relay: 'off' }, deps({
+    planCredentials: () => ({ ids: facts.ids, policy: 'require' }), credentials: heldBut('file:openai.md'),
+  }));
+  assert.deepEqual(legacy.blocking.map((b) => b.key), ['credentials']);
+});
+
+test('#379: an MCP server only a continue phase declares never blocks the start under the plan\'s require — read from a parsed plan', async () => {
+  const plan = parsePlan([
+    '---', 'slug: door', 'status: active', 'phases: 2', '---', '', '# Door', '',
+    '## Session budget', '',
+    '> **Target model:** `claude-opus-5` · **Budget:** ~200K · **Branch:** current',
+    '> **Credentials:** `gh`', '> **Credential policy:** require',
+    '> **MCP servers (every session):** `ctx`', '> **MCP policy:** require', '',
+    '## Phase graph', '',
+    '| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |',
+    '|------:|-------|-----------|--------------------|-------|---------------|',
+    '| 1 | Plain | — | — | r | x |',
+    '| 2 | Optional | 1 | — | r | x |', '',
+    '## Phases', '',
+    '### Phase 1 — Plain', '- **Verification:**', '  - `true`', '',
+    '### Phase 2 — Optional',
+    '- **Credentials:** `file:openai.md`', '- **Credential policy:** continue',
+    '- **MCP:** `browser`', '- **MCP policy:** continue',
+    '- **Verification:**', '  - `true`', '',
+  ].join('\n'), 'door', '/tmp/door.md');
+  const credentials = doorPolicyFacts(plan, 'credentials');
+  assert.deepEqual(credentials, {
+    ids: ['gh', 'file:openai.md'], policy: 'require', planIds: ['gh'],
+    phases: [{ phase: 1, ids: [], policy: null }, { phase: 2, ids: ['file:openai.md'], policy: 'continue' }],
+  });
+  const mcp = doorPolicyFacts(plan, 'mcp');
+  assert.deepEqual(mcp.ids, ['ctx', 'browser']);
+  const door = (downIds: string[], options: PreludeOptions = {}) => preludeFor('door', { resumeOnRestart: true, relay: 'off', ...options }, deps({
+    planCredentials: () => credentials, planMcp: () => mcp, credentials: heldBut('file:openai.md'),
+    mcp: { preflight: async () => ({ ok: !downIds.length, blocking: downIds.map((id) => ({ id, status: 'failed' })), unknown: [] }) },
+  }));
+  const optional = await door(['browser']);
+  assert.deepEqual(optional.blocking, [], 'neither the optional key nor the optional server blocks');
+  assert.equal(optional.probes.mcp.status, 'ok');
+  assert.deepEqual(optional.probes.mcp.warnings, ['browser (failed)']);
+  const planWide = await door(['ctx', 'browser']);
+  assert.deepEqual(planWide.blocking.map((b) => b.key), ['mcp']);
+  assert.match(planWide.probes.mcp.reason, /MCP policy is require and ctx \(failed\) will not connect/);
+  assert.deepEqual(planWide.probes.mcp.warnings, ["browser (failed) — its phase's MCP policy is continue"]);
+  // A server the run's own form asks for takes the door's word, not the phase's.
+  const asked = await door(['browser'], { mcpServers: ['browser'] });
+  assert.deepEqual(asked.blocking.map((b) => b.key), ['mcp']);
 });
 
 /* ------------------------------------------------------------------ *
@@ -917,3 +1023,4 @@ test('turn-by-turn 2: itemOf matches by the (E-N…) ref first — a 7.0 item ti
   // No ref on either side: the exact title, as before.
   assert.equal(itemOf(doorStep(), [{ id: 'hs-t', slug: 'demo', birth: 'plan', phase: 2, kind: 'browser-login', title: 'Sign in to Vercel' }], 'demo'), 'hs-t');
 });
+

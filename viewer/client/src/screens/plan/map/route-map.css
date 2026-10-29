@@ -5,9 +5,10 @@
  * never opens a map downloads none of it.
  *
  * Why CSS and not utilities: an SVG station is a group whose CHILDREN change
- * appearance on hover, focus and selection of the group (`.route-station:hover
+ * appearance on hover, focus and selection of the group (`.route-station.hovered
  * .halo`) — a descendant relationship no utility can say without a variant per
- * child. The geometry lives in `dag.tsx`; only the paint is here. Inside
+ * child. The hover and the focus are its BUTTON's (`.route-station-button`, in
+ * the layer over the drawing), lent to the group as a class by `dag.tsx`. The geometry lives in `dag.tsx`; only the paint is here. Inside
  * `@layer components`, so a utility on an element still wins.
  *
  * Every name is a `route-` one or hangs under one: once loaded, this sheet is
@@ -38,6 +39,8 @@
      below), and one paper is what lets the trunk's casing hide what it
      crosses. */
   .route-frame {
+    /* The stations' buttons stand in a layer over the drawing, placed from here. */
+    position: relative;
     background: var(--ground-deep);
     overflow: hidden;
     /* The visible viewport: `--app-height` is the token the shell corrects for
@@ -63,10 +66,34 @@
 
   .route-svg { display: block; user-select: none; width: 100%; height: 100%; }
 
-  /* The station's target, sized in plan units by `dag.tsx` so it lands at 44 CSS
-     px at any zoom. `transparent` and not `none`: `fill: none` takes no pointer,
-     which is the difference between a hit area and a decoration. */
-  .route-station-hit { fill: transparent; }
+  /* The stations' buttons — the map's targets, over the paint. The layer takes
+     no pointer itself, so a press between stations reaches the drawing's frame;
+     `overflow: clip` (never `hidden`) because a clipped box cannot be scrolled,
+     and a focus that landed on a button outside the window would otherwise
+     scroll the layer out of register with the drawing. Each button is a
+     transparent square `dag.tsx` sizes (44 CSS px, or the mark if larger) and
+     places by a transform on the drawing's own physical axis. */
+  .route-stations {
+    position: absolute;
+    inset: 0;
+    overflow: clip;
+    pointer-events: none;
+  }
+  .route-station-button {
+    position: absolute;
+    inset-block-start: 0;
+    inset-inline-start: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    pointer-events: auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* The halo is the focus mark (`.route-station.focused` below): a box round a
+     round station would be a second, wrong one. */
+  .route-station-button:focus-visible { outline: none; }
 
   /* ---------------------------------------------------------------- *
    * Platforms — the board, ruled
@@ -180,7 +207,8 @@
    * The station mark
    * ---------------------------------------------------------------- */
 
-  .route-station { cursor: pointer; }
+  /* Paint only: its button takes every pointer. */
+  .route-station { pointer-events: none; }
 
   .route-mark .dot {
     fill: var(--surface);
@@ -262,14 +290,13 @@
      the map is ringing; the focus ring's ink for the keyboard, because a
      focused station is not a summons, whatever state it is in. */
   .route-station .halo { fill: none; stroke: transparent; stroke-width: 2; }
-  .route-station:hover .halo,
+  .route-station.hovered .halo,
   .route-station.selected .halo { stroke: color-mix(in oklab, var(--state, var(--ink)) 55%, transparent); }
   .route-station.selected .halo { stroke-width: 3; }
-  .route-station:focus-visible .halo { stroke: var(--focus); stroke-width: 2.5; }
+  /* `focused` is set while the station's button has a keyboard focus
+     (`:focus-visible`), and it comes last so it wins over a hover. */
+  .route-station.focused .halo { stroke: var(--focus); stroke-width: 2.5; }
   .route-station.dim { opacity: 0.32; }
-  /* The halo is the focus mark: the browser's own outline would trace the
-     bounding box of a two-line label rather than the station. */
-  .route-station:focus-visible { outline: none; }
 
   .route-station-number {
     font-family: var(--font-sans);

@@ -38,7 +38,7 @@ import {
   withOwnerTouch,
   type OwnerKey,
 } from '@/data/owner';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { useRoute } from '@/shell/router';
 import { turnHref } from '@/shell/routes';
 import { Banner, Button, Input, Mono, RelativeTime, Skeleton, toast } from '@/ui';

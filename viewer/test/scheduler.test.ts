@@ -414,7 +414,7 @@ test('a wall the REGISTRY already knows holds admissions with nothing ever calli
 });
 
 test('throttle() writes THROUGH to the registry — there is no second copy to diverge', async () => {
-  let clock = 1_000;
+  const clock = 1_000;
   const { walls, byAccount } = registry();
   const s = scheduler({ now: () => clock, accountWalls: walls });
 
@@ -1928,7 +1928,7 @@ test('ACC-10.7: with a machine cap of 1 and two consoles, the second queues behi
   alpha.release(first);
   const grant = await Promise.race([
     second,
-    new Promise<null>((resolve) => setTimeout(() => { beta.poll(); }, 1_500)).then(() => second),
+    new Promise<null>((_resolve) => setTimeout(() => { beta.poll(); }, 1_500)).then(() => second),
   ]);
   assert.equal(grant.slug, 'two', 'releasing the first admits the second');
   assert.equal(liveLaneTokens().length, 1);

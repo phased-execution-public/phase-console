@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: finish-red-is-never-complete
+description: 'mode-phase-finish, Step 1: never hand off red — the earlier attempt committed `World`, one line is red.'
+tags: [phase-finish, working-if]
+context:
+  scaffold_script: fixture.sh

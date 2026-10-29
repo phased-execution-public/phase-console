@@ -10,8 +10,8 @@ import { tabItems } from './nav';
 import { NavBadge } from './brand';
 
 /**
- * The tab bar (under 900): Runs · Plans · Sessions · Insights (the Supervisor
- * in Pro) · More. A **grid row of the shell**, never `position: fixed`: a fixed
+ * The tab bar (under 900): Runs · Your turn · Plans · Sessions (the Supervisor
+ * in Pro) · More — `TAB_BAR` in `nav.ts` says why that order. A **grid row of the shell**, never `position: fixed`: a fixed
  * bar drifts under iOS's URL chrome and floats mid-page on a rubber-band
  * scroll; as the last row of an `--app-height` shell it is simply the bottom.
  * It registers its height as `--bottom-bars`, so toasts stack above it.

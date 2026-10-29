@@ -41,7 +41,15 @@ export function PanelCard({ id }: { id: string }) {
     item.record === 'ledger' ? ledger.data?.steps.find((step) => step.id === item.item) : undefined;
   return (
     <div className="flex min-w-0 flex-col gap-4" data-testid="turn-panel-card">
-      <TurnItemCard item={item} record={record} perform={perform} busy={busy} folded={false} parts={parts} />
+      <TurnItemCard
+        item={item}
+        record={record}
+        perform={perform}
+        busy={busy}
+        folded={false}
+        parts={parts}
+        inPanel
+      />
       <Disclosure label="Its record" openLabel="Fold its record">
         <ExplainOverview item={item} record={record} />
       </Disclosure>

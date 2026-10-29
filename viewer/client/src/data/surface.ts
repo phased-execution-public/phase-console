@@ -36,7 +36,7 @@
 /** What a row names. */
 export type SurfaceKind = 'route' | 'sse' | 'setting' | 'verb';
 
-/** The 7.0 map's places (§Architecture 3): seven destinations, Your turn, the two Pro places, and the shell around them. */
+/** The 7.0 map's places (§Architecture 3): the eight destinations (Your turn the eighth since 8.0), the two Pro places, and the shell around them. */
 export const SURFACE_PLACES = [
   'Runs',
   'Plans',
@@ -197,6 +197,8 @@ const webhooksFlag = { flag: '--allow-webhooks' } as const;
 const SESSION_HOOK = 'a hook a session posts on this machine, with its own credential — never a page';
 /** Writes the hooks a supervised session posts back (its `--settings`). */
 const HOOK_WRITER = 'viewer/server/runner/approvals.ts';
+/** Writes the exporter variables that point a session's OpenTelemetry at the console (`telemetryEnv`). */
+const TELEMETRY_WRITER = 'viewer/server/runner/errors.ts';
 /** The control surface's own reference, where a script's author reads a route no page needs. */
 const CONTROLS_DOC = 'docs/controls.md';
 const BY_INBOX = 'api/inbox#inboxApi.inboxAct';
@@ -226,6 +228,11 @@ const ROUTES: readonly SurfaceRow[] = [
   route('POST', '/hooks/stop', why(`the closeout hook: ${SESSION_HOOK}`, HOOK_WRITER)),
   route(
     'POST',
+    '/hooks/compact',
+    why(`the compaction hooks (PreCompact, PostCompact): ${SESSION_HOOK}`, HOOK_WRITER),
+  ),
+  route(
+    'POST',
     '/hooks/declaration',
     why(`\`phase-outcome.sh\` asks for a probe now: ${SESSION_HOOK}`, 'scripts/phase-outcome.sh'),
   ),
@@ -233,6 +240,14 @@ const ROUTES: readonly SurfaceRow[] = [
     'POST',
     '/hooks/session',
     why(`the presence hook (\`scripts/session-hook.sh\`): ${SESSION_HOOK}`, 'scripts/session-hook.sh'),
+  ),
+  // A session's OpenTelemetry export (measured-console phase 19): `childEnv` points its OTLP
+  // exporter here with the run's telemetry bearer; a free console answers 404.
+  route('POST', '/otel/v1/logs', why(`a session's OpenTelemetry events: ${SESSION_HOOK}`, TELEMETRY_WRITER)),
+  route(
+    'POST',
+    '/otel/v1/metrics',
+    why(`a session's OpenTelemetry metrics: ${SESSION_HOOK}`, TELEMETRY_WRITER),
   ),
   route('GET', '/events', at(shell('header'), 'live#useLiveData'), { stream: true }),
 
@@ -277,8 +292,10 @@ const ROUTES: readonly SurfaceRow[] = [
   route('GET', '/api/sessions/:id/events', at(sessionsPage, 'sessions#useSessionEvents')),
   route('POST', '/api/sessions/:id/release', at(runsHome, 'api/state#stateApi.releaseSessionHold'), runFlag),
   route('GET', '/api/converge', at(runsHome, 'runs#useConverge')),
-  route('GET', '/api/hooks-install', at(settings('automation'), 'sessions#useHooksStatus')),
-  route('POST', '/api/hooks-install', at(settings('automation'), 'sessions#useHooksWrite'), writesFlag),
+  route('GET', '/api/hooks-install', at(settings('hooks'), 'sessions#useHooksStatus')),
+  route('POST', '/api/hooks-install', at(settings('hooks'), 'sessions#useHooksWrite'), writesFlag),
+  // Settings ▸ Hooks (measured-console phase 28, D3): every hook, and each plan's hookify rules.
+  route('GET', '/api/hooks', at(settings('hooks'), 'sessions#useHooks')),
   route('GET', '/api/fs', at(sourcePicker, 'machine#useDirListing')),
 
   /* The repository. */
@@ -301,14 +318,30 @@ const ROUTES: readonly SurfaceRow[] = [
   route('GET', '/api/turn', at(turnPage, 'turn#turnApi.read')),
   // An item's explain view (quiet-console phase 8): the item's inspector Overview reads it.
   route('GET', '/api/turn/:id', at(turnPage, 'turn#useTurnItem')),
+  // *I can't do this* on an item the console projects (2026-10-20): the card's own press.
+  route('POST', '/api/turn/:id/cannot', at(turnPage, 'turn#cannotItem'), { authority: 'decline' }),
+  // *Hand it to the AI*, a decision's last way on, and a comment to the AI (2026-10-20).
+  route('POST', '/api/turn/:id/hand-off', at(turnPage, 'turn#handOffItem'), { authority: 'trust' }),
+  route('POST', '/api/turn/:id/note', at(turnPage, 'turn#noteItem'), { authority: 'answer' }),
   route('GET', '/api/human-steps', at(turnPage, 'human-steps#humanStepsApi.humanSteps')),
   route('POST', '/api/human-steps/suspected', at(shell('bell'), BY_INBOX)),
-  route('POST', '/api/human-steps/:id/open', at(turnPage, 'human-steps#humanStepsApi.humanStepOpen')),
+  route('POST', '/api/human-steps/:id/open', at(turnPage, 'human-steps#humanStepsApi.humanStepOpen'), {
+    authority: 'decline',
+  }),
   route('POST', '/api/human-steps/:id/check', at(turnPage, 'human-steps#humanStepsApi.humanStepCheck'), {
     authority: 'attest',
   }),
-  route('POST', '/api/human-steps/:id/snooze', at(turnPage, 'human-steps#humanStepsApi.humanStepSnooze')),
-  route('POST', '/api/human-steps/:id/cannot', at(turnPage, 'human-steps#humanStepsApi.humanStepCannot')),
+  route('POST', '/api/human-steps/:id/snooze', at(turnPage, 'human-steps#humanStepsApi.humanStepSnooze'), {
+    authority: 'decline',
+  }),
+  // The step's own *I can't do this* (measured-console phase 17, EI-7): the
+  // page presses `/api/turn/:id/cannot`, which settles a ledger item through it.
+  route(
+    'POST',
+    '/api/human-steps/:id/cannot',
+    why('the page says it through `POST /api/turn/:id/cannot`; a script may say it here', CONTROLS_DOC),
+    { authority: 'decline' },
+  ),
   // *Withdraw* among an item's moves (quiet-console phase 8): the owner takes an open item off the page.
   route('POST', '/api/human-steps/:id/dismiss', at(turnPage, 'turn#withdrawItem'), { authority: 'decline' }),
   route('POST', '/api/human-steps/:id/answer', at(turnPage, 'human-steps#humanStepsApi.humanStepAnswer'), {
@@ -547,6 +580,9 @@ const ROUTES: readonly SurfaceRow[] = [
   }),
   route('GET', '/api/spend', at(insightsPage, 'runs#useSpend')),
   route('GET', '/api/ledger', at(insightsPage, 'runs#useLedgerSummary')),
+  /* Logs ▸ Health over time (measured-console phase 31, F2): gate time, load, persist time and the
+     reconciliation's delta as a series. */
+  route('GET', '/api/health/series', at(logs('health'), 'logs#useHealthSeries')),
   route('GET', '/api/metrics', at(logs('health'), 'logs#readMetricsScrape')),
   /* The console's and the machine's thin reads (quiet-console phase 25): Logs ▸ Health
      draws the ceiling and the strays, Settings ▸ Accounts what this machine holds. */
@@ -924,6 +960,12 @@ const PREFS: readonly SurfaceRow[] = [
   automationKey('watchCmdRefs'),
   automationKey('watchMintedCmdRefs'),
   automationKey('mcpPolicy'),
+  // What an unattended session loads (measured-console phase 11), drawn on
+  // Settings ▸ Skills & plugins (phase 28, F1): the word and the tool through
+  // the one prefs write, the list by the switch on each plugin's line.
+  setting('autopilotLoads', at(settings('skills'), SAVE_PREFS)),
+  setting('autopilotPlugins', at(settings('skills'), SAVE_PREFS)),
+  setting('graphTool', at(settings('skills'), SAVE_PREFS)),
   automationKey('ladderPerPhaseRungs'),
   automationKey('ladderPerPhaseUsd'),
   automationKey('ladderPerRunRungs'),
@@ -1038,6 +1080,15 @@ const RUN_FIELDS: readonly SurfaceRow[] = [
     'qaRoundBudgetUsd',
     'ladderPerRunRungs',
     'ladderPerPhaseRungs',
+    // The session's environment (measured-console phase 6): the launch form's Engine tile.
+    'cacheTtlAb',
+    'keepWarmSec',
+    'subagentModel',
+    'bashMaxOutput',
+    // The platform's pieces (measured-console phase 12): the launch form's Engine tile too.
+    'humanStepMode',
+    'compaction',
+    'compactionWindow',
     'onLimit',
     'modelPolicy',
     'baseBranch',

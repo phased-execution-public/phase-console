@@ -94,6 +94,9 @@ const DETAIL = {
 
 const station = (container: HTMLElement, phase: number) =>
   container.querySelector<SVGGElement>(`.route-station[data-phase="${phase}"]`)!;
+/** A station's button — what a pointer or a press reaches, over the drawing. */
+const target = (container: HTMLElement, phase: number) =>
+  container.querySelector<HTMLButtonElement>(`.route-station-button[data-phase="${phase}"]`)!;
 const dimmedPhases = (container: HTMLElement) =>
   [...container.querySelectorAll('.route-station.dim')].map((el) => Number(el.getAttribute('data-phase')));
 
@@ -284,7 +287,7 @@ describe('MapView — the tools in the address', () => {
         <Probe />
       </>,
     );
-    fireEvent.click(station(view.container, 4));
+    fireEvent.click(target(view.container, 4));
     expect(screen.getByTestId('inspected').textContent).toContain('4');
     expect(queryOfHash().sel).toBe('4');
     expect(window.location.hash).not.toContain('/phase/4');
@@ -294,7 +297,7 @@ describe('MapView — the tools in the address', () => {
         <Probe />
       </>,
     );
-    fireEvent.click(station(view.container, 4));
+    fireEvent.click(target(view.container, 4));
     expect(window.location.hash).toBe('#/plan/demo/phase/4');
   });
 
@@ -302,7 +305,7 @@ describe('MapView — the tools in the address', () => {
     vi.useFakeTimers();
     try {
       const { container } = render(<MapView detail={DETAIL} run={null} />);
-      fireEvent.mouseEnter(station(container, 4));
+      fireEvent.mouseEnter(target(container, 4));
       const card = screen.getByTestId('map-hover-card');
       expect(within(card).getByText('Phase 4: Cutover')).toBeInTheDocument();
       expect(card).toHaveTextContent(/In progress · size M · \$1\.50 so far/);
@@ -313,10 +316,11 @@ describe('MapView — the tools in the address', () => {
         '#/plan/demo/phase/4',
       );
       // In place of the native tooltip, not beside it.
+      expect(target(container, 4).hasAttribute('title')).toBe(false);
       expect(station(container, 4).querySelector('title')).toBeNull();
       fireEvent.click(within(card).getByRole('button', { name: 'Trace' }));
       expect(queryOfHash().sel).toBe('4');
-      fireEvent.mouseLeave(station(container, 4));
+      fireEvent.mouseLeave(target(container, 4));
       act(() => vi.advanceTimersByTime(400));
       expect(screen.queryByTestId('map-hover-card')).toBeNull();
     } finally {
@@ -327,9 +331,9 @@ describe('MapView — the tools in the address', () => {
   it('a phone keeps its fact strip, with Inspect beside Open', () => {
     touch.mockReturnValue(true);
     const { container } = render(<MapView detail={DETAIL} run={null} />);
-    fireEvent.mouseEnter(station(container, 4));
+    fireEvent.mouseEnter(target(container, 4));
     expect(screen.queryByTestId('map-hover-card')).toBeNull();
-    fireEvent.click(station(container, 4));
+    fireEvent.click(target(container, 4));
     const strip = screen.getByRole('group', { name: 'Phase 4 facts' });
     expect(within(strip).getByRole('button', { name: 'Inspect' })).toBeInTheDocument();
   });
@@ -365,6 +369,8 @@ describe('export', () => {
     expect(markup).toContain(`viewBox="${svg.getAttribute('viewBox')}"`);
     expect(markup).toContain('fill:red');
     expect(markup).not.toContain('route-station-hit');
+    // The picture, never the buttons over it: nothing in the file to focus or press.
+    expect(markup).not.toMatch(/<button|route-station-button|tabindex|role="/);
     expect((markup.match(/class="route-station /g) ?? []).length).toBe(6);
     expect(svgDataUrl(markup).startsWith('data:image/svg+xml')).toBe(true);
     expect(exportName('one pool/x', 'png')).toBe('one-pool-x-map.png');

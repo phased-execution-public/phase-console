@@ -45,7 +45,7 @@
  * @typedef {'superseded'|'qa-failed'|'qa-pending'|'foreign-live'|'foreign-stale'
  *   |'waiting-external'|'gated-manual'|'mcp-unavailable'|'resource-wall'
  *   |'blocked-declared'|'plan-broken'|'verify-red'|'done-unrecorded'|'work-in-progress'
- *   |'never-started'|'unknown'} SituationId
+ *   |'spawn-sdk-failed'|'never-started'|'unknown'} SituationId
  */
 
 /** Every situation, in classifier precedence. Frozen: it is a vocabulary. */
@@ -65,6 +65,7 @@ export const SITUATIONS = Object.freeze(
     'verify-red',
     'done-unrecorded',
     'work-in-progress',
+    'spawn-sdk-failed',
     'never-started',
     'unknown',
   ]),
@@ -324,6 +325,7 @@ export const SITUATION_ACTOR = Object.freeze({
   'verify-red': 'machine',
   'done-unrecorded': 'machine',
   'work-in-progress': 'machine',
+  'spawn-sdk-failed': 'machine',
   'never-started': 'machine',
   unknown: 'person',
 });
@@ -399,6 +401,7 @@ export const SITUATION_LABELS = Object.freeze({
   'verify-red': 'Verification red',
   'done-unrecorded': 'Done, unrecorded',
   'work-in-progress': 'Work in progress',
+  'spawn-sdk-failed': 'Agent SDK door failed',
   'never-started': 'Never started',
   unknown: 'Unclassified',
 });
@@ -438,6 +441,8 @@ export const SITUATION_BLURBS = Object.freeze({
     'Verification is green and work landed, but no complete handoff exists. The own session is asked to close out; a fresh agent if it cannot.',
   'work-in-progress':
     'Real work exists and is unfinished — an in-progress handoff, commits, a dirty tree. The own session continues the work; else a fresh session boards with a resume brief.',
+  'spawn-sdk-failed':
+    "A session sent through the Agent SDK's door ended before its first event. The door re-attempts it once on the subprocess, and the phase's later sessions stay there; nothing else is spent.",
   'never-started':
     'No handoff, nothing on disk, a session that ended before it began. The phase re-boards fresh — no closeout, no person.',
   unknown: 'The evidence fits no named situation. A person reads it, and the classifier gains a case.',
@@ -468,6 +473,93 @@ export function parseSituationKey(key) {
   const sub = rest.join(':') || undefined;
   if (!isSituation(id)) return { id: 'unknown' };
   return sub ? { id: /** @type {SituationId} */ (id), sub } : { id: /** @type {SituationId} */ (id) };
+}
+
+/**
+ * Where a failure's owner is read from (measured-console phase 25): the
+ * `resume-owner` rung's vocabulary, beside the situations it stands in.
+ *
+ *   - `inherited-red` — a §Verification red the phase's own verification
+ *     attributed to ANOTHER phase (`InheritedRed.owner`: charged, commit, wip);
+ *   - `evaluator`     — the independent evaluator found an exit criterion
+ *     `not met` on a phase this one depends on (the `**Evaluator:** hold`);
+ *   - `verdict`       — a QA or review verdict that names a phase other than
+ *     the one it was recorded against.
+ */
+export const OWNER_SOURCES = Object.freeze(/** @type {const} */ (['inherited-red', 'evaluator', 'verdict']));
+
+/**
+ * @typedef {Object} OwnerClaim
+ * @property {number} owner  The phase the failure belongs to.
+ * @property {number} from  The phase whose verification, evaluation or verdict named it.
+ * @property {(typeof OWNER_SOURCES)[number]} source
+ * @property {string} failure  One sentence: what failed.
+ * @property {string[]} evidence  The lines that say so (failing tests, criterion evidence), at most six.
+ */
+
+/** @param {unknown} value @returns {value is number} */
+const isPhaseNumber = (value) => typeof value === 'number' && Number.isInteger(value) && value > 0;
+
+/**
+ * The owner a failure names, or null. Reads what the console already knows —
+ * never a guess: an inherited red with SEVERAL candidate owners names none
+ * (the attribution could not tell them apart), and a failure that names the
+ * failing phase itself is that phase's own, which `resume-own-session` takes.
+ * First source with a claim wins, in the order of the vocabulary above.
+ *
+ * @param {{
+ *   phase: number,
+ *   inherited?: ReadonlyArray<{ command: string, chain?: string, failures?: string[], owner?: number, candidates?: number[], how?: string }> | null,
+ *   notMet?: ReadonlyArray<{ phase: number, id: string, evidence: string, dimension?: string }> | null,
+ *   verdict?: { phase?: number, verdict: string, summary?: string } | null,
+ * }} facts
+ * @returns {OwnerClaim | null}
+ */
+export function ownerClaimOf(facts) {
+  const from = facts.phase;
+  const inherited = facts.inherited ?? [];
+  for (const red of inherited) {
+    if (!isPhaseNumber(red.owner) || red.owner === from) continue;
+    const owner = red.owner;
+    const command = red.chain ?? red.command;
+    return {
+      owner,
+      from,
+      source: 'inherited-red',
+      failure: `phase ${from}'s §Verification found \`${command}\` red and attributed it to phase ${owner}${red.how ? ` (${red.how})` : ''}`,
+      evidence: inherited
+        .filter((other) => other.owner === owner)
+        .flatMap((other) =>
+          other.failures?.length ? other.failures : [`\`${other.chain ?? other.command}\` is red`],
+        )
+        .slice(0, 6),
+    };
+  }
+  const notMet = facts.notMet ?? [];
+  const miss = notMet.find((m) => isPhaseNumber(m.phase) && m.phase !== from);
+  if (miss) {
+    return {
+      owner: miss.phase,
+      from,
+      source: 'evaluator',
+      failure: `the independent evaluator found phase ${miss.phase}'s exit criterion ${miss.id} not met, which holds phase ${from}`,
+      evidence: notMet
+        .filter((m) => m.phase === miss.phase)
+        .map((m) => `criterion ${m.id}${m.dimension ? ` (${m.dimension})` : ''}: ${m.evidence}`)
+        .slice(0, 6),
+    };
+  }
+  const verdict = facts.verdict;
+  if (verdict && isPhaseNumber(verdict.phase) && verdict.phase !== from) {
+    return {
+      owner: verdict.phase,
+      from,
+      source: 'verdict',
+      failure: `a ${verdict.verdict} verdict recorded for phase ${from} names phase ${verdict.phase}`,
+      evidence: verdict.summary ? [verdict.summary] : [],
+    };
+  }
+  return null;
 }
 
 /**

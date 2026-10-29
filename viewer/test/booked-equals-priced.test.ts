@@ -31,8 +31,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  COST_DRIFT_BAND, COST_DRIFT_SESSIONS, COST_DRIFT_WINDOW_MS, CostDrift, TOKEN_PRICES_USD, priceRowOf, priceUsage,
+  COST_DRIFT_BAND, COST_DRIFT_SESSIONS, COST_DRIFT_WINDOW_MS, CostDrift, priceRowOf, priceUsage,
 } from '../server/runner/usage.ts';
+import { MEASURED_MODELS } from '../shared/price-book.js';
 import type { SpawnOutcome } from '../server/runner/spawn.ts';
 import type { TokenCounters } from '../server/runner/usage.ts';
 
@@ -62,7 +63,7 @@ test('BP-1: Opus 5.5 is priced at its own rates, beside Opus 5\'s — per MTok, 
     near(priceUsage(id, tokensOf({ cacheRead: 1_000_000 }))!, 0.5, `${id} a cache read`);
     near(priceUsage(id, tokensOf({ output: 1_000_000 }))!, 25, `${id} output`);
   }
-  assert.deepEqual(Object.keys(TOKEN_PRICES_USD).sort(), ['claude-opus-5', 'claude-opus-5-5'], 'one row per measured model version');
+  assert.deepEqual([...MEASURED_MODELS].sort(), ['claude-opus-5', 'claude-opus-5-5'], 'one measured book row per measured model version');
 });
 
 test('BP-2: P85\'s tokens price to $14.2217 — the CLI\'s own total — where the one `opus` row said $27.2010', () => {

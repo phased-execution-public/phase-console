@@ -71,6 +71,9 @@ test('the shared resolver ranks attempt, run, plan, default — and names the on
     { value: 'low', source: 'retry' },
   );
   assert.deepEqual(resolvePhaseChoice({ fallback: 'max' }), { value: 'max', source: 'default' });
+  // The paying account's own default (EI-21) answers only when nothing above it does.
+  assert.deepEqual(resolvePhaseChoice({ account: 'low' }), { value: 'low', source: 'account' });
+  assert.deepEqual(resolvePhaseChoice({ plan: 'high', account: 'low' }), { value: 'high', source: 'plan' });
   // Nothing anywhere — the machine's own default, which no source can claim.
   assert.deepEqual(resolvePhaseChoice({}), { value: undefined, source: undefined });
   // An empty string is "no choice here", exactly as the per-phase select stores it.

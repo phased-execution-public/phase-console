@@ -20,8 +20,10 @@
 load ../helpers/test_helper
 
 # How a boot prompt names this copy's scripts since control-tower phase 98
-# (#151): through the session's `$PE_SCRIPTS`, falling back to this copy.
-SREF="\"\${PE_SCRIPTS:-$PE_SCRIPTS}\""
+# (#151): through the session's `$PE_SCRIPTS`, falling back to this copy —
+# written `$HOME/…` when the copy sits under $HOME (measured-console phase 2).
+_home_rel() { case "$1" in "$HOME"/*) printf '$HOME/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+SREF="\"\${PE_SCRIPTS:-$(_home_rel "$PE_SCRIPTS")}\""
 
 # Lines in `text` that invoke a skill script but do not name a docs root —
 # by this copy's path, or through the boot prompt's indirection.
@@ -157,7 +159,7 @@ missing_docs_root() {
 # in a dependency handoff's start section it reads the shared boot and its OWN
 # phase's block — a sibling's block is somebody else's prompt.
 @test "HF-5: the skill tells a booting session to read only its own block of a fan-out handoff" {
-  grep -q "never a sibling's" "$PE_DIR/SKILL.md"
+  grep -q "never a sibling's" "$PE_DIR/references/mode-phase-start.md"
   grep -q "never a sibling's" "$PE_DIR/references/handoff-format.md"
 }
 

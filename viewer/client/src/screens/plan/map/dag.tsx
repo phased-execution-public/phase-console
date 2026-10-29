@@ -46,6 +46,18 @@
  * and where the window is on it. And a station search moves the window to the
  * station it finds. The stations are one tab stop: the arrow keys walk them.
  *
+ * ---- Buttons over a drawing ----
+ *
+ * The SVG is paint and nothing else: hidden from assistive technology, with
+ * nothing in it to focus or press. Each drawn station has a real HTML
+ * `<button>` laid over it in a layer above the drawing, placed by the same
+ * view transform the hover card uses, and named `Phase N: title, state`. The
+ * buttons stand in PHASE order, so a screen reader's virtual cursor reads the
+ * plan in the order it is numbered; Tab enters the map once, at the one
+ * button holding the tab stop, and the arrow keys walk the network from there
+ * (`neighbour`). The focus mark is still the station's halo: the button lends
+ * its focus to the drawn station as a `focused` class.
+ *
  * The paint is `./route-map.css`, imported here so it rides the map's own lazy
  * chunk; every class it styles is a `route-` name or hangs under one.
  */
@@ -2040,14 +2052,20 @@ export function RouteMap({
     return stations.length ? Math.min(...stations.map((node) => node.phase)) : null;
   }, [current, focus, points, stations]);
 
+  /** The station whose button has a KEYBOARD focus — the drawn station wears it as its halo. */
+  const [keyed, setKeyed] = useState<number | null>(null);
+
   /* A keyboard move re-renders first (the station it went to may only now be
      inside the window, and so only now drawn), then takes focus. */
   const svg = useRef<SVGSVGElement>(null);
+  const targets = useRef<HTMLDivElement>(null);
   const pendingFocus = useRef<number | null>(null);
   useEffect(() => {
     const phase = pendingFocus.current;
     if (phase == null) return;
-    const node = svg.current?.querySelector<SVGGElement>(`.route-station[data-phase="${phase}"]`);
+    const node = targets.current?.querySelector<HTMLButtonElement>(
+      `.route-station-button[data-phase="${phase}"]`,
+    );
     if (!node) return;
     pendingFocus.current = null;
     node.focus();
@@ -2149,10 +2167,16 @@ export function RouteMap({
     ? `${route.layers} waves, top to bottom`
     : `Waves ${waveAt(view.x + COL_W / 2)}–${waveAt(view.x + boxW - COL_W / 2)} of ${route.layers}`;
 
-  /* A station's hit area, in plan units, so it lands at 44 CSS px whatever the
-     zoom. Capped at the row pitch: a target that overlaps its neighbour is
-     worse than a small one, and below MIN_K the cap would be doing that. */
-  const hitR = Math.min(TAP / view.k, ROW_H - 6) / 2;
+  /* A station's button, in CSS px: a square of 44 whatever the zoom, and never
+     smaller than the drawn mark (zoomed in, the halo outgrows 44 px, and a
+     press on the edge of a mark must still press it). Capped at the row
+     pitch: a target that overlaps its neighbour is worse than a small one,
+     and below MIN_K — a whole-plan fit — the cap is doing that. */
+  const tap = n2(Math.min(Math.max(TAP, 2 * geo.halo * view.k), (ROW_H - 6) * view.k));
+  /** The station's centre in the frame, in CSS px — where its button stands. */
+  const centreOf = (node: PlacedNode) => ({ x: (node.x - view.x) * view.k, y: (node.y - view.y) * view.k });
+  /** The buttons in phase order: the order a screen reader's virtual cursor reads them in. */
+  const targetsShown = [...shown].sort((a, b) => a.phase - b.phase);
 
   /* A name smaller than `LEGIBLE_PX` on screen is a smudge that covers the
      map (at a 73-phase plan's opening zoom a name was 6.5 px). Below it the
@@ -2357,11 +2381,14 @@ export function RouteMap({
           ref={frame}
           data-interactive={prefs.mapPanZoom || undefined}
           onDoubleClick={(event) => {
-            if ((event.target as Element).closest?.('.route-station')) return;
+            if ((event.target as Element).closest?.('.route-station-button')) return;
             fit();
           }}
           {...handlers}
         >
+          {/* Paint only: every station's name and press is its button in the
+            layer above, so the drawing is hidden from assistive technology
+            and holds nothing to focus. */}
           <svg
             ref={(el) => {
               svg.current = el;
@@ -2372,10 +2399,7 @@ export function RouteMap({
             height="100%"
             viewBox={`${n2(view.x)} ${n2(view.y)} ${n2(boxW)} ${n2(boxH)}`}
             preserveAspectRatio="xMidYMid meet"
-            /* `group`, not `img`: an image has no interactive content, so a
-             screen reader would be told to ignore every station button on it. */
-            role="group"
-            aria-label={`Phase dependency map, ${route.nodes.length} stations. The arrow keys move between them.`}
+            aria-hidden="true"
           >
             <defs>
               <pattern
@@ -2591,11 +2615,9 @@ export function RouteMap({
                 </g>
               )}
 
-              {/* Each station carries an invisible `route-station-hit` circle sized in
-                plan units to land at 44 CSS px. The 15-unit dot it sits under
-                is a 13px circle at the fit zoom of a phone — a mark, not a
-                target. Transparent rather than `fill: none`, because `none`
-                does not receive pointer events at all. */}
+              {/* Each station is drawn here and pressed in the layer above: the
+                15-unit dot is a 13 px circle at the fit zoom of a phone — a
+                mark, not a target. */}
               {shown.map((node) => {
                 const dim = stationDim(node.phase);
                 const paint = paintFor?.(node.phase);
@@ -2622,6 +2644,10 @@ export function RouteMap({
                       live && 'live',
                       dim && 'dim',
                       ringed === node.phase && 'selected',
+                      // The button's hover and keyboard focus, worn by the mark
+                      // they belong to — the pointer never reaches the drawing.
+                      hover === node.phase && 'hovered',
+                      keyed === node.phase && 'focused',
                     )}
                     data-phase={node.phase}
                     /* Colour by (#376): the chosen measure's paint on `--state`,
@@ -2629,48 +2655,7 @@ export function RouteMap({
                      the state, so nothing is lost to the colour. */
                     style={paint ? ({ '--state': paint } as React.CSSProperties) : undefined}
                     data-paint={paint ? '' : undefined}
-                    tabIndex={node.phase === tabStop ? 0 : -1}
-                    role="button"
-                    aria-label={`Phase ${node.phase}: ${node.title}, ${view.label}`}
-                    onClick={() => choose(node.phase)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        onSelect?.(node.phase);
-                      } else if (STATION_MOVES.has(event.key)) {
-                        event.preventDefault();
-                        walk(node.phase, event.key);
-                      }
-                    }}
-                    onMouseEnter={() => {
-                      setHover(node.phase);
-                      showCard(node.phase);
-                    }}
-                    onMouseLeave={() => {
-                      setHover(null);
-                      hideCard();
-                    }}
-                    /* Focus has to light the same neighbours hover does, or the
-                     keyboard walks the map with the one affordance the mouse
-                     gets for free switched off. A keyboard focus also brings
-                     the station into the window — Tab can land on the tab
-                     stop after the reader has panned away from it. A click
-                     does not move the map: it would move it under the finger
-                     between a phone's two taps. */
-                    onFocus={(event) => {
-                      setHover(node.phase);
-                      setCurrent(node.phase);
-                      if (focusVisible(event.currentTarget)) {
-                        reveal(node);
-                        showCard(node.phase);
-                      }
-                    }}
-                    onBlur={() => {
-                      setHover(null);
-                      hideCard();
-                    }}
                   >
-                    <circle className="route-station-hit" cx={node.x} cy={node.y} r={hitR} />
                     {node.gated && (
                       <circle
                         className="gate-ring"
@@ -2709,22 +2694,99 @@ export function RouteMap({
                     {named(node.phase) && (
                       <StationLabel node={node} drop={geo.label} short={nameMode === 'short'} />
                     )}
-                    {tooltips && (
-                      <title>
-                        {stationTitle(
-                          node,
-                          node.state,
-                          incoming.get(node.phase),
-                          driver,
-                          critical?.has(node.phase),
-                        )}
-                      </title>
-                    )}
                   </g>
                 );
               })}
             </g>
           </svg>
+          {/* The stations' buttons, over the drawing: inside the frame, so a
+            press that starts on one still bubbles to the frame's drag and
+            pinch, and a drag that ends on one is not a press (`choose` reads
+            `dragged`). The drawing's x axis is physical — an SVG does not
+            mirror with `dir` — so, like the hover card, the layer is LTR by
+            construction and each button is placed by a transform. One tab
+            stop (`tabStop`), the arrow keys between: a composite widget. */}
+          <div
+            ref={targets}
+            className="route-stations"
+            dir="ltr"
+            role="group"
+            aria-label={`Phase dependency map, ${route.nodes.length} stations. The arrow keys move between them.`}
+          >
+            {targetsShown.map((node) => {
+              const centre = centreOf(node);
+              return (
+                <button
+                  key={node.phase}
+                  type="button"
+                  className="route-station-button"
+                  data-phase={node.phase}
+                  tabIndex={node.phase === tabStop ? 0 : -1}
+                  aria-label={`Phase ${node.phase}: ${node.title}, ${viewOf(node).label}`}
+                  title={
+                    tooltips
+                      ? stationTitle(
+                          node,
+                          node.state,
+                          incoming.get(node.phase),
+                          drivers?.get(node.phase),
+                          critical?.has(node.phase),
+                        )
+                      : undefined
+                  }
+                  style={{
+                    inlineSize: tap,
+                    blockSize: tap,
+                    transform: `translate(${n2(centre.x - tap / 2)}px, ${n2(centre.y - tap / 2)}px)`,
+                  }}
+                  onClick={() => choose(node.phase)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      onSelect?.(node.phase);
+                    } else if (STATION_MOVES.has(event.key)) {
+                      event.preventDefault();
+                      walk(node.phase, event.key);
+                    }
+                  }}
+                  /* A button presses itself on Space's keyup; the keydown
+                     above already answered it. */
+                  onKeyUp={(event) => {
+                    if (event.key === ' ') event.preventDefault();
+                  }}
+                  onMouseEnter={() => {
+                    setHover(node.phase);
+                    showCard(node.phase);
+                  }}
+                  onMouseLeave={() => {
+                    setHover(null);
+                    hideCard();
+                  }}
+                  /* Focus has to light the same neighbours hover does, or the
+                   keyboard walks the map with the one affordance the mouse
+                   gets for free switched off. A keyboard focus also brings
+                   the station into the window — Tab can land on the tab
+                   stop after the reader has panned away from it — and rings
+                   it in the focus ink. A click does not move the map: it
+                   would move it under the finger between a phone's two taps. */
+                  onFocus={(event) => {
+                    setHover(node.phase);
+                    setCurrent(node.phase);
+                    if (focusVisible(event.currentTarget)) {
+                      setKeyed(node.phase);
+                      reveal(node);
+                      showCard(node.phase);
+                    }
+                  }}
+                  onBlur={() => {
+                    setHover(null);
+                    setKeyed(null);
+                    hideCard();
+                  }}
+                />
+              );
+            })}
+          </div>
         </div>
         {carded && cardFacts && (
           <HoverCard

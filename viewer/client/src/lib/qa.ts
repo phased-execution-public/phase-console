@@ -101,13 +101,14 @@ export function qaReportRound(path: string): number {
 }
 
 /**
- * The report sheet's address — `#/plan/<slug>/qa?report=<phase>[:<round>]`.
+ * The report sheet's address — `#/plan/<slug>/phases?view=handoffs&report=<phase>[:<round>]`.
  * A query, not a route, like every other overlay: open ⟺ the URL says so.
  */
 export function qaReportHref(slug: string, phase: number, round?: number): string {
-  // The QA view of the phase table (6.0): the retired `qa` tab's address
-  // redirects there too, carrying `report`, so an old link opens the same sheet.
-  return planViewHref(slug, 'qa', `report=${phase}${round && round > 1 ? `:${round}` : ''}`);
+  // The Handoffs & QA reading of the phase table (2026-10-20, Tower strips;
+  // the QA reading until then): the retired `qa` tab's address and an old
+  // `?view=qa` land there too, carrying `report`, so an old link opens the same sheet.
+  return planViewHref(slug, 'handoffs', `report=${phase}${round && round > 1 ? `:${round}` : ''}`);
 }
 
 /** What `?report=` names, or null for anything that is not a phase (and an optional round). */

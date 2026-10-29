@@ -382,6 +382,11 @@ export type SizingCensus = {
   caps: CapTable;
   context: ContextModel;
   sessions: Record<PhaseSize, SessionsRow>;
+  /**
+   * Each session's effort, by the CLI session id its `phase.session` line names — what the
+   * dollar forecast joins the ledger's sessions to (measured-console phase 23).
+   */
+  efforts?: Record<string, string>;
   derivedAt: string;
 };
 
@@ -407,6 +412,7 @@ export function sizingCensus(
   const capLines: CapSample[] = [];
   const contextSamples: SizingSession[] = [];
   const phases = new Map<string, { size?: PhaseSize; sessions: number; wrapped: boolean; done: boolean; at?: string }>();
+  const efforts: Record<string, string> = {};
   for (const run of runs) {
     for (const line of run.lines) {
       if (typeof line.phase !== 'number') continue;
@@ -422,6 +428,7 @@ export function sizingCensus(
           turns: num(data.turns), promptTurns: num(data.promptTurns), costUsd: num(data.costUsd), bookedUsd: num(data.bookedUsd),
           costSource: typeof data.costSource === 'string' ? data.costSource : undefined, resumed: data.resumed === true,
         });
+        if (typeof data.sessionId === 'string' && typeof data.effort === 'string') efforts[data.sessionId] = data.effort;
         const entry = phases.get(key) ?? { size: placed?.size, sessions: 0, wrapped: false, done: false };
         entry.sessions += 1;
         entry.at = line.time;
@@ -452,6 +459,7 @@ export function sizingCensus(
     caps: deriveCapTable(capLines, nowMs),
     context: fitContextModel(contextSamples, shipped),
     sessions: sessionsPerPhaseOf(finished, shipped),
+    efforts,
     derivedAt: new Date(nowMs).toISOString(),
   };
 }

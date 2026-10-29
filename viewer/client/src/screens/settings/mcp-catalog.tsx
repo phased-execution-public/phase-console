@@ -180,6 +180,8 @@ function CatalogEntry({
     entry.transport,
     authWords(entry.auth),
     entry.source === 'registry' ? 'from the registry' : null,
+    entry.pin ? `pinned ≥ ${entry.pin.min}` : null,
+    entry.untrustedOutput ? 'untrusted output' : null,
   ]
     .filter(Boolean)
     .join(' · ');

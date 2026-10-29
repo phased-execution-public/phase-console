@@ -19,6 +19,12 @@
  *   GR-3  a stuck phase with a person's hint and an unmet dependency is not
  *         admitted (`phase.dependency-held`); its dependency boards first,
  *         and the stuck phase boards the moment the dependency is done.
+ *   #416  a phase appended to a live plan read its GATED graph row before its
+ *         section existed: `ai` with an empty detail, queued, and about to
+ *         board a release the plan reserved for its owner.
+ *   GR-4  (measured-console phase 30) a queued phase whose plan file changes
+ *         under it reads its gate again — `phase.gate-reread` — and a gate
+ *         that now reads manual holds it `gated`; it never boards.
  */
 
 import './state-sandbox.ts';
@@ -40,12 +46,6 @@ type RunState = import('../server/runner/state.ts').RunState;
 const TRASH: string[] = [];
 process.on('exit', () => { for (const dir of TRASH) rmSync(dir, { recursive: true, force: true }); });
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(probe: () => boolean, ms: number): Promise<boolean> {
-  const end = Date.now() + ms;
-  while (Date.now() < end) { if (probe()) return true; await sleep(20); }
-  return probe();
-}
 
 /** A scratch root whose `phase-graph.sh` reads `.board` and `.gate` (present = clear). */
 function scratch(boardLines: string[]) {
@@ -227,4 +227,67 @@ test('GR-3b: a PERSON\'s re-board of that phase is a person\'s word — it board
   const { spawned, events } = await stuckAhead(PERSON_SLOT_BY);
   assert.equal(spawned[0], 65, `the person's Retry boards the phase they named: ${JSON.stringify(spawned)}`);
   assert.equal(journalled(events, 'phase.dependency-held').length, 0);
+});
+
+test('GR-4 (#416): a queued phase whose plan changed under it reads its gate again and never boards on the old read', async () => {
+  const { root, scripts } = scratch(['done: ', 'in-progress: ', 'stuck: ', 'ready: 1, 2', 'waiting: ']);
+  // Phase 2's gate: `ai:` with no detail (the #416 read) until the plan is
+  // amended, then the owner's manual gate the section always meant.
+  writeFileSync(join(scripts, 'phase-graph.sh'), `#!/bin/bash
+case "$2" in
+  --memory-block) cat "${root}/.board" ;;
+  --gate-status)
+    if [ "$3" = 2 ]; then
+      if [ -f "${root}/.amended" ]; then echo "manual: the owner approves Release A.1 on the Gate card"; else echo "ai:"; fi
+      exit 1
+    fi
+    echo "clear (no gate)" ;;
+  --gate-kind) if [ "$3" = 2 ] && [ -f "${root}/.amended" ]; then echo human; else echo ai; fi ;;
+  --boot-prompt) echo "BOOT phase $3 of $1" ;;
+  --size) echo M ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  const spawned: number[] = [];
+  const events: Events = [];
+  // One lane on the console: phase 2 queues behind phase 1's session.
+  const scheduler = new Scheduler({ max: 1, locks: () => [] });
+  let runner!: InstanceType<typeof Runner>;
+  const spawn = async (req: { prompt: string }) => {
+    const phase = Number(/BOOT phase (\d+)/.exec(req.prompt)?.[1] ?? 0);
+    spawned.push(phase);
+    if (phase === 1) {
+      // The plan is amended while phase 2 waits for the lane.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      writeFileSync(join(root, '.amended'), 'yes\n');
+      runner.notePlanChanged();
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      writeFileSync(join(root, '.board'), ['done: 1', 'in-progress: ', 'stuck: ', 'ready: 2', 'waiting: '].join('\n') + '\n');
+    }
+    return ok(phase);
+  };
+  runner = new Runner({
+    scriptsDir: scripts, spawn, scheduler,
+    phaseScope: (_slug: string, phase: number) => [phase === 1 ? 'a' : 'b'],
+    verificationText: () => '- `true`',
+    verify: async () => ({ ok: true, reason: 'green', notRun: [], ran: [] }),
+    onEvent: (event: string, data: Record<string, unknown>) => events.push({ event, data }),
+  } as never);
+  const stored: RunState = newRun({ slug: 'sweep', root, autonomy: 'keep-going', autoRecover: true } as never);
+  stored.status = 'parked';
+  saveRun(stored);
+  try {
+    await runner.start({ slug: 'sweep', root, resumeRunId: stored.id, maxParallel: 2 } as never);
+    await runner.wait();
+  } finally {
+    scheduler.close();
+    runner.stop?.();
+  }
+  assert.deepEqual(spawned, [1], `phase 2 never boarded on the old plan's gate: ${JSON.stringify(spawned)}`);
+  const reread = journalled(events, 'phase.gate-reread').filter((l) => l.phase === 2);
+  assert.ok(reread.length >= 1, `the gate was read again after the plan changed: ${JSON.stringify(reread)}`);
+  const record = runner.current()!.phases['2']!;
+  assert.equal(record.status, 'gated', 'held by the gate the plan now states');
+  assert.equal(record.gate?.kind, 'manual', `its true kind on the record /api/runs reads: ${JSON.stringify(record.gate)}`);
+  assert.match(record.gate?.detail ?? '', /owner approves/);
 });

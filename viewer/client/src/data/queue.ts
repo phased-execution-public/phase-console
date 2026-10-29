@@ -2,6 +2,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueueVerb } from '@shared/orchestration-model.js';
+import type { QueueMoveBody, QueuePolicyChange } from '@shared/wire/queue.js';
 import { api, type QueueView } from './api';
 import { keys } from './keys';
 import { press } from './press';
@@ -13,17 +14,12 @@ import { press } from './press';
  */
 export type QueueMove = Exclude<QueueVerb, 'bump' | 'reorder'>;
 
-/** A queue move's target — a phase of a run, or an entry by id — and what it is written down with. */
-export interface QueueMoveBody {
-  slug?: string;
-  phase?: number;
-  entryId?: string;
-  reason?: string;
-  /** `defer`: when the hold lifts by itself, an ISO time. */
-  until?: string;
-  /** `requeue`: back in at the front rather than at its seniority. */
-  position?: 'front';
-}
+export type {
+  QueueActAnswer,
+  QueueMoveBody,
+  QueuePolicyAnswer,
+  QueuePolicyChange,
+} from '@shared/wire/queue.js';
 
 /**
  * Hold, release, defer, withdraw or requeue one phase (`POST
@@ -42,14 +38,6 @@ export function useQueueAct() {
         void client.invalidateQueries({ queryKey });
     },
   });
-}
-
-/** What the queue's policy door takes: the console's word, a plan's own (`slug`; `null` gives it back), the load factor. */
-export interface QueuePolicyChange {
-  policy?: string | null;
-  slug?: string;
-  loadFactor?: number;
-  reason?: string;
 }
 
 /**
@@ -107,4 +95,5 @@ export function useRunScopes(slug: string | undefined, enabled = true) {
     retry: false,
   });
 }
+
 

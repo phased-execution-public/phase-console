@@ -2,18 +2,21 @@
  * Plans — the library (7.0, quiet-console phase 9; the estate since 3.0).
  *
  * ```
- * Plans                                                        [ New plan ⌄ ]
+ * Plans                                                                      [ New plan ⌄ ]
  * 2 things waiting on you, 1 running and 3 phases ready to start.
- * [Find a plan…]  Filter  Group  Sort Recent  View List            ⋯  Everything
- * ● Needs you   cart api              ○ 3 done ─ ◌ P4 next up ─ ○ 5 left   2 sessions   3d ago
- * ● Running     storefront redesign   ○ 41 done ─ ● P42 in progress …     5 sessions   2h ago
- * ───────────────────────────────────────────────────────────────────────────────
+ * [Find a plan…]  Filter  Group  Sort Recent  View List                          ⋯  Everything
+ * ● Needs you ◎ Active  Why   cart api             ▮▮▮▯▯▯▯▯▯ (33 %)   —            You, on phase 4   …  ⇢
+ * ● Running ◎ Active  Why     storefront redesign  ▮▮▮▮▮▮▮▮▯▯ (56 %)  P42 ● Running  —                 …  ⇢
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
  * › Closed plans (71)
  * › Documents (15)
  * ```
  *
  * One question: where does everything stand? Every open plan as one line —
- * its mark, its name, its line, the work left, when it last moved — in the
+ * its mark (a button: *Why* opens the panel on the reasons behind the word),
+ * its name, its line, what is live now, what it waits on, its items on Your
+ * turn, the work left, its spend, who pays and when it last moved, the table
+ * scrolling sideways with the status and the name pinned — in the
  * order the person asked for, as a list or as cards. The closed estate and
  * the documents are on the page too, folded under the list with their counts
  * named: never hidden, never a banner about something missing. A plan the
@@ -21,12 +24,14 @@
  * it is a guess. Each line expands in place, inspects in the panel, and opens
  * its plan.
  *
- * It reads the list, the SLIM runs (#234) and the inbox the bell already
- * holds — nothing per plan until a pointer rests on one.
+ * It reads the list, the SLIM runs (#234), the inbox the bell already holds
+ * and the accounts — nothing per plan until a pointer rests on one, or the
+ * panel opens on it (`why-panel.tsx` reads its detail, its run and the queue).
  */
 
 import { useCallback, useMemo, useState, type ReactNode } from 'react';
 import type { PlanSummaryFull } from '@/data/api';
+import { useAccounts } from '@/data/accounts';
 import { useConsoleState, usePrefsWrite } from '@/data/console';
 import { useAttentionInbox } from '@/data/inbox';
 import { usePlans } from '@/data/plans';
@@ -38,7 +43,7 @@ import { Disclosure } from '@/ui/disclosure';
 import { useInspected } from '@/shell/panel/inspector-host';
 import { planHref, runHref, type Route } from '@/shell/routes';
 import { PlanCards } from './card';
-import { inspectPlan } from './inspector';
+import { inspectPlan, planRecordKey } from './inspector';
 import { PlanList } from './list';
 import {
   NO_FILTERS,
@@ -78,11 +83,13 @@ export default function PlansLibrary(_props: { route: Route }) {
   // `/api/state` to answer rather than ask one that is not there.
   const { data: runs } = useRunList(state != null && state.autopilot !== false);
   const { data: inbox } = useAttentionInbox();
+  // Who pays for each plan's newest run, named as the account names itself.
+  const { data: accounts } = useAccounts();
 
   const summaries = useMemo(() => (plansQuery.data ?? []) as unknown as PlanSummaryFull[], [plansQuery.data]);
   const all = useMemo(
-    () => toRows(summaries, runs ?? [], Date.now(), inbox?.items ?? []),
-    [summaries, runs, inbox],
+    () => toRows(summaries, runs ?? [], Date.now(), inbox?.items ?? [], accounts?.accounts),
+    [summaries, runs, inbox, accounts],
   );
 
   const filters: Filters = useMemo(
@@ -175,15 +182,24 @@ export default function PlansLibrary(_props: { route: Route }) {
   /** One set of rows, drawn the way the person chose. */
   const view = (rows: readonly PlanRow[], key: string, label: string): ReactNode =>
     layout === 'cards' ? (
-      <PlanCards rows={rows} onInspect={onInspect} label={label} everything={everything.on} />
+      <PlanCards
+        rows={rows}
+        onInspect={onInspect}
+        inspected={inspected}
+        label={label}
+        everything={everything.on}
+      />
     ) : (
       <PlanList
         rows={rows}
         everything={everything}
         sort={sort}
         onSort={onSort}
+        // The status's *Why* opens the same record Inspect does, on its reasons.
+        onWhy={onInspect}
+        inspected={inspected}
         detail={(row) => (
-          <RowDetail row={row} onInspect={onInspect} inspected={inspected === `plan:${row.slug}`} />
+          <RowDetail row={row} onInspect={onInspect} inspected={inspected === planRecordKey(row.slug)} />
         )}
         label={label}
         tableId="plans"

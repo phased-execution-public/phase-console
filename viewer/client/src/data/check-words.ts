@@ -17,6 +17,7 @@ export const CHECK_PURPOSE_WORDS: Readonly<Record<VerifyingLane['purpose'], stri
   verify: '§Verification',
   baseline: 'baseline',
   'wip-gate': 'wrap-up gate',
+  'fast-gate': 'fast lines at stop',
 };
 
 /** A check's pass and place in it: `baseline 9/10`, `baseline setup 1/1` (control-tower phase 105). */

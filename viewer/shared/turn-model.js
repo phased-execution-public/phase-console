@@ -896,6 +896,26 @@ export function readinessShown(/** @type {string} */ personStatus) {
 }
 
 /**
+ * *Hand it to the AI* (2026-10-20) — the last way on of an open Decision the
+ * AI can take (`server/turn/index.ts` `handsOff`), so such a decision offers
+ * two at least: the person's note goes where the item goes and the AI decides
+ * it — a session's decision is answered "decide it yourself", a stopped
+ * phase's errand resumes its session, and a branch conflict is told to its
+ * run (and, in Pro, to the supervisor). A gate's Approve, a run's login, a
+ * sign-in, a secret and a permission are never handed over. The id every
+ * surface tells the option by; its words are `HAND_OFF_WORDS`.
+ */
+export const HAND_OFF_OPTION_ID = 'hand-to-ai';
+
+/** The hand-off option's words, and the box its note is typed in. */
+export const HAND_OFF_WORDS = Object.freeze({
+  label: 'Hand it to the AI',
+  consequence: 'The AI decides it, with your note; the item moves to Done.',
+  note: 'Your note for the AI',
+  placeholder: 'What it should know or weigh',
+});
+
+/**
  * Where a press goes — *Goes to*: the PHASE (its session resumes), the
  * SUPERVISOR (Pro) or the RUN (Free) — the run applies the act and resumes —
  * the GATE (it opens and its phase boards), or the CONSOLE (it checks; the

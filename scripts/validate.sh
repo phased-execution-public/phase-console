@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Deterministic validator for a phased-execution plan + its handoffs.
-#   F1/F2/F3 : structural lint of the plan (delegated to phase-graph.sh --lint).
+#   the plan : structural lint, delegated to phase-graph.sh --lint — every gating
+#              lint exits non-zero and the advisories ride stderr (the list:
+#              phase-graph.sh --explain <F-code>, scripts/lints.env).
 #   F10      : handoff body + consistency checks — valid status, required
-#              sections present, and depends_on agreeing with the plan graph.
+#              sections present, and depends_on agreeing with the plan graph;
+#              warnings for a body over 300 lines and a secret's shape in a
+#              handoff or a guide (measured-console phase 4).
 #
 # Usage: validate.sh <slug>     (run from the repo root, or set DOCS_ROOT)
 # Exit 0 = valid, non-zero = problems (printed to stderr).
@@ -63,6 +67,29 @@ if [ "$lint_status" -ge 2 ]; then
 fi
 [ "$lint_status" -eq 0 ] || exit "$lint_status"
 
+# A secret's shape in a handoff or a guide (measured-console phase 4, A8):
+# named by file and line, never echoed — a handoff says where a secret lives,
+# never its value. The shapes are human-steps.env's, the ones phase-outcome.sh
+# refuses in a declaration, each anchored at a word boundary (prose holds
+# "task-page", which the bare `sk-` shape reads as a key) — less the bare 6–8
+# digit code, which is a one-time code in a step's field and a byte count in
+# prose. A WARNING, never a problem.
+HUMAN_STEP_SECRET_PATTERNS=''
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/human-steps.env" ] && . "$SCRIPT_DIR/human-steps.env"
+secret_scan() {  # secret_scan <file> <label>
+  local pat hit
+  set -f
+  for pat in $HUMAN_STEP_SECRET_PATTERNS; do
+    case "$pat" in *'[0-9]{6,8}'*) continue ;; esac
+    hit="$(LC_ALL=C grep -niE -- "(^|[^[:alnum:]_])($pat)" "$1" 2>/dev/null | cut -d: -f1 | head -5 | paste -sd, - || true)"
+    [ -n "$hit" ] && printf '  ⚠ %s:%s: a secret'"'"'s shape (%.24s…) — redact it; a handoff or a guide names where a secret is kept, never its value\n' \
+      "$2" "$hit" "$pat" >&2
+  done
+  set +f
+  return 0
+}
+
 # 2) Handoff body + consistency checks (F10).
 ho_dir="$DOCS_ROOT/docs/handoffs/$slug"
 problems=0
@@ -83,28 +110,25 @@ if [ -d "$ho_dir" ]; then
     grep -qiE 'start next phase|final phase|closeout' "$f" \
       || { echo "  ✗ $base: missing the '▶ Start next phase(s)' boot section" >&2; problems=$((problems + 1)); }
 
-    # …and it must not swallow the handoff (control-tower phase 85, #115). The
-    # section is a hand-off to OTHER sessions; tfar phase 32's ran 1,090 of 1,350
-    # lines — eight whole prompts, ~85 % copies of each other — and buried
-    # `## Outstanding` at line 1,333. Over 300 lines, or over 40 % of the file, is
-    # named here: a WARNING, never a problem, so the exit code is untouched. A
-    # handoff written before the shared boot existed stays as it is. Fences are
-    # skipped, since a `## ` inside a prompt is not a heading.
+    # …and it must be a brief, not an archive (measured-console phase 4, A8; it
+    # was the boot section's size, #115). A handoff points at artifacts — the
+    # plan, a report, a commit — and copies none of them, so its BODY is held to
+    # 300 lines: everything but the frontmatter and the `▶ Start next phase(s)`
+    # section, which new-handoff.sh writes and a reader composes. A WARNING,
+    # never a problem: the exit code is untouched. Fences are skipped, since a
+    # `## ` inside a prompt is not a heading.
     awk -v base="$base" '
+      NR == 1 && /^---[[:space:]]*$/ { fm = 1; next }
+      fm { if ($0 ~ /^---[[:space:]]*$/) fm = 0; next }
       /^```/ || /^~~~/ { fence = !fence }
-      !fence && /^## / {
-        if (ins) { sec += NR - start; ins = 0 }
-        if ($0 ~ /[Ss]tart next phase/) { ins = 1; start = NR }
-      }
+      !fence && /^## / { ins = ($0 ~ /[Ss]tart next phase/) }
+      !ins { body++ }
       END {
-        if (ins) sec += NR - start + 1
-        if (NR == 0 || sec == 0) exit
-        over = ""
-        if (sec > 300) over = "300 lines"
-        if (100 * sec > 40 * NR) over = (over == "" ? "" : over " and ") "40% of the handoff"
-        if (over != "")
-          printf "  ⚠ %s: its \047▶ Start next phase(s)\047 section is %d of %d lines (%d%%) — over %s (#115: a fan-out writes the shared boot once, then a block per phase)\n", base, sec, NR, int(100 * sec / NR), over
+        if (body > 300)
+          printf "  ⚠ %s: its body is %d lines — over 300, without the frontmatter and the \047▶ Start next phase(s)\047 section; a handoff points at the plan, the reports and the commits rather than copying them (references/handoff-format.md)\n", base, body
       }' "$f" >&2
+
+    secret_scan "$f" "$base"
 
     # …and a person's `!` line must not point into a console RUN TREE
     # (control-tower phase 90, #123). A parked phase's handoff gave the operator
@@ -133,6 +157,12 @@ if [ -d "$ho_dir" ]; then
       got="$(grep -m1 '^depends_on:' "$f" | sed 's/^depends_on:[[:space:]]*\[//; s/\].*$//; s/,/ /g' | tr '\n' ' ' | tr -s ' ' | tr ' ' '\n' | sed '/^$/d' | sort -n | tr '\n' ' ' | sed 's/ *$//' || true)"
       [ "$want" = "$got" ] || { echo "  ✗ $base: depends_on [$got] disagrees with plan graph [$want]" >&2; problems=$((problems + 1)); }
     fi
+  done
+fi
+# …and every guide a person follows (`guides/`, the errand and human-step guides).
+if [ -d "$ho_dir/guides" ]; then
+  find "$ho_dir/guides" -type f -name '*.md' 2>/dev/null | LC_ALL=C sort | while IFS= read -r g; do
+    secret_scan "$g" "guides/${g#"$ho_dir/guides/"}"
   done
 fi
 

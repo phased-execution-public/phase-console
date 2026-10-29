@@ -18,9 +18,10 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -40,6 +41,7 @@ const {
   overRoundBudget, roundBudgetUsd,
 } = await import('../server/runner/qa-recover.ts');
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 /* ------------------------------------------------------------------ *
  * The pure half — words and arithmetic, no process
@@ -158,11 +160,6 @@ test('the exhausted errand names the LAST report, the rounds and the verbs', () 
 
 type Repo = { root: string; scripts: string; state: string; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /**
  * A plan with one phase and a QA verdict the stub session can move.
  *
@@ -171,19 +168,44 @@ function write(path: string, body: string): void {
  * top of every round" is a property this harness can actually observe, rather
  * than one the test asserts about its own bookkeeping.
  */
-function repo(verdict = 'fail', qaMode = 'on (plan directive)'): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-qarecover-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  const handoffs = join(root, 'docs', 'handoffs', 'demo', 'reports');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
+function stubbedPlan(verdict = 'fail', qaMode = 'on (plan directive)'): Repo {
+  const made = stubRepo({
+    prefix: 'pc-qarecover-',
+    // Round 1 already recorded and its report on disk — the shape a recovery
+    // always starts from, and what makes `nextQaRound` answer round 2.
+    state: {
+      verdict: `${verdict}\n`,
+      qamode: `${qaMode}\n`,
+      history: '1\tfail\treports/phase-01-qa.md\t2026-09-05\n',
+    },
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
+set -u
+S="${state}"
+shift
+case "\${1:-}" in
+  --memory-block) echo "done: 1"; echo "ready:"; echo "waiting:" ;;
+  --boot-prompt)  echo "BOOT phase \${2:-}" ;;
+  --qa-mode)      cat "$S/qamode" ;;
+  --qa-result)    cat "$S/verdict" ;;
+  --qa-history)   cat "$S/history" ;;
+  --gate-status)  echo "clear" ;;
+  --repos)        echo "demo-repo" ;;
+  *) echo "" ;;
+esac
+`,
+      'phase-lock.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'validate.sh': VALIDATE_OK_SH,
+      'next-phase-prompt.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'new-handoff.sh': '#!/usr/bin/env bash\nexit 0\n',
+    }),
+  });
+  const handoffs = join(made.root, 'docs', 'handoffs', 'demo', 'reports');
   mkdirSync(handoffs, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
   // A REAL phased plan, not a stub heading: `Service.qaMode` short-circuits to
   // `off` for a plan whose `## Phase graph` table it cannot parse, so a fixture
   // without one makes the gate guard untestable by making it always true.
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), [
+  writeFileSync(join(made.root, 'docs', 'plans', 'demo.md'), [
     '# demo',
     '',
     '## Session budget',
@@ -202,34 +224,8 @@ function repo(verdict = 'fail', qaMode = 'on (plan directive)'): Repo {
     '- **Verification:** `true`',
     '',
   ].join('\n'));
-  writeFileSync(join(state, 'verdict'), `${verdict}\n`);
-  writeFileSync(join(state, 'qamode'), `${qaMode}\n`);
-  // Round 1 already recorded and its report on disk — the shape a recovery
-  // always starts from, and what makes `nextQaRound` answer round 2.
-  writeFileSync(join(state, 'history'), '1\tfail\treports/phase-01-qa.md\t2026-09-05\n');
   writeFileSync(join(handoffs, 'phase-01-qa.md'), '# QA round 1\n\nF1 (High) — SENTINEL-FINDING.\n');
-
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
-set -u
-S="${state}"
-shift
-case "\${1:-}" in
-  --memory-block) echo "done: 1"; echo "ready:"; echo "waiting:" ;;
-  --boot-prompt)  echo "BOOT phase \${2:-}" ;;
-  --qa-mode)      cat "$S/qamode" ;;
-  --qa-result)    cat "$S/verdict" ;;
-  --qa-history)   cat "$S/history" ;;
-  --gate-status)  echo "clear" ;;
-  --repos)        echo "demo-repo" ;;
-  *) echo "" ;;
-esac
-`);
-  write(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  write(join(scripts, 'next-phase-prompt.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'new-handoff.sh'), '#!/usr/bin/env bash\nexit 0\n');
-
-  return { root, scripts, state, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return made;
 }
 
 function outcome(sessionId = 'sess-0001'): SpawnOutcome {
@@ -311,7 +307,7 @@ async function drive(
 test.after(() => rmSync(STATE_HOME, { recursive: true, force: true }));
 
 test('EC2: a fix session is boarded carrying the last report’s findings verbatim', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const { prompts, journal } = await drive(r, {}, () => 'pass');
     assert.equal(prompts.length, 1, 'one round, because the first one passed');
@@ -327,7 +323,7 @@ test('EC2: a fix session is boarded carrying the last report’s findings verbat
 });
 
 test('EC2: three failed rounds journal phase.qa-exhausted with ONE errand naming the last report', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const { prompts, journal } = await drive(r, { maxRounds: 3 }, () => 'fail');
     assert.equal(prompts.length, 3, 'exactly the budget, never a fourth');
@@ -349,7 +345,7 @@ test('EC2: three failed rounds journal phase.qa-exhausted with ONE errand naming
 });
 
 test('ZTD-9: with `QA exhausted: waive` a spent round budget records `waived` naming the policy, releases the dependents and writes no errand', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const waived: { slug: string; phase: number; opts: { reason: string; by: string } }[] = [];
     const { prompts, journal, state } = await drive(r, { maxRounds: 2 }, () => 'fail', {
@@ -384,7 +380,7 @@ test('ZTD-9: with `QA exhausted: waive` a spent round budget records `waived` na
 });
 
 test('ZTD-9: `QA exhausted: halt` halts the run with the errand; an owner\'s name parks with the errand addressed to them; a waiver the door refuses falls back to the errand', async () => {
-  const halted = repo('fail');
+  const halted = stubbedPlan('fail');
   try {
     const { journal, state } = await drive(halted, { maxRounds: 1 }, () => 'fail', { planQaExhausted: () => 'halt' });
     const lines = journal.split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; data: Record<string, unknown> });
@@ -395,7 +391,7 @@ test('ZTD-9: `QA exhausted: halt` halts the run with the errand; an owner\'s nam
     assert.match(String((run.halt as { reason: string }).reason), /the plan says halt \(QA exhausted: halt\)/);
     assert.ok((run.recoveries as Record<string, { errand?: { need: string } }>)['1'].errand, 'the errand stands beside the halt');
   } finally { halted.cleanup(); }
-  const owned = repo('fail');
+  const owned = stubbedPlan('fail');
   try {
     const { state } = await drive(owned, { maxRounds: 1 }, () => 'fail', { planQaExhausted: () => 'dev-lead' });
     const run = state()!;
@@ -403,7 +399,7 @@ test('ZTD-9: `QA exhausted: halt` halts the run with the errand; an owner\'s nam
     const errand = (run.recoveries as Record<string, { errand: { need: string } }>)['1'].errand;
     assert.match(errand.need, /The plan hands this verdict to dev-lead \(QA exhausted: dev-lead\)/);
   } finally { owned.cleanup(); }
-  const refused = repo('fail');
+  const refused = stubbedPlan('fail');
   try {
     const { journal, state } = await drive(refused, { maxRounds: 1 }, () => 'fail', {
       planQaExhausted: () => 'waive',
@@ -418,7 +414,7 @@ test('ZTD-9: `QA exhausted: halt` halts the run with the errand; an owner\'s nam
 });
 
 test('EC3: a pass recorded in round k stops the loop and journals the recovery', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     // Fail, fail, pass — the shape the budget exists to allow.
     const { prompts, journal } = await drive(r, { maxRounds: 3 }, (n) => (n < 3 ? 'fail' : 'pass'));
@@ -435,7 +431,7 @@ test('a verdict that already releases the gate is never re-reviewed', async () =
   // The one outcome this loop must never have: "fixing" a passing phase. The
   // verdict is re-read off the FILE at the top of every round, so a pass
   // recorded by hand or from another clone mid-loop stops it too.
-  const r = repo('pass');
+  const r = stubbedPlan('pass');
   try {
     const { prompts } = await drive(r, {}, () => null);
     assert.equal(prompts.length, 0, 'nothing was spawned over a passing phase');
@@ -443,7 +439,7 @@ test('a verdict that already releases the gate is never re-reviewed', async () =
 });
 
 test('EC4: qa-rerun boards the REVIEW alone — no fix session, no findings', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const { prompts } = await drive(r, { verb: 'qa-rerun', maxRounds: 1 }, () => 'pass');
     assert.equal(prompts.length, 1);
@@ -455,7 +451,7 @@ test('EC4: qa-rerun boards the REVIEW alone — no fix session, no findings', as
 });
 
 test('EC5: the reviewer runs at the run’s own qaModel/qaEffort, not the builder’s', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const { prompts } = await drive(
       r,
@@ -468,7 +464,7 @@ test('EC5: the reviewer runs at the run’s own qaModel/qaEffort, not the builde
 });
 
 test('the round budget bounds ONE round and never the run', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const { prompts } = await drive(r, { maxRounds: 2, roundBudgetUsd: 7 }, () => 'fail');
     assert.equal(prompts.length, 2, 'both rounds ran');
@@ -479,7 +475,7 @@ test('the round budget bounds ONE round and never the run', async () => {
 });
 
 test('the `fresh` strategy boards from the boot prompt; `resume` continues the session', async () => {
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const fresh = await drive(r, { maxRounds: 1, strategy: 'fresh' }, () => 'pass');
     assert.match(fresh.prompts[0]!.prompt, /BOOT phase 1/, 'a fresh session gets the plan first');
@@ -487,7 +483,7 @@ test('the `fresh` strategy boards from the boot prompt; `resume` continues the s
     assert.match(fresh.prompts[0]!.prompt, /SENTINEL-FINDING/, 'and the findings under it');
   } finally { r.cleanup(); }
 
-  const r2 = repo('fail');
+  const r2 = stubbedPlan('fail');
   try {
     const resumed = await drive(r2, { maxRounds: 1, strategy: 'resume' }, () => 'pass');
     assert.equal(resumed.prompts[0]!.resume, 'sess-built');
@@ -498,7 +494,7 @@ test('the `fresh` strategy boards from the boot prompt; `resume` continues the s
 test('with no session to resume, `resume` falls back to a fresh boarding by itself', async () => {
   // The strategy is a PREFERENCE, never a promise the machine can always keep:
   // a run from another console, a hand-driven plan, a transcript that is gone.
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const prompts: SpawnRequest[] = [];
     const spawn: SpawnFn = async (request) => {
@@ -527,7 +523,7 @@ test('QA round 1 (M4): qa-rerun with no session to resume boards FRESH, not zero
   // regardless, so `qaRound` found no session, recorded a skip and answered
   // null — and the loop "exhausted" after ZERO rounds with a self-contradictory
   // errand ("spent 0 of 3 rounds… and every one of them failed").
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   return (async () => {
     try {
       const prompts: SpawnRequest[] = [];
@@ -560,7 +556,7 @@ test('QA round 1 (M4): the `fresh` STRATEGY does not make qa-rerun board fresh o
   // The other half of the same fix: the strategy word is about the FIX session,
   // and a review-only verb must go on resuming the session that holds the
   // context whatever an operator picked for a fix it is not running.
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   return (async () => {
     try {
       const { prompts } = await drive(r, { verb: 'qa-rerun', strategy: 'fresh', maxRounds: 1 }, () => 'pass');
@@ -615,7 +611,7 @@ test('QA round 1 (M1): qa-recover refuses when the gate is NOT holding, whatever
   // turned off (`**QA gate:** off` → mode `waived`) but which still carried a
   // stale `fail` row would spawn a real, billable session loop for a phase the
   // engine is holding nothing behind. The refusal must stand BEFORE the spawn.
-  const r = repo('fail', 'waived (plan directive: QA gate: off)');
+  const r = stubbedPlan('fail', 'waived (plan directive: QA gate: off)');
   try {
     const svc = service(r);
     seedRun(r);
@@ -624,7 +620,7 @@ test('QA round 1 (M1): qa-recover refuses when the gate is NOT holding, whatever
       /gate is not holding/,
     );
     // …and the same door with the gate ON does not refuse for this reason.
-    const live = repo('fail');
+    const live = stubbedPlan('fail');
     try {
       const svc2 = service(live);
       seedRun(live);
@@ -641,7 +637,7 @@ test('QA round 1 (M1): qa-recover refuses when the gate is NOT holding, whatever
 });
 
 test('QA round 1 (M1/M2): both verbs refuse a phase with no verdict, and one that already passed', async () => {
-  const none = repo('none');
+  const none = stubbedPlan('none');
   try {
     const svc = service(none);
     seedRun(none);
@@ -656,7 +652,7 @@ test('QA round 1 (M1/M2): both verbs refuse a phase with no verdict, and one tha
   // with a decision that no review is needed — and a stale browser tab or a
   // repeated POST was enough to do it silently.
   for (const already of ['pass', 'waived']) {
-    const r = repo(already);
+    const r = stubbedPlan(already);
     try {
       const svc = service(r);
       seedRun(r);
@@ -674,7 +670,7 @@ test('QA round 1 (M2): a waiver with no reason is refused before anything is wri
   // where the operator is the one typing. A console button that writes an
   // unexplained waiver into a versioned file is how a plan forgets what it
   // decided not to fix.
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const svc = service(r);
     seedRun(r);
@@ -694,7 +690,7 @@ test('QA round 2 (M1): an UNREADABLE QA mode does not become a refusal', async (
   //
   // "I could not check" and "there is no gate" are different facts — the same
   // rule this codebase states for the MCP preflight.
-  const r = repo('fail', 'something the parser has never seen');
+  const r = stubbedPlan('fail', 'something the parser has never seen');
   try {
     const svc = service(r);
     seedRun(r);
@@ -715,7 +711,7 @@ test('QA round 2 (M2): qaWaive asks the gate too — the site round 1’s fix di
   // inside a commit whose message claimed "both now ask". The "listed five
   // sites, changed four" shape, recurring one level in. Both now go through
   // ONE assertion, which is the only shape in which "both" is checkable.
-  const r = repo('fail', 'waived (plan directive: QA gate: off)');
+  const r = stubbedPlan('fail', 'waived (plan directive: QA gate: off)');
   try {
     const svc = service(r);
     seedRun(r);
@@ -730,7 +726,7 @@ test('QA round 2 (L5): a re-review’s brief does not claim the verdict does not
   // `qa-rerun`'s whole premise is that a verdict EXISTS and is being reviewed
   // again; the brief opened "your phase has NO recorded verdict". A zero-context
   // fresh reviewer takes an opening sentence as fact, so it must be one.
-  const r = repo('fail');
+  const r = stubbedPlan('fail');
   try {
     const { prompts } = await drive(r, { verb: 'qa-rerun', maxRounds: 1 }, () => 'pass');
     assert.match(prompts[0]!.prompt, /recorded verdict is `fail`/);
@@ -740,7 +736,7 @@ test('QA round 2 (L5): a re-review’s brief does not claim the verdict does not
 
   // …and the `qa-pending` chase this brief was written for still says exactly
   // what it always said: there, no verdict is the truth.
-  const pending = repo('pending');
+  const pending = stubbedPlan('pending');
   try {
     const { prompts } = await drive(pending, { verb: 'qa-rerun', maxRounds: 1 }, () => 'pass');
     assert.match(prompts[0]!.prompt, /has NO recorded verdict/);

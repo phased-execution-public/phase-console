@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: halt-scope-conflict-stops
+description: 'the record: a foreign live lock on the scope (a lock queues, never builds over a live session).'
+tags: [halt, unattended]
+context:
+  scaffold_script: fixture.sh

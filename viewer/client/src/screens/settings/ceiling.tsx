@@ -16,6 +16,7 @@
 
 import { LADDER_PREF_DEFAULTS } from '@/data/api';
 import { NumberSetting, SettingsGroup } from './setting';
+import { formatUsd } from '@/ui/money';
 
 export function CeilingGroup() {
   return (
@@ -38,7 +39,7 @@ export function CeilingGroup() {
         unit="dollars"
         min={0}
         step={10}
-        hint={`What the sessions that ended in the last hour reported costing, across every run; past it the next automatic start is refused until the hour rolls on. 0 is no limit (shipped: $${LADDER_PREF_DEFAULTS.ceilingUsdPerHour}).`}
+        hint={`What the sessions that ended in the last hour reported costing, across every run; past it the next automatic start is refused until the hour rolls on. 0 is no limit (shipped: ${formatUsd(LADDER_PREF_DEFAULTS.ceilingUsdPerHour, 'short')}).`}
       />
     </SettingsGroup>
   );

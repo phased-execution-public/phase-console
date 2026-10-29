@@ -275,6 +275,15 @@ export type InboxItem = {
   /** The situation's card words on an errand row (`runner/ladder.ts` `askFor`) — the act, its steps, its check. */
   ask?: AskFacts;
   /**
+   * The ledger step an errand row names (`Errand.stepId`) when no open item
+   * stands behind it any more (2026-10-20): the card draws that step's words —
+   * its guide and its options, answered through the errand — because the
+   * phase still waits on what it asked, whatever became of the step itself.
+   */
+  stepId?: string;
+  /** What the parked phase asked a person for, in its session's own words (`declared.reason`). */
+  asked?: string;
+  /**
    * The row's whole words when its title had to be cut to the title rule
    * (#377, `turn/compose.ts` `shortTitle`): the title is at most 80
    * characters, and this is what it shortened.
@@ -377,7 +386,7 @@ export type InboxRunPhase = {
   /** `PhaseRecord.errandTree` — the stable checkout a person's errand runs in (control-tower phase 90, #123). */
   errandTree?: { dir: string; mounts?: readonly { rel: string; sha: string; pushed: boolean }[] };
   /** `PhaseRecord.declared` — only the step a phase is parked on (control-tower phase 132): its errand IS that item. */
-  declared?: { step?: { id: string } } | null;
+  declared?: { step?: { id: string }; status?: string; reason?: string } | null;
   /** `PhaseRecord.undriven`, read only through `undrivenPhases`. */
   undriven?: {
     since: string; board: string; situation: string | null; why: string;
@@ -611,6 +620,22 @@ export type InboxReach = {
   occupant?: { port: number; id?: string; name?: string };
 };
 
+/**
+ * An update that was asked for and stopped at its fetch (measured-console
+ * phase 13, #414) — `ServiceBase.restartUpdateFact()`: when it answered, who
+ * asked, the sentence it ended on, the commit the console stays on, the
+ * fetch's error and tries, and the one line that asks again.
+ */
+export type InboxRestartUpdate = {
+  at: string;
+  by: string;
+  detail: string;
+  from: string;
+  error: string;
+  tries: number | null;
+  command: string;
+};
+
 export type InboxFacts = {
   /**
    * Every run across every plan. `Service.allRuns()` — async, and it resolves
@@ -698,6 +723,12 @@ export type InboxFacts = {
   hookFaults?: readonly {
     runId: string; slug: string; phase?: number; sessionId: string; hook: string; count: number; since: string;
   }[];
+  /**
+   * The last update asked for, when it could not fetch (#414) — a `needs-you`
+   * health row while it stands: the console did not restart, and whatever
+   * waits on the new build waits on a person.
+   */
+  restartUpdate?: InboxRestartUpdate | null;
   /** `degradedState()`. */
   degraded?: { healthy?: boolean; recent?: readonly { kind: string; message: string; at?: string }[] };
   /**
@@ -1263,6 +1294,12 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         ...(item ? { turn: ledgerTurn(item) } : {}),
         ...(ask ? { ask } : {}),
         ...(options.length ? { options } : {}),
+        // The step the errand names, when no open item stands behind it, and
+        // what the phase asked for — the card's words (2026-10-20).
+        ...(!item && !planPending && !unlanded && errand.stepId ? { stepId: errand.stepId } : {}),
+        ...(ask && phase != null && askedOf(run.phases?.[String(phase)]?.declared)
+          ? { asked: askedOf(run.phases?.[String(phase)]?.declared)! }
+          : {}),
         // A plan a plan-mode phase presented is a yes or a no.
         ...(planPending ? {
           approval: {
@@ -3026,6 +3063,30 @@ function healthDrafts(facts: InboxFacts): Draft[] {
     });
   }
 
+  // An update that was asked for and could not fetch (measured-console phase
+  // 13, #414). It used to answer `current` and restart on the build the
+  // console already ran, so a phase waiting on the new build sat parked with
+  // no word; now the console stays up, and says so here. Keyed by its own
+  // clock, so a second failure is a new ask, never one already acknowledged.
+  if (facts.restartUpdate) {
+    const failed = facts.restartUpdate;
+    out.push({
+      kind: 'health',
+      severity: 'needs-you',
+      subject: 'restart-update-unfetched',
+      title: 'The console update could not fetch its remote — it did not restart',
+      need:
+        `The update ${failed.by} asked for stopped at its fetch`
+        + `${failed.tries ? ` after ${failed.tries} tr${failed.tries === 1 ? 'y' : 'ies'}` : ''}: ${failed.error}. `
+        + `Nothing changed — the console still runs ${failed.from.slice(0, 12) || 'the build it had'}, `
+        + 'and its held work went on.',
+      how: `Once this machine reaches the remote again, ask again: ${failed.command}.`,
+      since: stableSince(failed.at),
+      href: settings,
+      actions: [],
+    });
+  }
+
   // Only while it is still degraded. A healed degradation that stayed in the
   // list would be a row nothing could ever clear, which is precisely how an
   // inbox reaches 182 unread entries.
@@ -3463,6 +3524,18 @@ function conflictDrafts(facts: InboxFacts): Draft[] {
         // plan page would be a claim that one of these branches belongs to a
         // plan when neither does.
         href: target ? planHref(target.slug, 'run') : toHash('runs'),
+        // Its steps, numbered (2026-10-20): what conflicts, then each way it can end.
+        humanStep: humanStepView({
+          kind: HUMAN_STEP_FOLDS.conflict, fold: 'conflict', title: `${key} — these branches would not merge`,
+          lines: [
+            files.length
+              ? `${pair.a} and ${pair.b} conflict in ${files.length === 1 ? files[0] : files.join(', ')}`
+              : `${pair.a} and ${pair.b} would not merge`,
+            target ? `Choose Serialize ${target.slug} to stop the two editing the same files at once` : null,
+            'Choose Leave them to resolve the conflict once, when the branches meet',
+            'Or hand it to the AI, with a note of what it should do',
+          ],
+        }),
         actions,
         // Its options (turn-by-turn phase 4): serialize the run that can
         // move, or leave the two and resolve the conflict once.
@@ -3743,6 +3816,12 @@ function gateBoundActions(step: Pick<InboxHumanStep, 'id' | 'proof' | 'title' | 
 function decisionActions(step: Pick<InboxHumanStep, 'id' | 'options'>): InboxAction[] | null {
   if (!step.options?.length) return null;
   return humanStepActions(step.id).filter((action) => action.verb !== 'check');
+}
+
+/** What a parked phase asked a person for — its declared reason, only while it stopped to ask. */
+function askedOf(declared: InboxRunPhase['declared']): string | null {
+  if (!declared?.reason?.trim()) return null;
+  return declared.status === 'needs-human' || declared.status === 'blocked' ? declared.reason.trim() : null;
 }
 
 /**

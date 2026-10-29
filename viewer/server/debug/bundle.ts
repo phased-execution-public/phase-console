@@ -33,7 +33,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
-import { transcriptPhase } from '../runner/run-paths.ts';
+import { journalChainOf, transcriptPhase } from '../runner/run-paths.ts';
 import { tarGz, type TarMember } from './tar.ts';
 import { scrubText, scrubValue } from './sources.ts';
 
@@ -426,7 +426,13 @@ export async function runBundle(request: BundleRequest, deps: BundleDeps): Promi
   // `run.json` fails it as an undocumented event. It is also the better name —
   // the file is the run RECORD, and the archive is already of one run.
   members.push(member('record.json', recordText));
-  const journal = addText('journal.ndjson', join(dir, `run-${runId}.jsonl`), { narrow: true });
+  // The journal's whole chain, as one member (measured-console phase 17, B5).
+  const chain = journalChainOf(join(dir, `run-${runId}.jsonl`)).map((file) => readText(file)).filter((t): t is string => t !== null);
+  let journal = '';
+  if (chain.length) {
+    journal = narrow(chain.join(''), since);
+    members.push(member('journal.ndjson', journal));
+  } else missing.push('journal.ndjson');
   // The replay is one file per PHASE since control-tower phase 94 (#133). The
   // run's own file holds the lines that name no phase — and every line of a run
   // written before the split — so it is named `missing` only when there is no

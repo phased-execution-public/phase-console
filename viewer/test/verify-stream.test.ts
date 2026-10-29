@@ -18,13 +18,13 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 process.env.PHASE_CONSOLE_LOG = '';
 
-const { verifyPhase } = await import('../server/runner/verify.ts');
+const { boundedOutput, KEEP_OUTPUT, verifyLogDir, verifyPhase } = await import('../server/runner/verify.ts');
 import type { VerifyRun, VerifySkip } from '../server/runner/state.ts';
 
 const cwd = mkdtempSync(join(tmpdir(), 'pc-verify-stream-'));
@@ -129,6 +129,74 @@ test('a verification with nothing runnable still announces its skips', async () 
 test('the hooks are optional — a caller that passes none still verifies', async () => {
   const result = await verifyPhase('- `true`', { cwd } as never);
   assert.equal(result.ok, true);
+});
+
+/*
+ * The bound (measured-console phase 6, the audit's A4): what a session is
+ * shown of a red line is its last `KEEP_OUTPUT` characters — 8,000 — with the
+ * path of the log that holds the whole of it, and the ids are still read off
+ * the whole stream.
+ */
+test('a red line\'s output is tailed to 8,000 characters and names the log that holds all of it', async () => {
+  const script = join(cwd, 'loud-red.sh');
+  // The failing id first, then 30,000 characters after it: no tail of 8,000
+  // reaches back to it, and the record must still name it.
+  writeFileSync(script, '#!/usr/bin/env bash\necho "not ok 1 - the early one"\n'
+    + 'for i in $(seq 1 600); do printf "%049d\\n" "$i"; done\nexit 1\n');
+  const result = await verifyPhase(`- \`bash ${script}\``, { cwd } as never);
+
+  assert.equal(result.ok, false);
+  const run = result.ran.at(-1)!;
+  assert.equal(KEEP_OUTPUT, 8_000);
+  assert.ok(run.output.length <= KEEP_OUTPUT, `the tail is bounded — ${run.output.length} characters`);
+  assert.ok(run.output.length > KEEP_OUTPUT - 400, 'and is a real tail, not a stub');
+  const note = /\[the whole output \((\d+) characters\): (\S+\.log)\]$/.exec(run.output);
+  assert.ok(note, `the last line names the log: …${run.output.slice(-200)}`);
+  const logPath = note![2]!;
+  assert.ok(logPath.startsWith(verifyLogDir()), 'under the machine\'s temporary directory, never the repository');
+  assert.ok(existsSync(logPath), 'the log a red line names is there to read');
+  const whole = readFileSync(logPath, 'utf8');
+  assert.equal(whole.length, Number(note![1]), 'the note counts the whole output');
+  assert.ok(whole.length > 30_000);
+  assert.match(whole, /^not ok 1 - the early one$/m, 'the log holds what the tail lost');
+  assert.doesNotMatch(run.output, /the early one/, 'the tail alone could not have named it');
+  assert.deepEqual(run.failures, ['the early one'], 'the ids are read off the whole stream, not the tail');
+  for (const r of result.ran) {
+    const path = /: (\S+\.log)\]$/.exec(r.output)?.[1];
+    if (path) rmSync(path, { force: true });
+  }
+});
+
+test('a green line keeps no log, a silent red names none, and a red that fits is whole with its log named', async () => {
+  const marker = `green-marker-${process.pid}-${Date.now()}`;
+  const green = await verifyPhase(`- \`printf ${marker}\``, { cwd } as never);
+  assert.equal(green.ok, true);
+  assert.equal(green.ran[0]!.output, marker, 'a green line is untouched');
+  const left = existsSync(verifyLogDir())
+    ? readdirSync(verifyLogDir()).filter((name) => {
+      try { return readFileSync(join(verifyLogDir(), name), 'utf8').includes(marker); } catch { return false; }
+    })
+    : [];
+  assert.deepEqual(left, [], 'a green line\'s log is deleted');
+
+  const quiet = await verifyPhase('- `test -e /nonexistent-path-xyz`', { cwd } as never);
+  assert.equal(quiet.ok, false);
+  assert.equal(quiet.ran.at(-1)!.output, '', 'a red line that printed nothing names no log');
+
+  const script = join(cwd, 'small-red.sh');
+  writeFileSync(script, '#!/usr/bin/env bash\necho "not ok 1 - small"\nexit 1\n');
+  const small = await verifyPhase(`- \`bash ${script}\``, { cwd } as never);
+  const output = small.ran.at(-1)!.output;
+  assert.match(output, /^not ok 1 - small\n\[the whole output \(17 characters\): \S+\.log\]$/, output);
+  for (const r of small.ran) rmSync(/: (\S+\.log)\]$/.exec(r.output)![1]!, { force: true });
+});
+
+test('boundedOutput holds the bound whatever the path\'s length', () => {
+  const long = `/tmp/${'d'.repeat(9_000)}/x.log`;
+  assert.ok(boundedOutput('x'.repeat(20_000), long, 20_000).length <= KEEP_OUTPUT);
+  assert.equal(boundedOutput('short', null), 'short');
+  assert.equal(boundedOutput('y'.repeat(9_000), null).length, KEEP_OUTPUT);
+  assert.match(boundedOutput('short', '/tmp/a.log', 5), /^short\n\[the whole output \(5 characters\): \/tmp\/a\.log\]$/);
 });
 
 process.on('exit', () => rmSync(cwd, { recursive: true, force: true }));

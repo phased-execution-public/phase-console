@@ -20,7 +20,12 @@
 
 import { money } from '@/lib/format';
 import { PRIORITY_LABELS } from '@shared/orchestration-model.js';
-import { QA_FIX_STRATEGY_LABELS } from '@shared/run-settings.js';
+import {
+  DEFAULT_BASH_MAX_OUTPUT,
+  DEFAULT_COMPACTION_WINDOW,
+  DEFER_CLI_FLOOR,
+  QA_FIX_STRATEGY_LABELS,
+} from '@shared/run-settings.js';
 import { ISOLATED, RETENTION_LABELS, SETTLE_LABELS } from '@shared/worktree-model.js';
 import { CONFLICT_LABELS, LAND_LABELS } from '@shared/landing-model.js';
 import { ISSUE_MODE_LABELS } from '@shared/issues-model.js';
@@ -31,6 +36,7 @@ import type { RunSetupField, RunSetupValues } from './schema';
 import { WIRE, parsePhases } from './schema';
 import { BASELINE, sourceOf, type Origins, type Source } from './seed';
 import { FIELD_LABELS, STAGE_OF, isLive, type ControlStage } from './stages';
+import { formatUsd } from '@/ui/money';
 
 /** The words the review needs that the form owns — passed in, never re-declared here. */
 export interface NameSources {
@@ -158,7 +164,7 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
     case 'qaRoundBudgetUsd':
       return values.qaRoundBudgetUsd.trim() === ''
         ? 'no per-round ceiling'
-        : `$${values.qaRoundBudgetUsd} per round`;
+        : `${formatUsd(Number(values.qaRoundBudgetUsd), 'short')} per round`;
     case 'attachDefaultSkills':
       return values.attachDefaultSkills ? 'attached' : 'not attached';
     case 'skills':
@@ -182,6 +188,36 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
       if (Number(text) === 0) return 'none — nothing recovers by itself';
       return field === 'ladderPerRunRungs' ? `${text} across the open phases` : `${text} per phase`;
     }
+    // The session's environment (measured-console phase 6).
+    case 'cacheTtlAb':
+      return values.cacheTtlAb === 'alternate'
+        ? 'alternate phases run the other cache lifetime'
+        : 'off — every session keeps its account’s';
+    case 'keepWarmSec': {
+      const text = values.keepWarmSec.trim();
+      return text === '' || Number(text) === 0 ? 'off' : `${text} ${text === '1' ? 'second' : 'seconds'}`;
+    }
+    case 'subagentModel':
+      return values.subagentModel
+        ? (MODEL_NOTE[values.subagentModel] ?? values.subagentModel)
+        : 'the plan’s line, else the session’s own';
+    case 'bashMaxOutput':
+      return values.bashMaxOutput.trim() === ''
+        ? `the console’s ${DEFAULT_BASH_MAX_OUTPUT.toLocaleString('en-US')}`
+        : `${Number(values.bashMaxOutput).toLocaleString('en-US')} characters`;
+    // The platform's pieces (measured-console phase 12).
+    case 'humanStepMode':
+      if (values.humanStepMode === 'defer') return 'the session waits on the step, then carries on';
+      if (values.humanStepMode === 'park') return 'the phase parks until the step is done';
+      return `automatic — the session waits on a CLI ${DEFER_CLI_FLOOR} or later, else the phase parks`;
+    case 'compaction':
+      if (values.compaction === 'native') return 'the CLI compacts';
+      if (values.compaction === 'alternate') return 'odd phases the CLI, even phases the console';
+      return 'the console’s checkpoints';
+    case 'compactionWindow':
+      return values.compactionWindow.trim() === ''
+        ? `the console’s ${DEFAULT_COMPACTION_WINDOW.toLocaleString('en-US')} tokens`
+        : `${Number(values.compactionWindow).toLocaleString('en-US')} tokens`;
     case 'onlyPhases': {
       const phases = parsePhases(values.onlyPhases);
       return phases ? `P${phases.join(', P')}` : 'the whole plan';

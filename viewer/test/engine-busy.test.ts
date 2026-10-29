@@ -26,12 +26,13 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
 import type { SpawnFn, SpawnOutcome } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const core = await import('../server/runner/runner-core.ts') as Record<string, unknown>;
 const MAX_WAITS = (core.ENGINE_BUSY_MAX_WAITS as number | undefined) ?? 8;
@@ -52,17 +53,11 @@ const TIMED_OUT = 'the engine timed out reading this plan';
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-engine-busy-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-engine-busy-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -74,14 +69,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(stub, 'done'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: (phase) => writeFileSync(join(made.state, 'done'), `${phase}\n`) };
 }
 
 function ok(): SpawnOutcome {
@@ -127,7 +120,7 @@ const journalled = (frames: Frame[], name: string) => frames
   .map((f) => (f.data.data ?? {}) as Record<string, unknown>);
 
 test('EB-1: a board read that times out is waited out on a back-off clock — no halt, no failure, and the run carries on when the engine answers', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let calls = 0;
     const { instance, frames } = harness(r, async () => { calls += 1; r.markDone(1); return ok(); }, 2);
@@ -155,7 +148,7 @@ test('EB-1: a board read that times out is waited out on a back-off clock — no
 });
 
 test('EB-1: a timeout that outlasts the whole back-off stops the run once — `plan-unreadable`, saying how many reads timed out — and still charges nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { instance, frames } = harness(r, async () => ok(), Number.POSITIVE_INFINITY);
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
@@ -172,7 +165,7 @@ test('EB-1: a timeout that outlasts the whole back-off stops the run once — `p
 });
 
 test('EB-1: a Stop pressed during an engine-busy wait cuts it short — it does not sit out the back-off, and the run never reads running on the way out', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { instance, frames } = harness(r, async () => ok(), Number.POSITIVE_INFINITY, [60_000]);
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });

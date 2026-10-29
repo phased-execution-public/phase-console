@@ -310,6 +310,13 @@ test('UP-6: skill-api.env ships beside the scripts, and its pair reads as number
   assert.ok(shipped, 'scripts/skill-api.env ships');
   assert.ok(Number.isInteger(shipped.api) && Number.isInteger(shipped.min) && shipped.min <= shipped.api, JSON.stringify(shipped));
   assert.equal(readSkillApi(temp('no-api')), null);
+  assert.deepEqual([shipped.api, shipped.min], [3, 2], 'this tree speaks 3 and works with a half at 2');
+  // The floor: a stamp that contradicts itself is no verdict rather than a pass.
+  for (const [api, min] of [[2, 3], [3, 0]] as const) {
+    const dir = temp(`contradicts-${api}-${min}`);
+    writeFileSync(join(dir, 'skill-api.env'), `PE_API=${api}\nPE_API_MIN=${min}\n`);
+    assert.equal(readSkillApi(dir), null, `PE_API=${api} PE_API_MIN=${min} reads as no stamp`);
+  }
 
   const at = (api: number, min: number) => ({ api, min, file: '/x/skill-api.env' });
   assert.equal(skillApiVerdict(at(3, 2), at(3, 2)), null, 'the same interface');

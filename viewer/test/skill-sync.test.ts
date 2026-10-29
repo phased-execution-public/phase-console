@@ -40,6 +40,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { contextWrapupNotice, unattendedDirective, VERIFY_TIMEOUT_MS } from '../server/runner/runner-core.ts';
 import { DEFAULT_WAIT_BUDGET_MS, WAIT_MAX_PER_PHASE } from '../server/runner/wait-budget.ts';
@@ -84,6 +85,26 @@ const referenceDocs = (): string[] =>
  * browses. This is the set whose falsehoods get executed.
  */
 const SESSION_DOCS = (): string[] => ['SKILL.md', ...referenceDocs()];
+
+/**
+ * Where the skill's text lives since measured-console phase 3 (the lean skill): a core a session holds
+ * whole, three mode files each read only in its mode, and the script index. A hold below reads the file
+ * its paragraph moved to — never a looser reading of the old one.
+ */
+const SKILL_CORE = 'SKILL.md';
+const MODE_PLAN = 'references/mode-plan.md';
+const MODE_START = 'references/mode-phase-start.md';
+const MODE_FINISH = 'references/mode-phase-finish.md';
+const MODE_FILES = [MODE_PLAN, MODE_START, MODE_FINISH] as const;
+const SCRIPT_INDEX = 'references/scripts.md';
+/**
+ * What CLAUDE.md held until measured-console phase 5: the pointer file, and the two files its body
+ * moved to whole. Every check that read CLAUDE.md reads all three, so a paragraph it held is held
+ * wherever it now lives.
+ */
+const CLAUDE_DOCS = ['CLAUDE.md', 'viewer/docs/architecture.md', 'docs/invariants.md'] as const;
+/** The skill a session reads: the core, the three modes and the script index, as one text. */
+const skillText = (): string => [SKILL_CORE, ...MODE_FILES, SCRIPT_INDEX].map((doc) => read(doc)).join('\n\n');
 
 /* ------------------------------------------------------------------ *
  * 1. Capability flags
@@ -145,13 +166,13 @@ function* statedCounts(body: string, patterns: RegExp[]): Generator<{ word: stri
   }
 }
 
-test('SKILL.md names every capability flag and states the right count', () => {
+test('the script index names every capability flag and states the right count', () => {
   const flags = capabilityFlags();
   assert.ok(flags.length >= 5, 'CAPABILITY_WORDS did not parse out of shared/capability-model.js');
 
-  const skill = read('SKILL.md');
+  const skill = read(SCRIPT_INDEX);
   for (const flag of flags) {
-    assert.ok(skill.includes(`\`${flag}\``), `SKILL.md never names ${flag}`);
+    assert.ok(skill.includes(`\`${flag}\``), `${SCRIPT_INDEX} never names ${flag}`);
   }
 
   // "Seven flags each unlock one act, and all seven default off." The count is
@@ -163,14 +184,14 @@ test('SKILL.md names every capability flag and states the right count', () => {
   let stated = 0;
   for (const { word, want, where } of statedCounts(skill, patterns)) {
     stated++;
-    assert.equal(WORDS[word.toLowerCase()], want, `SKILL.md says '${word} flags' ${where}; that edition has ${want}`);
+    assert.equal(WORDS[word.toLowerCase()], want, `${SCRIPT_INDEX} says '${word} flags' ${where}; that edition has ${want}`);
   }
-  assert.ok(stated >= 2, `SKILL.md should state the flag count; found ${stated} statements`);
+  assert.ok(stated >= 2, `${SCRIPT_INDEX} should state the flag count; found ${stated} statements`);
 });
 
 test('a Pro flag is named only inside a Pro region, so the free tree never states it (phase 115)', () => {
   const pro = capabilityRows().filter((row) => row.pro).map((row) => row.flag);
-  for (const doc of ['SKILL.md', 'CLAUDE.md']) {
+  for (const doc of ['SKILL.md', SCRIPT_INDEX, ...CLAUDE_DOCS]) {
     const body = read(doc);
     const spans = proSpans(body);
     for (const flag of pro) {
@@ -195,7 +216,7 @@ test('the flag that switches something OFF is never counted among the ones that 
   // Asserted as the arithmetic rather than as a phrasing: a document may
   // describe the flag however it likes, but it may not present it as one of the
   // capability flags — that is what would make the count wrong.
-  for (const doc of ['SKILL.md', 'CLAUDE.md']) {
+  for (const doc of ['SKILL.md', SCRIPT_INDEX, ...CLAUDE_DOCS]) {
     const body = read(doc);
     assert.doesNotMatch(
       body, /--no-converge[^.\n]{0,80}\b(unlocks?|enables?|allows?) /i,
@@ -205,7 +226,7 @@ test('the flag that switches something OFF is never counted among the ones that 
 });
 
 test('CLAUDE.md and SKILL.md agree with config.ts about how many flags there are', () => {
-  for (const doc of ['CLAUDE.md', 'SKILL.md']) {
+  for (const doc of [...CLAUDE_DOCS, 'SKILL.md', SCRIPT_INDEX]) {
     const body = stripFences(read(doc));
     const counts = [/\b(two|three|four|five|six|seven|eight|nine|ten)\s+(?:capability\s+)?(?:flags|switches)\b/gi];
     for (const { word, want, where } of statedCounts(body, counts)) {
@@ -221,13 +242,12 @@ test('CLAUDE.md and SKILL.md agree with config.ts about how many flags there are
 const shippedScripts = (): string[] =>
   readdirSync(`${root}scripts`).filter((f) => f.endsWith('.sh')).sort();
 
-/** SKILL.md's §Helper scripts section — the list that claims to be complete. */
+/** The script index's §Helper scripts onward — the list that claims to be complete (it moved out of SKILL.md). */
 const helperSection = (): string => {
-  const skill = read('SKILL.md');
-  const from = skill.indexOf('## Helper scripts');
-  const to = skill.indexOf('## Guardrails');
-  assert.ok(from > 0 && to > from, 'SKILL.md lost its §Helper scripts section');
-  return skill.slice(from, to);
+  const index = read(SCRIPT_INDEX);
+  const from = index.indexOf('## Helper scripts');
+  assert.ok(from > 0, `${SCRIPT_INDEX} lost its §Helper scripts section`);
+  return index.slice(from);
 };
 
 test('every script that ships is named in SKILL.md §Helper scripts', () => {
@@ -240,7 +260,7 @@ test('every script that ships is named in SKILL.md §Helper scripts', () => {
   for (const script of shippedScripts()) {
     assert.ok(
       section.includes(script),
-      `scripts/${script} ships but SKILL.md §Helper scripts never names it`,
+      `scripts/${script} ships but ${SCRIPT_INDEX} §Helper scripts never names it`,
     );
   }
 });
@@ -260,13 +280,11 @@ test('every script SKILL.md and references/ name actually exists', () => {
   }
 });
 
-/** SKILL.md's Mode 2 — the procedure a session follows while it is BUILDING. */
+/** Mode 2 — the procedure a session follows while it is BUILDING — is its own file. */
 const mode2Section = (): string => {
-  const skill = read('SKILL.md');
-  const from = skill.indexOf('### Mode 2');
-  const to = skill.indexOf('### Mode 3');
-  assert.ok(from > 0 && to > from, 'SKILL.md lost its Mode 2 section');
-  return skill.slice(from, to);
+  const mode2 = read(MODE_START);
+  assert.ok(mode2.startsWith('# Mode 2'), `${MODE_START} lost its Mode 2 heading`);
+  return mode2;
 };
 
 
@@ -312,7 +330,7 @@ test('the bin still answers to the verbs the documents send people to', () => {
   }
 
   const cited = new Set<string>();
-  for (const doc of [...SESSION_DOCS(), 'CLAUDE.md', 'README.md', 'USAGE.md']) {
+  for (const doc of [...SESSION_DOCS(), ...CLAUDE_DOCS, 'README.md', 'USAGE.md']) {
     // Two tightenings the public repository's NAME forced, since it is
     // `phased-execution-public/phase-console`: a slug is not the binary, so a
     // preceding `/` disqualifies the match, and a verb sits on the SAME line as
@@ -396,7 +414,8 @@ test('the advisory family the documents name is exactly the one the engine emits
   const emitted = emittedAdvisories();
   assert.ok(emitted.size >= 6, `expected several advisories, parsed ${emitted.size}`);
 
-  const skill = read('SKILL.md');
+  // The family's sentence moved with validate.sh's entry into the script index (measured-console phase 3).
+  const skill = read(SCRIPT_INDEX);
   // SKILL.md states the family in ONE bolded span — `**advisory family F15–F19,
   // F22–F23, F28**` — of ranges and, since 5.1.0, standalone ids: F28 joined a
   // family that had been contiguous, and expanding ranges alone would have read
@@ -443,14 +462,14 @@ test('every F id the session documents cite is one the engine really has', () =>
   }
 });
 
-test('SKILL.md names every GATING lint, not only the three that predate the rest', () => {
+test('the script index names every GATING lint, not only the three that predate the rest', () => {
   // The claim under guard is the one `--lint`'s own description makes: what
   // makes it exit non-zero. F20 (the table's shape) and F21 (cells it could not
   // believe) are explicitly "F1 tier" in the engine and were missing from every
   // document for as long as they have existed.
-  const skill = read('SKILL.md');
+  const skill = read(SCRIPT_INDEX);
   for (const id of documentedGating()) {
-    assert.ok(skill.includes(id), `SKILL.md never names gating lint ${id}`);
+    assert.ok(skill.includes(id), `${SCRIPT_INDEX} never names gating lint ${id}`);
   }
 });
 
@@ -572,16 +591,16 @@ test('the gate kinds and QA words the documents use are the ones the code has', 
       );
     }
   }
+  const skill = skillText();
   for (const kind of GATE_KINDS) {
-    assert.ok(read('SKILL.md').includes(kind), `gate kind '${kind}' is never named in SKILL.md`);
+    assert.ok(skill.includes(kind), `gate kind '${kind}' is never named in the skill`);
   }
-  const skill = read('SKILL.md');
   for (const result of QA_RESULTS) {
-    assert.ok(skill.includes(result), `QA result '${result}' is never named in SKILL.md`);
+    assert.ok(skill.includes(result), `QA result '${result}' is never named in the skill`);
   }
   for (const mode of QA_MODES) {
     if (mode === 'unknown') continue; // an internal answer, never a plan directive
-    assert.ok(skill.includes(mode), `QA mode '${mode}' is never named in SKILL.md`);
+    assert.ok(skill.includes(mode), `QA mode '${mode}' is never named in the skill`);
   }
 });
 
@@ -604,14 +623,14 @@ test('the worktree paragraph names the mirror, and no document still says a supe
   const planFormat = read('references/plan-format.md');
   assert.match(planFormat, /mirror/i, 'references/plan-format.md lost the mirror');
 
-  const skill = read('SKILL.md');
+  const skill = read(MODE_PLAN);
   assert.match(
     skill, /mirror/i,
-    'SKILL.md describes worktrees without naming the mirror — the stale refusal is back',
+    `${MODE_PLAN} describes worktrees without naming the mirror — the stale refusal is back`,
   );
   // The exact sentence the drift wore. Pinned as a phrase because the claim is
   // the *conclusion*, and a session acts on the conclusion.
-  for (const doc of [...SESSION_DOCS(), 'CLAUDE.md']) {
+  for (const doc of [...SESSION_DOCS(), ...CLAUDE_DOCS]) {
     assert.doesNotMatch(
       read(doc), /monorepo-of-submodules plan gains nothing/i,
       `${doc} still tells a submodule plan that worktrees buy it nothing`,
@@ -624,12 +643,12 @@ test('the lane branch the documents promise is the one the code can actually cre
   // hyphen is load-bearing and every document that shows a lane branch shows it.
   const impl = read('viewer/server/runner/worktree.ts');
   assert.match(impl, /pe\/<slug>-p/, 'worktree.ts no longer documents the hyphenated lane branch');
-  const skill = read('SKILL.md');
-  assert.match(skill, /pe\/<slug>-p<N>/, 'SKILL.md no longer shows the hyphenated lane branch');
+  const skill = read(MODE_PLAN);
+  assert.match(skill, /pe\/<slug>-p<N>/, `${MODE_PLAN} no longer shows the hyphenated lane branch`);
   assert.doesNotMatch(
     stripFences(skill).replace(/`pe\/<slug>\/p4` is impossible[^.]*\./g, ''),
     /`pe\/<slug>\/p\d`/,
-    'SKILL.md shows a slash-separated lane branch as if it were creatable',
+    `${MODE_PLAN} shows a slash-separated lane branch as if it were creatable`,
   );
 });
 
@@ -694,11 +713,11 @@ const near = (text: string, a: string, b: string, span = 240): boolean => {
   return false;
 };
 
-/** SKILL.md's Mode 3 — the closeout — through step 6. */
-const mode3Section = (): string => between(read('SKILL.md'), '### Mode 3', '## Helper scripts');
+/** Mode 3 — the closeout — through step 6: its own file since measured-console phase 3. */
+const mode3Section = (): string => between(read(MODE_FINISH), '# Mode 3', "## It's working if");
 
-/** SKILL.md's account of the machinery a supervised session runs inside. */
-const consoleSection = (): string => between(read('SKILL.md'), '## Running under Phase Console', '## Modes');
+/** SKILL.md's account of the machinery a supervised session runs inside — the core's contract. */
+const consoleSection = (): string => between(read(SKILL_CORE), '## Under Phase Console', '## Modes');
 
 /** The plan's own words (exit criterion 9), pinned as a phrase: the claim is the conclusion. */
 const ONE_PHASE = 'the console runs one phase per session; batch only by hand';
@@ -713,7 +732,7 @@ test('CO-1: `complete` and the INDEX flip come LAST — a line owed, deferred or
   assert.ok(outcomeStatuses().includes('partial'), 'phase-outcome.sh no longer accepts `partial`');
 
   for (const [where, body] of [
-    ['SKILL.md Mode 3', mode3Section()],
+    [`${MODE_FINISH}`, mode3Section()],
     ['references/handoff-format.md', read('references/handoff-format.md')],
   ] as const) {
     const text = plain(body);
@@ -776,10 +795,10 @@ test('CO-2: §Verification runs on the console\'s clock — and `Verify timeout:
 });
 
 test('CO-3: one phase per session, batch only by hand — the context lines, and the measured sizing model', () => {
-  const skill = read('SKILL.md');
-  const intro = plain(between(skill, '# Phased Execution', '## Three artifacts'));
+  const skill = read(SKILL_CORE);
+  const intro = plain(between(skill, '# Phased Execution', '## Five artifacts'));
   assert.ok(intro.includes(ONE_PHASE), `the intro must say "${ONE_PHASE}"`);
-  const step6 = plain(between(skill, '6. **Stop & hand off', '## Helper scripts'));
+  const step6 = plain(between(read(MODE_FINISH), '## Step 6', "## It's working if"));
   assert.ok(step6.includes(ONE_PHASE), `Mode 3 step 6 must say "${ONE_PHASE}"`);
   assert.ok(
     plain(between(mode3Section(), '1. VERIFY', '```')).includes(`6. Stop & hand off — ${ONE_PHASE}`),
@@ -873,9 +892,9 @@ test('CO-3: one phase per session, batch only by hand — the context lines, and
 /** A duration the way the documents say one. */
 const inMinutes = (ms: number): string => `${ms / 60_000} minutes`;
 
-/** SKILL.md's §Helper scripts entry for `phase-outcome.sh`. */
+/** The script index's entry for `phase-outcome.sh` (it moved out of SKILL.md §Helper scripts). */
 const outcomeEntry = (): string =>
-  between(read('SKILL.md'), '- `scripts/phase-outcome.sh <slug> <N>', '- `scripts/decisions.sh');
+  between(read(SCRIPT_INDEX), '- `scripts/phase-outcome.sh <slug> <N>', '- `scripts/decisions.sh');
 
 /**
  * The watch schemes a text documents, asked of the console's own parser: every
@@ -943,7 +962,7 @@ test('SK-3: a cmd: probe is self-contained, phase: waits on a sibling, verify: o
   assert.ok(near(rule5, 'phase:<slug>/<N>', 'sibling'), 'the waiting rules must name phase: for a sibling');
 
   // Every scheme the console parses, in both places a session looks it up.
-  for (const [where, text] of [['SKILL.md §phase-outcome.sh', outcomeEntry()], ['references/plan-format.md', read('references/plan-format.md')]] as const) {
+  for (const [where, text] of [[`${SCRIPT_INDEX} §phase-outcome.sh`, outcomeEntry()], ['references/plan-format.md', read('references/plan-format.md')]] as const) {
     const documented = documentedSchemes(text);
     for (const scheme of WATCH_SCHEMES) {
       assert.ok(documented.has(scheme), `${where} documents no ${scheme} ref the console would parse`);
@@ -1124,14 +1143,15 @@ test('references/turn.md names every flag of a person\'s turn, and none the scri
   assert.deepEqual(invented, [], `references/turn.md names flags nothing implements: ${invented.join(' ')}`);
 });
 
-test('SKILL.md\'s rule for a person\'s turn says the four things, and a denied tool is never pressed past (phase 140)', () => {
-  const skill = read('SKILL.md');
-  const start = skill.indexOf("**A person's turn is a human step, not prose.**");
-  assert.ok(start >= 0, "SKILL.md Mode 2 has the person's-turn rule");
-  const rule = skill.slice(start, skill.indexOf('**An unrelated problem**', start)).replace(/\s+/g, ' ');
+test('Mode 2\'s rule for a person\'s turn says the four things, and a denied tool is never pressed past (phase 140)', () => {
+  const mode2 = read(MODE_START);
+  const start = mode2.indexOf("**A person's turn is a human step, not prose.**");
+  assert.ok(start >= 0, `${MODE_START} has the person's-turn rule`);
+  const rule = mode2.slice(start, mode2.indexOf('**An unrelated problem**', start)).replace(/\s+/g, ' ');
   for (const needle of [
     '`references/turn.md`', '--why', '--guide', '--lang', '**Guide language:**', '--proof-words', 'handled --what', 'exit 4',
-  ]) assert.ok(rule.includes(needle), `SKILL.md's person's-turn rule names ${needle}`);
+  ]) assert.ok(rule.includes(needle), `${MODE_START}'s person's-turn rule names ${needle}`);
+  const skill = read(SKILL_CORE);
   const denied = /- \*\*A denied tool is a decision, not a failure\.\*\*[\s\S]*?(?=\n- \*\*)/.exec(skill)?.[0] ?? '';
   assert.ok(denied, 'SKILL.md keeps its denied-tool bullet');
   assert.match(denied, /console-forge/, 'the denied-tool bullet says the session never presses its own console');
@@ -1164,7 +1184,7 @@ test('turn-by-turn phase 12: the references and SKILL.md document what 7.1 gave 
   const docs = {
     'references/turn.md': read('references/turn.md'),
     'references/plan-format.md': read('references/plan-format.md'),
-    'SKILL.md': read('SKILL.md'),
+    'the skill (core, modes, script index)': skillText(),
   };
   for (const [file, text] of Object.entries(docs)) {
     for (const [id, name] of Object.entries(ids)) {
@@ -1181,4 +1201,62 @@ test('turn-by-turn phase 12: the references and SKILL.md document what 7.1 gave 
     assert.ok(docs['references/turn.md'].includes(`\`${act}\``), `references/turn.md names the run act ${act}`);
   }
   assert.ok(read('references/conventions.md').includes('`run` with `--run-act <act>`'), 'conventions lists `run` among the blocker short forms');
+});
+
+/* ------------------------------------------------------------------ *
+ * The lean skill's shape (measured-console phase 3): a core a session holds whole, a file per mode
+ * that a re-attach after compaction keeps whole, the catalogue behind the engine's own --help.
+ * ------------------------------------------------------------------ */
+
+/** The size Claude Code keeps whole when it re-attaches a skill file after compaction (5,000 tokens). */
+const MODE_FILE_CEILING = 20_480;
+const CORE_CEILING = 16_384;
+const CORE_LINES = 500;
+const DESCRIPTION_CEILING = 1_536;
+
+test('the core fits its ceilings: 16 KB, 500 lines, a description under 1,536 characters', () => {
+  const core = read(SKILL_CORE);
+  assert.ok(Buffer.byteLength(core) <= CORE_CEILING, `SKILL.md is ${Buffer.byteLength(core)} bytes; the ceiling is ${CORE_CEILING}`);
+  const lines = core.split('\n').length - (core.endsWith('\n') ? 1 : 0);
+  assert.ok(lines <= CORE_LINES, `SKILL.md is ${lines} lines; the ceiling is ${CORE_LINES}`);
+  const description = /^description: "(.*)"$/m.exec(core)?.[1] ?? '';
+  assert.ok(description.length > 0, 'SKILL.md carries a quoted description');
+  assert.ok(description.length <= DESCRIPTION_CEILING, `the description is ${description.length} characters; the ceiling is ${DESCRIPTION_CEILING}`);
+  // Each mode is a pointer in the core: the file it lives in, by name.
+  for (const file of MODE_FILES) assert.ok(core.includes(`\`${file}\``), `SKILL.md never points at ${file}`);
+  assert.ok(core.includes(`\`${SCRIPT_INDEX}\``), `SKILL.md never points at ${SCRIPT_INDEX}`);
+});
+
+test('each mode file fits a compaction re-attach, names its mode, and says what to do first', () => {
+  for (const [file, mode] of [[MODE_PLAN, 1], [MODE_START, 2], [MODE_FINISH, 3]] as const) {
+    const body = read(file);
+    assert.ok(Buffer.byteLength(body) <= MODE_FILE_CEILING, `${file} is ${Buffer.byteLength(body)} bytes; the ceiling is ${MODE_FILE_CEILING}`);
+    assert.match(body, new RegExp(`^# Mode ${mode} — `), `${file} opens on its mode's heading`);
+    assert.match(body.split('\n').slice(1, 6).join('\n'), /\*\*First:\*\*/, `${file} begins with what to do first`);
+    assert.match(body, /^## It's working if$/m, `${file} ends on what "working" looks like`);
+  }
+});
+
+test('no reference names a viewer/ path — a session needs the rule, not the console\'s source tree', () => {
+  for (const doc of referenceDocs()) {
+    const hits = read(doc).split('\n').map((line, i) => [i + 1, line] as const).filter(([, line]) => line.includes('viewer/'));
+    assert.deepEqual(hits.map(([n]) => `${doc}:${n}`), [], `${doc} names viewer/ paths`);
+  }
+});
+
+test('every --help line of the engine has a home in the script index', () => {
+  const help = execFileSync('/bin/bash', [`${root}scripts/phase-graph.sh`, '--help'], { encoding: 'utf8' });
+  const modes = [...help.matchAll(/^ {2}(--[a-z][a-z0-9-]*)/gm)].map((m) => m[1]);
+  assert.ok(modes.length >= 50, `parsed only ${modes.length} modes out of --help`);
+  const index = read(SCRIPT_INDEX);
+  const missing = modes.filter((mode) => !index.includes(`\`${mode}`));
+  assert.deepEqual(missing, [], `${SCRIPT_INDEX}'s phase-graph.sh entry never names these --help modes`);
+});
+
+test('the core and the mode files steer by target, not prohibition: under 0.5 lines with "never" per KB', () => {
+  const docs = [SKILL_CORE, ...MODE_FILES];
+  const text = docs.map((doc) => read(doc)).join('\n');
+  const lines = text.split('\n').filter((line) => /never/i.test(line)).length;
+  const perKb = (lines * 1024) / Buffer.byteLength(text);
+  assert.ok(perKb < 0.5, `${lines} lines with "never" over ${Buffer.byteLength(text)} bytes is ${perKb.toFixed(2)} per KB`);
 });

@@ -306,9 +306,15 @@ export function PerPhase({
       aria-expanded={moreFor === p.phase}
       aria-label={`More for phase ${p.phase}`}
       onClick={() => setMoreFor(moreFor === p.phase ? null : p.phase)}
-      title="Permission mode, tool list, accounts and pool policy for this phase alone."
+      title="Plugin kinds, permission mode, tool list, accounts and pool policy for this phase alone."
     >
-      {own.permissionMode || own.tools?.length || own.autoApprove != null || ownPool(own) ? 'set' : 'add'}
+      {own.plugins?.length ||
+      own.permissionMode ||
+      own.tools?.length ||
+      own.autoApprove != null ||
+      ownPool(own)
+        ? 'set'
+        : 'add'}
     </Button>
   );
 
@@ -349,6 +355,7 @@ export function PerPhase({
       </label>
     </div>
   );
+
 
   const morePanel = (p: PhaseView, own: PhaseOptions) => (
     <div className="flex min-w-0 flex-col gap-2">

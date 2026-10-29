@@ -111,7 +111,6 @@ test('an inherited PE_TRACE_ID is still dropped — the filter is not weakened, 
 
 test('the engine cache key does not see the carrier, so two spans share one cached answer', async () => {
   const engine = await import('../server/engine.ts');
-  const opts = { root: '/tmp/root', scriptsDir: '/tmp/scripts' };
 
   // The key is built in `run()` from script, slug, revision, args and root —
   // never from the env — which is what lets the SAME engine answer serve two

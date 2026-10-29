@@ -43,6 +43,12 @@ const LINK = 'tap-line text-ink underline decoration-ink-faint underline-offset-
 export const entryKey = (entry: DebugEntry, index: number): string =>
   `${entry.at}|${entry.source}|${entry.event}|${index}`;
 
+/** The decision a supervisor line belongs to (`supervisor.*` journal lines carry `data.decision`). */
+export function decisionOfEntry(entry: DebugEntry): string | undefined {
+  const id = entry.data?.decision;
+  return entry.event.startsWith('supervisor.') && typeof id === 'string' && id ? id : undefined;
+}
+
 function EntryOverview({ entry }: { entry: DebugEntry }) {
   return (
     <div className="flex min-w-0 flex-col gap-4">

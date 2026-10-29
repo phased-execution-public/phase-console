@@ -477,3 +477,52 @@ EOF
   run pg verify-timeout --verify-timeout 9
   [ "$status" -eq 2 ]
 }
+
+# --------------------------------------------------------------------------
+# --verification-tier [N]: what a phase's heavy §Verification lines run as
+# (measured-console phase 15) — `impact` (the selected form,
+# scripts/verify-select.env) or `full` (as written), `word<TAB>phase|plan`, the
+# phase's own bullet over the plan's line, and silence when neither says (the
+# console then runs every line as written). The JS twin is `verificationTierFor`.
+# --------------------------------------------------------------------------
+
+@test "--verification-tier N: a phase with no bullet takes the plan's line, tagged plan" {
+  setup_docs verification-tier verification-tier
+  run pg verification-tier --verification-tier 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'impact\tplan')" ]
+}
+
+@test "--verification-tier N: a phase's own bullet wins, tagged phase, trailing prose ignored" {
+  setup_docs verification-tier verification-tier
+  run pg verification-tier --verification-tier 2
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'full\tphase')" ]
+}
+
+@test "--verification-tier N: the bold is optional and the word is read in any case" {
+  setup_docs verification-tier verification-tier
+  run pg verification-tier --verification-tier 3
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'impact\tphase')" ]
+}
+
+@test "--verification-tier N: an unreadable bullet falls through to the plan's line" {
+  setup_docs verification-tier verification-tier
+  run pg verification-tier --verification-tier 4
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'impact\tplan')" ]
+}
+
+@test "--verification-tier: the bare form is the plan's line alone; silence prints nothing" {
+  setup_docs verification-tier verification-tier
+  run pg verification-tier --verification-tier
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'impact\tplan')" ]
+  setup_docs verify-timeout verify-timeout
+  run pg verify-timeout --verification-tier 2
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run pg verify-timeout --verification-tier 9
+  [ "$status" -eq 2 ]
+}

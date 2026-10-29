@@ -5,7 +5,8 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, type DebugIndexParams } from './api';
+import { api } from './api';
+import type { DebugLevel, DebugSource, HealthSeriesView } from '@shared/wire/debug.js';
 import { request } from './http';
 import { keys } from './keys';
 
@@ -23,6 +24,27 @@ import { keys } from './keys';
  * is watching.
  */
 const DEBUG_STALE = 5_000;
+
+/**
+ * The index's parameters — what the Logs page asks the index (and the follow
+ * stream) for. A client-side shape: it becomes a query string, never a body.
+ *
+ * `type`, not `interface` — only a type alias is assignable to the
+ * `Record<string, …>` the query builder takes, the same reason `repo.ts` gives.
+ */
+export type DebugIndexParams = {
+  source?: DebugSource[];
+  level?: DebugLevel[];
+  slug?: string;
+  run?: string;
+  phase?: number;
+  /** One trace, exactly: the run's whole story and nothing that merely shares its clock. */
+  trace?: string;
+  q?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+};
 
 export function useDebugIndex(params: DebugIndexParams, enabled = true) {
   return useQuery({
@@ -147,6 +169,22 @@ export function useRuntime<T>(read: () => Promise<T>, refetchMs = 15_000) {
     queryFn: read,
     refetchInterval: refetchMs,
     staleTime: 10_000,
+  });
+}
+
+export type { HealthSeriesPointView, HealthSeriesView } from '@shared/wire/debug.js';
+
+export const healthSeriesApi = {
+  series: () => request<HealthSeriesView>('/api/health/series'),
+};
+
+/** The series, re-read every five minutes — the sampler's own cadence. */
+export function useHealthSeries() {
+  return useQuery({
+    queryKey: ['health', 'series'],
+    queryFn: healthSeriesApi.series,
+    refetchInterval: 5 * 60_000,
+    staleTime: 60_000,
   });
 }
 

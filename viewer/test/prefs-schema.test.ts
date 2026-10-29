@@ -395,3 +395,52 @@ test('POST /api/prefs {retention} stores each member within sanitiseRetention\'s
     clean();
   }
 });
+
+test('autopilotLoads, autopilotPlugins and graphTool (measured-console phase 11): console-set by default, written through the settings door, and the next spawn\'s loads read them', async () => {
+  clean();
+  writeJson(CONFIG, {});
+  const svc = await bareService();
+  try {
+    const post = async (body: unknown) => {
+      const out = await call(svc, 'POST', '/api/prefs', body);
+      assert.equal(out.status, 200, JSON.stringify(out.body));
+      return out.body as Record<string, unknown>;
+    };
+    assert.equal(loadPrefs().autopilotLoads, 'console-set', "9.0's default");
+    assert.deepEqual(loadPrefs().autopilotPlugins, [], 'no personal plugin unless a person switches one on');
+    const schema = (await call(svc, 'GET', '/api/prefs/schema')).body.rows as PrefsSchemaRow[];
+    assert.deepEqual(schema.find((r) => r.key === 'autopilotLoads')?.value, 'console-set');
+    assert.equal(PREF_META.autopilotLoads.type, 'word');
+    assert.deepEqual(PREF_META.autopilotLoads.words, ['console-set', 'operator-config']);
+
+    // A well-formed id is kept, a bad one dropped, the console's own never taken.
+    await post({ autopilotPlugins: ['mine@my-market', 'not an id', 'phased-execution@phased-execution-public', 'mine@my-market'] });
+    assert.deepEqual(json(CONFIG).autopilotPlugins, ['mine@my-market']);
+    const loads = (svc as unknown as { sessionLoads(): { mode: string; enabledPlugins?: Record<string, boolean> } }).sessionLoads();
+    assert.equal(loads.mode, 'console-set');
+    assert.equal(loads.enabledPlugins?.['mine@my-market'], true, 'the next spawn enables it');
+
+    // A typo keeps the default; the exact word turns the console's set off.
+    await post({ autopilotLoads: 'operator' });
+    assert.ok(!('autopilotLoads' in json(CONFIG)), 'an unknown word is dropped, not stored');
+    await post({ autopilotLoads: 'operator-config' });
+    assert.equal(loadPrefs().autopilotLoads, 'operator-config');
+    const off = (svc as unknown as { sessionLoads(): { mode: string; pluginDirs: string[]; enabledPlugins?: unknown } }).sessionLoads();
+    assert.equal(off.mode, 'operator-config');
+    assert.deepEqual(off.pluginDirs, []);
+    assert.equal(off.enabledPlugins, undefined);
+    await post({ autopilotLoads: null });
+    assert.equal(loadPrefs().autopilotLoads, 'console-set');
+
+    // The knowledge-graph tool (D6): off ('') unless named, a bare command name or nothing.
+    assert.equal(loadPrefs().graphTool, '');
+    await post({ graphTool: 'kgtool' });
+    assert.equal(json(CONFIG).graphTool, 'kgtool');
+    await post({ graphTool: '../bin/kgtool --evil' });
+    assert.equal(json(CONFIG).graphTool, 'kgtool', 'a path or a word with a space is dropped, the stored value survives');
+    await post({ graphTool: '' });
+    assert.equal(loadPrefs().graphTool, '');
+  } finally {
+    svc.close();
+  }
+});

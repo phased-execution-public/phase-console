@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: start-gated-manual-stops
+description: 'mode-phase-start, It''s working if: a gated phase''s gate read `clear` before implementing (here it reads `manual`).'
+tags: [phase-start, working-if, unattended]
+context:
+  scaffold_script: fixture.sh

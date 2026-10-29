@@ -48,6 +48,15 @@ export const DENSITIES = Object.freeze(/** @type {const} */ (['comfortable', 'co
  */
 export const PALETTES = Object.freeze(/** @type {const} */ (['quiet', 'departures']));
 
+/**
+ * What an unattended session loads (measured-console phase 11, D2):
+ * `console-set` — the console's own skill tree, the seed and the personal
+ * plugins switched on for autopilot, under `--setting-sources project,local`
+ * (9.0's default); `operator-config` — whatever the session's config dir
+ * carries, as 8.0 did.
+ */
+export const AUTOPILOT_LOADS = Object.freeze(/** @type {const} */ (['console-set', 'operator-config']));
+
 /** What `autostart` holds for one console in the machine profile, as words: `once` starts the next boot and is spent. */
 export const AUTOSTART_WORDS = Object.freeze(/** @type {const} */ (['true', 'false', 'once']));
 
@@ -255,6 +264,21 @@ export const PREF_META = Object.freeze({
     MCP_POLICIES,
     'automation',
     'What a phase does when one of its MCP servers cannot be reached.',
+  ),
+  autopilotLoads: word(
+    AUTOPILOT_LOADS,
+    'automation',
+    "What an unattended session loads: the console's own skill, the seed and the plugins switched on for autopilot, or whatever its config dir carries.",
+  ),
+  autopilotPlugins: row(
+    'automation',
+    'list',
+    'The personal plugins an unattended session also loads, each as name@marketplace.',
+  ),
+  graphTool: row(
+    'automation',
+    'string',
+    'The command of a per-repository knowledge-graph tool (it keeps <tool>-out/graph.json); empty is off.',
   ),
   ladderPerPhaseRungs: number('count', 'Repair attempts per phase before a person is asked.'),
   ladderPerPhaseUsd: number('usd', 'Repair dollars per phase before a person is asked.'),

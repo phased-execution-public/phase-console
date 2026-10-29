@@ -9,6 +9,7 @@ import { parseFrontMatter, fmString, fmList, fmPhaseList, scalar } from '../serv
 import {
   parsePlan, parseDependsOn, detachRequestedIn,
   landFor, isolationFor, issuesFor, baseBranchOf, conflictPolicyOf, messagingOf, clashZonesOf,
+  subagentModelFor, fastGateFor, mayDeleteTestsFor,
 } from '../server/parse/plan.ts';
 import { parseHandoff, parseHandoffFilename, normaliseStatus } from '../server/parse/handoff.ts';
 import { parseIndex, parseTestStatus, parseLock } from '../server/parse/folder.ts';
@@ -844,4 +845,37 @@ test('the issues directive narrows per phase, and defaults to off', () => {
   assert.deepEqual(issues('**Issues:** file', ''), { value: 'file', source: 'plan' });
   assert.deepEqual(issues('**Issues:** file', '- **Issues:** draft'), { value: 'draft', source: 'phase' });
   assert.deepEqual(issues('**Issues:** file', '- **Issues:** off'), { value: 'off', source: 'phase' });
+});
+
+test('the subagent model resolves phase over plan, and a plan that never says answers nothing (measured-console phase 6)', () => {
+  const sub = (planLine: string, bullet: string, phase?: number) => subagentModelFor(directivePlan(planLine, bullet), phase);
+  assert.equal(sub('', ''), undefined, "silence leaves it to the session's own default");
+  assert.equal(sub('', '', 2), undefined);
+  assert.deepEqual(sub('> **Subagent model:** `claude-sonnet-5-5`', '', 2), { model: 'claude-sonnet-5-5', source: 'plan' },
+    'the quoted §Session budget spelling, backticks stripped');
+  assert.deepEqual(sub('**Subagent model:** claude-sonnet-5-5', '- **Subagent model:** claude-haiku-4-5 for the explorers', 2),
+    { model: 'claude-haiku-4-5', source: 'phase' }, 'the bullet wins, its first word only');
+  assert.deepEqual(sub('**Subagent model:** claude-sonnet-5-5', '- **Subagent model:** claude-haiku-4-5'),
+    { model: 'claude-sonnet-5-5', source: 'plan' }, 'no phase: the plan line alone');
+  assert.deepEqual(sub('**Subagent model:** claude-sonnet-5-5', '- **Subagent model:**', 2),
+    { model: 'claude-sonnet-5-5', source: 'plan' }, 'a bullet naming nothing falls through');
+  assert.deepEqual(sub('', '- **Subagent model:** Claude-Opus-5-5[1m]', 2), { model: 'Claude-Opus-5-5[1m]', source: 'phase' },
+    'a model id keeps its case');
+});
+
+test('fast gate and may-delete-tests are phase bullets with a default of their own — a typo is silence (measured-console phase 6)', () => {
+  const fast = (bullet: string) => fastGateFor(directivePlan('', bullet), 2);
+  const del = (bullet: string) => mayDeleteTestsFor(directivePlan('', bullet), 2);
+  assert.deepEqual(fast(''), { value: 'on', source: 'default' });
+  assert.deepEqual(fast('- **Fast gate:** off'), { value: 'off', source: 'phase' });
+  assert.deepEqual(fast('- **Fast gate:** **ON**'), { value: 'on', source: 'phase' });
+  assert.deepEqual(fast('- **Fast gate:** maybe'), { value: 'on', source: 'default' });
+  assert.deepEqual(fastGateFor(directivePlan('**Fast gate:** off', ''), 2), { value: 'on', source: 'default' },
+    'there is no plan level: a §Session budget line is not read');
+  assert.deepEqual(del(''), { value: 'no', source: 'default' });
+  assert.deepEqual(del('- **May delete tests:** yes — the old suite'), { value: 'yes', source: 'phase' });
+  assert.deepEqual(del('- **May delete tests:** No.'), { value: 'no', source: 'phase' });
+  assert.deepEqual(del('- **May delete tests:** perhaps'), { value: 'no', source: 'default' });
+  assert.deepEqual(fastGateFor(undefined, 1), { value: 'on', source: 'default' });
+  assert.deepEqual(mayDeleteTestsFor(undefined, 1), { value: 'no', source: 'default' });
 });

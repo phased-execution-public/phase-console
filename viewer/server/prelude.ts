@@ -14,8 +14,8 @@
  *      starts once the form's answers are given (`docs/decisions.md` — the
  *      manifest is opt-in until a run asks for it). Only a row somebody WROTE
  *      can block.
- *   2. Five PROBES run, each over the console's own facts and never over a
- *      secret's value: the accounts the run may spend (entitlement, sign-in,
+ *   2. The PROBES run, nine of them (`PreludeProbeId`), each over the console's own facts
+ *      and never over a secret's value: the accounts the run may spend (entitlement, sign-in,
  *      headroom against the declared minimum), the MCP servers the plan names
  *      (the boarding preflight, one pass), the credentials it names (presence
  *      by id — `credentials-probe.ts`), and a delivery channel for the
@@ -23,8 +23,12 @@
  *      `PHASE_CONSOLE_NOTIFY`, a webhook; under `--remote` also Tailscale up
  *      and Serve pointing at this port), and — since 2026-09-18 — every
  *      §Verification command the run would stop on for a person
- *      (`probeVerification`). A probe that could not RUN answers `skip` and
- *      refuses nothing — the MCP preflight's rule.
+ *      (`probeVerification`); then the shared trees another open run's branch
+ *      holds (`probeTrees`), the plan's git lines the chosen strategy will not
+ *      honour (`probeGitStrategy`), whether the skill copy's interface stamp
+ *      meets the console's (`probeSkillApi`), and the person's turns the run
+ *      will need (`probeHumanSteps`). A probe that could not RUN answers
+ *      `skip` and refuses nothing — the MCP preflight's rule.
  *   3. The BLOCKING list is computed: an `outstanding` row marked `blocking:
  *      yes`, a `waived` row the start did not acknowledge, and a failed probe
  *      whose stated condition holds (`credential policy: require`, `MCP policy:
@@ -51,7 +55,7 @@ import type { CredentialVerdict } from './credentials-probe.ts';
 import type { PolicyPrefs } from './runner/policy.ts';
 import type { AccountRequirement, ManifestDecision, ResolvedManifest, RunVerifyApprovals } from './runner/state.ts';
 import type { SkillApi, SkillApiMismatch } from './skill-copy.ts';
-import type { HumanStepDirective } from './parse/plan.ts';
+import type { HumanStepDirective, Plan } from './parse/plan.ts';
 import { erefOf, isOpenableUrl, type HumanStepKind, type HumanStepWhere } from '../shared/human-step-model.js';
 import type { WhyPerson } from '../shared/turn-model.js';
 
@@ -195,16 +199,79 @@ export type VerificationFacts = {
   answers?: RunVerifyApprovals;
 };
 
+/**
+ * What the door reads about one class of need — credentials or MCP servers
+ * (measured-console phase 13, #379). `ids` is the union every phase names and
+ * `policy` the plan's own line. `planIds` and `phases` say WHO declared each
+ * id: a phase's `- **Credentials:**` / `- **MCP:**` bullet carries the
+ * phase's own `- **… policy:**` bullet with it (`policy` null = the phase is
+ * silent and the plan's line answers). Without them every id is read as
+ * plan-wide — the reading before #379, kept for a caller that has no plan.
+ */
+export type DoorPolicyFacts = {
+  ids: string[];
+  policy: string | null;
+  /** The ids the plan's §Session budget line names itself. */
+  planIds?: string[];
+  /** Each phase's OWN bullet ids and OWN policy bullet. */
+  phases?: { phase: number; ids: string[]; policy: string | null }[];
+};
+
+/**
+ * The door's facts for a parsed plan (measured-console phase 13, #379) — the
+ * plan-wide line and every phase's own bullets, kept apart so the door can
+ * honour each phase's own policy. `which` picks credentials or MCP servers.
+ */
+export function doorPolicyFacts(plan: Plan, which: 'credentials' | 'mcp'): DoorPolicyFacts {
+  const planIds = (which === 'credentials' ? plan.sessionBudget.credentials : plan.sessionBudget.mcpServers) ?? [];
+  const policy = (which === 'credentials' ? plan.sessionBudget.credentialPolicy : plan.sessionBudget.mcpPolicy) ?? null;
+  const phases = plan.graph.map((row) => {
+    const own = plan.phases[row.phase];
+    return {
+      phase: row.phase,
+      ids: (which === 'credentials' ? own?.credentials : own?.mcpServers) ?? [],
+      policy: (which === 'credentials' ? own?.credentialPolicy : own?.mcpPolicy) ?? null,
+    };
+  });
+  const ids = [...new Set([...planIds, ...phases.flatMap((p) => p.ids)])];
+  return { ids, policy, planIds: [...planIds], phases };
+}
+
+/**
+ * The policy the door applies to each id (measured-console phase 13, #379):
+ * an id the plan's own line names — or any id, when the caller did not say
+ * who declared it — takes `doorPolicy` (the plan's line, else the run's or the
+ * console's setting). An id only phases declare takes each declaring phase's
+ * own policy, its silence falling back to `doorPolicy`; it is `require` when
+ * ANY declaring phase resolves to require, else that phase's word. So an
+ * optional key on a phase that says `continue` never blocks the start — the
+ * phase decides at boarding — while the plan's `require` still holds for the
+ * plan's own ids and for a silent phase's.
+ */
+export function doorPolicyOf(facts: DoorPolicyFacts, doorPolicy: string): (id: string) => string {
+  if (!facts.planIds || !facts.phases) return () => doorPolicy;
+  const planWide = new Set(facts.planIds);
+  const perId = new Map<string, string>();
+  for (const phase of facts.phases) {
+    const word = phase.policy ?? doorPolicy;
+    for (const id of phase.ids) {
+      if (planWide.has(id)) continue;
+      if (perId.get(id) !== 'require') perId.set(id, word);
+    }
+  }
+  return (id) => perId.get(id) ?? doorPolicy;
+}
+
 /** The facts the prelude reads. Every field is a function so a caller supplies only what it has. */
 export type PreludeDeps = {
   /** The manifest as it holds: plan rows with the twin merged over them. */
   decisions: () => { rows: DecisionRow[]; present: boolean; error?: string };
   /** The plan's `**Accounts:**` clause. */
   planAccounts: () => AccountRequirement[];
-  /** Every credential id the plan or any phase names, and the plan's policy. */
-  planCredentials: () => { ids: string[]; policy: string | null };
-  /** Every MCP server the plan or any phase names, and the plan's policy. */
-  planMcp: () => { ids: string[]; policy: string | null };
+  /** Every credential id the plan or any phase names, and the plan's policy — with who declared each (#379). */
+  planCredentials: () => DoorPolicyFacts;
+  /** Every MCP server the plan or any phase names, and the plan's policy — with who declared each (#379). */
+  planMcp: () => DoorPolicyFacts;
   accounts: {
     defaultId: string;
     has: (id: string) => boolean;
@@ -513,31 +580,60 @@ function accountFailure(f: AccountFacts): string | null {
   return null;
 }
 
-/** The MCP probe: `require` and a server down refuses; `continue` warns; a probe that could not run skips. */
+/**
+ * The MCP probe: `require` and a server down refuses; `continue` warns; a probe
+ * that could not run skips. `policyOf` answers per server (#379) — a server
+ * only a `continue` phase declares warns even when `policy` is require.
+ */
 export function probeMcp(
   ids: readonly string[], policy: string,
   result: { ok: boolean; blocking: { id: string; status: string }[]; unknown: string[]; probeError?: string } | null,
+  policyOf: (id: string) => string = () => policy,
 ): ProbeVerdict {
   if (!ids.length) return { status: 'skip', ok: true, reason: 'no MCP server named' };
   if (!result) return { status: 'skip', ok: true, reason: 'the MCP preflight could not run' };
   if (result.probeError && !result.blocking.length) {
     return { status: 'skip', ok: true, reason: `the MCP preflight could not probe: ${result.probeError}` };
   }
-  const down = [...result.blocking.map((b) => `${b.id} (${b.status})`), ...result.unknown.map((id) => `${id} (unknown to this console)`)];
+  const downs = [
+    ...result.blocking.map((b) => ({ id: b.id, text: `${b.id} (${b.status})` })),
+    ...result.unknown.map((id) => ({ id, text: `${id} (unknown to this console)` })),
+  ];
+  const down = downs.map((d) => d.text);
   if (!down.length) return { status: 'ok', ok: true, reason: `${ids.length} server${ids.length === 1 ? '' : 's'} reachable` };
-  if (policy === 'require') {
-    return { status: 'fail', ok: false, reason: `MCP policy is require and ${down.join(', ')} will not connect`, detail: { down } };
+  const refusing = downs.filter((d) => policyOf(d.id) === 'require').map((d) => d.text);
+  if (refusing.length) {
+    const optional = down.filter((text) => !refusing.includes(text));
+    return {
+      status: 'fail', ok: false, reason: `MCP policy is require and ${refusing.join(', ')} will not connect`, detail: { down: refusing },
+      ...(optional.length ? { warnings: optional.map((text) => `${text} — its phase's MCP policy is continue`) } : {}),
+    };
   }
-  return { status: 'ok', ok: true, reason: `${down.length} of ${ids.length} server(s) unreachable; policy ${policy} runs without them`, warnings: down };
+  // Every server down is one whose own policy carries on: a phase's
+  // `continue` under a plan's `require` is named as the phase's (#379).
+  const word = policy === 'require' ? "its phase's continue" : policy;
+  return { status: 'ok', ok: true, reason: `${down.length} of ${ids.length} server(s) unreachable; policy ${word} runs without them`, warnings: down };
 }
 
-/** The credentials probe: `require` and an id absent refuses; `continue` warns; an id with no probe skips. */
-export function probeCredentials(ids: readonly string[], policy: string, verdicts: readonly CredentialVerdict[]): ProbeVerdict {
+/**
+ * The credentials probe: `require` and an id absent refuses; `continue` warns;
+ * an id with no probe skips. `policyOf` answers per id (#379) — an id only a
+ * `continue` phase declares is a note even when `policy` is require.
+ */
+export function probeCredentials(
+  ids: readonly string[], policy: string, verdicts: readonly CredentialVerdict[],
+  policyOf: (id: string) => string = () => policy,
+): ProbeVerdict {
   if (!ids.length) return { status: 'skip', ok: true, reason: 'no credential named' };
-  const missing = verdicts.filter((v) => v.status === 'fail');
+  const absent = verdicts.filter((v) => v.status === 'fail');
+  const missing = absent.filter((v) => policyOf(v.id) === 'require');
+  const optional = absent.filter((v) => policyOf(v.id) !== 'require');
   const unknown = verdicts.filter((v) => v.status === 'skip');
-  const warnings = unknown.map((v) => `${v.id} — ${v.reason}`);
-  if (missing.length && policy === 'require') {
+  const warnings = [
+    ...optional.map((v) => `${v.id} — ${v.reason}${policy === 'require' ? " (its phase's credential policy is continue)" : ''}`),
+    ...unknown.map((v) => `${v.id} — ${v.reason}`),
+  ];
+  if (missing.length) {
     return {
       status: 'fail', ok: false,
       reason: `credential policy is require and ${missing.map((v) => v.id).join(', ')} ${missing.length === 1 ? 'is' : 'are'} not held: ${missing.map((v) => v.reason).join('; ')}`,
@@ -545,11 +641,12 @@ export function probeCredentials(ids: readonly string[], policy: string, verdict
       ...(warnings.length ? { warnings } : {}),
     };
   }
-  if (missing.length) {
+  if (optional.length) {
+    const word = policy === 'require' ? "its phase's continue" : policy;
     return {
       status: 'ok', ok: true,
-      reason: `${missing.map((v) => v.id).join(', ')} not held; policy ${policy} runs and reports the gap`,
-      warnings: [...missing.map((v) => `${v.id} — ${v.reason}`), ...warnings],
+      reason: `${optional.map((v) => v.id).join(', ')} not held; policy ${word} runs and reports the gap`,
+      warnings,
     };
   }
   const held = verdicts.filter((v) => v.status === 'ok').length;
@@ -1144,13 +1241,19 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
       mcpResult = { ok: false, blocking: [], unknown: [], probeError: String((error as Error)?.message ?? error) };
     }
   }
-  const mcpVerdict = probeMcp(mcpIds, mcpPolicy, mcpResult);
+  // Each server takes the policy of whoever declared it (#379): the run's
+  // own extra servers and the plan's line take the door's word; a server only
+  // phases name takes those phases' own `**MCP policy:**`.
+  const mcpPolicyOfPlan = doorPolicyOf(mcp, mcpPolicy);
+  const runServers = new Set(options.mcpServers ?? []);
+  const mcpVerdict = probeMcp(mcpIds, mcpPolicy, mcpResult, (id) => (runServers.has(id) ? mcpPolicy : mcpPolicyOfPlan(id)));
 
-  // Probe 3 — credentials.
+  // Probe 3 — credentials. Same per-id reading (#379): the plan's `require`
+  // binds the plan's ids, a phase's own `continue` its own.
   const creds = deps.planCredentials();
   const credentialPolicy = creds.policy ?? resolvePolicy('credentials', { plan: written, prefs: deps.prefs })?.answer ?? 'continue';
   const verdicts = creds.ids.length ? await deps.credentials.held(creds.ids) : [];
-  const credentialsVerdict = probeCredentials(creds.ids, credentialPolicy, verdicts);
+  const credentialsVerdict = probeCredentials(creds.ids, credentialPolicy, verdicts, doorPolicyOf(creds, credentialPolicy));
 
   // Probe 4 — delivery.
   const deliveryFacts = await deps.delivery();

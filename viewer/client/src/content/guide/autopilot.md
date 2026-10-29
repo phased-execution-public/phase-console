@@ -32,6 +32,13 @@ green) and **Skipped** (this machine could not run it, because its command is mi
 suite or a build, may first wait for a seat: every console on the machine shares one budget of heavy jobs,
 and the wait is journalled `phase.verify-queued`, naming who holds the seats. That wait is not a hang.
 
+Two checks come earlier, inside the session. When it tries to end, its Stop hook runs the phase's fast lines
+once and holds a red exit with the failing ids (`- **Fast gate:** off` on a phase turns that off). And a
+guard refuses a write to the baselines, the ratchets, the known reds, the quarantine and the snapshots, and a
+test file's deletion unless the phase says `- **May delete tests:** yes` (`phase.guard-denied`). A plan
+that says `**Verification tier:** impact` runs a heavy line in the form its diff selects; a release still
+runs the full matrix.
+
 When a red line is not the phase's fault, **Waive this line** asks why, and **Waive it for phase N** records
 your reason as a ruling on the plan. That phase no longer runs the line, and it is listed under **Waived by
 the operator**. It is an owner's press, and it waives the line for that one phase only.

@@ -136,6 +136,7 @@ export const MOVE_LABEL = Object.freeze({
   approve: 'Approve',
   deny: 'Deny',
   gotIt: 'Got it',
+  cannot: "I can't do this",
 });
 
 /** What the primary says, or null when there is nothing to press (the card's own lent pieces name theirs). */

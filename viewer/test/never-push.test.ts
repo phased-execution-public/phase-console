@@ -180,11 +180,19 @@ const FORBIDDEN = [...REMOTE_VERBS, ...MUTATING_VERBS];
  *    FETCH_HEAD, no submodules), names the remote `origin` and one refspec, and
  *    exists in this file alone — the SHAPE test at the bottom holds all four.
  *    `fetch` stays banned in every other file.
+ *  - `config` is the seventeenth (measured-console phase 14, #441), for ONE
+ *    argv, `originPin`'s `config --list --includes --show-origin --show-scope
+ *    -z`: the pin the wrap-up's push (`pushFastForward`, through `pushRef`)
+ *    compares before and after a session, so a session that re-pointed its
+ *    remote does not get the console to push there. A READ — `--list` writes
+ *    nothing — and here rather than console-wide because `config` with any
+ *    other argument is a write; the test below holds it to `--list`.
  */
 const EXEMPT_FILE = 'runner/worktree.ts';
 const WORKTREE_VERBS = [
   'worktree', 'merge', 'merge-tree', 'rev-parse', 'rev-list', 'diff', 'status',
   'switch', 'symbolic-ref', 'branch', 'for-each-ref', 'log', 'push', 'add', 'write-tree', 'fetch',
+  'config',
 ];
 
 /** The flag that makes a phased-execution script commit and push its write. */
@@ -332,7 +340,7 @@ test('the worktree module runs ONLY the verbs its exemption names', () => {
   // …and of the three the reclaim and the branch hygiene added. Same rule,
   // same reason: an exemption nothing uses is a hole waiting for a first user,
   // and these three are the most dangerous entries on the list.
-  for (const verb of ['switch', 'symbolic-ref', 'branch', 'for-each-ref', 'push', 'fetch']) {
+  for (const verb of ['switch', 'symbolic-ref', 'branch', 'for-each-ref', 'push', 'fetch', 'config']) {
     assert.ok(used.has(verb),
       `${verb} is exempted but unused — take it out of WORKTREE_VERBS rather than leaving it open`);
   }
@@ -360,6 +368,15 @@ test('the one fetch is SHAPED: the proof head, the remote `origin`, one refspec,
   assert.ok(!only!.args.some((a) => /^--(all|prune|tags|update-head-ok|unshallow|mirror)$/.test(a) || a === '-p'),
     'no flag that fetches more than the trunk, or deletes a ref');
   assert.deepEqual([...PROOF_FETCH_ARGV], ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules']);
+});
+
+test('the config exemption is the LIST form — a read — and nothing else', () => {
+  const uses = ARGVS.filter((argv) => argv.args[0] === 'config');
+  assert.ok(uses.length > 0, 'config is exempted but no argument list uses it');
+  assert.deepEqual(uses.map((argv) => argv.file).filter((f) => f !== EXEMPT_FILE), [], 'config runs in the worktree module alone');
+  assert.ok(uses.every((argv) => argv.args[1] === '--list'
+    && argv.args.slice(2).every((a) => ['--includes', '--show-origin', '--show-scope', '-z'].includes(a))),
+  `every git config invocation must be the --list read: ${uses.map((argv) => `${argv.file}:${argv.line} ${JSON.stringify(argv.args)}`).join(', ')}`);
 });
 
 test('the branch exemption is the DELETE form, and -D appears nowhere', () => {
@@ -402,6 +419,17 @@ const NOT_AN_ARGV: { file: string; args: string[]; why: string }[] = [
     args: ['grep', 'egrep', 'fgrep', 'rg'],
     why: '`GREPS`, the grep family whose first operand is a pattern — a set of command NAMES the '
       + 'verification reader parses a §Verification line with (one-pool phase 20, #357 #311); nothing spawns it',
+  },
+  {
+    file: 'runner/approvals.ts',
+    args: ['rm', 'unlink', 'truncate', 'tee', 'shred'],
+    why: '`WRITING_LEADS`, the shell commands the protected-file guard reads a Bash call\'s writes from '
+      + '(measured-console phase 6) — command NAMES it classifies, and `rm` heads it as the shell\'s rm, not git\'s',
+  },
+  {
+    file: 'runner/approvals.ts',
+    args: ['rm', 'unlink', 'shred'],
+    why: '`DELETING_LEADS`, the test-deletion half of the same guard (measured-console phase 6); nothing spawns it',
   },
 ];
 

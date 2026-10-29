@@ -434,11 +434,12 @@ test('the guide sends readers only to settings sections that exist', () => {
   const declared = [...nav.matchAll(/title: '([^']+)'/g)];
   const titles = declared.map((m) => m[1]);
   const proTitles = declared.filter((m) => insidePro(navSpans, m.index ?? 0)).map((m) => m[1]).sort();
-  // Nine in every tree since 7.0 added Everything, every key the console stores
+  // Nine in every tree from 7.0, which added Everything, every key the console stores
   // (quiet-console phase 21); Pro adds Issues (control-tower phase 115) and
-  // License (phase 72) inside fences the free tree strips — eleven here, nine there.
-  assert.equal(titles.length - proTitles.length, 9, `expected 9 settings sections in every tree, nav.tsx has ${titles.length - proTitles.length}`);
-  assert.deepEqual(proTitles, proTitles.length ? ['Issues', 'License'] : [], 'the Pro sections are Issues and License');
+  // License (phase 72) inside fences the free tree strips. measured-console phase 28 adds Hooks to
+  // every tree and Skills & plugins to Pro — thirteen here, ten there.
+  assert.equal(titles.length - proTitles.length, 10, `expected 10 settings sections in every tree, nav.tsx has ${titles.length - proTitles.length}`);
+  assert.deepEqual(proTitles, proTitles.length ? ['Issues', 'License', 'Skills & plugins'] : [], 'the Pro sections are Issues, License and Skills & plugins');
 
   const guideDir = `${root}viewer/client/src/content/guide/`;
   const docs = [
@@ -557,6 +558,9 @@ test('every backticked repo path in docs/, references/, SKILL.md and the guides 
     'viewer/README.md',
     'viewer/README.fa.md',
     'CLAUDE.md',
+    // …and the two files CLAUDE.md's body moved to whole (measured-console phase 5).
+    'viewer/docs/architecture.md',
+    'docs/invariants.md',
   ];
   const missing: string[] = [];
   for (const rel of files) {
@@ -807,7 +811,7 @@ test('the reference states the flag composing a packet really needs', () => {
   assert.match(section[1], /--allow-writes/, 'composing is a write and the reference must say so');
 
   const routes = read('viewer/server/api/routes.ts');
-  const block = /if \(sub === 'landing'\)([\s\S]*?)\n      if \(sub === 'gate'/.exec(routes);
+  const block = /if \(sub === 'landing'\)([\s\S]*?)\n {6}if \(sub === 'gate'/.exec(routes);
   assert.ok(block, 'the landing route moved — this assertion is now checking nothing');
   assert.match(block[1], /guardMutation\(req, guardWrite\(req, service\)\)/,
     'the reference promises --allow-writes; the route must be the one that enforces it');
@@ -943,8 +947,15 @@ import { scriptFlags } from './script-flags.ts';
  */
 const UNDOCUMENTED_FLAGS = new Set<string>([]);
 
-test('SKILL.md never names a flag no script implements', () => {
-  const skill = read('SKILL.md');
+/**
+ * The documents that name the scripts' flags since measured-console phase 3: the lean core, the script
+ * index the catalogue moved to, and the maintainers' page the release scripts moved to — read as one.
+ */
+const FLAG_DOCS = ['SKILL.md', 'references/scripts.md', 'docs/maintainers.md'] as const;
+const flagDocs = (): string => FLAG_DOCS.map((doc) => read(doc)).join('\n\n');
+
+test('the skill\'s flag documents never name a flag no script implements', () => {
+  const skill = flagDocs();
   const universe = new Set<string>();
   for (const file of readdirSync(`${root}scripts/`).filter((f) => f.endsWith('.sh'))) {
     for (const flag of scriptFlags(read(`scripts/${file}`))) universe.add(flag);
@@ -982,8 +993,8 @@ test('SKILL.md never names a flag no script implements', () => {
   );
 });
 
-test('every flag the helper scripts implement is named in SKILL.md', () => {
-  const skill = read('SKILL.md');
+test('every flag the helper scripts implement is named in the skill\'s flag documents', () => {
+  const skill = flagDocs();
   const named = new Set(skill.match(/--[a-z][a-z0-9-]*/g) ?? []);
 
   const undocumented: string[] = [];
@@ -1069,7 +1080,7 @@ test('the UNDOCUMENTED_FLAGS allowance never outlives the flags it excuses', () 
  * acted, escalated and policy-changed are the supervisor's own journal lines. And `account`
  * (one-pool phase 7): the pool's own lines — a spill and a reached cap.
  */
-const EVENT_LITERAL = /'((?:phase|run|account|policy|git|http|engine|shell|msg|issue|retention|trigger|supervisor)\.[a-z0-9][a-z0-9.-]*)'/g;
+const EVENT_LITERAL = /'((?:phase|run|account|policy|git|http|engine|shell|msg|issue|retention|trigger|supervisor|landing(?=\.bisected))\.[a-z0-9][a-z0-9.-]*)'/g;
 /**
  * `debug` joins the three levels whose first argument is a documented name.
  *
@@ -1225,6 +1236,8 @@ test('every run-directory path the docs cite is one the code actually writes', (
     base(journalFile(fakeRoot, slug, id)),
     base(transcriptFile(fakeRoot, slug, id)),
     `outcomes/${base(inboxOutcomeFile(fakeRoot, slug, 7)).replace(/\d+/, 'NN')}`,
+    // …and the stamped name a script's declaration is written under (`phase-NN-<stamp>.json`).
+    `outcomes/${base(inboxOutcomeFile(fakeRoot, slug, 7, '<stamp>')).replace(/\d+/, 'NN')}`,
     base(rulingsFile(fakeRoot, slug)),
     // The phase task lists (`phase-tasks.sh` -> `$PE_TASKS_FILE`), whose name
     // is composed by the runner rather than by a helper this file can call.
@@ -1338,7 +1351,7 @@ function evidenceShapes(prefix: 'V'): number {
   return (read('viewer/shared/evidence-model.js').match(new RegExp(`^ \\*\\s{2,}${prefix}\\d\\s`, 'gm')) ?? []).length;
 }
 
-/** Pro's automatic-start doors (control-tower phase 120): counted in a fenced sentence of their own, never in the free census prose. */
+/** Pro's automatic-start doors (control-tower phase 120, measured-console phase 22): counted in a fenced sentence of their own, never in the free census prose. */
 const PRO_START_DOORS: string[] = [];
 
 const SPELLED_COUNTS: SpelledCount[] = [

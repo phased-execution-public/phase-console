@@ -12,8 +12,26 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # A bare first argument is the directory to open — `./start ~/code/repo` reads
 # better than `./start --root ~/code/repo` for the common case.
+#
+# …and only a directory. A bare word that names none is refused, never booted:
+# `./start run clear-streak …` (a verb typed at the wrong door — a Your-turn
+# card's command, a launcher, a clone's habit) read `run` as the repository and
+# started a console on `<cwd>/run`, held the terminal and registered an
+# instance called `run` (#385). The verbs are the CLI's — `phase-console <verb>`
+# — and `viewer/test/cli-dispatch.test.ts` holds this list to every word verb
+# of each edition's bin, so the next verb it learns is named here too.
+verbs="diagnostics doctor grants hooks-status install-hooks install-skill mcp owner report run sessions uninstall-hooks uninstall-skill accounts credentials eval start"
 args=()
-if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+if [ "$#" -gt 0 ] && [ -n "$1" ] && [ "${1#-}" = "$1" ]; then
+  if [ ! -d "$1" ]; then
+    {
+      echo "phase-console: '$1' is not a directory, so there is no repository to open."
+      echo "A verb goes to the CLI: phase-console <verb> [args] — the verbs:"
+      echo "  $verbs" | fold -s -w 78
+      echo "To open a repository, name its directory: ./start <repo>"
+    } >&2
+    exit 2
+  fi
   args+=(--root "$1")
   shift
 fi

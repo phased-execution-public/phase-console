@@ -59,6 +59,16 @@ packed tarball, cut by hand — no registry and no CI. Same tree, two cadences �
 every commit, the tags track releases, and each tag's notes are on the
 [Releases page](https://github.com/phased-execution-public/phase-console/releases).)
 
+**The presence hooks come with it.** Since 9.0 the plugin carries its own `hooks/hooks.json` — the
+four session-presence entries, run from wherever Claude Code cached the plugin — so a plugin install
+needs no `phase-console install-hooks`. That command writes nothing over a plugin that carries them
+(`--splice` writes the settings entries anyway, for a machine with no plugin), and while an older
+splice is still in `settings.json` the plugin's copy steps aside for it, so nothing reports twice;
+`phase-console uninstall-hooks` takes the old entries out. A console's own sessions load a lighter
+copy of the same skill — `scripts/build-plugin-tree.mjs`, the skill and its scripts without the console,
+under 5 MB — and `phase-console update-plugin` installs that tree into the marketplace clone's
+`plugin` branch for every config dir.
+
 **Removing it.** `/plugin uninstall phased-execution@phased-execution-public`, then optionally
 `/plugin marketplace remove phased-execution-public`.
 

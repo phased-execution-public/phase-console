@@ -23,31 +23,23 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
 import { EXTERNAL_PARK_GRACE_MS } from '../server/runner/runner-core.ts';
 import { owesVerification } from '../server/runner/state.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const MINUTE = 60_000;
 const T0 = Date.parse('2026-09-23T10:00:00.000Z');
 
 const call = (id: string, command: string): StreamEvent => ({ kind: 'tool', id, name: 'Bash', summary: command });
 
-function repo() {
-  const root = mkdtempSync(join(tmpdir(), 'pc-ck-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  const script = (name: string, body: string) => { writeFileSync(join(scripts, name), body, 'utf8'); chmodSync(join(scripts, name), 0o755); };
-  script('phase-graph.sh', `#!/usr/bin/env bash
+function stubbedPlan() {
+  const made = stubRepo({
+    prefix: 'pc-ck-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${state}"
 slug="$1"; shift
 mode="\${1:-}"; arg="\${2:-}"
@@ -61,18 +53,16 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  script('phase-lock.sh', '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  script('validate.sh', '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: () => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}1\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: () => made.markDone(1) };
 }
 
 /** One session held open, its event sink reachable. */
-function heldSession(r: ReturnType<typeof repo>) {
+function heldSession(r: ReturnType<typeof stubbedPlan>) {
   let release!: () => void;
   let entered!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
@@ -99,7 +89,7 @@ function clock() {
 }
 
 test('CK-3: a checkpoint that ends the session\'s own job owes it a re-run, arms no watch on its output even where minted refs run, and the next brief asks for it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
   const c = clock();
   const instance = new Runner({
@@ -135,7 +125,7 @@ test('CK-3: a checkpoint that ends the session\'s own job owes it a re-run, arms
 });
 
 test('CK-4: a watchdog park whose condition cannot succeed as a watch — the session\'s own `$L` — parks with no ref and says why', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
   const c = clock();
   const instance = new Runner({

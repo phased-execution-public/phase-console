@@ -21,8 +21,8 @@ import { useConsoleState } from '@/data/console';
 import { useAttentionInbox } from '@/data/inbox';
 import { useLifecycle } from '@/data/lifecycle';
 import { useRunGroups, type PlacedRun } from '@/data/run-groups';
-import { useNow } from '@/lib/clock';
-import { etaLabel } from '@/lib/format';
+import { useNow } from '@/ui/clock';
+import { etaLabel, plural } from '@/lib/format';
 import { Button, Money, Mono } from '@/ui';
 import { LaunchDoor } from '@/screens/launch/door';
 import { navigate, planHref, plansHref } from '@/shell/routes';
@@ -106,7 +106,70 @@ export function PlanGlance({
         </p>
         {act && <GlanceAct detail={detail} placed={placed} allowRun={allowRun} />}
       </div>
+      <PlanMoney detail={detail} />
     </header>
+  );
+}
+
+/**
+ * Forecast against actual (measured-console phase 23, §Architecture 9 A6): what the verified
+ * phases were forecast to cost beside what they did, the delta, every dollar per verified phase,
+ * what failed attempts cost, and what the phases still open will likely cost. Every forecast
+ * figure is `estimated`; nothing is drawn until a forecast or a verified phase exists.
+ */
+export function PlanMoney({ detail }: { detail: Pick<PlanDetail, 'cost' | 'forecastUsd' | 'phases'> }) {
+  const a = detail.cost?.actuals;
+  const open = new Set(detail.phases.filter((p) => p.state !== 'done').map((p) => p.phase));
+  const left = (detail.forecastUsd?.phases ?? []).filter((f) => f.phase !== undefined && open.has(f.phase));
+  const leftUsd = left.some((f) => f.usd !== null)
+    ? Math.round(left.reduce((sum, f) => sum + (f.usd ?? 0), 0) * 100) / 100
+    : null;
+  if (!a?.verifiedPhases && !left.length) return null;
+  return (
+    // `leading-[1.125rem]` is the meta line (12.5 px × 1.45 = 18.125 px) snapped to a whole 18 px: the
+    // paragraph wraps to two or three lines on a phone, and each fractional line would push every
+    // control below it — the phases search above a keyboard — a quarter pixel off the pixel grid.
+    <p className="min-w-0 text-meta leading-[1.125rem] text-ink-muted tnum" data-testid="plan-actuals">
+      {a && a.forecastUsd !== null && a.forecastActualUsd !== null && a.deltaUsd !== null ? (
+        <span data-testid="plan-actuals-delta">
+          Forecast <Money usd={a.forecastUsd} word="estimated" showWord /> for{' '}
+          {plural(a.forecastPhases, 'verified phase')}, actual <Money usd={a.forecastActualUsd} />
+          {a.deltaUsd === 0 ? (
+            ' — on the forecast'
+          ) : (
+            <>
+              {' '}
+              — <Money usd={Math.abs(a.deltaUsd)} /> {a.deltaUsd > 0 ? 'over' : 'under'}
+              {a.deltaPct !== null ? ` (${Math.abs(a.deltaPct)} %)` : ''}
+            </>
+          )}
+          .{' '}
+        </span>
+      ) : null}
+      {a && a.costPerVerifiedPhaseUsd !== null ? (
+        <span data-testid="plan-actuals-per-verified">
+          <Money usd={a.costPerVerifiedPhaseUsd} /> per verified phase over{' '}
+          {plural(a.verifiedPhases, 'phase')}, every attempt included.{' '}
+        </span>
+      ) : null}
+      {a && a.verifiedPhases > 0 ? (
+        <span data-testid="plan-actuals-failed">
+          {a.failedAttempts ? (
+            <>
+              <Money usd={a.costOfFailedAttemptsUsd} /> on {plural(a.failedAttempts, 'failed attempt')}.{' '}
+            </>
+          ) : (
+            'No failed attempt has cost anything. '
+          )}
+        </span>
+      ) : null}
+      {left.length ? (
+        <span data-testid="plan-actuals-left">
+          What is left will likely cost <Money usd={leftUsd} word="estimated" showWord /> over{' '}
+          {plural(left.length, 'phase')}.
+        </span>
+      ) : null}
+    </p>
   );
 }
 

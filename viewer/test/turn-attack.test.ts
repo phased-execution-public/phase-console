@@ -21,13 +21,13 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
 
 import {
-  CONSOLE_FORGE_RULE, DEFAULT_ALLOW, DEFAULT_ASK, DEFAULT_DENY, classifyTool, consoleForgeCall, consolePorts,
+  DEFAULT_ALLOW, DEFAULT_ASK, DEFAULT_DENY, classifyTool, consoleForgeCall, consolePorts,
   type ConsoleForgeContext,
 } from '../server/runner/approvals.ts';
 import { Grants, forcedPush } from '../server/permissions/grants.ts';
@@ -41,13 +41,13 @@ import { AuthorityRequests } from '../server/owner/requests.ts';
 import type { RecordedWall } from '../server/permissions/walls.ts';
 import { configDir, stateHome } from '../shared/instances.mjs';
 import {
-  AUTHORITY_ROUTES, AUTHORITY_VERBS, PRESS_DOORS, authorityRouteOf, doorMay,
+  AUTHORITY_ROUTES, AUTHORITY_VERBS, PRESS_DOORS, doorMay,
 } from '../shared/door-model.js';
 import { GRANT_SCOPES } from '../shared/turn-model.js';
 import { isOpenableUrl } from '../shared/human-step-model.js';
 import { parseGuide, guideCommands } from '../shared/guide-grammar.js';
 
-import { JUDGED, call as hCall, harness, parked } from './turn-harness.ts';
+import { call as hCall, harness, parked } from './turn-harness.ts';
 
 /** The console-forge guard's context — this machine's real state/config dirs and ports, a plausible lane cwd. */
 const CTX: ConsoleForgeContext = {

@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: finish-rulings-in-handoff
+description: 'mode-phase-finish, It''s working if: the handoff names every ruling and leaves the prompts to the composer.'
+tags: [phase-finish, working-if]
+context:
+  scaffold_script: fixture.sh

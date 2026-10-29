@@ -46,7 +46,7 @@ import { ciRefusalsOf, type CiRefusal } from '@shared/ci-refusal.js';
 import { HALT_CATEGORIES, isHaltCategory, type HaltCategory } from '@shared/halt-categories.js';
 import { haltView } from '@shared/halt-view.js';
 import { ATTENTION_LEVELS, bayOf, describeRun, type RunCtx, type StatusView } from '@shared/status-model.js';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { isClosed } from '@/lib/closure';
 import type { InboxItem, PlanSummaryFull, QueueEntry, SlimRun, VerifyingLane } from '@/data/api';
 import { useAttentionInbox } from './inbox';

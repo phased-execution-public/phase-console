@@ -9,7 +9,7 @@
  *     not run (#17 — never painted as a failure) or failed.
  *   - `QaLine` — the plan's QA gate when QA is anything but off: the switch
  *     with the reason the engine gave, the roll-up of every verdict on file and
- *     what those verdicts hold (#27), and the way to the QA reading.
+ *     what those verdicts hold (#27), and the way to the Handoffs & QA reading.
  *   - `PlanFacts` — the rest, one press away (Everything opens it): the model
  *     and budget, the branch as the plan wrote it, when work began and over how
  *     long (#28), what is left and at what pace, the cost and the finish date
@@ -75,8 +75,8 @@ export function QaLine({ detail }: { detail: PlanDetail }) {
         {rollup}
       </span>
       {holding && <span className="text-ink">{holding}</span>}
-      <a href={planViewHref(s.slug, 'qa')} className="text-ink underline-offset-2 hover:underline">
-        QA by phase
+      <a href={planViewHref(s.slug, 'handoffs')} className="text-ink underline-offset-2 hover:underline">
+        Handoffs &amp; QA
       </a>
     </section>
   );

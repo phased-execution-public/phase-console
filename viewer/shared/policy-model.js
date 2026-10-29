@@ -368,6 +368,7 @@ export const POLICY_TABLE = Object.freeze([
       ['work-in-progress', 'budgets'],
       ['never-started', 'budgets'],
       ['never-started:sleep', 'budgets'],
+      ['spawn-sdk-failed', 'budgets'],
     ],
     automatic: [],
     blurb: 'The plan or the phase cannot progress: the repair rungs first; a red lint refuses the boarding.',

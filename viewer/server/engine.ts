@@ -114,6 +114,16 @@ export type EngineOptions = {
    */
   credentials?: string[];
   /**
+   * The skills this console's unattended sessions load, for F47 and the
+   * boot prompt's Skill-tool line (measured-console phase 11): `PE_SKILLS`'
+   * words — `plugin:name`, a trailing `!` on one marked
+   * `disable-model-invocation`. Told, not asked, the `mcpServers` way: absent
+   * (a bare install, or `autopilotLoads: operator-config`, whose set the
+   * console does not own) leaves names as written and F47 off; it is not in
+   * the cache key, because it is passed only where nothing is cached.
+   */
+  skills?: string[];
+  /**
    * The workflow timeouts this console has learned, for F36
    * `wait-window-short` (control-tower phase 14, #40): `<ref>=<minutes>` per
    * `gh:…#run/<id>` ref it asked GitHub about (`watch-refs.ts`, once per run
@@ -256,6 +266,8 @@ export function scriptEnv(
   // two inputs, stated the same way (phase 11).
   if (opts.credentials) env.PE_CREDENTIALS = opts.credentials.join(' ');
   if (opts.accounts) env.PE_ACCOUNTS = opts.accounts.join(' ');
+  // The skills the console's sessions load (measured-console phase 11), the same way.
+  if (opts.skills) env.PE_SKILLS = opts.skills.join(' ');
   // The workflow timeouts F36 holds a `Waits on:` max to (phase 14), stated
   // the same way: after the denial, so an inherited one never answers.
   if (opts.waitTimeouts) env.PE_WAIT_TIMEOUTS = opts.waitTimeouts.join(' ');
@@ -688,6 +700,14 @@ export function readWaitBudget(result: EngineResult): { minutes: number; source:
  */
 export function readVerifyTimeout(result: EngineResult): { minutes: number; source: 'phase' | 'plan' } | undefined {
   return readWaitBudget(result);
+}
+
+/** `--verification-tier N` — `impact|full<TAB>phase|plan`, or undefined when the plan is silent (measured-console phase 15). */
+export function readVerificationTier(result: EngineResult): { tier: 'impact' | 'full'; source: 'phase' | 'plan' } | undefined {
+  if (result.timedOut || result.code !== 0) return undefined;
+  const [tier, source] = result.stdout.trim().split('\t');
+  if ((tier !== 'impact' && tier !== 'full') || (source !== 'phase' && source !== 'plan')) return undefined;
+  return { tier, source };
 }
 
 /** `--waits-on N` — the refs the phase's `Waits on:` bullet names, one per line; empty when none. */

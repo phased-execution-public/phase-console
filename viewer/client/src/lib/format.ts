@@ -170,8 +170,11 @@ export function relativeTime(ms: number | undefined): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
-/** `$1.20`. Absent and zero are different things — only the caller knows which. */
-export const money = (usd: number | null | undefined): string => `$${(usd ?? 0).toFixed(2)}`;
+/**
+ * `$1.20` — the money renderer's text form (`ui/money.tsx`, the one place a `$` is written).
+ * Absent is the word `unavailable`, never `$0.00` (measured-console phase 18, E5).
+ */
+export { usdText as money } from '@/ui/money';
 
 /**
  * Bytes as a person says them — `412 MB`, `1.8 GB`.

@@ -147,7 +147,7 @@ test('RI-2 — the run card says the run is parked, with the refusal and its fix
   assert.match(card, /run\?\.halt\?\.kind === 'isolation-refused'/, 'the card tells a parked refusal from a shared one');
   assert.match(card, /refusalFixes/);
   assert.match(card, /parked/);
-  const state = readFileSync(join(CLIENT, 'data/api/state.ts'), 'utf8');
-  assert.match(state, /refusalFixes\?: Record<string, string>/);
+  const state = readFileSync(join(CLIENT, '..', '..', 'shared', 'wire', 'state.js'), 'utf8');
+  assert.match(state, /@property \{Record<string, string>\} \[refusalFixes\]/, 'the wire names it, and the client reads the wire');
   assert.equal(existsSync(join(CLIENT, 'screens/plan/run/git-card.test.tsx')), true);
 });

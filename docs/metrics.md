@@ -80,7 +80,7 @@ which kind of scrape you got.
 | `phase_console_account_credit_used` | gauge | Credits an account has used this month, in its currency's major unit, by account id and currency. Absent while its credit state is unknown. |
 | `phase_console_log_lines_total` | counter | Console log lines written, by level. A line the level dropped is not counted. |
 | `phase_console_journal_appends_total` | counter | Journal lines appended across every run this process drove. |
-| `phase_console_journal_overflow_total` | counter | Journals that crossed the soft cap and fell back to the terminal reserve. |
+| `phase_console_journal_overflow_total` | counter | Journals that filled their last segment (eight rotations of 32 MB) and fell back to the terminal reserve. |
 | `phase_console_transcript_shed_total` | counter | Transcript records dropped rather than stored, by kind. |
 | `phase_console_git_commands_total` | counter | Git commands run through the seam, by verb and whether they exited 0. |
 | `phase_console_git_command_seconds_total` | counter | Seconds spent inside git, by verb. |
@@ -158,6 +158,12 @@ when it does so before the window resets — so `phase_console_account_wall_seco
 unmeasured or resetting-first window, never zero. An alert on "walls within two hours" is
 `phase_console_account_wall_seconds < 7200`, which is the rule `usage-climbing` itself pushes on.
 
+**Every dollar here is an estimate.** The spend families sum what each session booked: the CLI's
+own `total_cost_usd` or the price book (`viewer/shared/price-book.js`, dated rows) × tokens — client-side
+list prices, the word the console draws beside them is `estimated` (`viewer/shared/money-model.js`). A
+model nobody prices books no dollars at all (`costUsd: null`, logged `ledger.unpriced`) rather than a
+zero, so a spend family is a floor when such a model ran, and a provider's credits are never in it.
+
 ## What is NOT here
 
 No note, no title, no path, no owner, no session id, no prompt — a scrape is counts, slugs and
@@ -167,3 +173,8 @@ incidental: if you need the words, the pages have them.
 Nothing about **cost per model** either. It exists per plan (Insights ▸ *What this plan cost* ▸ *By
 model*, and the CSV) but a phase books to the model it *ended* on, so a fallback mid-run makes the
 per-model split a summary rather than an accounting — not a number to alert on.
+
+Nothing **over time** either, and no family for the cache hit, tokens per tool, skill or hook, retry
+overhead or the side spend (measured-console phase 31). A scrape is the present; the history lives
+where it is drawn. Logs ▸ Health keeps gate time, load, persist time and the reconciliation's delta as
+a bounded series (`GET /api/health/series`, 2,100 points per measure, 30 days).

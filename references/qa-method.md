@@ -8,10 +8,11 @@
 >
 > **The console has a second, unrelated reader — don't confuse them.** A run with `reviewEachPhase` on
 > dispatches a fresh session over the phase's *diff* at every phase-finish, on any plan, whatever the QA
-> gate says (`viewer/server/reviewer.ts`). It is off unless an operator turned it on, it records a
+> gate says (`server/reviewer.ts`). It is off unless an operator turned it on, it records a
 > **review** rather than a QA row, and with `reviewerPolicy: may-hold` its `requested-changes` holds this
 > phase's dependents exactly as a person's review would. This file is about the QA verdict; the reviewer
 > is `references/console-surface.md` §Run settings.
+
 
 The goal is a trustworthy **pass/fail** verdict, reached by independent reasoning about the real code,
 not by re-running the builder's own happy-path tests. Hold the work to the strongest reasonable reading
@@ -98,8 +99,8 @@ You no longer have to count. **Use the filename the brief gives you** — it is 
 ledger and then advanced past anything already on disk, so it is a name nothing has written yet. Every
 round is listed by `scripts/phase-graph.sh <slug> --qa-history N`.
 
-One implementation per language answers this now (`viewer/server/qa-round.ts` and `qa_next_round()`
-in the engine), held equal by `viewer/test/qa-round.test.ts`, because the six places that used to
+One implementation per language answers this now (`server/qa-round.ts` and `qa_next_round()`
+in the engine), held equal by `test/qa-round.test.ts`, because the six places that used to
 answer it separately drifted apart four times in a row. It is still a *convention the tools uphold*
 rather than a lock: `--report` writes whatever you pass it, so pass what you were given.
 
@@ -183,5 +184,5 @@ people: it means *the QA pass has been claimed but has not returned a verdict ye
 dependent exactly as hard as `fail` does** — a dependent is `ready` only on `pass` or `waived`. So a row
 left `pending` is not a neutral placeholder; it is a stop. `new-handoff.sh` writes one when it creates
 `test-status.md`, which is why finishing a phase under QA-`on` means dispatching the verdict, not merely
-writing the handoff. (Owner: `viewer/shared/plan-vocab.js` `QA_RESULTS`. `unknown` — a row the engine
+writing the handoff. (Owner: `shared/plan-vocab.js` `QA_RESULTS`. `unknown` — a row the engine
 could not read — is a fifth word and deliberately not in this list: it is not something you can record.)

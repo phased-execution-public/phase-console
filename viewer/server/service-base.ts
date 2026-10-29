@@ -9,7 +9,7 @@
  * more. Read the chain in order; `service.ts` holds the concrete class.
  */
 import { isolateCompat, isRunRequestOf } from './turn/run-requests.ts';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { availableParallelism, homedir, loadavg } from 'node:os';
 import { isSchedulingPolicy, loadGuardFactor, schedulingPolicy, type SchedulingPolicy } from '../shared/orchestration-model.js';
 import { MachineJobs, cpuBusyNow } from './load-reading.ts';
@@ -105,7 +105,8 @@ import {
 } from './engine.ts';
 import { ReviewStore, reviewHold } from './review.ts';
 import { SearchIndex, type SearchResult } from './search.ts';
-import { listSkills, type SkillInfo } from './skills.ts';
+import { claudeHome, listSkills, type SkillInfo } from './skills.ts';
+import { installedPluginIds, resolvePhasePlugins, resolveSessionLoads, type SessionLoads } from './runner/loads.ts';
 import { DocsWatcher } from './watch.ts';
 import {
   clearStopMarker,
@@ -166,6 +167,7 @@ import { guardStep, type CommandJudge } from './turn/guard.ts';
 import { parseGuide } from '../shared/guide-grammar.js';
 import { KIND_META } from '../shared/human-step-model.js';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
+import type { InboxPage, NotificationClearResult, NotificationScope, ReadResult } from '../shared/wire/notifications.js';
 import {
   composeDigest, DIGEST_EVERY_MS, UNDELIVERED_KEEP, type DigestDetection, type DigestTurn, type DigestUndelivered,
 } from './push/digest.ts';
@@ -233,6 +235,7 @@ import {
   isolationFor,
   landFor,
   mcpServersFor,
+  pluginKindsFor,
   personCheckFor,
   permissionModeFor,
   modelPolicyFor,
@@ -278,6 +281,7 @@ import {
   type Rung,
 } from './runner/ladder.ts';
 import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import { gateMarkerPoint, HEALTH_SAMPLE_MS, HEALTH_SERIES_DAYS, HealthSeries } from './health-series.ts';
 import { policyPrefsOf } from './runner/policy.ts';
 import { credentialsHeld, probeCredential, type CredentialVerdict } from './credentials-probe.ts';
 import { asActor, describeActor, doorActor, viaOfTrigger, type StartActor } from './actor.ts';
@@ -327,7 +331,7 @@ import { accessLedger } from './api/access.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { Journal, onJournalAppend } from './runner/journal.ts';
 import { CLOCK_MODEL, COST_MODEL, remeasureFromLedger, repriceFromLedger, type CapTable } from './runner/session-record.ts';
-import { journalFile } from './runner/run-paths.ts';
+import { journalChainOf, journalFile, runFile } from './runner/run-paths.ts';
 import { sizingCensus, type CensusLine, type CensusRun, type SizingCensus } from './analysis/sizing-model.ts';
 import { inferSessionScope, locateSessionLog, TranscriptReader, type InferredScope, type ScopeBasis } from './sessions/scope-inference.ts';
 import {
@@ -347,7 +351,7 @@ import {
 } from './runner/rulings.ts';
 import { Relay } from './relay.ts';
 import { initVersionFor, noteCliInit } from './cli-init.ts';
-import { RELAY_RULE_DEFAULTS, RELAY_WINDOW_MS, sanitiseRelayRules } from '../shared/relay-model.js';
+import { RELAY_RULE_DEFAULTS, RELAY_WINDOW_MS, sanitiseRelayRules, type RelayMechanism } from '../shared/relay-model.js';
 import {
   autoResolveRun,
   childrenOf,
@@ -365,6 +369,7 @@ import {
   resetForRetry,
   resolveRunsAgainst,
   saveRun,
+  PERSIST_MODEL,
   slugsNeedingBoard,
   runDir,
   waitClockOf,
@@ -385,6 +390,7 @@ import {
   consoleRunsDir,
   clearRunFileCache,
   setRunState,
+  takePersistTiming,
 } from './runner/state.ts';
 import { adoptionHeld, crashLoop, readCrashLedger, setAdoptionHold } from './crash-ledger.ts';
 import {
@@ -801,6 +807,9 @@ export abstract class ServiceBase {
   ): string | null;
   protected abstract armSessionInbox(root: string): void;
   abstract authStatus(force?: boolean): Promise<AuthStatus>;
+  abstract answerRunHook(
+    hook: RelayMechanism | 'stop' | 'compact', authorization: string | undefined, body: unknown,
+  ): Promise<{ status: number; body: Record<string, unknown> }>;
   abstract board(slug: string): Promise<Board>;
   /** A phase's wait budget through the engine — `ServiceLive.waitBudget`. */
   abstract waitBudget(slug: string, phase: number): Promise<WaitBudget>;
@@ -1096,6 +1105,7 @@ export abstract class ServiceBase {
     return cached?.value ?? null;
   }
 
+
   /** The measured caps the runner's spawns read (`RunnerDeps.sessionCaps`); null until the census lands. */
   protected sessionCapTable(): CapTable | null {
     return this.sizingCensus()?.caps ?? null;
@@ -1119,7 +1129,11 @@ export abstract class ServiceBase {
         const touched = Date.parse(run.updatedAt ?? '');
         if (Number.isFinite(touched) && touched < since) continue;
         let text: string;
-        try { text = await readFile(journalFile(root, record.slug, run.id), 'utf8'); } catch { continue; }
+        // The whole chain (B5): a long run's early sessions live in its segments.
+        const chain = journalChainOf(journalFile(root, record.slug, run.id));
+        const texts = await Promise.all(chain.map((file) => readFile(file, 'utf8').catch(() => '')));
+        text = texts.join('\n');
+        if (!text) continue;
         const lines: CensusLine[] = [];
         for (const raw of text.split('\n')) {
           if (!raw.includes('"phase.session"') && !raw.includes('"phase.tokens"') && !raw.includes('"phase.context-wrapup"')) continue;
@@ -1187,6 +1201,15 @@ export abstract class ServiceBase {
    * (control-tower phase 84, #112). Nothing here — `Service` reads the plan's
    * `permission.destructive` row; the base has no manifest to read.
    */
+  /**
+   * Does the plan's `permission.destructive` row allow `command` (a push) for
+   * this phase, as it stands? The service answers from the row; this layer
+   * knows no plan, so it answers no.
+   */
+  protected runBranchPushAllowed(_run: RunState, _phase: number, _command: string): boolean {
+    return false;
+  }
+
   protected manifestAnswerForCard(_approval: Approval): ManifestCheck | null {
     return null;
   }
@@ -1477,6 +1500,9 @@ export abstract class ServiceBase {
   /** When the last digest went out — what its "handled since the last digest" counts from (control-tower phase 138). */
   protected lastDigestAt: number | null = null;
   protected retentionTimer: NodeJS.Timeout | null = null;
+  /** Logs ▸ Health over time (measured-console phase 31): the series and its sampler's clock. */
+  readonly healthSeries = new HealthSeries({ dir: INSTANCE_STATE_DIR });
+  protected healthTimer: NodeJS.Timeout | null = null;
   /** The human-step ledger (control-tower phase 41), made on first use — `humanStepsNow`. */
   protected humanStepLedger: HumanStepLedger | null = null;
   /** The grant engine and its ledger (control-tower phase 149), made on first use — `grantsNow()`. */
@@ -2963,6 +2989,39 @@ export abstract class ServiceBase {
   }
 
   /**
+   * Bring every stored run to the incremental on-disk shape, `PERSIST_MODEL`,
+   * ONCE (measured-console phase 17, B5) — the `run.cost-repriced` pattern: the
+   * stamp (`persistModel`) makes a second boot a no-op, a run this process is
+   * driving is left to its runner, and `run.persist-v2 {from, bytes}` is
+   * journalled on each run it moved. The rewrite is the base a delta log
+   * follows; nothing in the record changes but the stamp and its generation.
+   */
+  protected migrateStoredRunShapes(): void {
+    if (!this.root?.ok) return;
+    const root = this.root.path;
+    const live = this.liveRunIds();
+    let moved = 0;
+    for (const plan of this.store?.list() ?? []) {
+      let runs: ReturnType<typeof listRuns> = [];
+      try { runs = listRuns(root, plan.slug, live); } catch { continue; }
+      for (const state of runs) {
+        if ((state.persistModel ?? 1) >= PERSIST_MODEL || live.has(state.id)) continue;
+        try {
+          const from = state.persistModel ?? 1;
+          saveRun(state);
+          moved += 1;
+          let bytes = 0;
+          try { bytes = statSync(runFile(root, plan.slug, state.id)).size; } catch { /* written; size unknown */ }
+          Journal.for(root, plan.slug, state.id).append('run.persist-v2', { from, to: PERSIST_MODEL, bytes });
+        } catch (error) {
+          log.warn('run.persist-migrate-failed', { slug: plan.slug, runId: state.id, error });
+        }
+      }
+    }
+    if (moved) log.info('run.records-reshaped', { runs: moved, persistModel: PERSIST_MODEL });
+  }
+
+  /**
    * Bring every stored run kept under the old clock model to `CLOCK_MODEL`,
    * ONCE (control-tower phase 58, #66, EE-2).
    *
@@ -3061,10 +3120,61 @@ export abstract class ServiceBase {
       } catch (error) {
         log.warn('retention.failed', { error: (error as Error).message });
       }
+      this.healthSeries.prune(HEALTH_SERIES_DAYS);
     };
     this.retentionTimer = setInterval(tick, RETENTION_SWEEP_MS);
     this.retentionTimer.unref?.();
     tick();
+  }
+
+  /**
+   * Health over time (measured-console phase 31, F2): every `HEALTH_SAMPLE_MS` the machine's load
+   * and the run saves' mean time are written as points, and any full-gate marker JSON this root's
+   * repositories hold that the series has not seen. `unref`'d like every clock here.
+   */
+  protected startHealthSeriesClock(): void {
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = setInterval(() => this.sampleHealth(), HEALTH_SAMPLE_MS);
+    this.healthTimer.unref?.();
+  }
+
+  /** One sample: load, persist time, and the gate markers. Never throws — Health never costs the console. */
+  sampleHealth(): void {
+    try {
+      const load = this.loadSample();
+      this.healthSeries.record('load', Math.round((load.avg5 / Math.max(1, load.cores)) * 100) / 100);
+      const persist = takePersistTiming();
+      if (persist.meanMs !== null) this.healthSeries.record('persist', persist.meanMs, { note: `${persist.saves} saves, max ${persist.maxMs} ms` });
+      for (const file of this.gateMarkerFiles()) {
+        try {
+          const point = gateMarkerPoint(JSON.parse(readFileSync(file, 'utf8')));
+          if (point) this.healthSeries.record('gate', point.v, { at: point.at, note: point.note });
+        } catch {
+          /* a marker being rewritten is read next time */
+        }
+      }
+    } catch (error) {
+      log.warn('health-series.sample-failed', { error: (error as Error).message });
+    }
+  }
+
+  /** `scripts/gates.sh`'s marker JSON in this root's git directory and each submodule's (`.git/modules/<name>/`). */
+  protected gateMarkerFiles(): string[] {
+    const root = this.root?.ok ? this.root.path : null;
+    if (!root) return [];
+    const name = 'phase-console-gates-ok.json';
+    const out: string[] = [];
+    const gitDir = join(root, '.git');
+    if (existsSync(join(gitDir, name))) out.push(join(gitDir, name));
+    try {
+      for (const sub of readdirSync(join(gitDir, 'modules'))) {
+        const file = join(gitDir, 'modules', sub, name);
+        if (existsSync(file)) out.push(file);
+      }
+    } catch {
+      /* no submodules, or `.git` is a worktree's file */
+    }
+    return out;
   }
 
   /**
@@ -3443,6 +3553,21 @@ export abstract class ServiceBase {
       this.tailscaleFacts = { running: false, forOurPort: false };
     }
     this.refreshDeliveryIssue();
+  }
+
+  /**
+   * What this console's unattended sessions load (measured-console phase 11,
+   * `runner/loads.ts`): `autopilotLoads` and `autopilotPlugins` over the tree
+   * its boot built and the machine's seed; personal plugins resolved in the
+   * config dir the console itself runs under.
+   */
+
+  sessionLoads(): SessionLoads {
+    return resolveSessionLoads({
+      mode: this.prefs.autopilotLoads === 'operator-config' ? 'operator-config' : 'console-set',
+      plugins: this.prefs.autopilotPlugins ?? [],
+      configDir: claudeHome(),
+    });
   }
 
   /** The last `skillCopy()` answer and when it was read — `/api/state` is polled, the disk is not the news. */
@@ -4643,6 +4768,12 @@ export abstract class ServiceBase {
       // The registry ids, so the runner's own engine calls (its validate.sh in
       // confirm(), its board reads) carry PE_MCP_SERVERS like the service's do.
       mcpIds: () => this.mcp.enabledIds(),
+      // What the sessions load (measured-console phase 11): the console's tree,
+      // the seed and the personal plugins switched on for autopilot, or the
+      // config dir's own under `operator-config`.
+      sessionLoads: () => this.sessionLoads(),
+      // The knowledge-graph tool the operator named, or '' — off (D6).
+      graphTool: () => this.prefs.graphTool ?? '',
       // The plan is the only source for what proves a phase worked, exactly as
       // it is the only source for what the phase should do.
       verificationText: (slug, phase) => this.store?.get(slug)?.plan?.phases[phase]?.verification,
@@ -4699,6 +4830,18 @@ export abstract class ServiceBase {
         return [
           ...new Set([...(plan.sessionBudget.mcpServers ?? []), ...(plan.phases[phase]?.mcpServers ?? [])]),
         ];
+      },
+      // One phase's plugin set (measured-console phase 27, D5): the plan's kinds
+      // for it (its line ∪ its bullet, `pluginKindsFor`, held to `--plugins N`)
+      // and the run's per-phase kinds, resolved against what the session loads
+      // and what this console's config dir installed.
+      phasePlugins: (slug, phase, chosen, permissionMode) => {
+        const kinds = [...new Set([...pluginKindsFor(this.store?.get(slug)?.plan, phase), ...chosen])];
+        if (!kinds.length) return null;
+        return resolvePhasePlugins({
+          kinds, loads: this.sessionLoads(), installed: installedPluginIds(claudeHome()),
+          ...(permissionMode ? { permissionMode } : {}),
+        });
       },
       // What the PLAN says to do when one of them will not connect — the
       // phase's own bullet first, then the §Session budget line. Absent means
@@ -4905,6 +5048,11 @@ export abstract class ServiceBase {
       rankAccounts: (excluding, forModel) => this.accounts.rankAccounts(excluding, forModel),
       // The console's commit and the skill a session of the run loads: the
       // plugin copy of the config dir its account spawns under (#151).
+      // The presence hook's brief (measured-console phase 4): installed in the
+      // config dir this account spawns under, and patient enough to print it.
+      briefHook: (accountId) => hooksStatus({
+        skillDir: SKILL_DIR, settingsPath: join(this.accounts.configDirFor(accountId), 'settings.json'),
+      }).brief,
       consoleSkill: (accountId) => {
         const copy = sessionSkillCopy(this.accounts.configDirFor(accountId));
         return {
@@ -4915,6 +5063,7 @@ export abstract class ServiceBase {
       // The wall's own picker (control-tower phase 78, #100): the rank inside
       // the pool, less every account that would wall before the reset.
       switchCandidates: (excluding, forModel, opts) => this.accounts.switchCandidates(excluding, forModel, opts),
+      poolNearestReset: (pool, nowMs) => this.accounts.nearestReset(pool, nowMs),
       autoAccountSwitch: () => this.prefs.autoAccountSwitch !== false,
       budgetAutoRaisePct: () => this.prefs.budgetAutoRaisePct ?? 25,
       mcpRequireTimeoutMs: () => this.prefs.mcpRequireTimeoutMs ?? DEFAULT_MCP_REQUIRE_TIMEOUT_MS,
@@ -4993,6 +5142,7 @@ export abstract class ServiceBase {
       // The quota door's verdict (ACT-2) — read from cache, never thrown; the
       // runner climbs or parks on it beside the auth door.
       accountHeadroom: (accountId, forModel) => this.preflightAccount(accountId, forModel),
+      accountDefaults: (accountId) => this.accounts.defaultsOf(accountId),
       // A session that spent under the account and ended well lifts its walls
       // and cooling (#78, control-tower phase 54); the runner re-reads the
       // phases it holds parked on them. The re-probe's poll is the same read
@@ -5051,6 +5201,8 @@ export abstract class ServiceBase {
       accountKind: (accountId) => this.accounts.meta(accountId ?? DEFAULT_ACCOUNT_ID)?.kind,
       // A person's switch undone by the machine (#106) is never silent.
       onAccountSwitchReverted: (state, detail) => this.announceReversal(state, detail),
+      // The wrap-up's push (measured-console phase 12, #397): the plan's row decides.
+      pushAllowed: (state, phase, command) => this.runBranchPushAllowed(state, phase, command),
       onLiveWallEscalated: (state, phase, detail) => {
         const name = this.accounts.labelFor(state.accountId);
         this.announce('limits', {
@@ -5827,10 +5979,13 @@ export abstract class ServiceBase {
     // …and before anything reads a phase's worked time: every session that
     // worked it, re-measured once from the journal (control-tower phase 58, #66).
     this.remeasureStoredRuns();
+    // Last: every stored run's record in the incremental shape (measured-console phase 17, B5).
+    this.migrateStoredRunShapes();
     // Every OTHER sink, after the run records and never before them: the global
     // byte cap is a floor under `pruneRuns`'s per-plan decision, not a second
     // opinion about it.
     this.startRetentionClock();
+    this.startHealthSeriesClock();
     // The health cache is empty in a fresh process, so every server reads
     // `unknown` until something asks — and the only thing that asked was an
     // operator opening the MCP page. A console driving unattended runs never
@@ -6773,6 +6928,8 @@ export abstract class ServiceBase {
     this.journalHook = null;
     if (this.retentionTimer) clearInterval(this.retentionTimer);
     this.retentionTimer = null;
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = null;
     this.stopTriggers();
     this.closeChats();
     this.converger.close();
@@ -6819,7 +6976,7 @@ export abstract class ServiceBase {
    * for a machine with no browser at all. Both were previously discoverable
    * only by reading source.
    */
-  inbox(query: NotificationQuery = {}) {
+  inbox(query: NotificationQuery = {}): InboxPage & { items: NotificationRecord[] } {
     return {
       ...this.notifications.list(query),
       categories: CATEGORIES,
@@ -7284,7 +7441,8 @@ export abstract class ServiceBase {
    * something a flag should be able to talk you into.
    */
   restart(
-    who: Actor | string, force = false, options: { update?: boolean; whenIdle?: boolean; session?: string | null } = {},
+    who: Actor | string, force = false,
+    options: { update?: boolean; whenIdle?: boolean; requireUpdate?: boolean; session?: string | null } = {},
   ): RestartOutcome {
     const actor = asActor(who, 'Service.restart');
     // Asked from inside a run's own session — the CLI passes the session's id
@@ -7359,7 +7517,7 @@ export abstract class ServiceBase {
   }
 
 
-  markNotificationsRead(ids?: string[] | null): { changed: number; unread: number } {
+  markNotificationsRead(ids?: string[] | null): ReadResult {
     const changed = this.notifications.markRead(ids);
     if (changed) this.emit('notification:read', { ids: ids ?? null, unread: this.notifications.unread() });
     return { changed, unread: this.notifications.unread() };
@@ -7371,7 +7529,7 @@ export abstract class ServiceBase {
    * read state moved: refetch, take the new count", so the badge and an open
    * drawer follow without a second event name.
    */
-  markNotificationsUnread(ids: readonly string[]): { changed: number; unread: number } {
+  markNotificationsUnread(ids: readonly string[]): ReadResult {
     const changed = this.notifications.markUnread(ids);
     if (changed) this.emit('notification:read', { ids: [...ids], read: false, unread: this.notifications.unread() });
     return { changed, unread: this.notifications.unread() };
@@ -7384,19 +7542,13 @@ export abstract class ServiceBase {
    * the inbox open refetches rather than trying to patch a list it cannot know
    * the shape of.
    */
-  markNotificationsReadFor(scope: {
-    slug?: string;
-    category?: string;
-    runId?: string;
-    sessionId?: string;
-    phase?: number;
-  }): { changed: number; unread: number } {
+  markNotificationsReadFor(scope: NotificationScope): ReadResult {
     const changed = this.notifications.markReadWhere(scope);
     if (changed) this.emit('notification:read', { ids: null, scope, unread: this.notifications.unread() });
     return { changed, unread: this.notifications.unread() };
   }
 
-  clearNotifications(what: 'all' | 'read' | { id: string }): { removed: number; unread: number } {
+  clearNotifications(what: 'all' | 'read' | { id: string }): NotificationClearResult {
     const removed = this.notifications.clear(what);
     if (removed) this.emit('notification:cleared', { removed, unread: this.notifications.unread() });
     return { removed, unread: this.notifications.unread() };

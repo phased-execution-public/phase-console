@@ -10,6 +10,7 @@
  * its timeout will do, from the moment it is raised.
  */
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';

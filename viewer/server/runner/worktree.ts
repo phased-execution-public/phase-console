@@ -1249,7 +1249,11 @@ async function ensureCheckout(
         // or moving away leaves it in the reflog and nowhere a person looks.
         // `for-each-ref --contains` is the read that answers it without the
         // `branch` verb, whose exemption here is the DELETE form alone.
-        const held = await git(root, ['for-each-ref', '--contains', at, '--format=%(refname:short)', 'refs/heads/']);
+        // `refs/remotes/` too since a detached mirror mount is placed at the
+        // FETCHED trunk (measured-console phase 13, #383): the commit it stood
+        // at is origin's, which no local branch need ever have reached, and
+        // reachable from origin's trunk is not "reachable from nothing".
+        const held = await git(root, ['for-each-ref', '--contains', at, '--format=%(refname:short)', 'refs/heads/', 'refs/remotes/']);
         if (at && !held.stdout.trim()) {
           return {
             ok: false,
@@ -1339,9 +1343,10 @@ async function ensureCheckout(
   // "the default branch" the whole time (CV-5). `defaultBranchOf` asks the
   // repository rather than guessing, and answers `undefined` for one whose
   // trunk it cannot name — where `HEAD` is the honest fallback and the only
-  // one there is. Fetching first is deliberately NOT done here: the console
-  // talks to no remote (`WORKTREE_VERBS`), and a base branch chosen from the
-  // remote is phase 6's option.
+  // one there is. Fetching is not done HERE: a mirror fetches before it calls
+  // in (`ensureMirror` → `freshTrunk`, measured-console phase 13, #383) and
+  // hands the fetched trunk over as `opts.base`; this fallback is the local
+  // trunk, as it always was.
   //
   // 🔴 …and it is resolved ONCE, to a COMMIT, before the fork. The caller's
   // `base` is already pinned (`resolveBase`); the fallback is pinned here for
@@ -2528,6 +2533,38 @@ export type MirrorManifest = {
    * how the mounts are validated.
    */
   detached?: true;
+  /**
+   * Where each mount's run branch was forked — or a detached mount was put —
+   * and where a boundary refresh last moved an out-of-scope one
+   * (measured-console phase 13, #383 #403). The sha a phase reads to tell a
+   * stale mount from a current one without asking git, and the fetch's
+   * outcome beside it. Optional: absent on every manifest written before it
+   * existed, and on an adopted mount nobody forked.
+   */
+  forks?: MirrorFork[];
+};
+
+/**
+ * One mount's starting point, as the mirror read it (#383 #403).
+ *
+ * `from` says WHICH trunk answered: `origin/<trunk>` when the fetch moved the
+ * remote copy and the local trunk held nothing it lacked, `<trunk>` otherwise —
+ * no remote copy at all (`fetched: 'no-remote'`), a fetch that failed
+ * (`'failed'`, with `detail`), or a local trunk carrying commits origin has
+ * never seen (`'fetched'`, and `from` the local name).
+ */
+export type MirrorFork = {
+  /** Root-relative mount; `''` is the root. */
+  mount: string;
+  /** The commit. */
+  at: string;
+  from: string;
+  fetched: TrunkFetch;
+  detail?: string;
+  /** `fork` — a new run branch cut; `detach` — a detached mount placed; `refresh` — moved at a boundary. */
+  by: 'fork' | 'detach' | 'refresh';
+  /** ISO-8601 instant. */
+  when: string;
 };
 
 /** Parents before children, so a superproject mounts before what it contains. */
@@ -2564,7 +2601,18 @@ function uninitializedUnder(repoTop: string, rel: string): string | undefined {
 }
 
 export type MountResolution =
-  | { ok: true; mounts: MirrorMount[]; skipped: string[] }
+  | {
+    ok: true; mounts: MirrorMount[]; skipped: string[];
+    /**
+     * The mounts a scope token NAMES — the repository a token resolves to, the
+     * root for a root-meaning token, every mount for `all` (measured-console
+     * phase 13, #403). A mount absent from it came in only by the expansion of
+     * a mounted superproject: no phase scopes it, the run mounts it to be READ
+     * (a sibling's tests read `../<repo>`), and `refreshMirrorMounts` keeps it
+     * at the fetched trunk. The rule `unscopedHeads` already judges drift by.
+     */
+    named: string[];
+  }
   | { ok: false; refusal: 'scope-unmapped'; detail: string };
 
 /** How deep a nest of superprojects the expansion will follow. */
@@ -2602,10 +2650,12 @@ export async function resolveMounts(
   const top = realish(resolve(root));
   const own = normalizeToken(basename(top));
   const byRel = new Map<string, MirrorMount>();
+  let all = false;
 
   for (const raw of scopes) {
     const token = normalizeToken(raw);
     if (!token) continue;
+    if (token === 'all') all = true;
     if (token === 'all' || (own && token === own)) {
       if (!byRel.has('')) byRel.set('', { rel: '', source: top });
       continue;
@@ -2677,6 +2727,8 @@ export async function resolveMounts(
     };
   }
 
+  // Read BEFORE the expansion below adds the children nobody named.
+  const named = [...byRel.keys()];
   const skipped: string[] = [];
   const queue = [...byRel.values()];
   const seen = new Set(queue.map((mount) => mount.source));
@@ -2700,7 +2752,11 @@ export async function resolveMounts(
     }
   }
 
-  return { ok: true, mounts: [...byRel.values()].sort(byMountDepth), skipped: skipped.sort() };
+  const mounts = [...byRel.values()].sort(byMountDepth);
+  return {
+    ok: true, mounts, skipped: skipped.sort(),
+    named: all ? mounts.map((mount) => mount.rel) : mounts.map((mount) => mount.rel).filter((rel) => named.includes(rel)),
+  };
 }
 
 /**
@@ -2958,6 +3014,8 @@ export async function ensureMirror(opts: {
   occupied?: ForeignMount[];
   /** Mounts adopted by re-seating a squash-landed branch on what landed (control-tower phase 112, #183). */
   reseated?: Reseat[];
+  /** Where THIS call forked or placed each mount, and how the trunk was read (#383) — also in the manifest. */
+  forks?: MirrorFork[];
 }> {
   const { names, mounts } = opts;
   const created: MirrorMount[] = [];
@@ -3038,25 +3096,42 @@ export async function ensureMirror(opts: {
     }
   }
 
+  // 🔴 FETCHED, then forked (measured-console phase 13, #383). Every mount
+  // forked from the shared checkout's LOCAL trunk with no fetch, so a run
+  // started from whatever the operator last pulled — five days stale, measured
+  // — and the fork could never be corrected, since an existing run branch is
+  // never moved. Now a mount that needs a NEW run branch (or a detached mount)
+  // asks `freshTrunk`: origin's trunk, fetched, unless the local trunk holds
+  // commits origin lacks; the local trunk, as before, when there is no remote
+  // copy or the fetch fails. Once per repository per build (`trunkMemo`), and
+  // never for a mount whose run branch already exists — a resumed run's branch
+  // is its work, and fetching for it would be a round trip spent on nothing.
+  // Where each one forked is written to the manifest (`forks`).
+  const trunkOf = trunkMemo();
+  const forks: MirrorFork[] = [];
   for (const mount of mounts) {
     const dir = join(names.integration, mount.rel);
     let at: CheckoutAt = { dir, branch: names.runBranch };
+    let base: BaseResolution | undefined;
+    let fresh: FreshTrunk | null = null;
     if (opts.detach) {
-      const trunk = await defaultBranchOf(mount.source);
-      const head = trunk
-        ? await git(mount.source, ['rev-parse', '--verify', '--quiet', trunk])
-        : null;
-      const sha = head?.stdout.trim();
-      if (!sha) {
+      fresh = await trunkOf(mount.source);
+      if (!fresh) {
         return fail('worktree-failed',
           `${mount.rel}: the repository names no default branch to detach at`);
       }
-      at = { dir, detachAt: sha };
+      at = { dir, detachAt: fresh.sha };
+    } else if (!(await refExists(mount.source, `refs/heads/${names.runBranch}`))) {
+      fresh = await trunkOf(mount.source);
+      // No trunk at all: `ensureCheckout`'s own fallback (`resolveBase`, then
+      // HEAD) decides, exactly as it did before the fetch existed.
+      if (fresh) base = { ref: fresh.from, sha: fresh.sha, source: fresh.from === fresh.trunk ? 'trunk' : 'origin-head' };
     }
-    const made = await ensureCheckout(mount.source, at);
+    const made = await ensureCheckout(mount.source, at, base ? { base } : undefined);
     if (made.ok) {
       if (made.created) created.push(mount); else adopted.push(mount.rel);
       if (made.reseated) reseated.push({ ...made.reseated, mount: mount.rel });
+      if (fresh && (made.created || opts.detach)) forks.push(forkOf(mount.rel, fresh, opts.detach ? 'detach' : 'fork'));
       continue;
     }
     const detail = `${mount.rel}: ${made.detail ?? 'git worktree add failed'}`;
@@ -3064,9 +3139,12 @@ export async function ensureMirror(opts: {
     return fail(refusal, detail);
   }
 
+  // A rebuild keeps what the earlier builds recorded for the mounts it adopted.
+  const recorded = mergeForks((await readMirror(names.integration))?.forks ?? [], forks, mounts);
   const manifest: MirrorManifest = {
     version: 1, runId: opts.runId, slug: opts.slug, branch: names.runBranch, mounts,
     ...(opts.detach ? { detached: true as const } : {}),
+    ...(recorded.length ? { forks: recorded } : {}),
   };
   try {
     await writeFile(mirrorManifestPath(names.integration), JSON.stringify(manifest, null, 2));
@@ -3075,7 +3153,11 @@ export async function ensureMirror(opts: {
       (error as Error)?.message ?? 'could not write the mirror manifest');
   }
 
-  return { ok: true, created: created.map((mount) => mount.rel), adopted, quarantined, ...(reseated.length ? { reseated } : {}) };
+  return {
+    ok: true, created: created.map((mount) => mount.rel), adopted, quarantined,
+    ...(reseated.length ? { reseated } : {}),
+    ...(forks.length ? { forks } : {}),
+  };
 }
 
 /**
@@ -3617,6 +3699,214 @@ async function fetchTrunk(repo: string, trunk: string): Promise<{ ok: boolean; d
   }
   const run = await git(repo, argv, undefined, FETCH_TIMEOUT_MS);
   return run.ok ? { ok: true } : { ok: false, detail: firstLine(run.stderr) || 'git fetch failed' };
+}
+
+/** How the trunk a mirror stands on was read: fetched, a fetch that failed, or no remote copy to fetch. */
+export type TrunkFetch = 'fetched' | 'failed' | 'no-remote';
+
+/** The trunk a mirror mount forks from or is refreshed to — `freshTrunk`'s answer. */
+export type FreshTrunk = {
+  /** The branch name — `main`. */
+  trunk: string;
+  /** What answered — `origin/main` or `main` (see `MirrorFork.from`). */
+  from: string;
+  sha: string;
+  fetched: TrunkFetch;
+  detail?: string;
+};
+
+/**
+ * The trunk a mirror mount should stand on, FETCHED first (measured-console
+ * phase 13, #383).
+ *
+ * Measured: a run forked aws's run branch from the shared checkout's local
+ * `main`, last pulled five days before, while `origin/main` was three commits
+ * on — and nothing the run did could ever move it. So the trunk is fetched
+ * (`fetchTrunk`, the one shaped fetch: `origin`'s trunk into its remote-tracking
+ * ref and nothing else, bounded by `FETCH_TIMEOUT_MS`) and the answer is
+ * whichever of the two trunks CONTAINS the other:
+ *  - `origin/<trunk>` when the local trunk is behind it or equal — the case
+ *    the issue measured;
+ *  - the local `<trunk>` when it holds commits origin lacks (ahead, or
+ *    diverged) — forking at origin would silently drop an operator's unpushed
+ *    work, which is a worse base than a stale one;
+ *  - the local `<trunk>`, exactly as before this existed, when the repository
+ *    has no remote copy of its trunk (no fetch is tried) or the fetch FAILED —
+ *    offline, a remote that refuses, a timeout. Never fatal: the failure rides
+ *    the answer (`fetched: 'failed'`, `detail`) for the caller to say.
+ * `null` only for a repository that names no trunk at all.
+ *
+ * The local trunk itself is never moved: the shared checkout is the
+ * operator's, and `fetchTrunk` writes the remote-tracking ref alone.
+ */
+async function freshTrunk(repo: string): Promise<FreshTrunk | null> {
+  const trunk = await defaultBranchOf(repo);
+  if (!trunk) return null;
+  const local = await commitOf(repo, `refs/heads/${trunk}`);
+  const remoteRef = `refs/remotes/origin/${trunk}`;
+  if (!(await refExists(repo, remoteRef))) {
+    return local ? { trunk, from: trunk, sha: local, fetched: 'no-remote' } : null;
+  }
+  const run = await fetchTrunk(repo, trunk);
+  const remote = await commitOf(repo, remoteRef);
+  if (!run.ok || !remote) {
+    const detail = run.detail ?? 'origin names no trunk after the fetch';
+    if (local) return { trunk, from: trunk, sha: local, fetched: 'failed', detail };
+    return remote ? { trunk, from: `origin/${trunk}`, sha: remote, fetched: 'failed', detail } : null;
+  }
+  if (!local || local === remote) return { trunk, from: `origin/${trunk}`, sha: remote, fetched: 'fetched' };
+  const localOnly = await git(repo, ['rev-list', '--count', `${remote}..${local}`]);
+  if (localOnly.ok && localOnly.stdout.trim() === '0') {
+    return { trunk, from: `origin/${trunk}`, sha: remote, fetched: 'fetched' };
+  }
+  return { trunk, from: trunk, sha: local, fetched: 'fetched' };
+}
+
+/**
+ * `freshTrunk` once per repository per pass — one mirror build, one boundary
+ * refresh. A mirror's mounts are distinct repositories, but a repository
+ * reached twice (two tokens, a resumed build) must not pay two fetches.
+ */
+function trunkMemo(): (repo: string) => Promise<FreshTrunk | null> {
+  const seen = new Map<string, Promise<FreshTrunk | null>>();
+  return (repo) => {
+    const key = realish(repo);
+    let answer = seen.get(key);
+    if (!answer) {
+      answer = freshTrunk(repo).catch(() => null);
+      seen.set(key, answer);
+    }
+    return answer;
+  };
+}
+
+/** A fork record for the manifest, from the trunk that answered. */
+function forkOf(mount: string, fresh: FreshTrunk, by: MirrorFork['by'], at = fresh.sha): MirrorFork {
+  return {
+    mount, at, from: fresh.from, fetched: fresh.fetched,
+    ...(fresh.detail ? { detail: fresh.detail } : {}),
+    by, when: new Date().toISOString(),
+  };
+}
+
+/** `prior` with every mount `next` names replaced, kept to the mounts the mirror still has. */
+function mergeForks(prior: readonly MirrorFork[], next: readonly MirrorFork[], mounts: readonly MirrorMount[]): MirrorFork[] {
+  const live = new Set(mounts.map((mount) => mount.rel));
+  const fresh = new Set(next.map((fork) => fork.mount));
+  return [...prior.filter((fork) => !fresh.has(fork.mount)), ...next].filter((fork) => live.has(fork.mount));
+}
+
+/** What one boundary refresh of a mirror's out-of-scope mounts did (#403). */
+export type MirrorRefresh = {
+  /** Mounts fast-forwarded to the fetched trunk: from, to, and which trunk answered. */
+  moved: { mount: string; from: string; to: string; ref: string }[];
+  /** Mounts the refresh should have moved and could not — dirty, a failed fetch, a refused merge. */
+  warnings: { mount: string; reason: string }[];
+  /** Mounts left alone by design — commits of their own, a mount standing elsewhere. */
+  kept: { mount: string; reason: string }[];
+};
+
+/**
+ * Keep a mirror's OUT-OF-SCOPE mounts at the fetched trunk — called at a phase
+ * boundary, with no lane of the run live (measured-console phase 13, #403).
+ *
+ * Measured: a run mounted MQL52026 — which no phase scoped; the root's
+ * expansion brought it in for its siblings to read — at the commit the run
+ * started on, and nothing ever moved it while origin went eight commits on. tb's
+ * vendored-copy test compared against it and read red for a day. A scoped mount
+ * is the run's own work and is never moved here (its branch forked at the
+ * fetched trunk, `ensureMirror`); an out-of-scope one — absent from
+ * `resolveMounts`'s `named` for the plan's scope, so `all` leaves none — is
+ * fast-forwarded to `freshTrunk`'s answer when ALL of these hold:
+ *  - it stands where the mirror put it (the run branch, or detached in a
+ *    detached mirror) — a mount a person switched is theirs (`kept`);
+ *  - the trunk moved past it — a mount at the trunk is left without a word;
+ *  - it carries no commit the trunk lacks — such a mount holds work, and is
+ *    never moved (`kept`, not a warning: it is the expected shape of a run that
+ *    wrote there);
+ *  - it is clean — a dirty mount is left alone and WARNED, since a stale tree
+ *    is exactly what this exists to end;
+ *  - the fetch succeeded — offline, the mount stays as it stands and the
+ *    failure is a warning, never a throw.
+ * The move is `merge --ff-only`, which moves the branch and the tree together
+ * and refuses anything that is not a fast-forward. Every move is written to the
+ * manifest's `forks` (`by: 'refresh'`), so the sha a mount stands on is
+ * readable without git. A scope that cannot be resolved moves nothing.
+ */
+export async function refreshMirrorMounts(opts: {
+  integration: string; runBranch: string; root: string; scope: Iterable<string>;
+}): Promise<MirrorRefresh> {
+  const out: MirrorRefresh = { moved: [], warnings: [], kept: [] };
+  const manifest = await readMirror(opts.integration);
+  if (!manifest?.mounts.length) return out;
+  const scope = [...opts.scope];
+  if (scope.some((token) => normalizeToken(token) === 'all')) return out;
+  const split = partitionScope(opts.root, scope);
+  if (!split.inside.length) return out;
+  const resolved = await resolveMounts(opts.root, split.inside).catch(() => null);
+  if (!resolved?.ok) return out;
+  const named = new Set(resolved.named);
+  const candidates: MirrorMount[] = [];
+  for (const mount of manifest.mounts) {
+    if (named.has(mount.rel)) continue;
+    const dir = join(opts.integration, mount.rel);
+    // A mount that is gone is `mirrorVerdict`'s question, not this one's.
+    if (!existsSync(dir) || !(await isRegistered(mount.source, dir))) continue;
+    const on = await branchAt(mount.source, dir);
+    if (manifest.detached ? on !== undefined : on !== opts.runBranch) {
+      out.kept.push({ mount: mount.rel, reason: on ? `stands on ${on}` : 'stands detached' });
+      continue;
+    }
+    candidates.push(mount);
+  }
+  if (!candidates.length) return out;
+  // Every candidate's fetch at once: a hub mounts a dozen repositories nobody
+  // scopes, and a boundary that waited on them one by one would wait minutes.
+  const trunkOf = trunkMemo();
+  const trunks = await Promise.all(candidates.map((mount) => trunkOf(mount.source)));
+  const refreshed: MirrorFork[] = [];
+  for (const [i, mount] of candidates.entries()) {
+    const fresh = trunks[i];
+    const dir = join(opts.integration, mount.rel);
+    if (!fresh) {
+      out.kept.push({ mount: mount.rel, reason: 'the repository names no trunk' });
+      continue;
+    }
+    if (fresh.fetched === 'failed') {
+      out.warnings.push({
+        mount: mount.rel,
+        reason: `the trunk could not be fetched (${fresh.detail ?? 'git fetch failed'}); the mount stays as it stands`,
+      });
+      continue;
+    }
+    const head = await commitOf(dir, 'HEAD');
+    if (!head || head === fresh.sha) continue;
+    const own = await git(dir, ['rev-list', '--count', `${fresh.sha}..${head}`]);
+    if (!own.ok || own.stdout.trim() !== '0') {
+      out.kept.push({ mount: mount.rel, reason: `carries commits ${fresh.from} lacks` });
+      continue;
+    }
+    if (await isDirty(dir)) {
+      out.warnings.push({
+        mount: mount.rel,
+        reason: `holds uncommitted work, so it was not moved to ${fresh.from} at ${fresh.sha.slice(0, 12)}`,
+      });
+      continue;
+    }
+    const ff = await git(dir, ['merge', '--ff-only', '--quiet', fresh.sha]);
+    if (!ff.ok) {
+      out.warnings.push({ mount: mount.rel, reason: firstLine(ff.stderr) || 'git merge --ff-only failed' });
+      continue;
+    }
+    out.moved.push({ mount: mount.rel, from: head, to: fresh.sha, ref: fresh.from });
+    refreshed.push(forkOf(mount.rel, fresh, 'refresh'));
+  }
+  if (refreshed.length) {
+    // Best effort: the mounts moved whether or not the record can be written.
+    const next: MirrorManifest = { ...manifest, forks: mergeForks(manifest.forks ?? [], refreshed, manifest.mounts) };
+    await writeFile(mirrorManifestPath(opts.integration), JSON.stringify(next, null, 2)).catch(() => undefined);
+  }
+  return out;
 }
 
 /** How many of the trunk's own commits the merge-commit proof reads back, newest first. */
@@ -5626,7 +5916,7 @@ const PUSH_FLAGS: Readonly<Record<string, PushFlag | 'rejected' | 'deleted' | 'f
  * to know a push happened without asking the network.
  */
 export async function pushRef(
-  repo: string, ref: string, opts: { remote: string; allowed: boolean },
+  repo: string, ref: string, opts: { remote: string; allowed: boolean; timeoutMs?: number },
 ): Promise<PushResult> {
   if (!opts.allowed) {
     return {
@@ -5660,7 +5950,7 @@ export async function pushRef(
   if (argv.slice(0, PUSH_ARGV.length).join('\u0000') !== PUSH_ARGV.join('\u0000')) {
     throw new Error('pushRef: the push argv drifted from PUSH_ARGV (shared/landing-model.js)');
   }
-  const out = await git(repo, argv);
+  const out = await git(repo, argv, undefined, opts.timeoutMs ?? GIT_TIMEOUT_MS);
 
   // The status lines are `<flag>\t<from>:<to>\t<summary>`; the LAST one is
   // ours (there is exactly one refspec). Parsed on success AND failure: a
@@ -5692,6 +5982,84 @@ export async function pushRef(
     return { ok: false, reason: 'failed', detail: `pushed, but refs/remotes/${remote}/${ref} reads ${tracking.slice(0, 12) || 'nothing'} where ${local.slice(0, 12)} was expected` };
   }
   return { ok: true, flag: status.flag, sha: local, ref, remote, summary: status.summary };
+}
+
+/* ------------------------------------------------------------------ *
+ * The wrap-up's push (measured-console phase 12, #397; phase 14)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where `git push origin` sends a tree's commits, and every config entry that
+ * could steer a push: the single push URL and every config entry git reads for
+ * the tree (`config --list --includes --show-origin --show-scope -z`), byte for
+ * byte and in git's order. Read BEFORE a session runs; `pushFastForward`
+ * pushes only when both read the same after it — so a re-pointed URL, a second
+ * push URL, an `insteadOf` rewrite, a proxy or a TLS switch, anything a session
+ * could write, stops the push rather than steering it.
+ *
+ * Here, not in `unpushed.ts`, because this is the one file `never-push.test.ts`
+ * lets push, and the push this pin guards is `pushRef`'s. The URL is read from
+ * the same listing rather than with `remote get-url` — `remote` is banned in
+ * every server file, this one included.
+ */
+export type OriginPin = { url: string; config: string };
+
+/**
+ * `origin`'s one push target in a `config --list -z --show-origin --show-scope`
+ * listing — its `pushurl`s, else its `url`s, as git picks them — or null for
+ * none or several: an `origin` that pushes to two places, or nowhere, is never
+ * pushed to.
+ */
+export function originPushUrlOf(listing: string): string | null {
+  const parts = listing.split('\0');
+  const values = (key: string): string[] => {
+    const out: string[] = [];
+    // Each entry is three NUL-ended fields: scope, origin, `key\nvalue`.
+    for (let i = 2; i < parts.length; i += 3) {
+      const entry = parts[i] ?? '';
+      const nl = entry.indexOf('\n');
+      if (nl > 0 && entry.slice(0, nl) === key) out.push(entry.slice(nl + 1));
+    }
+    return out;
+  };
+  const push = values('remote.origin.pushurl');
+  const targets = push.length ? push : values('remote.origin.url');
+  return targets.length === 1 && targets[0] ? targets[0] : null;
+}
+
+export async function originPin(tree: string): Promise<OriginPin | null> {
+  if (!existsSync(join(tree, '.git'))) return null;
+  // The WHOLE configuration git reads for the tree, includes followed — not a
+  // list of keys someone judged push-relevant (a proxy, a TLS switch, a
+  // credential or `push.*` setting all steer a push too). In git's own order,
+  // each entry with its file and scope: the last value of a key is the one git
+  // uses, so order is part of the pin.
+  const config = await git(tree, ['config', '--list', '--includes', '--show-origin', '--show-scope', '-z']);
+  if (!config.ok) return null;
+  const url = originPushUrlOf(config.stdout);
+  return url ? { url, config: config.stdout } : null;
+}
+
+/**
+ * Push one tree's run or lane branch to `origin` as a fast-forward, through
+ * `pushRef` — never forced, `pe/…` only — and only when the tree's `originPin`
+ * is still `pin`, the one read before the session ran. With the configuration
+ * unchanged, the name `origin` resolves to the pinned URL. Resolves with git's
+ * verdict; never throws.
+ */
+export async function pushFastForward(
+  tree: string, branch: string, pin: OriginPin | null | undefined, timeoutMs = 600_000,
+): Promise<{ ok: boolean; detail: string }> {
+  if (!PUSH_REF.test(branch)) return { ok: false, detail: `not a run or lane branch: ${branch}` };
+  const now = await originPin(tree).catch(() => null);
+  if (!pin || !now || now.url !== pin.url || now.config !== pin.config) {
+    return { ok: false, detail: 'origin’s push URL or remote configuration is not what it was before the session ran — not pushed' };
+  }
+  const pushed = await pushRef(tree, branch, { remote: 'origin', allowed: true, timeoutMs }).catch((error: unknown) => (
+    { ok: false as const, reason: 'failed' as const, detail: String((error as Error)?.message ?? error) }
+  ));
+  if (!pushed.ok) return { ok: false, detail: `${pushed.reason}: ${pushed.detail}`.slice(0, 300) };
+  return { ok: true, detail: `${pushed.flag} ${pushed.sha.slice(0, 12)} ${pushed.summary}`.trim().slice(0, 300) };
 }
 
 /* ------------------------------------------------------------------ *

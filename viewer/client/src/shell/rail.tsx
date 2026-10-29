@@ -10,7 +10,7 @@ import { Switcher } from './switcher';
 import { Limits } from './limits';
 
 /**
- * The rail (900 and up): the instance switcher at its top, seven places as a
+ * The rail (900 and up): the instance switcher at its top, eight places as a
  * glyph over a word, grouped into the three bands by a hairline and nothing
  * else, and at the bottom the things that are true on every page and press
  * rather than go — the panel toggle (Pro), Help, and the account meter.

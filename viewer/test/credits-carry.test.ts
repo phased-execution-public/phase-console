@@ -21,9 +21,9 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const { Accounts } = await import('../server/accounts/index.ts');
 const { withSample } = await import('../server/accounts/usage.ts');
@@ -193,17 +193,11 @@ test('CR-5: a session\'s refusal stops the carry at once — before any poll —
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-carry-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  const write = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-carry-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${state}"
 case "\${2:-}" in
   --memory-block)
@@ -215,14 +209,12 @@ case "\${2:-}" in
   --size) echo M ;;
   *) exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: (phase) => writeFileSync(join(made.state, 'done'), `${phase}\n`) };
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -254,7 +246,7 @@ const journalled = (events: { event: string; data: Record<string, unknown> }[], 
     .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
 
 test('CR-4: the live wall leaves a session on credit alone — 99 % of the window, and a rejected window the CLI carries on overage', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const session = heldSession(r);
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const left: LeaveReason[] = [];
@@ -290,7 +282,7 @@ test('CR-4: the live wall leaves a session on credit alone — 99 % of the windo
 });
 
 test('CR-5: a session saying its credits stopped is a wall again at once — and the account hears the reason', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const session = heldSession(r);
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const heard: { accountId: string | undefined; info: Record<string, unknown> }[] = [];

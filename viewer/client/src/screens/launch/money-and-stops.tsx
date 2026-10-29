@@ -7,9 +7,11 @@
  * reads "no ceiling" here rather than as a box nobody filled in.
  */
 
+import type { RunForecastUsdView } from '@/data/api';
 import { plural } from '@/lib/format';
 import { SectionHeading } from '@/ui';
-import { useLaunchFacts } from './model/facts';
+import { Money } from '@/ui/money';
+import { useDraftPrelude, useLaunchFacts } from './model/facts';
 import { useSetupForm } from './form-context';
 import { MoneySection, StopsSection } from './sections';
 import { ceilings, stopsWhen } from './model/summary';
@@ -25,6 +27,7 @@ export function MoneyAndStops() {
   const money = on('phaseBudgetUsd') || on('runBudgetUsd') || on('qaRoundBudgetUsd');
   const { stops, carriesOn } = stopsWhen(f.values);
   const cost = ceilings(f.values, facts.willRun.length || undefined);
+  const forecast = useDraftPrelude().data?.forecast;
   return (
     <div className="flex min-w-0 flex-col gap-6">
       <section className="flex min-w-0 flex-col gap-2">
@@ -41,6 +44,9 @@ export function MoneyAndStops() {
                 {line}
               </li>
             ))}
+            {forecast && forecast.phases.length > 0 && (
+              <ForecastLine forecast={forecast} atMost={cost.atMost} />
+            )}
             {facts.detail?.summary.remainingWeight ? (
               <li className="tabular-nums">
                 The plan's own sizes put what is left at ≈{' '}
@@ -55,6 +61,35 @@ export function MoneyAndStops() {
         <StopsSection />
       </section>
     </div>
+  );
+}
+
+/**
+ * What the run will likely cost, beside the ceilings (measured-console phase 23): the prelude's
+ * forecast — each phase its size's sessions × dollars per session — always `estimated`, and
+ * said to be over the ceiling when it is.
+ */
+export function ForecastLine({ forecast, atMost }: { forecast: RunForecastUsdView; atMost: number | null }) {
+  const measured = forecast.phases.filter((p) => p.perSession.basis === 'measured').length;
+  const over = atMost != null && forecast.usd != null && forecast.usd > atMost;
+  return (
+    <li data-testid="launch-forecast-usd" className="tabular-nums">
+      Likely cost <Money usd={forecast.usd} word="estimated" showWord className="text-ink" /> for{' '}
+      {plural(forecast.phases.length, 'phase')} — each its size's sessions × dollars per session,{' '}
+      {measured
+        ? `${measured} of them from this console's own ledger`
+        : 'from the shipped table until twenty sessions are measured'}
+      {forecast.unpricedPhases > 0
+        ? `; ${plural(forecast.unpricedPhases, 'phase')} nobody prices, so it is a floor`
+        : ''}
+      {over ? (
+        <>
+          {' '}
+          — over the ceiling of <Money usd={atMost} />, so it would halt and ask before the end
+        </>
+      ) : null}
+      .
+    </li>
   );
 }
 

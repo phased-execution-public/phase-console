@@ -189,6 +189,27 @@ describe('one column array, the phone’s records', () => {
   });
 });
 
+describe('strips on a phone (Tower strips)', () => {
+  it('a record in a state wears its edge, and sits on its tint while open — and only when the grid asks', () => {
+    const { unmount } = mount();
+    expect(recordOf('quiet-console').querySelector('[data-strip-edge]')).toBeNull();
+    unmount();
+    mount({ rowPaint: (r) => (r.state === 'running' ? 'running' : 'waiting') });
+    const record = recordOf('quiet-console');
+    expect(record).toHaveAttribute('data-strip', 'running');
+    expect(record).toHaveClass('relative');
+    expect(record.querySelector('[data-strip-edge]')).toHaveClass(
+      'state-running',
+      'bg-state-vivid',
+      'start-0',
+    );
+    expect(recordOf('control-tower').querySelector('[data-strip-edge]')).toHaveClass('state-waiting');
+    expect(record).not.toHaveClass('bg-state-tint');
+    fireEvent.click(foldOf(record));
+    expect(record).toHaveClass('state-running', 'bg-state-tint');
+  });
+});
+
 describe('groups and orders on a phone', () => {
   it('draws each group as a heading item with its count, and folds it in place', async () => {
     mount({ groupBy: 'state' });

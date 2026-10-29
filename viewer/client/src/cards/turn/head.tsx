@@ -1,32 +1,52 @@
 /**
- * The card's head (turn-by-turn phase 8) — what a person reads before anything
- * else, top to bottom:
+ * The card's head (turn-by-turn phase 8; a STRIP's head since Tower strips,
+ * 2026-10-20) — what a person reads before anything else, top to bottom:
  *
- *   1. NOW, or NOT YET with its *when* — drawn only while the act is still the
- *      person's (`readinessShown`); the type's mark (Approval · Task · Decision ·
- *      Heads-up, `TYPE_META`); the person's status as a dot and a word (the
- *      typed family's `turn` member); Inspect at the end;
+ *   1. ONE row: the type as a neutral plate (Approval · Task · Decision ·
+ *      Heads-up, `TYPE_META` — a glyph and a word, never a colour); NOW, or
+ *      NOT YET with its *when*, drawn only while the act is still the
+ *      person's (`readinessShown`); the person's status as the card's ONE lead
+ *      badge — the typed family's `turn` member on its state's tint, with the
+ *      attempt a Redo sent back; the plan's errand ref as an outlined chip;
+ *      Inspect at the end. The card's leading edge wears the same status's hue
+ *      (`edgeOf`), so the strip and its badge never disagree;
  *   2. the title — the act, as the composer said it (sentence case, at most 80
- *      characters, #377) — with the plan's errand ref as a chip beside it, the
- *      whole words beneath it when the title had to cut them, and a landing
- *      errand's files folded under *Details*, grouped by repository;
- *   3. the meta — the plan, the phase, the run, what it unblocks, the effort —
- *      each its own fact and each a link where it can be one (never a dotted
- *      string);
- *   4. why only the person fits it, said ONCE.
+ *      characters, #377) — the whole words beneath it when the title had to
+ *      cut them, and a landing errand's files folded under *Details*, grouped
+ *      by repository;
+ *   3. the meta — the plan, the phase, the run, what it unblocks, the effort,
+ *      when it was assigned and until when it stays open — each its own
+ *      outlined chip and each a link where it can be one (never a dotted
+ *      string).
+ *
+ * Why only the person fits it is said ONCE, where the act begins (`WhyLine`).
  */
 
 import type { ReactNode } from 'react';
-import { REASON_META, readinessShown } from '@shared/turn-model.js';
+import { describeWord } from '@shared/status-model.js';
+import { REASON_META, readinessShown, type PersonStatus } from '@shared/turn-model.js';
 import { TypeMark } from './type-mark';
+import type { Timing } from './timing';
 import type { HumanStepRecord } from '@/data/human-steps';
 import type { TurnItem } from '@/data/turn';
 import { cn } from '@/lib/cn';
 import { phaseHref, planHref, runHref } from '@/shell/routes';
 import { Button } from '@/ui';
+import { usePageNow } from '@/ui/clock';
 import { CopyButton } from '@/ui/copy-button';
 import { Disclosure } from '@/ui/disclosure';
 import { TurnReadiness, TurnStatus } from '@/ui/status';
+import { span, stamp } from './step-words';
+
+/**
+ * The card's strip edge: the hue of the person's status — the paint the lead
+ * badge's own view carries (`shared/status-model.js`, vocabulary `turn`), so
+ * the hue is chosen in one place and the strip only reads it.
+ */
+export function edgeOf(status: PersonStatus | undefined): string {
+  const view = describeWord('turn', status ?? 'todo');
+  return `state-${view.paint}`;
+}
 
 const link = 'tap-row text-ink underline decoration-rule-strong underline-offset-2 hover:decoration-ink';
 
@@ -56,25 +76,74 @@ function effortWords(minutes: number): string {
   return `About ${hours} h`;
 }
 
-function Fact({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
+/**
+ * One fact of the meta, as a chip (Tower strips, 2026-10-20): a small outlined
+ * box that wraps with its neighbours — its label muted, its value in ink, a
+ * link where it can be one. Never coloured: the card's one hue is its edge and
+ * its lead badge.
+ */
+function Fact({
+  label,
+  children,
+  testId,
+  quiet = false,
+}: {
+  /** What the fact is, said before it — or, `quiet`, heard and not shown, where the value names itself ("Phase 4"). */
+  label: string;
+  children: ReactNode;
+  testId?: string;
+  quiet?: boolean;
+}) {
   return (
-    <div className="flex min-w-0 items-center gap-1.5" data-testid={testId}>
-      <dt className="text-meta text-ink-muted">{label}</dt>
-      <dd className="min-w-0 text-meta break-words text-ink">{children}</dd>
-    </div>
+    <li
+      data-testid={testId}
+      className="inline-flex min-w-0 max-w-full flex-wrap items-baseline gap-x-1 rounded-sm border border-rule px-1.5 py-px text-meta"
+    >
+      <span className={quiet ? 'sr-only' : 'text-ink-muted'}>{label}</span>
+      <span className="min-w-0 break-words text-ink">{children}</span>
+    </li>
   );
 }
 
-/** The meta: where it belongs, what it unblocks and what it costs — each a fact, each a link where it can be. */
-export function Meta({ item, record }: { item: TurnItem; record: HumanStepRecord | undefined }) {
+/** "2 h ago" on the page clock — a leaf, so a tick re-renders this figure and never the card. */
+function AgoWords({ at }: { at: string }) {
+  const now = usePageNow();
+  const ms = Date.parse(at);
+  if (!Number.isFinite(ms)) return <>{at}</>;
+  return <span className="tabular-nums">{now - ms < 60_000 ? 'just now' : `${span(now - ms)} ago`}</span>;
+}
+
+/**
+ * The meta: where it belongs, what it unblocks, what it costs and its two
+ * standing clocks — when it became the person's and, while it is open, until
+ * when it stays open — each its own chip, each a link where it can be one
+ * (never a dotted string). The deadline is the Timing fold's head
+ * (`record.tsx`), said where the whole grid is one press away.
+ */
+export function Meta({
+  item,
+  record,
+  timing,
+  live = true,
+}: {
+  item: TurnItem;
+  record: HumanStepRecord | undefined;
+  /** The item's clocks (`timingOf`), when the card has them. */
+  timing?: Timing | undefined;
+  /** The act is still the person's: the window is drawn. */
+  live?: boolean;
+}) {
   const unblocks = unblocksOf(item, record);
   const effort = record?.effortMin ?? item.step?.effortMin;
   const runId = item.runId ?? record?.runId;
   // An item with no plan (a console's own ask) says the composer's meta, fact by fact.
   const loose = !item.slug && item.meta ? item.meta.split(' · ').filter(Boolean) : [];
-  if (!item.slug && !loose.length && !unblocks.length && effort == null) return null;
+  const assigned = timing?.assignedAt;
+  const openUntil = live ? timing?.openUntil : undefined;
+  if (!item.slug && !loose.length && !unblocks.length && effort == null && !assigned && !openUntil)
+    return null;
   return (
-    <dl data-testid="turn-meta" className="flex min-w-0 flex-wrap items-center gap-x-5 gap-y-1">
+    <ul data-testid="turn-meta" className="flex min-w-0 list-none flex-wrap items-center gap-1.5 p-0">
       {item.slug && (
         <Fact label="Plan">
           <a className={link} href={planHref(item.slug)}>
@@ -83,7 +152,7 @@ export function Meta({ item, record }: { item: TurnItem; record: HumanStepRecord
         </Fact>
       )}
       {item.slug && item.phase != null && (
-        <Fact label="Phase">
+        <Fact label="Phase" quiet={Boolean(item.phase)}>
           {item.phase ? (
             <a className={link} href={phaseHref(item.slug, item.phase)}>
               Phase {item.phase}
@@ -117,12 +186,25 @@ export function Meta({ item, record }: { item: TurnItem; record: HumanStepRecord
           {effortWords(effort)}
         </Fact>
       )}
+      {assigned && (
+        <Fact label="Assigned" testId="turn-meta-assigned">
+          <AgoWords at={assigned} />
+        </Fact>
+      )}
+      {openUntil && (
+        <Fact label="Open until" testId="turn-meta-open-until">
+          <span className="tabular-nums">{stamp(openUntil)}</span>
+        </Fact>
+      )}
       {loose.map((part) => (
-        <dd key={part} className="text-meta text-ink-muted">
+        <li
+          key={part}
+          className="inline-flex min-w-0 max-w-full rounded-sm border border-rule px-1.5 py-px text-meta break-words text-ink-muted"
+        >
           {part}
-        </dd>
+        </li>
       ))}
-    </dl>
+    </ul>
   );
 }
 
@@ -139,7 +221,7 @@ export function WhyLine({
   const said = item.record !== 'ledger' && item.need ? item.need : (REASON_META[why]?.sentence ?? why);
   if (!said) return null;
   return (
-    <p data-testid="turn-why" className="max-w-prose text-body text-ink">
+    <p data-testid="turn-why" className="max-w-(--measure) text-body text-ink">
       <span className="font-medium">Only you: </span>
       {said}
       {inferred && <span className="text-ink-muted"> (inferred from its kind)</span>}
@@ -201,6 +283,9 @@ export function Head({
   titleId,
   title,
   when,
+  attempt,
+  facts,
+  size = 'section',
   onInspect,
   children,
 }: {
@@ -209,23 +294,49 @@ export function Head({
   title: string;
   /** NOT YET's *when*, in words. */
   when?: string | undefined;
+  /** The attempt a check sent back, said beside a Redo. */
+  attempt?: number | undefined;
+  /** The meta's chips (`Meta`), under the title and its whole words. */
+  facts?: ReactNode;
+  /** `title` where the card is the panel's whole subject; `section` among other cards. */
+  size?: 'section' | 'title';
   onInspect?: (() => void) | undefined;
+  /** More of the head row's badges, outlined (a permission's risk). */
   children?: ReactNode;
 }) {
   const status = item.personStatus ?? 'todo';
   return (
     <header className="flex min-w-0 flex-col gap-2">
-      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
+      <div data-testid="turn-head-row" className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1.5">
+        <TypeMark type={item.type} plate />
         {readinessShown(status) && (
           <TurnReadiness
+            chrome="badge"
             readiness={item.readiness ?? 'now'}
             when={item.readiness === 'not-yet' ? when : undefined}
           />
         )}
-        <TypeMark type={item.type} />
-        <span data-testid="turn-state">
-          <TurnStatus status={status} />
+        <span data-testid="turn-state" className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
+          <TurnStatus status={status} chrome="tint" />
+          {status === 'redo' && attempt ? (
+            <span
+              data-testid="turn-state-attempt"
+              title={`Attempt ${attempt} was sent back`}
+              className="rounded-sm border border-rule px-1.5 py-px text-meta text-ink-muted tabular-nums"
+            >
+              Attempt {attempt}
+            </span>
+          ) : null}
         </span>
+        {item.errandRef && (
+          <span
+            data-testid="turn-errand-ref"
+            title={`The plan's errand ${item.errandRef}`}
+            className="rounded-sm border border-rule px-1.5 py-px font-mono text-meta text-ink-muted"
+          >
+            {item.errandRef}
+          </span>
+        )}
         {children}
         {onInspect && (
           <Button
@@ -240,26 +351,23 @@ export function Head({
           </Button>
         )}
       </div>
-      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
-        <h3 id={titleId} data-testid="turn-title" className="max-w-prose text-section font-semibold text-ink">
-          {title}
-        </h3>
-        {item.errandRef && (
-          <span
-            data-testid="turn-errand-ref"
-            title={`The plan's errand ${item.errandRef}`}
-            className="rounded-sm border border-rule px-1.5 font-mono text-meta text-ink-muted"
-          >
-            {item.errandRef}
-          </span>
+      <h3
+        id={titleId}
+        data-testid="turn-title"
+        className={cn(
+          'max-w-(--measure) font-semibold text-ink',
+          size === 'title' ? 'text-title' : 'text-section',
         )}
-      </div>
+      >
+        {title}
+      </h3>
       {item.headline && item.headline !== title && (
-        <p data-testid="turn-headline" className="max-w-prose text-meta break-words text-ink-muted">
+        <p data-testid="turn-headline" className="max-w-(--measure) text-meta break-words text-ink-muted">
           {item.headline}
         </p>
       )}
       {item.files?.length ? <FilesDetails files={item.files} /> : null}
+      {facts}
     </header>
   );
 }

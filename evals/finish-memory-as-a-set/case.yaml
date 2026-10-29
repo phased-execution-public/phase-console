@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: finish-memory-as-a-set
+description: 'mode-phase-finish, It''s working if: memory records the status as a set (docs/memory/<slug>/index.md, dated).'
+tags: [phase-finish, working-if]
+context:
+  scaffold_script: fixture.sh

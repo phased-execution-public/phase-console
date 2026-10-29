@@ -44,6 +44,7 @@ import {
 import { loadSizing } from './graph.ts';
 import { holderWaitsFromRuns, type HolderWait } from './holder-eta.ts';
 import { holderRemaining } from './stats.ts';
+import { journalChainOf } from '../runner/run-paths.ts';
 
 /** The four models `--replay` re-derives with, by the phase that shipped each. */
 export type ReplayRule = 'streak' | 'spend' | 'eta' | 'holder';
@@ -189,7 +190,8 @@ export function readRuns(runsDir: string): WeekRun[] {
       runs.push({
         slug,
         runId: match[1]!,
-        lines: readLines(join(dir, file)),
+        // The whole chain (measured-console phase 17): a rotated journal's segments first.
+        lines: journalChainOf(join(dir, file)).flatMap((path) => readLines(path)),
         maxFailures: Number.isInteger(max) && max > 0 ? max : 2,
         unverifiedDone: unverifiedOf(record),
       });

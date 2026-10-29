@@ -60,14 +60,14 @@ const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
  * be a third place to forget.
  */
 function unionWords(source: string, typeName: string): string[] {
-  const start = source.indexOf(`export type ${typeName} =`);
-  assert.ok(start >= 0, `${typeName} not found in the client contract`);
-  const bare = source.slice(start).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-  const body = bare.slice(0, bare.indexOf(';'));
-  return [...body.matchAll(/'([\w-]+)'/g)].map((m) => m[1]);
+  const m = source.match(new RegExp(`@typedef \\{([^}]*)\\} ${typeName}\\b`));
+  assert.ok(m, `${typeName} not found in the client contract`);
+  return [...m[1]!.matchAll(/'([\w-]+)'/g)].map((w) => w[1]!);
 }
 
-const CONTRACT = readFileSync(here('../client/src/data/api/inbox.ts'), 'utf8');
+// The wire owns the contract since measured-console phase 32; the client's
+// `data/api/inbox.ts` re-exports it.
+const CONTRACT = readFileSync(here('../shared/wire/turn.js'), 'utf8');
 
 /* ------------------------------------------------------------------ *
  * 1. Agreement with the client contract
@@ -78,7 +78,7 @@ test('INBOX_KINDS is the InboxKind union, same words, same order', () => {
   assert.deepEqual(
     [...INBOX_KINDS],
     union,
-    'shared/attention-model.js and client/src/data/api/inbox.ts have drifted — the union order is also the inbox sort tie-break, so a reorder is a behaviour change',
+    'shared/attention-model.js and shared/wire/turn.js have drifted — the union order is also the inbox sort tie-break, so a reorder is a behaviour change',
   );
   // 18 since control-tower phase 41: `human-step`, a person's turn.
   assert.equal(union.length, 18, union.join(','));
@@ -120,7 +120,7 @@ test('the contract still spells the fields the model assumes', () => {
   // since, kind and id. A rename on the wire that this file did not see would
   // otherwise show up as an inbox that sorts by nothing.
   for (const field of ['id', 'kind', 'severity', 'slug', 'phase', 'runId', 'since', 'ack']) {
-    assert.match(CONTRACT, new RegExp(`\\n\\s*${field}\\??:`), `InboxItem.${field} is gone from the contract`);
+    assert.match(CONTRACT, new RegExp(`@property \\{[^\\n]*\\} \\[?${field}\\]?(\\s|$)`, 'm'), `InboxItem.${field} is gone from the contract`);
   }
 });
 

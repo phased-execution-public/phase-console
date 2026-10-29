@@ -12,12 +12,13 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { RETRY_STORM_PARK_MS } from '../shared/attention-model.js';
 import { HALT_KINDS } from '../shared/recovery-model.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn as spawnProcess } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -39,13 +40,15 @@ const {
 const { Journal } = await import('../server/runner/journal.ts');
 const { liveErrandHow } = await import('../server/watch-refs.ts');
 const { Scheduler } = await import('../server/runner/scheduler.ts');
-const { LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, PROVISIONAL_LEASE_S, PROVISIONAL_REFUSAL_LIMIT, RUNNER_LEASE_S } = await import('../server/runner/runner-core.ts');
+const { LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, PROVISIONAL_LEASE_S, PROVISIONAL_REFUSAL_LIMIT, RUNNER_LEASE_S } = await import('../server/runner/runner-core.ts');
 const { freezeVerdict } = await import('../server/runner/freeze.ts');
-const { doorActor, pressActor } = await import('../server/actor.ts');
+const { doorActor } = await import('../server/actor.ts');
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
 import type { PhaseRecord, RunState } from '../server/runner/state.ts';
 import type { LockView } from '../server/runner/scheduler.ts';
 import type { LeaveReason, LeaveResult } from '../server/accounts/index.ts';
+import { stubRepo } from './fixtures/repo.ts';
+import { dateClock } from './fixtures/clock.ts';
 
 /* ------------------------------------------------------------------ *
  * A repo with stub scripts
@@ -124,18 +127,14 @@ function leaveStub(accountId: string | undefined, leaving: LeaveReason): LeaveRe
   };
 }
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-runner-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-
+function stubbedPlan(): Repo {
   // A linear 3-phase graph: phase N is ready once every earlier phase is done.
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+  // Mirrors the real script's shape: `status` is informational and always
+  // exits 0, so the holder has to be read out of its output.
+  const made = stubRepo({
+    prefix: 'pc-runner-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -211,11 +210,8 @@ case "$mode" in
   --size) if [ -f "$S/size-$arg" ]; then cat "$S/size-$arg"; else echo M; fi ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-
-  // Mirrors the real script's shape: `status` is informational and always
-  // exits 0, so the holder has to be read out of its output.
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
+`,
+      'phase-lock.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 echo "$*" >> "$S/locks"
@@ -234,15 +230,16 @@ if [ "\${2:-}" = "status" ]; then
   exit 0
 fi
 exit 0
-`);
-
-  write(join(scripts, 'validate.sh'), `#!/usr/bin/env bash
+`,
+      'validate.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 if [ -f "$S/lint-fail" ]; then echo "VALIDATE FAIL stub"; exit 1; fi
 echo "VALIDATE OK"
-`);
-
+`,
+    }),
+  });
+  const { root, scripts, state } = made;
   return {
     root, scripts, state,
     markDone: (phase) => writeFileSync(join(state, 'done'),
@@ -279,11 +276,6 @@ echo "VALIDATE OK"
     setSize: (phase, size) => writeFileSync(join(state, `size-${phase}`), `${size}\n`),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
-}
-
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -647,7 +639,7 @@ test('NDJSON split across arbitrary chunk boundaries still parses', () => {
  * ------------------------------------------------------------------ */
 
 test('a fresh plan runs every phase, each in its own process', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance } = runner(r, workingSession(r, seen));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -666,7 +658,7 @@ test('a fresh plan runs every phase, each in its own process', async () => {
  * ------------------------------------------------------------------ */
 
 test('the profile a run starts under reaches every one of its children', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const profiles: (string | undefined)[] = [];
   const spy: SpawnFn = async (request) => {
     profiles.push(request.permissionProfile);
@@ -685,7 +677,7 @@ test('the profile a run starts under reaches every one of its children', async (
 });
 
 test('a run with no profile is trusted, and writes that out', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const profiles: (string | undefined)[] = [];
   const spy: SpawnFn = async (request) => {
     profiles.push(request.permissionProfile);
@@ -707,7 +699,7 @@ test('`guarded` is the one profile written as an omission', async () => {
   // The compatibility rule the default flip must not break: absent means
   // guarded. A run file written before profiles existed has no field, and it has
   // to keep reading as the careful option however the default moves.
-  const r = repo();
+  const r = stubbedPlan();
   const profiles: (string | undefined)[] = [];
   const spy: SpawnFn = async (request) => {
     profiles.push(request.permissionProfile);
@@ -726,7 +718,7 @@ test('`guarded` is the one profile written as an omission', async () => {
 });
 
 test('switching profile mid-run is journaled, and the next phase runs under it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const profiles: (string | undefined)[] = [];
   const spy: SpawnFn = async (request) => {
     const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
@@ -763,7 +755,7 @@ test('switching profile mid-run is journaled, and the next phase runs under it',
  * ------------------------------------------------------------------ */
 
 test('an unanswered approval parks the run rather than failing it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -789,7 +781,7 @@ test('every session runs under the run\'s own lock identity', async () => {
   // PE_OWNER is how a lock the session claims gets attributed to this run, so
   // the runner can release it afterwards and a second console can see who is
   // working the phase.
-  const r = repo();
+  const r = stubbedPlan();
   const envs: (string | undefined)[] = [];
   const spy: SpawnFn = async (request) => {
     envs.push(request.env?.PE_OWNER);
@@ -810,7 +802,7 @@ test('every session runs under the run\'s own lock identity', async () => {
 });
 
 test('a half-finished plan resumes at the phase that is left', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.markDone(1);
   r.markDone(2);
   const seen: number[] = [];
@@ -824,7 +816,7 @@ test('a half-finished plan resumes at the phase that is left', async () => {
 });
 
 test('a session that claims success but writes nothing halts the run', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // The failure this whole design exists to catch: the process exits 0, the
   // result says "done", and the board still says the phase is not done.
   const liar: SpawnFn = async () => ok({ resultText: 'Phase complete!' });
@@ -852,7 +844,7 @@ test('a red verification over a complete handoff records the verdict, does not h
   // dependents boarded on a red — so since control-tower phase 62 (#68) the
   // phase is RE-OPENED instead: failed, with `reopened` set, which reconcile
   // leaves alone (`verification-gates.test.ts` holds the rest).
-  const r = repo();
+  const r = stubbedPlan();
   const { instance, events } = runner(r, workingSession(r), '`false`');
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -904,7 +896,7 @@ test('verification runs where the plan says, and the run records where that was'
   // the superproject, so one real plan's `docker compose run … -v "$PWD:/app"`
   // mounted the WHOLE monorepo into the container and hung there. The plan knew
   // which directory it meant; it had no way to say so.
-  const r = repo();
+  const r = stubbedPlan();
   mkdirSync(join(r.root, 'services', 'api'), { recursive: true });
 
   const { instance } = verifyInRunner(r, workingSession(r), '`pwd`', 'services/api');
@@ -922,7 +914,7 @@ test('a Verify in: that escapes the root is refused, and the refusal is journall
   // The plan file is editable by anyone who can open the repo, so this is a
   // boundary rather than a typo check: `../../etc` is not a directory this
   // console gets to run commands in, whatever a plan says.
-  const r = repo();
+  const r = stubbedPlan();
   const { instance, events } = verifyInRunner(r, workingSession(r), '`pwd`', '../../etc');
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -939,7 +931,7 @@ test('a Verify in: naming a directory that is not there falls back, loudly', asy
   // The worst case for silence: a path that named a directory when the plan was
   // written and does not now. bash would inherit the parent's cwd and nobody
   // would be told which tree had actually been verified.
-  const r = repo();
+  const r = stubbedPlan();
   const { instance, events } = verifyInRunner(r, workingSession(r), '`pwd`', 'services/api');
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -973,7 +965,7 @@ test('a failed verification suggests the Repos column\'s directory — as a hint
   // A silently-chosen directory that happens to be wrong verifies the wrong tree
   // and reports GREEN, which is worse than the failure it papers over. So the
   // console says what it noticed and a person writes it into the plan.
-  const r = repo();
+  const r = stubbedPlan();
   mkdirSync(join(r.root, 'packages', 'cart-api'), { recursive: true });
 
   const instance = hintRunner(r, ['cart-api']);
@@ -992,7 +984,7 @@ test('a failed verification suggests the Repos column\'s directory — as a hint
 });
 
 test('no hint when the plan already says where to verify', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   mkdirSync(join(r.root, 'packages', 'cart-api'), { recursive: true });
   const instance = hintRunner(r, ['cart-api'], 'packages/cart-api');
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1012,7 +1004,7 @@ test('no hint when the answer would be a guess', async () => {
     [['api'], []],
     [undefined, [['services', 'api']]],
   ] as [string[] | undefined, string[][]][]) {
-    const r = repo();
+    const r = stubbedPlan();
     for (const parts of dirs) mkdirSync(join(r.root, ...parts), { recursive: true });
 
     const instance = hintRunner(r, repos);
@@ -1033,7 +1025,7 @@ test('verification commands get half an hour, stated rather than defaulted', asy
   // halted a phase that had done nothing wrong. A phase's verification is a full
   // suite, often a build, sometimes a container — but still bounded, because a
   // wedged command has to end.
-  const r = repo();
+  const r = stubbedPlan();
   const seen: (number | undefined)[] = [];
   const instance = new Runner({
     scriptsDir: r.scripts,
@@ -1053,7 +1045,7 @@ test('verification commands get half an hour, stated rather than defaulted', asy
 });
 
 test('a plan that says nothing verifies at the root, and says so', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance, events } = verifyInRunner(r, workingSession(r), '`true`', undefined);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -1067,7 +1059,7 @@ test('a plan that says nothing verifies at the root, and says so', async () => {
 });
 
 test('a plan left failing validate.sh halts even when the phase verified', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setLintFail(true);
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1078,7 +1070,7 @@ test('a plan left failing validate.sh halts even when the phase verified', async
 });
 
 test('a closed human gate holds that phase as gated and stops rather than forcing it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setGate(1, 'manual: the operator must approve the deploy');
   // The console's word for the `gates` row is `operator` here — the shipped
   // default is `delegated` since 5.0.0 (phase 11), and this case is about the
@@ -1096,7 +1088,7 @@ test('a closed human gate holds that phase as gated and stops rather than forcin
 });
 
 test('an ai-clearable gate does not park — the session is booted to clear it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setGate(1, 'ai: verify staging deploy and smoke tests');
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1111,7 +1103,7 @@ test('an ai-clearable gate does not park — the session is booted to clear it',
 });
 
 test('the runner opts into cmd-gate execution (PHASE_EXEC_GATES=1)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   writeFileSync(join(r.state, 'gate-echo-env'), '');
   const { instance } = runner(r, workingSession(r), '`true`', undefined, { delegateHumanGates: () => false });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1125,7 +1117,7 @@ test('the runner opts into cmd-gate execution (PHASE_EXEC_GATES=1)', async () =>
 });
 
 test('a lock held elsewhere parks the phase instead of racing for it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setLockRefused(true);
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1142,7 +1134,7 @@ test('a LAPSED claim does not park the phase — it just runs', async () => {
   // first half, so a session that died without releasing parked its phase for
   // the whole lease — and then forever after, since nothing renews a dead
   // claim. A lease running out is exactly the event that means "go".
-  const r = repo();
+  const r = stubbedPlan();
   r.setLockLapsed(true);
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1165,7 +1157,7 @@ test('the runner reads the lock, then claims it PROVISIONALLY under its own owne
   // was NO lock on disk, for a process spawn and two preflights, while
   // `phase-lock.sh conflicts` scans files — so a hand session asking in that
   // window was told "safe to start" against a lane that was booting.
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -1181,7 +1173,7 @@ test('the runner reads the lock, then claims it PROVISIONALLY under its own owne
 });
 
 test('an expired login stops the run instead of failing every phase the same way', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const loggedOut: SpawnFn = async () => ok({
     signal: { subtype: 'error_during_execution', code: 1, text: 'Please run /login' },
     costUsd: 0,
@@ -1208,7 +1200,7 @@ test('an expired login stops the run instead of failing every phase the same way
 });
 
 test('a model-only limit moves down the ladder and carries on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const models: string[] = [];
   const limited: SpawnFn = async (request) => {
     models.push(request.model!);
@@ -1233,7 +1225,7 @@ test('a model-only limit moves down the ladder and carries on', async () => {
 const PLAN_LIMIT_TEXT = "You've hit your session limit · resets 3:45pm";
 
 test('policy `switch`: a plan limit moves to the other account and continues WITHOUT sleeping', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: { env?: NodeJS.ProcessEnv; resume?: string }[] = [];
   const limited: SpawnFn = async (request) => {
     spawns.push({ env: request.env, resume: request.resume });
@@ -1278,7 +1270,7 @@ test('policy `switch`: a plan limit moves to the other account and continues WIT
 });
 
 test('policy `switch` without a transcript port starts fresh instead of resuming into nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const resumes: (string | undefined)[] = [];
   const limited: SpawnFn = async (request) => {
     resumes.push(request.resume);
@@ -1308,7 +1300,7 @@ test('policy `switch` without a transcript port starts fresh instead of resuming
 });
 
 test('policy `pause`: a plan limit checkpoints the phase and stops for a person', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let calls = 0;
   const limited: SpawnFn = async () => {
     calls++;
@@ -1360,9 +1352,9 @@ const rateLimited = (attempt: number): StreamEvent =>
   ({ kind: 'retry', category: 'rate_limit', attempt, detail: 'API Error: 429' });
 
 test('policy `switch` fires from the STREAM, on a child that has not exited', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now,
     pickAccount: () => 'spare',
@@ -1399,9 +1391,9 @@ test('policy `switch` fires from the STREAM, on a child that has not exited', as
 });
 
 test('one real event between retries resets the debounce — the burst has to be consecutive', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now, pickAccount: () => 'spare', portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
   });
@@ -1426,9 +1418,9 @@ test('one real event between retries resets the debounce — the burst has to be
 });
 
 test('policy `pause`: a wall on a live child parks the run with the reset time on it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now,
     pickAccount: () => 'spare',   // available, and deliberately not taken
@@ -1459,9 +1451,9 @@ test('policy `pause`: a wall on a live child parks the run with the reset time o
 });
 
 test('a warning heartbeat is not a wall — an account at 97% is still working', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now, pickAccount: () => 'spare', portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
   });
@@ -1481,9 +1473,9 @@ test('a warning heartbeat is not a wall — an account at 97% is still working',
 });
 
 test('nowhere better to go means the session is left exactly as it was', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now,
     // No second account. Killing a child that has nowhere to move to only
@@ -1509,7 +1501,7 @@ test('nowhere better to go means the session is left exactly as it was', async (
 });
 
 test('the run’s account env reaches every spawn', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const envs: (NodeJS.ProcessEnv | undefined)[] = [];
   const watching: SpawnFn = async (request) => {
     envs.push(request.env);
@@ -1533,7 +1525,7 @@ test('the run’s account env reaches every spawn', async () => {
 });
 
 test('a budget cap resumes the same session rather than restarting the phase', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const resumes: (string | undefined)[] = [];
   const capped: SpawnFn = async (request) => {
     resumes.push(request.resume);
@@ -1555,7 +1547,7 @@ test('a budget cap resumes the same session rather than restarting the phase', a
 test('an incomplete verification stops the cautious run and not the eager one', async () => {
   const text = '`true` plus `… -q`'; // one runnable, one fragment
   for (const [autonomy, expected] of [['halt-on-everything', 'parked'], ['keep-going', 'finished']] as const) {
-    const r = repo();
+    const r = stubbedPlan();
     const { instance } = runner(r, workingSession(r), text);
     await instance.start({ slug: 'demo', root: r.root, autonomy });
     await instance.wait();
@@ -1580,7 +1572,7 @@ test('an incomplete verification stops the cautious run and not the eager one', 
  * ------------------------------------------------------------------ */
 
 test('a run interrupted mid-phase parks instead of re-running a half-done phase', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // A checkpoint left behind by a console that died: a child that is now gone.
   const stale = newRun({ slug: 'demo', root: r.root });
   stale.child = { pid: 999_999, phase: 1, sessionId: 'sess-x', startedAt: new Date().toISOString() };
@@ -1599,7 +1591,7 @@ test('a run interrupted mid-phase parks instead of re-running a half-done phase'
 });
 
 test('a child that outlived the console blocks the run rather than doubling up', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const stale = newRun({ slug: 'demo', root: r.root });
   // Our own pid: alive, guaranteed, and nothing to clean up afterwards.
   stale.child = { pid: process.pid, phase: 1, sessionId: 'sess-y', startedAt: new Date().toISOString() };
@@ -1629,7 +1621,7 @@ test('a child that outlived the console blocks the run rather than doubling up',
  * `orphanAdvice` is now the one composer both reach.
  */
 test('an adopted FROZEN orphan is told how to continue it, not to wait for it (autopilot-5)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const stale = newRun({ slug: 'demo', root: r.root });
   // Our own pid — alive, guaranteed — flagged the way a console records a
   // freeze it performed before it died.
@@ -1659,7 +1651,7 @@ test('an adopted FROZEN orphan is told how to continue it, not to wait for it (a
 });
 
 test('the checkpoint is on disk and readable after the run', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -1673,7 +1665,7 @@ test('the checkpoint is on disk and readable after the run', async () => {
 });
 
 test('the journal records the sequence a person would ask about', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -1688,7 +1680,7 @@ test('the journal records the sequence a person would ask about', async () => {
 });
 
 test('a second run on the same plan is refused while one is in flight', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let release: () => void = () => {};
   let entered: () => void = () => {};
   const inSession = new Promise<void>((resolve) => { entered = resolve; });
@@ -1749,7 +1741,7 @@ function heldSession(r: Repo, seen: number[] = []) {
 }
 
 test('an armed pause names the phase it is waiting for, and stops at the boundary', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
   const { instance } = runner(r, held.spawn);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1773,7 +1765,7 @@ test('an armed pause names the phase it is waiting for, and stops at the boundar
 });
 
 test('a cancelled pause lets the run carry on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
   const { instance } = runner(r, held.spawn);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1798,7 +1790,7 @@ test('a pause armed while the board is being read starts no phase at all', async
   // gap was set a few hundred milliseconds after the only line that read it, so
   // the next phase started anyway and the operator watched the thing they had
   // just stopped begin new work.
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   r.setSlowBoard(true);
   const { instance } = runner(r, workingSession(r, seen));
@@ -1822,7 +1814,7 @@ test('thawing a frozen session does not take back a pause that was already armed
   // Pause, then Freeze, then Continue. `thaw` wrote `running` unconditionally,
   // which silently discarded a request the operator had already made and never
   // took back — Cancel pause is the control for that, and they did not press it.
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -1844,7 +1836,7 @@ test('thawing a frozen session does not take back a pause that was already armed
 });
 
 test('pausing a run nothing is driving reports that it did nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   // The exact condition that made the Pause button answer 200 and do nothing:
   // no loop behind the run. The runner now says so instead of returning
@@ -1863,7 +1855,7 @@ test('pausing a run nothing is driving reports that it did nothing', async () =>
  * ------------------------------------------------------------------ */
 
 test('a question reaches the session that is running, framed so it cannot redirect it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const sent: string[] = [];
   let release: () => void = () => {};
   let entered: () => void = () => {};
@@ -1910,7 +1902,7 @@ test('a question reaches the session that is running, framed so it cannot redire
 });
 
 test('ACC-8.9 (TRS-6): an operator\'s question and the session\'s reply are a pair on the journal — phase.asked, then phase.answered {question, options, chosen, by, ms}, once', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let onEvent: ((event: StreamEvent) => void) | undefined;
   let release: () => void = () => {};
   let entered: () => void = () => {};
@@ -1967,7 +1959,7 @@ test('ACC-8.11 (QRL-9): the spawn door gives every session of a relay-off run --
     ['last-resort', '2.1.271', false, false],
     ['off', '2.1.200', false, true],
   ] as const) {
-    const r = repo();
+    const r = stubbedPlan();
     const seen: (string | undefined)[] = [];
     const spawn: SpawnFn = async (request) => {
       seen.push(request.permissionPrompts);
@@ -1995,7 +1987,7 @@ test('ACC-8.11 (QRL-9): the spawn door gives every session of a relay-off run --
 
 test('ACC-8.11 (AC-13, QRL-5): the relay arms at the spawn door only on an init version read at or above the floor — the host and no floor flag when armed, the floor and run.relay-refused when not, and a session\'s own init arms the next', async () => {
   const { RELAY_HOST_TOOL } = await import('../server/relay-host.ts');
-  const r = repo();
+  const r = stubbedPlan();
   const seen: { phase: number; prompts?: string; tool?: string; doc?: { mcpServers: Record<string, { type: string; args: string[] }> } }[] = [];
   const noted: string[] = [];
   let reported: string | null = null;
@@ -2045,7 +2037,7 @@ test('ACC-8.11 (AC-13, QRL-5): the relay arms at the spawn door only on an init 
 });
 
 test('ACC-8.4 (TRS-2): an armed session\'s own init is read at the door — below the floor refuses the relay, a missing AskUserQuestion or a host not connected is journalled — and a control_request and a defer go on the journal', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawn: SpawnFn = async (request) => {
     const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
     if (phase === 1) {
@@ -2081,7 +2073,7 @@ test('ACC-8.4 (TRS-2): an armed session\'s own init is read at the door — belo
 
 test('ACC-8.16 (QRL-6): the session is told the relay\'s answer down its own stdin, in the plan\'s exact sentence, tagged — and it writes no phase.asked', async () => {
   const { frameRelayAnswer } = await import('../server/runner/runner-core.ts');
-  const r = repo();
+  const r = stubbedPlan();
   const sent: string[] = [];
   let release: () => void = () => {};
   let entered: () => void = () => {};
@@ -2120,7 +2112,7 @@ test('ACC-8.16 (QRL-6): the session is told the relay\'s answer down its own std
 });
 
 test('the same idempotency key is one write, however many times it is posted', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const sent: string[] = [];
   let release: () => void = () => {};
   let entered: () => void = () => {};
@@ -2161,7 +2153,7 @@ test('the same idempotency key is one write, however many times it is posted', a
 });
 
 test('Steer is an instruction, and the journal records it as one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const sent: string[] = [];
   let release: () => void = () => {};
   let entered: () => void = () => {};
@@ -2206,7 +2198,7 @@ test('Steer is an instruction, and the journal records it as one', async () => {
 });
 
 test('an empty or oversized question is refused before it is sent anywhere', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const sent: string[] = [];
   let release: () => void = () => {};
   let entered: () => void = () => {};
@@ -2235,7 +2227,7 @@ test('an empty or oversized question is refused before it is sent anywhere', asy
 });
 
 test('asking when nothing is running says so rather than swallowing it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   const before = instance.ask('anyone there?');
   assert.equal(before.ok, false);
@@ -2251,7 +2243,7 @@ test('asking when nothing is running says so rather than swallowing it', async (
 });
 
 test('steering a settled lane is refused, and the refusal names steering', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
 
   const before = instance.steer('use the existing helper');
@@ -2355,7 +2347,7 @@ function streamingSession(r: Repo, markDone = true) {
 }
 
 /**
- * A `repo()` that is also a real git checkout, because "did this attempt change
+ * A `stubbedPlan()` that is also a real git checkout, because "did this attempt change
  * anything" is a question only the tree can answer.
  *
  * The base commit is dated years ago so it can never fall inside an attempt's
@@ -2363,7 +2355,7 @@ function streamingSession(r: Repo, markDone = true) {
  * a session marking its phase done does not read as work on disk.
  */
 function gitRepo(): Repo {
-  const r = repo();
+  const r = stubbedPlan();
   const env = {
     ...process.env,
     GIT_AUTHOR_DATE: '2020-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2020-01-01T00:00:00Z',
@@ -2376,23 +2368,14 @@ function gitRepo(): Repo {
   return r;
 }
 
-/** A fake clock the test winds by hand, shaped as `RunnerDeps.now`. */
-function fakeClock(from = '2026-08-22T10:00:00Z') {
-  const state = { at: Date.parse(from) };
-  return {
-    now: () => new Date(state.at),
-    wind: (ms: number) => { state.at += ms; },
-  };
-}
-
 const livenessEvents = (events: { event: string; data: Record<string, unknown> }[]) =>
   events.filter((e) => e.event === 'run:liveness')
     .map((e) => e.data as { phase: number; stall: { signal?: string; detail?: string } | null });
 
 test('a lane that goes quiet is reported ONCE, and clears the moment it speaks again', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -2453,9 +2436,9 @@ test('a lane that goes quiet is reported ONCE, and clears the moment it speaks a
  * waiting is fine, the squatting is not**, and the difference is the lock.
  */
 test('a lane inside a poll loop is parked, and its lock is let go', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -2539,9 +2522,9 @@ test('a lane inside a poll loop is parked, and its lock is let go', async () => 
  * had its time.
  */
 test('a lane watching its OWN job is nudged, not parked, and only parked much later', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r, { attempts: 1 });
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -2613,9 +2596,9 @@ test('a lane watching its OWN job is nudged, not parked, and only parked much la
  * minutes; after it, it waited for ever.
  */
 test('a local wait whose nudge is refused still parks, and says so once', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r, { attempts: 1, openStdin: false });
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -2659,9 +2642,9 @@ test('a local wait whose nudge is refused still parks, and says so once', async 
  * episodes on one lane, two lines — and with the clearing deleted, one.
  */
 test('the refusal latch is per episode — a second wait on the same lane is said again', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r, { attempts: 1, openStdin: false });
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -2769,9 +2752,9 @@ function silentSession(
 }
 
 test('a lane silent before its first tool call is nudged, then recycled on its own session', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -2843,9 +2826,9 @@ test('a session that ANSWERS the nudge and wedges again is still recycled, never
   // hangs again. The next silence read as episode two and the phase PARKED with
   // the recycle never climbed, while the errand told the operator it had been.
   // Counting rungs is what fixes it, and this is the case that proves it.
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -2885,9 +2868,9 @@ test('a nudge that could not be written is journalled as REFUSED, and costs no r
   // refusal left a sentence claiming the console had nudged the session and
   // that a recycle would follow in five minutes. On this plan a false sentence
   // is the defect class, not a nit.
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r, { openStdin: false });
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -2964,9 +2947,9 @@ const ENVELOPE_CLAUSES: {
 
 for (const { clause, what, arm } of ENVELOPE_CLAUSES) {
   test(`the envelope holds on ${clause} alone — ${what}`, async () => {
-    const r = repo();
+    const r = stubbedPlan();
     const s = silentSession(r);
-    const clock = fakeClock();
+    const clock = dateClock('2026-08-22T10:00:00Z');
     const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await s.gates[0].entered;
@@ -3002,7 +2985,7 @@ test('the envelope holds on commitsSinceStart alone — THIS attempt committed s
   // `record.costUsd`, in the clause meant to be the honest one.
   const r = gitRepo();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3049,7 +3032,7 @@ test('work evidence is measured from THIS attempt, so an earlier attempt-s commi
   // (`attemptStartedAt`) does not. No fake git and no second attempt needed.
   const r = gitRepo();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3085,7 +3068,7 @@ test('the envelope holds on a DIRTY TREE alone — the session has edited files'
   // and `evaluateLane` refreshes it on its own slower cadence.
   const r = gitRepo();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3113,9 +3096,9 @@ test('a lane with ANY work in it is never nudged and never recycled', async () =
   // One tool call — the weakest possible evidence of work — is enough, and it
   // is the clause `turnsSinceLastTool` alone cannot express (every tool call
   // resets it to zero, so on its own it reads "not right now", never "never").
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3152,7 +3135,7 @@ test('a lane with ANY work in it is never nudged and never recycled', async () =
  * well against a verdict chase that was deleted.
  */
 test('a frozen console does not chase the owed QA verdict — and still chases it after the thaw', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setQaOwed('pending');
   const spawns: { name?: string; resume?: string }[] = [];
   const spawn: SpawnFn = async (request) => {
@@ -3197,7 +3180,7 @@ test('a spent QA round budget parks the phase with an errand naming the last rep
   // has to name the report that describes the code AS IT STANDS, which after
   // two rounds is round 2's, not the plain `phase-01-qa.md` the static ask
   // pointed nowhere near.
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: { name?: string }[] = [];
   const spawn: SpawnFn = async (request) => {
     spawns.push({ name: request.name });
@@ -3249,7 +3232,7 @@ test('the QA budget counts the rounds ON FILE, not only the ones this console wa
   // records a new verdict, and nothing put that round on the record; the budget
   // therefore could not bind in the fail → fix → fail loop it exists for. The
   // FILE is the shared truth, so the climb re-reads it.
-  const r = repo();
+  const r = stubbedPlan();
   r.setQaHistory('1\tfail\treports/phase-01-qa.md\t2026-09-01\n2\tfail\treports/phase-01-qa-round2.md\t2026-09-02\n');
   const spawn: SpawnFn = async (request) => {
     const boot = /BOOT phase (\d+)/.exec(request.prompt);
@@ -3288,7 +3271,7 @@ test('re-reading the rounds MERGES onto the record — a round the file lacks is
   // not hold vanished — and one class of round is exactly that, the entry the
   // runner writes when a reviewer records no verdict at all. With it went the
   // session, the brief and what that review cost, which is criterion 4.
-  const r = repo();
+  const r = stubbedPlan();
   r.setQaHistory('1\tfail\treports/phase-01-qa.md\t2026-09-01\n');
   const spawn: SpawnFn = async (request) => {
     const boot = /BOOT phase (\d+)/.exec(request.prompt);
@@ -3333,7 +3316,7 @@ test('the QA budget is spent by FAILED rounds only — a pass on the record is n
   // waivers and the synthetic entry pushed when a reviewer records nothing —
   // and because `qa[]` deliberately survives `resetForRetry`, a phase could
   // park on its FIRST real fail claiming three had failed.
-  const r = repo();
+  const r = stubbedPlan();
   const spawn: SpawnFn = async (request) => {
     const boot = /BOOT phase (\d+)/.exec(request.prompt);
     if (boot) { r.markDone(Number(boot[1])); return ok({ sessionId: `sess-p${boot[1]}` }); }
@@ -3373,9 +3356,9 @@ test('a frozen, pausing or fleet-held lane is never touched by the watchdog', as
   // make a lane silent BY CONSTRUCTION, so an ungated watchdog reads the
   // console's own act as the failure it exists to catch and recycles the
   // operator's pause.
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   let fleet: { at: string; by?: string } | null = null;
   const { instance } = runner(r, s.spawn, '`true`', undefined, {
     now: clock.now, fleetHold: () => fleet,
@@ -3423,10 +3406,10 @@ test('a frozen, pausing or fleet-held lane is never touched by the watchdog', as
 });
 
 test('a lane that wedges again with BOTH rungs spent parks with one errand, and the others carry on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setParallel(true);
   const s = silentSession(r, { attempts: 2 });
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3485,12 +3468,12 @@ test('a park whose session never had an id does not claim it was resumed on one'
   // /recycled/, which both branch strings satisfy. The sentence next door in
   // `service-live.ts` WAS pinned — and this is the copy an operator reads on the
   // errand card, which is the one place they cannot check it against anything.
-  const r = repo();
+  const r = stubbedPlan();
   // No `init` frame, so the phase never learns a session id — exactly a lane
   // wedged before the CLI said anything at all, which is this watchdog's whole
   // subject.
   const s = silentSession(r, { announceSession: false });
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3529,9 +3512,9 @@ test('a ledger written by an OLDER build does not make the ladder unbounded', as
   // rung read as unclimbed for ever: measured at four ticks, four nudges, no
   // recycle, no park. Reading through `?? 0` makes a foreign ledger mean "this
   // phase has climbed nothing", which is safe AND bounded.
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3560,9 +3543,9 @@ test('a refused nudge writes NO ledger, so "absent means never" stays exact', as
   // QA round 2. An empty `{ nudges: 0, recycles: 0 }` on the record is not the
   // same fact as no record at all — every reader of the checkpoint would see a
   // phase the watchdog had "handled". Nothing was done, so nothing is written.
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r, { openStdin: false });
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -3596,9 +3579,9 @@ test('an operator Retry clears the watchdog ledger — and nothing else does', (
 test('an ordinary long command is never parked, however long it runs', async () => {
   // The false positive that would matter most: this ends a LIVE session. A
   // twelve-minute test suite is silent, is fine, and must keep its lock.
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -3616,9 +3599,9 @@ test('an ordinary long command is never parked, however long it runs', async () 
 });
 
 test('six turns without a tool call is spinning, and the count is in the words', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -3646,9 +3629,9 @@ test('six turns without a tool call is spinning, and the count is in the words',
 });
 
 test('a phase inside its own §Verification is exempt — a build is silent and fine', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -3674,7 +3657,7 @@ test('a phase inside its own §Verification is exempt — a build is silent and 
 test('an attempt that changed nothing counts up; at the threshold the lane is a stalemate', async () => {
   const r = gitRepo();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -3705,7 +3688,7 @@ test('an attempt that changed nothing counts up; at the threshold the lane is a 
 test('an attempt the console checkpointed is not counted as an idle attempt (autopilot-4)', async () => {
   const r = gitRepo();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -3731,7 +3714,7 @@ test('an attempt the console checkpointed is not counted as an idle attempt (aut
 test('an attempt that left work on disk resets the counter, whatever the board says', async () => {
   const r = gitRepo();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -3749,10 +3732,10 @@ test('an attempt that left work on disk resets the counter, whatever the board s
 test('a tree the console cannot read is never evidence of a stalemate', async () => {
   // "I could not check" and "nothing happened" are different facts, and three
   // attempts against a repository the console cannot see is a console problem.
-  // `repo()` is not a git checkout, so `workEvidence` answers `null` here.
-  const r = repo();
+  // `stubbedPlan()` is not a git checkout, so `workEvidence` answers `null` here.
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, held.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await held.inSession;
@@ -3772,7 +3755,7 @@ function procState(pid: number): string {
 }
 
 test('freezing stops the child where it stands, and thawing lets it carry on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -3815,7 +3798,7 @@ test('freezing stops the child where it stands, and thawing lets it carry on', a
  * instead of falling through to the board read forever.)
  */
 test('a freeze that outlived its lane is still thawable', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -3858,7 +3841,7 @@ test('a freeze that outlived its lane is still thawable', async () => {
  * THAW is what starts it, not the race.
  */
 test('a frozen run refuses to board, and boards again once thawed', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -3902,7 +3885,7 @@ test('a frozen run refuses to board, and boards again once thawed', async () => 
  * let the wedge ship — the one committed test for this fix bypassed the loop.
  */
 test('a freeze over a lane that never spawned settles the run instead of wedging it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let release: () => void = () => {};
   let entered: () => void = () => {};
   const inSession = new Promise<void>((resolve) => { entered = resolve; });
@@ -3965,7 +3948,7 @@ test('a freeze over a lane that never spawned settles the run instead of wedging
  * genuinely frozen.
  */
 test('a freeze holding a live child holds the loop — it is never settled out from under', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -4010,7 +3993,7 @@ test('a freeze holding a live child holds the loop — it is never settled out f
  * once, and a docs change during one would otherwise settle every run under it.
  */
 test('a docs-change wake during a freeze admits nothing and never settles the run', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -4059,7 +4042,7 @@ test('a docs-change wake during a freeze admits nothing and never settles the ru
  * record — because "no deadline" must not quietly become "no freeze".
  */
 test('a STANDING freeze stops the child and arms no clock at all', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -4099,7 +4082,7 @@ test('a STANDING freeze stops the child and arms no clock at all', async () => {
  * because both freezes are perfectly well gated.
  */
 test('a standing freeze converts a lane that was already frozen on a clock', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; });
   const { instance } = runner(r, held.spawn);
@@ -4133,7 +4116,7 @@ test('a standing freeze converts a lane that was already frozen on a clock', asy
 });
 
 test('a freeze held too long checkpoints, and Continue resumes that session', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; }, false);
   const { instance } = runner(r, held.spawn);
@@ -4179,7 +4162,7 @@ test('retry and skip say so the moment they act, not at the next thing that happ
   // old status — a retried phase still read `failed`, under a halt banner that
   // had already been cleared — until something unrelated happened to emit. The
   // only way to see the truth was to reload the page.
-  const r = repo();
+  const r = stubbedPlan();
   const { instance, events } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -4200,7 +4183,7 @@ test('retry and skip say so the moment they act, not at the next thing that happ
 });
 
 test('freezing a run nothing is driving reports that it did nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   assert.equal(instance.freeze(), false, 'no loop, no child, nothing to stop');
   assert.equal(instance.thaw(), false);
@@ -4212,7 +4195,7 @@ test('freezing a run nothing is driving reports that it did nothing', async () =
  * ------------------------------------------------------------------ */
 
 test('the operator wins over the plan, the plan wins over the run default', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: { phase: number; model?: string; effort?: string }[] = [];
   // The plan asks for opus/high on phase 2, and says nothing about 1 or 3.
   const { instance } = runner(r, recordingSession(r, seen), '`true`',
@@ -4237,7 +4220,7 @@ test('the operator wins over the plan, the plan wins over the run default', asyn
 });
 
 test('the journal says where each choice came from', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance, events } = runner(r, workingSession(r), '`true`',
     (_slug, phase) => (phase === 1 ? { model: 'opus' } : undefined));
   await instance.start({ slug: 'demo', root: r.root, effort: 'low', autonomy: 'keep-going', onlyPhases: [1] });
@@ -4250,7 +4233,7 @@ test('the journal says where each choice came from', async () => {
 });
 
 test('a restricted tool set reaches the session', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: { phase: number; tools?: string[] }[] = [];
   const { instance } = runner(r, recordingSession(r, seen));
   await instance.start({
@@ -4263,7 +4246,7 @@ test('a restricted tool set reaches the session', async () => {
 });
 
 test('a run asked for one phase runs that phase and stops', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance } = runner(r, workingSession(r, seen));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
@@ -4280,7 +4263,7 @@ test('a run asked for one phase runs that phase and stops', async () => {
 });
 
 test('a run that finishes a whole plan says that is why it stopped', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -4290,7 +4273,7 @@ test('a run that finishes a whole plan says that is why it stopped', async () =>
 });
 
 test('settings changed mid-run apply from the next phase', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const held = heldSession(r, seen);
   const { instance } = runner(r, held.spawn);
@@ -4311,7 +4294,7 @@ test('settings changed mid-run apply from the next phase', async () => {
 });
 
 test('nothing was written inside the repo — run state lives outside it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
@@ -4873,7 +4856,7 @@ test('an untrusted workspace no longer blocks a run', async () => {
   rmSync(dir, { recursive: true, force: true });
 
   // And end to end: a run in such a workspace actually runs.
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance } = runner(r, workingSession(r, seen));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
@@ -4960,7 +4943,7 @@ test("a plan's phase scopes are readable, with what each one would collide with"
  * ------------------------------------------------------------------ */
 
 test('continuing a resolved run clears the resolution, so a second halt raises a card', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // First life: the session claims success and writes nothing — halt #1.
   const liar: SpawnFn = async () => ok({ resultText: 'Phase complete!' });
   const first = runner(r, liar);
@@ -4991,7 +4974,7 @@ test('continuing a resolved run clears the resolution, so a second halt raises a
 });
 
 test("a new halt clears a stale resolution but keeps a person's reopen-veto", async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // The annotation appears while the run is live — the one path `start` and
   // `recover` cannot have cleaned up — and then the halt fires.
   let handle: InstanceType<typeof Runner> | null = null;
@@ -5032,7 +5015,7 @@ async function untilGateChecking(r: Repo): Promise<void> {
 }
 
 test('a pause armed while the gate is checked starts nothing and queues nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setSlowGate(true);
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen));
@@ -5054,7 +5037,7 @@ test('a pause armed while the gate is checked starts nothing and queues nothing'
 });
 
 test('the run does not claim a phase until it genuinely starts', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setSlowGate(true);
   const during: (number | null | undefined)[] = [];
   let instance!: InstanceType<typeof Runner>;
@@ -5080,7 +5063,7 @@ test('the run does not claim a phase until it genuinely starts', async () => {
  * ------------------------------------------------------------------ */
 
 test('retry on a stopped run resets the phase and starts the run again', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { Service } = await import('../server/service.ts');
   const { phaseRecord: recordOf } = await import('../server/runner/state.ts');
   const service = new Service({
@@ -5129,7 +5112,7 @@ test('retry on a stopped run resets the phase and starts the run again', async (
  * ------------------------------------------------------------------ */
 
 test('under `credential policy: require` a phase naming an unheld credential never spawns and journals phase.credential-preflight', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const asked: string[][] = [];
   const raised: { slug: string; phase: number; birth: string; step: unknown }[] = [];
@@ -5178,7 +5161,7 @@ test('under `credential policy: require` a phase naming an unheld credential nev
 });
 
 test('under `credential policy: continue` the phase boards, is told which credentials are missing, and the record says so', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const prompts: string[] = [];
   const spawn: SpawnFn = async (request) => {
     prompts.push(request.prompt);
@@ -5200,7 +5183,7 @@ test('under `credential policy: continue` the phase boards, is told which creden
   const [preflight] = journalled(events, 'phase.credential-preflight');
   assert.deepEqual(preflight, { ids: ['env:DEPLOY_KEY'], held: [], missing: ['env:DEPLOY_KEY'], policy: 'continue' });
   // A registry that cannot answer refuses nothing.
-  const r2 = repo();
+  const r2 = stubbedPlan();
   const seen: number[] = [];
   const { instance: i2, events: e2 } = runner(r2, workingSession(r2, seen), '`true`', undefined, {
     planCredentials: () => ({ ids: ['gh'], policy: 'require' }),
@@ -5219,7 +5202,7 @@ test('under `credential policy: continue` the phase boards, is told which creden
  * ------------------------------------------------------------------ */
 
 test('a verification with nothing runnable parks the phase BEFORE a session is spent', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen),
     'targeted pytest + full safe set; both green.');
@@ -5247,7 +5230,7 @@ test('a verification with nothing runnable parks the phase BEFORE a session is s
 });
 
 test('a plan with no verification at all parks the same way, saying so', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   // '' rather than undefined: the helper's parameter default would silently
   // substitute '`true`' for undefined — the exact defaulted-parameter trap
@@ -5262,7 +5245,7 @@ test('a plan with no verification at all parks the same way, saying so', async (
 });
 
 test('with allowUnverifiedPhases on, a plan with no verification boards and passes on its handoff — journalled as waived, never as "0 commands green"', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen), '', undefined, {
     allowUnverifiedPhases: () => true,
@@ -5289,7 +5272,7 @@ test('with allowUnverifiedPhases on, a plan with no verification boards and pass
 });
 
 test('allowUnverifiedPhases waives an OMITTED bullet only — a declared bullet the runner cannot read still parks', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen), '', undefined, {
     allowUnverifiedPhases: () => true,
@@ -5305,7 +5288,7 @@ test('allowUnverifiedPhases waives an OMITTED bullet only — a declared bullet 
 });
 
 test('a declared-but-unreadable verification blames the shape, not the plan', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   // The parser handed over '' but the raw block DOES declare the bullet — the
   // real ai-builder shape. "The plan states no verification" here once sent an
@@ -5326,7 +5309,7 @@ test('a declared-but-unreadable verification blames the shape, not the plan', as
 });
 
 test('preflight warnings are journalled without blocking the phase', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   // One runnable command, one continuation fragment: the fragment becomes a
   // person-check later, and the preflight says so up front — but the phase runs.
@@ -5354,7 +5337,7 @@ test('preflight warnings are journalled without blocking the phase', async () =>
 });
 
 test('an all-verification park halts with a machine-readable kind and an anchor phase', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   // Unscoped: phase 1 parks at preflight, later phases stay waiting, so the
   // loop runs out of candidates with work outstanding — the real run's shape.
@@ -5380,7 +5363,7 @@ test('an all-verification park halts with a machine-readable kind and an anchor 
  * ------------------------------------------------------------------ */
 
 test('a parked run names a gated phase with the gate note, and says what to do', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setGate(1, 'manual: confirm the rollout window');
   const { instance } = runner(r, workingSession(r), '`true`', undefined, { delegateHumanGates: () => false });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -5400,7 +5383,7 @@ test('a parked run names a gated phase with the gate note, and says what to do',
 });
 
 test('a stuck phase is named as blocked-by-its-handoff, never "waiting on a gate"', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setStuck(1);
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -5419,7 +5402,7 @@ test('a stuck phase is named as blocked-by-its-handoff, never "waiting on a gate
 /* ---------------- per-lane stop, the streak, and the account preflight ---------------- */
 
 test('continuing a run resets the failure streak, and says so in the journal', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const { instance } = runner(r, held.spawn);
   const stored = newRun({ slug: 'demo', root: r.root });
@@ -5444,7 +5427,7 @@ test('continuing a run resets the failure streak, and says so in the journal', a
 });
 
 test('ACC-5.1 (RCV-3): an automatic relaunch carries the streak forward — no reset, no run.failure-streak-reset — and a person\'s press is what clears it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const { instance, events } = runner(r, held.spawn);
   const stored = newRun({ slug: 'demo', root: r.root });
@@ -5470,7 +5453,7 @@ test('ACC-5.1 (RCV-3): an automatic relaunch carries the streak forward — no r
 });
 
 test('ACC-5.1 (RCV-3): a run whose streak is spent is refused an automatic relaunch with a named state — run.relaunch-refused, status untouched, no run.start', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: SpawnRequest[] = [];
   const { instance, events } = runner(r, async (request) => {
     spawns.push(request);
@@ -5521,7 +5504,7 @@ test('ACC-5.1 (RCV-3): a run whose streak is spent is refused an automatic relau
 });
 
 test('a frozen lane can be stopped: woken first, credited, session id kept, streak untouched', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; }, false);
   const { instance } = runner(r, held.spawn);
@@ -5571,7 +5554,7 @@ test('a per-phase stop carries phase and the DERIVED actor through the service, 
 });
 
 test('a per-model limit files its wall against the account, and the run continues on the next model', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const marked: { window: string; accountId?: string }[] = [];
   let spawns = 0;
   const limited: SpawnFn = async (request) => {
@@ -5604,7 +5587,7 @@ test('a per-model limit files its wall against the account, and the run continue
 });
 
 test('the preflight probes the RUN’s account, and a refusal parks before any spawn', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const probed: (string | undefined)[] = [];
   const seen: number[] = [];
   const { instance } = runner(r, workingSession(r, seen), '`true`', undefined, {
@@ -5617,7 +5600,7 @@ test('the preflight probes the RUN’s account, and a refusal parks before any s
   assert.ok(seen.length > 0, 'a healthy probe lets the run proceed');
   r.cleanup();
 
-  const r2 = repo();
+  const r2 = stubbedPlan();
   const seen2: number[] = [];
   const second = runner(r2, workingSession(r2, seen2), '`true`', undefined, {
     checkAuth: async () => ({
@@ -5657,7 +5640,7 @@ function fileOutcome(request: SpawnRequest, body: Record<string, unknown>): void
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test('a declared waiting-external parks the phase — no halt, no closeout nudge — and the resume continues the SAME session', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const resumes: (string | undefined)[] = [];
     let calls = 0;
@@ -5716,7 +5699,7 @@ test('a declared waiting-external parks the phase — no halt, no closeout nudge
 });
 
 test('the wait budget is finite: a phase that keeps re-filing the same wait parks honestly on a budgets errand', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => {
       fileOutcome(request, {
@@ -5756,7 +5739,7 @@ test('a closeout session that files waiting-external parks the phase instead of 
   // The exact phase-8 shape: the first session ends without paperwork, the
   // nudge resumes it, and the honest answer is still "the external clock has
   // not landed" — which used to become the halt. Now it becomes the park.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     execFileSync('git', ['init', '-q'], { cwd: r.root });
     writeFileSync(join(r.root, 'half-finished.txt'), 'work in flight\n');
@@ -5788,7 +5771,7 @@ test('a closeout session that files waiting-external parks the phase instead of 
 });
 
 test('a session with no outcome and no work still halts no-handoff — the legacy pin', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { instance } = runner(r, async () => ok({ resultText: 'Phase complete!' }));
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
@@ -5802,7 +5785,7 @@ test('a session with no outcome and no work still halts no-handoff — the legac
 });
 
 test('a stale outcome file from a previous attempt is ignored and the legacy path stands', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => {
       // Written BEFORE the attempt started — a leftover from a crashed try.
@@ -5824,7 +5807,7 @@ test('a stale outcome file from a previous attempt is ignored and the legacy pat
 });
 
 test('outcome blocked on a lock re-queues the phase without a halt; needs-human parks the run for a person', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let calls = 0;
     const spawn: SpawnFn = async (request) => {
@@ -5853,7 +5836,7 @@ test('outcome blocked on a lock re-queues the phase without a halt; needs-human 
     assert.equal(journalled(events, 'run.halt').length, 0, 'a refused lock is not a defect');
   } finally { r.cleanup(); }
 
-  const r2 = repo();
+  const r2 = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => {
       fileOutcome(request, {
@@ -5894,7 +5877,7 @@ test('a failed record the board has overtaken is closed as "outside this run", n
   // finishes that phase by hand, the run is continued — and the stale record
   // used to stand forever ("Departed" board chip over a red row) while the
   // loop, with `failed` in SETTLED, wouldn't touch the phase either.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stale = newRun({ slug: 'demo', root: r.root, model: 'opus' });
     stale.status = 'halted';
@@ -5917,7 +5900,7 @@ test('a failed record the board has overtaken is closed as "outside this run", n
 });
 
 test('the docs watcher wakes a mid-flight loop: a newly-ready phase boards before any lane settles', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const seen: number[] = [];
     let releaseFirst!: () => void;
@@ -5958,7 +5941,7 @@ test('the docs watcher wakes a mid-flight loop: a newly-ready phase boards befor
  * ------------------------------------------------------------------ */
 
 test('a foreign lock at boarding queues the phase behind the holder, and boards when it frees', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setLockRefused(true);
     const seen: number[] = [];
@@ -5981,7 +5964,7 @@ test('a foreign lock at boarding queues the phase behind the holder, and boards 
 });
 
 test('a lock wait that outlives the cap parks honestly, naming the holder and the wait', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setLockRefused(true);
     // A run whose record says it has already queued behind this lock for
@@ -6020,7 +6003,7 @@ test('D28/QA N-1: a halt holding BOTH park kinds carries BOTH remedies', async (
   // sentence for one MISSING one: a single cap-parked phase then suppressed the
   // lock sentence for every other parked phase in the same halt. They are two
   // independent `if`s now, like every other remedy in that block.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setParallel(true);
     // A lock the belt-check keeps seeing, so the lock park is not re-armed out
@@ -6061,7 +6044,7 @@ test('D28/QA N-1: a halt holding BOTH park kinds carries BOTH remedies', async (
  * the whole time.
  */
 test('a phase queued behind a foreign lock stamps its wait and parks at the cap (autopilot-3)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // The lock is real on BOTH sides — the scheduler's view below and the
     // script `rearmLockCapParks` asks. They are two different readers of one
@@ -6138,7 +6121,7 @@ test('at the session cap a queued phase waits for a lane — it is NOT capped in
   // watchdog, the phases behind it queue rather than park. That trade is the
   // plan's (`console-unattended-autopilot` §Phase 1, R9) and is recorded in the
   // handoff's Outstanding section.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stale = newRun({ slug: 'demo', root: r.root, model: 'opus' });
     stale.status = 'paused';
@@ -6186,7 +6169,7 @@ test('the lease keepalive refreshes the lock under the shared owner, and stands 
     return readFileSync(path, 'utf8').split('\n').filter((line) => /\bclaim\b/.test(line));
   };
 
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // The session holds its turn until the supervisor's keepalive has fired —
     // exactly the long-phase shape the keepalive exists for.
@@ -6208,7 +6191,7 @@ test('the lease keepalive refreshes the lock under the shared owner, and stands 
     assert.ok(journalled(events, 'phase.lock-refreshed').length, 'the refresh is on the record');
   } finally { r.cleanup(); }
 
-  const r2 = repo();
+  const r2 = stubbedPlan();
   try {
     r2.setClaimRefuse(true); // every claim answers "held by someone else"
     const spawn: SpawnFn = async () => {
@@ -6266,7 +6249,7 @@ test('the keepalive states the runner OWN lease — RUNNER_LEASE_S, 5400 s — o
       .filter((line) => /\bclaim\b/.test(line) && !line.includes(`--lease ${PROVISIONAL_LEASE_S}`));
   };
 
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async () => {
       for (let i = 0; i < 300 && !claims(r).length; i++) await sleep(10);
@@ -6288,7 +6271,7 @@ test('sessions carry PE_MCP_SERVERS from the registry — and nothing when no re
   // F15's MCP advisory was silently dead inside every unattended session:
   // sessions run validate.sh themselves, and launchd's env carries no
   // registry. Resolved per spawn; set-but-empty is a real answer.
-  const r = repo();
+  const r = stubbedPlan();
   const envs: (string | undefined)[] = [];
   const spy: SpawnFn = async (request) => {
     envs.push(request.env?.PE_MCP_SERVERS);
@@ -6303,7 +6286,7 @@ test('sessions carry PE_MCP_SERVERS from the registry — and nothing when no re
   assert.deepEqual(envs, ['context7 sentry', 'context7 sentry', 'context7 sentry']);
   r.cleanup();
 
-  const bare = repo();
+  const bare = stubbedPlan();
   const bareEnvs: (string | undefined)[] = [];
   const bareSpy: SpawnFn = async (request) => {
     bareEnvs.push(request.env?.PE_MCP_SERVERS);
@@ -6364,7 +6347,7 @@ const journalOrder = (events: { event: string; data: Record<string, unknown> }[]
   names.map((name) => events.findIndex((e) => e.event === 'run:journal' && e.data.event === name));
 
 test('ladder: a resumed run whose only open record is interrupted with no work boards that phase fresh — no press', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     gitInit(r.root);
     // The P12 specimen: a session that died during bootstrap, the console
@@ -6402,7 +6385,7 @@ test('ladder: a resumed run whose only open record is interrupted with no work b
 });
 
 test('ladder: interrupted over a tree git cannot read is work-in-progress — no session, so it boards with the RESUMING brief', async () => {
-  const r = repo(); // not a git repository: the tree is unreadable
+  const r = stubbedPlan(); // not a git repository: the tree is unreadable
   try {
     const stale = newRun({ slug: 'demo', root: r.root });
     stale.status = 'parked';
@@ -6428,7 +6411,7 @@ test('ladder: interrupted over a tree git cannot read is work-in-progress — no
 });
 
 test('ladder: a failed record with an in-progress handoff and a session left boards as `continue` — --resume plus the continue instruction', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setInProgress(1);
     const stale = newRun({ slug: 'demo', root: r.root });
@@ -6457,7 +6440,7 @@ test('ladder: a failed record with an in-progress handoff and a session left boa
 });
 
 test('ladder: a stuck board with an unknown blocker gets ONE unblock brief; the second time the phase parks with an errand and the run keeps driving', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setParallel(true);
     r.setStuck(1);
@@ -6498,7 +6481,7 @@ test('ladder: a stuck board with an unknown blocker gets ONE unblock brief; the 
 });
 
 test('ladder: a credential blocker parks with an errand at once — no session spent; a lock blocker goes back to the queue', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setParallel(true);
     r.setStuck(1);
@@ -6519,7 +6502,7 @@ test('ladder: a credential blocker parks with an errand at once — no session s
     assert.equal(state.phases['2'].status, 'done');
   } finally { r.cleanup(); }
 
-  const r2 = repo();
+  const r2 = stubbedPlan();
   try {
     r2.setStuck(1);
     const log: { phase: number; brief: string; resume?: string; prompt: string }[] = [];
@@ -6543,7 +6526,7 @@ test('ladder: a credential blocker parks with an errand at once — no session s
 });
 
 test('ladder: a `partial` outcome is work-in-progress at once — the phase re-boards as `continue` of its own session', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const log: { phase: number; brief: string; resume?: string; prompt: string }[] = [];
     let calls = 0;
@@ -6583,7 +6566,7 @@ test('ladder: a `partial` outcome is work-in-progress at once — the phase re-b
 });
 
 test('ladder: start({reboard}) boards the named brief and journals the request', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stale = newRun({ slug: 'demo', root: r.root });
     stale.status = 'halted';
@@ -6611,7 +6594,7 @@ test('ladder: start({reboard}) boards the named brief and journals the request',
 /* ---------------- the defect list ---------------- */
 
 test('defects: an expired wait on a stuck board is no livelock — the run does not re-enter waiting on a past clock, the phase resumes', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setStuck(1);
     const stale = newRun({ slug: 'demo', root: r.root });
@@ -6646,7 +6629,7 @@ test('defects: an expired wait on a stuck board is no livelock — the run does 
 });
 
 test('defects: a verification card that goes unanswered parks the phase and the run — the streak is untouched', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { Approvals } = await import('../server/runner/approvals.ts');
     const notRun = { ok: false, reason: 'nothing runnable (1 fragment left for a human)', ran: [], notRun: [{ text: 'look at the dashboard', reason: 'prose' }] };
@@ -6703,7 +6686,7 @@ test('defects: a verification card that goes unanswered parks the phase and the 
 });
 
 test('defects: every verification lead missing at verify time parks exactly as boarding would — no card, no verify-failed halt', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const skipped = [{ command: 'rg -n TODO', lead: 'rg', reason: '`rg` is not installed on the verification PATH' }];
     const unrunnable = {
@@ -6730,7 +6713,7 @@ test('defects: every verification lead missing at verify time parks exactly as b
 });
 
 test('defects: the belt-check backs off against a stale store — at most a handful of re-boards in five seconds, doubling', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setLockRefused(true);
     const seen: number[] = [];
@@ -6755,7 +6738,7 @@ test('defects: the belt-check backs off against a stale store — at most a hand
 });
 
 test('defects: the no-handoff halt quotes the PHASE session, not the closeout that failed after it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     gitInit(r.root, ['scratch.txt']);
     writeFileSync(join(r.root, 'scratch.txt'), 'work the session did');
@@ -6779,7 +6762,7 @@ test('defects: the no-handoff halt quotes the PHASE session, not the closeout th
 });
 
 test('defects: a freeze escalation with another lane still open leaves the halt that lane wrote alone', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let pid = 0;
   const held = realChildSession(r, (p) => { pid = p; }, false);
   let releaseTwo: () => void = () => {};
@@ -6820,7 +6803,7 @@ test('defects: a freeze escalation with another lane still open leaves the halt 
 /* ---------------- the lock-cap re-arm ---------------- */
 
 test('a lock-cap park re-arms by itself when the lock it waited out is gone — no Retry', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setParallel(true);
     r.setLockRefusedFor(1, true);
@@ -6870,7 +6853,7 @@ test('D28: a SESSION-CAP park re-arms by itself once a lane frees — no Retry',
   // Its question is not `phase-lock.sh status` (there is no lock to ask about)
   // but the scheduler's own snapshot: is a lane free? Driven directly, because
   // the alternative is a test that waits for a real fleet to drain.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const scheduler = new Scheduler({ max: 1, locks: () => [] });
     const wedged = await scheduler.admit({
@@ -6923,7 +6906,7 @@ test('a GRANT park re-arms by itself once nothing holds its scope — no Retry',
   // locks — so a hung sibling's standing grant still blocks the probe (D2's
   // re-park loop cannot recur), and a released foreign run reads as the
   // empty answer it is.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const scheduler = new Scheduler({ locks: () => [] });
     const held = await scheduler.admit({
@@ -6963,7 +6946,7 @@ test('a GRANT park re-arms by itself once nothing holds its scope — no Retry',
 });
 
 test('a console shutdown stamps the run as the system\'s stop and writes the killed-lane note; an operator stop stays theirs', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // A session that hangs until its signal is cut: the shutdown path aborts
     // it, the operator-stop path aborts it the same way — only the bookkeeping
@@ -7037,7 +7020,7 @@ test('a console shutdown stamps the run as the system\'s stop and writes the kil
  * 28 s is exactly where "which side of the merge" is the only question left.
  */
 test('SHD-8: a shutdown checkpoint names each killed child\'s phase, session, grace, why and open tool — and says its intent even with no live lane', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // The ladder's waits are unref'd (a console exiting must not be held up by
   // them), so something has to hold this test's event loop open around them.
   const keepAlive = setInterval(() => {}, 1_000);
@@ -7104,7 +7087,7 @@ test('SHD-8: a shutdown checkpoint names each killed child\'s phase, session, gr
  * race's backoff — never parks and never releases anything.
  */
 test('REG-3: boarding finds a live session in the repository holding no lock — the phase queues behind it, named, and boards once it is gone', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const scheduler = new Scheduler({ locks: () => [] });
   // The boarding backoff sleeps on an unref'd timer; hold the loop open.
   const keepAlive = setInterval(() => {}, 1_000);
@@ -7166,7 +7149,7 @@ const ladderJournal = (events: { event: string; data: Record<string, unknown> }[
     .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
 
 test('auth wall: a run pinned to a signed-out account switches at preflight to one that signs in, and boards', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const probed: (string | undefined)[] = [];
   const envs: (NodeJS.ProcessEnv | undefined)[] = [];
   const seen: number[] = [];
@@ -7206,7 +7189,7 @@ test('auth wall: a run pinned to a signed-out account switches at preflight to o
 });
 
 test('auth wall: with no account that signs in, the run parks run-preflight with the errand naming the sign-in — and the switch is off under the preference', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen), '`true`', undefined, {
     checkAuth: async (accountId) => ({
@@ -7228,7 +7211,7 @@ test('auth wall: with no account that signs in, the run parks run-preflight with
   r.cleanup();
 
   // The preference off: the candidate is never even probed.
-  const r2 = repo();
+  const r2 = stubbedPlan();
   const probed: (string | undefined)[] = [];
   const second = runner(r2, workingSession(r2), '`true`', undefined, {
     checkAuth: async (accountId) => { probed.push(accountId); return { loggedIn: accountId === 'spare', checkedAt: '' }; },
@@ -7244,7 +7227,7 @@ test('auth wall: with no account that signs in, the run parks run-preflight with
 });
 
 test('usage wall past the 12h ceiling: under `wait`, the run moves to an account with headroom instead of stopping for a person', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: { env?: NodeJS.ProcessEnv; resume?: string }[] = [];
   const far = Math.floor(Date.now() / 1000) + 20 * 3600;   // 20h out: past the auto-wait ceiling
   const limited: SpawnFn = async (request) => {
@@ -7283,7 +7266,7 @@ test('usage wall past the 12h ceiling: under `wait`, the run moves to an account
 });
 
 test('usage wall past the 12h ceiling with no account to pay: the run WAITS on the window — restart-safe, the errand says when — instead of halting needs-human', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const far = Math.floor(Date.now() / 1000) + 20 * 3600;
   let spawns = 0;
   const limited: SpawnFn = async () => {
@@ -7314,7 +7297,7 @@ test('usage wall past the 12h ceiling with no account to pay: the run WAITS on t
 });
 
 test('usage wall past the ceiling under `pause` keeps its word: checkpoint and stop for a person, with the errand on the run', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const far = Math.floor(Date.now() / 1000) + 20 * 3600;
   const limited: SpawnFn = async () => ok({
     signal: { subtype: 'error_during_execution', code: 1, text: `Claude AI usage limit reached|${far}` },
@@ -7337,7 +7320,7 @@ test('usage wall past the ceiling under `pause` keeps its word: checkpoint and s
 });
 
 test('models exhausted: the run waits for the FIRST model\'s window, then retries the same session on it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const T0 = Date.parse('2026-01-01T13:00:00Z');
   let clock = T0;
   const spawns: { model?: string; resume?: string }[] = [];
@@ -7378,7 +7361,7 @@ test('models exhausted: the run waits for the FIRST model\'s window, then retrie
 });
 
 test('models exhausted with no reset on the first model halts as it always did', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let spawns = 0;
   const limited: SpawnFn = async (request) => {
     spawns++;
@@ -7407,7 +7390,7 @@ test('budget wall: a spent run budget is raised once within the cap and journall
     r.markDone(phase);
     return ok({ costUsd: 1 });
   };
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, costly(r, seen));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', runBudgetUsd: 3 });
@@ -7426,7 +7409,7 @@ test('budget wall: a spent run budget is raised once within the cap and journall
 
   // (2) $2: spent at phase 2 → raised to 2.5 → phase 3 runs → $3 ≥ 2.5: the
   // second exhaustion is the halt, with the errand saying the raise was tried.
-  const r2 = repo();
+  const r2 = stubbedPlan();
   const seen2: number[] = [];
   const second = runner(r2, costly(r2, seen2));
   await second.instance.start({ slug: 'demo', root: r2.root, autonomy: 'keep-going', runBudgetUsd: 2 });
@@ -7444,7 +7427,7 @@ test('budget wall: a spent run budget is raised once within the cap and journall
 
   // (3) a budget already at the ladder's per-run USD cap has nowhere to go:
   // the halt comes at once, and the errand says why no raise happened.
-  const r3 = repo();
+  const r3 = stubbedPlan();
   const seen3: number[] = [];
   const third = runner(r3, costly(r3, seen3), '`true`', undefined, { ladderCaps: () => ({ perRunUsd: 2 }) });
   await third.instance.start({ slug: 'demo', root: r3.root, autonomy: 'keep-going', runBudgetUsd: 2 });
@@ -7459,7 +7442,7 @@ test('budget wall: a spent run budget is raised once within the cap and journall
 });
 
 test('two DAG leaves finishing together on a work-branch run: the last leaf\'s session opens the PR — never a bare run.pr-pending ending', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setParallel(true);
   const spawns: { prompt: string; resume?: string; name?: string }[] = [];
   const working: SpawnFn = async (request) => {
@@ -7489,7 +7472,7 @@ test('two DAG leaves finishing together on a work-branch run: the last leaf\'s s
 
   // When no session can be resumed for it, the honest ending stays: the
   // branch awaits its PR and the card asks.
-  const r2 = repo();
+  const r2 = stubbedPlan();
   r2.setParallel(true);
   const failing: SpawnFn = async (request) => {
     const boot = /BOOT phase (\d+)/.exec(request.prompt);
@@ -7513,7 +7496,7 @@ test('two DAG leaves finishing together on a work-branch run: the last leaf\'s s
  * ------------------------------------------------------------------ */
 
 test('P12 — settle `keep` spends no session at all and says the branch was left alone', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: string[] = [];
   const working: SpawnFn = async (request) => {
     spawns.push(request.prompt);
@@ -7543,7 +7526,7 @@ test('P12 — settle `keep` spends no session at all and says the branch was lef
 });
 
 test('P12 — settle `integration` merges the run branch in-console, pushes nothing, spends no session', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: string[] = [];
   const working: SpawnFn = async (request) => {
     spawns.push(request.prompt);
@@ -7591,7 +7574,7 @@ test('P12 — a stale, UNREGISTERED directory under the other worktree root neve
   const { join } = await import('node:path');
   const { consoleRunsDir } = await import('../server/runner/state.ts');
   const { isRegistered } = await import('../server/runner/worktree.ts');
-  const r = repo();
+  const r = stubbedPlan();
   const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
   execFileSync('git', ['init', '-q'], { cwd: r.root, env });
   execFileSync('git', ['add', '-A'], { cwd: r.root, env });
@@ -7626,7 +7609,7 @@ test('P12 — a stale, UNREGISTERED directory under the other worktree root neve
 });
 
 test('P12 — settle `merge-queue` boards ONE session whose prompt rebases, re-verifies, then pushes', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setParallel(true);
   const spawns: { prompt: string; resume?: string; name?: string }[] = [];
   const working: SpawnFn = async (request) => {
@@ -7667,7 +7650,7 @@ test('the start door\'s maxParallel reaches a NEW run, not only a continued one'
   // the list forgets reaches the run as silence. The fifth live rehearsal read
   // exactly that — `--max-sessions 6` on the console, nothing on the run — so
   // the value is asserted on the record the moment the run exists.
-  const r = repo();
+  const r = stubbedPlan();
   const done: SpawnFn = async (request) => {
     const boot = /BOOT phase (\d+)/.exec(request.prompt);
     if (boot) r.markDone(Number(boot[1]));
@@ -7683,7 +7666,7 @@ test('the start door\'s maxParallel reaches a NEW run, not only a continued one'
 });
 
 test('P12 — a run that never finished settles NOTHING, whatever strategy it was given', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // Phase 2 never gets marked done, so the run parks with work outstanding.
   const spawns: string[] = [];
   const stalling: SpawnFn = async (request) => {
@@ -7756,7 +7739,7 @@ test('O2: a policy-declined session starts the settle session fresh; only a LIVE
 });
 
 test('a frozen console does not open the pull request, and says the branch still awaits one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setParallel(true);
   const spawns: string[] = [];
   const working: SpawnFn = async (request) => {
@@ -7789,7 +7772,7 @@ test('a frozen console does not open the pull request, and says the branch still
 });
 
 test('a QA-wedged plan halts with a kind, an anchor phase and the verdict named', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance } = runner(r, workingSession(r, seen), '');
   // Phase 1 runs and lands; its QA verdict then holds every remaining phase.
@@ -7815,7 +7798,7 @@ test('a QA-wedged plan halts with a kind, an anchor phase and the verdict named'
 });
 
 test('a plain waiting board still halts generically — no false QA claim', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   // Phase 1 parks at preflight (unscoped, no verification), so later phases
   // stay waiting with no QA involved anywhere.
@@ -7836,7 +7819,7 @@ test('park() does not claim the run is parked while its lanes are still editing 
   // approval-timeout hook calls, from OUTSIDE the loop, while a lane is live.
   // Measured on a real run: 17 minutes of sessions editing trees under a
   // `parked` status.
-  const r = repo();
+  const r = stubbedPlan();
   let release = () => {};
   const held = new Promise<void>((resolve) => { release = resolve; });
   const session: SpawnFn = async (request: SpawnRequest) => {
@@ -7880,7 +7863,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
   // then changed production data. A manual gate is a person's now, delegated
   // or not; what delegation still reaches is a human-family VERDICT on a gate
   // the plan did not mark manual (an overdue deadline).
-  const r = repo();
+  const r = stubbedPlan();
   r.setGate(1, 'manual: the owner approves the copy');
   const seen: number[] = [];
   const { instance } = runner(r, workingSession(r, seen), '`true`', undefined, { delegateHumanGates: () => false });
@@ -7893,7 +7876,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
 
   // The SHIPPED default (`gates: delegated`): a harness that says nothing still
   // holds a manual gate — the journal names the row, its source, and why.
-  const r0 = repo();
+  const r0 = stubbedPlan();
   r0.setGate(1, 'manual: the owner approves the copy');
   const seen0: number[] = [];
   const { instance: shipped, events: events0 } = runner(r0, workingSession(r0, seen0));
@@ -7912,7 +7895,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
 
   // A plan row outranks the console: `gates: operator` in the manifest holds
   // the phase even on a console that delegates.
-  const r1 = repo();
+  const r1 = stubbedPlan();
   r1.setGate(1, 'manual: the owner approves the copy');
   const seen1: number[] = [];
   const { instance: byPlan } = runner(r1, workingSession(r1, seen1), '`true`', undefined, { delegateHumanGates: () => true });
@@ -7932,7 +7915,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
 
   // The console's own delegation switch on, explicitly: a manual gate STILL
   // holds — the act #174 forbids is exactly this boarding.
-  const r2 = repo();
+  const r2 = stubbedPlan();
   r2.setGate(1, 'manual: the owner approves the copy');
   const seen2: number[] = [];
   const { instance: switched, events } = runner(r2, workingSession(r2, seen2), '`true`', undefined, {
@@ -7951,7 +7934,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
 
   // A kind the engine cannot name — a failed read, an unknown word — is a
   // person's gate too: the safe side of a manual gate.
-  const r5 = repo();
+  const r5 = stubbedPlan();
   r5.setGate(1, 'manual: the owner approves the copy');
   writeFileSync(join(r5.root, '.stub', 'gate-kind-1'), 'not-a-kind\n');
   const seen5: number[] = [];
@@ -7966,7 +7949,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
   // What delegation still reaches: an OVERDUE verdict on a deadline gate (kind
   // auto — the plan never marked it a person's) boots the phase, journalled as
   // a delegated gate rather than an ai-clearable one.
-  const r4 = repo();
+  const r4 = stubbedPlan();
   r4.setGate(1, 'OVERDUE: deadline 2000-01-01 passed (today 2026-10-04)');
   const seen4: number[] = [];
   const { instance: overdue, events: events4 } = runner(r4, workingSession(r4, seen4), '`true`', undefined, {
@@ -7982,7 +7965,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
 
   // A delegated verdict that states NO condition cannot be evidenced: it stops
   // at boarding, before the spend, and the journal says why.
-  const r3 = repo();
+  const r3 = stubbedPlan();
   r3.setGate(1, 'OVERDUE:');
   const seen3: number[] = [];
   const { instance: bare, events: events3 } = runner(r3, workingSession(r3, seen3));
@@ -8002,7 +7985,7 @@ test('a MANUAL gate stops the run whatever the gates row says; delegation reache
  * ------------------------------------------------------------------ */
 
 test('onStream feeds the session registry: every event is liveness, only a `step` is a turn, and nothing is reported before the id is known', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const beats: { sessionId: string; turnEnded: boolean }[] = [];
     // A session that streams a realistic turn before it finishes: some words,
@@ -8050,7 +8033,7 @@ test('onStream feeds the session registry: every event is liveness, only a `step
  * ------------------------------------------------------------------ */
 
 test('the task channel: a session publishing with phase-tasks.sh is folded into the record, journalled and streamed', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const taskScript = join(import.meta.dirname, '..', '..', 'scripts', 'phase-tasks.sh');
   try {
     let armed: string | undefined;
@@ -8122,7 +8105,7 @@ test('the task channel: a session publishing with phase-tasks.sh is folded into 
 });
 
 test('a runner without the heartbeat dep behaves exactly as it did — the registry is an optional seam', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request: SpawnRequest) => {
       const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
@@ -8173,7 +8156,7 @@ function boardingRecorder(r: Repo, seen: { phase: number; model?: string; prompt
 }
 
 test('a retry with an addendum and a model override boards ONCE with both, journalled, plan untouched', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const planFile = join(r.root, 'docs', 'plans', 'demo.md');
   const planBefore = readFileSync(planFile, 'utf8');
 
@@ -8225,7 +8208,7 @@ test('a retry with an addendum and a model override boards ONCE with both, journ
 });
 
 test('an addendum-only retry changes nothing else — the model is still the one the phase had', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const state = stoppedOnFailure(r);
   resetForRetry(phaseRecord(state, 1), { by: 'operator', override: retryOverrideFrom({ addendum: ADDENDUM }), journal: () => {} });
   saveRun(state);
@@ -8244,7 +8227,7 @@ test('an addendum-only retry changes nothing else — the model is still the one
 });
 
 test('a plain Retry after one with edits is a plain retry — an unspent override is cleared, not inherited', () => {
-  const r = repo();
+  const r = stubbedPlan();
   const state = stoppedOnFailure(r);
   const record = phaseRecord(state, 1);
 
@@ -8270,7 +8253,7 @@ test('an override with nothing in it is not an override', () => {
 });
 
 test('the attempt override outranks the run`s own per-phase choice, which outranks the plan', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const state = newRun({
     slug: 'demo',
     root: r.root,
@@ -8297,7 +8280,7 @@ test('the attempt override outranks the run`s own per-phase choice, which outran
 });
 
 test('an attempt override REPLACES the run`s list-valued choices rather than merging with them', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const state = newRun({
     slug: 'demo', root: r.root, model: 'claude-sonnet-5',
     phaseOptions: { 1: { tools: ['Read', 'Grep', 'Bash'] } },
@@ -8326,7 +8309,7 @@ test('D4: a lock held by a SPACED owner whose session ended is released as debri
   // never matched itself: the release named a holder that does not exist, the
   // real script refuses it, and the journal recorded an attempt that freed
   // nothing. The phase then queued behind debris for the whole lease.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setLockSpacedOwner(true);
     const seen: number[] = [];
@@ -8362,7 +8345,7 @@ test('a phase queued behind a foreign GRANT is NEVER capped — it boards when t
   // which acts on the lane that is wrong rather than on the one waiting behind
   // it. The wait here is seeded three hours old — past the old cap — precisely
   // to prove the cap does not fire.
-  const r = repo();
+  const r = stubbedPlan();
   const scheduler = new Scheduler({ guard: () => true });
   try {
     // Somebody else's lane, admitted — and released once the waiter is queued.
@@ -8412,7 +8395,7 @@ test('D2: a wait on a CLOCK is never capped into a park', async () => {
   // that pins the opposite for it. This one used the cap as its clock and so
   // asserted the contract D28 reversed; it passed only while the release beat
   // the admission, and went red the first time the suite ran serially.
-  const r = repo();
+  const r = stubbedPlan();
   let held: { at: string; by?: string } | null = { at: new Date().toISOString(), by: 'mo' };
   const scheduler = new Scheduler({ max: 1, guard: () => true, holdFor: () => held });
   try {
@@ -8449,7 +8432,7 @@ test('D25: phase.admitted reports the WHOLE wait, not the age of the last write'
   // a 653-minute queue gap reported itself as 20 seconds. The clock that means
   // something is `lockWaitSince`, stamped when the wait began and surviving
   // re-arms.
-  const r = repo();
+  const r = stubbedPlan();
   const scheduler = new Scheduler({ guard: () => true });
   const WAITED_MS = 40 * 60_000;
   try {
@@ -8505,7 +8488,7 @@ test('D25: phase.admitted reports the WHOLE wait, not the age of the last write'
  */
 
 test('D1: guard OFF — the belt-check queues on a same-phase foreign lock instead of walking past it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     r.setLockRefused(true);
     // The scheduler is given NO locks, so admission cannot be what stops this:
@@ -8550,9 +8533,9 @@ test('D1: guard OFF — the belt-check queues on a same-phase foreign lock inste
  * ------------------------------------------------------------------ */
 
 test('a lane that does nothing but retry is recycled once, then parked on the wall it is hitting', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   assert.equal(state.slug, 'demo');
@@ -8639,9 +8622,9 @@ test('a lane that does nothing but retry is recycled once, then parked on the wa
 });
 
 test('a retry storm parks on the METER’s reset time when the CLI reported one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -8686,9 +8669,9 @@ test('a retry storm parks on the METER’s reset time when the CLI reported one'
 });
 
 test('a lane that retries and then WORKS is left alone', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const s = silentSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await s.gates[0].entered;
@@ -8726,7 +8709,7 @@ test('the warm QA chase whose resume is gone marks the session gone and records 
   // answered `No conversation found`, and the round was scored as a review
   // that recorded nothing — a `pending` entry on the record, a rung spent,
   // and the same `--resume` offered again two minutes later.
-  const r = repo();
+  const r = stubbedPlan();
   r.setQaOwed('pending');
   const spawns: { name?: string; resume?: string }[] = [];
   const spawn: SpawnFn = async (request) => {
@@ -8769,7 +8752,7 @@ test('an attempt whose checkpointed session is gone boards fresh in the same bre
   // A checkpoint left `resumeSessionId` behind; the transcript did not follow
   // the account. The boot prompt is self-contained by design, so the right
   // answer is a fresh boarding NOW — not a 60 s retry of the same `--resume`.
-  const r = repo();
+  const r = stubbedPlan();
   const stale = newRun({ slug: 'demo', root: r.root });
   stale.status = 'paused';
   stale.phases['1'] = { phase: 1, status: 'pending', attempts: 1, costUsd: 0, resumeSessionId: 'sess-old' };
@@ -8803,7 +8786,7 @@ test('the drive loop boards its own QA rung: a done phase held by a fail resumes
   // had finished) and the candidate filter admitted a board-`done` phase only
   // for a review follow-up — so the rung was spent, no session ran, and the
   // healer had to do it the long way round.
-  const r = repo();
+  const r = stubbedPlan();
   r.markDone(1);
   r.setQaBlocked(1, 'fail');
   mkdirSync(join(r.root, 'docs', 'handoffs', 'demo'), { recursive: true });
@@ -8852,7 +8835,7 @@ test('a QA round is a first-class session: task channel, stream, pid handle, and
   // `PE_TASKS_FILE`, no `onPid` — so the reviewer's output never reached the
   // run log, its task list had nowhere to go, Stop could not see it, and the
   // record said nothing about a review being in flight.
-  const r = repo();
+  const r = stubbedPlan();
   r.setQaOwed('pending');
   type Seen = { env?: NodeJS.ProcessEnv; cwd?: string; onEvent: boolean; onPid: boolean; marker?: unknown; name?: string };
   const seen: Seen[] = [];
@@ -8918,7 +8901,7 @@ test('under halt-on-everything a recorded QA fail parks the run on the phase, na
   // cautious mode, whose label is "Stop and ask me", moved on past a fail
   // exactly as the eager one did.
   for (const autonomy of ['halt-on-everything', 'keep-going'] as const) {
-    const r = repo();
+    const r = stubbedPlan();
     r.setQaOwed('fail');
     const { instance } = runner(r, workingSession(r), '`true`');
     await instance.start({ slug: 'demo', root: r.root, autonomy });
@@ -8948,7 +8931,7 @@ test('an operator stop under a standing run-level halt keeps the run halted, pin
   // the halt as an error. `runRecovery` already settled this the other way
   // round (`if (!state.halt) state.status = 'paused'`); the attempt path did
   // not ask.
-  const r = repo();
+  const r = stubbedPlan();
   // The stop must land while the lane is MID-SESSION: `start()` returns before
   // the board subprocess has even seated phase 1, so the stub signals the
   // moment the session is live instead of the test guessing a sleep.
@@ -8987,7 +8970,7 @@ type LedgerCap = { value: number; source: string; basis?: string };
 test('a run started with no budget still caps every session it spawns, each cap with the policy that set it (SES-8)', async () => {
   // 0 of 507 lifetime argvs carried a dollar cap: both conditions read values
   // that defaulted to null and only the launch form ever set them.
-  const r = repo();
+  const r = stubbedPlan();
   r.setSize(1, 'L');
   const requests: SpawnRequest[] = [];
   const work = workingSession(r);
@@ -9029,8 +9012,115 @@ test('a run started with no budget still caps every session it spawns, each cap 
   } finally { r.cleanup(); }
 });
 
+/** What `start` takes, for the SB cases' three calls (the file's older calls predate the type). */
+type StartArgs = Parameters<InstanceType<typeof Runner>['start']>[0];
+
+test('SB-1: with the SDK uninstalled every session takes the subprocess door, and the journal says so once (measured-console phase 20)', async () => {
+  // Asked for, and absent: the optional dependency was not installed. Three
+  // phases, three sessions — each through the subprocess (here the harness's
+  // spawn), and ONE `phase.spawn-backend` line for the run, not one a session.
+  const r = stubbedPlan();
+  const requests: SpawnRequest[] = [];
+  const work = workingSession(r);
+  const spawn: SpawnFn = async (request) => { requests.push(request); return work(request); };
+  let asked = 0;
+  const { instance, events } = runner(r, spawn, undefined, undefined, {
+    spawnBackend: { wanted: () => 'sdk', sdk: async () => { asked += 1; return { ok: false, reason: 'absent', detail: 'Cannot find package' }; } },
+  });
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' } as StartArgs);
+    await instance.wait();
+    assert.equal(requests.length, 3, 'every session ran, through the subprocess');
+    assert.ok(asked >= 3, 'the door asked at every spawn — an install mid-run is picked up');
+    const said = journalled(events, 'phase.spawn-backend');
+    assert.equal(said.length, 1, 'said once, however many sessions follow');
+    assert.deepEqual({ ...said[0], detail: undefined }, { mode: 'phase', backend: 'subprocess', wanted: 'sdk', reason: 'absent', detail: undefined });
+  } finally { r.cleanup(); }
+});
+
+test('SB-2: with the SDK there, the one door takes its spawn — and still writes every record; a free tree asks nothing', async () => {
+  const r = stubbedPlan();
+  const viaSdk: SpawnRequest[] = [];
+  const viaSubprocess: SpawnRequest[] = [];
+  const work = workingSession(r);
+  const { instance, events } = runner(r, async (request) => { viaSubprocess.push(request); return work(request); }, undefined, undefined, {
+    spawnBackend: {
+      wanted: () => 'sdk',
+      sdk: async () => ({ ok: true, version: '0.3.311', spawn: async (request) => { viaSdk.push(request); return work(request); } }),
+    },
+  });
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' } as StartArgs);
+    await instance.wait();
+    assert.equal(viaSdk.length, 3);
+    assert.equal(viaSubprocess.length, 0);
+    const said = journalled(events, 'phase.spawn-backend');
+    assert.deepEqual(said, [{ mode: 'phase', backend: 'sdk', wanted: 'sdk', version: '0.3.311' }]);
+    assert.equal(journalled(events, 'phase.session').length, 3, 'the door writes the record whichever backend ran');
+  } finally { r.cleanup(); }
+
+  // No `spawnBackend` (the free tree, a harness): nothing is asked and nothing journalled.
+  const plain = stubbedPlan();
+  const { instance: bare, events: quiet } = runner(plain, workingSession(plain));
+  try {
+    await bare.start({ slug: 'demo', root: plain.root, autonomy: 'keep-going' } as StartArgs);
+    await bare.wait();
+    assert.equal(journalled(quiet, 'phase.spawn-backend').length, 0);
+  } finally { plain.cleanup(); }
+});
+
+
+test('SB-4: an SDK session that ends before its first event is re-attempted ONCE on the subprocess, journalled phase.spawn-fallback — and the phase stays there (measured-console phase 21)', async () => {
+  const r = stubbedPlan();
+  const viaSdk: number[] = [];
+  const viaSubprocess: number[] = [];
+  const phaseOf = (request: SpawnRequest) => Number(/BOOT phase (\d+)/.exec(request.prompt)?.[1]);
+  const work = workingSession(r);
+  // The SDK door that never got as far as `init`: no event, no turn, no model.
+  const lost = (): SpawnOutcome => ok({ signal: { subtype: 'error', code: 1, text: 'spawn claude ENOENT' }, sessionId: '', turns: 0, costUsd: 0, resultText: '' });
+  const { instance, events } = runner(r, async (request) => { viaSubprocess.push(phaseOf(request)); return work(request); }, undefined, undefined, {
+    spawnBackend: {
+      wanted: () => 'sdk',
+      sdk: async () => ({
+        ok: true, version: '0.3.311',
+        spawn: async (request) => {
+          viaSdk.push(phaseOf(request));
+          // Phase 2's SDK session dies before it starts; phases 1 and 3 run.
+          // It printed an error first: the core's stderr is not the session's first event.
+          if (phaseOf(request) === 2) { request.onEvent?.({ kind: 'stderr', text: 'Error: the CLI could not start' }); return lost(); }
+          return work(request);
+        },
+      }),
+    },
+  });
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' } as StartArgs);
+    await instance.wait();
+    assert.deepEqual(viaSdk, [1, 2, 3], 'each phase asked the SDK first');
+    assert.deepEqual(viaSubprocess, [2], 'the lost session re-attempted on the subprocess, once');
+    const fallback = journalled(events, 'phase.spawn-fallback');
+    assert.equal(fallback.length, 1);
+    assert.deepEqual({ ...fallback[0], detail: undefined }, {
+      mode: 'phase', situation: 'spawn-sdk-failed', rung: 'reboard-subprocess', from: 'sdk', to: 'subprocess',
+      detail: undefined, sdkMs: 10, sdkCostUsd: 0,
+    });
+    assert.match(String(fallback[0].detail), /ended before its first event.*spawn claude ENOENT/);
+    const backends = events.filter((e) => e.event === 'run:journal' && e.data.event === 'phase.spawn-backend')
+      .map((e) => ({ phase: e.data.phase, ...(e.data.data as Record<string, unknown>), detail: undefined }));
+    assert.deepEqual(backends, [
+      { phase: 1, mode: 'phase', backend: 'sdk', wanted: 'sdk', version: '0.3.311', detail: undefined },
+      { phase: 2, mode: 'phase', backend: 'subprocess', wanted: 'sdk', reason: 'fallback', detail: undefined },
+      { phase: 3, mode: 'phase', backend: 'sdk', wanted: 'sdk', version: '0.3.311', detail: undefined },
+    ]);
+    const record = instance.current()?.phases['2'];
+    assert.equal(record?.status, 'done');
+    assert.equal(record?.spawnFallback?.done, true, 'the re-attempt ran, so nothing reads the phase as lost');
+    assert.equal(journalled(events, 'phase.session').length, 3, 'one record per phase session — the lost attempt is the fallback line');
+  } finally { r.cleanup(); }
+});
+
 test('a run budget is the dollar cap, and a spent cap resumes under double it — attributed as a raise', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const requests: SpawnRequest[] = [];
   const capped: SpawnFn = async (request) => {
     requests.push(request);
@@ -9059,7 +9149,7 @@ test('a run budget is the dollar cap, and a spent cap resumes under double it �
 test('a resume with an instruction is in the census — the same session record as every other session (SES-6)', async () => {
   // 50 of 138 sessions wrote `phase.resume-done {costUsd, turns, said}` and
   // nothing else: no subtype, no argv, no duration.
-  const r = repo();
+  const r = stubbedPlan();
   let calls = 0;
   const spawn: SpawnFn = async () => {
     calls += 1;
@@ -9090,7 +9180,7 @@ test('a resume with an instruction is in the census — the same session record 
 test('a usage warning past the alert threshold is decided once per window — not only journalled (SES-9)', async () => {
   // 3 150 `run.usage-window` lines, every one `allowed_warning`, up to 0.99,
   // and nothing acted on any of them.
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const { instance, events } = runner(r, held.spawn);
   try {
@@ -9121,7 +9211,7 @@ test('a usage warning past the alert threshold is decided once per window — no
 });
 
 test('whoever ends a live session names the ending on its handle first, and the session record carries it (SES-1)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const endings: string[] = [];
   let entered!: () => void;
   const inSession = new Promise<void>((resolve) => { entered = resolve; });
@@ -9152,7 +9242,7 @@ test('whoever ends a live session names the ending on its handle first, and the 
 });
 
 test('a denial the CLI recorded and the refusal the session read are two distinct journal lines', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const { instance, events } = runner(r, held.spawn);
   try {
@@ -9200,7 +9290,7 @@ function expiredWait(r: Repo, record: Partial<PhaseRecord>): RunState {
 }
 
 test('SLF-10: a wait never resumes onto a session already marked gone — no --resume, and phase.resume-lost once', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const gone = { sessionId: 'sess-gone', at: new Date(Date.now() - P5_HOUR).toISOString(), reason: 'No conversation found' };
     // Both shapes the old code re-armed: the id named at park, and none named (the `??=`).
@@ -9225,7 +9315,7 @@ test('SLF-10: a wait never resumes onto a session already marked gone — no --r
 });
 
 test('REG-1: a resume onto a session still RUNNING is refused and recorded — nothing spawns, the wait and its session are kept', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stale = expiredWait(r, { sessionId: 'sess-live', resumeSessionId: 'sess-live' });
     let spawned = 0;
@@ -9253,7 +9343,7 @@ test('REG-1: a resume onto a session still RUNNING is refused and recorded — n
 });
 
 test('SLF-5: a park with no declaration is not a declared wait — its own session resumes on the engine prompt, and nothing says the window elapsed', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // A declaration some licence already spent, or a console park that never had one.
     const stale = expiredWait(r, { sessionId: 'sess-w', resumeSessionId: 'sess-w', declared: undefined });
@@ -9277,7 +9367,7 @@ test('SLF-5: a park with no declaration is not a declared wait — its own sessi
 
 test('WAI-4: a resumed wait that only LOOKS keeps its declaration — a commit or an outcome spends it, a git status does not', async () => {
   for (const [summary, spends] of [['git status', false], ['git commit -m "wip: the build landed"', true]] as const) {
-    const r = repo();
+    const r = stubbedPlan();
     try {
       const stale = expiredWait(r, { sessionId: 'sess-w', resumeSessionId: 'sess-w' });
       let calls = 0;
@@ -9300,7 +9390,7 @@ test('WAI-4: a resumed wait that only LOOKS keeps its declaration — a commit o
 });
 
 test('WAI-9: a new declaration spends the old one once — new-outcome journals exactly one line, naming what came next', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // A phase parked on a declared wait, resumed; the session now declares a
     // different word. The old testimony is spent under `new-outcome`, once.
@@ -9337,7 +9427,7 @@ test('WAI-9: a new declaration spends the old one once — new-outcome journals 
  * exists to prevent.
  */
 test('O3: a wait-resume onto a GONE session boards fresh WITH the resume brief, not the bare wait prompt', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const gone = { sessionId: 'sess-gone', at: new Date(Date.now() - P5_HOUR).toISOString(), reason: 'No conversation found' };
     const stale = expiredWait(r, { sessionId: 'sess-gone', resumeSessionId: 'sess-gone', sessionGone: gone });
@@ -9364,7 +9454,7 @@ test('O3: a wait-resume onto a GONE session boards fresh WITH the resume brief, 
 });
 
 test('WAI-9: a declaration a resumed session left standing is spent under board-closed when the board reads done — not left on a done record', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stale = expiredWait(r, { sessionId: 'sess-w', resumeSessionId: 'sess-w' });
     const spawn: SpawnFn = async () => { r.markDone(1); return ok({ sessionId: 'sess-w' }); };
@@ -9379,7 +9469,7 @@ test('WAI-9: a declaration a resumed session left standing is spent under board-
 });
 
 test('WAI-1/WAI-11: a declared park says what it granted against what it asked, and names a ref nothing can poll', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => {
       fileOutcome(request, {
@@ -9413,7 +9503,7 @@ test('WAI-1/WAI-11: a declared park says what it granted against what it asked, 
 });
 
 test('WAI-1: a declared window past the budget parks on a budgets errand with the arithmetic — never for a cut-down eight hours', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => {
       fileOutcome(request, {
@@ -9441,7 +9531,7 @@ test('WAI-1: a declared window past the budget parks on a budgets errand with th
 });
 
 test('WAI-4: phase.wait-resume carries the lateness, the cause and the turn cap\'s source', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stale = expiredWait(r, {
       sessionId: 'sess-w', resumeSessionId: 'sess-w',
@@ -9463,10 +9553,10 @@ test('WAI-4: phase.wait-resume carries the lateness, the cause and the turn cap\
 });
 
 test('WAI-5/SLF-9: the watchdog parks in its OWN name — by watchdog, its own ledger, and no ref on a job the checkpoint ends', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const s = silentSession(r, { attempts: 1 });
-    const clock = fakeClock();
+    const clock = dateClock('2026-08-22T10:00:00Z');
     const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await s.gates[0].entered;
@@ -9493,10 +9583,10 @@ test('WAI-5/SLF-9: the watchdog parks in its OWN name — by watchdog, its own l
 });
 
 test('SLF-9: with stallAutomaticPark off, the watchdog parks nothing — the stall is still named', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const s = silentSession(r, { attempts: 1 });
-    const clock = fakeClock();
+    const clock = dateClock('2026-08-22T10:00:00Z');
     const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now, stallAutomaticPark: () => false });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await s.gates[0].entered;
@@ -9514,10 +9604,10 @@ test('SLF-9: with stallAutomaticPark off, the watchdog parks nothing — the sta
 });
 
 test('RCV-5 (firing half): a wait the console REFUSED inside the turn reaches the local-job ladder — nudged, then parked with no ref and the job owed', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const s = silentSession(r, { attempts: 1 });
-    const clock = fakeClock();
+    const clock = dateClock('2026-08-22T10:00:00Z');
     const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await s.gates[0].entered;
@@ -9550,10 +9640,10 @@ test('RCV-5 (firing half): a wait the console REFUSED inside the turn reaches th
 });
 
 test('RCV-5 (phase 9): a refused `--watch` reaches the same local-job ladder — nudged, then parked with no ref and the job owed', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const s = silentSession(r, { attempts: 1 });
-    const clock = fakeClock();
+    const clock = dateClock('2026-08-22T10:00:00Z');
     const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await s.gates[0].entered;
@@ -9598,10 +9688,10 @@ test('autopilot-token-drain P1: a lane whose turn ended on its own subagent runn
   // completion starts a new turn, while a background Bash dies with the turn.
   // A session waiting like that is quiet by construction; nudging or recycling
   // it would throw away the agent it is waiting on.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const s = silentSession(r, { attempts: 1 });
-    const clock = fakeClock();
+    const clock = dateClock('2026-08-22T10:00:00Z');
     const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await s.gates[0].entered;
@@ -9624,10 +9714,10 @@ test('autopilot-token-drain P1: a lane whose turn ended on its own subagent runn
 });
 
 test('autopilot-token-drain P2: a lane counts its own status checks — the hook asks it, the stream resets it, and it nudges once', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const s = silentSession(r, { attempts: 1 });
-    const clock = fakeClock();
+    const clock = dateClock('2026-08-22T10:00:00Z');
     const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await s.gates[0].entered;
@@ -9670,7 +9760,7 @@ const journalledFor = (
   .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
 
 test('autopilot-token-drain P3: every session\'s API calls are journalled as phase.tokens and kept on the record per attempt', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const tokens = {
       calls: 242, lastContext: 681_000, peakContext: 681_000,
@@ -9707,7 +9797,7 @@ test('autopilot-token-drain P3: every session\'s API calls are journalled as pha
 });
 
 test('autopilot-token-drain P3: past 0.6 × its window a phase session is told once to wrap up; past 0.8 × it is checkpointed and boards fresh', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const s = silentSession(r, { attempts: 2 });
     const requests: SpawnRequest[] = [];
@@ -9762,7 +9852,7 @@ test('autopilot-token-drain P3: past 0.6 × its window a phase session is told o
 test('autopilot-token-drain P3: only the phase\'s own sessions are wrapped up — a closeout at 900k is left to finish', async () => {
   // The closeout shape the no-handoff tests use: the first session ends with
   // work in the tree and no paperwork, and the one continuation resumes it.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     execFileSync('git', ['init', '-q'], { cwd: r.root });
     writeFileSync(join(r.root, 'half-finished.txt'), 'work in flight\n');
@@ -9818,7 +9908,7 @@ const tokenRow = (sessionId: string, lastContext: number, endedAgoMs: number, ac
 });
 
 test('autopilot-token-drain P4: a waiting-external resume at 600k after 70 min boards FRESH with the resume brief — the wait and the last words ride it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stale = expiredWait(r, {
       sessionId: 'sess-wait', resumeSessionId: 'sess-wait', watch: ['gh:acme/app#run/42'],
@@ -9854,7 +9944,7 @@ test('autopilot-token-drain P4: a waiting-external resume at 600k after 70 min b
 });
 
 test('autopilot-token-drain P4: a switch to another account at 824k does not carry the conversation — the phase re-boards fresh with the resume brief', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: { env?: NodeJS.ProcessEnv; resume?: string; prompt: string }[] = [];
   const limited: SpawnFn = async (request) => {
     spawns.push({ env: request.env, resume: request.resume, prompt: request.prompt });
@@ -9907,7 +9997,7 @@ test('autopilot-token-drain P4: a switch to another account at 824k does not car
 
 test('autopilot-token-drain P4: a session that declared `partial --reason budget` or `context` is not resumed, even small and warm — the phase boards fresh with the resume brief', async () => {
   for (const reason of ['budget', 'context']) {
-    const r = repo();
+    const r = stubbedPlan();
     try {
       const log: { resume?: string; prompt: string }[] = [];
       const spawn: SpawnFn = async (request) => {
@@ -9941,7 +10031,7 @@ test('autopilot-token-drain P4: a session that declared `partial --reason budget
 });
 
 test('autopilot-token-drain P4: an owed QA verdict on a session not worth resuming is reviewed by a FRESH session, from the boot prompt', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setQaOwed('pending');
   const spawns: { name?: string; resume?: string; prompt: string }[] = [];
   const spawn: SpawnFn = async (request) => {
@@ -9972,7 +10062,7 @@ test('autopilot-token-drain P4: an owed QA verdict on a session not worth resumi
 });
 
 test('autopilot-token-drain P4: an instructed resume of a session not worth resuming spawns nothing, marks nothing gone, and says why', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const stored = newRun({ slug: 'demo', root: r.root });
     stored.status = 'halted';
@@ -10000,7 +10090,7 @@ test('autopilot-token-drain P4: an instructed resume of a session not worth resu
 });
 
 test('TRS-3 (phase 9): a waiting-external declared with NO ref after the guard refused the session\'s wait is adopted — the ref minted from the refused command, marked minted', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const declaring: SpawnFn = async (request) => {
       // The measured shape: refused `until … sleep` at 16:11, refused `--watch`
@@ -10029,7 +10119,7 @@ test('TRS-3 (phase 9): a waiting-external declared with NO ref after the guard r
 });
 
 test('TRS-3 (phase 9): a ref-less wait after a refusal the console can neither mint nor read off the plan is REFUSED — parked for a person with the errand naming the command', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const declaring: SpawnFn = async (request) => {
       // `tail -f` has no landing the console can name, and the plan has no
@@ -10061,7 +10151,7 @@ test('TRS-3 (phase 9): a ref-less wait after a refusal the console can neither m
 });
 
 test('ACC-8.12 (TRS-10, in the loop): a session blocked on the console\'s own deny rule parks behind a standing widen card — no streak, no session — and Allow strikes the rule and resumes its own session', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { Approvals } = await import('../server/runner/approvals.ts');
     const approvals = new Approvals();
@@ -10121,7 +10211,7 @@ test('ACC-8.12 (TRS-10, in the loop): a session blocked on the console\'s own de
 });
 
 test('ACC-8.12 (TRS-10, in the loop): a denied widen card settles the rung failed and parks the phase with the errand naming the rule and the command', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { Approvals } = await import('../server/runner/approvals.ts');
     const approvals = new Approvals();
@@ -10174,7 +10264,7 @@ function headroomStub(spent: Record<string, string | null>) {
 }
 
 test('ACT-2: a start whose account is at 100 % with a second at 10 % starts under the second and journals run.account-switched {at: preflight, reason: quota}', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const envs: (NodeJS.ProcessEnv | undefined)[] = [];
   const asked: (string | undefined)[] = [];
   const left: { accountId?: string; leaving: LeaveReason }[] = [];
@@ -10219,7 +10309,7 @@ test('ACT-2: a start whose account is at 100 % with a second at 10 % starts unde
 });
 
 test('ACT-2: with no second account the run PARKS carrying run.errand and run.preflight-refused {wall: quota} — and throws nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen), '`true`', undefined, {
     checkAuth: async () => ({ loggedIn: true, checkedAt: '' }),
@@ -10248,7 +10338,7 @@ test('ACT-2: with no second account the run PARKS carrying run.errand and run.pr
 });
 
 test('ACT-1: a stored run with accountId p, resumed with no account named, preflights p — the auth door and the quota door alike', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const probed: (string | undefined)[] = [];
   const asked: (string | undefined)[] = [];
   const stored = newRun({ slug: 'demo', root: r.root, accountId: 'p' });
@@ -10270,9 +10360,9 @@ test('ACT-1: a stored run with accountId p, resumed with no account named, prefl
 });
 
 test('ACT-5: a live burst that switches A→B records a wall against A BEFORE the switch, and a second burst on B does not return the run to A', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const cooling = new Set<string>();
   const left: { accountId: string; leaving: LeaveReason }[] = [];
   const order: string[] = [];
@@ -10324,9 +10414,9 @@ test('ACT-5: a live burst that switches A→B records a wall against A BEFORE th
 });
 
 test('ACT-6: a rate-limit burst on a single-account console produces — inside the bound — a phase.errand, a limits announcement and a parked phase, not a third phase.live-wall {action: none}', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r, false);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const escalated: { action: string; until: string | null }[] = [];
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now,
@@ -10373,9 +10463,9 @@ test('ACT-6 + H6: with a reset hours away, the FIRST wall WAITS on the window �
   // twenty minutes of retries on a reset four hours off. A reset past
   // `LIMIT_ACTION_COOLDOWN_MS` now waits on the first burst; the escalation it
   // reaches is unchanged, and the no-reset park above keeps its two `none`s.
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r, false);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const escalated: { action: string; until: string | null }[] = [];
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now,
@@ -10412,9 +10502,9 @@ test('ACT-6 + H6: with a reset hours away, the FIRST wall WAITS on the window �
 });
 
 test('ACT-7: a rate_limit_event at WALL_PCT counts as a wall hit whatever its status word — 0.99 allowed_warning ×3 moves the run', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock();
+  const clock = dateClock('2026-08-22T10:00:00Z');
   const { instance, events } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now, pickAccount: () => 'spare',
     leaveAccount: (accountId, leaving) => leaveStub(accountId, leaving),
@@ -10437,7 +10527,7 @@ test('ACT-7: a rate_limit_event at WALL_PCT counts as a wall hit whatever its st
 });
 
 test('RCV-1 + SES-2: an org-policy refusal halts the RUN on credential-refused — one session, one run-level halt, the account retired, the errand quoting the sign-off, no second phase.start; a second start on the retired account spawns nothing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // Two more phases are READY beside phase 1 — the shape the audit measured:
   // the old phase-level park handed the loop its next candidate into the same
   // wall, ten boardings inside 157 s. `maxParallel: 1` queues them behind the
@@ -10530,7 +10620,7 @@ test('RCV-1 + SES-2: an org-policy refusal halts the RUN on credential-refused �
 });
 
 test('RCV-1 (admission): a phase boarding under an account the breaker has retired since the run started is refused at the door — no spawn, the run halts credential-refused', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setParallel(true);
   const spawns: SpawnRequest[] = [];
   let retired = false;
@@ -10568,7 +10658,7 @@ test('RCV-1 (admission): a phase boarding under an account the breaker has retir
 });
 
 test('RCV-1 (the wall clears): a Continue whose preflight passes re-boards the phase the credential wall parked, and the cause goes with it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawns: SpawnRequest[] = [];
   let refuse = true;
   const { instance, events } = runner(r, async (request) => {
@@ -10609,7 +10699,7 @@ test('RCV-1 (the wall clears): a Continue whose preflight passes re-boards the p
 });
 
 test('ACT-3: isSpending answers true for the run\'s account only while a child is live — the poller\'s active probe', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
     accountEnv: async () => ({ CLAUDE_CONFIG_DIR: '/tmp/p' }),
@@ -10629,7 +10719,7 @@ test('ACT-3: isSpending answers true for the run\'s account only while a child i
 });
 
 test('ACT-12: a token account\'s run attaches only the stdio servers the plan declares — the rest are dropped and run.token-scope says so', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const configured: string[][] = [];
   const { instance, events } = runner(r, workingSession(r), '`true`', undefined, {
     accountEnv: async () => ({ CLAUDE_CODE_OAUTH_TOKEN: 'tok' }),
@@ -10664,7 +10754,7 @@ test('LFC-2: a table this loop cannot drive is EXHAUSTED when the healer cannot 
   // compute exhaustion from the unfiltered table — `false` — and write
   // `phase.ladder-deferred` for a table nothing would ever climb (28 records,
   // 0 errands). With no healer answering, the loop is exhausted and asks.
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const blocked: SpawnFn = async (request) => {
       fileOutcome(request, { phase: 1, status: 'blocked', needs: 'external', reason: 'the deploy window opens tonight' });
@@ -10689,7 +10779,7 @@ test('LFC-2: a table this loop cannot drive is EXHAUSTED when the healer cannot 
 
   // …and when the HEALER can drive a rung the loop cannot, the loop defers to
   // it — `phase.ladder-deferred` naming what remains and what comes next.
-  const r2 = repo();
+  const r2 = stubbedPlan();
   try {
     const blocked: SpawnFn = async (request) => {
       fileOutcome(request, { phase: 1, status: 'blocked', needs: 'external', reason: 'the deploy window opens tonight' });
@@ -10710,7 +10800,7 @@ test('LFC-2: a table this loop cannot drive is EXHAUSTED when the healer cannot 
 });
 
 test('RCV-6: a rung the attempt left open is settled at the lane\'s end — situation and cost on the line — so the next attempt never books onto it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let calls = 0;
     const spawn: SpawnFn = async () => {
@@ -10758,7 +10848,7 @@ test('RCV-6: a rung the attempt left open is settled at the lane\'s end — situ
  * ------------------------------------------------------------------ */
 
 test('a Person-check: halt park names the refused command and why — before a session is bought', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance } = runner(r, workingSession(r, seen), '- `true`\n- `frobnicate --check tests/`', undefined, {
     personCheck: () => 'halt',
@@ -10773,7 +10863,7 @@ test('a Person-check: halt park names the refused command and why — before a s
 });
 
 test('the bats line that halted run f0da619a boards under Person-check: halt', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen), '- `true`\n- `bats --version`', undefined, {
     personCheck: () => 'halt',
@@ -10787,7 +10877,7 @@ test('the bats line that halted run f0da619a boards under Person-check: halt', a
 
 test('the start door\'s exact approval boards an unknown command, and the run keeps the answer', async () => {
   const { commandFingerprint } = await import('../server/runner/verify.ts');
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const { instance, events } = runner(r, workingSession(r, seen), '- `true`\n- `frobnicate --check tests/`', undefined, {
     personCheck: () => 'halt',
@@ -10807,7 +10897,7 @@ test('the start door\'s exact approval boards an unknown command, and the run ke
 
 test('a phase whose every check was waived at the door boards and passes on its handoff, journalled as waived', async () => {
   const { commandFingerprint } = await import('../server/runner/verify.ts');
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const prose = 'eyeball the chart on a phone';
   const { instance, events } = runner(r, workingSession(r, seen), prose, undefined, { personCheck: () => 'halt' });
@@ -10838,7 +10928,7 @@ test('a phase whose every check was waived at the door boards and passes on its 
 // session running `phase-lock.sh conflicts` in that window scanned files, found
 // none, and was told "safe to start" against a console lane that was booting.
 test('S1-a: the runner claims provisionally at grant, under its own owner, on a short lease', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { instance } = runner(r, async (request: SpawnRequest) => {
     const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
     r.markDone(phase);
@@ -10880,7 +10970,7 @@ test('S1-a: the runner claims provisionally at grant, under its own owner, on a 
  * Adopted here verbatim in intent, adjusted only where this tree's helpers
  * have moved on. */
 test('P12-QA allowUnverifiedPhases: a plan WITH a command still runs it — a red command stays a red verdict, never a waiver', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { instance, events } = runner(r, workingSession(r), '`false`', undefined, { allowUnverifiedPhases: () => true });
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
@@ -10897,7 +10987,7 @@ test('P12-QA allowUnverifiedPhases: a plan WITH a command still runs it — a re
 
 test('P12-QA the runner\'s declared errand: a permission wall on the CLI\'s own path reads blocked-declared:protected-path with a person\'s remedy; an external one keeps the watch note', async () => {
   const WALL = "Edit/Write on .claude/** is permission-denied in this unattended session ('sensitive file'); run the edits by hand.";
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => { fileOutcome(request, { phase: 1, status: 'needs-human', reason: WALL }); return ok(); };
     const { instance } = runner(r, spawn);
@@ -10916,7 +11006,7 @@ test('P12-QA the runner\'s declared errand: a permission wall on the CLI\'s own 
     assert.doesNotMatch(errand?.how ?? '', /watching its refs/);
     assert.deepEqual(errand?.tried, []);
   } finally { r.cleanup(); }
-  const r2 = repo();
+  const r2 = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => {
       fileOutcome(request, { phase: 1, status: 'needs-human', reason: 'the staging gate needs an operator', watch: ['gh:acme/app#run/123'] });
@@ -10969,7 +11059,7 @@ const CANNOT_REACH_TLS = `API Err${'or'}: Unable to conn${'ect'} to API: Self-si
 const LOGIN_REFUSED = `API Err${'or'}: 401 ${['oauth', 'token', 'expired'].join(' ')}`;
 
 test('connectivity waits uncharged: no attempt is spent, no failure is charged, and the phase runs when the network comes back', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const texts: string[] = [];
   let calls = 0;
   const flaky: SpawnFn = async (request) => {
@@ -10998,7 +11088,7 @@ test('connectivity waits uncharged: no attempt is spent, no failure is charged, 
 });
 
 test('a certificate-shaped connect failure files a strike and waits — it does not retire anything', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const left: { accountId?: string; leaving: LeaveReason }[] = [];
   let calls = 0;
   const flaky: SpawnFn = async (request) => {
@@ -11025,7 +11115,7 @@ test('a certificate-shaped connect failure files a strike and waits — it does 
 });
 
 test('RF-1: a credential refusal halts the run and charges NOTHING', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const refusing: SpawnFn = async () => ok({
     signal: { subtype: 'error_during_execution', code: 1, text: LOGIN_REFUSED }, costUsd: 0, turns: 1,
   });
@@ -11041,7 +11131,7 @@ test('RF-1: a credential refusal halts the run and charges NOTHING', async () =>
 });
 
 test('RF-2: a SECOND lane meeting the same wall neither charges nor re-halts', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   r.setParallel(true);
   const left: { accountId?: string; leaving: LeaveReason }[] = [];
   const refusing: SpawnFn = async () => ok({
@@ -11063,7 +11153,7 @@ test('RF-2: a SECOND lane meeting the same wall neither charges nor re-halts', a
 });
 
 test('RF-3: the streak can never exceed its maximum, and clear-streak zeroes it', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // Seeded AT the bound, which is the state #37 measured a run arriving at and
   // then passing: `consecutiveFailures: 3, maxConsecutiveFailures: 2`. It
   // resumes through `watch-landed` — an automatic door, so the streak carries

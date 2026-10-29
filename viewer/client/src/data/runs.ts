@@ -6,9 +6,59 @@
 
 import { useMemo } from 'react';
 import { keepPreviousData, useQueries, useQuery } from '@tanstack/react-query';
-import { api, runList, runStrip, type PreludeDraft } from './api';
+import { api, runList, runStrip } from './api';
+import type {
+  AccountRequirement,
+  RelayMode,
+  RunProofs,
+  RunVerifications,
+  SessionSizing,
+  WeekReportAnswer,
+} from '@shared/wire/runs.js';
 import { q, request } from './http';
 import { keys } from './keys';
+
+/** The measured shapes this module reads — the wire's (`shared/wire/runs.js`), re-exported for their importers. */
+export type {
+  EtaScore,
+  RunProof,
+  RunProofs,
+  RunVerification,
+  RunVerifications,
+  SessionCap,
+  SessionCapTable,
+  SessionSizing,
+  SessionsPerPhase,
+  WeekMetrics,
+  WeekReportAnswer,
+} from '@shared/wire/runs.js';
+
+/** The launch draft's answers to probe 5 — fingerprints; waivers as `<phase>:<fp>`. */
+export interface VerifyAnswers {
+  approve: string[];
+  waive: string[];
+}
+
+/**
+ * What the launch form's draft sends the prelude — client-only: it rides in
+ * `GET /api/run/:slug/prelude`'s query, never as a body.
+ */
+export interface PreludeDraft {
+  accounts?: AccountRequirement[];
+  relay?: RelayMode;
+  resumeOnRestart?: boolean;
+  acknowledgedWaivers?: string[];
+  model?: string;
+  profile?: string;
+  mcpPolicy?: string;
+  /** Probe 5's question: the phases the run will drive, its autonomy, and the answers so far. */
+  onlyPhases?: number[];
+  autonomy?: string;
+  verifyAnswers?: VerifyAnswers;
+  /** Probes 6 and 7: the draft's checkout — whether it cuts a branch, and whether it stands in a tree of its own. */
+  gitMode?: string;
+  isolation?: string;
+}
 
 /** The convergence loop's standing and its last pass per plan (`GET /api/converge`). */
 export function useConverge(enabled = true) {
@@ -403,64 +453,6 @@ export function useSpend(enabled = true) {
  * Insights and the run view's Verification section draw them (phase 26)
  * ------------------------------------------------------------------ */
 
-/** A session cap and where its number came from. */
-export interface SessionCap {
-  value: number;
-  source: string;
-  basis?: string;
-  derivation?: {
-    basis: string;
-    percentile: number;
-    headroom: number;
-    samples: number;
-    from: string | null;
-    to: string | null;
-    observed: number;
-  };
-}
-
-/** Caps by session mode — a mode this console has not measured takes the shipped table's. */
-export interface SessionCapTable {
-  modes: Record<string, { turns?: SessionCap; usd?: SessionCap }>;
-  derivedAt: string | null;
-}
-
-/** Sessions per phase of one size, measured or shipped. */
-export interface SessionsPerPhase {
-  noWrap: number;
-  wraps: number;
-  wrapRate: number;
-  expected: number;
-  phases: number;
-  basis: string;
-}
-
-/** What a session may spend: the measured caps beside the shipped ones, the context model, sessions per phase. */
-export interface SessionSizing {
-  /** Null until this console's first read of its own sessions lands — every answer is then the shipped one. */
-  derivedAt: string | null;
-  caps: {
-    measured: SessionCapTable | null;
-    shipped: SessionCapTable;
-    phase: { turns: SessionCap; usd: SessionCap };
-  };
-  /** The context model: a session peaks near `floor` (its boot plus its work) plus `slope` × its weight. */
-  context: {
-    basis: string;
-    boot: number;
-    /** The boot this repository measured, with its evidence; null while the shipped floor stands. */
-    bootMeasured: { tokens: number; samples: number; min: number; max: number } | null;
-    work: number;
-    floor: number;
-    slope: number;
-    samples: number;
-    /** Per size: the median peak, and that median over the model at the size's weight — near 1 is the claim. */
-    sizes?: { size: string; weight: number; medianPeak: number; samples: number; ratio: number }[];
-  };
-  bootLine: string;
-  sessions: Record<'S' | 'M' | 'L', SessionsPerPhase>;
-}
-
 export const readSessionSizing = (): Promise<SessionSizing> => request<SessionSizing>('/api/sizing');
 
 /** The census behind the sizing is re-derived as sessions end, which no event announces. */
@@ -480,95 +472,6 @@ export function useSessionSizing(enabled = true) {
     staleTime: SIZING_STALE_MS,
     retry: false,
   });
-}
-
-/** One estimator's back-test score: the share within ×2 of the truth, and the mean |log| error (MALE). */
-export interface EtaScore {
-  n: number;
-  male: number;
-  within2: number;
-  medianRatio: number;
-  over2: number;
-  under2: number;
-}
-
-/** The week's measurements, each summed and rounded by the server (`server/analysis/week-report.ts`). */
-export interface WeekMetrics {
-  /** The share of each run's working life it spent stopped, and the hours each kind of press ended. */
-  down: {
-    runs: { slug: string; run: string; lifeHours: number; downHours: number; share: number }[];
-    lifeHours: number;
-    downHours: number;
-    share: number;
-    endedBy: Record<'person' | 'console' | 'wait-clock' | 'open', number>;
-  };
-  /** Stopped time today's rules would not have stopped for. */
-  avoidable: { hours: number; byCause: Record<'streak' | 'lint-crash' | 'credential-latch', number> };
-  streakHalts: {
-    total: number;
-    flagged: number;
-    byCause: Record<'rescued-command' | 'repeated-phase' | 'wait-budget', number>;
-  };
-  verifyFailed: { halts: number; fromRescued: number };
-  /** What the ledger booked against the CLI's own final total per session. */
-  spend: {
-    sessions: number;
-    bookedUsd: number;
-    finalUsd: number;
-    phantomUsd: number;
-    phantomShare: number;
-    mismatched: number;
-  };
-  queue: {
-    episodes: number;
-    episodeHours: number;
-    recordedHours: number;
-    recordedShare: number;
-    ownRunHours: number;
-    ownRunShare: number;
-    serialHours: number;
-  };
-  /** The holder label a queue card showed, against the wait that followed. */
-  holderEta: {
-    waits: number;
-    medianRealisedOverLabel: number;
-    errorAtMedian: number;
-    medianLowOverRealised: number;
-    lowCoverage: number;
-    bandCoverage: number;
-  };
-  /** The phase ETA back-test: `estimator` is null when the shown estimate was not journalled. */
-  phaseEta: { records: number; estimator: EtaScore | null; baseline: EtaScore; ships: boolean | null };
-  stallsOnFinished: { count: number; bySignal: Record<string, number> };
-  closeoutCapResumes: { maxTurnsEndings: number; underCloseoutCap: number };
-  unrunVerification: { count: number; phases: { slug: string; run: string; phase: number }[] };
-  modelNamed: { starts: number; differs: number };
-  /** What re-reading the context cost; `bootShare` is null when no session measured its boot. */
-  context: {
-    sessions: number;
-    calls: number;
-    cacheReadMTokens: number;
-    meanContextK: number;
-    bootShare: number | null;
-    bootMeasured: number;
-  };
-}
-
-/** The week in numbers: the report, its ETA backtest (`metrics.phaseEta`) and its holder ETA (`metrics.holderEta`). */
-export interface WeekReportAnswer {
-  report: {
-    instance: string;
-    since: string;
-    until: string;
-    /** The models re-derived with today's rules; empty when the report was not replayed. */
-    replay: string[];
-    metrics: WeekMetrics;
-    /** Each acceptance target judged on these numbers — `met: null` when there was nothing to judge. */
-    targets: { id: string; target: string; value: string; met: boolean | null }[];
-  };
-  readAt: string;
-  /** The same question asked inside five minutes is answered from memory. */
-  cached: boolean;
 }
 
 /** What the week report is asked: the window (two instants) and whether to replay. */
@@ -610,52 +513,8 @@ export function useWeekReport(options: WeekReportQuery = {}, enabled = true) {
   });
 }
 
-/** The last proof of one command a session recorded, and the tree it ran against. */
-export interface RunProof {
-  phase: number;
-  command: string;
-  code: number;
-  tree: string;
-  head?: string;
-  at: string;
-  session?: string;
-}
-
-export interface RunProofs {
-  slug: string;
-  phase: number | null;
-  proofs: RunProof[];
-}
-
 export const readRunProofs = (slug: string, phase?: number): Promise<RunProofs> =>
   request<RunProofs>(`/api/run/${q(slug)}/proofs${phase ? `?phase=${phase}` : ''}`);
-
-/** One run of one §Verification line — a verdict, or the baseline it was compared with. */
-export interface RunVerification {
-  phase: number;
-  run: string;
-  at: string;
-  kind: 'verify' | 'baseline';
-  command: string;
-  chain?: string;
-  code: number;
-  ms: number;
-  ok: boolean;
-  timedOut?: boolean;
-  failures?: string[];
-  tail?: string;
-  environment?: string;
-  own?: string[];
-}
-
-export interface RunVerifications {
-  slug: string;
-  /** Newest first. */
-  rows: RunVerification[];
-  /** How many matched before `limit` cut them. */
-  total: number;
-  limit: number;
-}
 
 export function readRunVerifications(
   slug: string,

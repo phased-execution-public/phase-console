@@ -47,7 +47,8 @@ const DEFAULT_MAX_SESSIONS = 3;
 /** The full-options start line for one console. */
 export function composeStartCommand(state: {
   scriptsDir?: string;
-  root?: { path?: string };
+  /** Null while no source directory is open — the server sends `null`, not nothing. */
+  root?: { path?: string } | null;
   port?: number;
   home?: string;
   remoteHosts?: string[];

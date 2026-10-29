@@ -39,7 +39,7 @@ import { useQueue, useRunScopes } from '@/data/queue';
 import { useJournal, useLedger, useRulings, useRun, useTimeline, useTriggers } from '@/data/runs';
 import { useSessions } from '@/data/sessions';
 import { useRunVerifications } from '@/data/verification';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { looksLikeAuthFailure } from '@/lib/failures';
 import { scrollIntoScroller } from '@/lib/scroll';

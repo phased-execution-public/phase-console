@@ -1,18 +1,18 @@
 # A person's turn — the session's reference
 
-Contents: When to ask a person · The declaration · The reasons · The guide · A template per kind ·
+Contents: When to ask a person · The declaration · A deferred step · The reasons · The guide · What the console reads from your closing words · A template per kind ·
 The proof and the check · The guard · A permission block · A run request · The answer's road back · What you handled ·
 The doors
 
-`SKILL.md` Mode 2 states the rule in one paragraph; this file is its detail. A person's turn is an act
+`references/mode-phase-start.md` states the rule in one paragraph; this file is its detail. A person's turn is an act
 only a person can do, declared as a typed record that the console shows on **Your turn** (`#/turn`),
 announces once, checks, and answers back to your own session. The words below are the code's:
-`viewer/shared/turn-model.js` (twin `scripts/turn.env`) owns the reasons, the proof types, the
+`shared/turn-model.js` (twin `scripts/turn.env`) owns the reasons, the proof types, the
 verdicts, the grant scopes and risk tiers, the page's groups, the handled sources and the guard's exit;
-`viewer/shared/human-step-model.js` (twin `scripts/human-steps.env`) owns the kinds and their states;
-`viewer/shared/guide-grammar.js` is the one guide parser; `viewer/shared/door-model.js` owns the doors.
+`shared/human-step-model.js` (twin `scripts/human-steps.env`) owns the kinds and their states;
+`shared/guide-grammar.js` is the one guide parser; `shared/door-model.js` owns the doors.
 `references/conventions.md` §A person's turn is the lifecycle; the console's half is
-`viewer/server/turn/guard.ts`.
+`server/turn/guard.ts`.
 
 ## When to ask a person
 
@@ -68,6 +68,24 @@ guard refused (G4 or G5): you can do this yourself, or nothing refused it — ru
 A plan declares the same act ahead of time on a `- **Human step:**` bullet with `why:`, `effort:`,
 `unblocks:` and `guide:` fields (`references/plan-format.md`), asked for at the launch door.
 
+## A deferred step
+
+Under the run setting `humanStepMode: defer` (the default on a CLI at 2.1.306 or later), the
+declaration above does not end your turn the way it used to. The console's hook DEFERS the call: it
+raises the person's item from your call's own words, and your turn stops at that call with nothing
+lost. When the person's check passes, the console resumes THIS session and the same call runs again,
+given `--resumed-with "<what was proven or answered>"`. The script then prints that answer, declares
+nothing and exits 0. Read it, and carry on from the line after the call, as if the step had taken a
+moment. You do not declare again, and you do not stop.
+
+Two things keep the 8.0 shape:
+- a call the console cannot read plainly — one statement, the script and its words, nothing computed
+  (`$(…)`, `$VAR` outside the script's path), nothing redirected, nothing beside it on the line;
+- a run set to `humanStepMode: park`.
+
+Then the call runs, the phase parks, and a resume carries the answer as its instruction. Write the
+declaration as one plain call on its own, and the deferred path is the one you get.
+
 ## The reasons
 
 Ten, and each kind allows some of them. Three claim that the AI **cannot** (`permission`, `reach`,
@@ -91,7 +109,7 @@ are never judged: a sign-in is the person's even when policy would let its comma
 
 The guide is what a person reads to act, so write it for someone who has not seen your session: why
 it matters, then the steps, then what to do when one fails. One file, in the grammar of
-`viewer/shared/guide-grammar.js`:
+`shared/guide-grammar.js`:
 
 ````markdown
 Signing in lets the run push its branch to the acme org.
@@ -140,6 +158,41 @@ gates: a task or decision bullet with no `guide:`, no `options:` and no bound ta
 budget (`fa`, `en`, …), else English, and pass that tag as `--lang`. A right-to-left guide is drawn
 right to left with its commands, refs and numbers left to right; your `--title` and the console's own
 words stay as they are.
+
+**A wizard is a guide too** (measured-console phase 29). A plan bullet's `guide:` may name a wizard
+script in the shape of mattpocock's wizard template — a `run_wizard` of `stage "<name>"` blocks
+of `say`/`step`, `open_url`, `ask`/`ask_secret`, `write_env`, `set_secret`/`set_var` and `confirm`.
+The console reads it as a Task guide: a first step that runs the wizard (`bash <path>`), then one step
+per stage, "Stage 2 of 3 · <name>", carrying its commands (`open <url>`, `gh secret set <NAME>`, `gh
+variable set <NAME>`). A secret is said by **where it goes** — the env file the wizard writes, the
+repository's GitHub secret (`gh secret set` asks for it hidden), else the login keychain (`security
+add-generic-password … -w`) — with a warning to enter it only at a hidden prompt. Nothing on the card
+takes a value, and a secret-shaped line in the script is refused by its line number.
+
+## What the console reads from your closing words
+
+Ending a turn on a question is not asking one — but the console reads your last message when you
+declare no outcome, so a question left there still reaches a person, once (measured-console phase 29):
+
+- **Prose questions.** When your final message ENDS on questions — walking back from the last line,
+  every line a question (its words end in `?`), a lettered choice (`A) …`), a recommendation
+  (`Recommended: …`, `I recommend …`) or blank, until the first other line or a code fence — the
+  console raises ONE Decision item carrying them, each with the answer you recommended, and parks the
+  phase on it; the same session resumes with the answer (journalled `phase.prose-question`). One
+  question with lettered choices offers those choices, the `(recommended)` one marked; otherwise the
+  options are *Go with the recommended answers* and *Answer them myself*. Closing courtesy ("Let me
+  know if …?") is not a question. Declaring `needs-human --step decision` yourself is still the
+  better road: you name the options and the proof.
+- **gstack at its gate.** A last `GSTACK_RESULT: skill=<s> status=gate_pending run=<dir>` line is a
+  run stopped at its gate. With an absolute `run=` whose `decisions.jsonl` holds a row `kind:
+  "approval", status: "pending"` of the newest `gate_rev`, the first such row is an **Approval**, each
+  option in `gate.json`'s words, the recommended one marked; with none readable, a **Decision** on the
+  gate (*Take every recommendation*, recommended, or *Walk me through each item*). Either way the
+  console never approves for the owner: the answer comes back to you, and you relay it through
+  gstack's own `answer` command, by `agent:<id>`, in the owner's words. The next pending approval
+  rises when you end again (journalled `phase.pack-item`).
+- **A questionnaire's shape** (`to-questionnaire`): `### <question>` sections whose lettered choices
+  become a Decision's options, the `(recommended)` one marked.
 
 ## A template per kind
 
@@ -196,7 +249,7 @@ exits 126 or 127 and reads `unrunnable` — the card says **Cannot run**, "the p
 script may land; the person is not sent to redo anything. A script that lives only on the run branch is
 the usual cause, which the lint names at plan time (**F46** `proof-script-run-branch-only`), beside a
 proof the check reader would refuse every time (**F45** `proof-unparsable`). Both read the ref the way
-the check does: `viewer/shared/proof-words.js` `cmdOfRef`, and its bash twin `scripts/cmd-ref.sh`.
+the check does: `shared/proof-words.js` `cmdOfRef`, and its bash twin `scripts/cmd-ref.sh`.
 
 ## The guard
 
@@ -250,7 +303,7 @@ so a permission ask for one reaches nobody. Declare it, hand off `in-progress`, 
 bash "$PE_SCRIPTS/phase-outcome.sh" <slug> <N> blocked --needs run --run-act <act> --reason "<why the run must>"
 ```
 
-`--run-act` is one of `RUN_ACTS` (`scripts/turn.env`; owner `viewer/shared/verb-model.js`): `isolate`
+`--run-act` is one of `RUN_ACTS` (`scripts/turn.env`; owner `shared/verb-model.js`): `isolate`
 (a checkout of its own at the next boundary), `switch-account` (the account with the most headroom, at
 the boundary), `raise-budget` (the phase's dollar budget — money, so always a person's), `stop`, `hold`.
 `--needs run` without it, `--run-act` anywhere else, or an act not on the list is exit 2. The runner

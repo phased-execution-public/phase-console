@@ -33,7 +33,7 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
      Sessions: under Phase Console the unit is 1 phase ≥ 1 session — the autopilot never batches — so
      state the count `--session-plan` FORECASTS from measured sessions per phase, and paste its
      generated `Weight:` line rather than typing a sum. Its batches are for a person driving by hand. -->
-**Target model:** `claude-opus-5`  ·  **Budget:** ~200K weight/session (≈60% of a 1M window)  ·  **Branch:** current branch (no new branch)
+**Target model:** `claude-opus-5-5`  ·  **Budget:** ~200K weight/session (a weight preset; the context target is 60% of a 1M window)  ·  **Branch:** current branch (no new branch)
 **Sessions:** <!-- paste `scripts/phase-graph.sh <slug> --session-plan <model>`'s `Weight:` and `Forecast:` lines — generated, in the unit 1 phase ≥ 1 session. -->
 **Skills (every session):** <!-- optional — backtick each skill to use across ALL phases, e.g. `design-system`, `some-plugin:test-first`; the engine re-injects them into every phase's boot prompt + QA brief. Remove this line if none. -->
 **MCP servers (every session):** <!-- optional — backtick each MCP server id this work needs across ALL phases, e.g. `github`, `context7`. Registered in Phase Console → MCP; checked before a phase spends a token, so a wall costs a probe rather than an hour. Keep it to 3-6. Remove this line if none. -->
@@ -74,7 +74,7 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
      **QA exhausted:** waive                   <-- waive | halt | <owner> — once the QA round budget
                                                   is spent (the `qa.exhausted` row)
      **When in doubt:** prefer X · never Y · record a ruling   <-- the `ambiguity` row
-     **Wait budget:** 8h                       <-- the ceiling on any one external wait (`waits`)
+     **Wait budget:** 8h                       <-- the TOTAL one phase may spend parked across its waits (`waits`)
      **Issues:** off                           <-- off | draft | file — whether a session may open an
                                                   issue for something it finds OUTSIDE its phase (the
                                                   `issues` row). `draft` is the recommended answer:

@@ -10,6 +10,7 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, statSync, readFileSync, writeFileSync } from 'node:fs';
@@ -23,13 +24,19 @@ process.env.XDG_STATE_HOME = STATE_HOME;
 // able to reach the operator's own `~/.config/phase-console/autopilot.json`.
 process.env.XDG_CONFIG_HOME = join(STATE_HOME, 'config');
 process.env.PHASE_CONSOLE_LOG = '';
+// A suite run from a console's phase session inherits that console's plugin
+// seed, which an operator-config session would then appear to carry.
+delete process.env.CLAUDE_CODE_PLUGIN_SEED_DIR;
 
+const approvalsModule = await import('../server/runner/approvals.ts');
 const {
   Approvals, buildSettings, writeSettingsFile, loadPolicy, classifyTool, ruleMatches,
   DEFAULT_DENY, DEFAULT_ASK, HOOK_TIMEOUT_SECONDS, RECOVERED_NOTE, TIMEOUT_REASON, UNANSWERABLE_REASONS,
-  tokenFromSettingsFile, treeGuard, RUN_TREE_CLONE_RULE,
+  tokenFromSettingsFile, treeGuard, RUN_TREE_CLONE_RULE, memoryDirFor,
 } = await import('../server/runner/approvals.ts');
 const { recent: recentLog } = await import('../server/log.ts');
+import type { SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
+import type { SessionLoads } from '../server/runner/loads.ts';
 
 /* ------------------------------------------------------------------ *
  * The two layers
@@ -70,6 +77,21 @@ test('crossSessionInbound is written only when the plan allows messaging, and on
   // And it is not a permission: it must never reach the permissions block,
   // where a profile or a strike could move it.
   assert.ok(!JSON.stringify(on.permissions).includes('crossSessionInbound'));
+});
+
+test('a run\'s settings file names autoMemoryDirectory under <docs root>/docs/memory/<slug>/ (measured-console phase 4)', () => {
+  // The plan's memory travels with the plan: one directory for every config
+  // dir and every lane, versioned beside the handoffs — where the CLI's own
+  // default is a folder per config dir that no other account reads.
+  const dir = memoryDirFor('/work/docs-root', 'demo-plan');
+  assert.equal(dir, join('/work/docs-root', 'docs', 'memory', 'demo-plan'));
+  const settings = buildSettings({ runId: 'r-mem', token: 't', origin: 'http://x', memoryDir: dir });
+  assert.equal(settings.autoMemoryDirectory, dir);
+  const path = writeSettingsFile('r-mem', settings);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).autoMemoryDirectory, dir);
+  // Not a permission, and absent when the run names no root.
+  assert.ok(!JSON.stringify(settings.permissions).includes('autoMemoryDirectory'));
+  assert.ok(!('autoMemoryDirectory' in buildSettings({ runId: 'r-mem', token: 't', origin: 'http://x' })));
 });
 
 test('the ask list is never handed to the CLI — headless has nobody to ask', () => {
@@ -2268,4 +2290,529 @@ test('a tool card IS a permission item until phase 149: its Grant is the broker\
     svc.approvals.disarm();
     svc.close();
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * The session's hooks and guards (measured-console phase 6, B3 C4)
+ * ------------------------------------------------------------------ */
+
+test('every hook in a generated settings file blocks on its own failure — HTTP and the local guard alike', () => {
+  const { HOOK_ON_FAILURE } = approvalsModule;
+  const settings = buildSettings({
+    runId: 'r-fail', token: 't', origin: 'http://x', relay: true, guardHook: '/skill/scripts/guard-hook.sh',
+  });
+  const hooks = settings.hooks as Record<string, { matcher?: string; hooks: Record<string, unknown>[] }[]>;
+  const all = Object.values(hooks).flatMap((groups) => groups.flatMap((group) => group.hooks));
+  assert.ok(all.length >= 4, `PreToolUse (http + command), PermissionRequest and Stop — saw ${all.length}`);
+  for (const hook of all) assert.equal(hook.onFailure, HOOK_ON_FAILURE, `${JSON.stringify(hook)} must block on failure`);
+  assert.equal(HOOK_ON_FAILURE, 'block');
+  const guard = hooks.PreToolUse!.find((group) => group.hooks.some((hook) => hook.type === 'command'))!;
+  assert.equal(guard.matcher, 'Bash|Write|Edit|NotebookEdit');
+  assert.equal(guard.hooks[0]!.command, "bash '/skill/scripts/guard-hook.sh'");
+  // No guard named, none written — the HTTP layer alone, still blocking.
+  const bare = buildSettings({ runId: 'r-fail', token: 't', origin: 'http://x' }).hooks as typeof hooks;
+  assert.equal(bare.PreToolUse!.length, 1);
+});
+
+test('the protected files: a baseline is never writable by a session, a test is deleted only when the phase says so', () => {
+  const { protectedFileCall, PROTECTED_FILES } = approvalsModule;
+  assert.deepEqual([...PROTECTED_FILES], [
+    'e2e/baseline.json', 'status-ratchet.json', 'known-reds.json', 'scripts/quarantine.env',
+    '**/__snapshots__/**', '**/*.snap',
+  ]);
+  const denied: [string, unknown][] = [
+    ['Write', { file_path: '/repo/viewer/e2e/baseline.json' }],
+    ['Edit', { file_path: 'viewer/status-ratchet.json' }],
+    ['Edit', { file_path: 'tests/known-reds.json' }],
+    ['Write', { file_path: 'scripts/quarantine.env' }],
+    ['Edit', { file_path: 'client/src/__snapshots__/card.test.tsx.snap' }],
+    ['Bash', { command: 'echo [] > viewer/e2e/baseline.json' }],
+    ['Bash', { command: 'cp /tmp/x.json e2e/baseline.json' }],
+    ['Bash', { command: "sed -i '' 's/a/b/' known-reds.json" }],
+    ['Bash', { command: 'rm -rf client/src/__snapshots__' }],
+    ['Bash', { command: 'git checkout -- viewer/e2e/baseline.json' }],
+    ['Bash', { command: 'git restore --source HEAD~1 status-ratchet.json' }],
+  ];
+  for (const [tool, input] of denied) {
+    for (const mayDeleteTests of [false, true]) {
+      assert.match(protectedFileCall(tool, input, { mayDeleteTests }) ?? '', /the console protects/, `${tool} ${JSON.stringify(input)} — never, lifted or not`);
+    }
+  }
+  const deletions: [string, unknown][] = [
+    ['Bash', { command: 'rm viewer/test/foo.test.ts' }],
+    ['Bash', { command: 'git rm -q viewer/test/foo.test.ts' }],
+    ['Bash', { command: 'git -C viewer rm test/foo.spec.js' }],
+    ['Bash', { command: "bash -c 'rm -f src/foo.test.tsx'" }],
+    ['Bash', { command: 'cd viewer && rm -rf test/foo.test.ts' }],
+    ['Bash', { command: "find . -name '*.test.ts' -delete" }],
+    ['Bash', { command: 'rm -rf viewer/test/' }],
+    ['Bash', { command: 'rm *.spec.js' }],
+  ];
+  for (const [tool, input] of deletions) {
+    assert.match(protectedFileCall(tool, input) ?? '', /deletes the test (?:file|directory) .*May delete tests/, JSON.stringify(input));
+    assert.equal(protectedFileCall(tool, input, { mayDeleteTests: true }), null, `lifted: ${JSON.stringify(input)}`);
+  }
+  const allowed: [string, unknown][] = [
+    ['Bash', { command: 'cat viewer/e2e/baseline.json' }],
+    ['Bash', { command: 'node --test viewer/test/foo.test.ts' }],
+    ['Bash', { command: 'git mv test/a.test.ts test/b.test.ts' }],
+    ['Bash', { command: 'grep -n x known-reds.json' }],
+    ['Bash', { command: 'git checkout -q pe/x' }],
+    ['Bash', { command: 'rm -rf viewer/dist' }],
+    ['Edit', { file_path: 'viewer/test/foo.test.ts' }],
+    ['Read', { file_path: 'viewer/e2e/baseline.json' }],
+  ];
+  for (const [tool, input] of allowed) assert.equal(protectedFileCall(tool, input), null, `${tool} ${JSON.stringify(input)}`);
+});
+
+test('the guard hook and the HTTP hook answer the same deny, and the guard says nothing about the rest', async () => {
+  const { guardAnswer } = await import('../server/runner/classify-cli.ts');
+  const svc = await service();
+  try {
+    const run = { id: 'r-guard', slug: 'demo', root: '/tmp/nowhere', activePhase: 2, phases: { 2: { phase: 2, sessionId: 'sess-g' } } };
+    let mayDelete = false;
+    const noted: string[] = [];
+    (svc as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+      busy: () => true, current: () => run, isSpending: () => false,
+      note: (event: string) => { noted.push(event); return 1; },
+      mayDeleteTests: () => mayDelete,
+    });
+    const body = (command: string) => ({ session_id: 'sess-g', tool_name: 'Bash', tool_input: { command } });
+    const http = await svc.decideToolUse(body('rm viewer/test/foo.test.ts'), 'r-guard') as { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } };
+    const local = guardAnswer(JSON.stringify(body('rm viewer/test/foo.test.ts')), {}) as typeof http;
+    assert.equal(http.hookSpecificOutput.permissionDecision, 'deny');
+    assert.equal(local.hookSpecificOutput.permissionDecision, 'deny');
+    assert.equal(local.hookSpecificOutput.permissionDecisionReason, http.hookSpecificOutput.permissionDecisionReason);
+    assert.match(http.hookSpecificOutput.permissionDecisionReason, /rule: protected-file/);
+    assert.ok(noted.includes('phase.guard-denied'));
+    // Lifted by the phase's own words, on both layers.
+    mayDelete = true;
+    const lifted = await svc.decideToolUse(body('rm viewer/test/foo.test.ts'), 'r-guard') as { hookSpecificOutput?: { permissionDecision?: string } };
+    assert.notEqual(lifted.hookSpecificOutput?.permissionDecision, 'deny');
+    assert.deepEqual(guardAnswer(JSON.stringify(body('rm viewer/test/foo.test.ts')), { PE_MAY_DELETE_TESTS: 'yes' }), {});
+    // A baseline is not lifted by anything.
+    const baseline = guardAnswer(JSON.stringify({ tool_name: 'Write', tool_input: { file_path: 'viewer/e2e/baseline.json' } }), { PE_MAY_DELETE_TESTS: 'yes' }) as typeof http;
+    assert.equal(baseline.hookSpecificOutput.permissionDecision, 'deny');
+    // Everything else is the HTTP hook's to decide; input it cannot read is a deny.
+    assert.deepEqual(guardAnswer(JSON.stringify(body('git status')), {}), {});
+    assert.equal((guardAnswer('not json', {}) as typeof http).hookSpecificOutput.permissionDecision, 'deny');
+  } finally {
+    svc.close();
+  }
+});
+
+test('Stop: red fast lines hold a session ending its work ONCE, naming the ids; `Fast gate: off` and `stop_hook_active` never', async () => {
+  const { stopBlock } = await import('../server/runner/runner-core.ts');
+  // The CLI reads `decision` at the top level (measured, CLI 2.1.307).
+  assert.deepEqual(stopBlock('why'), {
+    decision: 'block', reason: 'why', hookSpecificOutput: { hookEventName: 'Stop', decision: 'block', reason: 'why' },
+  });
+  const svc = await service();
+  try {
+    const run = { id: 'r-stop', slug: 'demo', root: '/tmp/nowhere', activePhase: 2, phases: { 2: { phase: 2, sessionId: 'sess-s' } } };
+    let gateCalls = 0;
+    let fastGate = true;
+    (svc as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+      busy: () => true, current: () => run, isSpending: () => false, note: () => 1,
+      stopGate: async () => {
+        gateCalls += 1;
+        return fastGate ? [{ command: 'npm test', failures: ['test/a.test.ts', 'b is red'] }] : null;
+      },
+    });
+    (svc as unknown as { root: unknown }).root = { ok: true, path: '/tmp/nowhere' };
+    (svc as unknown as { board: () => Promise<unknown> }).board = async () => ({
+      phased: true, states: { 2: 'done' }, done: [], inProgress: [], stuck: [], ready: [], waiting: [], blockedBy: {}, qa: {},
+    });
+    (svc as unknown as { qaMode: () => Promise<{ mode: string }> }).qaMode = async () => ({ mode: 'off' });
+    // Already continuing for a Stop hook: never run, never held.
+    assert.deepEqual(await svc.decideStop({ session_id: 'sess-s', stop_hook_active: true }, 'r-stop'), {});
+    assert.equal(gateCalls, 0);
+    const first = await svc.decideStop({ session_id: 'sess-s', stop_hook_active: false }, 'r-stop') as { decision?: string; reason?: string };
+    assert.equal(first.decision, 'block');
+    assert.match(first.reason ?? '', /`npm test` — failing: test\/a\.test\.ts, b is red/);
+    assert.match(first.reason ?? '', /phase-outcome\.sh demo 2 partial/);
+    // Not twice for the same session.
+    assert.deepEqual(await svc.decideStop({ session_id: 'sess-s', stop_hook_active: false }, 'r-stop'), {});
+    assert.equal(gateCalls, 1, 'the gate runs once per session');
+    // A phase whose plan section says `- **Fast gate:** off`: the runner's gate answers null.
+    fastGate = false;
+    run.phases[2]!.sessionId = 'sess-t';
+    assert.deepEqual(await svc.decideStop({ session_id: 'sess-t' }, 'r-stop'), {});
+  } finally {
+    svc.close();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * What loads (measured-console phase 11, §Architecture 6 D2)
+ * ------------------------------------------------------------------ */
+
+/** A plugin dir with one SKILL.md per name (`name!` marks disable-model-invocation), under `sub`. */
+function pluginTree(dir: string, names: string[], sub = 'skills'): string {
+  mkdirSync(dir, { recursive: true });
+  for (const raw of names) {
+    const name = raw.replace(/!$/, '');
+    const at = join(dir, sub, name);
+    mkdirSync(at, { recursive: true });
+    writeFileSync(join(at, 'SKILL.md'), `---\nname: ${name}\ndescription: x\n${raw.endsWith('!') ? 'disable-model-invocation: true\n' : ''}---\nbody\n`);
+  }
+  return dir;
+}
+
+/** A seed with two entries, as `server/seed.ts` reads one. */
+function fakeSeed(root: string) {
+  pluginTree(join(root, 'plugins/cache/phased-execution-seed/superpowers/v1'), ['test-driven-development', 'brainstorming'], '.');
+  pluginTree(join(root, 'plugins/cache/phased-execution-seed/mattpocock-skills/v1'), ['tdd', 'grilling!'], 'engineering');
+  return {
+    digest: 'abcdefabcdef', dir: root, pluginsDir: join(root, 'plugins'), notices: join(root, 'THIRD-PARTY-NOTICES'),
+    marketplace: 'phased-execution-seed', builtAt: '2026-10-25T00:00:00Z', ageMs: 0, bytes: 1, format: 3,
+    entries: [
+      { name: 'superpowers', source: 's', sha: null, commit: null, version: null, license: 'MIT', skills: ['test-driven-development'],
+        installPath: 'plugins/cache/phased-execution-seed/superpowers/v1', bytes: 1, notices: [] },
+      { name: 'mattpocock-skills', source: 'm', sha: null, commit: null, version: null, license: 'MIT', skills: ['tdd', 'grilling'],
+        installPath: 'plugins/cache/phased-execution-seed/mattpocock-skills/v1', bytes: 1, notices: [] },
+    ],
+  };
+}
+
+test('what loads: console-set names the tree, the seed and the switched-on plugins in enabledPlugins, the seed env and PE_PLUGIN_HOOKS — operator-config none of it', async () => {
+  const { composeLoads, forgetObservedSkills, userSettings } = await import('../server/runner/loads.ts');
+  forgetObservedSkills();
+  const root = mkdtempSync(join(tmpdir(), 'pc-loads-'));
+  try {
+    const tree = pluginTree(join(root, 'tree'), [], 'x');
+    writeFileSync(join(tree, 'SKILL.md'), '---\nname: phased-execution\ndescription: x\n---\n');
+    const personal = pluginTree(join(root, 'personal'), ['shipit']);
+    const loads = composeLoads({
+      mode: 'console-set', pluginDir: tree, seed: fakeSeed(join(root, 'seed')) as never,
+      personal: [{ id: 'mine@my-market', installPath: personal }],
+    });
+    assert.deepEqual(loads.enabledPlugins, {
+      'phased-execution@phased-execution-public': false,
+      'superpowers@phased-execution-seed': true,
+      'mattpocock-skills@phased-execution-seed': true,
+      'mine@my-market': true,
+    });
+    assert.deepEqual(loads.pluginDirs, [tree]);
+    assert.equal(loads.settingSources, 'project,local');
+    assert.deepEqual(loads.env, { PE_PLUGIN_HOOKS: '1', CLAUDE_CODE_PLUGIN_SEED_DIR: join(root, 'seed', 'plugins') });
+    // The skill set PE_SKILLS tells the engine: the entry's `skills` array
+    // keeps brainstorming out, and a disable-model-invocation skill carries `!`.
+    assert.deepEqual(loads.skills.sort(), [
+      'mattpocock-skills:grilling!', 'mattpocock-skills:tdd', 'mine:shipit',
+      'phased-execution:phased-execution', 'superpowers:test-driven-development',
+    ]);
+    assert.deepEqual(loads.missing, []);
+    assert.deepEqual(loads.carriedDeny, [], 'no user settings given, nothing carried');
+
+    // The user's own settings: deny rules carried, hook events named, never a throw on a bad file.
+    const configDir = join(root, 'config');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'settings.json'), JSON.stringify({
+      permissions: { deny: ['Read(./.env)', 'Read(./.env)', 7], allow: ['Bash(ls:*)'] },
+      hooks: { Stop: [], PreToolUse: [] },
+    }));
+    assert.deepEqual(userSettings(configDir), { deny: ['Read(./.env)'], hookEvents: ['PreToolUse', 'Stop'] });
+    assert.deepEqual(userSettings(join(root, 'nowhere')), { deny: [], hookEvents: [] });
+    const carried = composeLoads({ mode: 'console-set', pluginDir: tree, seed: null, personal: [], user: userSettings(configDir) });
+    assert.deepEqual(carried.carriedDeny, ['Read(./.env)']);
+    const wall = (buildSettings({ runId: 'r-carry', token: 't', origin: 'http://x', carriedDeny: carried.carriedDeny }).permissions as { deny: string[] }).deny;
+    assert.ok(wall.includes('Read(./.env)'));
+
+    // The settings file the run writes from it.
+    const settings = buildSettings({ runId: 'r-loads', token: 't', origin: 'http://x', enabledPlugins: loads.enabledPlugins });
+    const path = writeSettingsFile('r-loads', settings);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).enabledPlugins, loads.enabledPlugins);
+    assert.ok(!('enabledPlugins' in buildSettings({ runId: 'r-loads', token: 't', origin: 'http://x' })), 'absent when nothing is named');
+
+    // No tree for this revision: the installed copy is the skill, said by name.
+    const noTree = composeLoads({ mode: 'console-set', pluginDir: null, seed: null, personal: [] });
+    assert.deepEqual(noTree.enabledPlugins, { 'phased-execution@phased-execution-public': true });
+    assert.deepEqual(noTree.pluginDirs, []);
+    assert.equal(noTree.missing.length, 2, 'the tree and the seed, each named');
+
+    const operator = composeLoads({ mode: 'operator-config', pluginDir: tree, seed: fakeSeed(join(root, 'seed')) as never, personal: [{ id: 'mine@my-market' }] });
+    assert.deepEqual(operator.pluginDirs, []);
+    assert.equal(operator.settingSources, undefined);
+    assert.deepEqual(operator.env, {});
+    assert.equal(operator.enabledPlugins, undefined);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+/** A Runner over a stub engine whose one phase session plays the frames a console-set session opens with. */
+async function loadsRun(mode: 'console-set' | 'operator-config', extra: { deps?: (loads: SessionLoads) => Record<string, unknown>; start?: Record<string, unknown> } = {}) {
+  const { Runner } = await import('../server/runner/runner.ts');
+  const { composeLoads, forgetObservedSkills } = await import('../server/runner/loads.ts');
+  forgetObservedSkills();
+  const root = mkdtempSync(join(tmpdir(), 'pc-loads-run-'));
+  const scripts = join(root, 'scripts');
+  const stub = join(root, '.stub');
+  mkdirSync(scripts, { recursive: true });
+  mkdirSync(stub, { recursive: true });
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
+  writeFileSync(join(stub, 'done'), '');
+  const exe = (path: string, body: string) => { writeFileSync(path, body, { mode: 0o755 }); };
+  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
+case "$mode" in
+  --memory-block)
+    if grep -qx 1 "$S/done"; then echo "done: 1"; echo "ready: "; else echo "done: "; echo "ready: 1"; fi
+    echo "in-progress: "; echo "stuck: "; echo "waiting: " ;;
+  --gate-status) echo "clear (no gate)" ;;
+  --qa-history) exit 0 ;;
+  --boot-prompt) printf 'BOOT phase %s\\nBefore you start: Call the Skill tool with "superpowers:test-driven-development". Call the Skill tool with "mattpocock-skills:tdd".\\n' "$arg"; printf '%s\\n' "\${PE_SKILLS:-unset}" > "$S/pe-skills" ;;
+  --size) echo M ;;
+  *) exit 0 ;;
+esac
+`);
+  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
+  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
+  const tree = pluginTree(join(root, 'tree'), [], 'x');
+  writeFileSync(join(tree, 'SKILL.md'), '---\nname: phased-execution\ndescription: x\n---\n');
+  const loads = composeLoads({
+    mode, pluginDir: tree, seed: fakeSeed(join(root, 'seed')) as never, personal: [],
+    user: { deny: ['Read(./secrets/**)'], hookEvents: ['PreToolUse', 'Stop'] },
+  });
+  const seen: SpawnRequest[] = [];
+  // Read while the session lives: a settled run removes its settings file.
+  const settingsDocs: Record<string, unknown>[] = [];
+  const events: { event: string; data: Record<string, unknown> }[] = [];
+  const approvals = new Approvals({}, join(root, 'pending.json'));
+  const runner = new Runner({
+    scriptsDir: scripts, verificationText: () => '`true`', approvals, origin: 'http://127.0.0.1:1',
+    sessionLoads: () => loads,
+    ...(extra.deps?.(loads) ?? {}),
+    onEvent: (event: string, data: Record<string, unknown>) => events.push({ event, data }),
+    spawn: async (request: SpawnRequest) => {
+      seen.push(request);
+      if (request.settings) settingsDocs.push(JSON.parse(readFileSync(request.settings, 'utf8')) as Record<string, unknown>);
+      const say = (event: StreamEvent) => request.onEvent?.(event);
+      say({ kind: 'hook', name: 'SessionStart:startup', event: 'SessionStart', outcome: 'success' });
+      say({ kind: 'init', sessionId: 'sess-l', model: 'opus', tools: 2, skills: ['superpowers:test-driven-development', 'mattpocock-skills:tdd'],
+        plugins: [{ name: 'phased-execution', source: 'phased-execution@inline' }, { name: 'superpowers', source: 'superpowers@phased-execution-seed' }] });
+      for (let i = 0; i < 3; i++) say({ kind: 'hook', name: 'PreToolUse:Bash', event: 'PreToolUse', outcome: 'success' });
+      say({ kind: 'tool', name: 'Skill', summary: 's', id: 'toolu_1', skill: 'superpowers:test-driven-development' });
+      say({ kind: 'tool', name: 'Skill', summary: 's', id: 'toolu_2', skill: 'brainstorm-anything' });
+      writeFileSync(join(stub, 'done'), '1\n');
+      return { signal: { subtype: 'success', code: 0, text: '' }, sessionId: 'sess-l', costUsd: 0, turns: 1, resultText: 'ok', durationMs: 1, argv: [] };
+    },
+  } as never);
+  await runner.start({ slug: 'demo', root, ...(extra.start ?? {}) } as never);
+  await runner.wait();
+  const journal = (name: string) => events.filter((e) => e.event === 'run:journal' && e.data.event === name).map((e) => e.data.data as Record<string, unknown>);
+  return {
+    root, tree, loads, seen, journal, stub, settingsDocs,
+    cleanup: () => { approvals.close?.(); rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+test('what loads: a stub autopilot session gets --plugin-dir, --setting-sources project,local and the seed env, its settings file enabledPlugins, and its journal phase.plugins, phase.hook and phase.skill-invoked', async () => {
+  const { buildArgv } = await import('../server/runner/spawn.ts');
+  const run = await loadsRun('console-set');
+  try {
+    const phaseSession = run.seen[0]!;
+    const argv = buildArgv(phaseSession);
+    assert.equal(argv[argv.indexOf('--plugin-dir') + 1], run.tree);
+    assert.equal(argv[argv.indexOf('--setting-sources') + 1], 'project,local');
+    assert.equal(phaseSession.env?.CLAUDE_CODE_PLUGIN_SEED_DIR, join(run.root, 'seed', 'plugins'));
+    assert.equal(phaseSession.env?.PE_PLUGIN_HOOKS, '1');
+    // The run's settings file — the one `--settings` names — carries enabledPlugins.
+    assert.ok(argv.includes('--settings'));
+    assert.deepEqual(run.settingsDocs[0]!.enabledPlugins, run.loads.enabledPlugins);
+    // The operator's own deny rule survives leaving user settings out: carried into the run's wall.
+    const deny = (run.settingsDocs[0]!.permissions as { deny: string[] }).deny;
+    assert.ok(deny.includes('Read(./secrets/**)'), 'a person\'s deny rule is not lost with their plugins');
+    assert.ok(deny.includes('Bash(git push:*)'), 'the console\'s own wall stands beside it');
+    // The engine was told the set (PE_SKILLS) when it composed the boot prompt.
+    assert.match(readFileSync(join(run.stub, 'pe-skills'), 'utf8'), /superpowers:test-driven-development/);
+    const plugins = run.journal('phase.plugins');
+    assert.equal(plugins.length, 1);
+    assert.deepEqual(plugins[0]!.plugins, [{ name: 'phased-execution', source: 'phased-execution@inline' }, { name: 'superpowers', source: 'superpowers@phased-execution-seed' }]);
+    assert.equal(plugins[0]!.loads, 'console-set');
+    assert.equal(plugins[0]!.carriedDeny, 1);
+    assert.deepEqual(plugins[0]!.userHooksLeftOut, ['PreToolUse', 'Stop'], 'the user hooks a console-set session leaves out are named');
+    const hooks = run.journal('phase.hook');
+    assert.deepEqual(hooks.map((h) => `${h.event}/${h.name}`), ['SessionStart/SessionStart:startup', 'PreToolUse/PreToolUse:Bash'], 'the first of each hook and outcome, not every call');
+    const skills = run.journal('phase.skill-invoked');
+    assert.equal(skills.length, 1);
+    assert.deepEqual(skills[0]!.named, ['superpowers:test-driven-development', 'mattpocock-skills:tdd']);
+    assert.deepEqual(skills[0]!.invoked, ['superpowers:test-driven-development', 'brainstorm-anything']);
+    assert.deepEqual(skills[0]!.uncalled, ['mattpocock-skills:tdd']);
+    assert.deepEqual(skills[0]!.unasked, ['brainstorm-anything']);
+  } finally { run.cleanup(); }
+});
+
+test('what loads: under operator-config a session carries none of the three, and its settings file names no enabledPlugins', async () => {
+  const { buildArgv } = await import('../server/runner/spawn.ts');
+  const run = await loadsRun('operator-config');
+  try {
+    const phaseSession = run.seen[0]!;
+    const argv = buildArgv(phaseSession);
+    assert.ok(!argv.includes('--plugin-dir'));
+    assert.ok(!argv.includes('--setting-sources'));
+    assert.equal(phaseSession.env?.CLAUDE_CODE_PLUGIN_SEED_DIR, undefined);
+    assert.ok(run.settingsDocs[0], 'the run wrote its settings file');
+    assert.ok(!('enabledPlugins' in run.settingsDocs[0]!));
+    assert.ok(!(run.settingsDocs[0]!.permissions as { deny: string[] }).deny.includes('Read(./secrets/**)'), 'operator-config loads the user\'s own settings, so nothing is carried');
+    assert.equal(readFileSync(join(run.stub, 'pe-skills'), 'utf8').trim(), 'unset', 'the console owns no set to tell the engine');
+    assert.equal(run.journal('phase.plugins')[0]!.loads, 'operator-config');
+  } finally { run.cleanup(); }
+});
+
+
+test('a phase\'s plugin set: the settings variant helpers — a phase file is the run\'s, the set never lowers an OFF entry', async () => {
+  const { ownsSettingsFile, phasePluginsSettingsName, withPhasePlugins } = await import('../server/runner/approvals.ts');
+  assert.equal(phasePluginsSettingsName('abc123', 4), 'abc123-p4');
+  assert.equal(phasePluginsSettingsName('abc123', 4, true), 'abc123-plan-p4');
+  for (const name of ['run-abc123.json', 'run-abc123-plan.json', 'run-abc123-p4.json', 'run-abc123-plan-p12.json']) {
+    assert.ok(ownsSettingsFile('abc123', name), name);
+  }
+  for (const name of ['run-abc1234.json', 'run-abc123-px.json', 'run-abc123-p4.json.tmp', 'run-other-p4.json']) {
+    assert.ok(!ownsSettingsFile('abc123', name), name);
+  }
+  assert.deepEqual(
+    withPhasePlugins({ 'phased-execution@phased-execution-public': false, 'a@m': true }, ['phased-execution@phased-execution-public', 'b@m']),
+    { 'phased-execution@phased-execution-public': false, 'a@m': true, 'b@m': true },
+  );
+  assert.equal(withPhasePlugins(undefined, []), undefined);
+  assert.deepEqual(withPhasePlugins(undefined, ['b@m']), { 'b@m': true }, 'operator-config: the set alone, merged by the CLI over the user\'s');
+});
+
+/* ------------------------------------------------------------------ *
+ * A person's step, deferred at its call (measured-console phase 12, B2)
+ * ------------------------------------------------------------------ */
+
+/** A runner stub holding one deferral at a time, the way `Runner` does. */
+function deferBench(mode: 'park' | 'defer' | undefined) {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-defer-'));
+  const file = join(dir, 'outcome.json');
+  const run: Record<string, unknown> = {
+    id: 'r-defer', slug: 'demo', root: dir, activePhase: 8,
+    phases: { 8: { phase: 8, sessionId: 'sess-d' } },
+    ...(mode ? { humanStepMode: mode } : {}),
+  };
+  const noted: { event: string; data: Record<string, unknown> }[] = [];
+  let deferred: { toolUseId: string; answer?: string } | undefined;
+  const runner = {
+    busy: () => true, current: () => run, isSpending: () => false,
+    note: (event: string, data: Record<string, unknown>) => { noted.push({ event, data }); return 1; },
+    declarationFile: () => file,
+    noteDeferred: (_p: number, call: { toolUseId: string }) => { deferred = { toolUseId: call.toolUseId }; noted.push({ event: 'phase.deferred', data: call }); },
+    answerDeferred: (_p: number, answer: string) => { if (!deferred) return false; deferred.answer = answer; return true; },
+    takeDeferred: (_p: number, id: string) => {
+      if (!deferred || deferred.toolUseId !== id) return null;
+      const was = deferred; deferred = undefined;
+      return was.answer ? { answer: was.answer } : {};
+    },
+  };
+  return { dir, file, run, runner, noted, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+const DECLARE = 'bash "${PE_SCRIPTS}"/phase-outcome.sh demo 8 needs-human --needs credential --reason "gh is signed out" '
+  + '--step browser-login --title "Sign the gh CLI in" --open-command "gh auth login --web" --proof credential:gh --why identity';
+
+test('B2: under defer the needs-human call is DEFERRED, the item is raised from the call, and the re-fire hands the answer back', async () => {
+  process.env.PHASE_OUTCOME_PROBE = '0';
+  const svc = await service();
+  const b = deferBench('defer');
+  try {
+    (svc as unknown as { runners: Map<string, unknown> }).runners.set('demo', b.runner);
+    const body = { session_id: 'sess-d', tool_use_id: 'toolu_d1', tool_name: 'Bash', tool_input: { command: DECLARE }, cwd: b.dir };
+    const first = await svc.decideToolUse(body, 'r-defer') as { hookSpecificOutput: { permissionDecision: string } };
+    assert.equal(first.hookSpecificOutput.permissionDecision, 'defer');
+    // Raised FROM THE CALL: the console's own script wrote the declaration the session would have.
+    const declared = JSON.parse(readFileSync(b.file, 'utf8'));
+    assert.equal(declared.status, 'needs-human');
+    assert.equal(declared.needs, 'credential');
+    assert.equal(declared.step.kind, 'browser-login');
+    assert.equal(declared.step.title, 'Sign the gh CLI in');
+    assert.equal(declared.session_id, 'sess-d', 'the session that asked is the one resumed');
+    assert.ok(b.noted.some((n) => n.event === 'phase.deferred'));
+    // The person's check passes; the resumed session's hook fires again for the same call.
+    assert.equal(b.runner.answerDeferred(8, 'a person\'s turn is PROVEN — gh is signed in'), true);
+    const again = await svc.decideToolUse(body, 'r-defer') as { hookSpecificOutput: { permissionDecision: string; updatedInput: { command: string } } };
+    assert.equal(again.hookSpecificOutput.permissionDecision, 'allow');
+    assert.match(again.hookSpecificOutput.updatedInput.command, /--resumed-with 'a person'\\''s turn is PROVEN — gh is signed in'$/);
+    // …and the script, run as the session will run it, prints the answer and declares nothing.
+    const { spawnSync } = await import('node:child_process');
+    const { SKILL_DIR } = await import('../server/config.ts');
+    rmSync(b.file, { force: true });
+    const ran = spawnSync('/bin/bash', ['-c', again.hookSpecificOutput.updatedInput.command], {
+      cwd: b.dir, encoding: 'utf8', env: { ...process.env, PE_SCRIPTS: join(SKILL_DIR, 'scripts'), PE_OUTCOME_FILE: b.file },
+    });
+    assert.equal(ran.status, 0);
+    assert.match(ran.stdout, /resumed: the person's step for demo phase 8 is done — a person's turn is PROVEN — gh is signed in/);
+    assert.throws(() => statSync(b.file), 'nothing was declared on the resume');
+  } finally { b.cleanup(); }
+});
+
+test('B2: under park — and for a call the reader cannot vouch for — the hook answers exactly as 8.0 did', async () => {
+  process.env.PHASE_OUTCOME_PROBE = '0';
+  const svc = await service();
+  for (const [mode, command] of [
+    ['park', DECLARE],
+    ['defer', `${DECLARE}; rm -rf ~`],
+    ['defer', DECLARE.replace('demo 8', 'other 8')],
+    ['defer', DECLARE.replace('needs-human', 'blocked')],
+    // The console reads nothing for a session beyond the run's trees (the 2026-10-25 review).
+    ['defer', `${DECLARE} --guide /etc/hosts`],
+    ['defer', `${DECLARE} --guide ../../outside.md`],
+    ['defer', `cwd:/etc`],
+  ] as const) {
+    const b = deferBench(mode);
+    try {
+      (svc as unknown as { runners: Map<string, unknown> }).runners.set('demo', b.runner);
+      const outsideCwd = command === 'cwd:/etc';
+      const answer = await svc.decideToolUse({
+        session_id: 'sess-d', tool_use_id: 'toolu_p', tool_name: 'Bash',
+        tool_input: { command: outsideCwd ? DECLARE : command }, cwd: outsideCwd ? '/etc' : b.dir,
+      }, 'r-defer') as
+        { hookSpecificOutput?: { permissionDecision?: string } };
+      assert.notEqual(answer.hookSpecificOutput?.permissionDecision, 'defer', `${mode}: ${command.slice(-40)}`);
+      assert.throws(() => statSync(b.file), 'the console declared nothing');
+      assert.ok(!b.noted.some((n) => n.event === 'phase.deferred'));
+    } finally { b.cleanup(); }
+  }
+});
+
+test('B2: the reader defers only a plain call of the script for this phase', async () => {
+  const { deferableDeclaration, resumedCommand } = await import('../server/runner/defer-step.ts');
+  const at = { slug: 'demo', phase: 8 };
+  assert.deepEqual(deferableDeclaration('bash /x/scripts/phase-outcome.sh demo 8 needs-human --needs gates', at), ['demo', '8', 'needs-human', '--needs', 'gates']);
+  assert.ok(deferableDeclaration('bash "${PE_SCRIPTS:-/x/scripts}"/phase-outcome.sh demo 8 needs-human --needs gates', at));
+  for (const refused of [
+    'bash /x/phase-outcome.sh demo 8 needs-human --reason "$(cat ~/.ssh/id_rsa)"',
+    'bash /x/phase-outcome.sh demo 8 needs-human > /tmp/x',
+    'bash /x/evil.sh demo 8 needs-human',
+    'sh -c "bash /x/phase-outcome.sh demo 8 needs-human"',
+    'bash /x/phase-outcome.sh demo 8 needs-human --reason $HOME',
+    'bash /x/phase-outcome.sh demo 8 needs-human --resumed-with x',
+    'bash /x/phase-outcome.sh demo 9 needs-human',
+  ]) assert.equal(deferableDeclaration(refused, at), null, refused);
+  assert.equal(resumedCommand('bash x.sh demo 8 needs-human', "it's done"), `bash x.sh demo 8 needs-human --resumed-with 'it'\\''s done'`);
+});
+
+test('B2: a guide is read through its real path — a symlink out of the run’s trees is refused, a guide inside is copied and carried', async () => {
+  process.env.PHASE_OUTCOME_PROBE = '0';
+  const { symlinkSync } = await import('node:fs');
+  const svc = await service();
+  const outside = mkdtempSync(join(tmpdir(), 'pc-defer-outside-'));
+  const b = deferBench('defer');
+  try {
+    writeFileSync(join(outside, 'secret.md'), 'Why: not yours\n\n1. Read me\n');
+    symlinkSync(join(outside, 'secret.md'), join(b.dir, 'link.md'));
+    writeFileSync(join(b.dir, 'guide.md'), 'Why: the gh CLI is signed out.\n\n1. Run `gh auth login --web`.\n2. Finish in the browser.\n\nIf it goes wrong: run it again.\n');
+    (svc as unknown as { runners: Map<string, unknown> }).runners.set('demo', b.runner);
+    const ask = (command: string, id: string) => svc.decideToolUse(
+      { session_id: 'sess-d', tool_use_id: id, tool_name: 'Bash', tool_input: { command }, cwd: b.dir }, 'r-defer',
+    ) as Promise<{ hookSpecificOutput?: { permissionDecision?: string } }>;
+    const linked = await ask(`${DECLARE} --guide link.md`, 'toolu_l');
+    assert.notEqual(linked.hookSpecificOutput?.permissionDecision, 'defer', 'a link out of the trees is not followed');
+    assert.throws(() => statSync(b.file));
+    const guided = await ask(`${DECLARE} --guide guide.md`, 'toolu_g');
+    assert.equal(guided.hookSpecificOutput?.permissionDecision, 'defer');
+    const declared = JSON.parse(readFileSync(b.file, 'utf8'));
+    assert.match(declared.step.guide.text, /Run `gh auth login --web`/, 'the guide reached the item through the console’s private copy');
+  } finally { b.cleanup(); rmSync(outside, { recursive: true, force: true }); }
 });

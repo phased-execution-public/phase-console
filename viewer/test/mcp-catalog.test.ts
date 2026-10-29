@@ -17,7 +17,7 @@ import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { CURATED, RegistryCatalog, searchCatalog } from '../server/mcp/catalog.ts';
+import { CURATED, RegistryCatalog, pinOf, searchCatalog, untrustedOutputOf } from '../server/mcp/catalog.ts';
 import { buildMcpConfig, expandHeld } from '../server/mcp/config.ts';
 import { McpCredentials } from '../server/mcp/credentials.ts';
 import { Mcp, unresolvedVars, writtenVars } from '../server/mcp/index.ts';
@@ -219,4 +219,20 @@ test('`mcp fill` takes NAME=value words, a file or stdin, and refuses a value sh
   assert.equal(fromFile.vars.DATABASE_URL, 'postgres://u:pw@h/d');
   assert.match((await fillVars(parseMcpArgs(['fill', 'x']), ['NOEQUALS'])).error, /has no =/);
   assert.match(serverLine({ id: 'fs', status: 'failed', transport: 'stdio', command: 'npx x', enabled: true, needsConfig: ['MCP_FS_ROOT'] }), /needs \$\{MCP_FS_ROOT\}/);
+});
+
+test('D8 (measured-console phase 27): Context7 is pinned at or above 2.1.3 and marked untrusted; Playwright runs --isolated', () => {
+  const context7 = CURATED.find((entry) => entry.id === 'context7')!;
+  assert.equal(context7.transport, 'stdio', 'the package, which a version can pin — the hosted endpoint carries none');
+  assert.deepEqual(context7.args, ['-y', '@upstash/context7-mcp@>=2.1.3']);
+  assert.deepEqual(context7.pin, { package: '@upstash/context7-mcp', min: '2.1.3' });
+  assert.equal(context7.untrustedOutput, true);
+  assert.deepEqual(pinOf('context7', context7.args), { min: '2.1.3', held: true });
+  assert.deepEqual(pinOf('context7', ['-y', '@upstash/context7-mcp@latest']), { min: '2.1.3', held: false }, 'a registration that drifted off the pin says so');
+  assert.equal(pinOf('github', []), undefined, 'the catalog pins nothing else');
+  assert.ok(untrustedOutputOf('context7') && !untrustedOutputOf('playwright'));
+  const playwright = CURATED.find((entry) => entry.id === 'playwright')!;
+  assert.ok(playwright.args?.includes('--isolated'), 'one browser profile per session, so two lanes never share one');
+  assert.ok(CURATED.filter((entry) => entry.pin).every((entry) => entry.args?.includes(`${entry.pin!.package}@>=${entry.pin!.min}`)),
+    'every pin is in the command it ships');
 });

@@ -5,17 +5,22 @@
 A [Skill](https://code.claude.com/docs/en/skills) is a folder with a `SKILL.md` whose frontmatter
 (`name` + `description`) is the *only* part always loaded. Claude reads the full body **only when the
 skill is relevant or invoked**, and bundled scripts run via Bash without their code ever entering the
-context window. That is why a skill costs almost nothing until it is used — this one is **~190 tokens**
-in every session, and ~9K only on the turns where it actually fires.
+context window. That is why a skill costs almost nothing until it is used — this one's description is about
+**150 tokens** in every session (615 characters). When it fires, the body is a core of about 14.5 KB
+(≈3.6K tokens: the console contract, the three modes as pointers, the guardrails), and a session then
+reads the ONE mode file it is in — each at most 20 KB (≈5K tokens), the size a re-attach after
+compaction keeps whole. The references and the script index are read on demand. (Measured at
+measured-console phase 3; before it the body was 142 KB, ≈35K tokens, read whole every boot.)
 
 ```
 phased-execution/
-├── SKILL.md          # frontmatter + the procedure Claude follows
+├── SKILL.md          # frontmatter + the core: the console contract, the modes as pointers, the guardrails
 ├── USAGE.md          # human-facing orientation
 ├── start             # launch the console
 ├── bin/              # phase-console — the same launcher, on PATH for plugin installs
 ├── scripts/          # the engine and its helpers (run, don't read)
-├── references/       # plan/handoff formats, conventions, sizing, QA method
+├── references/       # mode-plan/-phase-start/-phase-finish.md (one per mode), scripts.md (the index),
+│                     #   plan/handoff formats, conventions, sizing, QA method
 ├── templates/        # plan, handoff and INDEX scaffolds
 ├── tests/            # bats suite for the scripts
 ├── viewer/           # Phase Console — the local web app

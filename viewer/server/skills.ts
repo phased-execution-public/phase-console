@@ -18,13 +18,16 @@
  * what a picker needs.
  */
 
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 
+import { newestPerPlugin, parseInstalledPlugins } from '../shared/installed-plugins.js';
 import { log } from './log.ts';
 import { parseFrontMatter, scalar } from './parse/frontmatter.ts';
 import { mcpReasonText, type McpDegradation } from './runner/state.ts';
+import { graphDirFor, graphToolOf } from './runner/graph-refresh.ts';
 
 export type SkillSource = 'personal' | 'project' | 'plugin';
 
@@ -160,36 +163,24 @@ function readCommand(file: string, name: string, source: SkillSource, plugin?: s
  * Plugins
  * ------------------------------------------------------------------ */
 
-type InstalledPlugins = {
-  plugins?: Record<string, { installPath?: string; lastUpdated?: string }[]>;
-};
-
 /**
  * Installed plugins, by the path they were actually installed to.
  *
  * Globbing the cache directory would be wrong: several versions of the same
  * plugin sit there side by side, and only one of them is the one a session
- * would load. The install record says which.
+ * would load. The install record says which — read by the one reader of
+ * `installed_plugins.json` (`shared/installed-plugins.js`), which knows both
+ * the version-1 and the version-2 shape.
  */
 export function installedPlugins(home: string): { plugin: string; path: string }[] {
-  let config: InstalledPlugins;
-  try { config = JSON.parse(readFileSync(join(home, 'plugins', 'installed_plugins.json'), 'utf8')) as InstalledPlugins; }
+  let text: string;
+  try { text = readFileSync(join(home, 'plugins', 'installed_plugins.json'), 'utf8'); }
   catch { return []; }
-
-  const out: { plugin: string; path: string }[] = [];
-  for (const [key, entries] of Object.entries(config.plugins ?? {})) {
+  // Newest install wins when a plugin was installed more than once.
+  return newestPerPlugin(parseInstalledPlugins(text).installs)
+    .filter((one) => existsSync(one.installPath))
     // `plugin@marketplace`; the invocation prefix is the plugin alone.
-    const plugin = key.split('@')[0];
-    if (!plugin || !Array.isArray(entries)) continue;
-    // Newest install wins when a plugin was installed more than once.
-    const newest = [...entries]
-      .filter((e) => e?.installPath)
-      .sort((a, b) => String(b.lastUpdated ?? '').localeCompare(String(a.lastUpdated ?? '')))[0];
-    if (newest?.installPath && existsSync(newest.installPath)) {
-      out.push({ plugin, path: newest.installPath });
-    }
-  }
-  return out;
+    .map((one) => ({ plugin: one.plugin, path: one.installPath }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -241,26 +232,88 @@ export function listSkills(root: string | undefined, env: NodeJS.ProcessEnv = pr
 export function forgetSkills(): void { cache = null; }
 
 /**
- * What a session should do with a skill that keeps a per-repository index.
+ * What a session should do with a per-repository knowledge graph — said only
+ * when one is FRESH (measured-console phase 11, the audit's D6).
  *
- * Written CONDITIONALLY and in the general case on purpose. Some machines run a
- * skill that maintains durable per-repository state — a knowledge graph, a
- * search index — and such a skill is worth almost nothing if it is only ever
- * written: the value is in querying it at the START of a session, when the cost
- * of not knowing where something lives is highest, and refreshing it at the end,
- * when what changed is still known. A session naming the skill and never doing
- * either was the ordinary outcome, because nothing asked.
- *
- * It says "if a listed skill" rather than naming one, so a console with no such
- * skill installed carries a sentence that is simply vacuous rather than an
- * instruction to invoke something that does not exist. The per-repository half
- * matters as much: these graphs are built inside a repository and a query run
- * from the wrong directory answers about the wrong tree.
+ * Such a graph is worth almost nothing if it is only ever written: the value is
+ * in querying it at the START of a session, when not knowing where something
+ * lives costs the most, and refreshing it at the end. But a graph older than
+ * the last change that landed in its repository answers about a tree that is
+ * gone, and the directive used to ride every list of skills whatever the graph's
+ * age. So it is emitted only for a repository whose `<tool>-out/graph.json` is
+ * newer than its last landing, and the landing engine refreshes the graph when
+ * it lands (`runner/graph-refresh.ts`). WHICH tool is the console's `graphTool`
+ * setting — empty, the shipped default, is off — and the directive names the
+ * repositories, never the tool.
  */
-const KNOWLEDGE_GRAPH_DIRECTIVE =
-  'If a listed skill maintains a per-repository knowledge graph: at session START, query it for '
-  + 'each repository this phase touches — run the query from inside that repository — and '
-  + 'refresh/update the graph there before your handoff.';
+
+/**
+ * The repository's last landing, as a time: the commit time of its HEAD — the
+ * newest work the graph would have to know about. Null when git cannot say.
+ */
+function landedAtMs(repo: string): number | null {
+  try {
+    const out = execFileSync('git', ['-C', repo, 'log', '-1', '--format=%ct', 'HEAD'], {
+      encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const seconds = Number(out);
+    return out && Number.isFinite(seconds) ? seconds * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a repository's knowledge graph (the `tool`'s) is newer than its last
+ * landing. `graphAtMs` and `landedAtMs` are the two times compared.
+ */
+export function graphFreshness(repo: string, tool: string): { fresh: boolean; graphAtMs?: number; landedAtMs?: number } {
+  const name = graphToolOf(tool);
+  if (!name) return { fresh: false };
+  let graphAtMs: number;
+  try { graphAtMs = statSync(join(repo, graphDirFor(name), 'graph.json')).mtimeMs; } catch { return { fresh: false }; }
+  const landed = landedAtMs(repo);
+  // A repository git cannot date has nothing to be stale against.
+  if (landed === null) return { fresh: true, graphAtMs };
+  return { fresh: graphAtMs > landed, graphAtMs, landedAtMs: landed };
+}
+
+/** The repositories among `repos` whose graph is fresh, in the order given, once each; none with no tool named. */
+export function freshGraphs(repos: readonly string[], tool: string): string[] {
+  return [...new Set(repos)].filter((repo) => graphFreshness(repo, tool).fresh);
+}
+
+/** The directive for the fresh graphs, named as the caller wants them read (relative paths); empty with none. */
+export function knowledgeGraphDirective(named: readonly string[]): string {
+  const repos = [...new Set(named.filter(Boolean))];
+  if (!repos.length) return '';
+  return `\nA per-repository knowledge graph newer than the last landing is kept in ${repos.map((r) => `\`${r}\``).join(', ')}: `
+    + 'at session START, query it for each repository this phase touches — run the query from inside that '
+    + 'repository — and refresh/update the graph there before your handoff.\n';
+}
+
+/**
+ * The ONE line a skill is named in (measured-console phase 11, §Architecture
+ * 12 "delivery, not presence"): a Skill-tool call by the name the tool takes,
+ * per skill — the engine's boot-prompt line has the same shape
+ * (`skill_calls_line` in phase-graph.sh). Empty for none.
+ */
+export function skillCallsLine(names: readonly string[]): string {
+  const named = [...new Set(names.filter(Boolean))];
+  return named.length ? named.map((name) => `Call the Skill tool with "${name}".`).join(' ') : '';
+}
+
+/**
+ * The name the Skill tool is called with — `skill_qualify` in phase-graph.sh:
+ * as written when it names its plugin, else the ONE skill of that name in
+ * `loaded` (the console's resolved set, `PE_SKILLS`' words with their `!`),
+ * qualified by its plugin, else as written.
+ */
+export function qualifySkill(name: string, loaded: readonly string[]): string {
+  if (name.includes(':')) return name;
+  const hits = loaded.map((token) => token.replace(/!$/, '')).filter((token) => token === name || token.endsWith(`:${name}`));
+  return hits.length === 1 ? hits[0]! : name;
+}
 
 /**
  * The line appended to a boot prompt for skills chosen in the console.
@@ -268,18 +321,13 @@ const KNOWLEDGE_GRAPH_DIRECTIVE =
  * Deliberately additive and deliberately separate from the engine's own text:
  * `phase-graph.sh` remains the only thing that decides what a boot prompt says
  * about the *plan*, including the plan's own skills line. This is the operator
- * adding to it for one run, and it reads as that.
- *
- * Every caller that names skills goes through here — the runner's phase prompts,
- * the agent launcher, the wizard, recovery sessions — which is why the directive
- * above lives in this function and not at one of them.
+ * adding to it for one run, and it reads as that — in the engine line's shape,
+ * a Skill-tool call per skill, qualified by `loaded` when the caller has it.
  */
-export function skillDirective(skills: string[]): string {
-  const named = [...new Set(skills.filter(Boolean))];
+export function skillDirective(skills: string[], opts: { loaded?: readonly string[] } = {}): string {
+  const named = [...new Set(skills.filter(Boolean).map((s) => qualifySkill(s, opts.loaded ?? [])))];
   if (!named.length) return '';
-  return `\nAlso invoke ${named.length === 1 ? 'this skill' : 'these skills'} for this phase `
-    + `(chosen for this run, in addition to any the plan names): ${named.map((s) => `/${s}`).join(', ')}\n`
-    + `\n${KNOWLEDGE_GRAPH_DIRECTIVE}\n`;
+  return `\nChosen for this run, in addition to any the plan names: ${skillCallsLine(named)}\n`;
 }
 
 /**

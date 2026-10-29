@@ -121,6 +121,8 @@ export type PhaseEvidence = {
     declared?: { status: string; reason?: string; watch?: string[]; needs?: string; rule?: string; command?: string; at?: string } | null;
     costUsd?: number;
     turns?: number;
+    /** The Agent SDK's door lost a session and the subprocess re-attempt has not run yet (measured-console phase 21). */
+    spawnFallback?: { detail: string; done: boolean };
     /** A lane of THIS console is driving the phase right now. */
     live?: boolean;
     mcpDegraded?: string[];
@@ -553,7 +555,31 @@ export function recordEvidence(record: PhaseRecord): NonNullable<PhaseEvidence['
     ...(record.turns != null ? { turns: record.turns } : {}),
     ...(record.mcpDegraded?.length ? { mcpDegraded: record.mcpDegraded.map((d) => d.id) } : {}),
     ...(record.reopened ? { reopened: { failed: record.reopened.failed } } : {}),
+    ...(record.spawnFallback ? { spawnFallback: { detail: record.spawnFallback.detail, done: record.spawnFallback.done } } : {}),
   };
+}
+
+/**
+ * An Agent SDK session that ended before its first event (measured-console
+ * phase 21, B1) — `spawn-sdk-failed`, read by the spawn door the moment the
+ * session returns, because only the door saw whether an event arrived. Null
+ * when one did, when the console itself ended it (an abort, a watchdog), or
+ * when it reported a turn or a cent: a session that worked is never re-run.
+ */
+export function spawnSdkFailure(
+  outcome: { turns: number; costUsd?: number; resolvedModel?: string; endedBy?: string; resultText?: string; signal?: { text?: string } } | null,
+  facts: { sawEvent: boolean; aborted: boolean; thrown?: unknown },
+): Situation | null {
+  if (facts.sawEvent || facts.aborted) return null;
+  if (outcome && (outcome.turns > 0 || (outcome.costUsd ?? 0) > 0 || outcome.resolvedModel || (outcome.endedBy && outcome.endedBy !== 'exit'))) return null;
+  const said = facts.thrown !== undefined && facts.thrown !== null
+    ? String((facts.thrown as Error)?.message ?? facts.thrown)
+    : (outcome?.signal?.text || outcome?.resultText || '').trim();
+  return situation('spawn-sdk-failed', [
+    'the session went through the Agent SDK\'s door',
+    facts.thrown !== undefined && facts.thrown !== null ? 'the door threw before the session started' : 'it ended before its first event',
+    ...(said ? [`it said: "${said.replace(/\s+/g, ' ').slice(0, 160)}"`] : []),
+  ]);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1074,6 +1100,18 @@ export function classifySituation(e: PhaseEvidence): Situation {
       ...(wallLifted ? [liftedWall(e)] : []),
       ...(rec?.status === 'running' || rec?.status === 'verifying' ? [`the record reads ${rec.status}`] : []),
       ...(e.handoff.outstanding ? [`Outstanding: ${e.handoff.outstanding.replace(/\s+/g, ' ').slice(0, 160)}`] : []),
+    ]);
+  }
+
+  /* 13b. The Agent SDK's door lost a session and its subprocess re-attempt
+   * never ran (measured-console phase 21) — a console that died between the
+   * two. The one rung boards the phase again, and its record keeps it on the
+   * subprocess. */
+  if (rec?.spawnFallback && !rec.spawnFallback.done && !e.handoff.exists) {
+    return situation('spawn-sdk-failed', [
+      'a session sent through the Agent SDK\'s door ended before its first event',
+      'the subprocess re-attempt has not run',
+      `the door said: ${rec.spawnFallback.detail.slice(0, 160)}`,
     ]);
   }
 

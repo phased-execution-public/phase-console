@@ -58,6 +58,8 @@ import { RETENTION_DEFAULTS, type RetentionPolicy, sanitiseRetention } from './r
 // from here at runtime, so a value import would close the cycle. Node erases
 // `import type` before it ever resolves the specifier.
 import type { McpPolicy } from './runner/state.ts';
+import { autopilotPluginsOf, type AutopilotLoads } from './runner/loads.ts';
+import { graphToolOf } from './runner/graph-refresh.ts';
 import type { GitMode, ReviewerPolicy } from '../shared/run-lifecycle.js';
 
 export const VIEWER_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1200,6 +1202,25 @@ export type Prefs = {
   watchMintedCmdRefs?: boolean;
   mcpPolicy?: McpPolicy;
   /**
+   * What an unattended session loads (measured-console phase 11, D2):
+   * `console-set` — the console's own skill tree (`--plugin-dir`), the seed
+   * (`CLAUDE_CODE_PLUGIN_SEED_DIR`) and `autopilotPlugins`, under
+   * `--setting-sources project,local`, so the operator's user-level hooks and
+   * plugins stay out (9.0's default); `operator-config` — the config dir
+   * decides, as 8.0 did. Only the exact word `operator-config` turns it off.
+   */
+  autopilotLoads?: AutopilotLoads;
+  /** The personal plugins (`name@marketplace`) a console-set session also enables — none unless a person switches one on. */
+  autopilotPlugins?: string[];
+  /**
+   * The knowledge-graph tool a repository may keep a graph with (measured-console
+   * phase 11, D6): a bare command name that writes `<tool>-out/graph.json` and
+   * updates it with `<tool> update <path>`. The boot prompt's graph directive is
+   * emitted only for a repository whose graph is newer than its last landing,
+   * and a landing refreshes it. '' (shipped) is off — the console names no tool.
+   */
+  graphTool?: string;
+  /**
    * The remediation ladder (`runner/ladder.ts`) — what the autopilot may try
    * by itself before it asks a person, and how much it may spend doing so.
    *
@@ -1462,6 +1483,7 @@ const DEFAULT_PREFS: Prefs = {
   isolationReclaim: 'clean-only', deleteMergedRunBranches: true,
   reviewEachPhaseByDefault: false, reviewerPolicy: 'comment-only',
   autoRecoverByDefault: true, autoContinueRecovery: true, watchCmdRefs: true, watchMintedCmdRefs: false, mcpPolicy: 'continue',
+  autopilotLoads: 'console-set', autopilotPlugins: [], graphTool: '',
   ladderPerPhaseRungs: 3, ladderPerPhaseUsd: 100, ladderPerRunRungs: 10, ladderPerRunUsd: 400, ladderPerDayUsd: 600,
   ceilingStartsPerHour: DEFAULT_STARTS_PER_HOUR, ceilingUsdPerHour: DEFAULT_USD_PER_HOUR,
   usageForecastLeadHours: FORECAST_LEAD_HOURS, usageForecastHold: false,
@@ -1625,6 +1647,7 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
   | 'isolationReclaim' | 'deleteMergedRunBranches'
   | 'reviewEachPhaseByDefault' | 'reviewerPolicy'
   | 'autoRecoverByDefault' | 'autoContinueRecovery' | 'watchCmdRefs' | 'watchMintedCmdRefs' | 'mcpPolicy'
+  | 'autopilotLoads' | 'autopilotPlugins' | 'graphTool'
   | 'ladderPerPhaseRungs' | 'ladderPerPhaseUsd' | 'ladderPerRunRungs' | 'ladderPerRunUsd' | 'ladderPerDayUsd'
   | 'ceilingStartsPerHour' | 'ceilingUsdPerHour' | 'usageForecastLeadHours' | 'usageForecastHold'
   | 'unblockAttempts' | 'staleClaimTakeover' | 'resumeAtBoot' | 'autoAccountSwitch'
@@ -1724,6 +1747,10 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     watchCmdRefs: bool(parsed.watchCmdRefs, true),
     watchMintedCmdRefs: bool(parsed.watchMintedCmdRefs, false),
     mcpPolicy: parsed.mcpPolicy === 'require' ? 'require' : 'continue',
+    // Only the exact word leaves the console's set: a typo keeps 9.0's default.
+    autopilotLoads: parsed.autopilotLoads === 'operator-config' ? 'operator-config' : 'console-set',
+    autopilotPlugins: autopilotPluginsOf(parsed.autopilotPlugins),
+    graphTool: graphToolOf(parsed.graphTool),
     ladderPerPhaseRungs: cap(parsed.ladderPerPhaseRungs, 3),
     ladderPerPhaseUsd: cap(parsed.ladderPerPhaseUsd, 100),
     ladderPerRunRungs: cap(parsed.ladderPerRunRungs, 10),

@@ -26,6 +26,7 @@
  * light.
  */
 
+import { PLUGIN_KINDS, PLUGIN_MISSING_REASONS, SKILL_STATES, UNATTENDED_WORDS } from '../shared/plugin-sets.js';
 import './state-sandbox.ts';
 
 import assert from 'node:assert/strict';
@@ -143,7 +144,7 @@ import { RESUME_AT_BOOT_MODES } from '../shared/automation-model.js';
 import { SCHEDULING_POLICIES } from '../shared/orchestration-model.js';
 import { EFFORT_LEVELS } from '../shared/run-settings.js';
 import { MESSAGING_WORDS } from '../shared/message-model.js';
-import { AUTOSTART_WORDS, DENSITIES, PALETTES, PREF_META, PROFILE_META, THEMES } from '../shared/prefs-model.js';
+import { AUTOPILOT_LOADS, AUTOSTART_WORDS, DENSITIES, PALETTES, PREF_META, PROFILE_META, THEMES } from '../shared/prefs-model.js';
 import { DECISION_KEYS, DECISION_STATES, DECISION_SOURCES, NEED_CLASSES } from '../shared/decisions-model.js';
 import { REFUSAL_CAUSES, SITUATIONS, parseSituationKey } from '../shared/situation-model.js';
 import { RUNG_DRIVERS, RUNG_FAILURE_CAUSES, RUNG_VEHICLES } from '../shared/ladder-model.js';
@@ -173,6 +174,7 @@ import {
   ISOLATION_DIRECTIVES,
   WORKTREE_RETENTION,
 } from '../shared/worktree-model.js';
+import { MONEY_WORDS } from '../shared/money-model.js';
 import {
   LAND_POLICIES,
   GITLINK_POLICIES,
@@ -522,6 +524,7 @@ test('the settings schema takes each key\'s words from their owner — the same 
     ['issuesMode', ISSUE_MODES],
     ['isolationReclaim', ISOLATION_RECLAIM],
     ['mcpPolicy', MCP_POLICIES],
+    ['autopilotLoads', AUTOPILOT_LOADS],
     ['schedulingPolicy', SCHEDULING_POLICIES],
     ['resumeAtBoot', RESUME_AT_BOOT_MODES],
     ['checkEffort', EFFORT_LEVELS],
@@ -674,6 +677,14 @@ const VOCABULARIES: {
   { name: 'settle strategies', members: SETTLE_STRATEGIES, owner: 'shared/worktree-model.js' },
   { name: 'isolation reclaim modes', members: ISOLATION_RECLAIM, owner: 'shared/worktree-model.js' },
   { name: 'worktree roots', members: WORKTREE_ROOTS, owner: 'shared/worktree-model.js' },
+  // What a dollar figure may claim to be (measured-console phase 18, E5).
+  { name: 'money words', members: MONEY_WORDS, owner: 'shared/money-model.js' },
+  // The per-phase plugin sets (measured-console phase 27, D5); the bash twin is scripts/plugin-sets.env.
+  { name: 'plugin kinds', members: PLUGIN_KINDS, owner: 'shared/plugin-sets.js' },
+  { name: 'plugin unattended words', members: UNATTENDED_WORDS, owner: 'shared/plugin-sets.js' },
+  { name: 'plugin missing reasons', members: PLUGIN_MISSING_REASONS, owner: 'shared/plugin-sets.js' },
+  // Settings ▸ Skills & plugins' line states (measured-console phase 28, F1).
+  { name: 'skill states', members: SKILL_STATES, owner: 'shared/plugin-sets.js' },
   // The Repo destination's two tables paint these (control-tower phase 26).
   { name: 'settle kinds', members: SETTLE_KINDS, owner: 'shared/worktree-model.js' },
   { name: 'checkout roles', members: CHECKOUT_ROLES, owner: 'shared/worktree-model.js' },
@@ -1220,7 +1231,11 @@ test('START_DOORS is the census — fifteen doors, owned once — and the actor 
   // checking session's door (`turn-checker`, control-tower phase 134) is the
   // seventeenth, a spawn the ceiling counts with no `startRun` site.
   const proDoors: string[] = [];
-  assert.equal(START_DOORS.length, 17 + proDoors.length, 'the audit counted fourteen automatic-start doors; phase 98 added the trigger, phase 101 the supervisor, phase 134 the checker');
+  // The independent evaluator's door (`auto-evaluator`, measured-console phase 22, 6257f2b8) is
+  // Pro too, and like `turn-checker` a spawn the ceiling counts with no `startRun` site — so it
+  // is counted apart from `proDoors`, which the slice below holds to the startRun doors.
+  const proSpawnDoors: string[] = [];
+  assert.equal(START_DOORS.length, 17 + proDoors.length + proSpawnDoors.length, 'the audit counted fourteen automatic-start doors; phase 98 added the trigger, phase 101 the supervisor, phase 134 the checker');
   assert.ok((START_DOORS as readonly string[]).includes('turn-checker'), 'the checking session names its door');
   assert.deepEqual(START_DOORS.slice(9, 9 + proDoors.length), proDoors, 'a Pro startRun door follows the nine');
   assert.deepEqual(START_DOORS.slice(-2), ['trigger', 'supervisor'], 'the trigger and the supervisor ride their verb\'s own door, so they follow the five that are not startRun sites');
@@ -1291,4 +1306,12 @@ test('every WAIT_REASONS member is ASSIGNED somewhere under server/, and setRunS
   const unlisted = [...assigned.keys()].filter((reason) => !(WAIT_REASONS as readonly string[]).includes(reason));
   assert.deepEqual(unlisted, [], 'a writer assigns a wait reason WAIT_REASONS does not hold');
   assert.ok(namedWriterCalls >= 5, `setRunState is called ${namedWriterCalls} time(s) under server/ — the named writer must be the production path`);
+});
+
+test('the money words reach the one renderer by identity, and no client file spells them (measured-console phase 18)', () => {
+  const renderer = readFileSync(new URL('../client/src/ui/money.tsx', import.meta.url), 'utf8');
+  assert.match(renderer, /from '\.\.\/\.\.\/\.\.\/shared\/money-model\.js'/, 'ui/money.tsx imports the owner itself');
+  assert.match(renderer, /export \{\s*MONEY_WORDS\b[^}]*\} from '\.\.\/\.\.\/\.\.\/shared\/money-model\.js'/, 'and re-exports its words, never a copy');
+  assert.deepEqual([...MONEY_WORDS], ['reported', 'estimated', 'unavailable']);
+  assert.ok(Object.isFrozen(MONEY_WORDS));
 });

@@ -363,7 +363,7 @@ test('the body pass honours the CALLER\'s clock', async () => {
   const issues: Issue[] = [{
     number: 1, title: '', state: 'OPEN', labels: [], assignees: [], updatedAt: '', url: 'u',
   }];
-  let clock = 1_000;
+  const clock = 1_000;
   const filled = await fetchBodies(
     REMOTE, issues, [1],
     async () => ({ ok: true, stdout: JSON.stringify({ body: 'b' }), stderr: '' }),

@@ -143,3 +143,64 @@ landed_root() {
   [ "$status" -eq 0 ]
   grep -q '^status: abandoned' "$DOCS_ROOT/docs/plans/linear.md"
 }
+
+# ── the plan's memory is history (measured-console phase 4) ──────────────────
+# `docs/memory/<slug>/index.md` holds dated, commit-cited claims; closing names
+# each claim that carries neither a date nor a commit, by line, and refuses nothing.
+@test "close-plan: an undated claim in the plan's memory is named by line; dated and commit-cited ones are not" {
+  setup_docs linear linear
+  mkdir -p "$DOCS_ROOT/docs/memory/linear"
+  cat > "$DOCS_ROOT/docs/memory/linear/index.md" <<'EOF'
+# linear — memory
+
+- 2026-10-25 (phase 1): the floor measured at 111,210 tokens
+- the brief replaces the prompt's rows (phase 4, `1a2b3c4d`)
+- the hook waits 15 s at SessionStart
+- a claim whose date sits on its
+  continuation line, 2026-10-24
+EOF
+  run pe_close linear --status abandoned --reason "done with it"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "memory: 1 claim(s) in docs/memory/linear/index.md carry no date and no commit"
+  assert_contains "$output" "index.md:5  the hook waits 15 s at SessionStart"
+  refute_contains "$output" "index.md:3"
+  refute_contains "$output" "index.md:4"
+  refute_contains "$output" "index.md:6"
+}
+
+@test "close-plan: a plan with no memory, or a memory all dated, says nothing about it" {
+  setup_docs linear linear
+  run pe_close linear --status abandoned --reason "done with it"
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "memory:"
+}
+
+# ── Not yet specified (measured-console phase 30) ───────────────────────────
+# `complete` is a claim that nothing is missing; the plan's own list of what is
+# missing refuses it, and --force does not close over that.
+@test "close-plan: complete is refused while ## Not yet specified holds a line, naming the section" {
+  setup_docs amended amended
+  run pe_close amended --status complete --reason "all done"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "Not yet specified"
+  assert_contains "$output" "the retry policy for Gamma"
+  grep -q '^status: active' "$DOCS_ROOT/docs/plans/amended.md"
+  run pe_close amended --status complete --reason "all done" --force
+  [ "$status" -eq 1 ]
+  grep -q '^status: active' "$DOCS_ROOT/docs/plans/amended.md"
+}
+
+@test "close-plan: complete is allowed once ## Not yet specified is empty; abandoned never asks" {
+  setup_docs amended amended
+  run pe_close amended --status abandoned --reason "not pursuing it"
+  [ "$status" -eq 0 ]
+  setup_docs amended amended
+  awk '/^## Not yet specified/ { print; skip = 1; next } /^## / { skip = 0 } !skip { print }' \
+    "$DOCS_ROOT/docs/plans/amended.md" > "$DOCS_ROOT/docs/plans/amended.md.new"
+  mv "$DOCS_ROOT/docs/plans/amended.md.new" "$DOCS_ROOT/docs/plans/amended.md"
+  run pg amended --not-yet-specified
+  [ -z "$output" ]
+  run pe_close amended --status complete --reason "all done" --force
+  [ "$status" -eq 0 ]
+  grep -q '^status: complete' "$DOCS_ROOT/docs/plans/amended.md"
+}

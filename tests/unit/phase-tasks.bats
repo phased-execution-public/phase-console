@@ -24,7 +24,7 @@ setup() {
 }
 
 # The identity rule of viewer/shared/instances.mjs, in bash — the same one
-# outcome.bats uses, because the two inboxes are siblings.
+# the outcome suites use (tests/helpers/outcome_helper.bash), because the two inboxes are siblings.
 inbox_file() { # <slug> <phase>
   local id pad
   id="$(printf '%s' "$DOCS_ROOT" | shasum -a 256 | cut -c1-8)-$(basename "$DOCS_ROOT")"

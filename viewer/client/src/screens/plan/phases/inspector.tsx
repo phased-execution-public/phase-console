@@ -18,13 +18,13 @@
  * panel as it moves on the board.
  */
 
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { PHASE_CLOCK_LABELS } from '@shared/phase-clocks.js';
 import type { LaneLiveness, PhaseRecord } from '@/data/api';
 import { usePlan } from '@/data/plans';
 import { countdown, duration, pad2, plural } from '@/lib/format';
 import { KeyValue, Money, Mono, RelativeTime, SectionHeading, type KeyValueItem } from '@/ui';
-import { Disclosure } from '@/ui/disclosure';
+import { Accordion, AccordionItem } from '@/ui/accordion';
 import { useEverything } from '@/ui/everything';
 import { plainText } from '@/ui/markdown';
 import { ActionsTab } from '@/shell/panel/actions-tab';
@@ -36,6 +36,7 @@ import { displayState, mcpCallWords, runningOf, spendOf, type PhaseTableRow } fr
 import { NotesSection } from './notes';
 import { PhaseMark } from './row';
 import { PhaseVerbs } from './table';
+import { formatUsd } from '@/ui/money';
 
 /** The panel's name for a phase — what the grid compares to mark the row on show. */
 export const phaseInspectKey = (slug: string, phase: number): string => `phase:${slug}:${phase}`;
@@ -143,7 +144,9 @@ function boarding(r: PhaseRecord, live?: LaneLiveness): KeyValueItem[] {
           {r.lastSession.subtype ? ` (${r.lastSession.subtype})` : ''}
           {r.lastSession.terminalReason ? `, ${r.lastSession.terminalReason}` : ''}
           {r.lastSession.maxTurns ? `, at most ${r.lastSession.maxTurns.value} turns` : ''}
-          {r.lastSession.maxBudgetUsd ? `, at most $${r.lastSession.maxBudgetUsd.value}` : ''}
+          {r.lastSession.maxBudgetUsd
+            ? `, at most ${formatUsd(r.lastSession.maxBudgetUsd.value, 'short')}`
+            : ''}
           , <RelativeTime at={r.lastSession.at} live={false} />
         </>
       ) : null,
@@ -356,6 +359,19 @@ function verification(r: PhaseRecord): KeyValueItem[] {
           {r.wipRed.lines?.length ? `, ${plural(r.wipRed.lines.length, 'line')} red` : ''}
           {r.wipRed.files?.length ? `, in ${list(r.wipRed.files)}` : ''}
         </>
+      ) : null,
+    ),
+    fact(
+      'Unpushed',
+      r.unpushed?.trees.length ? (
+        <Lines
+          lines={r.unpushed.trees.map((t) => (
+            <>
+              {plural(t.ahead, 'commit')} on <Mono value={t.branch} /> in {t.repo}
+              {t.tracked ? '' : ', never pushed'}
+            </>
+          ))}
+        />
       ) : null,
     ),
     fact(
@@ -715,9 +731,11 @@ const present = (items: KeyValueItem[]) =>
   items.filter((item): item is readonly [string, ReactNode] => Boolean(item));
 
 /**
- * The eight sections. A section with something to say folds behind its name
- * and how many facts it holds; one with nothing says so on its line and offers
- * no fold — a press that opens onto nothing is a press wasted.
+ * The eight sections, as ONE accordion of fold strips (2026-10-20, Tower
+ * strips): a section with something to say folds behind its name and how many
+ * facts it holds; one with nothing says so on its line and offers no fold — a
+ * press that opens onto nothing is a press wasted. The page's Everything opens
+ * every fold; the folds a person opened stay theirs when it goes off.
  */
 export function PhaseRecordSections({
   record,
@@ -727,37 +745,44 @@ export function PhaseRecordSections({
   liveness?: LaneLiveness | undefined;
 }) {
   const everything = useEverything('plan');
+  const [opened, setOpened] = useState<string[]>([]);
   if (!record) {
     return (
       <p className="text-body text-ink-muted">This run has no record of the phase yet: it has not boarded.</p>
     );
   }
+  const sections = PHASE_RECORD_SECTIONS.map((section) => ({
+    section,
+    items: present(section.facts(record, liveness)),
+  }));
+  const folds = sections.filter(({ items }) => items.length > 0).map(({ section }) => section.id);
   return (
-    <div className="flex min-w-0 flex-col gap-2" data-testid="phase-record-sections">
-      {PHASE_RECORD_SECTIONS.map((section) => {
-        const items = present(section.facts(record, liveness));
-        if (!items.length) {
-          return (
-            <p key={section.id} className="text-meta text-ink-muted" data-section={section.id}>
-              {section.label}: nothing recorded.
-            </p>
-          );
-        }
-        return (
-          <section key={section.id} data-section={section.id} className="min-w-0">
-            <Disclosure
+    <div className="min-w-0" data-testid="phase-record-sections">
+      <Accordion value={everything.on ? folds : opened} onValueChange={setOpened}>
+        {sections.map(({ section, items }) =>
+          items.length ? (
+            <AccordionItem
+              key={section.id}
+              value={section.id}
+              section={section.id}
               label={section.label}
-              openLabel={section.label}
               count={items.length}
               testId={`phase-section-${section.id}`}
-              {...(everything.on ? { open: true } : {})}
-              bodyClassName="pt-1.5 ps-4"
+              bodyClassName="pt-0.5"
             >
               <KeyValue items={items} />
-            </Disclosure>
-          </section>
-        );
-      })}
+            </AccordionItem>
+          ) : (
+            <p
+              key={section.id}
+              className="border-b border-rule py-2.5 ps-8 text-meta text-ink-muted last:border-b-0"
+              data-section={section.id}
+            >
+              {section.label}: nothing recorded.
+            </p>
+          ),
+        )}
+      </Accordion>
     </div>
   );
 }
@@ -882,6 +907,8 @@ export function inspectPhase(row: PhaseTableRow, options: { open?: boolean } = {
       actions: <Actions row={row} />,
       history: <History record={p.record} />,
       raw: <Raw row={row} />,
+      // Facts, folds and prose — a reading measure, never a table's width.
+      measure: 'reading',
     },
     options,
   );

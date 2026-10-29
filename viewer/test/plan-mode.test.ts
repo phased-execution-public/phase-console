@@ -19,11 +19,11 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 for (const key of ['PE_WORKTREE', 'PE_BRANCH', 'PE_SCOPE', 'PE_OWNER', 'PE_OUTCOME_FILE']) delete process.env[key];
 
@@ -173,22 +173,12 @@ test('PM-2 — permissionMode rides start and settings; a word that is not a mod
 
 type Repo = { root: string; scripts: string; state: string };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /** A one-phase stub plan whose engine answers from a `done` file. */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-planmode-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-planmode-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 shift
@@ -203,10 +193,14 @@ case "$mode" in
   --repos) echo "demo-repo" ;;
   *) echo "" ;;
 esac
-`);
-  for (const name of ['phase-lock.sh', 'next-phase-prompt.sh', 'new-handoff.sh']) write(join(scripts, name), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return { root, scripts, state };
+`,
+      'phase-lock.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'next-phase-prompt.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'new-handoff.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function outcome(sessionId = 'sess-plan-0001'): SpawnOutcome {
@@ -251,7 +245,7 @@ test('PM-3 — the plan\'s mode boards the phase; the run default and a Retry ta
     [{ phaseDefaults: () => ({ permissionMode: 'plan' }) }, { phaseOptions: { 1: { permissionMode: 'acceptEdits' } } }, 'acceptEdits'],
   ];
   for (const [deps, options, want] of cases) {
-    const r = repo();
+    const r = stubbedPlan();
     try {
       const { runner, requests } = runnerFor(r, deps, finishes(r));
       await runner.start({ slug: 'demo', root: r.root, onlyPhases: [1], ...options } as never);
@@ -265,7 +259,7 @@ test('PM-3 — the plan\'s mode boards the phase; the run default and a Retry ta
 });
 
 test('PM-3 — a plan-mode phase boards with the relay\'s host and the plan-host settings, even with the relay off', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // Read while the session lives: the run's teardown sweeps both of its
     // settings files, the plan-host variant included.
@@ -317,7 +311,6 @@ test('PM-4 — ExitPlanMode reaches the hook and is classified hold on every pro
   assert.equal(planOf({ plan: '   ' }), null, 'an empty plan is no plan');
 });
 
-type Noted = { event: string; data: Record<string, unknown>; phase?: number };
 const flags = { port: 0, host: '127.0.0.1', open: false, allowWrites: false, scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null };
 
 function serviceWithPlanRunner(decisions: Record<string, unknown>[] = []) {
@@ -372,7 +365,7 @@ test('PM-4 — a plan no run of this console drives is let through, never held f
  * ------------------------------------------------------------------ */
 
 test('PM-5 — presentPlan keeps the text and journals it; holdPlan declares needs-human --needs plan-approval', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const text = (EXIT_PLAN_BODY.tool_input as { plan: string }).plan;
     let presented: ReturnType<InstanceType<typeof Runner>['presentPlan']> = null;
@@ -554,7 +547,7 @@ test('PM-8 — a Decisions row plan-approval: continue approves at the hook and 
 });
 
 test('PM-8 — continuePlan journals phase.plan-approved {by: policy} and never declares', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const { runner } = runnerFor(r, {}, (request, self) => {
       if (!/BOOT phase 1/.test(request.prompt)) return;

@@ -6,7 +6,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { askCount, attentionCount } from '@shared/attention-model.js';
 import { isClosed } from '@/lib/closure';
-import type { PrefSource } from '@shared/prefs-model.js';
+import type { PrefsSchemaAnswer } from '@shared/wire/state.js';
 import { api, type PlanSummary } from './api';
 import { request } from './http';
 import { keys } from './keys';
@@ -144,31 +144,7 @@ export function shellCounts(
  * The settings schema (quiet-console phase 25) — Settings ▸ Everything draws it
  * ------------------------------------------------------------------ */
 
-/** One key as the server describes it: the shared table's facts, its default, its value, where that came from. */
-export interface PrefSchemaRow {
-  /** `theme` · `notify.needs-you` · `retention.runRetainDays` · `profile.heapMb`. */
-  key: string;
-  group: string;
-  type: string;
-  words?: readonly string[];
-  unit?: string;
-  description: string;
-  /** Absent for a key with no shipped default. */
-  default?: unknown;
-  /** A `secret` key's is said without the secret: a webhook's origin and masked tail, anything else as `[withheld]`. */
-  value: unknown;
-  /** The value is a credential or may carry one, so the server never serves it. */
-  secret?: boolean;
-  source: PrefSource;
-  writable: boolean;
-  /** The line that changes it from a terminal, where there is one. */
-  cli: string | null;
-}
-
-export interface PrefsSchemaAnswer {
-  files: { instance: string; config: string; profile: string };
-  rows: PrefSchemaRow[];
-}
+export type { PrefSchemaRow, PrefsSchemaAnswer } from '@shared/wire/state.js';
 
 /** Every preference and machine-profile field, described, with its value and its source. */
 export const readPrefsSchema = (): Promise<PrefsSchemaAnswer> =>

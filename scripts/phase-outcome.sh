@@ -32,9 +32,9 @@
 #                             console next brings the phase up.
 #   --needs   REQUIRED on blocked and needs-human (exit 2 without it), refused on
 #             the rest: the decision KEY the session is missing — one of the
-#             manifest's seventeen (scripts/decisions.env DECISION_KEYS) or a
+#             manifest's nineteen (scripts/decisions.env DECISION_KEYS) or a
 #             blocker class as its short form (NEED_CLASSES: lock permission
-#             credential gate external). Read by the runner BEFORE the prose
+#             credential gate external run). Read by the runner BEFORE the prose
 #             (chapter 10 ZTD-3): `blocked-declared:unknown` then means "a key
 #             the manifest lacks", a defect report, not 39 % of asks. Two keys
 #             are read as a sub-kind of their own spelling: `human-acts` and
@@ -153,7 +153,7 @@
 # that path into every session it supervises and consumes the file on exit.
 # Without $PE_OUTCOME_FILE (no runner supervising this session) the file goes to
 # the console's own inbox for this repository instead —
-#   ${XDG_STATE_HOME:-~/.local/state}/phase-console/runs/<instance id>/<slug>/outcomes/phase-NN.json
+#   ${XDG_STATE_HOME:-~/.local/state}/phase-console/runs/<instance id>/<slug>/outcomes/phase-NN-<stamp>.json
 # (the identity rule of viewer/shared/instances.mjs, mirrored in scripts/instance.sh) —
 # where Phase Console's convergence loop picks it up: a human session's declared
 # wait, block or partial drives the same machinery as a supervised one's. The JSON
@@ -225,8 +225,9 @@ usage() {
   echo '        --proof-type TYPE · --proof-words TEXT · --option ID=LABEL[::CONSEQUENCE]... · --recommended ID ·' >&2
   echo '        --allow-decline · --decision-key KEY · --window DURATION · --tried TEXT  (references/turn.md;' >&2
   echo '        exit 4: the guard refused — the AI can do it itself, or nothing recorded refused it)' >&2
+  echo '   --resumed-with TEXT: the console'"'"'s, on a deferred step'"'"'s resume — prints the answer, declares nothing, exits 0' >&2
   echo "               ($DECISION_KEYS) or a blocker class as its short form ($NEED_CLASSES)" >&2
-  echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>" · unit:<host>/<unit>' >&2
+  echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>" · unit:<host>/<unit> · credential:<id>' >&2
   echo '       unit:<host>/<unit> lands when that systemd unit on that host leaves activating/active (the host is named in the machine profile);' >&2
   echo '       a date: beside a live ref is a BACKSTOP: the ref wakes the phase, the date only bounds the wait' >&2
   echo '       phase:<slug>/<N> lands when the console reads sibling phase N done — the way to wait on a sibling;' >&2
@@ -253,6 +254,26 @@ usage() {
 slug="${1:-}"; phase="${2:-}"; status="${3:-}"
 [ -n "$slug" ] && [ -n "$phase" ] && [ -n "$status" ] || usage
 shift 3
+
+# ---- a deferred person's step, resumed (measured-console phase 12, B2) --------
+# Under `humanStepMode: defer` the console's hook DEFERS this very call: the
+# session stops with it kept, the console raises the person's item from it,
+# and when the person's check passes the resumed session runs the call again
+# with `--resumed-with <the answer>` appended by the hook. Then the call is no
+# declaration: it prints the answer, writes nothing and exits 0, and the
+# session carries on from where it asked. Checked before anything else is
+# validated — the call's own flags were validated when the item was raised.
+resumed_with=""; resumed_seen=0
+for _arg in "$@"; do
+  if [ "$resumed_seen" = 1 ]; then resumed_with="$_arg"; resumed_seen=2; break; fi
+  [ "$_arg" = --resumed-with ] && resumed_seen=1
+done
+if [ "$resumed_seen" != 0 ]; then
+  [ "$resumed_seen" = 2 ] || { echo "--resumed-with needs the answer" >&2; exit 2; }
+  echo "resumed: the person's step for $slug phase $phase is done — $resumed_with"
+  echo "nothing was declared: carry on with the phase from here." >&2
+  exit 0
+fi
 
 case "$phase" in ''|*[!0-9]*) echo "phase must be a number, got: $phase" >&2; exit 2 ;; esac
 # `08` passes the all-digits test and then goes UNQUOTED into the JSON number
@@ -508,6 +529,8 @@ while [ $# -gt 0 ]; do
     --window)       step_window="${2:?--window needs a duration}"; step_flags=1; shift 2 ;;
     --lang)         step_lang="${2:?--lang needs a language tag}"; step_flags=1; shift 2 ;;
     --tried)        step_tried="${2:?--tried needs text}"; step_flags=1; shift 2 ;;
+    # Handled before this loop, and never reached: named so the flag is one the parser knows.
+    --resumed-with) shift 2 ;;
     --option)
       # ID=LABEL[::CONSEQUENCE] — a decision's option, and what choosing it does.
       opt="${2:?--option needs ID=LABEL[::CONSEQUENCE]}"; step_flags=1
@@ -1494,6 +1517,46 @@ _probe_or_carry_on() {  # _probe_or_carry_on <staged file>
   [ "$rc" = 4 ] && _say_guarded
   _say_refused
 }
+
+# ---- unpushed work (measured-console phase 12, #397) ------------------------
+# A `partial` hands the phase to a later session, and commits that live only in
+# this checkout are lost with it — a rebuilt mirror, a dead machine. So the
+# declaration names, LOUDLY on stderr, each tree of the session's scope whose
+# `pe/…` branch is ahead of `origin/<branch>`: the root of this checkout (its
+# superproject's, inside a submodule) and each repository `PE_SCOPE` names
+# under it (every `.gitmodules` path when the scope is `all` or unset). Read
+# from the local tracking ref, never a fetch. A warning, never a refusal: the
+# exit and the file are unchanged, and the console shows the same count on the
+# phase until a push lands. PHASE_OUTCOME_UNPUSHED=0 skips it.
+_warn_unpushed() {
+  local base tree rel branch ahead tokens
+  command -v git >/dev/null 2>&1 || return 0
+  # The outermost checkout holding the cwd — the run's mirror root, its submodules under it.
+  base="$(pe_outer_checkout 2>/dev/null || true)"
+  [ -n "$base" ] || return 0
+  tokens="$(printf '%s' "${PE_SCOPE:-}" | tr ',' ' ')"
+  case " $tokens " in
+    *" all "*|"  ") tokens="$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' "$base/.gitmodules" 2>/dev/null || true)" ;;
+  esac
+  for tree in "$base" $tokens; do
+    [ "$tree" = "$base" ] || tree="$base/$tree"
+    case "$tree" in *..*) continue ;; esac
+    [ -e "$tree/.git" ] || continue
+    branch="$(git -C "$tree" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    case "$branch" in pe/*) : ;; *) continue ;; esac
+    if git -C "$tree" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null 2>&1; then
+      ahead="$(git -C "$tree" rev-list --count "refs/remotes/origin/$branch..HEAD" 2>/dev/null || echo 0)"
+    else
+      ahead="$(git -C "$tree" rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)"
+    fi
+    case "$ahead" in ''|*[!0-9]*) continue ;; esac
+    [ "$ahead" -gt 0 ] || continue
+    rel="${tree#"$base"}"; rel="${rel#/}"; [ -n "$rel" ] || rel="."
+    echo "WARNING: unpushed — $rel is $ahead commit(s) ahead of origin/$branch. Push it (git -C $tree push origin $branch) if this phase may; until a push lands the console names it on the phase." >&2
+  done
+  return 0
+}
+[ "$status" = partial ] && [ "${PHASE_OUTCOME_UNPUSHED:-1}" != 0 ] && _warn_unpushed
 
 if [ -n "${PE_OUTCOME_FILE:-}" ]; then
   # The unsupervised branch below has always degraded honestly — mkdir, and on

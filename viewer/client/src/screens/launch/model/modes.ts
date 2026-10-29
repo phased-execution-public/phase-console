@@ -37,7 +37,13 @@ import {
   type RunSetupField,
   type RunSetupValues,
 } from './schema';
-import { PERMISSION_MODES, PERMISSION_PROFILES, PROFILE_LABELS } from '@shared/run-settings.js';
+import {
+  DEFAULT_CACHE_TTL_AB,
+  DEFAULT_COMPACTION,
+  PERMISSION_MODES,
+  PERMISSION_PROFILES,
+  PROFILE_LABELS,
+} from '@shared/run-settings.js';
 import { DEFAULT_MODEL_POLICY } from '@shared/run-lifecycle.js';
 
 export type RunSetupMode =
@@ -165,6 +171,17 @@ const RUN_FIELDS = [
   // a spent cap's errand names the setting, and raising it is the way through.
   'ladderPerRunRungs',
   'ladderPerPhaseRungs',
+  // The session's environment (measured-console phase 6) — on both doors, each
+  // landing on the next phase to board.
+  'cacheTtlAb',
+  'keepWarmSec',
+  'subagentModel',
+  'bashMaxOutput',
+  // The platform's pieces (measured-console phase 12) — on both doors too,
+  // each landing on the next phase to board.
+  'humanStepMode',
+  'compaction',
+  'compactionWindow',
   'onlyPhases',
   'phaseOptions',
 ] as const;
@@ -567,6 +584,33 @@ export function buildRunPayload(
     if (!on(field)) continue;
     const n = cap(values[field]);
     if (n !== null || existing) payload[field] = n;
+  }
+  // The session's environment (measured-console phase 6). Each is sent only
+  // when it says something — so a fresh start at the defaults posts what it
+  // always posted — and on a run that EXISTS a default is sent too: `off` and
+  // the `null` of an empty box are how both doors read "back to the default".
+  if (on('cacheTtlAb') && (values.cacheTtlAb !== DEFAULT_CACHE_TTL_AB || existing)) {
+    payload.cacheTtlAb = values.cacheTtlAb;
+  }
+  // The platform's pieces (measured-console phase 12), the same rule: an
+  // empty step mode is "the console decides", `console` is the default
+  // compaction, and an empty window is the console's own.
+  if (on('humanStepMode')) {
+    if (values.humanStepMode) payload.humanStepMode = values.humanStepMode;
+    else if (existing) payload.humanStepMode = null;
+  }
+  if (on('compaction') && (values.compaction !== DEFAULT_COMPACTION || existing)) {
+    payload.compaction = values.compaction;
+  }
+  for (const field of ['keepWarmSec', 'bashMaxOutput', 'compactionWindow'] as const) {
+    if (!on(field)) continue;
+    const n = whole(values[field]);
+    if (n !== undefined) payload[field] = n;
+    else if (existing) payload[field] = null;
+  }
+  if (on('subagentModel')) {
+    if (values.subagentModel) payload.subagentModel = values.subagentModel;
+    else if (existing) payload.subagentModel = null;
   }
   if (on('phaseOptions') && Object.keys(values.phaseOptions).length) {
     payload.phaseOptions = values.phaseOptions;

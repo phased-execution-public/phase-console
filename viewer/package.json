@@ -1,6 +1,6 @@
 {
   "name": "phase-console",
-  "version": "8.0.0",
+  "version": "9.0.0",
   "private": true,
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -10,15 +10,17 @@
   },
   "scripts": {
     "start": "node scripts/check-stamp.mjs && node server/index.ts",
-    "test": "node --test --test-concurrency=4 --test-timeout=600000 --test-force-exit \"test/*.test.ts\"",
+    "test": "mkdir -p .cache && node --test --test-concurrency=4 --test-timeout=600000 --test-force-exit --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./test/suite-ledger.mjs --test-reporter-destination=.cache/suite-ledger.tsv \"test/*.test.ts\"",
     "typecheck": "npm run typecheck:client && npm run typecheck:server",
-    "typecheck:client": "tsc -p client/tsconfig.json --noEmit && tsc -p client/tsconfig.sw.json --noEmit",
-    "typecheck:server": "tsc -p server/tsconfig.json --noEmit",
+    "typecheck:client": "tsc -p client/tsconfig.json --noEmit --incremental --tsBuildInfoFile .cache/tsc-client.tsbuildinfo && tsc -p client/tsconfig.sw.json --noEmit --incremental --tsBuildInfoFile .cache/tsc-sw.tsbuildinfo",
+    "typecheck:server": "tsc -p server/tsconfig.json --noEmit --incremental --tsBuildInfoFile .cache/tsc-server.tsbuildinfo",
     "typecheck:e2e": "tsc -p e2e/tsconfig.json --noEmit",
-    "lint:client": "eslint client/src shared e2e playwright.config.ts --max-warnings 0",
+    "typecheck:test": "node scripts/typecheck-test.mjs",
+    "lint:client": "eslint --cache --cache-location .cache/eslint/ --cache-strategy content client/src shared e2e playwright.config.ts --max-warnings 0",
+    "lint:test": "eslint --cache --cache-location .cache/eslint-test/ --cache-strategy content test --max-warnings 0",
     "lint:client:fix": "eslint client/src shared e2e playwright.config.ts --fix",
     "format": "prettier --write \"client/src/**/*.{ts,tsx,js,mjs}\" \"shared/**/*.{js,mjs}\" \"scripts/**/*.mjs\" \"e2e/**/*.{ts,mjs}\" eslint.config.js vite.config.ts playwright.config.ts",
-    "format:check": "prettier --check \"client/src/**/*.{ts,tsx,js,mjs}\" \"shared/**/*.{js,mjs}\" \"scripts/**/*.mjs\" \"e2e/**/*.{ts,mjs}\" eslint.config.js vite.config.ts playwright.config.ts",
+    "format:check": "prettier --check --cache --cache-location .cache/prettier --cache-strategy content \"client/src/**/*.{ts,tsx,js,mjs}\" \"shared/**/*.{js,mjs}\" \"scripts/**/*.mjs\" \"e2e/**/*.{ts,mjs}\" eslint.config.js vite.config.ts playwright.config.ts",
     "test:e2e": "node e2e/run.ts",
     "test:e2e:baseline": "PHASE_CONSOLE_E2E_BASELINE=write node e2e/run.ts register.spec.ts",
     "test:e2e:dist": "node scripts/verify-dist.mjs --keep && PHASE_CONSOLE_DIST_DIR=\"$PWD/client/.dist-verify\" node e2e/run.ts",
@@ -29,13 +31,17 @@
     "verify:dist": "node scripts/verify-dist.mjs",
     "preview": "vite preview",
     "test:client": "vitest run",
+    "test:mutation": "node scripts/nightly-mutation.mjs",
+    "coverage:diff": "node scripts/coverage-diff.mjs",
     "test:client:watch": "vitest"
   },
   "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.311",
     "node-pty": "^1.1.0",
     "ws": "^8.21.1"
   },
   "devDependencies": {
+    "@base-ui/react": "1.8.0",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "1.62.1",
     "@radix-ui/react-alert-dialog": "^1.1.23",

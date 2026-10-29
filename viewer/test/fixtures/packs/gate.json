@@ -1,0 +1,9 @@
+{"schema_version":1,"run":"run-1","gate_rev":2,"title":"autoplan gate","items":[
+ {"id":"p1","title":"The plan for the billing export","kind":"approval","recommended":"b","options":[
+  {"key":"a","text":"approve as-is"},
+  {"key":"b","text":"approve with the recommended changes","changes_plan":true},
+  {"key":"c","text":"interrogate (ask questions; stays pending)"},
+  {"key":"d","text":"rerun every phase"},
+  {"key":"e","text":"reject"}]},
+ {"id":"uc1","title":"Keep the CSV columns stable for one release","kind":"auto","recommended":"a","options":[{"key":"a","text":"keep them"},{"key":"b","text":"rename now"}]}
+]}

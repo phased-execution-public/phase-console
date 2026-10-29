@@ -78,9 +78,11 @@ describe('where the plans stand', () => {
       Number(s.dataset.count),
     );
     expect(counts.reduce((a, b) => a + b, 0)).toBe(10);
-    expect(within(line).getByTestId('plan-legend')).toHaveTextContent(
-      '4 done · 1 in progress · 1 stuck · 1 next up · 3 waiting · 40 %',
-    );
+    // The legend is the family's badges, one per share, and the percentage a badge of its own.
+    expect(
+      [...within(line).getByTestId('plan-legend').querySelectorAll('[data-share]')].map((b) => b.textContent),
+    ).toEqual(['4 done', '1 in progress', '1 stuck', '1 next up', '3 waiting']);
+    expect(within(line).getByTestId('plan-percent')).toHaveTextContent('40 %');
     // A plan the list does not know draws no track — only what waits on you.
     const beta = screen.getAllByTestId('turn-plan').find((li) => li.dataset.plan === 'beta')!;
     expect(within(beta).queryByRole('img')).toBeNull();

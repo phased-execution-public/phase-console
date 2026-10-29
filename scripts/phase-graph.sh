@@ -12,76 +12,36 @@
 # a linear cursor. A plan is finished only when EVERY phase is done — not when the
 # highest-numbered phase is reached.
 #
-# Usage:
-#   phase-graph.sh <slug>                 # human status board (default; shows SUGGESTED BATCHES)
-#   phase-graph.sh <slug> --ready         # space-separated ready phase numbers
-#   phase-graph.sh <slug> --ready-after N # ready set assuming phase N just completed
-#   phase-graph.sh <slug> --dependents N  # phases that list N as a dependency (static)
-#   phase-graph.sh <slug> --deps N        # N's own dependencies (space-separated)
-#   phase-graph.sh <slug> --gated N       # "yes"/"no"
-#   phase-graph.sh <slug> --gate-kind N   # gate category: human|ai|auto|none
-#   phase-graph.sh <slug> --gate-status N # evaluate the gate (exit 0 clear, 1 blocked/manual/ai/unevaluated)
-#   phase-graph.sh <slug> --size N        # rough working-set size of phase N (S|M|L; default M)
-#   phase-graph.sh <slug> --repos N       # phase N's SCOPE as normalized csv (Repos column; "" → all)
-#   phase-graph.sh <slug> --boot-prompt N # full copy-paste boot prompt for phase N
-#   phase-graph.sh <slug> --boot-fanout "N M …" # the shared boot once + each phase's own block (#115)
-#   phase-graph.sh <slug> --mcp [N]       # MCP servers the plan (or phase N: plan ∪ bullet) needs, csv
-#   phase-graph.sh <slug> --mcp-policy [N] # continue | require | "" (the plan's word, phase overriding)
-#   phase-graph.sh <slug> --permission-mode [N] # acceptEdits|auto|dontAsk|plan|manual<TAB>phase|plan — or
-#                                         # nothing (the plan is silent; the run's default answers)
-#   phase-graph.sh <slug> --model-policy [N] # ladder|pinned<TAB>phase|plan — or nothing (the plan is
-#                                         # silent; the run's `modelPolicy` answers, else ladder)
-#   phase-graph.sh <slug> --decisions [N] # the decision manifest: key<TAB>state<TAB>owner<TAB>blocking<TAB>source<TAB>value
-#                                         # per row — the plan's `## Decisions` table with docs/handoffs/<slug>/
-#                                         # decisions.md merged over it (and phase N's rows over both)
-#   phase-graph.sh <slug> --credentials [N] # credential ids the plan (or phase N: plan ∪ bullet) needs, csv
-#   phase-graph.sh <slug> --credential-policy [N] # require | continue | "" (like --mcp-policy)
-#   phase-graph.sh <slug> --qa-exhausted         # waive | halt | <owner> | "" (the `**QA exhausted:**` line)
-#   phase-graph.sh <slug> --person-check N       # allow | halt | <owner> | "" (the phase's `- **Person-check:**` bullet)
-#   phase-graph.sh <slug> --accounts      # the `**Accounts:**` line as id<TAB>minHeadroom per line
-#   phase-graph.sh <slug> --wait-budget [N] # minutes<TAB>phase|plan — how long a phase may stay parked on
-#                                         # its declared waits (the phase's `Waits on:` max, else the plan's
-#                                         # `Wait budget:`); nothing when the plan is silent (the console default)
-#   phase-graph.sh <slug> --verify-timeout [N] # minutes<TAB>phase|plan — how long ONE §Verification
-#                                         # command may run (the phase's `Verify timeout:`, else the
-#                                         # plan's); nothing when silent (the console scales it from history)
-#   phase-graph.sh <slug> --waits-on N    # the refs phase N's `- **Waits on:**` bullet names, one per line
-#   phase-graph.sh <slug> --human-steps [N] # the `- **Human step:**` bullets as TSV: kind, what, open, proof, where,
-#                                         # window minutes, auto-open, credential (no N: every phase, led by `N<TAB>`)
-#   phase-graph.sh <slug> --model [N]     # the model phase N runs: its `- **Model:**` bullet (a prose
-#                                         # "(1M window)" read as [1m]), else the plan's target model;
-#                                         # nothing when neither names one (the run's model answers)
-#   phase-graph.sh <slug> --checkout N    # the phase's `- **Checkout:**` branch, verbatim
-#   phase-graph.sh <slug> --verify-in N   # the phase's `**Verify in:**` directory, one line (empty: the root)
-#   phase-graph.sh <slug> --floor [N]     # phase N's `- **Wall-clock floor:**` bullet in MINUTES,
-#                                         # rounded up; with no N, every phase that declares a readable
-#                                         # one as N<TAB>minutes, ascending order; nothing when none do
-#   phase-graph.sh <slug> --land [N]      # hold|integrate|pr|trunk<TAB>phase|plan|default
-#   phase-graph.sh <slug> --gitlink [N]   # bump|leave<TAB>phase|plan|default
-#   phase-graph.sh <slug> --isolation [N] # shared|worktree<TAB>phase|plan — or nothing (the run decides)
-#   phase-graph.sh <slug> --issues [N]    # off|draft|file<TAB>phase|plan|default
-#   phase-graph.sh <slug> --conflict-policy # halt|park|rebase-session<TAB>plan|default  (plan-wide)
-#   phase-graph.sh <slug> --messaging       # on|off<TAB>plan|default                    (plan-wide)
-#   phase-graph.sh <slug> --base-branch     # <ref><TAB>plan|default                     (plan-wide)
-#   phase-graph.sh <slug> --clash-zones     # the paths two phases must never both touch, csv
-#   phase-graph.sh <slug> --landing N     # the landing LEDGER's row for phase N, as TSV (nothing = no record)
-#   phase-graph.sh <slug> --notes N       # what phase N is handed: source<TAB>note per line
-#   phase-graph.sh <slug> --session-plan [model|budget]
-#                                         # the unit (1 phase ≥ 1 session under the console), the
-#                                         # plan's weight (generated), the REMAINING phases forecast
-#                                         # in measured sessions, the session model and boot floor;
-#                                         # then which of them a person may batch by hand, sized to a
-#                                         # model's budget (haiku|sonnet|opus|fable) or a raw token
-#                                         # number. Groups cut only at unmet deps, GATED phases, QA
-#                                         # boundaries, and the floor + slope × weight passing the
-#                                         # target. See references/sizing.md.
+# Usage: phase-graph.sh <slug> [<mode> [N]]. Every mode, one line each, is
+# `phase-graph.sh --help` — the table `_modes_table` below, held to this
+# file's dispatch by tests/unit/help.bats; a lint's paragraph is
+# `phase-graph.sh --explain <F-code>` (scripts/lints.env).
 #
 # Run from the repo root that owns docs/, or set DOCS_ROOT.
 set -euo pipefail
 
-slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--verified|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--permission-mode [N]|--model-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--verify-timeout [N]|--waits-on N|--human-steps [N]|--model [N]|--checkout N|--verify-in N|--floor [N]|--land [N]|--landing N|--base-branch|--gitlink [N]|--conflict-policy|--isolation [N]|--clash-zones|--issues [N]|--messaging|--notes N|--boot-prompt N|--boot-fanout "N M …"|--session-plan [model|budget]]}"
+# Every awk, grep and sed in this engine — and in the files it sources — reads
+# the plan under ONE locale (#410). macOS awk's `[[:space:]]` matches U+00A0
+# under a UTF-8 locale and not under C (grep's and sed's likewise), so a fence,
+# a table row or a bullet after a no-break space existed or not by the shell
+# the engine ran in: the gate's suite went red under `LC_ALL=en_US.UTF-8` and
+# green under `LANG=C`. C is the reading CommonMark gives (only a space or a
+# tab indents). Functions rather than an exported LC_ALL keep `cut -c`, `sort`
+# and the output's own characters in the caller's locale — the 500-character
+# note cut counts characters, as its JS twin does. A count that must be in
+# characters inside awk strips UTF-8 continuation bytes first (`/[\200-\277]/`).
+awk()  { LC_ALL=C command awk "$@"; }
+grep() { LC_ALL=C command grep "$@"; }
+sed()  { LC_ALL=C command sed "$@"; }
+
+slug="${1:?usage: phase-graph.sh <slug> [<mode> [N]] — every mode, one line each: phase-graph.sh --help}"
 mode="${2:-board}"
 arg="${3:-}"
+# `--help` and `--explain` read no plan, so they answer in the slug's place too
+# (`phase-graph.sh --help`, `phase-graph.sh --explain F39`).
+case "$slug" in
+  --help|--explain) mode="$slug"; arg="${2:-}" ;;
+esac
 
 # Normalise a phase argument at the door. Handoff FILES are `phase-08-*.md`, so
 # `--boot-prompt 08` and `--deps 08` are what a person (and a prompt that copied
@@ -105,6 +65,120 @@ esac
 
 # Script dir — portable across accounts/clones (F13): never hardcode ~/.claude.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ---- The catalogue: every mode in one line, every lint's paragraph ----------
+# What a session used to read out of the skill (measured-console phase 2): the
+# modes' list is this table — `--help` prints it, and `tests/unit/help.bats`
+# holds it to the dispatch's own arms both ways — and a lint's paragraph is
+# `scripts/lints.env`, which `--explain <F-code>` prints and
+# `references/plan-format.md` points at. One row per mode: the flag, its
+# argument, what it answers. Keep a row to one line.
+_modes_table() {
+  cat <<'MODES'
+(none)	<slug>	the board: done, in progress, ready, waiting, and suggested batches
+--help		every mode, one line each (this list; needs no plan)
+--explain	<F-code>	one lint's name, tier and paragraph, from scripts/lints.env (needs no plan)
+--section	N	phase N's `### Phase N` section verbatim, its graph row, and the §Session budget lines that bind it
+--lint		structural validation: gates exit 1 on a problem; advisories ride stderr
+--plan-status		the plan's stored status, one bare word
+--closed		exit 0 when the plan is closed (`closed <status>`), 1 when open
+--ready		the ready phases, space-separated
+--ready-after	N	the ready set assuming phase N just completed
+--dependents	N	the phases that list N as a dependency
+--deps	N	phase N's own dependencies
+--gated	N	yes|no — the phase carries a gate
+--gate-kind	N	the gate's category: human|ai|auto|none
+--gate-status	N	evaluate the gate: exit 0 clear, 1 blocked|manual|ai|unevaluated
+--size	N	phase N's weight: S|M|L (default M)
+--repos	N	phase N's scope as a normalized csv (the Repos column; empty reads all)
+--setup	N	phase N's bring-up commands, one per line, in the order they run
+--verify-in	N	phase N's `**Verify in:**` directory (empty: the root)
+--checkout	N	phase N's `- **Checkout:**` branch, verbatim
+--floor	[N]	phase N's wall-clock floor in minutes; no N: every phase that declares one
+--out-of-scope	N	phase N's `- **Out of scope:**` bullet and its continuation lines, one per line (nothing when absent)
+--not-yet-specified		the plan's `## Not yet specified` lines, one per line (nothing when empty or absent)
+--skills	[N]	the skills the plan (or phase N: plan ∪ bullet) names, csv as written
+--mcp	[N]	the MCP servers the plan (or phase N: plan ∪ bullet) needs, csv
+--plugins	[N]	the plugin-set entries the plan's kinds (or phase N's: plan ∪ bullet) bring, csv
+--mcp-policy	[N]	continue|require|"" — the phase's word over the plan's
+--permission-mode	[N]	mode<TAB>phase|plan, or nothing (the run's default answers)
+--model	[N]	the model phase N runs (its bullet, else the plan's target model)
+--model-policy	[N]	ladder|pinned<TAB>phase|plan, or nothing
+--subagent-model	[N]	the model phase N's subagents run: model<TAB>phase|plan, or nothing
+--fast-gate	N	on|off<TAB>phase|default — whether the session's Stop hook runs the fast gate (default on)
+--may-delete-tests	N	yes|no<TAB>phase|default — whether the session may delete a test file (default no)
+--credentials	[N]	the credential ids the plan (or phase N: plan ∪ bullet) needs, csv
+--credential-policy	[N]	require|continue|"" — the phase's word over the plan's
+--accounts	[N]	id<TAB>minHeadroom per line (with N, Pro: the phase's bullet over the plan's line)
+MODES
+  cat <<'MODES'
+--qa-exhausted		waive|halt|<owner>|"" — the `**QA exhausted:**` line
+--person-check	N	allow|halt|<owner>|"" — the phase's `- **Person-check:**` bullet
+--wait-budget	[N]	minutes<TAB>phase|plan — how long a phase may stay parked on its waits
+--wait-count	[N]	n<TAB>phase|plan — how many waits a phase may declare
+--verify-timeout	[N]	minutes<TAB>phase|plan — how long ONE §Verification command may run
+--verification-tier	[N]	impact|full<TAB>phase|plan — what a phase's heavy §Verification lines run as
+--waits-on	N	the refs phase N's `- **Waits on:**` bullet names, one per line
+--human-steps	[N]	the `- **Human step:**` bullets as TSV (no N: every phase, led by N<TAB>)
+--land	[N]	hold|integrate|pr|trunk<TAB>phase|plan|default
+--gitlink	[N]	bump|leave<TAB>phase|plan|default
+--isolation	[N]	shared|worktree<TAB>phase|plan, or nothing (the run decides)
+--issues	[N]	off|draft|file<TAB>phase|plan|default
+MODES
+  cat <<'MODES'
+--conflict-policy		halt|park|rebase-session<TAB>plan|default (plan-wide)
+--messaging		on|off<TAB>plan|default (plan-wide)
+--base-branch		<ref><TAB>plan|default (plan-wide)
+--clash-zones		the paths two phases must never both touch, csv
+--landing	N	the landing ledger's rows for phase N, as TSV (nothing: no record)
+--notes	N	what phase N is handed by earlier phases: source<TAB>kind<TAB>id<TAB>at<TAB>text
+--decisions	[N]	the decision manifest: key<TAB>state<TAB>owner<TAB>blocking<TAB>source<TAB>value
+--qa-mode	[N]	the QA regime: off | on <reason> | waived <reason>
+--qa-result	N	the current QA verdict (none when unrecorded)
+--qa-history	N	every recorded QA round: round<TAB>result<TAB>report<TAB>recorded
+--qa-prompt	N	the fresh QA subagent's brief, round-aware
+--verified		the phases done AND QA-verified, space-separated
+--memory-block		the canonical done/ready/waiting block, plus the blocked: line
+--session-plan	[model|budget]	the session forecast, measured, and the batches a person may run by hand
+--boot-prompt	N	the full boot prompt for phase N (under PE_BRIEF=hook, less what the brief carries)
+--brief	N	the SessionStart brief for phase N: mode file, section head, open decisions, notes, scope, the previous handoff's summary, errands, memory
+--boot-fanout	"N M …"	the shared boot once, then each phase's own block (#115)
+MODES
+}
+
+modes_help() {
+  printf 'phase-graph.sh <slug> [<mode> [N]] — every mode, one line each:\n'
+  _modes_table | awk -F'\t' '{ printf "  %-21s %-16s %s\n", $1, $2, $3 }'
+}
+
+# The paragraph of one lint, from scripts/lints.env: a record line `<code>
+# <name> <tier>` at column 0, then its paragraph indented two spaces.
+explain_lint() {  # explain_lint <F-code>
+  local code="${1:-}" file="$SCRIPT_DIR/lints.env" out
+  case "$code" in
+    [Ff][0-9]*) code="F${code#?}" ;;
+    [0-9]*)     code="F$code" ;;
+    '') printf 'usage: phase-graph.sh --explain <F-code>   (e.g. F14)\n' >&2; return 2 ;;
+  esac
+  [ -f "$file" ] || { printf 'no lint catalogue at %s\n' "$file" >&2; return 2; }
+  out="$(awk -v want="$code" '
+    /^#/ { next }
+    /^F[0-9]+ / { if (on) exit; if ($1 == want) { on = 1; printf "%s %s (%s)\n", $1, $2, $3 }; next }
+    on && /^  / { sub(/^  /, ""); print; next }
+    on && /^[[:space:]]*$/ { exit }
+  ' "$file")"
+  if [ -z "$out" ]; then
+    printf 'no lint %s — the catalogue holds: %s\n' "$code" \
+      "$(awk '/^F[0-9]+ / { printf "%s%s", sep, $1; sep = " " }' "$file")" >&2
+    return 2
+  fi
+  printf '%s\n' "$out"
+}
+
+case "$mode" in
+  --help)    modes_help; exit 0 ;;
+  --explain) explain_lint "$arg"; exit $? ;;
+esac
 # One bash reading of the Repos column, shared with phase-lock.sh.
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/scope.sh"
@@ -118,7 +192,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # a fallback so the script still runs if the file is ever missing.
 SIZE_S=15000; SIZE_M=40000; SIZE_L=90000
 BUDGET_HAIKU=40000; BUDGET_BIG=200000; BUDGET_DEFAULT=40000; BUDGET_1M=200000
-SESSION_BOOT_FLOOR=121000; SESSION_WORK_FLOOR=198000; SESSION_SLOPE_PCT=217; SESSION_TARGET_PCT=60
+SESSION_BOOT_FLOOR=55000; SESSION_WORK_FLOOR=183000; SESSION_SLOPE_PCT=191; SESSION_TARGET_PCT=60
 SESSIONS_S_X100=169; SESSIONS_S_WRAP_X100=200; WRAP_S_PCT=7
 SESSIONS_M_X100=146; SESSIONS_M_WRAP_X100=278; WRAP_M_PCT=15
 SESSIONS_L_X100=148; SESSIONS_L_WRAP_X100=254; WRAP_L_PCT=42
@@ -145,6 +219,15 @@ MODEL_1M_SUFFIX="[1m]"
 MCP_SURCHARGE=1500; MCP_SURCHARGE_MAX=12000
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/mcp.env" ] && . "$SCRIPT_DIR/mcp.env"
+
+# The per-phase plugin sets (measured-console phase 27): the kinds and each
+# kind's entries — the bash twin of viewer/shared/plugin-sets.js. These
+# defaults keep `--plugins` alive (and empty) if the file is ever missing.
+PLUGIN_KINDS="review security planning release docs ui"
+PLUGIN_LISTING_PCT=1; PLUGIN_ENTRY_CHARS=1536; PLUGIN_CHARS_PER_TOKEN=4
+PLUGIN_WINDOW=200000; PLUGIN_WINDOW_1M=1000000
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/plugin-sets.env" ] && . "$SCRIPT_DIR/plugin-sets.env"
 
 # F5, same shape: the verification-command vocabulary (cwd-sensitive leads,
 # names never worth a resolution warning, the external-clock waits). Canonical
@@ -193,7 +276,22 @@ CMD="DOCS_ROOT=$DOCS_ROOT bash $SCRIPT_DIR"
 # older scripts under a console that enforced newer ones. Every session a
 # console starts carries `PE_SCRIPTS=<its scriptsDir>`, so the same line runs
 # the launching console's scripts there and this copy's when pasted by hand.
-BOOT_CMD="DOCS_ROOT=$DOCS_ROOT bash \"\${PE_SCRIPTS:-$SCRIPT_DIR}\""
+#
+# Both paths are written relative to `$HOME` where they sit under it
+# (measured-console phase 2): a prompt carried the account's absolute path 39
+# times — in every handoff that embedded it and in every byte two sessions
+# could otherwise share — and `$HOME/…` pastes on the account it was made for
+# exactly as the absolute path did. The root stays unconditional (never
+# `${DOCS_ROOT:-…}`), for the reason above: a shell with another DOCS_ROOT
+# exported must still write here.
+_home_rel() {  # _home_rel <path> → `$HOME/…` when the path is under $HOME, else the path
+  case "${HOME:-}" in ''|/) printf '%s' "$1"; return 0 ;; esac
+  case "$1" in
+    "$HOME"/*) printf '$HOME/%s' "${1#"$HOME"/}" ;;
+    *)         printf '%s' "$1" ;;
+  esac
+}
+BOOT_CMD="DOCS_ROOT=$(_home_rel "$DOCS_ROOT") bash \"\${PE_SCRIPTS:-$(_home_rel "$SCRIPT_DIR")}\""
 
 if [ ! -f "$plan_file" ]; then
   printf 'ERROR: plan not found: %s\n' "$plan_file" >&2
@@ -437,12 +535,170 @@ phase_block() {  # phase_block <phase>
   ' "$plan_file"
 }
 
+# ---- `--section N`: what a session reads of the plan (measured-console phase 2)
+# The `### Phase N` section verbatim, its graph row, and the §Session budget
+# lines that bind it — nothing of any other phase. A session used to read the
+# plan whole (or grep it) to find these; a 3,500-line plan is ~100K tokens it
+# paid for one phase. The shape, which the skill's mode files and the
+# SessionStart brief are written against:
+#
+#   <the ### Phase N heading and body, verbatim, trailing blank lines trimmed>
+#   <blank>
+#   ## Phase graph — phase N's row
+#   <the table's header row>
+#   <its separator row>
+#   <phase N's row>
+#   <blank>
+#   ## Session budget — the lines that bind phase N
+#   <each plan-wide directive, one per line (a `·` line split, quote marks
+#    dropped), with its continuation lines — less those the phase overrides
+#    with a bullet of its own label; a phase's `Model:` overrides `Target model:`>
+#
+# A §Session budget paragraph that opens with no bold label is prose and is
+# left out. The JS twin is `phaseSection` in parse/plan.ts; engine-parity
+# holds the two to one answer.
+_graph_row() {  # _graph_row <phase> → the table's header, separator and phase N's row
+  awk -v want="$1" '
+    tolower($0) ~ /^##[[:space:]]+phase graph/ { inpg = 1; seen = 0; next }
+    inpg && seen && $0 !~ /^[ \t]*\|/ { exit }
+    inpg && /^[ \t]*\|/ {
+      seen = 1; n++
+      c = $0; sub(/^[ \t]*\|/, "", c); sub(/\|.*$/, "", c); gsub(/[*` \t]/, "", c)
+      if (c ~ /^[0-9]+$/) { if (c + 0 == want + 0) print; next }
+      if (n <= 2) print
+    }
+  ' "$plan_file"
+}
+
+_phase_labels() {  # _phase_labels <phase> → "|label|label|…|", lower-cased, of its bullets
+  phase_block "$1" | awk '
+    match($0, /^[ \t]*[-*][ \t]+\*\*[^*]+(:\*\*|\*\*:)/) {
+      l = substr($0, RSTART, RLENGTH); sub(/^[ \t]*[-*][ \t]+\*\*/, "", l); sub(/(:\*\*|\*\*:)$/, "", l)
+      out = out "|" tolower(l)
+    }
+    END { print out "|" }'
+}
+
+_budget_binding() {  # _budget_binding <phase> → the §Session budget directives that bind phase N
+  local own; own="$(_phase_labels "$1")"
+  case "$own" in *"|model|"*) own="${own}target model|" ;; esac
+  _section 2 "session budget" | awk -v own="$own" '
+    { s = $0; sub(/^[ \t>]*/, "", s) }
+    s == "" { cur = 0; next }
+    match(s, /^([-*][ \t]+)?\*\*[^*]+(:\*\*|\*\*:)/) {
+      l = substr(s, RSTART, RLENGTH); sub(/^([-*][ \t]+)?\*\*/, "", l); sub(/(:\*\*|\*\*:)$/, "", l)
+      cur = (index(own, "|" tolower(l) "|") == 0)
+      if (cur) print s
+      next
+    }
+    cur { print s }'
+}
+
+phase_section() {  # phase_section <phase>
+  local p="$1"
+  phase_block "$p" | awk '{ line[NR] = $0 } END { n = NR; while (n > 0 && line[n] ~ /^[ \t]*$/) n--; for (i = 1; i <= n; i++) print line[i] }'
+  printf '\n## Phase graph — phase %s'\''s row\n' "$p"
+  _graph_row "$p"
+  printf '\n## Session budget — the lines that bind phase %s\n' "$p"
+  _budget_binding "$p"
+}
+
 # F12: the machine-checkable "- **Gate-check:** <type> <value>" directive, if any.
 gate_check_directive() {  # gate_check_directive <phase>
   phase_block "$1" \
     | grep -iE '^[[:space:]]*[-*].*gate-check' \
     | sed -E 's/.*[Gg]ate-check[^:]*:[[:space:]]*//; s/[*`]//g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
     | head -1 || true
+}
+
+# `- **Out of scope:** …` (measured-console phase 30): what a phase is NOT to
+# build, so an evaluator can tell a missing piece from a refused one. The
+# bullet's own text and its continuation lines — everything up to the next
+# top-level bullet that opens with a bold label — one trimmed non-empty line
+# each. `labelledBullets` in parse/plan.ts reads it the same way.
+out_of_scope_directive() {  # out_of_scope_directive <phase>
+  phase_block "$1" | awk '
+    function trim(x) { sub(/^[ \t]+/, "", x); sub(/[ \t]+$/, "", x); return x }
+    inb && /^[ \t]*(```|~~~)/ { fence = !fence }
+    inb && !fence && /^[-*][ \t]+\*\*/ { exit }
+    inb { t = trim($0); if (t != "") print t; next }
+    tolower($0) ~ /^[ \t]*[-*][ \t]+\*\*out[ \t]+of[ \t]+scope(:\*\*|\*\*:)/ {
+      t = $0; sub(/^[ \t]*[-*][ \t]+\*\*[^*]+(:\*\*|\*\*:)/, "", t); t = trim(t)
+      if (t != "") print t
+      inb = 1
+    }
+  '
+}
+
+# `## Not yet specified` (measured-console phase 30): the plan-level list of
+# what is known to be missing. One trimmed non-empty line each; close-plan.sh
+# refuses `complete` while it holds any.
+not_yet_specified_lines() {
+  _section 2 "not yet specified" | awk '{ t = $0; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t); if (t != "") print t }'
+}
+
+# Amendments (measured-console phase 30). `scripts/amend-plan.sh` is the one
+# writer: a phase carries `- **Amendment:** K (YYYY-MM-DD)` and the preamble
+# under the title carries `> *(Amendment K, YYYY-MM-DD)* Phase N — title: why`.
+# `amendment_of_phase` reads the bullet's number; `amendment_notes` the notes,
+# one `K<TAB>date<TAB>phase|-` per well-formed note and `BAD<TAB>line` for one
+# that opens `*(Amendment` and is not the shape.
+amendment_of_phase() {  # amendment_of_phase <phase> → K, or nothing
+  phase_block "$1" | awk '
+    match($0, /^[ \t]*[-*][ \t]+\*\*Amendment:?\*\*:?[ \t]*[0-9]+/) {
+      s = substr($0, RSTART, RLENGTH); sub(/^.*[^0-9]/, "", s); print s; exit
+    }'
+}
+amendment_notes() {
+  awk '
+    NR == 1 && /^---[ \t]*$/ { fm = 1; next }
+    fm { if (/^---[ \t]*$/) fm = 0; next }
+    /^##[ \t]/ { exit }
+    /^[ \t]*(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    match($0, /^>[ \t]*\*\(Amendment [0-9]+, [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)\*/) {
+      head = substr($0, RSTART, RLENGTH); rest = substr($0, RSTART + RLENGTH)
+      k = head; sub(/^>[ \t]*\*\(Amendment /, "", k); d = k
+      sub(/,.*/, "", k); sub(/^[0-9]+, /, "", d); sub(/\)\*.*/, "", d)
+      ph = "-"
+      if (match(rest, /^[ \t]*Phase [0-9]+/)) { ph = substr(rest, RSTART, RLENGTH); sub(/^[ \t]*Phase /, "", ph) }
+      printf "%s\t%s\t%s\n", k, d, ph
+      next
+    }
+    /^>.*\*\(Amendment[ )]/ { printf "BAD\t%s\n", $0 }
+  ' "$plan_file"
+}
+
+# The per-phase skills bullet (measured-console phase 11): backticked names on a
+# "- **Skills:** `a`, `b`" bullet inside the ### Phase N block, UNIONED with the
+# plan's `**Skills (every session):**` line by skills_for_phase — the MCP
+# shapes exactly. Empty if none.
+skills_directive() {  # skills_directive <phase>
+  phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}Skills\*{0,2}[[:space:]]*:' \
+    | head -1 | grep -oE '`[^`]+`' | tr -d '`' | paste -sd ',' - | sed 's/,/, /g' || true
+}
+
+# The per-phase plugins bullet (measured-console phase 27): the words on a
+# "- **Plugins:** review, ui" bullet inside the ### Phase N block, backticks
+# optional — kinds, and any typo beside them, which F48 names. Words out, one
+# space between; empty if none. UNIONED with the plan's `**Plugins:**` line by
+# plugin_words_for_phase, never across phases.
+_plugin_words() {  # _plugin_words <text> → lower-cased words, deduped, space-separated
+  local w out=" "
+  for w in $(printf '%s' "$1" | tr '`,' '  ' | tr '[:upper:]' '[:lower:]'); do
+    case "$out" in *" $w "*) continue ;; esac
+    out="${out}${w} "
+  done
+  printf '%s' "$out" | sed 's/^ //; s/ $//'
+}
+
+plugins_directive() {  # plugins_directive <phase>
+  local body
+  body="$(phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}Plugins\*{0,2}[[:space:]]*:' \
+    | head -1 | sed -E 's/^[^:]*://; s/\*//g' || true)"
+  _plugin_words "$body"
 }
 
 # The per-phase MCP directive: backticked server names on a "- **MCP:** `a`, `b`"
@@ -577,11 +833,21 @@ _gate_type_known() {  # _gate_type_known <type>
 #           (GATE_DEFAULT, gates.env — the audit's bias, and a lint failure)
 #   auto  — the engine evaluates it by itself
 #   none  — not gated
+phase_section_written() {  # phase_section_written <phase> → 0 when a `### Phase N` heading exists
+  [ -n "$(phase_block "$1")" ]
+}
+
 gate_kind() {  # gate_kind <phase> → human|ai|auto|none
   local gc gtype
   [ "$(is_gated "$1")" = yes ] || { echo none; return; }
   gc="$(gate_check_directive "$1")"
-  [ -z "$gc" ] && gc="$GATE_DEFAULT"
+  if [ -z "$gc" ]; then
+    # A graph row that says GATED before its `### Phase N` section exists (an
+    # amendment read between two writes, #416) is not an `ai` gate with an empty
+    # detail: nobody has said what it asks, so a person is the only safe reader.
+    phase_section_written "$1" || { echo human; return; }
+    gc="$GATE_DEFAULT"
+  fi
   gtype="${gc%% *}"
   case " $GATE_TYPES_HUMAN " in *" $gtype "*) echo human; return ;; esac
   case " $GATE_TYPES_AI "    in *" $gtype "*) echo ai; return ;; esac
@@ -1830,6 +2096,191 @@ checkout_inert_advisories() {
   return 0
 }
 
+# F49 `amendment-malformed`: the two halves of an amendment disagree — ADVISORY
+# (measured-console phase 30). `amend-plan.sh` writes a phase's
+# `- **Amendment:** K` bullet and the preamble's `> *(Amendment K, DATE)*` note
+# together; a hand edit that kept one and lost the other, a note that names a
+# phase the plan does not have, or a note that opens `*(Amendment` and is not
+# the shape, is named. Advisory, like every lint that judges prose about the
+# plan rather than the graph: no reader's answer depends on it, and a gate here
+# would refuse a plan over a missing sentence.
+amendment_advisories() {
+  local p k notes nk nd nph pk found
+  notes="$(amendment_notes)"
+  for p in "${PHASES[@]}"; do
+    k="$(amendment_of_phase "$p")"
+    [ -n "$k" ] || continue
+    found=no
+    while IFS=$'\t' read -r nk nd nph; do
+      [ "$nk" = "$k" ] && { found=yes; break; }
+    done <<EOF
+$notes
+EOF
+    [ "$found" = yes ] || printf 'F49 phase %s: amendment-malformed — it carries "Amendment: %s" but the plan has no "> *(Amendment %s, YYYY-MM-DD)*" note under its title; add the note, or let scripts/amend-plan.sh write both\n' "$p" "$k" "$k"
+  done
+  while IFS=$'\t' read -r nk nd nph; do
+    [ -n "$nk" ] || continue
+    if [ "$nk" = BAD ]; then
+      printf 'F49 amendment: amendment-malformed — "%s" opens *(Amendment but is not "> *(Amendment K, YYYY-MM-DD)* Phase N — title: why"\n' "$(printf '%s' "$nd" | cut -c1-80)"
+      continue
+    fi
+    if [ "$nph" != "-" ]; then
+      case " ${PHASES[*]} " in
+        *" $nph "*) ;;
+        *) printf 'F49 amendment %s: amendment-malformed — its note names phase %s, which this plan does not have\n' "$nk" "$nph"; continue ;;
+      esac
+      pk="$(amendment_of_phase "$nph")"
+      if [ -n "$pk" ] && [ "$pk" != "$nk" ]; then
+        printf 'F49 amendment %s: amendment-malformed — its note names phase %s, whose section says "Amendment: %s"\n' "$nk" "$nph" "$pk"
+      fi
+    else
+      found=no
+      for p in "${PHASES[@]}"; do
+        [ "$(amendment_of_phase "$p")" = "$nk" ] && { found=yes; break; }
+      done
+      [ "$found" = yes ] || printf 'F49 amendment %s: amendment-malformed — its note names no phase and no phase carries "Amendment: %s"\n' "$nk" "$nk"
+    fi
+  done <<EOF
+$notes
+EOF
+  return 0
+}
+
+# F50 `directive-mid-line`: a directive label a reader would read, written
+# where none does — ADVISORY (measured-console phase 2, #419). A §Session
+# budget line may carry several directives after ` · ` since that phase
+# (`_split_directives`), but a label after a comma or inside prose is still
+# silence, and so is a SECOND label inside a phase's bullet (`- **Size:** M ·
+# **Verify timeout:** 90m`): every phase reader anchors its label at the
+# bullet's start. The labels named are the ones whose readers anchor —
+# `Skills (every session)`, `MCP policy` and their loose kin are read
+# anywhere, so they are never a miss. Backticked spans and fences are prose.
+PLAN_ANCHORED_LABELS='credentials|accounts|wait budget|wait count|verify timeout|qa exhausted|qa gate|worktrees|landing|gitlink|conflicts|messaging|issues|isolation|permission mode|model policy|subagent model|pool policy|evaluator|canary|base branch|clash zones'
+PHASE_ANCHORED_LABELS='size|model|verify timeout|wait count|waits on|land|gitlink|isolation|issues|permission mode|model policy|subagent model|fast gate|may delete tests|pool policy|evaluator|accounts|credentials|mcp|qa|checkout|setup|person-check|gate-check|wall-clock floor|human step|verify in'
+_mid_line_labels() {  # stdin: text; $1: label alternation → "<label>\t<line>" per miss
+  awk -v labels="$1" '
+    /^[ \t>]*(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    {
+      s = $0; gsub(/`[^`]*`/, "", s)
+      # The line'"'"'s own leading label is the one a reader reads.
+      if (match(s, /^[ \t>]*([-*][ \t]+)?\*\*[^*]+(:\*\*|\*\*:)/)) s = substr(s, RSTART + RLENGTH)
+      while (match(s, /\*\*[A-Za-z][^*]*(:\*\*|\*\*:)/)) {
+        l = substr(s, RSTART + 2, RLENGTH - 5); s = substr(s, RSTART + RLENGTH)
+        if (tolower(l) ~ ("^(" labels ")$")) printf "%s\t%s\n", l, $0
+      }
+    }'
+}
+directive_mid_line_advisories() {
+  local p l line tab; tab="$(printf '\t')"
+  while IFS="$tab" read -r l line; do
+    [ -n "$l" ] || continue
+    printf 'F50 §Session budget: directive-mid-line — `**%s:**` sits mid-line, where no reader reads it ("%s"); give it a line of its own, or put it after ` · ` (`**A:** x · **%s:** y`)\n' \
+      "$l" "$(printf '%s' "$line" | sed 's/^[[:space:]>]*//' | cut -c1-80)" "$l"
+  done <<EOF
+$(_section 2 "session budget" | _mid_line_labels "$PLAN_ANCHORED_LABELS")
+EOF
+  for p in "${PHASES[@]}"; do
+    _is_done "$p" && continue
+    while IFS="$tab" read -r l line; do
+      [ -n "$l" ] || continue
+      printf 'F50 phase %s: directive-mid-line — `**%s:**` sits mid-line in a bullet ("%s"); a phase reader reads only the label that opens its bullet — give it a `- **%s:**` bullet of its own\n' \
+        "$p" "$l" "$(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-80)" "$l"
+    done <<EOF
+$(phase_block "$p" | tail -n +2 | _mid_line_labels "$PHASE_ANCHORED_LABELS")
+EOF
+  done
+  return 0
+}
+
+# F51 `path-no-dir`: a Repos token or a `Verify in:` path that names no
+# directory under the docs root — ADVISORY (measured-console phase 2, #402). A
+# hand-written plan naming `web/admin` where the repository sits at
+# `admin` linted OK and failed to mount at boarding; the Solve author
+# refuses such a plan (`estateFindings`), and this is the engine's half. A
+# token that is not `all`, the root's own name or an existing directory is
+# named — a mistyped path and a repository outside the root alike, so the
+# author reads it beside F33's isolation sentence and picks; the hub shape (no
+# token under the root at all, F33's exemption) is exempt here too. A
+# `Verify in:` path is always a path under the root, so any that is no
+# directory is named.
+path_no_dir_advisories() {
+  local top own p tok v inside=0
+  top="$(cd "$DOCS_ROOT" 2>/dev/null && pwd -P)" || return 0
+  own="$(scope_normalize "$(basename "$top")")"
+  for p in "${PHASES[@]}"; do
+    for tok in $(printf '%s' "${REPOS[$p]:-all}" | tr ',' ' '); do
+      [ "$(_repos_token_side "$top" "$own" "$tok")" = inside ] && { inside=1; break 2; }
+    done
+  done
+  for p in "${PHASES[@]}"; do
+    _is_done "$p" && continue
+    for tok in $(printf '%s' "${REPOS[$p]:-all}" | tr ',' ' '); do
+      [ "$inside" = 1 ] || break
+      [ "$(_repos_path_no_dir "$top" "$own" "$tok")" = yes ] || continue
+      printf 'F51 phase %s: path-no-dir — the Repos cell names `%s`, which is no directory under %s: a run cannot mount it at boarding; spell the path from the docs root as it is on disk (a repository outside the root is F33'"'"'s)\n' "$p" "$tok" "$top"
+    done
+    v="$(verify_in_directive "$p")"; v="${v#./}"; v="${v%/}"
+    case "$v" in ''|.) continue ;; esac
+    case "$v" in /*|../*|..) continue ;; esac            # F33's ground, not a path under the root
+    [ -d "$top/$v" ] && continue
+    printf 'F51 phase %s: path-no-dir — `Verify in: %s` is no directory under %s: §Verification and Setup would run nowhere; spell the directory from the docs root as it is on disk\n' "$p" "$v" "$top"
+  done
+  return 0
+}
+_repos_path_no_dir() {  # <physical root> <root's own token> <token> → yes|no
+  local top="$1" own="$2" tok="$3"
+  case "$tok" in ''|all|pe--shared-checkout|/*|../*|..) echo no; return 0 ;; esac
+  [ "$tok" = "$own" ] && { echo no; return 0; }
+  tok="${tok%/}"
+  if [ -d "$top/$tok" ]; then echo no; else echo yes; fi
+}
+
+# F52 `verification-shared-checkout`: a §Verification or Setup line that
+# `cd`s (or `git -C`s, `--prefix`es, `--dir`s) into an ABSOLUTE path under the
+# docs root — ADVISORY (measured-console phase 2, #423). That path is the
+# shared checkout, which stands on `main`; in an isolated run the line tests
+# main, not the run's branch, and passes or fails on code the phase never
+# touched — the hub's tradingview plan did exactly that three times while the
+# lint read OK. The fix is the same path written from the phase's `Verify in:`.
+verification_shared_checkout_advisories() {
+  local top logical p bullet path rel v up
+  top="$(cd "$DOCS_ROOT" 2>/dev/null && pwd -P)" || return 0
+  logical="${DOCS_ROOT%/}"
+  for p in "${PHASES[@]}"; do
+    _is_done "$p" && continue
+    v="$(verify_in_directive "$p")"; v="${v#./}"; v="${v%/}"
+    for bullet in Verification Setup; do
+      while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        path="${path%/}"
+        case "$path/" in
+          "$top"/*)     rel="${path#"$top"}" ;;
+          "$logical"/*) rel="${path#"$logical"}" ;;
+          *) continue ;;
+        esac
+        rel="${rel#/}"; [ -n "$rel" ] || rel=.
+        up=""
+        case "$v" in
+          ''|.) ;;
+          *) up="$(printf '%s\n' "$v" | awk -F/ '{ for (i = 1; i <= NF; i++) printf "../" }')" ;;
+        esac
+        printf 'F52 phase %s: verification-shared-checkout — the %s line names `%s`, an absolute path into the shared checkout, which stands on main: in an isolated run it tests main, not this run'"'"'s branch; write it from the phase'"'"'s Verify in (%s) as `%s`\n' \
+          "$p" "$bullet" "$path" "${v:-.}" "${up}${rel}"
+      done <<EOF
+$(_verification_reach "$p" "$bullet" | awk '{
+    s = $0
+    while (match(s, /(^|[^A-Za-z0-9_-])(cd|-C|--prefix|--dir|-d)[ =]+["'"'"']?\/[^ ;&|`"'"'"')]+/)) {
+      m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      sub(/^.*[ =]["'"'"']?/, "", m); print m
+    }
+  }')
+EOF
+    done
+  done
+  return 0
+}
+
 # F36 `wait-window-short`: a `Waits on:` maximum shorter than the timeout of the
 # workflow it watches — ADVISORY (control-tower phase 14, #40). Phase 19 declared
 # `· 60m` against a job whose own timeout was 100 minutes, measured on a faster
@@ -2362,7 +2813,8 @@ verification_setup_deps_advisories() {
           }
           else { what = (TOOL == "npx") ? "an npx command" : "an npm script"; fix = (r == ".") ? "npm ci" : "npm --prefix " r " ci" }
           gsub(/[\t\037]/, " ", c)
-          if (length(c) > 120) c = substr(c, 1, 117) "..."
+          # Bytes under C: a cut never leaves half a character behind it.
+          if (length(c) > 120) { c = substr(c, 1, 117); sub(/[\300-\377][\200-\277]*$/, "", c); c = c "..." }
           printf "%s\037%s\037%s\037%s\037%s\037%s\n", c, what, x, (FAM == "node") ? "node_modules" : ".venv", fix, BASE
         }
       }
@@ -2481,11 +2933,40 @@ _section() {  # _section <level> <heading-prefix>
   hashes="$(printf '%*s' "$1" '' | tr ' ' '#')"
   open_re="^${hashes}[[:space:]]+$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
   if [ "$1" -ge 3 ]; then close_re="^#{2,3}[[:space:]]"; else close_re="^##[[:space:]]"; fi
+  if [ "$2" = "session budget" ]; then
+    awk -v open_re="$open_re" -v close_re="$close_re" '
+      tolower($0) ~ open_re { f = 1; next }
+      f && $0 ~ close_re { f = 0 }
+      f
+    ' "$plan_file" | _split_directives
+    return 0
+  fi
   awk -v open_re="$open_re" -v close_re="$close_re" '
     tolower($0) ~ open_re { f = 1; next }
     f && $0 ~ close_re { f = 0 }
     f
   ' "$plan_file"
+}
+
+# §Session budget lines carrying several directives, one per line (#419). A
+# plan writes `**Wait budget:** 8h · **Wait count:** 8 · **Verify timeout:** 90m`
+# and every reader below anchors its label at the START of a line, so all but
+# the first were silence: one plan ran a 30-minute verify clock, four waits,
+# `gitlink bump` and `issues file` while its line said 90m, 8, leave and draft.
+# The split is at a ` · ` that a bold label follows (`**Label:**` or
+# `**Label**:`) and nowhere else, so a value that carries a middle dot of its
+# own (`ref · 90m`) is untouched. The JS twin is `splitDirectives` in
+# parse/plan.ts; F50 names a label that is still mid-line after it.
+_split_directives() {
+  awk '{
+    line = $0; out = ""
+    while (match(line, /[ \t]*\302\267[ \t]*\*\*[A-Za-z][^*:]*(:\*\*|\*\*:)/)) {
+      seg = substr(line, RSTART, RLENGTH); sub(/^[ \t]*\302\267[ \t]*/, "", seg)
+      out = out substr(line, 1, RSTART - 1) "\n"
+      line = seg substr(line, RSTART + RLENGTH)
+    }
+    print out line
+  }'
 }
 
 # F6: model named in the plan's "## Session budget" section (empty if none).
@@ -2559,6 +3040,43 @@ plan_skills() {
 plan_mcp() {
   _section 2 "session budget" \
     | grep -i 'mcp servers (every session)' | grep -oE '`[^`]+`' | tr -d '`' | paste -sd ',' - | sed 's/,/, /g' || true
+}
+
+# The plan-wide plugins line (measured-console phase 27): the words after a
+# bold `**Plugins:**` in §Session budget, up to a ` · ` that starts the next
+# directive on the same line. Bold required — the strict phrase, as plan_mcp's,
+# so budget prose that says "plugins:" is never read as kinds.
+plan_plugins() {
+  local body
+  body="$(_section 2 "session budget" \
+    | grep -iE '\*\*Plugins:?\*\*' | head -1 \
+    | sed -E 's/.*\*\*[Pp][Ll][Uu][Gg][Ii][Nn][Ss]:?\*\*:?//; s/ · .*//' || true)"
+  _plugin_words "$body"
+}
+
+_is_plugin_kind() {  # _is_plugin_kind <word>
+  case " $PLUGIN_KINDS " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+# Phase N's words (plan line ∪ bullet; no N: the plan line alone), deduped.
+plugin_words_for_phase() {  # plugin_words_for_phase [phase]
+  if [ -n "${1:-}" ]; then _plugin_words "$(plan_plugins) $(plugins_directive "$1")"; else plan_plugins; fi
+}
+
+# The entries those kinds bring, deduped in first-seen order, csv — what
+# `--plugins [N]` prints and `pluginsFor` in parse/plan.ts is held to.
+plugins_for_phase() {  # plugins_for_phase [phase]
+  local w e var out=" "
+  for w in $(plugin_words_for_phase "${1:-}"); do
+    _is_plugin_kind "$w" || continue
+    var="PLUGIN_SET_$w"
+    for e in ${!var:-}; do
+      case "$out" in *" $e "*) continue ;; esac
+      out="${out}${e} "
+    done
+  done
+  printf '%s' "$out" | sed 's/^ //; s/ $//; s/ /, /g'
 }
 
 # Credentials directive (chapter 10 ZTD-4): backtick-quoted credential ids on
@@ -2660,6 +3178,33 @@ _setup_commands() {  # _setup_commands <phase>
     esac
   done < <(_verification_reach "$1" "Setup")
   return 0
+}
+
+# A csv's names once each, first-seen order, trimmed: "a, b".
+_csv_dedupe() {  # _csv_dedupe <csv>
+  local seen out t
+  seen=" "; out=""
+  local IFS=,
+  for t in $1; do
+    t="$(printf '%s' "$t" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$t" ] && continue
+    case "$seen" in *" $t "*) continue ;; esac
+    seen="${seen}${t} "
+    out="${out:+$out, }$t"
+  done
+  printf '%s' "$out"
+}
+
+# The skills a phase's sessions call (measured-console phase 11): the plan's
+# `**Skills (every session):**` line UNIONED with the phase's `- **Skills:**`
+# bullet, deduped, first-seen order — what `--skills N` prints and
+# `skillsFor` in parse/plan.ts is held to by engine-parity.
+skills_for_phase() {  # skills_for_phase <phase>
+  local combined t
+  combined="$(plan_skills)"
+  t="$(skills_directive "$1")"
+  [ -n "$t" ] && combined="${combined:+$combined, }$t"
+  _csv_dedupe "$combined"
 }
 
 mcp_for_phase() {  # mcp_for_phase <phase>
@@ -3038,7 +3583,8 @@ EOF
           sep = index(rest, "::"); label = sep ? substr(rest, 1, sep - 1) : rest
           gsub(/^[ \t]+|[ \t]+$/, "", label)
           if (eq < 2 || id !~ /^[a-z0-9][a-z0-9-]*$/ || length(id) > 32) { print "bad\t" o; exit }
-          if (label == "" || length(label) > 120) { print "label\t" id; exit }
+          chars = label; gsub(/[\200-\277]/, "", chars)    # characters, not bytes, under C
+          if (label == "" || length(chars) > 120) { print "label\t" id; exit }
           if (id in seen) { print "twice\t" id; exit }
           seen[id] = 1; ids = ids (ids == "" ? "" : " ") id
         }
@@ -3338,6 +3884,41 @@ verify_timeout_for_phase() {  # verify_timeout_for_phase <phase> → minutes<TAB
   if [ -n "$m" ]; then printf '%s\tphase\n' "$m"; return 0; fi
   m="$(plan_verify_timeout)"
   [ -n "$m" ] && printf '%s\tplan\n' "$m"
+  return 0
+}
+
+# ---- The verification tier (measured-console phase 15) ----------------------
+# `**Verification tier:** impact` in §Session budget runs every phase's HEAVY
+# §Verification lines in their selected form (scripts/verify-select.env): the
+# tests its diff maps to, the invariants and a seeded sample. `full` — and
+# silence — runs each line as written. A phase's own `- **Verification tier:**`
+# bullet wins. A word that is neither is no answer. The JS twin is
+# `verificationTierFor` in parse/plan.ts.
+_tier_word() {  # _tier_word <text> → impact|full, or nothing
+  local w
+  w="$(printf '%s' "$1" | sed -E 's/^[*`[:space:]]+//' | awk '{print tolower($1)}' | tr -d '*`.,;')"
+  case "$w" in impact|full) printf '%s' "$w" ;; esac
+}
+
+plan_verification_tier() {  # plan_verification_tier → impact|full, or nothing
+  local body
+  body="$(_section 2 "session budget" \
+    | grep -iE '^[[:space:]>]*\*{0,2}verification[[:space:]]+tier\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*//')" || true
+  [ -n "$body" ] && _tier_word "$body"
+  return 0
+}
+
+verification_tier_for_phase() {  # verification_tier_for_phase <phase> → impact|full<TAB>phase|plan, or nothing
+  local body w
+  body="$(phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}verification[[:space:]]+tier\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*//')" || true
+  w=""
+  [ -n "$body" ] && w="$(_tier_word "$body")"
+  if [ -n "$w" ]; then printf '%s\tphase\n' "$w"; return 0; fi
+  w="$(plan_verification_tier)"
+  [ -n "$w" ] && printf '%s\tplan\n' "$w"
   return 0
 }
 
@@ -3948,6 +4529,43 @@ model_policy_for_phase() {  # model_policy_for_phase [phase]
   case " $MODEL_POLICIES " in *" $word "*) [ -n "$word" ] && printf '%s\tplan\n' "$word" ;; esac
   return 0
 }
+
+# The model a phase's SUBAGENTS run (measured-console phase 6), as
+# `model<TAB>phase|plan` — or NOTHING when the plan is silent, because the
+# session's own default answers then. `**Subagent model:**` in §Session budget
+# for every phase, a phase's `- **Subagent model:**` bullet over it; the first
+# word, backticks stripped, the way `phase_model` takes `- **Model:**`'s. The
+# JS twin is `subagentModelFor` in parse/plan.ts.
+_model_token() { tr -d '`' | awk 'NF { print $1; exit }'; }
+subagent_model_for_phase() {  # subagent_model_for_phase [phase]
+  local phase="${1:-}" m
+  if [ -n "$phase" ]; then
+    m="$(_phase_directive "$phase" 'Subagent[[:space:]]+model' | _model_token)"
+    if [ -n "$m" ]; then printf '%s\tphase\n' "$m"; return 0; fi
+  fi
+  m="$(_plan_directive 'Subagent[[:space:]]+model' | _model_token)"
+  [ -n "$m" ] && printf '%s\tplan\n' "$m"
+  return 0
+}
+
+# Two per-phase switches with a default of their own (measured-console phase
+# 6), each as `word<TAB>phase|default` — a phase bullet only, so there is no
+# plan level. `- **Fast gate:** on|off` (default on): whether the run's Stop
+# hook runs the phase's fast gate lines; `- **May delete tests:** yes|no`
+# (default no): whether the guard lifts its deny on deleting a `*.test.*` or
+# `*.spec.*` file. A word off the vocabulary is silence and the default
+# answers. The JS twins are `fastGateFor` / `mayDeleteTestsFor`.
+FAST_GATE_WORDS="on off"
+MAY_DELETE_TESTS_WORDS="yes no"
+_phase_switch() {  # _phase_switch <phase> <label-regex> <word-list> <default>
+  local word
+  word="$(_phase_directive "$1" "$2" | _first_word)"
+  case " $3 " in *" $word "*) [ -n "$word" ] && { printf '%s\tphase\n' "$word"; return 0; } ;; esac
+  printf '%s\tdefault\n' "$4"
+  return 0
+}
+fast_gate_for_phase() { _phase_switch "$1" 'Fast[[:space:]]+gate' "$FAST_GATE_WORDS" on; }
+may_delete_tests_for_phase() { _phase_switch "$1" 'May[[:space:]]+delete[[:space:]]+tests' "$MAY_DELETE_TESTS_WORDS" no; }
 
 
 land_for_phase() {  # land_for_phase [phase] -> hold|integrate|pr|trunk<TAB>source
@@ -4780,6 +5398,46 @@ BP_MARKS=0
 _bp_mark() { [ "$BP_MARKS" = 1 ] && printf '\036%s\n' "$1"; return 0; }
 
 
+# The notes block and the decision rows, shared by the boot prompt and the
+# brief (measured-console phase 4): one rendering, so the two never disagree.
+_bp_notes_block() {  # _bp_notes_block <phase> <shown>
+  local p="$1" bp_show="$2" bp_notes bp_n
+  bp_notes="$(notes_for "$p")"
+  if [ -n "$bp_notes" ]; then
+    bp_n="$(printf '%s\n' "$bp_notes" | awk -F'\t' '$2 != "trailer"' | grep -c . || true)"
+    printf '\n### Notes from earlier phases (%s) — what they left for you, and nothing you can look up:\n' "$bp_n"
+    printf '%s\n' "$bp_notes" | awk -F'\t' '
+      $2 == "trailer" { printf "  %s\n", $5; next }
+      $2 == "message" { printf "  - [%s] %s (mail from %s)\n", $3, $5, $1; next }
+      $2 == "deferral" { printf "  - %s (deferred by %s)\n", $5, $1; next }
+      { printf "  - %s (%s)\n", $5, $1 }
+    '
+    printf 'Each was left by a session that is gone. Say in your handoff what became of each —\n'
+    printf 'acted on, or deliberately not; a note nobody answers is a note nobody writes next time.\n'
+    if printf '%s\n' "$bp_notes" | awk -F'\t' '$2 == "message"' | grep -q .; then
+      printf 'The bracketed ids are mail. Acknowledge the ones you act on, so the sender learns it landed:\n'
+      printf -- '    %s/phase-msg.sh %s %s ack <id>\n' "$CMD" "$slug" "$bp_show"
+    fi
+  fi
+}
+
+_bp_decision_rows() {  # _bp_decision_rows <phase>
+  local p="$1" dec_rows
+  dec_rows="$(decisions_rows "$p")"
+  if [ -n "$dec_rows" ]; then
+    printf '%s\n' "$dec_rows" | awk -F'\t' '
+      $2 == "outstanding" { printf "  - [%s] %s — owner %s, blocking %s: %s\n", $2, $1, ($3 == "" ? "nobody" : $3), $4, ($6 == "" ? "(no value yet)" : $6); next }
+      $4 == "yes" && $2 != "answered" && $2 != "waived" { printf "  - [%s] %s — blocking: %s\n", $2, $1, ($6 == "" ? "(no value)" : $6); next }
+      { rest++ }
+      END {
+        if (rest > 0 && rest == NR) printf "  (none outstanding — all %d rows are answered or waived; read them with the line above)\n", rest
+        else if (rest > 0) printf "  (%d more rows are answered or waived; read them with the line above)\n", rest
+      }'
+  else
+    printf '  (this plan carries no `## Decisions` manifest — the keys are: %s)\n' "$(printf '%s' "$DECISION_KEYS" | sed 's/ /, /g')"
+  fi
+}
+
 boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   local p="$1" bp_show="$2" bp_pad dep_lines d pad hf sk mc sp gk ga gc_text ga_by ga_on gs
   local bp_notes bp_n dec_rows sc root_tok lock_git _bpn
@@ -4809,8 +5467,11 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   printf '/phased-execution\n\n'
   printf 'Continue the "%s" plan — start Phase %s in this fresh session.\n' "$slug" "$bp_show"
   _bp_mark skills
-  sk="$(plan_skills)"
-  [ -n "$sk" ] && printf 'First, invoke these skills (every session in this plan uses them): %s\n' "$sk"
+  # ONE line (measured-console phase 11): the plan's skills, this phase's
+  # `- **Skills:**` bullet and its predecessors' `suggested_skills:`, each a
+  # Skill-tool call by qualified name. Silent when none, so a plan naming no
+  # skill keeps a byte-identical prompt.
+  skills_line "$p"
   _bp_mark mcp
   mc="$(mcp_for_phase "$p")"
   if [ -n "$mc" ]; then
@@ -4927,7 +5588,11 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   _bp_mark reading
   [ -n "$dep_lines" ] && printf '%s' "$dep_lines"
   _bp_mark plan
-  printf -- '- docs/plans/%s.md §Phase %s + §Session budget (model, budget, branch)\n' "$slug" "$bp_show"
+  # The phase's own section, never the whole plan (measured-console phase 2):
+  # `--section N` is the `### Phase N` block, its graph row and the §Session
+  # budget lines that bind it.
+  printf -- '- your phase of the plan: `%s/phase-graph.sh %s --section %s` (its section, its graph row\n' "$CMD" "$slug" "$bp_show"
+  printf -- '  and the §Session budget lines that bind it — open docs/plans/%s.md for nothing else)\n' "$slug"
   printf -- '- memory %s\n' "$memory_key"
   printf 'This is a DAG: other phases may be ready too and lower-numbered phases may still be\n'
   printf 'unfinished — do NOT assume phases below %s are done. Run `%s/phase-graph.sh %s`\n' "$bp_show" "$CMD" "$slug"
@@ -4940,40 +5605,31 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   # below is the plan's standing instruction, and this is what actually
   # happened on the way here. Omitted entirely when nobody left anything, so
   # a plan that never writes a note gets a byte-identical prompt.
-  bp_notes="$(notes_for "$p")"
-  if [ -n "$bp_notes" ]; then
-    bp_n="$(printf '%s\n' "$bp_notes" | awk -F'\t' '$2 != "trailer"' | grep -c . || true)"
-    printf '\n### Notes from earlier phases (%s) — what they left for you, and nothing you can look up:\n' "$bp_n"
-    printf '%s\n' "$bp_notes" | awk -F'\t' '
-      $2 == "trailer" { printf "  %s\n", $5; next }
-      $2 == "message" { printf "  - [%s] %s (mail from %s)\n", $3, $5, $1; next }
-      $2 == "deferral" { printf "  - %s (deferred by %s)\n", $5, $1; next }
-      { printf "  - %s (%s)\n", $5, $1 }
-    '
-    printf 'Each was left by a session that is gone. Say in your handoff what became of each —\n'
-    printf 'acted on, or deliberately not; a note nobody answers is a note nobody writes next time.\n'
-    if printf '%s\n' "$bp_notes" | awk -F'\t' '$2 == "message"' | grep -q .; then
-      printf 'The bracketed ids are mail. Acknowledge the ones you act on, so the sender learns it landed:\n'
-      printf -- '    %s/phase-msg.sh %s %s ack <id>\n' "$CMD" "$slug" "$bp_show"
-    fi
-  fi
-  _bp_mark decisions
-  # The decision manifest, resolved for this phase — `outstanding` rows first,
-  # because a row nobody has answered is the one thing the session must not
-  # discover mid-phase (chapter 13 Tier 0). Then the one duty the manifest
-  # puts on a session: a block is declared BY KEY, never asked in prose.
-  dec_rows="$(decisions_rows "$p")"
-  printf '\nThis phase'\''s DECISIONS (the plan'\''s manifest, `%s/phase-graph.sh %s --decisions %s`):\n' "$CMD" "$slug" "$bp_show"
-  if [ -n "$dec_rows" ]; then
-    printf '%s\n' "$dec_rows" | awk -F'\t' '$2 == "outstanding" { printf "  - [%s] %s — owner %s, blocking %s: %s\n", $2, $1, ($3 == "" ? "nobody" : $3), $4, ($6 == "" ? "(no value yet)" : $6) }'
-    printf '%s\n' "$dec_rows" | awk -F'\t' '$2 != "outstanding" { printf "  - [%s] %s: %s\n", $2, $1, ($6 == "" ? "(no value)" : $6) }'
+  # Under `PE_BRIEF=hook` (measured-console phase 4) the presence hook hands the
+  # session its brief at SessionStart — these notes, the decision rows, the scope
+  # and the lock lines among it — so the prompt says where they went instead.
+  if [ "${BP_BRIEF:-0}" = 1 ]; then
+    printf '\nThe brief the presence hook gave this session at its start carries the rest of what you\n'
+    printf 'start from: your section'\''s head, the decisions still open, the notes earlier phases left,\n'
+    printf 'your scope and lock lines, the previous handoff'\''s summary, the open errands and the memory\n'
+    printf 'index. No brief in your context? Print it:\n'
+    printf -- '    %s/phase-graph.sh %s --brief %s\n' "$CMD" "$slug" "$bp_show"
   else
-    printf '  (this plan carries no `## Decisions` manifest — the keys are: %s)\n' "$(printf '%s' "$DECISION_KEYS" | sed 's/ /, /g')"
-  fi
+  _bp_notes_block "$p" "$bp_show"
+  _bp_mark decisions
+  # The decision manifest, resolved for this phase: only the rows a session
+  # must not discover mid-phase — `outstanding`, and any `blocking` row that
+  # is not answered (chapter 13 Tier 0). An answered row is the plan's
+  # standing instruction and `--decisions N` reads it on demand; listing all
+  # nineteen cost every boot ~3 KB nobody acts on (measured-console phase 2).
+  # Then the one duty the manifest puts on a session: a block is declared BY
+  # KEY, never asked in prose.
+  printf '\nThis phase'\''s DECISIONS (the plan'\''s manifest, `%s/phase-graph.sh %s --decisions %s`):\n' "$CMD" "$slug" "$bp_show"
+  _bp_decision_rows "$p"
   printf 'If you cannot proceed because a decision is missing or wrong, declare it BY KEY and stop:\n'
   printf -- '    %s/phase-outcome.sh %s %s blocked --needs <key> --reason "<what you need>"\n' "$CMD" "$slug" "$bp_show"
-  printf -- '`--needs` is REQUIRED on `blocked` and `needs-human` (exit 2 without it): a decision key from\n'
-  printf 'the list above, or its short form (%s). Never ask in prose — prose reaches nobody.\n' "$(printf '%s' "$NEED_CLASSES" | sed 's/ /, /g')"
+  printf -- '`--needs` is REQUIRED on `blocked` and `needs-human` (exit 2 without it): a decision key\n'
+  printf '(`--decisions` lists them), or its short form (%s). Never ask in prose — prose reaches nobody.\n' "$(printf '%s' "$NEED_CLASSES" | sed 's/ /, /g')"
   # A run-level act (turn-by-turn phase 6, #286) is the RUN's to take, never a
   # permission ask: a session cannot press its own console, and a permission
   # item nobody can grant is an ask that reaches nobody.
@@ -5017,6 +5673,7 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   printf 'docs repo ARE your scope, and other plans'\'' sessions share that index: commit your own paths by name, never\n'
   printf 'the whole index, and if a commit races another writer, retry up to 3 times. phase-lock.sh orders its own\n'
   printf 'commits there in the docs root'\''s critical section.)\n'
+  fi
   _bp_mark tasks
   printf '\nThen publish this phase'\''s p%s.task* list with `phase-tasks.sh`. Phase Console\n' "$bp_show"
   printf 'renders it live as "What it is doing" — the only way anyone watching an unattended\n'
@@ -5058,8 +5715,8 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
       printf 'FRESH-context QA subagent over this phase (get its brief with\n'
       printf -- '`%s/phase-graph.sh %s --qa-prompt %s`) and record what it finds:\n' "$CMD" "$slug" "$bp_show"
       _bpn="$(qa_next_round "$p")"
-      printf -- '    bash %s/qa-record.sh %s %s <pass|fail|waived> --report %s --round %s\n' \
-        "$SCRIPT_DIR" "$slug" "$bp_show" "${_bpn#*	}" "${_bpn%%	*}"
+      printf -- '    %s/qa-record.sh %s %s <pass|fail|waived> --report %s --round %s\n' \
+        "$CMD" "$slug" "$bp_show" "${_bpn#*	}" "${_bpn%%	*}"
       printf 'Never review your own work as the QA verdict, and never hand-edit test-status.md.\n'
       printf 'Dispatch the subagent, record the verdict, THEN stop.\n'
       printf 'The reviewer is work inside your turn: dispatch it in the FOREGROUND, so the call returns\n'
@@ -5087,6 +5744,281 @@ boot_prompt_render() {  # boot_prompt_render <phase> <shown>
   printf 'cmd: grep over its handoff. Red only on a sibling'\''s work? --watch verify:%s/%s re-runs your red\n' "$slug" "$bp_show"
   printf '§Verification lines whenever the branch head moves. A cmd: ref is self-contained (absolute\n'
   printf 'paths, no $, no cd) and exits 0 only once the thing has happened; exit 2 means fix the ref.\n'
+}
+
+# ---------------------------------------------------------------------------
+# The brief (measured-console phase 4, A2): what a supervised session is told
+# at SessionStart by the presence hook, and what `--brief N` prints for the
+# hook and for a person to paste. Stable content first — the mode file, the
+# phase's section, its open decisions, the notes, the scope and lock lines,
+# the previous handoff's summary, the open errands, the memory index — so the
+# prefix two sessions of one phase share is byte-stable; the hook appends the
+# presence line and the session id LAST. Cut on a line boundary from the END
+# at `PE_BRIEF_MAX` bytes (default BRIEF_MAX), which the hook lowers by the
+# length of what it appends: a byte cap is a character cap that never splits
+# a character.
+# ---------------------------------------------------------------------------
+BRIEF_MAX=10000
+BRIEF_SECTION_MAX=6000
+BRIEF_SUMMARY_MAX=1500
+BRIEF_ERRANDS_MAX=1500
+BRIEF_MEMORY_LINES=40
+
+# _brief_cut <bytes> <more-line> — stdin cut to whole lines within <bytes>; when
+# anything was dropped, <more-line> is printed in its place (inside the cap).
+_brief_cut() {
+  LC_ALL=C awk -v max="$1" -v more="$2" '
+    { line[NR] = $0 }
+    END {
+      used = 0; n = 0
+      for (i = 1; i <= NR; i++) { if (used + length(line[i]) + 1 > max) break; used += length(line[i]) + 1; n = i }
+      if (n < NR && more != "") { while (n > 0 && used + length(more) + 1 > max) { used -= length(line[n]) + 1; n-- } }
+      for (i = 1; i <= n; i++) print line[i]
+      if (n < NR && more != "") print more
+    }'
+}
+
+# _brief_summary <handoff> — its `## Summary` section, else (a handoff written
+# before the section existed) `## What this phase did`.
+_brief_section_of() {  # _brief_section_of <file> <heading> — its body, template comments dropped
+  LC_ALL=C awk -v h="## $2" '$0 == h || index($0, h " ") == 1 { on = 1; next } on && /^## / { exit } on' "$1" \
+    | LC_ALL=C awk '/^[[:space:]]*<!--/ { c = 1 } !c { print } c && /-->[[:space:]]*$/ { c = 0 }'
+}
+_brief_summary() {
+  local f="$1" body
+  body="$(_brief_section_of "$f" Summary)"
+  [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] || body="$(_brief_section_of "$f" 'What this phase did')"
+  printf '%s\n' "$body" | LC_ALL=C awk 'NF { seen = 1 } seen'
+}
+
+# The skills the phases before this one SUGGEST for it (measured-console phase
+# 4): each dependency handoff's `suggested_skills: [a, b]`, in order, once each,
+# as "`a`, `b`" — what the boot prompt's Skill-tool line and the brief name.
+suggested_skills_for() {  # suggested_skills_for <phase>
+  local d hf
+  for d in ${DEPS[$1]:-}; do
+    hf="$(handoff_file "$d")"
+    [ -n "$hf" ] || continue
+    LC_ALL=C awk '
+      NR == 1 && /^---/ { fm = 1; next }
+      fm && /^---/ { exit }
+      fm && /^suggested_skills:/ {
+        v = $0; sub(/^suggested_skills:[[:space:]]*/, "", v); sub(/[[:space:]]+#.*$/, "", v)
+        gsub(/[][`"\047]/, "", v); n = split(v, a, ","); for (i = 1; i <= n; i++) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[i]); if (a[i] != "") print a[i] }
+      }' "$hf"
+  done | LC_ALL=C awk '!seen[$0]++ { printf "%s`%s`", (n++ ? ", " : ""), $0 } END { if (n) printf "\n" }'
+}
+
+# PE_SKILLS (measured-console phase 11): the skills this console's unattended
+# sessions load, TOLD rather than asked — the PE_MCP_SERVERS arrangement. A
+# space-separated list of the names the Skill tool takes, `plugin:name` for a
+# plugin's skill and `name` for a standalone one, a trailing `!` on a skill
+# marked `disable-model-invocation` (the Skill tool refuses it). Unset means no
+# console here: names stay as written and F47 is silent.
+
+# The name the Skill tool is called with: as written when it names its plugin;
+# else the ONE loaded skill of that name, qualified by its plugin; else as written.
+skill_qualify() {  # skill_qualify <name>
+  local name="$1" t hit="" n=0
+  local IFS=$' \t\n'
+  case "$name" in *:*) printf '%s' "$name"; return 0 ;; esac
+  for t in ${PE_SKILLS:-}; do
+    t="${t%!}"
+    case "$t" in "$name"|*:"$name") hit="$t"; n=$((n + 1)) ;; esac
+  done
+  if [ "$n" -eq 1 ]; then printf '%s' "$hit"; else printf '%s' "$name"; fi
+}
+
+# Every skill phase N's session calls: the plan's line, the phase's bullet and
+# what the phases before it suggest — qualified, deduped, as "a, b".
+phase_skill_set() {  # phase_skill_set <phase>
+  local all sug t out=""
+  sug="$(suggested_skills_for "$1" | tr -d '`')"
+  all="$(skills_for_phase "$1")"
+  [ -n "$sug" ] && all="${all:+$all, }$sug"
+  local IFS=,
+  for t in $all; do
+    t="$(printf '%s' "$t" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$t" ] && continue
+    out="${out:+$out, }$(skill_qualify "$t")"
+  done
+  _csv_dedupe "$out"
+}
+
+# ONE line, a Skill-tool call by qualified name per skill (measured-console
+# phase 11, §Architecture 12 "delivery, not presence"): a skill named in prose
+# was called in 37–92 % of sessions (the plan's baseline); a call the line
+# spells is one the journal can match (`phase.skill-invoked`). Silent when the
+# set is empty.
+skill_calls_line() {  # skill_calls_line <csv>
+  local t out=""
+  local IFS=,
+  for t in $1; do
+    t="$(printf '%s' "$t" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$t" ] && continue
+    out="${out} Call the Skill tool with \"${t}\"."
+  done
+  [ -n "$out" ] && printf 'Before you start:%s\n' "$out"
+  return 0
+}
+
+# The six lines a seeded mattpocock skill needs in an unattended session —
+# `references/mode-phase-start.md` §The unattended adapter, read where it is
+# written. A Pro region: the free tree has no section, and prints nothing.
+unattended_adapter() {
+  local f="$SCRIPT_DIR/../references/mode-phase-start.md"
+  [ -f "$f" ] || return 0
+  LC_ALL=C awk '/^### The unattended adapter/ { on = 1; next } on && /^(#|<!--)/ { exit } on && /^[1-9]\. / { print }' "$f"
+}
+
+# The skills line of phase N's boot prompt and brief, and the adapter after it
+# when a mattpocock skill is in the set.
+skills_line() {  # skills_line <phase>
+  local set adapter
+  set="$(phase_skill_set "$1")"
+  [ -z "$set" ] && return 0
+  skill_calls_line "$set"
+  case ", $set," in
+    *", mattpocock-skills:"*)
+      adapter="$(unattended_adapter)"
+      [ -n "$adapter" ] && printf 'Unattended, these rule where a mattpocock skill'\''s words differ:\n%s\n' "$adapter"
+      ;;
+  esac
+  return 0
+}
+
+# F47 (measured-console phase 11): a skill the plan or a phase names that this
+# console's sessions do not load (`skill-unresolved`), or one marked
+# `disable-model-invocation`, which the Skill tool refuses
+# (`skill-user-invoked`). ADVISORY, read from PE_SKILLS the way F15 reads
+# PE_MCP_SERVERS: unset (by hand), silent; set-but-empty, a real answer.
+_skill_verdict() {  # _skill_verdict <name> → ok | user | unresolved
+  local name="$1" t base
+  local IFS=$' \t\n'
+  for t in ${PE_SKILLS:-}; do
+    base="${t%!}"
+    case "$name" in
+      *:*) [ "$base" = "$name" ] || continue ;;
+      *) case "$base" in "$name"|*:"$name") ;; *) continue ;; esac ;;
+    esac
+    case "$t" in *!) printf 'user' ;; *) printf 'ok' ;; esac
+    return 0
+  done
+  printf 'unresolved'
+}
+
+skill_advisories() {
+  [ -z "${PE_SKILLS+set}" ] && return 0
+  local p reported=" "
+  _skill_report() {  # _skill_report <where> <csv>
+    local one v
+    local IFS=,
+    for one in $2; do
+      one="$(printf '%s' "$one" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -z "$one" ] && continue
+      case "$reported" in *" $one "*) continue ;; esac
+      v="$(_skill_verdict "$one")"
+      case "$v" in
+        unresolved)
+          reported="${reported}${one} "
+          printf 'F47 %s: skill-unresolved — `%s` is not among the skills this console'\''s sessions load, so the Skill tool will not find it; seed its plugin or switch it on for autopilot (autopilotPlugins), or drop it\n' "$1" "$one" ;;
+        user)
+          reported="${reported}${one} "
+          printf 'F47 %s: skill-user-invoked — `%s` is marked disable-model-invocation, so the Skill tool refuses it and an unattended session cannot run it; drop it, or name a skill the model may invoke\n' "$1" "$one" ;;
+      esac
+    done
+  }
+  _skill_report plan "$(plan_skills)"
+  for p in "${PHASES[@]}"; do
+    _is_done "$p" && continue
+    _skill_report "phase $p" "$(skills_directive "$p")"
+  done
+  return 0
+}
+
+# F48 (measured-console phase 27): a phase's plugin set over the listing
+# budget (`plugin-set-over-budget`) — entries × PLUGIN_ENTRY_CHARS against
+# PLUGIN_LISTING_PCT % of its model's window at PLUGIN_CHARS_PER_TOKEN — or a
+# word on a `**Plugins:**` line that is no kind (`plugin-kind-unknown`).
+# ADVISORY. The plan's line is judged alone (the plan model) and per phase
+# with the bullet unioned (the phase's model); never a union across phases.
+_plugin_budget_report() {  # _plugin_budget_report <where> <model> <csv>
+  local n window budget cost
+  n="$(printf '%s' "$3" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | grep -c . || true)"
+  [ "${n:-0}" -gt 0 ] || return 0
+  case "$2" in *"[1m]"|*"[1M]") window="$PLUGIN_WINDOW_1M" ;; *) window="$PLUGIN_WINDOW" ;; esac
+  budget=$(( window * PLUGIN_LISTING_PCT * PLUGIN_CHARS_PER_TOKEN / 100 ))
+  cost=$(( n * PLUGIN_ENTRY_CHARS ))
+  if [ "$cost" -gt "$budget" ]; then
+    printf 'F48 %s: plugin-set-over-budget — %s entries list at up to %s characters, over the %s a %s-token window allows (1 entry = %s characters, %s %% of the window); name fewer kinds, or split the phase\n' \
+      "$1" "$n" "$cost" "$budget" "$window" "$PLUGIN_ENTRY_CHARS" "$PLUGIN_LISTING_PCT"
+  fi
+}
+
+plugin_advisories() {
+  local p w reported=" "
+  _plugin_unknown_report() {  # _plugin_unknown_report <where> <words>
+    for w in $2; do
+      _is_plugin_kind "$w" && continue
+      case "$reported" in *" $w "*) continue ;; esac
+      reported="${reported}${w} "
+      printf 'F48 %s: plugin-kind-unknown — `%s` is not a plugin kind (%s), so it brings nothing; fix the word or drop it\n' "$1" "$w" "$(printf '%s' "$PLUGIN_KINDS" | sed 's/ /, /g')"
+    done
+  }
+  _plugin_unknown_report plan "$(plan_plugins)"
+  _plugin_budget_report plan "$(plan_model 2>/dev/null | tr -d '`' | awk 'NF { print $1; exit }')" "$(plugins_for_phase)"
+  for p in "${PHASES[@]}"; do
+    _is_done "$p" && continue
+    _plugin_unknown_report "phase $p" "$(plugins_directive "$p")"
+    [ -n "$(plugins_directive "$p")" ] || continue
+    _plugin_budget_report "phase $p" "$(phase_model "$p")" "$(plugins_for_phase "$p")"
+  done
+  return 0
+}
+
+brief_render() {  # brief_render <phase>
+  local p="$1" d hf sc root_tok lock_git mem steps dec_rows sk
+  printf 'Read first: references/mode-phase-start.md in the phased-execution skill — then references/mode-phase-finish.md once the work is done.\n'
+  printf 'This is the brief for phase %s of "%s": what you start from, in one place.\n' "$p" "$slug"
+  skills_line "$p"
+  printf '\n'
+  phase_block "$p" | awk '{ line[NR] = $0 } END { n = NR; while (n > 0 && line[n] ~ /^[ \t]*$/) n--; for (i = 1; i <= n; i++) print line[i] }' \
+    | _brief_cut "$BRIEF_SECTION_MAX" "… (the rest, with its graph row and budget lines: $CMD/phase-graph.sh $slug --section $p)"
+  printf '\n## Decisions still open (`%s/phase-graph.sh %s --decisions %s` lists every row)\n' "$CMD" "$slug" "$p"
+  _bp_decision_rows "$p"
+  printf 'A decision you are missing is declared by key, then you stop: %s/phase-outcome.sh %s %s blocked --needs <key> --reason "<what you need>"\n' "$CMD" "$slug" "$p"
+  printf 'An act only the run can take (%s) is `--needs run --run-act <act>`.\n' "$(printf '%s' "$RUN_ACTS" | sed 's/ /, /g')"
+  _bp_notes_block "$p" "$p"
+  sc="${REPOS[$p]:-all}"
+  root_tok="$(scope_root_token "$slug")"
+  lock_git=' --git'; [ "${PE_LOCK_MIRROR:-}" = console ] && lock_git=''
+  printf '\n## Scope and lock\n'
+  printf 'Scope: %s' "$sc"
+  [ -n "$root_tok" ] && [ "$sc" != all ] && printf ', plus `%s` in the docs root (your handoff and lock writes)' "$root_tok"
+  printf '.\n'
+  printf 'Check, then claim: %s/phase-lock.sh %s conflicts %s --scope "%s"%s — then the same with claim.\n' "$CMD" "$slug" "$p" "$sc" "$lock_git"
+  if [ -z "$lock_git" ]; then
+    printf 'Both are file-only under this autopilot: the console holds the lease and mirrors the lock to git. --owner defaults to $PE_OWNER — keep it.\n'
+  else
+    printf 'A conflict names a live session: stop and ask before building over it.\n'
+  fi
+  for d in ${DEPS[$p]:-}; do
+    hf="$(handoff_file "$d")"
+    [ -n "$hf" ] || continue
+    printf '\n## Phase %s handed you (docs/handoffs/%s/%s)\n' "$((10#$d))" "$slug" "$(basename "$hf")"
+    _brief_summary "$hf" | _brief_cut "$BRIEF_SUMMARY_MAX" "… (the rest is in the file)"
+  done
+  steps="$( { human_steps_for_phase 0 | awk -F'\t' '$2 != "" { print "- [plan] " $2 }'
+              human_steps_for_phase "$p" | awk -F'\t' -v p="$p" '$2 != "" { print "- [phase " p "] " $2 }'; } 2>/dev/null || true)"
+  if [ -n "$steps" ]; then
+    printf '\n## Open errands (the plan'\''s acts for a person; the console checks each — nothing here is yours unless your phase names it)\n'
+    printf '%s\n' "$steps" | _brief_cut "$BRIEF_ERRANDS_MAX" "… (every one: $CMD/phase-graph.sh $slug --human-steps)"
+  fi
+  mem="$DOCS_ROOT/docs/memory/$slug/index.md"
+  if [ -f "$mem" ]; then
+    printf '\n## Memory (docs/memory/%s/index.md, its first %s lines)\n' "$slug" "$BRIEF_MEMORY_LINES"
+    head -n "$BRIEF_MEMORY_LINES" "$mem"
+  fi
 }
 
 # `boot_fanout "<phase> <phase> …"` — what next-phase-prompt.sh prints for
@@ -5212,6 +6144,15 @@ case "$mode" in
     if plan_is_closed; then printf 'closed %s\n' "$PLAN_STATUS"; exit 0; fi
     printf 'open %s\n' "$PLAN_STATUS"; exit 1
     ;;
+  --section)
+    [ -z "$arg" ] && { echo "usage: --section <phase>" >&2; exit 2; }
+    case " ${PHASES[*]} " in
+      *" $arg "*) ;;
+      *) printf 'phase %s is not in this plan (%s has phases: %s)\n' "$arg" "$slug" "${PHASES[*]}" >&2; exit 2 ;;
+    esac
+    phase_section "$arg"
+    exit 0
+    ;;
   --lint)
     # F1/F2/F3: structural validation. Exit non-zero on any problem.
     #
@@ -5234,9 +6175,15 @@ case "$mode" in
       _advise F33 repos_outside_root_advisories
       _advise F34 repos_root_token_advisories
       _advise F35 checkout_inert_advisories
+      _advise F49 amendment_advisories
+      _advise F50 directive_mid_line_advisories
+      _advise F51 path_no_dir_advisories
+      _advise F52 verification_shared_checkout_advisories
       _advise F36 wait_window_advisories
       _advise F15 mcp_advisories
       _advise F15 credential_advisories
+      _advise F47 skill_advisories
+      _advise F48 plugin_advisories
       _advise F17 verification_lead_advisories
       _advise F18 verification_cwd_advisories
       _advise F22 verification_setup_advisories
@@ -5280,6 +6227,25 @@ case "$mode" in
     setup_for_phase "$arg"
     exit 0
     ;;
+  --skills)
+    # The skills a phase's sessions call (measured-console phase 11): with no
+    # argument the plan's `**Skills (every session):**` line alone; with one,
+    # that line UNIONED with the phase's `- **Skills:**` bullet. A csv, as
+    # written — the Skill-tool line qualifies them, this prints the plan.
+    if [ -n "$arg" ]; then skills_for_phase "$arg"; else printf '%s' "$(plan_skills)"; fi
+    printf '\n'
+    exit 0
+    ;;
+  --plugins)
+    # The plugin set a phase's session is given (measured-console phase 27):
+    # the entries of the kinds on the plan's `**Plugins:**` line — with an
+    # argument, UNIONED with the phase's `- **Plugins:**` bullet. A csv in the
+    # kinds table's order, empty when no kind is named (and in the Free tree,
+    # whose kinds bring nothing).
+    plugins_for_phase "$arg"
+    printf '\n'
+    exit 0
+    ;;
   --mcp)
     # Which MCP servers a phase runs with, as the console's preflight reads it.
     # With no argument: the plan-wide line alone. With one: that phase's full set
@@ -5305,6 +6271,19 @@ case "$mode" in
     [ -z "$arg" ] && { printf 'usage: --verify-in <phase>\n' >&2; exit 2; }
     verify_in_directive "$arg"
     printf '\n'
+    exit 0
+    ;;
+  --out-of-scope)
+    # The phase's `- **Out of scope:**` bullet and its continuation lines, one
+    # trimmed non-empty line each; nothing (exit 0) when it has none.
+    [ -z "$arg" ] && { echo "usage: --out-of-scope <phase>" >&2; exit 2; }
+    out_of_scope_directive "$arg"
+    exit 0
+    ;;
+  --not-yet-specified)
+    # The plan's `## Not yet specified` lines, one per line; nothing when the
+    # section is empty or absent.
+    not_yet_specified_lines
     exit 0
     ;;
   --floor)
@@ -5372,6 +6351,33 @@ case "$mode" in
       case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
     fi
     model_policy_for_phase "$arg"
+    exit 0
+    ;;
+  --subagent-model)
+    # The model a phase's subagents run (measured-console phase 6):
+    # `model<TAB>phase|plan`, or nothing when the plan is silent — the
+    # session's own default answers then. With no argument, the §Session
+    # budget line alone.
+    if [ -n "$arg" ]; then
+      case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+    fi
+    subagent_model_for_phase "$arg"
+    exit 0
+    ;;
+  --fast-gate)
+    # Whether the run's Stop hook runs phase N's fast gate lines
+    # (measured-console phase 6): `on|off<TAB>phase`, else `on<TAB>default`.
+    [ -n "$arg" ] || { printf 'usage: phase-graph.sh <slug> --fast-gate N\n' >&2; exit 2; }
+    case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+    fast_gate_for_phase "$arg"
+    exit 0
+    ;;
+  --may-delete-tests)
+    # Whether phase N's session may delete a test file — the guard's deny
+    # lifted (measured-console phase 6): `yes|no<TAB>phase`, else `no<TAB>default`.
+    [ -n "$arg" ] || { printf 'usage: phase-graph.sh <slug> --may-delete-tests N\n' >&2; exit 2; }
+    case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+    may_delete_tests_for_phase "$arg"
     exit 0
     ;;
   --credentials)
@@ -5446,6 +6452,18 @@ case "$mode" in
       verify_timeout_for_phase "$arg"
     else
       vt="$(plan_verify_timeout)"
+      [ -n "$vt" ] && printf '%s\tplan\n' "$vt"
+    fi
+    exit 0
+    ;;
+  --verification-tier)
+    # What a phase's heavy §Verification lines run as — `impact` (selected) or
+    # `full` (as written) — and which line said so (measured-console phase 15).
+    if [ -n "$arg" ]; then
+      case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+      verification_tier_for_phase "$arg"
+    else
+      vt="$(plan_verification_tier)"
       [ -n "$vt" ] && printf '%s\tplan\n' "$vt"
     fi
     exit 0
@@ -5663,8 +6681,8 @@ case "$mode" in
       done
       printf '\n'
     fi
-    sk="$(plan_skills)"
-    [ -n "$sk" ] && printf 'First invoke these skills (the plan uses them for every session): %s\n\n' "$sk"
+    sk="$(skills_for_phase "$p")"
+    [ -n "$sk" ] && printf '%s\n' "$(skill_calls_line "$(phase_skill_set "$p")")"
     mc="$(mcp_for_phase "$p")"
     [ -n "$mc" ] && printf 'The phase ran with these MCP servers: %s — you may use them to establish ground\ntruth, but never take a server'\''s word for whether the work is correct.\n\n' "$mc"
     # The plan's own review rules, before the steps and before the verdict verb:
@@ -5719,7 +6737,14 @@ case "$mode" in
     if [ -z "$gc" ]; then
       # A gated heading with no directive reads as GATE_DEFAULT (`ai`), the
       # same answer --gate-kind gives; --lint has already named it (F24).
-      if [ "$(is_gated "$arg")" = yes ]; then gc="$GATE_DEFAULT"; else echo "clear (no gate)"; exit 0; fi
+      if [ "$(is_gated "$arg")" = yes ]; then
+        # ...unless the section is not written yet (#416): the row is read
+        # before the amendment's section lands, and that is a person's, not `ai`.
+        if ! phase_section_written "$arg"; then
+          echo "manual: phase $arg's section is not written yet${gate_note:+ — $gate_note}"; exit 1
+        fi
+        gc="$GATE_DEFAULT"
+      else echo "clear (no gate)"; exit 0; fi
     fi
     gtype="${gc%% *}"; gval="${gc#"$gtype"}"; gval="${gval# }"
     case "$gtype" in
@@ -5926,7 +6951,23 @@ case "$mode" in
       *) printf 'phase %s is not in this plan (%s has phases: %s)\n' "$p" "$slug" "${PHASES[*]}" >&2; exit 2 ;;
     esac
     CMD="$BOOT_CMD"
+    # `PE_BRIEF=hook` (measured-console phase 4): the console says the presence
+    # hook will brief this session, so the prompt leaves out what the brief
+    # carries. Read here only — a fan-out and next-phase-prompt.sh stay whole.
+    [ "${PE_BRIEF:-}" = hook ] && BP_BRIEF=1
     boot_prompt_render "$p" "$p"
+    exit 0
+    ;;
+  --brief)
+    [ -z "$arg" ] && { echo "usage: --brief <phase>" >&2; exit 2; }
+    case " ${PHASES[*]} " in
+      *" $arg "*) ;;
+      *) printf 'phase %s is not in this plan (%s has phases: %s)\n' "$arg" "$slug" "${PHASES[*]}" >&2; exit 2 ;;
+    esac
+    CMD="$BOOT_CMD"
+    _brief_max="${PE_BRIEF_MAX:-$BRIEF_MAX}"
+    case "$_brief_max" in ''|*[!0-9]*) _brief_max="$BRIEF_MAX" ;; esac
+    brief_render "$arg" | _brief_cut "$_brief_max" "… (the brief stops here at $_brief_max bytes)"
     exit 0
     ;;
   --boot-fanout)

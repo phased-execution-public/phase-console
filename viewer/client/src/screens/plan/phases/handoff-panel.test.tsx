@@ -39,7 +39,7 @@ const SEVENTH = {
   skillsUsed: ['superpowers:test-driven-development'],
   body: '## What landed\n\nThe **baton**.',
   keyFiles: ['viewer/client/src/x.tsx'],
-  prompts: 1,
+  prompts: [{ phase: 2, gated: false, text: 'Boot phase 2.' }],
   bytes: 120,
   mtime: 0,
 } as HandoffDetail;

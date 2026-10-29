@@ -12,7 +12,7 @@
  */
 
 import type { HANDLED_SOURCES } from '@shared/turn-model.js';
-import { stamp } from '@/cards/human-step-card';
+import { stamp } from '@/cards/turn/step-words';
 import type { HandledRow } from '@/data/turn';
 import { phaseHref, planHref } from '@/shell/routes';
 

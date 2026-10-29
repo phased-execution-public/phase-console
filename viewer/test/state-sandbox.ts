@@ -34,6 +34,9 @@ import { join } from 'node:path';
  * console a test starts. A test of the guard injects its own reading.
  */
 import '../e2e/fixture/steady-load.mjs';
+// …and signed in (measured-console phase 14): a run's preflight asks the
+// `claude` on PATH, and the gate's `env -i` PATH has none — `signed-in.ts`.
+import './signed-in.ts';
 import { sweepBrokers } from './broker-sweep.ts';
 
 /**
@@ -72,6 +75,12 @@ process.env.PE_CLAUDE_CONFIG_DIRS = join(dir, 'claude');
 // session's own tree. A test that means them sets them.
 delete process.env.PE_VERIFY_DIR;
 delete process.env.PE_RUN_ROOT;
+// …nor what a console exports to the session that ran the suite: its plugin
+// seed and its telemetry receiver, which a spawned stub would carry as its own
+// (measured-console phase 35's gate run 3).
+delete process.env.CLAUDE_CODE_PLUGIN_SEED_DIR;
+delete process.env.PE_OTEL_ENDPOINT;
+delete process.env.PE_OTEL_TOKEN;
 
 /**
  * A pty broker started by a test retires in seconds, not in five minutes.

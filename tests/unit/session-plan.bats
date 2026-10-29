@@ -40,13 +40,18 @@ load ../helpers/test_helper
   assert_contains "$output" "~40K"
 }
 
-@test "session-plan: a batch pays the session floor ONCE — 175K of weight is two sessions by hand, not one" {
-  # sizes fixture: S+S+M+L+S = 175K. Under the old "context ≈ 3 × weight" it fit
-  # one 200K session; measured, a session peaks at 319K + 2.17 × weight, so
-  # 175K of weight is ~700K of context — past the 600K target (control-tower
-  # phase 59, #83). The first three (70K → ~471K) share; the rest (105K) do.
+@test "session-plan: a batch pays the session floor ONCE — 175K of weight is one 1M session, two at a 170K budget" {
+  # sizes fixture: S+S+M+L+S = 175K. Measured, a session peaks at the floor plus
+  # the slope × weight (control-tower phase 59, #83), re-fitted by
+  # measured-console phase 33 to 238K + 1.91 × weight: 175K of weight is ~572K
+  # of context, under a 1M session's 600K target. At a 170K budget (a 510K
+  # target) it is past it, and the floor is paid once per session: the first
+  # three (70K → ~372K) share, the rest (105K → ~439K) do.
   setup_docs sizes sizes
   run pg sizes --session-plan opus
+  assert_contains "$output" "Session 1  batch  (~175K):  1 → 2 → 3 → 4 → 5"
+  refute_contains "$output" "Session 2"
+  run pg sizes --session-plan 170000
   assert_contains "$output" "Session 1  batch  (~70K):  1 → 2 → 3"
   assert_contains "$output" "Session 2  batch  (~105K):  4 → 5"
   refute_contains "$output" "Session 3"
@@ -87,20 +92,20 @@ load ../helpers/test_helper
 @test "session-plan: the boot floor is its own line, and a console's measured floor replaces the shipped one" {
   setup_docs sizes sizes
   run pg sizes --session-plan opus
-  assert_contains "$output" "Boot floor: 121K per session — shipped default"
-  assert_contains "$output" "Context: a session peaks near 319K + 2.17 × its weight (boot 121K + work 198K), sized to stay under 600K — 60 % of a 1M window"
+  assert_contains "$output" "Boot floor: 55K per session — shipped default"
+  assert_contains "$output" "Context: a session peaks near 238K + 1.91 × its weight (boot 55K + work 183K), sized to stay under 600K — 60 % of a 1M window"
   PE_BOOT_FLOOR=89000 PE_BOOT_FLOOR_SAMPLES=14 run pg sizes --session-plan opus
   assert_contains "$output" "Boot floor: 89K per session — the first call's context on this repository, measured over 14 sessions"
-  assert_contains "$output" "peaks near 287K + 2.17 × its weight (boot 89K + work 198K)"
+  assert_contains "$output" "peaks near 272K + 1.91 × its weight (boot 89K + work 183K)"
   # A garbage value is ignored, never arithmetic.
   PE_BOOT_FLOOR=lots run pg sizes --session-plan opus
-  assert_contains "$output" "Boot floor: 121K per session — shipped default"
+  assert_contains "$output" "Boot floor: 55K per session — shipped default"
 }
 
 @test "session-plan: a budget whose target the floor alone reaches says so" {
   setup_docs sizes sizes
   run pg sizes --session-plan haiku
-  assert_contains "$output" "the session floor alone (319K) reaches this budget's target (120K)"
+  assert_contains "$output" "the session floor alone (238K) reaches this budget's target (120K)"
 }
 
 @test "size weights: S=15K M=40K L=90K appear in the legend" {

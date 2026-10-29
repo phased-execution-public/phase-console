@@ -53,6 +53,7 @@ import {
 import { extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './verify.ts';
 import { loadVerifyEnv, type VerifyEnv } from './verify-env.ts';
 import { knownEndOf, localNudgeAfterMs, mintWatchRef, ownBackgroundWork, probeSignature, unmintedReason, watchesDetachedJob } from './liveness.ts';
+import { sessionReaper } from './reap.ts';
 import {
   failureContext, resumeBrief, resumeInstruction, unblockBrief, type BriefFacts,
 } from './failure-context.ts';
@@ -69,9 +70,11 @@ import { answeredByItem, grantedByItem, strikeLabel, wallOfCliDenial, wallOfHook
 import {
   accountRung, capErrand, capRefusal, chargeRung, countedRungs, errandFor, errandSaid, widenCard, widenInstruction, nextRung, openRunRungs,
   retryForgives, runCapOverrides, rungKey, rungsFor, switchRungDecision, untriedRungs, DEFAULT_LADDER_CAPS, PERSON_SLOT_BY, type LadderCaps, type Rung,
+  ownerInstruction, routesToOwner, type OwnerInput, type RecoverySlot,
 } from './ladder.ts';
+import { ownerClaimOf, type OwnerClaim } from '../../shared/situation-model.js';
 import { qaRungInstruction } from './qa-recover.ts';
-import type { RungRecord, UsageDecisionAction, WaitBeside } from './state.ts';
+import type { ResumeCost, RungRecord, UsageDecisionAction, WaitBeside } from './state.ts';
 import type { AccountSessions } from '../sessions/registry.ts';
 import { ALERT_PCT, WALL_PCT, WARN_PCT } from '../../shared/ops-vocab.js';
 import {
@@ -83,7 +86,7 @@ import {
   type RunState, type PhaseStatus, type RunStatus, type VerifySummary, isSessionGone, mergeQaHistory,
   syncWaitClock, accountPool, type AccountChoice, retirePhaseHalt, owesVerification, THIS_CONSOLE,
 } from './state.ts';
-import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
+import { consumeOutcome, outcomeFileFor, outcomeFromStructured, readOutcome, reconcileOutcome, type PhaseOutcome } from './outcome.ts';
 import { liveRefs, pollableRefs, stillLiveRefs } from '../watch-refs.ts';
 import {
   boundedPlan, planDigest, planHoldOutcome, planTextFile, PLAN_HOLD_GRACE_MS,
@@ -112,9 +115,11 @@ import {
 import {
   CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, GIT_FIRST_PROBE_MS, GIT_PROBE_MS, LADDER_SEEN_TTL_MS, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_NONE_MAX, LIMIT_NONE_WINDOW_MS, WALL_REPROBE_BACKOFF_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_RESOURCES_EVERY_MS, LIVENESS_TICK_MS, RUN_PROGRESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, RUNNER_LEASE_S, lockStatusHolder, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, EXTERNAL_PARK_GRACE_MS, EXTERNAL_WAIT_NUDGE, LOCAL_JOB_NUDGE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, SILENT_NUDGE, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
 } from './runner-core.ts';
-import { contextCheckpointInstruction, contextWrapupNotice, resumePolicyInstruction, resumePolicyWhy, type VettedResume } from './runner-core.ts';
+import { contextCheckpointInstruction, contextCompactionNotice, contextWrapupNotice, resumePolicyInstruction, resumePolicyWhy, type VettedResume } from './runner-core.ts';
 import { loadModelsEnv, sameModel } from './models.ts';
-import { CONTEXT_CHECKPOINT_FRACTION, CONTEXT_WRAPUP_FRACTION, contextStage, contextWindowOf, tokensLabel } from './usage.ts';
+import { resumeCostWords } from './session-record.ts';
+import { CONTEXT_CHECKPOINT_FRACTION, CONTEXT_WRAPUP_FRACTION, contextStageFor, contextWindowOf, tokensLabel } from './usage.ts';
+import { compactionArm, DEFAULT_COMPACTION_WINDOW } from '../../shared/run-settings.js';
 import { RunnerAttempt } from './runner-attempt.ts';
 import type { HaltExtra } from './runner-base.ts';
 import {
@@ -310,16 +315,23 @@ export class Runner extends RunnerAttempt {
     const state = this.state!;
     const record = phaseRecord(state, phase);
     const path = this.outcomePath(phase);
-    const read = readOutcome(path, {
+    const fromFile = readOutcome(path, {
       // THIS attempt's start, never the phase's first: a file written by an
       // earlier attempt must not speak for the one that just ended.
       slug: state.slug, phase, notBefore: record.attemptStartedAt ?? record.startedAt,
     });
     consumeOutcome(path);
+    // The session's `structured_output` FIRST, the file second (B4).
+    const held = this.structuredOutcomes.get(phase);
+    this.structuredOutcomes.delete(phase);
+    const structured = held ? outcomeFromStructured(held.value, { slug: state.slug, phase, at: held.at }) : null;
+    const { outcome: read, via, disagreed } = reconcileOutcome(structured, fromFile);
+    if (disagreed) this.record('phase.outcome-disagreed', { ...disagreed, chose: via }, phase);
     if (!read) return null;
     const screened = this.screenOutcome(phase, read, 'ingest');
     const declared = screened.outcome;
     this.record('phase.outcome', {
+      ...(via && via !== 'file' ? { via } : {}),
       status: declared.status, reason: declared.reason ?? null,
       needs: declared.needs ?? null,
       resumeAfter: declared.resume_after ?? null, watch: declared.watch,
@@ -754,7 +766,7 @@ export class Runner extends RunnerAttempt {
    * spend that went through (`noteSpendProof`), or this phase's own back-off
    * re-probe. Answers how many parks moved.
    */
-  rereadWalls(trigger: 'reading' | 'spend' | 'reprobe'): number {
+  rereadWalls(trigger: 'reading' | 'spend' | 'reprobe' | 'switch'): number {
     const state = this.state;
     const headroom = this.deps.accountHeadroom;
     if (!state || !headroom) return 0;
@@ -826,6 +838,20 @@ export class Runner extends RunnerAttempt {
       if (verdict?.ok) {
         this.record('run.window-lifted', { account, by: trigger, was: state.waitUntil ?? null });
         this.haltSignal.dispatchEvent(new Event('wake'));
+        moved += 1;
+      }
+    }
+    // A run whose loop settled `paused` on a usage window (measured-console phase 24, #388) is read
+    // too: its clock was the walled account's reset, and with the run's account able to pay it is
+    // brought to now — the service resumes a paused run from its clock (`resumeLimitPaused`). A
+    // person's pause is a hold, not a window, and is never read here (`state.pause`).
+    if (state.status === 'paused' && state.waitReason === 'usage-limit' && !state.pause && state.waitUntil
+      && Date.parse(state.waitUntil) > now) {
+      let verdict: ReturnType<NonNullable<RunnerDeps['accountHeadroom']>> | null = null;
+      try { verdict = headroom(account === 'default' ? undefined : account, state.model); } catch { verdict = null; }
+      if (verdict?.ok) {
+        this.record('run.window-lifted', { account, by: trigger, was: state.waitUntil, paused: true });
+        state.waitUntil = at;
         moved += 1;
       }
     }
@@ -1399,6 +1425,10 @@ export class Runner extends RunnerAttempt {
 
     const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: now });
     const history = slot.rungs ?? [];
+    // The newest rung was `resume-owner` and the owner's session is still at
+    // work: the phase waits for it rather than climbing past it (phase 25).
+    const lastRung = history.at(-1);
+    if (lastRung?.rung === 'resume-owner' && this.ownerBusy(Number(lastRung.params?.owner))) return false;
     // The ONE run-wide counter (#14): counted rungs on phases the board does
     // not read done — the healer's gate reads the same helper.
     const run = openRunRungs(state.recoveries, (p) => board.states?.[p] === 'done');
@@ -1445,8 +1475,20 @@ export class Runner extends RunnerAttempt {
     // real fail under a message claiming three had failed (QA F3).
     const qaRounds = (record.qa ?? []).filter((entry) => entry.verdict === 'fail').length;
     const qaMaxRounds = state.qaMaxRounds ?? DEFAULT_QA_MAX_ROUNDS;
-    const climb = { situation: situation.key, history, run, dayHistory, caps, qaRounds, qaMaxRounds };
+    // The failure's owner, when it names a phase other than this one and that
+    // phase's session passes the one resume gate (measured-console phase 25).
+    const found = this.ownerFor(record, situation.key);
+    const climb = {
+      situation: situation.key, history, run, dayHistory, caps, qaRounds, qaMaxRounds,
+      ...(found ? { owner: found.input } : {}),
+    };
     const any = nextRung(climb);
+    // …and it is climbed BEFORE the table: the owner's session is resumed with
+    // the failure, the phase waits, and only when that rung is tried does the
+    // generic fixer below board.
+    if (any.ok && any.rung.vehicle === 'resume-owner' && found) {
+      return this.routeToOwner(record, situation.key, slot, any.rung, found, by, now);
+    }
     const mine = nextRung({ ...climb, available: (rung) => actOf(rung) !== null });
     // …and the THIRD question (LFC-2, phase 10): is there a rung ANY driver
     // can climb — this loop's own vehicles, or the healer's on a stopped run.
@@ -1643,9 +1685,9 @@ export class Runner extends RunnerAttempt {
         let candidates: { id: string; headroomPct: number | null }[] = [];
         if (!verdict.ok && this.deps.switchCandidates) {
           try {
-            const plan = this.deps.switchCandidates(from === 'default' ? undefined : from, model, {
+            const plan = this.switchPlan(from === 'default' ? undefined : from, model, {
               until: this.wallResetMs(null, from === 'default' ? undefined : from, model), pool,
-            });
+            })!;
             candidates = plan.ranked
               .filter((id) => id !== from && (!pool || pool.includes(id)))
               .map((id) => ({ id, headroomPct: room(id)?.headroomPct ?? null }));
@@ -2150,6 +2192,99 @@ export class Runner extends RunnerAttempt {
     this.persist();
   }
 
+  /**
+   * Is the phase's session busy — in flight, boarded, or holding a lane? A
+   * phase being fixed by its owner's resumed session is not climbed past.
+   */
+  private ownerBusy(phase: number): boolean {
+    const record = Number.isInteger(phase) ? this.state?.phases[String(phase)] : undefined;
+    return Boolean(record) && (PHASE_IN_FLIGHT.includes(record!.status) || Boolean(record!.boardingHint) || this.lanes.has(phase));
+  }
+
+  /**
+   * The owner a failure names, judged by the ONE resume gate
+   * (`resumableSession`: announced, not gone, not live, not cold, not over its
+   * window, not checkpointed, on the paying account) — or null when the
+   * failure names no other phase, or that phase left no record in this run.
+   *
+   * The sources are what the console already knows (`ownerClaimOf`): an
+   * inherited red attributed to another phase, and — under `**Evaluator:**
+   * hold` — a dependency the independent evaluator found `not met`. A phase
+   * whose session is busy is no owner to resume: it is working.
+   */
+  private ownerFor(record: PhaseRecord, situationKey: string): { claim: OwnerClaim; input: OwnerInput; sessionId?: string } | null {
+    const state = this.state;
+    if (!state || !routesToOwner(situationKey)) return null;
+    const notMet: { phase: number; id: string; evidence: string; dimension?: string }[] = [];
+    const claim = ownerClaimOf({ phase: record.phase, inherited: record.verification?.inherited ?? null, notMet });
+    const owner = claim ? state.phases[String(claim.owner)] : undefined;
+    if (!claim || !owner || this.ownerBusy(claim.owner)) return null;
+    const sessionId = owner.sessionId ?? owner.resumeSessionId;
+    const resumable = Boolean(sessionId) && this.resumableSession(owner, sessionId).ok;
+    return { claim, input: { phase: claim.owner, from: claim.from, resumable }, ...(sessionId ? { sessionId } : {}) };
+  }
+
+  /**
+   * The `resume-owner` rung (measured-console phase 25): the failing phase's
+   * rung is accounted and handed off at once (`work-in-progress` — the owner's
+   * session carries it, and books its own spend), the OWNER's record is
+   * re-boarded with a `continue` hint that resumes its session with the
+   * failure, and `phase.routed-to-owner` says who, why and in which session.
+   * True: a boarding is queued, the way every climbed rung is.
+   */
+  private routeToOwner(
+    record: PhaseRecord, situationKey: string, slot: RecoverySlot, rung: Rung,
+    found: { claim: OwnerClaim; input: OwnerInput; sessionId?: string }, by: string, now: string,
+  ): boolean {
+    const state = this.state!;
+    const { claim } = found;
+    const owner = phaseRecord(state, claim.owner);
+    accountRung(slot, { situation: situationKey, rung: rung.vehicle, params: rung.params, at: now, note: rung.label });
+    const hint: BoardingHint = {
+      situation: situationKey, rung: 'resume-owner', brief: 'continue', at: now, by,
+      ...(found.sessionId ? { sessionId: found.sessionId } : {}),
+      instruction: ownerInstruction(claim),
+    };
+    this.reboardWith(owner, hint);
+    this.record('phase.rung', {
+      situation: situationKey, rung: rung.vehicle, params: rung.params ?? null, brief: hint.brief, vehicle: 'runner',
+      attempt: slot.attempts, by, ...(found.sessionId ? { sessionId: found.sessionId } : {}),
+    }, record.phase);
+    this.record('phase.routed-to-owner', {
+      phase: claim.owner, from: claim.from, source: claim.source, failure: claim.failure,
+      evidence: claim.evidence, sessionId: found.sessionId ?? null, situation: situationKey,
+      reason: `${claim.failure}; phase ${claim.owner}'s session is resumable, so it is resumed with the failure before any fixer boards`,
+    }, claim.owner);
+    this.settleOpenRung(record.phase, 'work-in-progress', `handed to phase ${claim.owner}'s session`);
+    this.emit('phase', { phase: claim.owner, status: owner.status, situation: situationKey, rung: rung.vehicle, brief: hint.brief });
+    this.persist();
+    return true;
+  }
+
+  /**
+   * A phase that PASSED on its own work with reds that are another phase's
+   * (`inheritedOnly`) never reaches the ladder — its record reads done. When
+   * the owner's session is still worth resuming it is resumed with the red
+   * now, once per owner, rather than left to a later sibling to find
+   * (measured-console phase 25).
+   */
+  protected routeOwed(record: PhaseRecord): void {
+    const state = this.state;
+    if (!state?.autoRecover) return;
+    const situationKey = 'verify-red';
+    const found = this.ownerFor(record, situationKey);
+    if (!found) return;
+    const slot = ((state.recoveries ??= {})[String(record.phase)] ??= { attempts: 0, lastAt: new Date().toISOString() });
+    const caps = { ...(this.deps.ladderCaps?.() ?? {}), ...runCapOverrides(state) };
+    const run = openRunRungs(state.recoveries, (p) => state.phases[String(p)]?.status === 'done');
+    const next = nextRung({
+      situation: situationKey, history: slot.rungs ?? [], run, caps, dayHistory: this.deps.dayHistory?.(), owner: found.input,
+    });
+    if (next.ok && next.rung.vehicle === 'resume-owner') {
+      this.routeToOwner(record, situationKey, slot, next.rung, found, 'inherited', new Date().toISOString());
+    }
+  }
+
   /** Which of this runner's vehicles a rung maps to, as the hint boarding reads — or null. */
   private hintFor(
     phase: number, rung: Rung, situation: Situation, evidence: PhaseEvidence | null,
@@ -2158,6 +2293,11 @@ export class Runner extends RunnerAttempt {
     const base = { situation: situation.key, rung: rung.vehicle, at, by };
     switch (rung.vehicle) {
       case 'reboard-fresh':
+        return { ...base, brief: 'fresh' };
+      // The SDK's door lost the session (measured-console phase 21): the
+      // record's `spawnFallback` keeps every session of the phase on the
+      // subprocess, so a fresh boarding is the re-attempt.
+      case 'reboard-subprocess':
         return { ...base, brief: 'fresh' };
       case 'queue':
         // Back to the queue behind the lock; a handoff on disk means the
@@ -2431,7 +2571,9 @@ export class Runner extends RunnerAttempt {
         // shape a review follow-up needs — a self-contained boot prompt plus
         // the evidence block plus WORDS — and dropping the words would
         // re-board the phase to do nothing in particular.
-        const instruction = hint.instruction ?? resumeInstruction(facts);
+        // …and what a resume of this phase cost last time, in its own words (A10).
+        const cost = resumeCostWords(phaseRecord(this.state!, phase).resumeCost);
+        const instruction = `${hint.instruction ?? resumeInstruction(facts)}${cost ? `\n\n${cost}` : ''}`;
         return {
           prompt: `${engineText}\n\n${resumeBrief(facts, notWorth ? `${notWorth.words}\n\n${instruction}` : instruction)}`,
           brief, ...(degraded ? { degraded } : {}),
@@ -3700,7 +3842,19 @@ export class Runner extends RunnerAttempt {
     if (!window) return;
     lane.signals.contextWindow = window;
     const context = event.totals.lastContext;
-    const stage = contextStage(context, window);
+    // A compaction the hooks reported, measured on the first call after it (A10).
+    const compacted = lane.signals.compaction;
+    if (compacted?.done) {
+      delete lane.signals.compaction;
+      this.record('phase.compaction', {
+        trigger: compacted.trigger, before: compacted.before, after: context,
+        recacheTokens: event.call.cacheWrite, at: compacted.at, sessionId: record.sessionId ?? null,
+        arm: compactionArm({ mode: state.compaction, phase }),
+      }, phase);
+    }
+    lane.signals.lastContext = context;
+    const arm = compactionArm({ mode: state.compaction, phase });
+    const stage = contextStageFor(context, window, arm);
     // A lane the console is already ending has nothing left to be told.
     if (stage === 'ok' || lane.checkpointed || lane.stopped || this.stopRequested) return;
     const sessionId = record.sessionId ?? null;
@@ -3746,20 +3900,28 @@ export class Runner extends RunnerAttempt {
     // ran 41 minutes from 0.6 to 0.8 of its window). The checkpoint above is
     // where the retries end — a lane it has cut is never reached again.
     const attempt = (mark?.attempts ?? 0) + 1;
+    // …and whether it may push what it commits (measured-console phase 12, #397).
+    const pushBranch = lane.branch ?? (state.gitMode === 'new-branch' ? `pe/${state.slug}` : null);
+    const push = pushBranch ? { push: { branch: pushBranch, allowed: this.mayPushBranch(phase, pushBranch) } } : {};
     const told = this.steer(
-      // Which commit step applies (control-tower phase 89, #127): a lane of its
-      // own, or the run's shared branch with the fast gate the boarding read.
-      contextWrapupNotice(context, window, `bash ${SCRIPTS_REF}/phase-outcome.sh ${state.slug} ${phase}`, {
-        shared: !lane.worktree, ...(lane.fastGate ? { fastGate: lane.fastGate } : {}),
-        // …and its own agents still at work, named (control-tower phase 109, #188).
-        background: awaitingBackground(lane.signals), now: Date.now(),
-      }),
+      arm === 'native'
+        // Native compaction (A10): the line is a notice — the CLI compacts, the session carries on.
+        ? contextCompactionNotice(context, window, state.compactionWindow ?? DEFAULT_COMPACTION_WINDOW, push)
+        // Which commit step applies (control-tower phase 89, #127): a lane of its
+        // own, or the run's shared branch with the fast gate the boarding read.
+        : contextWrapupNotice(context, window, `bash ${SCRIPTS_REF}/phase-outcome.sh ${state.slug} ${phase}`, {
+          shared: !lane.worktree, ...(lane.fastGate ? { fastGate: lane.fastGate } : {}),
+          ...push,
+          // …and its own agents still at work, named (control-tower phase 109, #188).
+          background: awaitingBackground(lane.signals), now: Date.now(),
+        }),
       'watchdog', undefined, phase,
     );
     if (told.ok) {
       record.contextWrapup = { sessionId, at, context, window, delivered: true, attempts: attempt };
       this.record('phase.context-wrapup', {
         stage, context, window, fraction: CONTEXT_WRAPUP_FRACTION, sessionId, delivered: true, attempt,
+        ...(arm === 'native' ? { arm, notice: true } : {}),
       }, phase);
     } else {
       const reason = told.reason ?? 'the steer was refused';
@@ -3771,6 +3933,103 @@ export class Runner extends RunnerAttempt {
       }
     }
     this.persist();
+  }
+
+  /** Where this phase's session declares its outcome — the file the console's own raise of a deferred step writes. */
+  declarationFile(phase: number): string {
+    return this.outcomePath(phase);
+  }
+
+  /** A person's step deferred at its call (measured-console phase 12, B2): kept on the record and journalled. */
+  noteDeferred(phase: number, call: { toolUseId: string; sessionId: string | null; command: string; exit: number }): void {
+    const record = this.state?.phases[String(phase)];
+    if (!record) return;
+    record.deferred = { toolUseId: call.toolUseId, sessionId: call.sessionId, command: call.command.slice(0, 2_000), at: this.now().toISOString() };
+    this.record('phase.deferred', { toolUseId: call.toolUseId, sessionId: call.sessionId, exit: call.exit }, phase);
+    this.persist();
+  }
+
+  /** The person's answer for the deferred call, set when their check passes — true when one was waiting. */
+  answerDeferred(phase: number, answer: string, stepId?: string): boolean {
+    const record = this.state?.phases[String(phase)];
+    if (!record?.deferred) return false;
+    record.deferred = { ...record.deferred, answer, ...(stepId ? { stepId } : {}) };
+    this.persist();
+    return true;
+  }
+
+  /**
+   * The re-fired hook for a deferred call (B2): the call's answer, spent —
+   * `{answer}` when the person's check gave one, `{}` when the session was
+   * resumed for another reason (the call then runs as it was written, and
+   * parks the phase as 8.0 did), null when this call is not the deferred one.
+   */
+  takeDeferred(phase: number, toolUseId: string): { answer?: string } | null {
+    const record = this.state?.phases[String(phase)];
+    const deferred = record?.deferred;
+    if (!record || !deferred || deferred.toolUseId !== toolUseId) return null;
+    delete record.deferred;
+    this.record('phase.deferred-resumed', {
+      toolUseId, answered: Boolean(deferred.answer), ...(deferred.stepId ? { stepId: deferred.stepId } : {}),
+      waitedMs: Math.max(0, this.now().getTime() - Date.parse(deferred.at)),
+    }, phase);
+    this.persist();
+    return deferred.answer ? { answer: deferred.answer } : {};
+  }
+
+  /**
+   * A resumed session's own account of what its resume cost (measured-console
+   * phase 12): stamped on the phase whose session it is and journalled
+   * `phase.resume-cost`. True when this run holds that session.
+   */
+  noteResumeCost(sessionId: string, cost: ResumeCost): boolean {
+    const state = this.state;
+    if (!state) return false;
+    // A `--resume` keeps its conversation's id, so the record's own session id is the one to match.
+    const entry = Object.entries(state.phases).find(([, record]) => record.sessionId === sessionId);
+    if (!entry) return false;
+    const [key, record] = entry;
+    record.resumeCost = { ...cost, at: this.now().toISOString(), sessionId };
+    // A deferred step's resume is the figure B2 measures against a parked one's.
+    this.record('phase.resume-cost', {
+      sessionId, ...cost, ...(record.deferred ? { deferred: true, ...(record.deferred.stepId ? { stepId: record.deferred.stepId } : {}) } : {}),
+    }, Number(key));
+    this.persist();
+    return true;
+  }
+
+  /**
+   * A compaction the session's own hooks reported (measured-console phase 12,
+   * A10): `PreCompact` stamps the context before it, `PostCompact` marks it
+   * done, and the next usage event journals `phase.compaction` with the context
+   * after and the cache it had to write again (`noteContext`). The hooks carry
+   * no token counts, so the stream measures both sides.
+   */
+  noteCompactionHook(phase: number, event: 'PreCompact' | 'PostCompact', trigger: string): void {
+    const lane = this.lanes.get(phase);
+    if (!lane) return;
+    const word = trigger === 'manual' ? 'manual' : 'auto';
+    if (event === 'PreCompact') {
+      lane.signals.compaction = { trigger: word, before: lane.signals.lastContext ?? null, at: this.now().toISOString(), done: false };
+      return;
+    }
+    const pending = lane.signals.compaction;
+    lane.signals.compaction = pending
+      ? { ...pending, done: true }
+      : { trigger: word, before: lane.signals.lastContext ?? null, at: this.now().toISOString(), done: true };
+  }
+
+  /**
+   * A line a session's OpenTelemetry export asked for (measured-console phase
+   * 19): an API error, a refused tool, a compaction, a finished subagent or a
+   * hook run (`server/otel/fold.ts` `OTEL_JOURNAL_EVENTS`), at the phase its
+   * resource attributes name — else the run's active one. A run with neither
+   * journals nothing: a line with no phase is no phase's evidence.
+   */
+  noteOtelEvent(phase: number | null, event: string, data: Record<string, unknown>): void {
+    const at = phase ?? this.state?.activePhase ?? null;
+    if (at === null || !/^phase\.otel-/.test(event)) return;
+    this.record(event, data, at);
   }
 
   /**
@@ -3896,6 +4155,11 @@ export class Runner extends RunnerAttempt {
         : thresholds.stallExternalWaitMs,
     }, phase);
 
+    // The detached job this park waits on is spared by the reaper when the
+    // checkpoint below ends the session — even when the minted ref is held
+    // and nothing is armed (measured-console phase 13, #409). Before the
+    // checkpoint, so the keep is there when the session's close is read.
+    if (detached) sessionReaper.keep(phaseRecord(state, phase).sessionId, [detached, ...(minted ? [minted] : [])]);
     this.checkpointLane(lane, reason, { carryOn: false, endedBy: 'watchdog' });
     if (ownJob) {
       // Owed by the SESSION, not the console (`owesVerification` tells the two
@@ -4017,11 +4281,19 @@ export class Runner extends RunnerAttempt {
 
   protected engine(args: string[], env?: Record<string, string>) {
     const state = this.state!;
+    // The skill set the console's sessions load (measured-console phase 11):
+    // what qualifies the boot prompt's Skill-tool line and arms F47. Only under
+    // `console-set`, whose set the console owns.
+    let skills: string[] | undefined;
+    try {
+      const loads = this.deps.sessionLoads?.();
+      if (loads?.mode === 'console-set') skills = loads.skills;
+    } catch { skills = undefined; }
     // No cache key on purpose. The board is read moments after a child wrote a
     // handoff, and the watcher that invalidates the cache may not have fired
     // yet — a cached "not done" here would fail a phase that succeeded.
     return engineRun(
-      { scriptsDir: this.deps.scriptsDir, root: state.root, mcpServers: this.deps.mcpIds?.() },
+      { scriptsDir: this.deps.scriptsDir, root: state.root, mcpServers: this.deps.mcpIds?.(), ...(skills ? { skills } : {}) },
       'phase-graph.sh', [state.slug, ...args],
       undefined, env ? { env } : undefined,
     );
@@ -4509,7 +4781,7 @@ export class Runner extends RunnerAttempt {
       const resetsMs = typeof event.resetsAt === 'number' && Number.isFinite(event.resetsAt) ? event.resetsAt * 1000 : null;
       try {
         if (this.deps.switchCandidates) {
-          const plan = this.deps.switchCandidates(from, state.model, { until: resetsMs, pool: accountPool(state), floors: this.accountFloors() });
+          const plan = this.switchPlan(from, state.model, { until: resetsMs, pool: accountPool(state), floors: this.accountFloors() })!;
           headroom = plan.ranked.find((id) => id !== (from ?? 'default')) ?? null;
           if (!headroom) {
             why = plan.declined.length

@@ -460,6 +460,61 @@ describe('before the engine lands', () => {
   });
 });
 
+describe('strips — a row that is one record in one state (Tower strips)', () => {
+  const paintOf = (r: Lock) => (r.state === 'running' ? ('running' as const) : ('waiting' as const));
+
+  it('is opt-in: a grid with no rowPaint draws no edge, no tint and its own toggle', () => {
+    box = 2000;
+    need = 1000;
+    const { container } = mount();
+    expect(container.querySelector('[data-strip-edge]')).toBeNull();
+    expect(container.querySelector('tr[data-strip]')).toBeNull();
+    const toggle = toggleOf('tower-p3');
+    fireEvent.click(toggle);
+    expect(detailOf(toggle)).toHaveClass('bg-ground-deep');
+  });
+
+  it('draws the state’s edge on the first cell, and an open strip and its detail on the state’s tint, the edge running down', () => {
+    box = 2000;
+    need = 1000;
+    mount({ rowPaint: paintOf });
+    const row = screen.getByText('tower-p3').closest('tr')!;
+    expect(row).toHaveAttribute('data-strip', 'running');
+    // The edge is the FIRST cell's, in the state's vivid hue — a state class's, never a page's.
+    const first = row.querySelector('td')!;
+    const edge = first.querySelector('[data-strip-edge]')!;
+    expect(edge).toHaveClass('state-running', 'bg-state-vivid', 'start-0', 'w-1');
+    expect(edge).toHaveAttribute('aria-hidden');
+    expect(row.querySelectorAll('[data-strip-edge]')).toHaveLength(1);
+    expect(screen.getByText('tower-p4').closest('tr')!.querySelector('[data-strip-edge]')).toHaveClass(
+      'state-waiting',
+    );
+    // Folded, the strip sits on the table's ground.
+    expect(row).not.toHaveClass('bg-state-tint');
+
+    const toggle = toggleOf('tower-p3');
+    // The toggle keeps its words, and is a 44 px target around a round plate that turns.
+    expect(toggle).toHaveAccessibleName('Show the rest of this row — 1 more column');
+    expect(toggle).toHaveClass('size-(--tap-min)', 'rounded-full');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAccessibleName('Hide the rest of this row — 1 more column');
+    expect(toggle.querySelector('svg')).toHaveClass('rotate-90');
+    expect(row).toHaveClass('state-running', 'bg-state-tint');
+    const detail = detailOf(toggle);
+    expect(detail).toHaveClass('state-running', 'bg-state-tint');
+    expect(detail).not.toHaveClass('bg-ground-deep');
+    expect(detail.querySelector('[data-strip-edge]')).toHaveClass('state-running');
+  });
+
+  it('a row the paint leaves out draws as any table’s row', () => {
+    box = 2000;
+    need = 1000;
+    mount({ rowPaint: (r) => (r.phase === 'tower-p4' ? undefined : paintOf(r)) });
+    expect(screen.getByText('tower-p4').closest('tr')!.querySelector('[data-strip-edge]')).toBeNull();
+    expect(screen.getByText('tower-p3').closest('tr')!.querySelector('[data-strip-edge]')).not.toBeNull();
+  });
+});
+
 describe('a grid with every door open', () => {
   it('has no axe violation', async () => {
     box = 440;
@@ -472,6 +527,14 @@ describe('a grid with every door open', () => {
       everything: { on: false, toggle: () => {} },
     });
     await screen.findByRole('checkbox', { name: 'Select tower-p3' });
+    fireEvent.click(toggleOf('tower-p3'));
+    await expectNoAxeViolations(container);
+  });
+
+  it('has no axe violation as strips, one open', async () => {
+    box = 440;
+    need = 400;
+    const { container } = mount({ rowPaint: () => 'needs-you', tableId: 'locks-strips-axe' });
     fireEvent.click(toggleOf('tower-p3'));
     await expectNoAxeViolations(container);
   });

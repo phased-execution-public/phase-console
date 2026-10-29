@@ -92,7 +92,25 @@ export type LedgerRow = {
    * red a later phase inherits.
    */
   own?: string[];
+  /**
+   * The phase tier ran the line in its selected form (measured-console phase
+   * 15): `command` stays the ORIGINAL text, the key; `selected`, `sample` and
+   * `covered` say what ran. A row without `tier` ran as written. The two are
+   * never one measurement — the limit, the fast gate and a baseline's reuse
+   * read only rows of their own tier (`sameTier`).
+   */
+  tier?: 'phase';
+  /** What a selected row actually ran — two selections of one line are one measurement only when this matches. */
+  ranAs?: string;
+  selected?: string[];
+  sample?: string[];
+  covered?: number;
 };
+
+/** Does a ledger row measure the line in this tier — `phase` (selected) or the full line (no tier)? */
+export function sameTier(row: Pick<LedgerRow, 'tier'>, tier: 'phase' | undefined): boolean {
+  return (row.tier ?? undefined) === tier;
+}
 
 const strings = (value: unknown): string[] | undefined =>
   (Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : undefined);
@@ -129,6 +147,11 @@ export function readLedger(file: string, slug: string): LedgerRow[] {
       ...(typeof row.tail === 'string' && row.tail ? { tail: row.tail } : {}),
       ...(typeof row.environment === 'string' && row.environment ? { environment: row.environment } : {}),
       ...(own ? { own } : {}),
+      ...(row.tier === 'phase' ? { tier: 'phase' as const } : {}),
+      ...(typeof row.ranAs === 'string' && row.ranAs ? { ranAs: row.ranAs } : {}),
+      ...(strings(row.selected) ? { selected: strings(row.selected)! } : {}),
+      ...(strings(row.sample) ? { sample: strings(row.sample)! } : {}),
+      ...(typeof row.covered === 'number' && Number.isFinite(row.covered) ? { covered: row.covered } : {}),
     });
   }
   return out;
@@ -189,11 +212,13 @@ export function resolveVerifyLimit(opts: {
   command: string;
   rows: readonly LedgerRow[];
   directive?: { minutes: number; source: 'phase' | 'plan' };
+  /** The tier the line is about to run in — its history is that tier's alone. */
+  tier?: 'phase';
 }): { ms: number; source: VerifyLimitSource; samples?: number } {
   if (opts.directive) return { ms: opts.directive.minutes * 60_000, source: opts.directive.source };
   const folded = foldCommand(opts.command);
   const samples = opts.rows
-    .filter((row) => row.command === folded && !row.timedOut && Number.isFinite(row.ms) && row.ms > 0)
+    .filter((row) => row.command === folded && sameTier(row, opts.tier) && !row.timedOut && Number.isFinite(row.ms) && row.ms > 0)
     .slice(-VERIFY_HISTORY_WINDOW);
   if (!samples.length) return { ms: VERIFY_TIMEOUT_MS, source: 'default' };
   const scaled = Math.min(VERIFY_HISTORY_FACTOR * Math.max(...samples.map((row) => row.ms)), VERIFY_TIMEOUT_CEILING_MS);
@@ -229,7 +254,7 @@ export function fastGateLines(
   for (const command of commands) {
     const folded = foldCommand(command);
     const samples = rows
-      .filter((row) => row.command === folded && !row.chain && !row.timedOut && Number.isFinite(row.ms) && row.ms > 0)
+      .filter((row) => row.command === folded && !row.tier && !row.chain && !row.timedOut && Number.isFinite(row.ms) && row.ms > 0)
       .slice(-VERIFY_HISTORY_WINDOW);
     if (!samples.length) continue;
     const worst = Math.max(...samples.map((row) => row.ms));
@@ -287,13 +312,18 @@ export function readConsoleLedgers(root: string): LedgerRow[] {
  */
 export function reusableRun(rows: readonly LedgerRow[], key: {
   command: string; tree: string; env: string; dir: string; now?: number; maxAgeMs?: number;
+  /** A selected run never stands in for the full line, nor the full line for a selection (phase 15). */
+  tier?: 'phase';
+  /** The selected form about to run — a selected row stands in only for the same selection. */
+  ranAs?: string;
 }): LedgerRow | undefined {
   const folded = foldCommand(key.command);
   const now = key.now ?? Date.now();
   const maxAge = key.maxAgeMs ?? BASELINE_REUSE_MAX_AGE_MS;
   let best: LedgerRow | undefined;
   for (const row of rows) {
-    if (row.command !== folded || row.tree !== key.tree || row.timedOut) continue;
+    if (row.command !== folded || row.tree !== key.tree || row.timedOut || !sameTier(row, key.tier)) continue;
+    if (key.tier === 'phase' && row.ranAs !== key.ranAs) continue;
     if (!row.env || row.env !== key.env || (row.dir ?? null) !== key.dir) continue;
     const at = Date.parse(row.at);
     if (!Number.isFinite(at) || now - at > maxAge || at - now > 60_000) continue;

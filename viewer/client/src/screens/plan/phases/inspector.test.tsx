@@ -29,7 +29,12 @@ import { HANDOFF_PROSE_FIELDS } from '@shared/projection.js';
 import type { LaneLiveness, PhaseRecord, PhaseView, PlanDetail } from '@/data/api';
 import { queryClientConfig } from '@/data/keys';
 import { setPrefs } from '@/lib/prefs';
-import { InspectorHost, __resetInspectorForTests } from '@/shell/panel/inspector-host';
+import {
+  InspectorHost,
+  __resetInspectorForTests,
+  useInspected,
+  type Inspected,
+} from '@/shell/panel/inspector-host';
 import { TooltipProvider } from '@/ui/tooltip';
 import { PROSE_INCLUDES } from '../tabs';
 import type { PhaseTableRow } from './model';
@@ -97,7 +102,7 @@ function inspectIn(row: PhaseTableRow) {
 }
 
 const panel = () => screen.getByRole('region', { name: 'Shell and navigation' });
-const openTab = (name: string) => fireEvent.mouseDown(screen.getByRole('tab', { name }), { button: 0 });
+const openTab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }));
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -119,6 +124,17 @@ describe('a phase in the panel — what it says about the phase as written', () 
     expect(within(panel()).getByText('Phase 04 of demo')).toBeInTheDocument();
     // …and its board word is the panel's identity row, as a dot and a word.
     expect(panel().querySelector('[data-status="done"]')).toHaveTextContent('Done');
+  });
+
+  it('asks the panel for a reading measure — facts, folds and prose, never a table’s width', () => {
+    let seen: Inspected | null = null;
+    function Probe() {
+      seen = useInspected();
+      return null;
+    }
+    render(<Probe />);
+    act(() => inspectPhase(rowOf(BOARD_PHASE)));
+    expect((seen as Inspected | null)?.measure).toBe('reading');
   });
 
   it('is keyed by plan and phase, so a grid can tell its own row is the one on show', () => {
@@ -350,7 +366,8 @@ describe('the run’s record, in eight sections (exit criterion 2)', () => {
     for (const section of PHASE_RECORD_SECTIONS) {
       const toggle = screen.getByTestId(`phase-section-${section.id}`);
       expect(toggle).toHaveAttribute('aria-expanded', 'false');
-      expect(toggle.textContent).toMatch(new RegExp(`^${section.label}\\(\\d+\\)$`));
+      // A fold strip: the name, and its count in a pill — heard as "Boarding (4)".
+      expect(toggle.textContent).toMatch(new RegExp(`^${section.label} \\(\\d+\\)$`));
       // A fold is not a cache: what it folds is not in the page until it opens.
       expect(screen.queryByText(OPENS_ONTO[section.id]!, { exact: false })).toBeNull();
     }
@@ -375,6 +392,19 @@ describe('the run’s record, in eight sections (exit criterion 2)', () => {
       expect(screen.queryByTestId(`phase-section-${section.id}`)).toBeNull();
       expect(screen.getByText(`${section.label}: nothing recorded.`)).toBeInTheDocument();
     }
+  });
+
+  it('is ONE accordion of fold strips: the sections are its folds, the arrow keys move between them', () => {
+    mountSections(FULL_RECORD);
+    const boarding = screen.getByTestId('phase-section-boarding');
+    // The trigger is the fold's head inside a heading, and several folds may be open at once.
+    expect(boarding.closest('h3')).not.toBeNull();
+    fireEvent.click(boarding);
+    fireEvent.click(screen.getByTestId('phase-section-cost'));
+    expect(boarding).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByTestId('phase-section-cost')).toHaveAttribute('aria-expanded', 'true');
+    // The sections stay addressable by id, folds and "nothing recorded" lines alike.
+    expect(boarding.closest('[data-section]')).toHaveAttribute('data-section', 'boarding');
   });
 
   it('with Everything on, every section is open — no press at all', () => {

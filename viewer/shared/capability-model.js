@@ -42,11 +42,13 @@ const word = (flag, field, act) => Object.freeze({ flag, field, act });
 
 /** Every capability flag, worst blast radius first. @type {readonly Readonly<CapabilityWord>[]} */
 export const CAPABILITY_WORDS = Object.freeze([
-  word('--allow-run', 'allowRun', 'start unattended sessions that edit a repository for hours'),
+  word('--allow-run', 'allowRun', 'start unattended sessions that edit a repo for hours; switch accounts'),
   word('--allow-terminal', 'allowTerminal', 'open a real shell in the browser'),
   word('--allow-agent', 'allowAgent', 'open interactive sessions and the plan wizard'),
   word('--allow-publish', 'allowPublish', "push a finished phase's branch where the plan allows it"),
-  word('--allow-accounts', 'allowAccounts', 'register Claude accounts, pick one per run and switch mid-run'),
+  // Picking is this flag's; a switch mid-run is a run act, `--allow-run`'s
+  // (one-pool phase 7, #323; #411).
+  word('--allow-accounts', 'allowAccounts', 'register Claude accounts and pick one per run'),
   word('--allow-mcp', 'allowMcp', 'register MCP servers and attach them to plans and phases'),
   word('--allow-webhooks', 'allowWebhooks', 'post every announcement to the addresses you register'),
   word('--allow-writes', 'allowWrites', 'scaffold plans and handoffs, record QA and take locks'),

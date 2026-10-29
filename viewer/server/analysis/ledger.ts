@@ -29,6 +29,7 @@ import { drivableBy } from '../../shared/ladder-model.js';
 import { describeActor } from '../actor.ts';
 import type { JournalEntry } from '../runner/journal.ts';
 import { consoleEnded } from '../runner/session-record.ts';
+import type { LedgerSessionDollars } from './spend.ts';
 
 /** Below this, a gap between the session lines and `spentUsd` is rounding, not a finding. */
 export const LEDGER_GAP_USD = 0.01;
@@ -312,10 +313,22 @@ export type LedgerSummary = {
    * phase 19).
    */
   unknownSessions: number;
+  /** Sessions whose dollars were read from the usage ledger rather than their journal line (phase 31). */
+  ledgerSessions?: number;
 };
 
-/** The same ledger, aggregated per plan and per account — what Insights draws. Most expensive first. */
-export function summariseLedgers(ledgers: readonly { slug: string; ledger: RunLedger }[]): LedgerSummary {
+/**
+ * The same ledger, aggregated per plan and per account — what Insights draws. Most expensive first.
+ *
+ * `dollars` is the usage ledger's own figure per session (`sessionDollarsOf`, measured-console
+ * phase 31): a session it holds is counted at the ledger's dollars, once whatever its resumes,
+ * on the accounts its rows were paid from — so "What each session cost" and Settings ▸ Accounts
+ * ▸ History agree to the cent. A session the ledger never saw keeps its journal figure.
+ */
+export function summariseLedgers(
+  ledgers: readonly { slug: string; ledger: RunLedger }[],
+  opts: { dollars?: ReadonlyMap<string, LedgerSessionDollars> } = {},
+): LedgerSummary {
   const plans = new Map<string, LedgerSummaryRow & { runIds: Set<string> }>();
   const accounts = new Map<string, LedgerSummaryRow & { runIds: Set<string> }>();
   const slot = (map: typeof plans, key: string) => {
@@ -326,22 +339,50 @@ export function summariseLedgers(ledgers: readonly { slug: string; ledger: RunLe
     }
     return row;
   };
+  const counted = new Set<string>();
   let truncatedRuns = 0;
   let unknownSessions = 0;
+  let ledgerSessions = 0;
   ledgers.forEach(({ slug, ledger }, index) => {
     if (ledger.totals.truncated) truncatedRuns++;
-    unknownSessions += ledger.sessions.filter((session) => session.costUsd == null).length;
     const runKey = ledger.runId ?? `#${index}`;
     const plan = slot(plans, slug);
     plan.runIds.add(runKey);
     for (const session of ledger.sessions) {
-      for (const row of [plan, slot(accounts, session.account ?? 'default')]) {
+      const booked = session.sessionId ? opts.dollars?.get(session.sessionId) : undefined;
+      const account = slot(accounts, session.account ?? 'default');
+      for (const row of [plan, account]) {
         row.runIds.add(runKey);
         row.sessions++;
         row.turns += session.turns ?? 0;
         row.ms += session.ms ?? 0;
-        if (session.costUsd == null) row.unknownCost++;
-        else row.costUsd += session.costUsd;
+      }
+      if (!booked) {
+        if (session.costUsd == null) {
+          unknownSessions++;
+          plan.unknownCost++;
+          account.unknownCost++;
+        } else {
+          plan.costUsd += session.costUsd;
+          account.costUsd += session.costUsd;
+        }
+        continue;
+      }
+      // A resume of a session already counted adds nothing: the ledger's figure is the whole session's.
+      if (counted.has(session.sessionId!)) continue;
+      counted.add(session.sessionId!);
+      ledgerSessions++;
+      if (booked.usd == null) {
+        unknownSessions++;
+        plan.unknownCost++;
+        account.unknownCost++;
+        continue;
+      }
+      plan.costUsd += booked.usd;
+      for (const [paidBy, usd] of Object.entries(booked.byAccount)) {
+        const payer = slot(accounts, paidBy);
+        payer.runIds.add(runKey);
+        payer.costUsd += usd;
       }
     }
   });
@@ -349,5 +390,5 @@ export function summariseLedgers(ledgers: readonly { slug: string; ledger: RunLe
     [...map.values()]
       .map(({ runIds, ...row }) => ({ ...row, runs: runIds.size, costUsd: round(row.costUsd) }))
       .sort((a, b) => b.costUsd - a.costUsd || a.key.localeCompare(b.key));
-  return { plans: finish(plans), accounts: finish(accounts), truncatedRuns, unknownSessions };
+  return { plans: finish(plans), accounts: finish(accounts), truncatedRuns, unknownSessions, ledgerSessions };
 }

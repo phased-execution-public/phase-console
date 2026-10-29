@@ -1,11 +1,8 @@
 /**
  * Issues — the estate surface Phase 15 shipped under `GET /api/issues`.
  *
- * The types are **re-declared here from the endpoint contract**, not imported
- * from `server/issues/`, exactly as `./repo.ts` mirrors the git surfaces. A view
- * shape is a wire contract, and mirroring it is what makes a server change that
- * breaks the client fail a CLIENT test instead of silently type-checking against
- * the server's own definition.
+ * The shapes are the wire's (`shared/wire/issues.js`), imported by the
+ * server's handlers and by this file alike; this file keeps only the fetches.
  *
  * Three things the shapes say that a renderer must not flatten:
  *
@@ -22,114 +19,19 @@
  */
 
 import { request, post } from '../http';
-import type { IssueCategory, IssuePlanState, IssueSeverityWord } from '@shared/issues-model.js';
+import type { IssuesPayload, IssuesRefreshBody } from '@shared/wire/issues.js';
 
-/** Why a repository's issues could not be refreshed. */
-export type IssueReason = 'no-gh' | 'no-auth' | 'rate-limited' | 'no-remote' | 'never-fetched' | 'failed';
-
-/** How old — and how trustworthy — a repository's rows are. */
-export type IssueFreshness = 'fresh' | 'stale' | 'unknown';
-
-/**
- * What kind of repository this is: the estate's own (`root`, `submodule`), or
- * one the operator ADDED to the desk by its `owner/name` (control-tower phase
- * 118) — read and refreshed like the rest, and outside this console.
- */
-export type IssueRepoKind = 'root' | 'submodule' | 'added';
-
-/**
- * What the desk reads off an issue — `shared/issues-model.js` `triageOf`,
- * joined on by the server (with the phase a local plan's `Fixes:` line names).
- */
-export interface IssueTriage {
-  category: IssueCategory;
-  severity: IssueSeverityWord;
-  plan: { state: IssuePlanState; slug?: string; phases?: number[] };
-}
-
-export interface Issue {
-  number: number;
-  /** `OPEN` | `CLOSED`, as `gh` spells it. Compared case-insensitively here. */
-  state: string;
-  title: string;
-  labels: string[];
-  assignees: string[];
-  /** Who opened it — a login. Absent when GitHub named nobody, or from a server before 6.1. */
-  author?: string;
-  /** ISO 8601, as GitHub sent it. */
-  createdAt?: string;
-  /** ISO 8601, as GitHub sent it. */
-  updatedAt: string;
-  /** ISO 8601 — a closed issue's only. */
-  closedAt?: string;
-  url: string;
-  /** Category, severity and plan state. Absent from a server before 6.1: read it through `triageOfIssue`. */
-  triage?: IssueTriage;
-  /** Present only once a body was asked for. Plain text — never rendered as markup. */
-  body?: string;
-  /** True when `body` was cut at the server's byte ceiling. */
-  bodyTruncated?: boolean;
-  /**
-   * Which plan, phase and run FILED this issue, when a session of this console
-   * did (phase 12) — joined on by the server from the plans' issue ledgers.
-   * Absent on every issue a person opened; the "filed by sessions" filter and
-   * the provenance chip read nothing else.
-   */
-  provenance?: IssueProvenance;
-}
-
-/** Where a session-filed issue came from. */
-export interface IssueProvenance {
-  slug: string;
-  phase: number;
-  runId?: string;
-  draftId: string;
-}
-
-export interface RepoIssues {
-  /** `root`, or the root-relative submodule path. The ONLY way to name one. */
-  key: string;
-  label: string;
-  /** The plan Repos-column token for this repository. */
-  scopeToken: string;
-  kind: IssueRepoKind;
-  /** Absent when this repository has no origin at all. */
-  remote?: string;
-  /** Absent unless the remote is GitHub — and then it is `owner/repo`. */
-  nameWithOwner?: string;
-  state: IssueFreshness;
-  /** Only with `unknown`. */
-  reason?: IssueReason;
-  /** Only with `unknown` — what `gh` said, already bounded by the server. */
-  detail?: string;
-  /** Epoch ms of the last SUCCESSFUL fetch. Absent if there has never been one. */
-  fetchedAt?: number;
-  /**
-   * How old that data is, measured by the SERVER against the payload's own
-   * `at`. It travels with `fetchedAt` — both present, or neither — so it is the
-   * age to render: it is immune to a browser clock that disagrees with the
-   * machine the cache is on.
-   */
-  ageMs?: number;
-  /**
-   * Epoch ms before which a refresh will not happen however often it is asked.
-   * Present ONLY with `rate-limited` — the one failure whose backoff a forced
-   * refresh honours, which is why a board must not offer a button that lies.
-   */
-  retryAt?: number;
-  /** More issues exist than the server's list cap holds (2,000 since control-tower phase 118). */
-  truncated?: boolean;
-  issues: Issue[];
-}
-
-export interface IssuesPayload {
-  /** When this payload was assembled — NOT when its data was fetched. */
-  at: number;
-  /** True while any repository is being fetched right now. */
-  refreshing: boolean;
-  /** Every repository, always — `unknown` ones included. */
-  repos: RepoIssues[];
-}
+export type {
+  Issue,
+  IssueFreshness,
+  IssueProvenance,
+  IssueReason,
+  IssueRepoKind,
+  IssueTriage,
+  IssuesPayload,
+  IssuesRefreshBody,
+  RepoIssues,
+} from '@shared/wire/issues.js';
 
 export const issuesApi = {
   /** Never fetches, so it never blocks on the network. */
@@ -142,5 +44,6 @@ export const issuesApi = {
    * 200 whose row says `no-remote`. Single-flighted server-side, so two
    * browsers pressing Refresh is one `gh` call.
    */
-  issuesRefresh: (repo?: string) => post<IssuesPayload>('/api/issues/refresh', repo ? { repo } : {}),
+  issuesRefresh: (repo?: string) =>
+    post<IssuesPayload>('/api/issues/refresh', (repo ? { repo } : {}) satisfies IssuesRefreshBody),
 };

@@ -50,6 +50,18 @@ export type CatalogEntry = {
   registryName?: string;
   source: 'curated' | 'registry';
   homepage?: string;
+  /**
+   * The lowest version this entry may run (measured-console phase 27, D8): its
+   * package spec in `args` carries `>=<min>`, and a registered server whose
+   * command does not is drawn as not pinned (`pinOf`).
+   */
+  pin?: { package: string; min: string };
+  /**
+   * What the server returns is third-party text a model will read — Context7's
+   * library docs are written by each library's owners ("ContextCrush") — so the
+   * page marks it, and a session should weigh it as a claim, never an instruction.
+   */
+  untrustedOutput?: boolean;
 };
 
 const BEARER: McpSecretRef = { kind: 'header', name: 'Authorization', template: 'Bearer {}' };
@@ -75,14 +87,21 @@ export const CURATED: Omit<CatalogEntry, 'source'>[] = [
     id: 'playwright', label: 'Playwright', category: 'Browser',
     description: 'Drive a real browser through the accessibility tree — navigate, click, fill, read '
       + 'the page. Turns "I made the change" into "I made the change and watched it render".',
-    transport: 'stdio', command: 'npx', args: ['-y', '@playwright/mcp@latest'],
+    // `--isolated` (measured-console phase 27, D8): a fresh in-memory browser
+    // profile per session, so two lanes never share one profile's cookies or
+    // lock — every console lane spawns its own server.
+    transport: 'stdio', command: 'npx', args: ['-y', '@playwright/mcp@latest', '--isolated'],
     auth: 'none', homepage: 'https://playwright.dev/docs/getting-started-mcp',
   },
   {
     id: 'context7', label: 'Context7', category: 'Docs',
     description: 'Version-specific documentation for libraries and frameworks, fetched on demand '
       + 'instead of recalled from training.',
-    transport: 'http', url: 'https://mcp.context7.com/mcp',
+    // The package, pinned at or above 2.1.3 (measured-console phase 27, D8) —
+    // the hosted endpoint carries no version a console could hold — and its
+    // output marked untrusted. npm read 2026-10-28: latest 4.4.4.
+    transport: 'stdio', command: 'npx', args: ['-y', '@upstash/context7-mcp@>=2.1.3'],
+    pin: { package: '@upstash/context7-mcp', min: '2.1.3' }, untrustedOutput: true,
     auth: 'none', homepage: 'https://context7.com',
   },
   {
@@ -515,4 +534,20 @@ function fromRegistry(row: unknown): CatalogEntry | null {
   }
 
   return null;
+}
+
+/**
+ * A registered server's pin, against the curated entry of the same id
+ * (measured-console phase 27): `held` when its command still names the
+ * package at `>=<min>`. Undefined for a server the catalog pins nothing for.
+ */
+export function pinOf(id: string, args: readonly string[] | undefined): { min: string; held: boolean } | undefined {
+  const pin = CURATED.find((entry) => entry.id === id)?.pin;
+  if (!pin) return undefined;
+  return { min: pin.min, held: (args ?? []).includes(`${pin.package}@>=${pin.min}`) };
+}
+
+/** Whether the curated entry of this id marks its output untrusted. */
+export function untrustedOutputOf(id: string): boolean {
+  return CURATED.find((entry) => entry.id === id)?.untrustedOutput === true;
 }

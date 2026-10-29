@@ -1,6 +1,7 @@
 /**
- * The navigation is **seven destinations**, the same seven in both editions
- * (7.0, quiet-console phase 3) — and that is the whole point.
+ * The navigation is **eight destinations**, the same eight in both editions
+ * (seven in 7.0, quiet-console phase 3; Your turn joined in 8.0, one-pool phase
+ * 14, #366) — and that is the whole point.
  *
  * 2.x had thirteen entries, a gate on two of them, and three lists that each
  * kept their own copy — which is how the phone once ended up unable to reach

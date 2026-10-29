@@ -75,6 +75,26 @@ export const SUPERVISOR_OUTCOMES = Object.freeze(
 );
 
 /**
+ * The decision ledger's words (measured-console phase 25,
+ * `pro/supervisor/decisions.ts`): a decision is the life of one root cause in
+ * rows — its `detection`, each `remedy` the pass applied, and the `outcome`
+ * that ended it. A remedy row's outcome is a `SUPERVISOR_OUTCOMES` word, or
+ * `refused` (pressed, and the console said no); an outcome row says how the
+ * decision ended.
+ */
+export const DECISION_STEPS = Object.freeze(/** @type {const} */ (['detection', 'remedy', 'outcome']));
+
+/** How a decision ended — the cause cleared, a person answered its card, or the remedy lifted its own hold. */
+export const DECISION_ENDINGS = Object.freeze(
+  /** @type {const} */ (['cleared', 'accepted', 'dismissed', 'extended', 'released']),
+);
+
+/** Every word a ledger row's `outcome` may hold. */
+export const DECISION_OUTCOMES = Object.freeze(
+  /** @type {const} */ ([...SUPERVISOR_OUTCOMES, 'refused', ...DECISION_ENDINGS]),
+);
+
+/**
  * The decision table: a policy and a row's class in, what the supervisor does
  * out. `observe` answers `observed` for anything it would have done; a row whose
  * class is `none` is only ever detected.
@@ -102,6 +122,9 @@ export const SUPERVISOR_EVENTS = Object.freeze(
     'supervisor.acted',
     'supervisor.escalated',
     'supervisor.policy-changed',
+    // The machine-load remedy lifted its own hold once the load settled
+    // (measured-console phase 13, #381).
+    'supervisor.released',
   ]),
 );
 
@@ -120,6 +143,10 @@ export const SUPERVISOR_SITUATIONS = Object.freeze(
     'lane-lost-at-start',
     'hot-account',
     'stale-credential',
+    // A meter that has not read for a while because its poll failed for a
+    // reason a sign-in does not lift — a 429, the network — or has not failed
+    // at all (measured-console phase 25, #387): said, never a sign-in errand.
+    'meter-stale',
     'checkout-refused',
     'replay-at-cap',
     'approval-timed-out',
@@ -158,6 +185,42 @@ export const SUPERVISOR_CAPS = Object.freeze({
   /** The machine-wide cap the fleet supervisor holds unless it says otherwise. */
   machinePerHour: 30,
 });
+
+/**
+ * The machine-load remedy's own hold (measured-console phase 13, #381). Its
+ * `hold` once stood until a person pressed Release, however soon the load
+ * fell (one-pool run 410a042587c8, 2026-10-17: held 01:16Z, load 9.4 by 03:06Z,
+ * released by hand at 01:54Z and 03:07Z). Now the remedy releases the hold IT
+ * placed — never a person's, and never one a person touched since — once the
+ * guard's reading has read clear for `settleMin` minutes: five by default,
+ * the span of the 5-minute average the guard's ceiling reads, so one quiet
+ * sample of a busy machine is not "the load fell". A remedy hold that stands
+ * `holdMaxMin` minutes with the load still high is escalated to a person
+ * (release it anyway, or leave it); `0` never escalates. A console sets
+ * either in `supervisor-policy.json` as `loadHold: { settleMin, holdMaxMin }`.
+ */
+export const SUPERVISOR_LOAD_HOLD = Object.freeze({ settleMin: 5, holdMaxMin: 60 });
+
+/** The bounds a `loadHold` setting is held to: whole minutes. */
+export const SUPERVISOR_LOAD_HOLD_MAX = Object.freeze({ settleMin: 240, holdMaxMin: 24 * 60 });
+
+/**
+ * The machine-load hold's knobs from a stored `loadHold` value: each a whole
+ * number of minutes within its bound, else the shipped default.
+ * @param {unknown} raw
+ * @returns {{ settleMin: number, holdMaxMin: number }}
+ */
+export function loadHoldSettings(raw) {
+  const value = raw && typeof raw === 'object' ? /** @type {Record<string, unknown>} */ (raw) : {};
+  /** @param {'settleMin'|'holdMaxMin'} key */
+  const knob = (key) => {
+    const n = value[key];
+    return typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= SUPERVISOR_LOAD_HOLD_MAX[key]
+      ? n
+      : SUPERVISOR_LOAD_HOLD[key];
+  };
+  return { settleMin: knob('settleMin'), holdMaxMin: knob('holdMaxMin') };
+}
 
 /** How often the pass runs on its own clock; a run's journal line also wakes it (debounced). */
 export const SUPERVISOR_PASS_MS = 60_000;
@@ -228,11 +291,21 @@ export const REMEDIES = Object.freeze([
   remedy('stale-credential', {
     category: 'accounts',
     evidence:
-      'the account the run spends has no usage reading for 30 minutes while the run works, or its login was refused, expired or changed identity',
+      'the account the run spends reads signed out, or its usage poll was refused for its credential (401, a refresh refused), or its login was refused, expired or changed identity',
     remedy: 'a re-login is a person’s act: sign the account in again, then read the accounts',
     verb: 'accounts',
     autonomy: 'escalate',
     cap: { perHour: 1 },
+  }),
+  remedy('meter-stale', {
+    category: 'accounts',
+    evidence:
+      'the account the run spends has no usage reading for 30 minutes while the run works, and its last poll was rate-limited (429), unreachable or did not fail — nothing a sign-in lifts (#387)',
+    remedy:
+      'leave it to the poll: the meter reads again when its backoff ends; a stale meter is never a sign-out, and no person is asked to sign in',
+    verb: null,
+    autonomy: 'none',
+    cap: { perHour: 0 },
   }),
   remedy('checkout-refused', {
     category: 'checkout',

@@ -15,7 +15,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -23,22 +23,17 @@ process.env.PHASE_CONSOLE_LOG = '';
 
 import { Runner } from '../server/runner/runner.ts';
 import { spawnClaude, type SpawnFn, type SpawnOutcome, type SpawnRequest, type StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const PINNED = 'claude-opus-5-5[1m]';
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-frame-pin-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-frame-pin-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -50,14 +45,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(stub, 'done'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: (phase) => writeFileSync(join(made.state, 'done'), `${phase}\n`) };
 }
 
 const journalled = (events: { event: string; data: Record<string, unknown> }[], name: string) => events
@@ -92,7 +85,7 @@ function framing(r: Repo, frames: { model: string; messageId?: string }[], seen:
 }
 
 test('#281: a pinned session whose assistant frame runs on another model is parked, the frame quoted', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance, events } = runner(r, framing(r, [
     { model: 'claude-opus-5-5', messageId: 'msg_0001' },
@@ -122,7 +115,7 @@ test('#281: frames on the pinned model — its base id, an alias the init named 
     [{ model: 'claude-opus-5-5', messageId: 'a' }],
     [{ model: 'claude-opus-5-5[1m]' }, { model: 'claude-opus-5-5' }],
   ]) {
-    const r = repo();
+    const r = stubbedPlan();
     const seen: SpawnRequest[] = [];
     const { instance, events } = runner(r, framing(r, frames, seen));
     try {
@@ -136,7 +129,7 @@ test('#281: frames on the pinned model — its base id, an alias the init named 
 });
 
 test('#281 (control): under `ladder` a fallback frame is recorded with the frame, never parked', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance, events } = runner(r, framing(r, [{ model: 'claude-opus-4-8', messageId: 'msg_9' }], seen));
   try {

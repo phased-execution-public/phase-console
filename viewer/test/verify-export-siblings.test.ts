@@ -36,6 +36,10 @@ import { exportCheckout } from '../server/runner/worktree.ts';
 import { verifyPhase, type VerifyOptions } from '../server/runner/verify.ts';
 import { Runner } from '../server/runner/runner.ts';
 import { newRun, phaseRecord, saveRun, type RunState, type VerifySummary } from '../server/runner/state.ts';
+import { repo } from './fixtures/repo.ts';
+
+/** A repository with one commit (`base`) holding `files`, on git's default branch. */
+const baseRepo = (dir: string, files: Record<string, string>): string => repo({ dir, files, branch: null, message: 'base' });
 
 const TRASH: string[] = [];
 process.on('exit', () => { for (const dir of TRASH) rmSync(dir, { recursive: true, force: true }); });
@@ -52,31 +56,18 @@ function git(cwd: string, ...args: string[]): string {
   ], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
-/** A repository with one commit holding `files`. */
-function repo(dir: string, files: Record<string, string>): string {
-  mkdirSync(dir, { recursive: true });
-  git(dir, 'init', '-q');
-  for (const [path, text] of Object.entries(files)) {
-    mkdirSync(dirname(join(dir, path)), { recursive: true });
-    writeFileSync(join(dir, path), text);
-  }
-  git(dir, 'add', '-A');
-  git(dir, 'commit', '-q', '-m', 'base');
-  return dir;
-}
-
 /**
  * The mirror's shape: a superproject whose `trade/backend` line reads its
  * sibling `trade/frontend`, the root's own `docs/` beside them.
  */
 function superproject(): { root: string; backend: string; frontend: string } {
   const base = scratch('pc-vxs-');
-  const backendOrigin = repo(join(base, 'origins', 'backend'), {
+  const backendOrigin = baseRepo(join(base, 'origins', 'backend'), {
     'parity.sh': 'cat ../frontend/VERSION\n',
     'src.txt': 'backend\n',
   });
-  const frontendOrigin = repo(join(base, 'origins', 'frontend'), { VERSION: '1.2.3\n' });
-  const root = repo(join(base, 'root'), { 'docs/notes.md': '# the root\n' });
+  const frontendOrigin = baseRepo(join(base, 'origins', 'frontend'), { VERSION: '1.2.3\n' });
+  const root = baseRepo(join(base, 'root'), { 'docs/notes.md': '# the root\n' });
   git(root, 'submodule', 'add', '-q', backendOrigin, 'trade/backend');
   git(root, 'submodule', 'add', '-q', frontendOrigin, 'trade/frontend');
   git(root, 'commit', '-q', '-m', 'mount');
@@ -116,7 +107,7 @@ test('VE-2: an export of a superproject\'s repository stands where it stood — 
 test('VE-2: a sibling the export cannot provide is `environment` — named, never a red', async () => {
   // A repository with no superproject, whose working tree has `../shared` on disk.
   const base = scratch('pc-vxe-');
-  const lone = repo(join(base, 'lone'), { 'reads-sibling.sh': 'cat ../shared/VERSION\n' });
+  const lone = baseRepo(join(base, 'lone'), { 'reads-sibling.sh': 'cat ../shared/VERSION\n' });
   mkdirSync(join(base, 'shared'));
   writeFileSync(join(base, 'shared', 'VERSION'), '9.9.9\n');
   const made = await exportCheckout(lone, git(lone, 'rev-parse', 'HEAD'));

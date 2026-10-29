@@ -27,22 +27,23 @@ is one model planning and another executing.
 The **budget** is measured in summed phase *weight*, not raw context, and defaults to **~0.2 × the
 model's effective window**, so a session's context target — 60 % of the window, the console's own
 wrap-up line — is 3 × its budget. What a session's context actually IS comes from a measured model,
-never from a multiple of its weight (control-tower phase 59, #83):
+never from a multiple of its weight (control-tower phase 59, #83; re-fitted by measured-console phase 33,
+`docs/handoffs/measured-console/reports/p33-after.json` in pe-hub):
 
 ```
-peak context ≈ boot floor + work floor + slope × weight      (shipped: 121K + 198K + 2.17 × weight)
+peak context ≈ boot floor + work floor + slope × weight      (shipped: 55K + 183K + 1.91 × weight)
 ```
 
 - the **boot floor** is the first API call's context — the system prompt, tools, CLAUDE.md, rules,
-  memory and the boot prompt, read before any work. It is per REPOSITORY (121K on one console of the
-  machine that measured it, 89K on the other), and `--session-plan` reports it as its own line,
+  memory and the boot prompt, read before any work. It is per REPOSITORY (55K on the lean skill
+  where 8.0 booted at 111K and shipped 121K), and `--session-plan` reports it as its own line,
   because it is the part a repository can shrink;
 - the **work floor** is what every phase session adds above its boot whatever its size;
 - the **slope** is what the phase's own weight adds.
 
 `boot + work` is the per-session floor, paid ONCE by every session: a batch of phases fits when
 `floor + slope × Σweight` stays under the target. The old "≈ 3 × weight" was under 107 of 108
-measured phases; the model above sits within 10 % of the median peak for every tag. Override the
+measured phases; the model above sits on the median peak of every tag it measured (M and L). Override the
 budget if your session's effective window is smaller than the model's maximum:
 
 ```bash
@@ -218,9 +219,10 @@ DOCS_ROOT=/path/to/repo scripts/phase-graph.sh checkout-rewrite
 ## 11 · What a run needs decided before it starts
 
 **Written in `## Decisions`** — the decision manifest, one row per key of a closed vocabulary
-(`permission.policy`, `permission.destructive`, `credentials`, `accounts`, `mcp`, `gates`,
+(`permission.policy`, `permission.destructive`, `issues`, `credentials`, `accounts`, `mcp`, `gates`,
 `verification.person-check`, `qa.exhausted`, `waits`, `human-acts`, `ambiguity`, `budgets`,
-`resume.on-restart`, `plan-health`, `stop`, `relay`, `announce`), each with a value, an owner, a
+`resume.on-restart`, `plan-health`, `stop`, `relay`, `announce`, `plan-approval` — nineteen, with
+`issues` after `permission.destructive`), each with a value, an owner, a
 state (`answered` · `outstanding` · `waived`), whether it blocks the run, where the answer came from
 and its evidence. Nothing asks a person mid-run: the skill's plan mode asks these once, before
 authoring, and the console refuses to start a run while a blocking row is still `outstanding`.

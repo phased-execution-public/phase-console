@@ -277,7 +277,99 @@ export const RUN_START_FIELDS = Object.freeze([
   'conflictPolicy',
   'messaging',
   'issuesMode',
+  // The session's environment (measured-console phase 6, A3 A4 A5): the run's
+  // cache A/B, how long a parked session's cache is kept warm, the model the
+  // session's subagents run, and how much of a command's output the CLI reads
+  // back. On BOTH lists — each reaches only the next spawn, so moving it mid-run
+  // changes nothing a session already boarded was started with.
+  'cacheTtlAb',
+  'keepWarmSec',
+  'subagentModel',
+  'bashMaxOutput',
+  // The platform's pieces (measured-console phase 12, B2 A10): how a person's
+  // step meets its session, and who compacts a long one. Next-phase both.
+  'humanStepMode',
+  'compaction',
+  'compactionWindow',
 ]);
+
+/* ------------------------------------------------------------------ *
+ * The platform's pieces (measured-console phase 12, B2 A10)
+ * ------------------------------------------------------------------ */
+
+/**
+ * How a person's step meets its session (`humanStepMode`, B2): `park` — the
+ * 8.0 behaviour, the declaration ends the turn and the phase parks until the
+ * person's check passes, then a resume; `defer` — the run's `PreToolUse` hook
+ * answers `defer` to the `phase-outcome.sh … needs-human` call itself, the
+ * session stops WITH the call kept, and when the check passes `--resume`
+ * re-fires the hook, which runs the call with the person's answer, so the
+ * session carries on where it stood. The default is `defer` on a CLI at
+ * `DEFER_CLI_FLOOR` or later and `park` below it (`humanStepModeFor`).
+ * @typedef {'park'|'defer'} HumanStepMode
+ * @type {readonly HumanStepMode[]}
+ */
+export const HUMAN_STEP_MODES = Object.freeze(/** @type {const} */ (['park', 'defer']));
+/** The CLI that honours a deferred tool call and resumes it (2.1.306; spike S3 measured 2.1.270). */
+export const DEFER_CLI_FLOOR = '2.1.306';
+
+/**
+ * The mode a run's sessions take: the run's own word, else `defer` on a CLI
+ * at the floor and `park` on one below it or of unknown version.
+ * @param {string | null | undefined} mode
+ * @param {string | null | undefined} cliVersion
+ * @returns {HumanStepMode}
+ */
+export function humanStepModeFor(mode, cliVersion) {
+  if (mode === 'park' || mode === 'defer') return mode;
+  return versionAtLeast(cliVersion, DEFER_CLI_FLOOR) === true ? 'defer' : 'park';
+}
+
+/**
+ * Who compacts a long session (`compaction`, A10): `console` — today's
+ * checkpoints, the 0.6 × wrap-up notice and the 0.8 × checkpoint; `native` —
+ * the CLI compacts at `compactionWindow` tokens (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`),
+ * the console's `PreCompact`/`PostCompact` hooks journal it, the 0.8 checkpoint
+ * is off and the 0.6 steer stays as a notice; `alternate` — ODD phases
+ * `native`, even ones `console`, so phase 33 reads both arms from one run.
+ * @typedef {'console'|'native'|'alternate'} CompactionMode
+ * @type {readonly CompactionMode[]}
+ */
+export const COMPACTION_MODES = Object.freeze(/** @type {const} */ (['console', 'native', 'alternate']));
+// Kept `console` by measured-console phase 33 (reports/p33-after.json
+// `compaction_by_arm`): native ran 2 phases, console 4, neither arm wrapped or
+// broke, and the dollars follow the phases' content, not the arm — too few to move it.
+export const DEFAULT_COMPACTION = /** @type {const} */ ('console');
+/** The window `native` compacts at: 350 K on a 1M model — inside the 0.6 × wrap-up line. */
+export const DEFAULT_COMPACTION_WINDOW = 350_000;
+export const COMPACTION_WINDOW_MIN = 50_000;
+export const COMPACTION_WINDOW_MAX = 1_000_000;
+
+/**
+ * The arm one phase's sessions run: `native` or `console`.
+ * @param {{ mode?: string | null, phase?: number | null }} [arm]
+ * @returns {'console'|'native'}
+ */
+export function compactionArm({ mode, phase } = {}) {
+  if (mode === 'native') return 'native';
+  if (mode === 'alternate' && Number.isInteger(phase) && Number(phase) % 2 === 1) return 'native';
+  return 'console';
+}
+
+
+/*
+ * The one vocabulary of the evaluator's the free tree owns: the status model
+ * paints it and the Run view's Verification fold reads a row's words, though
+ * only Pro's server writes one.
+ */
+/**
+ * What a judge says of ONE numbered exit criterion. Spelled `not-met` here;
+ * the judge may write `not met`, and `criterionVerdictOf` reads both.
+ * @typedef {'met'|'not-met'|'unknown'} CriterionVerdict
+ * @type {readonly CriterionVerdict[]}
+ */
+export const CRITERION_VERDICTS = Object.freeze(/** @type {const} */ (['met', 'not-met', 'unknown']));
+
 
 /**
  * The relay (Tier 2, phase 14) a run may arm: `off` — the console answers
@@ -289,6 +381,83 @@ export const RUN_START_FIELDS = Object.freeze([
  * @type {readonly RelayMode[]}
  */
 export const RELAY_MODES = Object.freeze(/** @type {const} */ (['off', 'last-resort']));
+
+/* ------------------------------------------------------------------ *
+ * The session's environment (measured-console phase 6, A3 A4 A5)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The prompt-cache lifetimes the CLI accepts (`CLAUDE_CODE_PROMPT_CACHE_TTL`,
+ * CLI 2.1.242+; the env-vars page read 2026-10-25). An API-key account's
+ * `cacheTtl` is one of these; `5m` is the CLI's own default and the shipped one.
+ * @typedef {'5m'|'1h'} CacheTtl
+ * @type {readonly CacheTtl[]}
+ */
+export const CACHE_TTLS = Object.freeze(/** @type {const} */ (['5m', '1h']));
+// Kept `5m` by measured-console phase 33 (reports/p33-after.json
+// `cache_hit_by_ttl_arm`): no session ran under an arm — the phases ran on a
+// login, which states no lifetime — so the A/B has no sample.
+export const DEFAULT_CACHE_TTL = /** @type {const} */ ('5m');
+
+/**
+ * The run's cache A/B (`cacheTtlAb`): `off` — every API-key session runs its
+ * account's `cacheTtl`; `alternate` — ODD phases run the other arm, so phase 33
+ * can read `cacheHitPct` and dollars per arm from one run.
+ * @typedef {'off'|'alternate'} CacheTtlAb
+ * @type {readonly CacheTtlAb[]}
+ */
+export const CACHE_TTL_AB_MODES = Object.freeze(/** @type {const} */ (['off', 'alternate']));
+export const DEFAULT_CACHE_TTL_AB = /** @type {const} */ ('off');
+
+/**
+ * The lifetime one API-key session runs under: its account's, or — under
+ * `alternate`, on an odd phase — the other one.
+ * @param {{ ttl?: string | null, ab?: string | null, phase?: number | null }} [arm]
+ * @returns {CacheTtl}
+ */
+export function cacheArmTtl({ ttl, ab, phase } = {}) {
+  const own = ttl === '1h' ? '1h' : DEFAULT_CACHE_TTL;
+  if (ab !== 'alternate' || !Number.isInteger(phase) || Number(phase) % 2 === 0) return own;
+  return own === '1h' ? '5m' : '1h';
+}
+
+/**
+ * The variables that say a lifetime to the CLI. `FORCE_PROMPT_CACHING_5M`
+ * overrides every other TTL source, so the 5-minute arm sets it and the hour
+ * arm names `1h` (and the force is cleared — `undefined` drops it from a spawn).
+ * @param {CacheTtl} ttl
+ * @returns {Record<string, string | undefined>}
+ */
+export function cacheTtlEnv(ttl) {
+  return ttl === '1h'
+    ? { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h', FORCE_PROMPT_CACHING_5M: undefined }
+    : { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m', FORCE_PROMPT_CACHING_5M: '1' };
+}
+
+/** The lifetime an environment says, or null when it says none (a login, not an API key). */
+export function cacheTtlOfEnv(env) {
+  if (!env) return null;
+  if (env.FORCE_PROMPT_CACHING_5M) return '5m';
+  const ttl = env.CLAUDE_CODE_PROMPT_CACHE_TTL;
+  return ttl === '1h' || ttl === '5m' ? ttl : null;
+}
+
+/**
+ * How long the console keeps a parked session's cache warm (`keepWarmSec`).
+ * 0, the default, is off: phase 33 measures a keep-warm only if an arm asks.
+ */
+export const DEFAULT_KEEP_WARM_SEC = 0;
+export const KEEP_WARM_MAX_SEC = 3600;
+
+/**
+ * `BASH_MAX_OUTPUT_LENGTH` for every session (`bashMaxOutput`): how much of a
+ * command's output the CLI reads back. The CLI's default is 30,000 and its
+ * ceiling 150,000; the console's is measured (phase 6's handoff) — the smallest
+ * ceiling above the longest tail `failureIds` needs to read every failing id.
+ */
+export const DEFAULT_BASH_MAX_OUTPUT = 32_000;
+export const BASH_MAX_OUTPUT_MIN = 8_000;
+export const BASH_MAX_OUTPUT_MAX = 150_000;
 
 /**
  * The CLI version the relay arms at — the first release whose
@@ -456,6 +625,16 @@ export const RUN_SETTINGS_FIELDS = Object.freeze([
   'resumeOnRestart',
   'relay',
   'accounts',
+  // The session's environment (measured-console phase 6) — see the start list.
+  'cacheTtlAb',
+  'keepWarmSec',
+  'subagentModel',
+  'bashMaxOutput',
+  // The platform's pieces (measured-console phase 12, B2 A10): how a person's
+  // step meets its session, and who compacts a long one. Next-phase both.
+  'humanStepMode',
+  'compaction',
+  'compactionWindow',
 ]);
 
 /** Accepted on `start` and refused on `settings` — asserted, not assumed. */
@@ -565,6 +744,16 @@ export const SETTING_EFFECTS = Object.freeze({
   resumeOnRestart: 'next-restart',
   relay: 'next-phase',
   accounts: 'now',
+  // All four reach a session's spawn — its env or its argv; the session running
+  // now keeps what it was started with.
+  cacheTtlAb: 'next-phase',
+  keepWarmSec: 'next-phase',
+  subagentModel: 'next-phase',
+  bashMaxOutput: 'next-phase',
+  // Read at a session's spawn (its env, its hooks) and at its declaration.
+  humanStepMode: 'next-phase',
+  compaction: 'next-phase',
+  compactionWindow: 'next-phase',
 });
 
 /**
@@ -597,6 +786,9 @@ export const PHASE_OPTION_FIELDS = Object.freeze([
   'mcpServers',
   'mcpOff',
   'mcpPolicy',
+  // The plugin kinds a phase's session loads beside the plan's (measured-console
+  // phase 27): a phase's alone — no run-wide twin, since a set is never unioned across phases.
+  'plugins',
   'autoApprove',
   // A phase may carve itself out of the run's answer in EITHER direction, like
   // `autoApprove` and unlike `skillsOff`: "fan out here" and "not here" are
@@ -649,8 +841,9 @@ export function resolvePermissionMode({ retry, run, planPhase, planLine, runDefa
 /**
  * Where a phase's model or effort came from: `retry` (this attempt's Retry with
  * edits) · `run` (this run's per-phase choice) · `plan` (the plan's own bullet) ·
- * `default` (the run's default), strongest first.
- * @typedef {'retry'|'run'|'plan'|'default'} PhaseChoiceSource
+ * `default` (the run's default) · `account` (the paying account's own default,
+ * EI-21), strongest first.
+ * @typedef {'retry'|'run'|'plan'|'default'|'account'} PhaseChoiceSource
  */
 
 /**
@@ -660,7 +853,9 @@ export function resolvePermissionMode({ retry, run, planPhase, planLine, runDefa
  * The order is the runner's and is never rearranged: the attempt, then the run's
  * per-phase choice, because both are more recent and more specific than the plan;
  * then the plan, the durable statement of what the phase needs; then the run's
- * default. `source` is undefined only when nothing answered, which leaves the
+ * default; last the account's own `defaultModel` / `defaultEffort` (measured-console
+ * phase 17, EI-21), which answers only when neither the run nor the phase names
+ * one. `source` is undefined only when nothing answered, which leaves the
  * machine's own default.
  *
  * ONE function with two readers (autopilot-token-drain phase 5): the runner boards
@@ -668,14 +863,15 @@ export function resolvePermissionMode({ retry, run, planPhase, planLine, runDefa
  * They were two copies of one rule, and run `deadaff9` launched with a form that
  * never said the plan's `high` sat below the run default's `max`. An empty string is
  * "no choice here", the per-phase select's own empty value.
- * @param {{ retry?: string, run?: string, plan?: string, fallback?: string }} [levels]
+ * @param {{ retry?: string, run?: string, plan?: string, fallback?: string, account?: string }} [levels]
  * @returns {{ value: string | undefined, source: PhaseChoiceSource | undefined }}
  */
-export function resolvePhaseChoice({ retry, run, plan, fallback } = {}) {
+export function resolvePhaseChoice({ retry, run, plan, fallback, account } = {}) {
   if (retry) return { value: retry, source: 'retry' };
   if (run) return { value: run, source: 'run' };
   if (plan) return { value: plan, source: 'plan' };
   if (fallback) return { value: fallback, source: 'default' };
+  if (account) return { value: account, source: 'account' };
   return { value: undefined, source: undefined };
 }
 

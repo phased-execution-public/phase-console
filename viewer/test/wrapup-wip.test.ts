@@ -117,7 +117,7 @@ async function wrapup(
   const texts: { purpose: string; text: string; cwd: string }[] = [];
   let sessions = 0;
   let seenAtReboard: unknown;
-  // eslint-disable-next-line prefer-const
+   
   let runner: Runner;
   const spawn = async (req: { env?: Record<string, string> }) => {
     sessions += 1;

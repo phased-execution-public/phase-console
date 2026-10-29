@@ -47,7 +47,7 @@ export const SIZING_ENV_FALLBACK: Sizing = {
   S: 15_000, M: 40_000, L: 90_000,
   budgetHaiku: 40_000, budgetBig: 200_000, budgetDefault: 40_000,
   budget1m: 200_000,
-  bootFloor: 121_000, workFloor: 198_000, slopePct: 217, targetPct: 60,
+  bootFloor: 55_000, workFloor: 183_000, slopePct: 191, targetPct: 60,
   sessions: {
     S: { noWrapX100: 169, wrapX100: 200, wrapPct: 7 },
     M: { noWrapX100: 146, wrapX100: 278, wrapPct: 15 },

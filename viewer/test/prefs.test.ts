@@ -10,6 +10,7 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
@@ -158,6 +159,10 @@ test('sanitiseAutomation is the single coercion table', () => {
     // execute a writing command against a repository nobody is watching (SLF-8).
     watchMintedCmdRefs: false,
     mcpPolicy: 'continue',
+    // What an unattended session loads (measured-console phase 11): 9.0's own
+    // tree by default, no personal plugin until a person switches one on, and
+    // no knowledge-graph tool until one is named.
+    autopilotLoads: 'console-set', autopilotPlugins: [], graphTool: '',
     ladderPerPhaseRungs: 3, ladderPerPhaseUsd: 100, ladderPerRunRungs: 10, ladderPerRunUsd: 400, ladderPerDayUsd: 600,
     // The start ceiling (phase 7): forty automatic starts and $250 per sliding hour.
     ceilingStartsPerHour: 40, ceilingUsdPerHour: 250,
@@ -452,6 +457,8 @@ test('every automation preference the loader accepts can also be SET', () => {
     // `stop` is a free-text key: one line, kept since phase 12's editor.
     policy: { gates: 'operator', 'qa.exhausted': 'halt', stop: 'keep-going; page me' },
     relayRules: [{ id: 'AskUserQuestion:colour:*:*', tool: 'AskUserQuestion', key: 'colour:*', profile: '*', answer: 'Blue' }],
+    // measured-console phase 11: one personal plugin, as name@marketplace.
+    autopilotPlugins: ['mine@my-market'],
   };
   // 🔴 **A string used to flip to ITSELF**, so `same(flipped[key], after[key])`
   // was trivially true for every word-valued key and this test proved nothing
@@ -481,6 +488,10 @@ test('every automation preference the loader accepts can also be SET', () => {
     conflictPolicy: 'park',
     messaging: 'off',
     issuesMode: 'draft',
+    // What an unattended session loads (measured-console phase 11): the
+    // operator's config dir instead, and a graph tool named by its command.
+    autopilotLoads: 'operator-config',
+    graphTool: 'kgtool',
   };
   const flipped: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(loaded)) {

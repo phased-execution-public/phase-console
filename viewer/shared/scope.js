@@ -197,7 +197,7 @@ export function scopesIntersect(a, b) {
  * still refuses the same tree and a nested one (console-parallel-repaint P1,
  * W3 — the serialisation P6 had accepted as a tradeoff). `sameUnitOfWork`
  * outranks all of this in the scheduler, so two runs of ONE plan never carve.
- * The CLAIM_TABLE rows in `test/scope.test.ts` and `tests/unit/lock-scope.bats`
+ * The CLAIM_TABLE rows in `test/scope.test.ts` and `tests/unit/lock-claim.bats`
  * pin every case.
  *
  * 🔑 **A RUN's hold on a shared tree is not a lock, and one rule flips for it**

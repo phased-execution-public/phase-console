@@ -9,9 +9,11 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,8 +23,11 @@ process.env.PHASE_CONSOLE_LOG = '';
 process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), 'pc-sbx-'));
 process.env.XDG_CONFIG_HOME = join(process.env.XDG_STATE_HOME, 'config');
 
-const { listSkills, forgetSkills, skillDirective, claudeHome, installedPlugins } =
-  await import('../server/skills.ts');
+const {
+  listSkills, forgetSkills, skillDirective, claudeHome, installedPlugins, qualifySkill,
+  knowledgeGraphDirective, graphFreshness, freshGraphs,
+} = await import('../server/skills.ts');
+const { refreshGraphs } = await import('../server/runner/graph-refresh.ts');
 
 function file(path: string, body: string): void {
   mkdirSync(join(path, '..'), { recursive: true });
@@ -151,40 +156,120 @@ test('a missing home is empty, not an error', () => {
   forgetSkills();
 });
 
-test('the directive is additive, deduped, and silent when nothing was chosen', () => {
+test('the directive is additive, deduped, a Skill-tool call per skill, and silent when nothing was chosen', () => {
   assert.equal(skillDirective([]), '');
   assert.equal(skillDirective(['', '']), '');
   const text = skillDirective(['investigate', 'toolkit:deploy', 'investigate']);
-  assert.match(text, /\/investigate, \/toolkit:deploy/);
-  assert.doesNotMatch(text, /\/investigate.*\/investigate/, 'named once, however many times it was asked for');
+  // The engine's line's shape (measured-console phase 11): one call per skill, by the name the tool takes.
+  assert.match(text, /Call the Skill tool with "investigate"\. Call the Skill tool with "toolkit:deploy"\./);
+  assert.doesNotMatch(text, /"investigate"[\s\S]*"investigate"/, 'named once, however many times it was asked for');
   // It must read as an addition. The plan's own skills line comes from the
   // engine, and nothing here may look like it replaced it.
   assert.match(text, /in addition to any the plan names/);
+  // A bare name the console's set carries once is qualified by its plugin; two carriers leave it bare.
+  assert.match(skillDirective(['tdd'], { loaded: ['mattpocock-skills:tdd', 'superpowers:brainstorming'] }), /"mattpocock-skills:tdd"/);
+  assert.match(skillDirective(['tdd'], { loaded: ['a:tdd', 'b:tdd!'] }), /"tdd"/);
+  assert.equal(qualifySkill('x:y', ['z:y']), 'x:y', 'a qualified name is the caller\'s');
 });
 
-test('naming a skill also asks what to do with a knowledge graph, if there is one', () => {
-  // A skill that keeps durable per-repository state is worth almost nothing if
-  // it is only ever written. Sessions named one and did neither, because nothing
-  // asked — so the ask rides along with every list of skills.
-  const text = skillDirective(['some-graph-skill']);
-  assert.match(text, /knowledge graph/i);
-  assert.match(text, /session START/i, 'query it when not knowing costs the most');
-  assert.match(text, /before your handoff/i, 'refresh it while what changed is still known');
-  assert.match(text, /from inside that repository/i, 'a query from the wrong tree answers about the wrong tree');
+test('the knowledge-graph directive is no longer hung off a list of skills: it names the fresh graphs, and no tool', () => {
+  assert.doesNotMatch(skillDirective(['some-graph-skill']), /knowledge graph/i);
+  assert.equal(knowledgeGraphDirective([]), '');
+  const text = knowledgeGraphDirective(['phased-execution', 'phased-execution']);
+  assert.match(text, /knowledge graph newer than the last landing is kept in `phased-execution`:/);
+  assert.equal(text.match(/phased-execution/g)?.length, 1, 'each repository once');
+  assert.match(text, /session START/, 'query it when not knowing costs the most');
+  assert.match(text, /before your handoff/, 'refresh it while what changed is still known');
+  assert.match(text, /from inside that repository/, 'a query from the wrong tree answers about the wrong tree');
+  assert.doesNotMatch(text, /kgtool|-out\b/, 'the directive names the repositories, never a tool');
 });
 
-test('the knowledge-graph ask is conditional, and names no particular skill', () => {
-  // A console with no such skill installed must carry a sentence that is simply
-  // vacuous — never an instruction to invoke something that is not there.
-  const text = skillDirective(['investigate']);
-  assert.match(text, /^[\s\S]*If a listed skill maintains/m);
-  // Whatever this machine happens to call its graph tool, the public text does
-  // not know: only "a listed skill" and only "if".
-  assert.doesNotMatch(text, /\/(?!investigate)[a-z-]+ (?:will|must) (?:query|update)/i);
+/** The stub knowledge-graph tool these tests name — the repository names no real one (scrub.sh). */
+const TOOL = 'kgtool';
+
+/** A git repository with one commit at `committedAt` (seconds) and, when asked, a graph written at `graphAt`. */
+function graphRepo(committedAt: number, graphAt?: number): { dir: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-graph-'));
+  const env = { ...process.env, GIT_AUTHOR_DATE: `${committedAt} +0000`, GIT_COMMITTER_DATE: `${committedAt} +0000` };
+  execFileSync('git', ['init', '-q', dir], { env });
+  writeFileSync(join(dir, 'a.txt'), 'a\n');
+  execFileSync('git', ['-C', dir, 'add', 'a.txt'], { env });
+  execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'a'], { env });
+  if (graphAt !== undefined) {
+    mkdirSync(join(dir, `${TOOL}-out`), { recursive: true });
+    writeFileSync(join(dir, `${TOOL}-out`, 'graph.json'), '{}');
+    utimesSync(join(dir, `${TOOL}-out`, 'graph.json'), graphAt, graphAt);
+  }
+  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+test('the graph directive\'s freshness rule: absent when the graph is older than the last landing, present when newer, absent with no graph or no tool named', () => {
+  const landed = 1_800_000_000;
+  const stale = graphRepo(landed, landed - 3600);
+  const fresh = graphRepo(landed, landed + 3600);
+  const none = graphRepo(landed);
+  try {
+    assert.equal(graphFreshness(stale.dir, TOOL).fresh, false);
+    assert.equal(graphFreshness(stale.dir, TOOL).landedAtMs, landed * 1000);
+    assert.equal(graphFreshness(fresh.dir, TOOL).fresh, true);
+    assert.equal(graphFreshness(none.dir, TOOL).fresh, false);
+    assert.deepEqual(freshGraphs([stale.dir, fresh.dir, none.dir, fresh.dir], TOOL), [fresh.dir]);
+    assert.equal(knowledgeGraphDirective(freshGraphs([stale.dir, none.dir], TOOL)), '', 'no fresh graph, no directive');
+    // The setting off (the shipped default) or not a command name: nothing is fresh, so nothing is said.
+    assert.deepEqual(freshGraphs([fresh.dir], ''), []);
+    assert.deepEqual(freshGraphs([fresh.dir], '../kgtool'), []);
+  } finally { stale.cleanup(); fresh.cleanup(); none.cleanup(); }
 });
 
-test('with nothing chosen there is no directive at all, graph ask included', () => {
-  // The paragraph hangs off a list of skills. With no list there is nothing it
-  // could be about, and a bare instruction in a boot prompt is noise.
-  assert.equal(skillDirective([]), '');
+test('a landing runs `<tool> update .` (a stub tool) only where a graph is kept — after it, the graph is fresh again; no tool on PATH, no tool named or a failure is never a throw', async () => {
+  const landed = Math.floor(Date.now() / 1000) - 60;
+  const kept = graphRepo(landed, landed - 3600);
+  const bare = graphRepo(landed);
+  const bin = mkdtempSync(join(tmpdir(), 'pc-kgtool-bin-'));
+  try {
+    // A tool that does what an `update` does to the file: rewrites graph.json, from inside the repository.
+    writeFileSync(join(bin, TOOL), `#!/usr/bin/env bash\n[ "$1" = update ] || exit 9\necho "$PWD $*" >> "$KG_LOG"\n: > ${TOOL}-out/graph.json\n`, { mode: 0o755 });
+    const log = join(bin, 'calls.log');
+    assert.equal(graphFreshness(kept.dir, TOOL).fresh, false, 'stale before the landing');
+    const ran = await refreshGraphs([kept.dir, bare.dir], { tool: TOOL, env: { PATH: `${bin}:/usr/bin:/bin`, KG_LOG: log } });
+    assert.deepEqual(ran.map((one) => [one.repo === kept.dir ? 'kept' : 'bare', one.result]), [['bare', 'no-graph'], ['kept', 'updated']]);
+    assert.match(readFileSync(log, 'utf8'), /update \./, 'the tool\'s own update verb, from inside the repository');
+    assert.ok(!readFileSync(log, 'utf8').includes(bare.dir), 'a repository with no graph is never given one');
+    assert.equal(graphFreshness(kept.dir, TOOL).fresh, true, 'fresh after the landing refreshed it');
+    assert.deepEqual(await refreshGraphs([kept.dir], { tool: '' }), [], 'no tool named: nothing at all');
+    assert.deepEqual((await refreshGraphs([kept.dir], { tool: TOOL, env: { PATH: '/nowhere' } })).map((one) => one.result), ['no-tool']);
+    const failed = await refreshGraphs([kept.dir], { tool: TOOL, env: { PATH: bin }, run: async () => ({ code: 3, timedOut: false, stderr: 'boom\n' }) });
+    assert.deepEqual(failed.map((one) => [one.result, one.detail]), [['failed', 'boom']]);
+    const slow = await refreshGraphs([kept.dir], { tool: TOOL, env: { PATH: bin }, run: async () => ({ code: null, timedOut: true, stderr: '' }) });
+    assert.equal(slow[0]!.result, 'timed-out');
+  } finally { kept.cleanup(); bare.cleanup(); rmSync(bin, { recursive: true, force: true }); }
+});
+
+test('one reader of installed_plugins.json: skills.ts and skill-copy.ts agree on a version-1 and a version-2 registry', async () => {
+  // measured-console phase 10 (EI-26): the two readers had two ideas of the
+  // file's shape — skills.ts read only version 2's list, so a version-1
+  // registry listed no plugin skills at all. Both now read through
+  // shared/installed-plugins.js; one fixture per shape, both readers asked.
+  const { readSkillCopy } = await import('../server/skill-copy.ts');
+  const { parseInstalledPlugins } = await import('../shared/installed-plugins.js');
+  const dir = mkdtempSync(join(tmpdir(), 'pc-reader-'));
+  const sha = 'a'.repeat(40);
+  for (const shape of [1, 2] as const) {
+    const home = join(dir, `v${shape}`);
+    const install = join(home, 'plugins', 'cache', 'phased-execution-public', 'phased-execution', sha.slice(0, 12));
+    skill(install, 'phased-execution', 'the skill itself');
+    const record = { scope: 'user', installPath: install, version: sha.slice(0, 12), gitCommitSha: sha, lastUpdated: '2026-10-25T00:00:00.000Z' };
+    file(join(home, 'plugins', 'installed_plugins.json'), JSON.stringify({
+      version: shape,
+      plugins: { 'phased-execution@phased-execution-public': shape === 1 ? record : [record] },
+    }));
+    const listed = installedPlugins(home);
+    assert.deepEqual(listed, [{ plugin: 'phased-execution', path: install }], `skills.ts reads the version-${shape} registry`);
+    const copy = readSkillCopy(home);
+    assert.equal(copy.install?.installPath, install, `skill-copy.ts reads the version-${shape} registry`);
+    assert.equal(copy.install?.commit, sha);
+    assert.equal(parseInstalledPlugins(JSON.stringify({ version: shape, plugins: {} })).fileVersion, shape);
+  }
+  assert.match(parseInstalledPlugins('{').parseError ?? '', /./, 'a file that does not parse is said, never thrown');
+  rmSync(dir, { recursive: true, force: true });
 });

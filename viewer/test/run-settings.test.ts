@@ -478,3 +478,32 @@ test('a "(1M window)" after the model name reads as `[1m]` — the bullet, the T
   );
   assert.equal(plan.sessionBudget.targetModel, 'claude-opus-5-5[1m]', 'the plan\'s own line keeps the window it named');
 });
+
+test('the session\'s environment (measured-console phase 6): newRun stores only a word that is not the default, applySettings moves and clears each', () => {
+  const fresh = newRun({ slug: 'x', root: '/tmp/x', cacheTtlAb: 'off', keepWarmSec: 0 });
+  for (const field of ['cacheTtlAb', 'keepWarmSec', 'subagentModel', 'bashMaxOutput']) {
+    assert.equal(field in fresh, false, `${field} at its default is no key`);
+  }
+  const chosen = newRun({ slug: 'x', root: '/tmp/x', cacheTtlAb: 'alternate', keepWarmSec: 120, subagentModel: 'haiku', bashMaxOutput: 40_000 });
+  assert.deepEqual(
+    [chosen.cacheTtlAb, chosen.keepWarmSec, chosen.subagentModel, chosen.bashMaxOutput],
+    ['alternate', 120, 'haiku', 40_000],
+  );
+  const state = newRun({ slug: 'x', root: '/tmp/x' });
+  applySettings(state, { cacheTtlAb: 'alternate', keepWarmSec: 600, subagentModel: 'sonnet', bashMaxOutput: 64_000 });
+  assert.deepEqual(
+    [state.cacheTtlAb, state.keepWarmSec, state.subagentModel, state.bashMaxOutput],
+    ['alternate', 600, 'sonnet', 64_000],
+  );
+  // Out of range or off the vocabulary is the default again, never a stored typo.
+  applySettings(state, { keepWarmSec: 99_999, bashMaxOutput: 10 });
+  assert.equal('keepWarmSec' in state, false);
+  assert.equal('bashMaxOutput' in state, false);
+  applySettings(state, { cacheTtlAb: null, subagentModel: null });
+  assert.equal('cacheTtlAb' in state, false);
+  assert.equal('subagentModel' in state, false);
+  for (const field of ['cacheTtlAb', 'keepWarmSec', 'subagentModel', 'bashMaxOutput']) {
+    assert.ok((RUN_START_FIELDS as readonly string[]).includes(field), `a start may choose ${field}`);
+    assert.ok((RUN_SETTINGS_FIELDS as readonly string[]).includes(field), `a running run may change ${field}`);
+  }
+});

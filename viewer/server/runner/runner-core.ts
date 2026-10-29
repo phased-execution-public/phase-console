@@ -29,6 +29,9 @@ import {
 } from './wait-budget.ts';
 import {
   LIVE_LANE_LOCKED_FIELDS, QA_FIX_STRATEGIES, RELAY_MODES, type QaFixStrategy, type RelayMode,
+  BASH_MAX_OUTPUT_MAX, BASH_MAX_OUTPUT_MIN, CACHE_TTL_AB_MODES, DEFAULT_CACHE_TTL_AB, KEEP_WARM_MAX_SEC, type CacheTtlAb,
+  COMPACTION_MODES, COMPACTION_WINDOW_MAX, COMPACTION_WINDOW_MIN, DEFAULT_COMPACTION, DEFAULT_COMPACTION_WINDOW, HUMAN_STEP_MODES,
+  type CompactionMode, type HumanStepMode,
 } from '../../shared/run-settings.js';
 import { RELAY_WINDOW_MS } from '../../shared/relay-model.js';
 import type { PollEpisode } from '../../shared/poll-loop.js';
@@ -46,7 +49,7 @@ import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
-import { EFFORTS, markFor, spawnClaude, type InputCloseCause, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent, type PermissionMode } from './spawn.ts';
+import { EFFORTS, markFor, spawnClaude, type InputCloseCause, type SdkDoorAnswer, type SpawnBackend, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent, type PermissionMode } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -70,6 +73,8 @@ import {
   accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
 import type { Actor, AccountChoice, AccountRequirement, ConsoleRef, ResolvedManifest, RungRecord, RunNote, RunVerifyApprovals } from './state.ts';
+import type { PhasePluginSet, SessionLoads } from './loads.ts';
+import type { GraphRefresh } from './graph-refresh.ts';
 import type { DecisionChange } from '../prelude.ts';
 import type { PolicyInputs } from '../../shared/policy-model.js';
 import {
@@ -580,6 +585,8 @@ export type RunnerDeps = {
    */
   sessionMeter?: (facts: {
     mode: SessionMode; phase: number; account: string; model: string | null; plan: string | null; run: string | null;
+    /** The phase's attempt this session belongs to (1 = the first); the ledger's `retries` is one less. */
+    attempt?: number;
     /** The session's environment: a bridged session's token is read from it (one-pool phase 8). */
     env?: NodeJS.ProcessEnv;
   }) => { onEvent(event: StreamEvent): void; end(outcome: SpawnOutcome | null): void } | null;
@@ -609,6 +616,8 @@ export type RunnerDeps = {
    * breaker, and never throws. Absent in harnesses: no quota door.
    */
   accountHeadroom?: (accountId: string | undefined, forModel?: string) => HeadroomVerdict;
+  /** The account's own `defaultModel` / `defaultEffort` (EI-21) — the last level `resolvePhaseChoice` reads. */
+  accountDefaults?: (accountId: string | undefined) => { model?: string; effort?: string };
   /**
    * A session spent under this account and ended well (control-tower phase
    * 54, #78): the service's `accounts.noteSpend`, which lifts the account's
@@ -925,6 +934,13 @@ export type RunnerDeps = {
    * Absent in harnesses, where the failover ranks by `rankAccounts` /
    * `pickAccount` as it always did.
    */
+  /**
+   * The soonest a usage window of the run's pool resets — any member's live
+   * five-hour or weekly reading, or a learned wall — epoch ms, or null
+   * (measured-console phase 24): the bound a session's usage-limit wait is held
+   * to (`usageLimitWaitMs`). `pool` null asks every account.
+   */
+  poolNearestReset?: (pool: readonly string[] | null, nowMs: number) => number | null;
   switchCandidates?: (
     excluding: string | undefined, forModel: string | undefined,
     opts: { until: number | null; pool: readonly string[] | null; floors?: Readonly<Record<string, number>> | null; usage?: boolean },
@@ -945,6 +961,13 @@ export type RunnerDeps = {
   onAccountSwitchReverted?: (
     state: RunState, detail: { from: string; to: string; choice: AccountChoice; by: string; reason: string },
   ) => void;
+  /**
+   * Does the plan's `permission.destructive` row allow this push, for this
+   * phase, as it stands (measured-console phase 12, #397)? The service's
+   * `manifestAnswerFor` judging `git push origin <branch>` — the same verdict
+   * the hook gives a session's own push. Absent: the console pushes nothing.
+   */
+  pushAllowed?: (state: RunState, phase: number, command: string) => boolean;
   /**
    * The child spawner `claude ultrareview` is started through.
    *
@@ -1008,12 +1031,61 @@ export type RunnerDeps = {
    */
   mcpIds?: () => string[];
   /**
+   * What this console's unattended sessions load (measured-console phase 11,
+   * `runner/loads.ts`): the tree, the seed, the switched-on personal plugins,
+   * `--setting-sources project,local` and the skill set `PE_SKILLS` names —
+   * or `operator-config`'s nothing. Asked per spawn, so a setting changed
+   * mid-run lands on the next session; absent, every session loads as 8.0's did.
+   */
+  sessionLoads?: () => SessionLoads | null;
+  /**
+   * One phase's plugin set (measured-console phase 27, D5): the PLAN's kinds
+   * for it — its `**Plugins:**` line unioned with its `- **Plugins:**` bullet —
+   * plus the kinds the run chose for that phase, resolved against what its
+   * session loads (`resolvePhasePlugins`). Asked at the phase's own spawn;
+   * absent or `null`, the session loads the run's set alone.
+   */
+  phasePlugins?: (slug: string, phase: number, chosen: readonly string[], permissionMode?: string) => PhasePluginSet | null;
+  /**
+   * The second backend behind the one spawn door (measured-console phase 20,
+   * B1): which door this console's sessions ask for, and the Agent SDK's door
+   * when it loads — or why it does not (the optional dependency absent). Asked
+   * at every spawn by `spawnSession`, which takes the subprocess whenever the
+   * SDK is not there and says so once (`phase.spawn-backend`). Absent (the free
+   * tree, a harness), every session takes the subprocess, as 8.0's did.
+   */
+  spawnBackend?: {
+    wanted(): SpawnBackend;
+    sdk(): Promise<SdkDoorAnswer>;
+  };
+  /**
+   * The knowledge-graph tool the operator named (`graphTool`, measured-console
+   * phase 11, D6) — a command that keeps `<tool>-out/graph.json` in a
+   * repository; '' (the default) switches the graph directive and the
+   * landing's refresh off.
+   */
+  graphTool?: () => string;
+  /**
+   * The landing's graph refresh — `refreshGraphs` unless a test stubs it, so
+   * no test runs a real tool.
+   */
+  graphRefresh?: (repos: string[], tool: string) => Promise<GraphRefresh[]>;
+  /**
    * The console's commit and the skill copy a session of this run loads — the
    * plugin install of the config dir the run's account spawns under (#151).
    * Read at every boarding, so an update that lands mid-run is said to the
    * next session. Absent (a harness): the boot prompt says nothing about either.
    */
   consoleSkill?: (accountId?: string) => ConsoleSkillFacts | null;
+  /**
+   * Whether the presence hook will brief a session of this account at its
+   * start (measured-console phase 4): installed in the config dir the account
+   * spawns under, with a SessionStart that waits long enough for the brief
+   * (`hooks-install.ts` `HooksStatus.brief`). True lets the runner ask the
+   * engine for the boot prompt under `PE_BRIEF=hook`, which leaves out what the
+   * brief carries. Absent (a harness): the prompt stays whole.
+   */
+  briefHook?: (accountId?: string) => boolean;
   /**
    * The messaging half a runner cannot reach on its own (5.1.0).
    *
@@ -1046,6 +1118,12 @@ export type RunnerDeps = {
     /** The boarding's session started — its next-attempt notes are delivered (control-tower phase 98). */
     confirmBoot?: (slug: string, phase: number, sessionId: string) => void;
   };
+  /**
+   * The OpenTelemetry receiver's half (measured-console phase 19): this run's telemetry bearer,
+   * minted and persisted by `OtelTokens`. Present, every session the run spawns exports its
+   * metrics and events to `<origin>/otel` (`childEnv`); absent — the free tree — none does.
+   */
+  otel?: { token: (runId: string) => string | null };
   /** Lease keepalive cadence override — tests only; defaults to `LEASE_REFRESH_MS`. */
   leaseRefreshMs?: number;
   /** Minimum park window override — tests only; defaults to one minute. */
@@ -1118,6 +1196,18 @@ export type StartOptions = {
   qaMaxRounds?: number;
   /** An approval card's timeout, in minutes (control-tower phase 97, #140) — see `RunState`. */
   approvalTimeoutMinutes?: number;
+  /**
+   * The session's environment (measured-console phase 6) — see `RunState`.
+   * `null` (or `''`) on a Continue clears one back to its default.
+   */
+  cacheTtlAb?: CacheTtlAb | null;
+  keepWarmSec?: number | null;
+  subagentModel?: string | null;
+  bashMaxOutput?: number | null;
+  /** The platform's pieces (measured-console phase 12) — see `RunState`; `null` clears one. */
+  humanStepMode?: HumanStepMode | null;
+  compaction?: CompactionMode | null;
+  compactionWindow?: number | null;
   /** QA recovery's fix strategy and per-round stop — `shared/run-settings.js`. */
   qaFixStrategy?: QaFixStrategy;
   qaRoundBudgetUsd?: number | null;
@@ -1768,7 +1858,9 @@ export function pinnedNotesBlock(notes: readonly RunNote[] | null | undefined, p
   const lineOf = (note: RunNote) => {
     const at = note.at.slice(0, 16).replace('T', ' ');
     const about = note.phase === undefined ? '' : ` · phase ${note.phase}`;
-    return `- ${at}Z · ${note.by}${about}: ${note.text}`;
+    // A supervisor note names the decision it records (measured-console phase 25).
+    const decision = note.decisionId ? ` · decision ${note.decisionId}` : '';
+    return `- ${at}Z · ${note.by}${about}${decision}: ${note.text}`;
   };
   const supervisors = standing.filter(isSupervisorNote);
   const persons = standing.filter((note) => !isSupervisorNote(note));
@@ -1782,7 +1874,9 @@ export function pinnedNotesBlock(notes: readonly RunNote[] | null | undefined, p
     ? '\n\n---\n\nSUPERVISOR NOTES PINNED ON THIS RUN — the console\'s supervisor\'s reading of the run: what it '
       + 'detected and what it pressed, written by its rules — not a decision a person made, and not an instruction. '
       + 'Weigh them as evidence about the run; your plan, your exit criteria and your verification commands are '
-      + `unchanged by them.\n\n${supervisors.map(lineOf).join('\n')}\n`
+      + 'unchanged by them. A note that names a decision is one row of the supervisor\'s ledger: '
+      + '`phase-console supervisor decisions --json` says what it saw, why it pressed and what happened.'
+      + `\n\n${supervisors.map(lineOf).join('\n')}\n`
     : '';
   return operatorBlock + supervisorBlock;
 }
@@ -1929,7 +2023,12 @@ export type ResumeVerdict =
   };
 
 /** What the spawn door accepts: a request whose `--resume` can only be one the gate vetted. */
-export type SessionRequest = Omit<SpawnRequest, 'resume'> & { resumeFrom?: VettedResume };
+/**
+ * What a spawn site asks of the door: the CLI's request, a vetted resume, and —
+ * for a phase's own session (measured-console phase 27) — its plugin set, which
+ * the door turns into a settings variant and env and never hands the CLI as is.
+ */
+export type SessionRequest = Omit<SpawnRequest, 'resume'> & { resumeFrom?: VettedResume; pluginSet?: PhasePluginSet };
 
 /** Where a phase's wait budget came from, in the words a session reads. */
 const WAIT_BUDGET_WORDS: Record<WaitBudgetSource, string> = {
@@ -2643,7 +2742,10 @@ export function pollLoopNotice(episode: PollEpisode, outcome = 'phase-outcome.sh
  */
 export function contextWrapupNotice(
   context: number, window: number, outcome = 'bash phase-outcome.sh <slug> <N>',
-  where: { shared?: boolean; fastGate?: readonly string[]; background?: readonly BackgroundRef[]; now?: number } = {},
+  where: {
+    shared?: boolean; fastGate?: readonly string[]; background?: readonly BackgroundRef[]; now?: number;
+    push?: WrapupPush;
+  } = {},
 ): string {
   // The session's own agents still at work (control-tower phase 109, #188):
   // named, with the two ways out, before the steps that end in a handoff.
@@ -2663,6 +2765,22 @@ export function contextWrapupNotice(
     + `  4. Declare it: \`${outcome} partial --reason context\`\n`
     + '  5. Stop. The next attempt boards fresh from the handoff.\n'
     + `At ${Math.round(CONTEXT_CHECKPOINT_FRACTION * 100)} % of the window the console checkpoints this session itself.`;
+}
+
+/**
+ * The 0.6 × line's words under native compaction (measured-console phase 12,
+ * A10): a notice, not a hand-off — the CLI compacts this session at
+ * `compactAt` tokens, so the session carries on, committing what is green as
+ * it goes; the console's 0.8 checkpoint is off for this arm.
+ */
+export function contextCompactionNotice(
+  context: number, window: number, compactAt: number, where: { push?: WrapupPush } = {},
+): string {
+  return `Supervisor notice: your context is ${tokensLabel(context)} tokens of a ${tokensLabel(window)} window `
+    + `(${Math.round((context / window) * 100)} %). This run's compaction arm is native: the CLI compacts this session `
+    + `at ${tokensLabel(compactAt)} tokens and the console does not checkpoint it, so carry on with the phase. `
+    + 'Keep what a summary would lose on disk: commit what is green as you go'
+    + `${where.push?.allowed ? ` and push it (\`git push origin ${where.push.branch}\`)` : ''}, and keep the handoff's notes current.`;
 }
 
 /** A background task as the wrap-up, the Stop hook and the brief name it (control-tower phase 109, #188). */
@@ -2686,6 +2804,45 @@ function backgroundList(tasks: readonly BackgroundRef[], now: number): string {
     return `${what} (${tool}, task ${task.id}${since})`;
   });
   return shown.join(', ') + (tasks.length > 5 ? ` and ${tasks.length - 5} more` : '');
+}
+
+/**
+ * A Stop hook's "keep working" answer, in the shape the CLI reads (the hooks
+ * page's Stop decision control, read 2026-10-25): `decision` and `reason` at
+ * the TOP level. The console used to put them inside `hookSpecificOutput`
+ * only, and measured on CLI 2.1.307 (measured-console phase 6) that shape is
+ * read as no decision at all — the session stopped, every refusal this hook
+ * ever wrote unheard. The inner copy stays for the readers that look there;
+ * the CLI accepts both together (measured the same day).
+ */
+export function stopBlock(reason: string): Record<string, unknown> {
+  return {
+    decision: 'block',
+    reason,
+    hookSpecificOutput: { hookEventName: 'Stop', decision: 'block', reason },
+  };
+}
+
+/**
+ * The fast gate's refusal (measured-console phase 6, C4): a session ending its
+ * work on red fast lines is held once, told which lines and which ids failed,
+ * and the two ways out — fix and finish, or hand off saying what is red.
+ */
+export function fastGateRefusal(
+  phase: number, slug: string, red: readonly { command: string; failures: readonly string[] }[],
+): string {
+  const lines = red.slice(0, 5).map((line) => {
+    const ids = line.failures.slice(0, 8);
+    const more = line.failures.length > ids.length ? ` and ${line.failures.length - ids.length} more` : '';
+    return `\`${line.command}\`${ids.length ? ` — failing: ${ids.join(', ')}${more}` : ''}`;
+  });
+  return `Phase ${phase} of ${slug} is ending its work, and the console ran its fast §Verification lines on the `
+    + `tree as you leave it: ${red.length} ${red.length === 1 ? 'is' : 'are'} red — ${lines.join('; ')}`
+    + `${red.length > lines.length ? ` and ${red.length - lines.length} more` : ''}. `
+    + 'Fix them and finish the closeout, or — if the red is not yours to fix — rewrite the handoff '
+    + '`in-progress` naming what is red and declare it '
+    + `(\`bash ${SCRIPTS_REF}/phase-outcome.sh ${slug} ${phase} partial --reason other\`). `
+    + 'This hold comes once: the console re-runs every line itself at phase-finish.';
 }
 
 /**
@@ -2715,15 +2872,32 @@ export function backgroundExitRefusal(phase: number, slug: string, tasks: readon
  * console will do with the commit — its fast gate, the `wipRed` record, the
  * siblings told — or, with no fast line measured, that nothing will check it.
  */
-export function wrapupCommitStep(where: { shared?: boolean; fastGate?: readonly string[] }): string {
-  if (where.shared === false) return 'Commit what is done — this lane\'s branch is its own; nothing else builds on it until it lands.';
+/**
+ * The push half of the wrap-up's commit step (measured-console phase 12, #397):
+ * the branch the session commits to, and whether the plan's
+ * `permission.destructive` row allows `git push origin <branch>` for this phase.
+ */
+export type WrapupPush = { branch: string; allowed: boolean };
+
+/** The push sentence: push the fast-forward where the row allows it, else say the console names it until one lands. */
+export function wrapupPushWords(push: WrapupPush | undefined): string {
+  if (!push) return '';
+  return push.allowed
+    ? ` Then push what you committed: \`git push origin ${push.branch}\` — a fast-forward, never forced. `
+      + 'Unpushed commits live only in this checkout; `phase-outcome.sh … partial` names any you leave.'
+    : ' This phase may not push it: the console names the unpushed commits on the phase until a push lands.';
+}
+
+export function wrapupCommitStep(where: { shared?: boolean; fastGate?: readonly string[]; push?: WrapupPush }): string {
+  const push = wrapupPushWords(where.push);
+  if (where.shared === false) return `Commit what is done — this lane's branch is its own; nothing else builds on it until it lands.${push}`;
   const gate = where.fastGate?.length
     ? `After you stop, the console runs this phase's fast gate on your last commit (${where.fastGate.map((line) => `\`${line}\``).join(', ')}); `
       + 'if it is red, the red is recorded against THIS phase (`wipRed`) and every sibling is told those files are yours.'
     : 'No line of this phase\'s §Verification is measured fast, so NOTHING checks your commit before siblings build on it.';
   return 'Commit only work whose checks you ran green — this branch is SHARED, and every sibling phase builds on your commit. '
     + `${gate} Leave anything unverified UNCOMMITTED: the next session of this phase finds it in \`git status\`, `
-    + 'and every sibling\'s brief names it as yours.';
+    + `and every sibling's brief names it as yours.${push}`;
 }
 
 /**
@@ -3008,6 +3182,20 @@ export type RunSettingsPatch = {
   /** An approval card's timeout, in minutes (control-tower phase 97, #140); `null` goes back to the hook call's hour. */
   approvalTimeoutMinutes?: number | null;
   /**
+   * The session's environment (measured-console phase 6), mid-run: each lands
+   * on the next spawn, and `null`/`''` puts it back to its default — `off`, 0,
+   * the plan's `**Subagent model:**` line, `DEFAULT_BASH_MAX_OUTPUT`. The door
+   * has already judged the words and the ranges.
+   */
+  cacheTtlAb?: CacheTtlAb | null;
+  keepWarmSec?: number | null;
+  subagentModel?: string | null;
+  bashMaxOutput?: number | null;
+  /** The platform's pieces (measured-console phase 12) — see `RunState`; `null` clears one. */
+  humanStepMode?: HumanStepMode | null;
+  compaction?: CompactionMode | null;
+  compactionWindow?: number | null;
+  /**
    * QA recovery's two, mid-run for the same reason: an operator watching a
    * recovery loop board fresh sessions it should be resuming, or spend more per
    * round than they meant, must be able to change THAT without stopping the
@@ -3151,7 +3339,8 @@ export const RUN_SETTING_KEYS = [
   'maxParallel', 'onlyPhases', 'phaseOptions', 'skills', 'mcpServers', 'mcpPolicy', 'permissionProfile',
   'accountId', 'onLimit', 'modelPolicy', 'gitMode', 'openPr', 'isolation', 'settle', 'priority', 'startAfter',
   'reviewEachPhase', 'reviewerPolicy', 'ultracode', 'ultraReview', 'qaModel', 'qaEffort', 'qaMaxRounds',
-  'approvalTimeoutMinutes',
+  'approvalTimeoutMinutes', 'cacheTtlAb', 'keepWarmSec', 'subagentModel', 'bashMaxOutput',
+  'humanStepMode', 'compaction', 'compactionWindow',
   'ladderPerRunRungs', 'ladderPerPhaseRungs', 'baseBranch', 'maxConcurrentPerRepo', 'worktreeRetention',
   'landing', 'conflictPolicy', 'messaging', 'issuesMode', 'resumeOnRestart', 'relay', 'accounts',
 ] as const satisfies readonly (keyof RunState)[];
@@ -3295,6 +3484,57 @@ export function lockedSettingRefusals(state: RunState | null, patch: RunSettings
 }
 
 /**
+ * The session's environment (measured-console phase 6) — the one rule a
+ * settings patch and a Continue share. Absent says nothing; a value off the
+ * vocabulary or out of range, `null` or `''` clears the field back to its
+ * default, which is stored as no key (`off`, 0, the plan's word, the shipped
+ * ceiling), so a run put back to a default reads as one that never left it.
+ */
+export function applySessionEnvSettings(
+  state: RunState,
+  patch: Pick<RunSettingsPatch, 'cacheTtlAb' | 'keepWarmSec' | 'subagentModel' | 'bashMaxOutput' | 'humanStepMode' | 'compaction' | 'compactionWindow'>,
+): void {
+  // The platform's pieces (measured-console phase 12): the same rule — a word
+  // off the list, `null` or `''` clears; `console` and the shipped window are
+  // stored as no key; `humanStepMode` has no default to drop (the CLI decides).
+  if (patch.humanStepMode !== undefined) {
+    if (patch.humanStepMode && (HUMAN_STEP_MODES as readonly string[]).includes(patch.humanStepMode)) state.humanStepMode = patch.humanStepMode;
+    else delete state.humanStepMode;
+  }
+  if (patch.compaction !== undefined) {
+    if (patch.compaction && patch.compaction !== DEFAULT_COMPACTION
+      && (COMPACTION_MODES as readonly string[]).includes(patch.compaction)) state.compaction = patch.compaction;
+    else delete state.compaction;
+  }
+  if (patch.compactionWindow !== undefined) {
+    const n = patch.compactionWindow;
+    if (typeof n === 'number' && Number.isInteger(n) && n >= COMPACTION_WINDOW_MIN && n <= COMPACTION_WINDOW_MAX
+      && n !== DEFAULT_COMPACTION_WINDOW) state.compactionWindow = n;
+    else delete state.compactionWindow;
+  }
+  if (patch.cacheTtlAb !== undefined) {
+    if (patch.cacheTtlAb && patch.cacheTtlAb !== DEFAULT_CACHE_TTL_AB
+      && (CACHE_TTL_AB_MODES as readonly string[]).includes(patch.cacheTtlAb)) state.cacheTtlAb = patch.cacheTtlAb;
+    else delete state.cacheTtlAb;
+  }
+  if (patch.keepWarmSec !== undefined) {
+    const n = patch.keepWarmSec;
+    if (typeof n === 'number' && Number.isInteger(n) && n > 0 && n <= KEEP_WARM_MAX_SEC) state.keepWarmSec = n;
+    else delete state.keepWarmSec;
+  }
+  if (patch.subagentModel !== undefined) {
+    if (patch.subagentModel) state.subagentModel = patch.subagentModel;
+    else delete state.subagentModel;
+  }
+  if (patch.bashMaxOutput !== undefined) {
+    const n = patch.bashMaxOutput;
+    if (typeof n === 'number' && Number.isInteger(n) && n >= BASH_MAX_OUTPUT_MIN && n <= BASH_MAX_OUTPUT_MAX) {
+      state.bashMaxOutput = n;
+    } else delete state.bashMaxOutput;
+  }
+}
+
+/**
  * `consoleIssues` is this console's own issue word (Settings ▸ Issues, Pro) —
  * what `issuesModeLoosens` reads a run with no word of its own as. Absent is
  * `off`, the rule as it was.
@@ -3339,6 +3579,7 @@ export function applySettings(state: RunState, patch: RunSettingsPatch, consoleI
     if (patch.approvalTimeoutMinutes) state.approvalTimeoutMinutes = patch.approvalTimeoutMinutes;
     else delete state.approvalTimeoutMinutes;
   }
+  applySessionEnvSettings(state, patch);
   // QA recovery's two. The strategy is a closed vocabulary, so anything off it
   // is "stop overriding" and deletes the field — a typo must never be the reason
   // a loop stops resuming and starts paying for fresh sessions. The round budget

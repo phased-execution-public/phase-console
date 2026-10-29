@@ -18,6 +18,7 @@
  */
 
 import { test } from 'node:test';
+import { execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -34,9 +35,38 @@ test('there is no plugin.json — the marketplace entry carries the metadata', (
   }
   // And the entry that stands in for it says so.
   const marketplace = json('.claude-plugin/marketplace.json');
-  assert.equal(marketplace.plugins.length, 1, 'one plugin in this marketplace');
+  assert.equal(marketplace.plugins[0].name, 'phased-execution', 'the console\'s own entry comes first');
   assert.equal(marketplace.plugins[0].strict, false,
     'strict:false is what lets the entry carry the metadata a plugin.json would');
+});
+
+test('the curated entries (measured-console phase 10) are pinned by a full sha, licensed, and never carry what the seed refuses', () => {
+  // §Architecture 6 D1: every third-party entry is a `git-subdir` source at a
+  // 40-character sha, with an SPDX licence from the seed's allow list; one that
+  // narrows a pack to named skills is `strict: false` with its `skills` array
+  // over a directory that has no plugin.json of its own (the CLI refuses
+  // strict:false + components beside a plugin.json — "conflicting manifests");
+  // a share-alike licence is installed unmodified, with no override at all.
+  const marketplace = json('.claude-plugin/marketplace.json');
+  const curated = marketplace.plugins.slice(1);
+  // The free tree's marketplace is its own entry alone (free/overrides): the curated packs are Pro's.
+  const expectedCurated: string[] = [];
+  assert.deepEqual(curated.map((p: { name: string }) => p.name), expectedCurated);
+  const ALLOWED = ['MIT', 'Apache-2.0', 'CC-BY-SA-4.0'];
+  for (const entry of curated) {
+    assert.ok(ALLOWED.includes(entry.license), `${entry.name}: licence ${entry.license}`);
+    if (typeof entry.source === 'string') {
+      assert.match(entry.source, /^\.\/\.claude-plugin\/plugins\//, `${entry.name}: a vendored entry lives under .claude-plugin/plugins/`);
+      continue;
+    }
+    assert.equal(entry.source.source, 'git-subdir', entry.name);
+    assert.match(entry.source.sha, /^[0-9a-f]{40}$/, `${entry.name} is pinned by a full sha`);
+    if (entry.license === 'CC-BY-SA-4.0') {
+      assert.equal(entry.strict, undefined, `${entry.name}: share-alike — installed unmodified`);
+      assert.equal(entry.skills, undefined, `${entry.name}: share-alike — installed unmodified`);
+    }
+    if (entry.skills) assert.equal(entry.strict, false, `${entry.name}: a skills array is the manifest only under strict:false`);
+  }
 });
 
 test('the marketplace entry has the shape a listing needs', () => {
@@ -131,7 +161,11 @@ test('the console has no runtime dependency — the map libraries are build-time
   for (const dep of ['react', '@xyflow/react', 'd3-dag', 'qrcode']) {
     assert.ok(pkg.devDependencies?.[dep], `${dep} is a devDependency`);
   }
-  assert.deepEqual(Object.keys(pkg.optionalDependencies ?? {}).sort(), ['node-pty', 'ws']);
+  // The Agent SDK door's (measured-console phase 20) is optional too: absent, every session takes the
+  // subprocess. Pinned to one exact version, the same in the source package the Pro package reads.
+  assert.deepEqual(Object.keys(pkg.optionalDependencies ?? {}).sort(), ['@anthropic-ai/claude-agent-sdk', 'node-pty', 'ws']);
+  const sdk = pkg.optionalDependencies?.['@anthropic-ai/claude-agent-sdk'] ?? '';
+  assert.match(sdk, /^\d+\.\d+\.\d+$/, 'the SDK is pinned, never a range');
 });
 
 test('the npm allowlist ships the report template, not the 34 MB screencast', () => {
@@ -147,4 +181,24 @@ test('the npm allowlist ships the report template, not the 34 MB screencast', ()
   const readme = read('README.md');
   assert.ok(!/\]\(assets\/console\.gif\)/.test(readme),
     'README links a hosted copy of the screencast, not the unshipped path');
+});
+
+test('the screencast has left the tree, and the tarball holds under its new size (measured-console phase 10)', () => {
+  // A plugin install from the repository root copied the 33 MB GIF into every
+  // config dir's cache; it is gone from the tree, and the READMEs link a copy
+  // that outlives it (the v8.0.0 tag's, until the site hosts one — phase 39).
+  assert.equal(existsSync(join(REPO, 'assets', 'console.gif')), false);
+  for (const rel of ['README.md', 'README.fa.md']) {
+    assert.ok(!/phase-console\/main\/assets\/console\.gif/.test(read(rel)), `${rel} links a copy that a publish cannot delete`);
+  }
+  // What `npm pack` would ship, the client build aside (dist exists only after
+  // a build): 14.7 MB of source at 8.0.0. The ceiling is that and a margin; a
+  // single entry over 1 MB is a screencast coming back.
+  const out = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const files = (JSON.parse(out)[0].files as { path: string; size: number }[]).filter((f) => !f.path.startsWith('viewer/client/dist/'));
+  const bytes = files.reduce((sum, f) => sum + f.size, 0);
+  assert.ok(bytes < 18 * 1024 * 1024, `the tarball's source is ${bytes} bytes, over 18 MB`);
+  const big = files.filter((f) => f.size > 1024 * 1024).map((f) => f.path);
+  assert.deepEqual(big, [], 'no single entry over 1 MB');
+  assert.ok(!files.some((f) => f.path.startsWith('assets/') && f.path !== 'assets/report-template.md'));
 });

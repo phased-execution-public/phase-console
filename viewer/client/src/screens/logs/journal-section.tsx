@@ -99,6 +99,7 @@ export default function JournalSection({ route }: { route: Route }) {
         </div>
       )}
 
+
       <section aria-labelledby="journal-why" className="flex min-w-0 flex-col gap-3" data-testid="diagnosis">
         <SectionHeading id="journal-why">
           {phaseInRun ? `Why phase ${phase} is not done` : 'Why a phase is not done'}

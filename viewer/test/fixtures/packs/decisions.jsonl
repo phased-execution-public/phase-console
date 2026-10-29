@@ -1,0 +1,6 @@
+{"schema_version":1,"run":"run-1","id":"run-1-d1","label":"D1","title":"Split the export job from the request path","options":["a","b"],"recommended":"a","kind":"auto","status":"approved","gate_rev":1,"default_if_unanswered":"a","chosen":"a"}
+{"schema_version":1,"run":"run-1","id":"run-1-p1","label":"P1","title":"The plan for the billing export","options":["a","b","c","d","e"],"recommended":"b","kind":"approval","status":"pending","gate_rev":1,"default_if_unanswered":null}
+{"schema_version":1,"run":"run-1","id":"run-1-r2-p1","label":"P1","title":"The plan for the billing export","options":["a","b","c","d","e"],"recommended":"b","kind":"approval","status":"pending","gate_rev":2,"default_if_unanswered":null,"phase":"eng"}
+{"schema_version":1,"run":"run-1","id":"run-1-r2-uc1","label":"UC1","title":"Keep the CSV columns stable for one release","options":["a","b"],"recommended":"a","kind":"user_challenge","status":"pending","gate_rev":2}
+{"schema_version":1,"run":"run-1","id":"run-1-r2-p2","label":"P2","title":"The rollout order","options":["a","b"],"recommended":"a","kind":"approval","status":"approved","gate_rev":2,"chosen":"a","answered_at":"2026-10-27T10:00:00Z","answered_by":"human"}
+not a json line

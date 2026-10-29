@@ -67,7 +67,7 @@ export const HELP_SECTIONS: readonly GuideSection[] = [
   {
     id: 'destinations',
     label: 'Getting around',
-    lede: 'The seven places, the three doors every page shares, and what opens over any page.',
+    lede: 'The eight places, the three doors every page shares, and what opens over any page.',
     kind: 'topic',
   },
   {
@@ -125,6 +125,18 @@ export const HELP_SECTIONS: readonly GuideSection[] = [
     kind: 'topic',
   },
   {
+    id: 'settings',
+    label: 'Skills, plugins and hooks',
+    lede: 'What a session can call, what an unattended one loads, every hook it runs, and the rules each plan writes.',
+    kind: 'topic',
+  },
+  {
+    id: 'insights',
+    label: 'Tokens, cache and trends',
+    lede: 'Where the tokens and the money went, whether the cache held, and how the checks and the machine are trending.',
+    kind: 'topic',
+  },
+  {
     id: 'mobile',
     label: 'Mobile setup',
     lede: 'Reaching the console from a phone, end to end, with nothing on the public internet.',
@@ -175,6 +187,15 @@ export const PAGE_HELP_SECTIONS: Readonly<Record<string, string>> = Object.freez
 });
 
 /**
+ * The addresses whose help is a section of its own when their head's is not —
+ * `<head>/<second segment>`, asked before the head (#408): a page's help was
+ * chosen by its first segment alone, so a page under Insights opened Getting
+ * around at the Insights card rather than its own section.
+ */
+export const PAGE_HELP_ADDRESSES: Readonly<Record<string, string>> = Object.freeze({
+});
+
+/**
  * The heads with a Getting around card of their own that the rail does not
  * list — each is reached from the shell instead (the switcher opens Fleet).
  */
@@ -192,9 +213,13 @@ export interface HelpPlace {
   cardLabel?: string;
 }
 
-/** A page's own help: its section, else Getting around at the card its rail label heads, else the first section. */
+/** A page's own help: its address's section, its head's, else Getting around at the card its rail label heads, else the first section. */
 export function pageHelp(route: Pick<Route, 'segments'>): HelpPlace {
   const head = route.segments[0] || DEFAULT_HEAD;
+  const address = `${head}/${route.segments[1] ?? ''}`;
+  if (Object.hasOwn(PAGE_HELP_ADDRESSES, address)) {
+    return { section: resolveHelpSection(PAGE_HELP_ADDRESSES[address]) };
+  }
   // Own keys only: a head is whatever the address says, `constructor` included.
   if (Object.hasOwn(PAGE_HELP_SECTIONS, head)) {
     return { section: resolveHelpSection(PAGE_HELP_SECTIONS[head]) };

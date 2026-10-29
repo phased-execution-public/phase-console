@@ -20,32 +20,22 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
 import { SKILL_DIR } from '../server/config.ts';
 import { Service } from '../server/service.ts';
 import type { SpawnFn, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const MINUTE = 60_000;
 const T0 = Date.parse('2026-09-23T11:00:00.000Z');
 
-function repo() {
-  const root = mkdtempSync(join(tmpdir(), 'pc-stall-landing-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  const script = (name: string, body: string) => {
-    writeFileSync(join(scripts, name), body, 'utf8');
-    chmodSync(join(scripts, name), 0o755);
-  };
-  script('phase-graph.sh', `#!/usr/bin/env bash
+function stubbedPlan() {
+  const made = stubRepo({
+    prefix: 'pc-stall-landing-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -61,19 +51,17 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  script('phase-lock.sh', '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  script('validate.sh', '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: () => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}1\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: () => made.markDone(1) };
 }
 
 /** A lane held open by the test, then let finish with the board reading done. */
 function lane() {
-  const r = repo();
+  const r = stubbedPlan();
   const at = { now: T0 };
   let release!: () => void;
   let entered!: () => void;

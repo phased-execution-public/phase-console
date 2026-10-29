@@ -61,7 +61,7 @@ function shellProbe(source: string, where: string): (v: string) => boolean {
       versions: { node: version },
       exit: (status: number) => { code = status; },
     };
-    // eslint-disable-next-line no-new-func
+     
     new Function('process', body)(stub);
     assert.notEqual(code, undefined, `${where}: the probe did not call process.exit`);
     return code === 0;
@@ -75,7 +75,7 @@ function binProbe(source: string): (v: string) => boolean {
   const expression = match[1];
   return (version: string) => {
     const parts = version.split('.').map(Number);
-    // eslint-disable-next-line no-new-func
+     
     return Boolean(new Function('parts', `return (${expression});`)(parts));
   };
 }

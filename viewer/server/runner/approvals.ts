@@ -57,7 +57,7 @@ import {
 import { DEFAULT_PORT, PORT_RANGE_SIZE, PORT_RANGE_START, readRegistry } from '../../shared/instances.mjs';
 import { HOST_COMMANDS } from '../../shared/turn-model.js';
 import { splitStatements, type Statement } from './liveness.ts';
-import { executedTexts, readShell, type ShellReading } from './shell-reading.ts';
+import { executedTexts, gitCanonical, readShell, type ShellReading } from './shell-reading.ts';
 
 /* ------------------------------------------------------------------ *
  * The two lists
@@ -1220,6 +1220,124 @@ export function gateForgeCall(toolName: string, input: unknown): string | null {
     }
   }
   return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * The protected-file guard (measured-console phase 6, C4)
+ * ------------------------------------------------------------------ */
+
+/** The rule name a write to a baseline, a ratchet or a snapshot — or a test's deletion — is denied under. */
+export const PROTECTED_FILE_RULE = 'protected-file';
+
+/**
+ * The files a session never writes, whatever its phase says (C4): the client's
+ * finding baseline, the ratchets, the known reds, the quarantine and every
+ * snapshot. Each is the bar a change is held to; a session that could move it
+ * could make any change pass. Verbatim in the handoff of phase 6 and in
+ * `docs/safety-rails.md`.
+ */
+export const PROTECTED_FILES: readonly string[] = Object.freeze([
+  'e2e/baseline.json',
+  'status-ratchet.json',
+  'known-reds.json',
+  'scripts/quarantine.env',
+  '**/__snapshots__/**',
+  '**/*.snap',
+]);
+
+/** A test file by its name — deleting one is denied unless the phase says `- **May delete tests:** yes`. */
+const TEST_FILE = /\.(?:test|spec)\.[A-Za-z0-9*]+$/;
+/** A directory that holds tests by its name — `test/`, `tests/`, `__tests__/`, `spec/`, `e2e/`. */
+const TEST_DIR = /(?:^|\/)(?:tests?|__tests__|specs?|e2e)$/;
+
+/** Whether a path is one of `PROTECTED_FILES`: matched on its trailing segments, so a relative and an absolute spelling agree. */
+export function protectedPath(path: string): boolean {
+  const p = path.replace(/\\/g, '/').replace(/^\.\//, '');
+  return /(?:^|\/)e2e\/baseline\.json$/.test(p)
+    || /(?:^|\/)status-ratchet\.json$/.test(p)
+    || /(?:^|\/)known-reds\.json$/.test(p)
+    || /(?:^|\/)scripts\/quarantine\.env$/.test(p)
+    || /(?:^|\/)__snapshots__(?:\/|$)/.test(p)
+    || /\.snap$/.test(p);
+}
+
+/** Leads that write the files they are handed (the LAST argument for a copy or a move). */
+const WRITING_LEADS = new Set(['rm', 'unlink', 'truncate', 'tee', 'shred']);
+const TARGET_LEADS = new Set(['cp', 'mv', 'install', 'ln', 'rsync']);
+/** Leads that delete what they are handed — the test-deletion half. */
+const DELETING_LEADS = new Set(['rm', 'unlink', 'shred']);
+
+/**
+ * Why a call writes a protected file or deletes a test, or null (C4). The file
+ * tools by their path; Bash by the shell's own reading — a redirection's
+ * target, a writing lead's arguments (`rm`, `tee`, `truncate`, a copy's or a
+ * move's last argument, `sed -i`, `perl -i`), `git rm` and `git mv` — through
+ * every `bash -c` payload and substitution the reader resolves. A read (`cat`,
+ * `grep`, a test runner) names the file and writes nothing, and is not denied.
+ * `mayDeleteTests` (the phase's `- **May delete tests:** yes`) lifts the test
+ * half only: a baseline is never writable by a session.
+ */
+export function protectedFileCall(
+  toolName: string, input: unknown, opts: { mayDeleteTests?: boolean } = {},
+): string | null {
+  const fields = (input ?? {}) as Record<string, unknown>;
+  if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit' || toolName === 'NotebookEdit') {
+    const path = fields.file_path ?? fields.notebook_path;
+    if (typeof path === 'string' && protectedPath(path)) return protectedWords(path);
+    return null;
+  }
+  if (toolName !== 'Bash' || typeof fields.command !== 'string') return null;
+  const reading = readShell(fields.command);
+  for (const target of reading.writes) if (protectedPath(target)) return protectedWords(target);
+  for (const command of reading.commands) {
+    const words = gitCanonical(command.lead) ?? command.lead;
+    const lead = basename(words[0] ?? '');
+    const args = words.slice(1).filter((word) => !word.startsWith('-'));
+    // A move writes its target and takes its sources away: a protected file
+    // moved is a protected file written, while a test moved is still a test.
+    let written: string[] = [];
+    let deleted: string[] = [];
+    if (WRITING_LEADS.has(lead)) written = args;
+    if (DELETING_LEADS.has(lead)) deleted = args;
+    if (TARGET_LEADS.has(lead)) written = lead === 'mv' ? args : args.slice(-1);
+    if ((lead === 'sed' || lead === 'perl') && words.some((word) => /^-[A-Za-z]*i/.test(word) || word === '--in-place')) written = args;
+    if (lead === 'git' && (words[1] === 'rm' || words[1] === 'mv')) {
+      written = words.slice(2).filter((word) => !word.startsWith('-'));
+      if (words[1] === 'rm') deleted = written;
+    }
+    // `git checkout -- <path>` and `git restore <path>` rewrite a file from another commit.
+    if (lead === 'git' && (words[1] === 'checkout' || words[1] === 'restore')) {
+      written = words.slice(2).filter((word) => !word.startsWith('-'));
+    }
+    // `find … -delete` deletes what it names: a protected file, or a test, by its `-name` pattern.
+    if (lead === 'find' && words.includes('-delete')) {
+      written = words.filter((word, i) => i > 0 && !word.startsWith('-'));
+      deleted = written;
+    }
+    // A recursive delete of a whole test directory deletes every test in it.
+    if (DELETING_LEADS.has(lead) && words.some((word) => /^-[A-Za-z]*[rR]/.test(word) || word === '--recursive')) {
+      const dir = args.find((path) => TEST_DIR.test(path.replace(/\/+$/, '')));
+      if (dir && !opts.mayDeleteTests) {
+        return `it deletes the test directory ${dir} — a phase deletes tests only when its plan section says `
+          + '`- **May delete tests:** yes`';
+      }
+    }
+    for (const path of [...written, ...deleted]) if (protectedPath(path)) return protectedWords(path);
+    if (!opts.mayDeleteTests) {
+      const test = deleted.find((path) => TEST_FILE.test(path));
+      if (test) {
+        return `it deletes the test file ${test} — a phase deletes a test only when its plan section says `
+          + '`- **May delete tests:** yes`; otherwise fix the test, or record why it should go with `phase-outcome.sh … ruling --kind deferral`';
+      }
+    }
+  }
+  return null;
+}
+
+function protectedWords(path: string): string {
+  return `it writes ${path}, one of the files the console protects (a baseline, a ratchet, the known reds, `
+    + 'the quarantine or a snapshot) — a change is held to them, never moves them; record what should change '
+    + 'with `phase-outcome.sh … ruling --kind deferral` for a person';
 }
 
 /* ------------------------------------------------------------------ *
@@ -3924,7 +4042,64 @@ export type SettingsOptions = {
    * the grant ends. A never rule is never lowered, whatever is asked.
    */
   lowered?: { deny: readonly string[]; allow: readonly string[] };
+  /**
+   * Where the run's sessions keep their auto memory (measured-console phase
+   * 4, A9): `<docs root>/docs/memory/<slug>/` — versioned with the plan, the
+   * same for every config dir and every lane, where the CLI's default is a
+   * per-config-dir folder nobody else reads. Omitted: the CLI's default.
+   */
+  memoryDir?: string;
+  /**
+   * The local command hook beside the HTTP one (measured-console phase 6,
+   * C4): `scripts/guard-hook.sh`, which asks this console's classifier the
+   * protected-file and gate-forge questions with no console up. Omitted: none.
+   */
+  guardHook?: string;
+  /**
+   * The compaction hooks (measured-console phase 12, A10): `PreCompact` and
+   * `PostCompact`, HTTP, to `/hooks/compact`, so `phase.compaction` can say
+   * when a session compacted and what it cost. On a run whose `compaction` is
+   * `native` or `alternate`; omitted on `console`, where the console's own
+   * checkpoint comes first.
+   */
+  compactionHooks?: boolean;
+  /**
+   * What the run's sessions load (measured-console phase 11, D2): the
+   * settings key `enabledPlugins` — the installed
+   * `phased-execution@phased-execution-public` OFF where the console's tree
+   * loads by `--plugin-dir`, each seed entry and each personal plugin switched
+   * on for autopilot ON (`runner/loads.ts`). Omitted under
+   * `autopilotLoads: operator-config`: the config dir decides, as in 8.0.
+   */
+  enabledPlugins?: Record<string, boolean>;
+  /**
+   * The operator's own user-level deny rules, carried into this file when the
+   * session leaves user settings out (`--setting-sources project,local`,
+   * measured-console phase 11): added to the wall, never lowered by a grant.
+   */
+  carriedDeny?: readonly string[];
 };
+
+/**
+ * What a hook does when it fails — cannot start, times out, answers a non-2xx
+ * or output that does not parse: BLOCK the call (measured-console phase 6, B3;
+ * CLI 2.1.295+, the hooks page read 2026-10-25). Unset, the CLI carried the
+ * action out — a console restarting mid-session let every call through
+ * unclassified (EI-9). The pairing: a session's tool calls now wait out a
+ * console restart, which `update --when-idle`'s drain is the only one a run
+ * meets. The CLI says the field has no effect on `Stop`; it is set there too so
+ * that every hook the console writes reads the same.
+ */
+export const HOOK_ON_FAILURE = 'block';
+
+/** The compaction hooks journal and answer at once; a minute bounds a console that does not. */
+export const COMPACT_HOOK_TIMEOUT_SECONDS = 60;
+
+/** How long the local guard hook may take — a node start and one classification. */
+export const GUARD_HOOK_TIMEOUT_SECONDS = 30;
+
+/** The tools the local guard hook is asked about: the ones that write a file or delete one. */
+export const GUARD_HOOK_MATCHER = 'Bash|Write|Edit|NotebookEdit';
 
 /** The deny rules no grant lowers — the forced and deleting pushes, the host family. */
 export function neverLowered(rule: string): boolean {
@@ -3938,6 +4113,11 @@ export function neverLowered(rule: string): boolean {
  * without a host is never offered the tool, so the entry costs it nothing.
  */
 export const PRE_TOOL_USE_MATCHER = HOOK_TOOLS.join('|');
+
+/** The run's auto-memory directory: `<docs root>/docs/memory/<slug>` (measured-console phase 4). */
+export function memoryDirFor(docsRoot: string, slug: string): string {
+  return join(docsRoot, 'docs', 'memory', slug);
+}
 
 export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
   const policy = carvedPolicy(
@@ -3955,6 +4135,8 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
     // Omitted entirely when messaging is off, so the CLI's own default stands
     // rather than this console asserting a value it has no opinion about.
     ...(opts.messaging ? { crossSessionInbound: 'accept' } : {}),
+    ...(opts.memoryDir ? { autoMemoryDirectory: opts.memoryDir } : {}),
+    ...(opts.enabledPlugins && Object.keys(opts.enabledPlugins).length ? { enabledPlugins: { ...opts.enabledPlugins } } : {}),
     permissions: {
       // `allow` rides along because permission rules merge across scopes: it
       // adds to what the repository already permits and cannot take anything
@@ -3971,7 +4153,10 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
       // appear. Asking a human is the hook's job, because the hook is the only
       // part of this that can actually reach one. A live grant below plan
       // scope lowers its deny rule for this run only (phase 149).
-      deny: lowered.size ? [...policy.deny.filter((rule) => !lowered.has(rule)), ...carved] : policy.deny,
+      deny: [...new Set([
+        ...(lowered.size ? [...policy.deny.filter((rule) => !lowered.has(rule)), ...carved] : policy.deny),
+        ...(opts.carriedDeny ?? []),
+      ])],
     },
     hooks: {
       PreToolUse: [
@@ -3986,9 +4171,24 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
               url: `${opts.origin}/hooks/pre-tool-use`,
               headers: { Authorization: `Bearer ${opts.token}` },
               timeout: HOOK_TIMEOUT_SECONDS,
+              onFailure: HOOK_ON_FAILURE,
             },
           ],
         },
+        // The second layer (C4, the audit's D4): the same classifier, local, so
+        // a baseline stays unwritable and a test undeleted with the console
+        // unreachable. Blocks on its own failure too.
+        ...(opts.guardHook ? [{
+          matcher: GUARD_HOOK_MATCHER,
+          hooks: [
+            {
+              type: 'command',
+              command: `bash ${shellQuote(opts.guardHook)}`,
+              timeout: GUARD_HOOK_TIMEOUT_SECONDS,
+              onFailure: HOOK_ON_FAILURE,
+            },
+          ],
+        }] : []),
       ],
       // The relay's transport (phase 14, spike S2): with a permission host
       // attached, every call that reaches the permission step is put to the
@@ -4006,6 +4206,7 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
                 url: `${opts.origin}/hooks/permission-request`,
                 headers: { Authorization: `Bearer ${opts.token}` },
                 timeout: HOOK_TIMEOUT_SECONDS,
+                onFailure: HOOK_ON_FAILURE,
               },
             ],
           },
@@ -4014,11 +4215,30 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
       // The closeout contract, enforced at the one moment it can still be
       // acted on: a session about to end its turn with neither a handoff on
       // the board nor a declared outcome is told exactly what to do instead
-      // of exiting into a halt. Same fail-open philosophy as the hook above —
-      // the console being unreachable means the CLI proceeds, and the
-      // runner's own exit-time check remains the load-bearing layer. Never a
-      // safety mechanism: `deny` above is that, and profiles still never
-      // move it.
+      // of exiting into a halt — and, a session that is ending its work, is
+      // held once on its phase's red fast lines (measured-console phase 6,
+      // C4). Fail-open whatever `onFailure` says: the CLI does not apply the
+      // field to `Stop` (a Stop hook that cannot run would hold the session for
+      // ever), so the console being unreachable means the session stops, and
+      // the runner's own exit-time check remains the load-bearing layer. Never
+      // a safety mechanism: `deny` above is that, and profiles never move it.
+      // A compaction, measured (A10): both events to one route, which reads
+      // `hook_event_name`. They answer `{}` and decide nothing — `onFailure`
+      // is the wall's like every hook here: with the console down a session's
+      // tool calls wait anyway (B3), so its compaction waits with them.
+      ...(opts.compactionHooks ? Object.fromEntries((['PreCompact', 'PostCompact'] as const).map((event) => [event, [
+        {
+          hooks: [
+            {
+              type: 'http',
+              url: `${opts.origin}/hooks/compact`,
+              headers: { Authorization: `Bearer ${opts.token}` },
+              timeout: COMPACT_HOOK_TIMEOUT_SECONDS,
+              onFailure: HOOK_ON_FAILURE,
+            },
+          ],
+        },
+      ]])) : {}),
       Stop: [
         {
           hooks: [
@@ -4027,6 +4247,7 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
               url: `${opts.origin}/hooks/stop`,
               headers: { Authorization: `Bearer ${opts.token}` },
               timeout: HOOK_TIMEOUT_SECONDS,
+              onFailure: HOOK_ON_FAILURE,
             },
           ],
         },
@@ -4063,8 +4284,8 @@ export function writeSettingsFile(runId: string, settings: Record<string, unknow
  * moved from a process listing to a permanent one. Best effort, never throws.
  */
 export function pruneSettingsFiles(keep: Iterable<string>): string[] {
-  const live = new Set([...keep].flatMap((runId) => [`run-${runId}.json`, `run-${runId}${PLAN_HOST_SETTINGS_SUFFIX}.json`]));
-  return sweepSettings((name) => !live.has(name));
+  const live = [...keep];
+  return sweepSettings((name) => !live.some((runId) => ownsSettingsFile(runId, name)));
 }
 
 /**
@@ -4074,9 +4295,43 @@ export function pruneSettingsFiles(keep: Iterable<string>): string[] {
  */
 export const PLAN_HOST_SETTINGS_SUFFIX = '-plan';
 
-/** One run's settings files (its own and its plan-host variant). The runner's own sweep — see `dropMcpConfigsFor`. */
+/**
+ * The settings variant ONE phase's session loads when its plugin set switches
+ * plugins on (measured-console phase 27): `run-<id>-p<N>.json`, or
+ * `run-<id>-plan-p<N>.json` for a plan-mode phase's host variant — the run's
+ * own file stays exactly what every other session loads, because a set is one
+ * phase's and never a union across phases.
+ */
+export function phasePluginsSettingsName(runId: string, phase: number, planHost = false): string {
+  return `${runId}${planHost ? PLAN_HOST_SETTINGS_SUFFIX : ''}-p${phase}`;
+}
+
+/** Whether `name` (a file in the settings directory) is one of `runId`'s: its own, its plan-host variant, a phase's. */
+export function ownsSettingsFile(runId: string, name: string): boolean {
+  if (name === `run-${runId}.json` || name === `run-${runId}${PLAN_HOST_SETTINGS_SUFFIX}.json`) return true;
+  const prefix = `run-${runId}`;
+  if (!name.startsWith(prefix)) return false;
+  return new RegExp(`^(?:${PLAN_HOST_SETTINGS_SUFFIX})?-p\\d+\\.json$`).test(name.slice(prefix.length));
+}
+
+/**
+ * The run's `enabledPlugins` with one phase's set switched on (measured-console
+ * phase 27): the ids `resolvePhasePlugins` enabled, added and never lowering
+ * an entry the run's answer turned OFF on purpose (the installed copy of the
+ * console's own skill). Absent when neither says anything.
+ */
+export function withPhasePlugins(
+  base: Readonly<Record<string, boolean>> | undefined, ids: readonly string[] | undefined,
+): Record<string, boolean> | undefined {
+  if (!ids?.length) return base ? { ...base } : undefined;
+  const out: Record<string, boolean> = { ...(base ?? {}) };
+  for (const id of ids) if (!(id in out)) out[id] = true;
+  return out;
+}
+
+/** One run's settings files (its own, its plan-host variant, its phases'). The runner's own sweep — see `dropMcpConfigsFor`. */
 export function dropSettingsFileFor(runId: string): string[] {
-  return sweepSettings((name) => name === `run-${runId}.json` || name === `run-${runId}${PLAN_HOST_SETTINGS_SUFFIX}.json`);
+  return sweepSettings((name) => ownsSettingsFile(runId, name));
 }
 
 function sweepSettings(shouldDelete: (name: string) => boolean): string[] {

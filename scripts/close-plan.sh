@@ -18,10 +18,17 @@
 # last fetched it), while `landing.md` has a row in `conflict` or `failed`, or while
 # an issue labelled `plan:<slug>` is open on a repository of the docs root. `--force`
 # closes it anyway, says so, and writes the exception into `closed_reason`.
+# It is also refused — and `--force` does not help — while the plan's
+# `## Not yet specified` section holds a line (measured-console phase 30).
 #
 # Usage:
 #   close-plan.sh <slug> [--status abandoned|superseded|complete] [--reason "TEXT"] [--force]
 #   close-plan.sh <slug> --reopen
+#
+# Closing also reads the plan's memory, `docs/memory/<slug>/index.md` (measured-console
+# phase 4): a claim there — a list item — that carries neither a date (YYYY-MM-DD) nor
+# a commit is NAMED, by line, so the memory a plan leaves behind is history rather
+# than a present tense nobody can date. It names; it never refuses.
 #
 # Writes only the plan file (and releases that plan's own phase locks). It reads git
 # and asks `gh` for the open issues; it never moves a ref, fetches or pushes.
@@ -155,6 +162,21 @@ blockers_of_complete() {
 }
 
 forced=""
+# A plan that still lists what it has not specified is not complete — and unlike
+# the items below, no --force closes it over that: the section is the plan's own
+# word that work is missing (measured-console phase 30). Empty it (or say the
+# line is done by removing it) and close again.
+if [ "$reopen" = 0 ] && [ "$status" = complete ]; then
+  nys="$(DOCS_ROOT="$DOCS_ROOT" bash "$SCRIPT_DIR/phase-graph.sh" "$slug" --not-yet-specified 2>/dev/null || true)"
+  if [ -n "$nys" ]; then
+    {
+      echo "refusing to close $slug complete — its \"## Not yet specified\" section still holds $(printf '%s\n' "$nys" | grep -c .) line(s):"
+      printf '%s\n' "$nys" | sed 's/^/  /'
+      echo "specify each (or remove the line) first; --force does not close over this section"
+    } >&2
+    exit 1
+  fi
+fi
 if [ "$reopen" = 0 ] && [ "$status" = complete ]; then
   repos_file="$(mktemp "${TMPDIR:-/tmp}/close-plan.XXXXXX")"
   trap 'rm -f "$repos_file"' EXIT
@@ -230,6 +252,39 @@ if [ "$reopen" = 0 ] && [ -d "$lock_dir" ]; then
   rmdir "$lock_dir" 2>/dev/null || true
 fi
 
+# The memory's undated claims: one line each — `index.md:<line>` and the claim's
+# head. An item runs from its marker to the next item, heading or blank line, so a
+# date on a continuation line counts.
+memory_undated() {  # memory_undated <index.md>
+  LC_ALL=C awk '
+    function flush() {
+      if (item != "" && item !~ /(^|[^0-9])20[0-9][0-9]-[01][0-9]-[0-3][0-9]([^0-9]|$)/) {
+        head = item; if (length(head) > 100) head = substr(head, 1, 100) "…"
+        printf "%d\t%s\n", at, head
+      }
+      item = ""
+    }
+    /^[[:space:]]*$/ || /^#/ { flush(); next }
+    /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/ { flush(); item = $0; at = NR; sub(/^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+/, "", item); next }
+    item != "" { line = $0; sub(/^[[:space:]]+/, "", line); item = item " " line }
+    END { flush() }
+  ' "$1" | LC_ALL=C awk -F'\t' '
+    { n = $2; sha = 0
+      # a commit is 7 to 40 hex characters with a digit among them
+      while (match(n, /[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]+/)) {
+        w = substr(n, RSTART, RLENGTH); pre = (RSTART > 1 ? substr(n, RSTART - 1, 1) : " "); post = substr(n, RSTART + RLENGTH, 1)
+        if (w ~ /[0-9]/ && RLENGTH <= 40 && pre !~ /[0-9A-Za-z]/ && post !~ /[0-9A-Za-z]/) { sha = 1; break }
+        n = substr(n, RSTART + RLENGTH)
+      }
+      if (!sha) print
+    }'
+}
+memory_lines=""
+memory_index="$DOCS_ROOT/docs/memory/$slug/index.md"
+if [ "$reopen" = 0 ] && [ -f "$memory_index" ]; then
+  memory_lines="$(memory_undated "$memory_index" || true)"
+fi
+
 if [ "$reopen" = 1 ]; then
   echo "reopened: $slug is active again  ->  $plan_file"
 else
@@ -240,6 +295,13 @@ else
   if [ -n "$forced" ]; then
     echo "  --force: closed complete over what is still open:"
     printf '%s\n' "$forced"
+  fi
+  if [ -n "$memory_lines" ]; then
+    printf '  memory: %s claim(s) in docs/memory/%s/index.md carry no date and no commit — write each as history (a date and the commit):\n' \
+      "$(printf '%s\n' "$memory_lines" | grep -c .)" "$slug"
+    printf '%s\n' "$memory_lines" | while IFS="$(printf '\t')" read -r at text; do
+      printf '    index.md:%s  %s\n' "$at" "$text"
+    done
   fi
 fi
 exit 0

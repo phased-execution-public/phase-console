@@ -148,9 +148,16 @@ const copyOf = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
  * clears the drift, an add registers — so a page read again shows what the
  * press did.
  */
-function serve(servers: McpServerView[], { allowMcp = true }: { allowMcp?: boolean } = {}) {
+function serve(
+  servers: McpServerView[],
+  { allowMcp = true, contextTokens }: { allowMcp?: boolean; contextTokens?: number } = {},
+) {
   const held = copyOf(servers);
-  server.reads['/api/mcp'] = () => ({ servers: copyOf(held), allowMcp });
+  server.reads['/api/mcp'] = () => ({
+    servers: copyOf(held),
+    allowMcp,
+    ...(contextTokens ? { contextTokens } : {}),
+  });
   server.reads['POST /api/mcp'] = (body: unknown) => {
     const { id, label, transport } = body as Pick<McpServerView, 'id' | 'label' | 'transport'>;
     const added: McpServerView = {
@@ -296,6 +303,36 @@ describe('the registry, read', () => {
       '#/settings/mcp?tab=catalog',
     );
     expect(writes()).toEqual([]);
+  });
+
+  it('draws what each attached server costs every turn, and the catalog’s pin and untrusted output on Context7’s line (measured-console phase 27)', async () => {
+    const context7: McpServerView = {
+      ...DOCS,
+      id: 'context7',
+      label: 'Context7',
+      transport: 'stdio',
+      command: 'npx -y @upstash/context7-mcp@>=2.1.3',
+      pin: { min: '2.1.3', held: true },
+      untrustedOutput: true,
+    };
+    const drifted: McpServerView = {
+      ...context7,
+      id: 'c7-old',
+      label: 'Old C7',
+      pin: { min: '2.1.3', held: false },
+    };
+    serve([DOCS, context7, drifted, { ...TRACKER, enabled: false }], { contextTokens: 1500 });
+    mount();
+
+    expect(await rowOf('docs')).toHaveTextContent('http · 2 tools · ~1,500 tokens a turn');
+    expect(await rowOf('context7')).toHaveTextContent(
+      'stdio · 2 tools · ~1,500 tokens a turn · pinned ≥ 2.1.3 · untrusted output',
+    );
+    expect(await rowOf('c7-old')).toHaveTextContent('not pinned — the catalog runs ≥ 2.1.3');
+    // Switched off is attached to nothing, and costs nothing.
+    const tracker = await rowOf('tracker');
+    expect(tracker).toHaveTextContent('Switched off · sse');
+    expect(tracker).not.toHaveTextContent('tokens a turn');
   });
 
   it('names the flag when registration is off, and offers no press — in the registry or the catalog', async () => {
@@ -946,6 +983,31 @@ describe('the catalog', () => {
     );
     expect(await entryOf('calendar')).toHaveTextContent('sse · signs in');
     expect(writes()).toEqual([]);
+  });
+
+  it('marks a pinned entry and one whose output is untrusted (measured-console phase 27)', async () => {
+    server.reads['/api/mcp/catalog'] = {
+      entries: [
+        {
+          id: 'context7',
+          label: 'Context7',
+          description: 'Library docs.',
+          transport: 'stdio',
+          command: 'npx',
+          args: ['-y', '@upstash/context7-mcp@>=2.1.3'],
+          auth: 'none',
+          category: 'Docs',
+          source: 'curated',
+          pin: { package: '@upstash/context7-mcp', min: '2.1.3' },
+          untrustedOutput: true,
+        },
+      ],
+    };
+    mount();
+    await rowOf('docs');
+    const views = screen.getByRole('navigation', { name: 'MCP server views' });
+    fireEvent.click(within(views).getByRole('link', { name: 'Catalog' }));
+    expect(await entryOf('context7')).toHaveTextContent('stdio · pinned ≥ 2.1.3 · untrusted output');
   });
 
   it('adds an entry with the token it needs in one press, and an OAuth one to be signed in from its line', async () => {

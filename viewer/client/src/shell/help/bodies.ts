@@ -23,6 +23,8 @@ import notifications from '@/content/guide/notifications.md?raw';
 import yourTurn from '@/content/guide/your-turn.md?raw';
 import permissions from '@/content/guide/permissions.md?raw';
 import mcp from '@/content/guide/mcp.md?raw';
+import settings from '@/content/guide/settings.md?raw';
+import insights from '@/content/guide/insights.md?raw';
 import mobile from '@/content/guide/mobile.md?raw';
 import troubleshooting from '@/content/guide/troubleshooting.md?raw';
 import reference from '@/content/guide/reference.md?raw';
@@ -42,6 +44,8 @@ export const HELP_BODIES: Readonly<Record<string, string>> = Object.freeze({
   'your-turn': yourTurn,
   permissions,
   mcp,
+  settings,
+  insights,
   mobile,
   troubleshooting,
   reference,

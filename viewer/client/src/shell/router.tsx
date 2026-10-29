@@ -103,15 +103,18 @@ const redirect = (to: (route: Route) => string): RedirectRoute => ({ kind: 'redi
 
 /**
  * One entry per `ROUTE_HEADS` member — the client test fails if that stops
- * being true in either direction. The order mirrors `ROUTE_HEADS`: the seven
+ * being true in either direction. The order mirrors `ROUTE_HEADS`: the eight
  * destinations, then the pages a destination has not absorbed, then the
  * redirects. A page's loader is its screen's chunk; a redirect is
  * `shell/redirects.ts`'s.
  */
 export const ROUTE_TABLE: Record<string, RouteEntry> = {
-  /* ---- the seven destinations ---- */
+  /* ---- the eight destinations ---- */
   // The home — 7.0's own screen (quiet-console phase 7).
   runs: page(() => import('@/screens/runs')),
+  // Your turn — 7.0's own screen (quiet-console phase 8); a destination since
+  // one-pool phase 14 (#366).
+  turn: page(() => import('@/screens/turn')),
   // The library — 7.0's own screen (quiet-console phase 9).
   plans: page(() => import('@/screens/plans')),
   sessions: page(() => import('@/screens/sessions')),
@@ -126,8 +129,6 @@ export const ROUTE_TABLE: Record<string, RouteEntry> = {
   /* ---- pages a destination has not absorbed yet ---- */
   // A plan — 7.0's own screen (quiet-console phase 10), its Run view included.
   plan: page(() => import('@/screens/plan')),
-  // Your turn — 7.0's own screen (quiet-console phase 8).
-  turn: page(() => import('@/screens/turn')),
   // The chromeless directory picker, drawn instead of the shell (quiet-console phase 21).
   source: page(() => import('@/screens/settings/source')),
 

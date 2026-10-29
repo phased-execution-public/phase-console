@@ -168,7 +168,7 @@ function inspectIn(run: RunState) {
   return out;
 }
 
-const openTab = (name: string) => fireEvent.mouseDown(screen.getByRole('tab', { name }), { button: 0 });
+const openTab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }));
 const sectionIds = () =>
   [...document.querySelectorAll('[data-section]')].map((s) => s.getAttribute('data-section'));
 
@@ -201,7 +201,8 @@ describe('the run’s record, in eight sections', () => {
     for (const section of RUN_RECORD_SECTIONS) {
       const toggle = screen.getByTestId(`run-section-${section.id}`);
       expect(toggle).toHaveAttribute('aria-expanded', 'false');
-      expect(toggle.textContent).toMatch(new RegExp(`^${section.label}\\(\\d+\\)$`));
+      // A fold strip: the name, and its count in a pill — heard as "Boarding (4)".
+      expect(toggle.textContent).toMatch(new RegExp(`^${section.label} \\(\\d+\\)$`));
       expect(document.body.textContent).not.toContain(OPENS_ONTO[section.id]);
     }
   });

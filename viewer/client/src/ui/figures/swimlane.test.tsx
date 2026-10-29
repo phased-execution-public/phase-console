@@ -543,6 +543,66 @@ describe('Swimlane', () => {
     expect(marks[1]).not.toHaveAttribute('data-mark-count');
   });
 
+  it('ties one bar to another by key, named; a tie with a missing end is not drawn (#407)', () => {
+    const { container } = render(
+      <Swimlane
+        spanMs={60 * MIN}
+        ariaLabel="ties"
+        rows={[
+          row({ key: 'a', bars: [{ key: 'one', startMs: 0, endMs: 10 * MIN, state: 'state-running' }] }),
+          row({
+            key: 'b',
+            bars: [{ key: 'two', startMs: 20 * MIN, endMs: 30 * MIN, state: 'state-running' }],
+          }),
+        ]}
+        ties={[
+          {
+            key: 't',
+            from: { row: 'a', bar: 'one' },
+            to: { row: 'b', bar: 'two' },
+            title: 'two waits for one',
+          },
+          { key: 'gone', from: { row: 'a', bar: 'one' }, to: { row: 'b', bar: 'nope' }, title: 'nothing' },
+        ]}
+      />,
+    );
+    const ties = container.querySelectorAll('g[data-tie]');
+    expect(ties).toHaveLength(1);
+    expect(ties[0]).toHaveAttribute('aria-label', 'two waits for one');
+    expect(ties[0]!.querySelector('title')?.textContent).toBe('two waits for one');
+  });
+
+  it('hangs a named lock or person under the bar it marks (#407)', () => {
+    const { container } = render(
+      <Swimlane
+        spanMs={60 * MIN}
+        ariaLabel="glyphs"
+        rows={[
+          row({
+            key: 'a',
+            bars: [
+              {
+                key: 'one',
+                startMs: 0,
+                endMs: 10 * MIN,
+                state: 'state-running',
+                glyphs: [
+                  { kind: 'person', title: 'waits for a person' },
+                  { kind: 'lock', title: 'held by a holder' },
+                ],
+              },
+            ],
+          }),
+        ]}
+      />,
+    );
+    const glyphs = [...container.querySelectorAll('g[data-glyph]')];
+    expect(glyphs.map((g) => [g.getAttribute('data-glyph'), g.getAttribute('aria-label')])).toEqual([
+      ['person', 'waits for a person'],
+      ['lock', 'held by a holder'],
+    ]);
+  });
+
   it('draws nothing but says so when there are no rows', () => {
     const { container } = render(<Swimlane spanMs={0} ariaLabel="empty" rows={[]} />);
     expect(container.querySelector('svg')).toBeNull();

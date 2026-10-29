@@ -36,12 +36,14 @@ import {
   markKind,
   markLabel,
   matchesPlan,
+  pipelineOf,
   repoLabel,
   repoOptions,
   rowTotals,
   sortRows,
   statusOptions,
   toRows,
+  turnCountsOf,
   workSentence,
   type PlanRow,
 } from './model';
@@ -162,6 +164,90 @@ describe('building a row', () => {
     ] as unknown as InboxItem[];
     const rows = toRows([plan(), plan({ slug: 'gone', status: 'abandoned' })], [], NOW, inbox);
     expect(rows.map((r) => r.needsYou)).toEqual([1, 0]);
+  });
+});
+
+describe('a row’s live facts — its inbox, its Your turn, its spend, who pays', () => {
+  const turnRow = (id: string, group: string, severity = 'needs-you') =>
+    ({
+      id,
+      slug: 'alpha',
+      severity,
+      turn: { item: id, group },
+      since: '2026-08-03T00:00:00Z',
+    }) as unknown as InboxItem;
+
+  it('keeps the plan’s own inbox rows, and counts its open items on Your turn and those asked now', () => {
+    const inbox = [
+      turnRow('a', 'decide'),
+      turnRow('b', 'upcoming', 'fyi'),
+      turnRow('c', 'done', 'fyi'),
+      { ...turnRow('d', 'decide'), slug: 'gone' } as InboxItem,
+      { id: 'e', slug: 'beta', severity: 'needs-you' } as unknown as InboxItem,
+    ];
+    const [alpha, gone] = toRows([plan(), plan({ slug: 'gone', status: 'abandoned' })], [], NOW, inbox);
+    expect(alpha!.inbox.map((row) => row.id)).toEqual(['a', 'b', 'c']);
+    expect(turnCountsOf(alpha!.inbox)).toEqual({ open: 2, now: 1 });
+    expect(alpha!.turn).toEqual({ open: 2, now: 1 });
+    // A closed plan asks for nothing.
+    expect(gone!.turn).toEqual({ open: 0, now: 0 });
+    expect(gone!.inbox).toEqual([]);
+  });
+
+  it('adds up every run’s spend — booked and in flight — and names who pays for the newest', () => {
+    const [row] = toRows(
+      [plan()],
+      [
+        run({ id: 'old', createdAt: '2026-08-01T00:00:00Z', spentUsd: 4.5, accountId: 'work' }),
+        run({ id: 'new', createdAt: '2026-08-03T00:00:00Z', spentUsd: 2, liveUsd: 0.75, accountId: null }),
+        run({ id: 'other', slug: 'beta', spentUsd: 99 }),
+      ],
+      NOW,
+    );
+    expect(row!.spend).toEqual({ usd: 6.5, liveUsd: 0.75, runs: 2 });
+    expect(row!.account).toEqual({ id: 'default', who: 'machine login', provider: 'Claude' });
+    expect(toRows([plan()], [], NOW)[0]!.account).toBeUndefined();
+  });
+});
+
+describe('the pipeline — the phases in their own order', () => {
+  const phase = (n: number, state: string, gated = false, title = `Phase ${n} **work**`) => ({
+    phase: n,
+    state,
+    gated,
+    title,
+  });
+
+  it('places each phase as the counts do: QA’s hold, a gate on an open phase only, titles in plain words', () => {
+    const [row] = toRows([plan({ phases: 5, qaFailures: [2], gated: [4, 5] })], [], NOW);
+    expect(
+      pipelineOf(row!, [
+        phase(3, 'in-progress', true),
+        phase(1, 'done'),
+        phase(2, 'done'),
+        phase(4, 'ready', true),
+        phase(5, 'waiting', true),
+      ]),
+    ).toEqual([
+      { phase: 1, share: 'done', title: 'Phase 1 work' },
+      { phase: 2, share: 'held-by-qa', title: 'Phase 2 work' },
+      { phase: 3, share: 'in-progress', title: 'Phase 3 work' },
+      { phase: 4, share: 'ready', gated: true, title: 'Phase 4 work' },
+      { phase: 5, share: 'waiting', gated: true, title: 'Phase 5 work' },
+    ]);
+  });
+
+  it('draws a closed plan’s phases as done or never ran, and an unread board not at all', () => {
+    const [closed] = toRows([plan({ status: 'abandoned', phases: 2, done: 1 })], [], NOW);
+    expect(
+      pipelineOf(closed!, [phase(1, 'done'), phase(2, 'ready', true)])?.map((s) => [s.share, s.gated]),
+    ).toEqual([
+      ['done', undefined],
+      ['never', undefined],
+    ]);
+    const [blind] = toRows([plan({ progress: 'unknown', done: null, percent: null })], [], NOW);
+    expect(pipelineOf(blind!, [phase(1, 'done')])).toBeNull();
+    expect(pipelineOf(closed!, [])).toBeNull();
   });
 });
 

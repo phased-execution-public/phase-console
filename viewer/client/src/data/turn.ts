@@ -11,189 +11,39 @@
  * a projected item's own endpoints.
  */
 
-import type { Guide } from '@shared/guide-grammar.js';
-import type { HumanStepKind, HumanStepState } from '@shared/human-step-model.js';
 import type {
-  HANDLED_LINK_KINDS,
-  HANDLED_SOURCES,
-  ItemType,
-  PersonStatus,
-  ProofType,
-  Readiness,
-  RouteTo,
-  StepsFrom,
-  TurnGroup,
-  TurnRecord as SharedTurnRecord,
-  WhyPerson,
-} from '@shared/turn-model.js';
+  InboxAction,
+  InboxItem,
+  TurnAnswer,
+  TurnCannotAnswer,
+  TurnExplainAnswer,
+  TurnHandOffAnswer,
+  TurnNoteAnswer,
+  TurnOption,
+} from '@shared/wire/turn.js';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { inboxApi, type InboxAction, type InboxItem, type TurnOption } from './api/inbox';
-import {
-  humanStepsApi,
-  type HumanStepRecord,
-  type PermissionRecord,
-  type StepVerbAnswer,
-  type StepVerdictRecord,
-} from './human-steps';
-import type { AuthorityRequest } from './owner';
+import { inboxApi } from './api/inbox';
+import { humanStepsApi, type HumanStepRecord, type StepVerbAnswer } from './human-steps';
 import type { GrantRecord } from './permissions';
-import { request } from './http';
+import { post, request, sendOnLeave } from './http';
 import { keys } from './keys';
 import { press, type Pressed } from './press';
 
-/**
- * Which record holds an item: the human-step ledger, the row's own (a gate, an
- * approval card, …), or — an owner request about no item the turn shows
- * (control-tower phase 148) — the request itself. Owned by
- * `shared/turn-model.js` (`TURN_RECORDS`) since turn-by-turn phase 1.
- */
-export type TurnRecord = SharedTurnRecord;
-
-/** The `turn` view an inbox row carries when it asks a person for an act. */
-export type TurnView = {
-  /** The item this row is: a ledger step's id, or the row's own id when the item is projected. */
-  item: string;
-  record: TurnRecord;
-  /** Where it came from — `shared/turn-model.js` `TURN_SOURCES`. */
-  source: string;
-  kind: HumanStepKind;
-  why: WhyPerson;
-  proofType: ProofType;
-  group: TurnGroup;
-  /** A permission item's record — on a ledger item and on the approval card it projects (phase 135). */
-  permission?: PermissionRecord;
-  /**
-   * The card's words a ROW carries (turn-by-turn phase 10, `server/turn/fold.ts`
-   * `withRowWords`): the type, whether it is due, and NOT YET's *when* — so the
-   * Runs home and the bell say what the card says.
-   */
-  type?: ItemType;
-  readiness?: Readiness;
-  startWhen?: string;
-};
-
-/** A ledger item's own record — its reason, proof, options, waiters and attempts. Never a value. */
-export type TurnStepDetail = {
-  id: string;
-  kind: HumanStepKind;
-  title: string;
-  state: HumanStepState;
-  why: WhyPerson;
-  whySource: 'declared' | 'inferred';
-  proofType: ProofType;
-  attempts: number;
-  waiters: { slug: string; phase: number; runId?: string; sessionId?: string }[];
-  declaredAt: string;
-  birth: string;
-  proof?: string;
-  proofWords?: string;
-  /** The full guide, as the one grammar parsed it (`shared/guide-grammar.js`). */
-  guide?: Guide;
-  options?: { id: string; label: string; consequence?: string; recommended?: true }[];
-  allowDecline?: boolean;
-  effortMin?: number;
-  /** The phases it unblocks. */
-  unblocks?: { slug: string; phase: number }[];
-  until?: string;
-  source?: { kind: string; ref?: string };
-  read?: string;
-  note?: string;
-  permission?: PermissionRecord;
-  /** What the person wrote with each check (turn-by-turn phase 5), oldest first — the card shows the latest. */
-  notes?: { attempt: number; text: string; at: string; by?: string }[];
-  /** A plan item's session item that covers it (turn-by-turn phase 7) — linked, never merged. */
-  coveredBy?: { id: string; phase: number; title: string };
-  /** The plan items this session item covers. */
-  covers?: { id: string; phase: number; title: string }[];
-};
-
-/**
- * How a pressed projected item ended (turn-by-turn phase 5) — an approval
- * card, a gate, a plan approval, an answered question, an ack-bound option:
- * passed or closed, by whom, when, and what was pressed, in words.
- */
-export type TurnSettled = { outcome: 'passed' | 'closed'; by: string; at: string; what: string };
-
-/** One thing to do, however many inbox rows stand for it. */
-export type TurnItem = TurnView & {
-  /** Every inbox row this item stands for — an errand row and its step's row are one item. */
-  rows: string[];
-  title: string;
-  need: string;
-  how: string;
-  severity: string;
-  slug?: string;
-  phase?: number;
-  runId?: string;
-  since: string;
-  expiresAt?: string;
-  /** A human step's window end (#341) — when the act stops being open, never a countdown. */
-  openUntil?: string;
-  href: string;
-  actions: InboxAction[];
-  /*
-   * The card's words (turn-by-turn phase 1, `server/turn/fold.ts` `CardWords`):
-   * what is asked, where the person stands, whether it is due, where a press
-   * goes and who checks it. Optional so a 7.0 answer still reads.
-   */
-  type?: ItemType;
-  personStatus?: PersonStatus;
-  readiness?: Readiness;
-  /** *Goes to* — `ROUTE_META[route]` says it; never `supervisor` in the Free edition. */
-  route?: RouteTo;
-  /** *Checked by*, in words (`CHECKED_BY_LABEL`). */
-  checkedBy?: string;
-  /** A Done item that was pressed: passed or closed, by whom, when (turn-by-turn phase 5). */
-  settled?: TurnSettled;
-  /*
-   * The composer's words (turn-by-turn phase 3, `server/turn/compose.ts`): the
-   * meta in words, the steps by precedence and where they came from, the
-   * check in words, the clocks, and the check's verdicts. Optional here so a
-   * 7.0 console's answer still reads; the card draws them from phase 8.
-   */
-  meta?: string;
-  steps?: Guide['steps'];
-  stepsFrom?: StepsFrom;
-  check?: string;
-  trouble?: Guide['trouble'];
-  timing?: {
-    assignedAt: string;
-    startAt?: string;
-    startWhen?: string;
-    deadline?: string;
-    openUntil?: string;
-    submittedAt?: string;
-    checkedAt?: string;
-  };
-  verdict?: StepVerdictRecord | null;
-  verdicts?: StepVerdictRecord[];
-  /*
-   * What each source says (turn-by-turn phase 4): the ways on, each bound to
-   * its verb, at most one recommended; and the approval block of a yes or a
-   * no. Optional so a 7.0 answer still reads; the card draws them from phase 8.
-   */
-  options?: InboxItem['options'];
-  approval?: InboxItem['approval'] | null;
-  humanStep?: InboxItem['humanStep'];
-  category?: InboxItem['category'];
-  /** A supervisor card's own facts (control-tower phase 139) — the page draws its card inside the item. */
-  supervisor?: InboxItem['supervisor'];
-  step?: TurnStepDetail;
-  /** What other doors asked the owner to press ON this item (phase 148) — each confirmed or refused once. */
-  requests?: AuthorityRequest[];
-  /** An owner request about no item the turn shows: it is the item (`record: 'request'`). */
-  request?: AuthorityRequest;
-  /*
-   * The title rule (#377, `server/turn/compose.ts` `shortTitle`): `title` is
-   * sentence case and at most 80 characters; `headline` is the act's whole
-   * words when the title had to be cut, `errandRef` the plan's errands-table
-   * ref ("E-4") drawn as a chip, and `files` the landing errand's files
-   * grouped by repository — the card's folded *Details*.
-   */
-  headline?: string;
-  errandRef?: string;
-  files?: InboxItem['files'];
-};
+export type {
+  HandledRow,
+  TurnAnswer,
+  TurnCannotAnswer,
+  TurnExplain,
+  TurnExplainAnswer,
+  TurnHandOffAnswer,
+  TurnItem,
+  TurnNoteAnswer,
+  TurnRecord,
+  TurnSettled,
+  TurnStepDetail,
+  TurnStrip,
+  TurnView,
+} from '@shared/wire/turn.js';
 
 /**
  * The item an inbox row stands for: its turn view's id, else — a projected
@@ -313,102 +163,13 @@ export function runItems(
   return itemsNow((rows ?? []).filter((row) => rowInScope(row, { runId: run.id, slug: run.slug })));
 }
 
-/** One thing the AI handled instead of asking (control-tower phase 136) — `server/turn/handled.ts`. */
-export type HandledRow = {
-  id: string;
-  at: string;
-  first: string;
-  source: (typeof HANDLED_SOURCES)[number];
-  what: string;
-  slug?: string;
-  phase?: number;
-  runId?: string;
-  note?: string;
-  count: number;
-  links: { kind: (typeof HANDLED_LINK_KINDS)[number]; ref: string }[];
-};
-
-/** `GET /api/turn`. */
-export type TurnAnswer = {
-  /** When this was read, and the console's round: `n` rises only when a round changed the turn. */
-  round: { at: string; n: number; ranAt: string | null; changedAt: string | null };
-  /** One sentence, composed by rules. */
-  headline: string;
-  groups: Record<TurnGroup, TurnItem[]>;
-  /** What the AI handled instead of asking, newest first. */
-  handled: HandledRow[];
-  /** Per group, the open total, and how many were handled since `seen` (or in the last day). */
-  counts: Record<TurnGroup, number> & { total: number; handled: number };
-  seen: string | null;
-  /** Issue drafts wait on Repo ▸ Issues: how many, and the link. */
-  issues: { count: number; href: string } | null;
-  /**
-   * The plans' heads-ups (turn-by-turn phase 4): an `## Operator errands` row
-   * no bullet names, with its steps — in no group and never counted. Optional
-   * so a 7.0 answer still reads; the page draws them from phase 9.
-   */
-  headsUp?: TurnItem[];
-  /**
-   * The page's strip (turn-by-turn phase 9, `server/turn/index.ts` `stripOf`):
-   * to do, checking, passed today and the nearest deadline. Optional so a 7.0
-   * answer still reads — the page counts its groups instead.
-   */
-  strip?: TurnStrip;
-};
-
-/** The strip's numbers and its *Next deadline* — `TurnAnswer.strip`. */
-export type TurnStrip = {
-  todo: number;
-  checking: number;
-  passedToday: number;
-  nextDeadline: { at: string; item: string; title: string } | null;
-};
-
-/**
- * One item explained — `GET /api/turn/:id` (quiet-console phase 8; the
- * route is control-tower phase 137's, read by the supervisor's `turn-explain`
- * until now). The ledger's record said in the reader's words: why only a
- * person fits it as a sentence, the guide and the commands it asks for, how it
- * is proven, every verdict so far, who waits on it. Only a LEDGER item has
- * one: a projected item (a gate, an approval card, a relayed question) is its
- * row, and the route answers 404 for it.
- */
-export type TurnExplain = {
-  id: string;
-  kind: HumanStepKind;
-  title: string;
-  state: HumanStepState;
-  birth: string;
-  slug: string;
-  phase: number;
-  why: WhyPerson;
-  whySource: 'declared' | 'inferred';
-  /** "<label>: <sentence>." */
-  whyPerson: string;
-  guide?: Guide;
-  /** Every command the guide asks for, in order. */
-  commands?: string[];
-  lines?: string[];
-  proofType: ProofType;
-  proof?: string;
-  proofWords?: string;
-  attempts: number;
-  verdicts: StepVerdictRecord[];
-  escalatedAt?: string;
-  waiters: { slug: string; phase: number; runId?: string; sessionId?: string }[];
-  declaredAt: string;
-  at: string;
-  source?: { kind: string; ref?: string };
-  note?: string;
-};
-
 export const turnApi = {
   /** Every item of Your turn, grouped — `seen` is the person's last look, for the handled count. */
   read: (seen?: string | null): Promise<TurnAnswer> =>
     request<TurnAnswer>(seen ? `/api/turn?seen=${encodeURIComponent(seen)}` : '/api/turn'),
   /** One ledger item, explained (`GET /api/turn/:id`). */
-  explain: (id: string): Promise<{ ok: true; item: TurnExplain }> =>
-    request<{ ok: true; item: TurnExplain }>(`/api/turn/${encodeURIComponent(id)}`),
+  explain: (id: string): Promise<TurnExplainAnswer> =>
+    request<TurnExplainAnswer>(`/api/turn/${encodeURIComponent(id)}`),
 };
 
 /**
@@ -461,6 +222,43 @@ export function withdrawItem(id: string, note?: string): Promise<Pressed<StepVer
  */
 export function undoCheck(id: string): Promise<Pressed<StepVerbAnswer>> {
   return press(() => humanStepsApi.humanStepUndo(id));
+}
+
+/**
+ * *I can't do this* on an item the console projects (2026-10-20) — a gate, a
+ * sign-in, a conflict, a ladder's errand: the person's reason goes with it, the
+ * item moves to Done as Not doing, and whoever it goes to is told. Through the
+ * owner door like every press; a ledger item's is its step's own verb.
+ */
+export function cannotItem(id: string, reason: string): Promise<Pressed<TurnCannotAnswer>> {
+  return press(() => post<TurnCannotAnswer>(`/api/turn/${encodeURIComponent(id)}/cannot`, { reason }));
+}
+
+/**
+ * A comment to the AI on an item (2026-10-20) — the decision card's box when
+ * the way on the person chose carries no words of its own: whoever the item
+ * goes to is told, and the item stays as open as it was.
+ */
+export function noteItem(id: string, text: string): Promise<Pressed<TurnNoteAnswer>> {
+  return press(() => post<TurnNoteAnswer>(`/api/turn/${encodeURIComponent(id)}/note`, { text }));
+}
+
+/**
+ * *Hand it to the AI* (2026-10-20): a decision's last option, through the
+ * turn's own verb — the AI takes it with the person's note: a session's
+ * decision is answered "decide it yourself", a stopped phase resumes, a
+ * conflict's run is told. The server refuses it on a choice only a person
+ * may make.
+ */
+export function handOffItem(id: string, note?: string): Promise<Pressed<TurnHandOffAnswer>> {
+  return press(() =>
+    post<TurnHandOffAnswer>(`/api/turn/${encodeURIComponent(id)}/hand-off`, note ? { note } : {}),
+  );
+}
+
+/** The same comment, as the page goes away inside the undo window — sent once, unanswered. */
+export function noteOnLeave(id: string, text: string): boolean {
+  return sendOnLeave(`/api/turn/${encodeURIComponent(id)}/note`, { text });
 }
 
 /**

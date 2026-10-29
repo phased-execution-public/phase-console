@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { SKILL_DIR, checkRoot } from '../server/config.ts';
+import { SKILL_DIR } from '../server/config.ts';
 import { Service } from '../server/service.ts';
 import { planWrite, WriteError } from '../server/writes.ts';
 import { indexGraph, layerGraph, routeLayout, criticalPath, transitiveDependents, resolveBudget, loadSizing } from '../server/analysis/graph.ts';

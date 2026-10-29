@@ -315,12 +315,28 @@ test('OD-4 (phase 133): the owner\'s moves — a session\'s door may not answer,
     // An answer and a decline carry authority; a question and evidence do not, and the table says so.
     const rows = AUTHORITY_ROUTES.filter((row) => row.path.startsWith('/api/human-steps/:id/'));
     assert.deepEqual(rows.map((row) => `${row.path.split('/').pop()}:${row.authority}`).sort(),
-      ['answer:answer', 'check:attest', 'convert:decline', 'decline:decline', 'deny:decline', 'dismiss:decline', 'grant:grant', 'override:override',
-        'rewrite:decline']);
+      ['answer:answer', 'cannot:decline', 'check:attest', 'convert:decline', 'decline:decline', 'deny:decline', 'dismiss:decline', 'grant:grant',
+        'open:decline', 'override:override', 'rewrite:decline', 'snooze:decline']);
     assert.equal(doorMay('device', 'answer'), 'press', 'a paired device answers');
     assert.equal(doorMay('session', 'answer'), 'refuse');
     assert.equal(doorMay('supervisor', 'decline', { mode: 'enrolled' }), 'request', 'the supervisor may only ask the owner');
     assert.equal(doorMay('checker', 'answer'), 'refuse', 'nor the checker');
+  } finally {
+    close();
+  }
+});
+
+test('OD-4 (EI-7, measured-console phase 17): a session\'s door may not say a person cannot, snooze their step or open it; a local press gets past the door', async () => {
+  const { service, close } = serviceWithRun();
+  try {
+    const token = service.approvals.arm('r1');
+    for (const [verb, body] of [['cannot', { reason: 'no' }], ['snooze', { minutes: 60 }], ['open', { where: 'here' }]] as const) {
+      const viaSession = await call(service, 'POST', `/api/human-steps/s-1/${verb}`, { authorization: `Bearer ${token}` }, body);
+      assert.equal(viaSession.status, 403, `${verb}: ${JSON.stringify(viaSession.answer)}`);
+      assert.equal(viaSession.answer.door, 'session', verb);
+      const viaLocal = await call(service, 'POST', `/api/human-steps/s-1/${verb}`, {}, body);
+      assert.notEqual(viaLocal.status, 403, `${verb}: a local press is past the door — ${JSON.stringify(viaLocal.answer)}`);
+    }
   } finally {
     close();
   }
@@ -452,4 +468,13 @@ test('EC5: `ownerDoor` reads unenrolled, enrolled or unlocked — per request; a
     service.close();
     freshOwnerState();
   }
+});
+
+test('EI-39 (measured-console phase 17): isLoopbackRequest — the three loopback addresses, nothing else, and no socket only where a door allows an in-process request', async () => {
+  const { isLoopbackRequest } = await import('../server/api/loopback.ts');
+  const at = (remoteAddress?: string) => ({ socket: { remoteAddress } }) as never;
+  for (const address of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) assert.equal(isLoopbackRequest(at(address)), true, address);
+  for (const address of ['10.0.0.4', '::ffff:10.0.0.4', '100.64.1.2']) assert.equal(isLoopbackRequest(at(address)), false, address);
+  assert.equal(isLoopbackRequest(at(undefined)), false, 'no socket is not the machine');
+  assert.equal(isLoopbackRequest(at(undefined), { inProcess: true }), true);
 });

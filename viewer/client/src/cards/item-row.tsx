@@ -17,8 +17,9 @@
  *   options opens its card (turn-by-turn phase 10) — save a projected one with
  *   exactly one answer that asks for no words, pressed here (a gate's Approve
  *   asks for its evidence, so it is the page's);
- * - a step leads with the human-step card's primary — its kind's opener or its
- *   check, or a folded card's recommended verb, exactly as the server spelled it;
+ * - a step leads with its own primary (`turn/step-parts.tsx`) — its kind's
+ *   opener or its check, or a folded card's recommended verb, exactly as the
+ *   server spelled it;
  * - anything else with its first pressable action, pressed verbatim.
  *
  * Since turn-by-turn phase 10 the row says the card's words first — NOW or NOT
@@ -35,7 +36,7 @@ import { cn } from '@/lib/cn';
 import { turnHref } from '@/shell/routes';
 import { Button } from '@/ui';
 import { OpsStatus } from '@/ui/status';
-import { HumanStepPrimary, KindMark } from './human-step-card';
+import { HumanStepPrimary, KindMark } from './turn/step-parts';
 import { TurnRowWords } from './turn/row-words';
 
 type Perform = (item: InboxItem, action: InboxAction, says?: string) => void;

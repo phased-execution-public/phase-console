@@ -43,6 +43,7 @@ vi.mock('@/data/http', async (importOriginal) => {
 });
 
 import type { AccountsState, ConsoleState, DebugBundle, DoctorReport, DoctorRow } from '@/data/api';
+import type { HealthSeriesView } from '@/data/logs';
 import { ApiError } from '@/data/http';
 import type { CeilingWindow, StartCeilingCounters } from '@/data/machine';
 import { queryClientConfig } from '@/data/keys';
@@ -212,6 +213,29 @@ async function readTheBundle(): Promise<HTMLElement> {
 
 const writeText = vi.fn(async (_text: string) => {});
 
+/** `/api/health/series`: a few points of each measure, the bounds the server keeps them to. */
+const SERIES: HealthSeriesView = {
+  from: '2026-09-01T00:00:00.000Z',
+  to: '2026-09-29T10:00:00.000Z',
+  bounds: { maxPoints: 2100, days: 30, sampleMs: 300_000 },
+  measures: {
+    gate: [
+      { at: '2026-09-20T12:00:00.000Z', v: 410 },
+      { at: '2026-09-27T12:00:00.000Z', v: 352, note: 'abc1234' },
+    ],
+    load: [
+      { at: '2026-09-29T09:50:00.000Z', v: 0.4 },
+      { at: '2026-09-29T09:55:00.000Z', v: 0.75 },
+      { at: '2026-09-29T10:00:00.000Z', v: 0.5 },
+    ],
+    persist: [{ at: '2026-09-29T09:55:00.000Z', v: 12.4 }],
+    reconcile: [
+      { at: '2026-09-22T00:00:00.000Z', v: 3.1 },
+      { at: '2026-09-29T00:00:00.000Z', v: -1.2 },
+    ],
+  },
+};
+
 beforeEach(() => {
   server.calls = [];
   server.reads = {
@@ -221,6 +245,7 @@ beforeEach(() => {
     '/api/doctor': REPORT,
     '/api/debug/bundle': bundle(),
     '/api/ceiling': ceiling(),
+    '/api/health/series': SERIES,
     '/api/doctor/strays': { at: '2026-09-29T10:00:00.000Z', strays: [], stop: STOP },
   };
   writeText.mockClear();
@@ -232,11 +257,12 @@ beforeEach(() => {
  * ------------------------------------------------------------------ */
 
 describe('the questions, top to bottom', () => {
-  it('asks seven questions in their order, each a region named by its heading — and no retirements over none', async () => {
+  it('asks eight questions in their order, each a region named by its heading — and no retirements over none', async () => {
     mount();
     await screen.findByTestId('process');
     expect(questions()).toEqual([
       'runtime',
+      'series',
       'doctor',
       'process',
       'ceiling',
@@ -246,6 +272,7 @@ describe('the questions, top to bottom', () => {
     ]);
     for (const name of [
       'This console’s runtime',
+      'Over time',
       'Doctor',
       'This process',
       'Automatic starts this hour',
@@ -285,6 +312,60 @@ describe('the questions, top to bottom', () => {
 /* ------------------------------------------------------------------ *
  * The doctor
  * ------------------------------------------------------------------ */
+
+describe('over time: the four measures, bounded', () => {
+  it('draws a figure for each measure from the server’s points, and says the bounds in words', async () => {
+    mount();
+    const series = await screen.findByTestId('health-series');
+    expect(series).toBe(screen.getByRole('region', { name: 'Over time' }));
+    expect(await within(series).findByTestId('health-series-bounds')).toHaveTextContent(
+      'Kept for 30 days, and at most 2100 points of each measure, the newest. Load and save time are sampled every 5 minutes; the gate has a point per run. Times are UTC.',
+    );
+    for (const id of ['gate', 'load', 'persist'] as const) {
+      expect(within(series).getByTestId(`health-series-${id}`)).toHaveAttribute(
+        'data-points',
+        String(SERIES.measures[id].length),
+      );
+    }
+    // Each is a strip with its newest value, and no total: a load does not add up.
+    expect(within(series).getByTestId('health-series-gate')).toHaveTextContent('Gate time 5m 52s');
+    expect(within(series).getByTestId('health-series-load')).toHaveTextContent('Load per core 0.50');
+    expect(within(series).getByTestId('health-series-persist')).toHaveTextContent('Save time 12 ms');
+    expect(series).not.toHaveTextContent('in all');
+  });
+
+
+  it('says what a measure with no points has not seen, in words and never a zero', async () => {
+    server.reads['/api/health/series'] = {
+      ...SERIES,
+      measures: { gate: [], load: [], persist: [], reconcile: [] },
+    };
+    mount();
+    const series = await screen.findByTestId('health-series');
+    expect(await within(series).findByText('The full gate has not run on this machine.')).toBeInTheDocument();
+    expect(within(series).getByText('No load has been sampled yet.')).toBeInTheDocument();
+    expect(within(series).getByText('No run has been saved since sampling began.')).toBeInTheDocument();
+  });
+
+  it('says the server’s words when the series cannot be read, and Try again asks again', async () => {
+    let asks = 0;
+    server.reads['/api/health/series'] = () => {
+      asks += 1;
+      if (asks === 1) throw new ApiError('the series file is unreadable', 500, '/api/health/series');
+      return SERIES;
+    };
+    mount();
+    const series = await screen.findByTestId('health-series');
+    expect(await within(series).findByText(/Health over time could not be read/)).toHaveTextContent(
+      'Health over time could not be read: the series file is unreadable',
+    );
+    // The rest of the page still stands.
+    expect(await screen.findByTestId('process')).toBeInTheDocument();
+    fireEvent.click(within(series).getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByTestId('health-series-bounds')).toBeInTheDocument();
+    expect(asks).toBe(2);
+  });
+});
 
 describe('the doctor leads with the check to fix first', () => {
   it('asks only when the reader does, then draws a probe word per row with the first blocking failure first', async () => {
@@ -502,6 +583,7 @@ describe('a retirement’s evidence, and its contradiction', () => {
     expect(question).toBe(screen.getByRole('region', { name: 'Retired credentials' }));
     expect(questions()).toEqual([
       'runtime',
+      'series',
       'doctor',
       'process',
       'retirements',
@@ -670,7 +752,7 @@ describe('environment, the watch clock and metrics — read on a press', () => {
     mount();
     const health = await readTheBundle();
     expect(health).toHaveTextContent(
-      '1 family, as /api/metrics renders them now. This console keeps no history; a chart over time is for whatever scrapes it.',
+      '1 family, as /api/metrics renders them now: a snapshot, not a history. What this console does keep over time is under Over time, above.',
     );
     expect(within(health).getByRole('link', { name: '/api/metrics' })).toHaveAttribute(
       'href',

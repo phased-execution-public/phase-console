@@ -149,13 +149,17 @@ twin() {  # twin <slug> <rows…>  — write a decisions.md twin in the writer's
   assert_contains "$output" "phase 3: gate-directive-missing"
 }
 
-@test "boot-prompt: the phase's decision rows ride between the bootstrap list and the scope block, outstanding first, with the --needs duty" {
+@test "boot-prompt: the phase's decision rows ride between the bootstrap list and the scope block, outstanding only, with the --needs duty" {
   setup_docs decisions decisions
   run pg decisions --boot-prompt 1
   [ "$status" -eq 0 ]
   assert_contains "$output" "This phase's DECISIONS"
   assert_contains "$output" "  - [outstanding] waits — owner dev-lead, blocking yes: (no value yet)"
-  assert_contains "$output" "  - [answered] relay: off"
+  # An answered row is the plan's standing instruction: `--decisions N` reads
+  # it, the prompt only counts it (measured-console phase 2).
+  refute_contains "$output" "  - [answered]"
+  assert_contains "$output" "more rows are answered or waived; read them with the line above"
+  assert_contains "$output" "phase-graph.sh decisions --decisions 1"
   assert_contains "$output" "blocked --needs <key> --reason"
   assert_contains "$output" '`--needs` is REQUIRED on `blocked` and `needs-human`'
   # a run-level act is the run's (turn-by-turn phase 6): the class and the acts
@@ -166,9 +170,11 @@ twin() {  # twin <slug> <rows…>  — write a decisions.md twin in the writer's
   dec="$(printf '%s\n' "$output" | grep -n "This phase's DECISIONS" | cut -d: -f1)"
   scope="$(printf '%s\n' "$output" | grep -n "This phase's SCOPE" | cut -d: -f1)"
   [ "$boot" -lt "$dec" ] && [ "$dec" -lt "$scope" ]
-  # phase 2's own waits row is the one phase 2's prompt shows
+  # phase 2's own waits row is answered: its prompt shows none, its read does
   run pg decisions --boot-prompt 2
-  assert_contains "$output" '  - [answered] waits: `gh:acme/widgets#run/1` · 45m'
+  refute_contains "$output" '  - [answered] waits'
+  run pg decisions --decisions 2
+  assert_contains "$output" '`gh:acme/widgets#run/1` · 45m'
 }
 
 @test "boot-prompt: a plan with no manifest still tells the session the keys and the duty" {

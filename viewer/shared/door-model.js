@@ -407,6 +407,25 @@ export const AUTHORITY_ROUTES = Object.freeze([
     declare: HUMAN,
     summary: "withdraw a person's step",
   }),
+  // The verbs a session's door could still press in a person's name
+  // (measured-console phase 17, EI-7): each settles, defers or opens a
+  // person's item, so each is fenced at the lowest tier — any person's door,
+  // never an agent's. The client's *I can't do this* goes through `/api/turn`.
+  press('cannot-step', 'POST /api/human-steps/:id/cannot', {
+    authority: 'decline',
+    declare: HUMAN,
+    summary: 'say a person cannot do a step — the reason goes with it',
+  }),
+  press('snooze-step', 'POST /api/human-steps/:id/snooze', {
+    authority: 'decline',
+    declare: HUMAN,
+    summary: "hold a person's step's reminders for a while",
+  }),
+  press('open-step', 'POST /api/human-steps/:id/open', {
+    authority: 'decline',
+    declare: HUMAN,
+    summary: "open what a person's step names — its link or its command",
+  }),
   // The owner's moves (control-tower phase 133, #210): an answer and a decline
   // are the owner's to give, so the hook's forge guard fences them from the
   // day they exist. `ask` and `evidence` are not authority — a route-level
@@ -469,6 +488,27 @@ export const AUTHORITY_ROUTES = Object.freeze([
     authority: 'decline',
     declare: HUMAN,
     summary: 'withdraw an escalated item and ask the session that raised it for a new version',
+  }),
+  // *I can't do this* on any open item of Your turn (2026-10-20): a person's
+  // word that an act is not theirs to do, which settles the item and pins a
+  // note its phase's next session reads — fenced from a session the day it is born.
+  press('cannot-item', 'POST /api/turn/:id/cannot', {
+    authority: 'decline',
+    declare: HUMAN,
+    summary: 'say a person cannot do an item of Your turn — the reason goes with it, and its run is told',
+  }),
+  // *Hand it to the AI* (2026-10-20): the last way on of every decision — the
+  // person hands the AI the call, so it is trust handed to an agent.
+  press('hand-off-item', 'POST /api/turn/:id/hand-off', {
+    authority: 'trust',
+    declare: HUMAN,
+    summary: 'hand a decision of Your turn to the AI — it decides, with the note',
+  }),
+  // A comment to the AI on an item (2026-10-20): the person's words, pinned where the phase reads them.
+  press('note-item', 'POST /api/turn/:id/note', {
+    authority: 'answer',
+    declare: HUMAN,
+    summary: 'send the AI a note about an item of Your turn',
   }),
   // A signed lock-screen action proves its own door inside its route — the
   // token the console signed for a subscribed device stamps `device` (phase

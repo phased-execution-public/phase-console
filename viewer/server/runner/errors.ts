@@ -21,6 +21,7 @@ import type { EndedBy } from '../../shared/run-lifecycle.js';
 import type { CredentialClass, CredentialEvidenceSource } from '../../shared/ops-vocab.js';
 import { MODELS_ENV_FALLBACK, modelFamily } from './models.ts';
 import { envCarrier } from '../trace.ts';
+import { DEFAULT_BASH_MAX_OUTPUT, cacheTtlOfEnv } from '../../shared/run-settings.js';
 
 export type Disposition =
   /** Transient; try the same phase again shortly. */
@@ -887,6 +888,17 @@ export const CONSOLE_MAX_RETRIES = '15';
 export const BG_WAIT_CEILING_MS = 600_000;
 
 /**
+ * The compaction arm's environment (measured-console phase 12, A10): under
+ * `native` the CLI compacts the session itself at `window` tokens
+ * (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`); under `console` the variable is cleared
+ * (`undefined` drops it from a spawn), so the console's own checkpoints are the
+ * only ones and an inherited value never speaks for a run that did not choose it.
+ */
+export function compactionEnv(arm: 'console' | 'native', window: number): NodeJS.ProcessEnv {
+  return arm === 'native' ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(window) } : { CLAUDE_CODE_AUTO_COMPACT_WINDOW: undefined };
+}
+
+/**
  * Environment for a child session.
  *
  * `CLAUDE_CODE_RETRY_WATCHDOG=1` is documented for "CI/unattended sessions":
@@ -904,6 +916,14 @@ export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessE
     // The watchdog governs 429/529; this covers everything else it does not.
     CLAUDE_CODE_MAX_RETRIES: decided.maxRetries.value,
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: decided.bgWaitCeilingMs.value,
+    // The 2.1.302 defaults, set on purpose (measured-console phase 6, E4 and
+    // A4; the env-vars page read 2026-10-25) rather than inherited by accident.
+    // A run's own value (`sessionEnv`: the run's `bashMaxOutput`, its subagent
+    // model, the phase's wait budget) arrives in `base` and wins.
+    ...sessionDefaults(base),
+    // Where the session's OpenTelemetry goes (measured-console phase 19): the
+    // console's receiver, when the run armed one — nothing otherwise.
+    ...telemetryEnv(base),
     // The session's own evidence — its task list, its declared outcome, its
     // lock, its presence hook — is written by a process this console lets go
     // of. Nothing afterwards could correlate those with the drive that started
@@ -912,6 +932,125 @@ export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessE
     // `TRACEPARENT` rather than handing a stranger's trace to a two-hour
     // session.
     ...envCarrier(),
+  };
+}
+
+/**
+ * How long ONE API request may wait out 429s and 529s under the watchdog
+ * (`CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS`, CLI 2.1.295+): half an hour, the
+ * docs' own example, unless the phase's wait budget is shorter. Unset, the
+ * CLI waits for ever — a session sat out a usage wall the pool could have
+ * routed round (B9); bounded, the request ends and the console's `onLimit`
+ * decides: pause, or move the phase to an account with headroom.
+ */
+export const WATCHDOG_MAX_WAIT_MS = 30 * 60_000;
+
+/**
+ * How often a request waiting on a subscription's usage limit asks whether it
+ * has lifted (`CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS`, CLI
+ * 2.1.305+, 60 000–10 800 000): every five minutes, so a limit lifted early is
+ * used at once.
+ */
+export const WATCHDOG_USAGE_RECHECK_MS = 5 * 60_000;
+
+/**
+ * How long a request may wait on a subscription's usage limit before it ends
+ * and the console's `onLimit` decides (`CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS`,
+ * read by CLI 2.1.311 — phase 6 found no such variable in 2.1.305; measured-console
+ * phase 24, B9): until the run's pool next has room — its nearest reset — and
+ * never past `WATCHDOG_MAX_WAIT_MS`, so a session rotates instead of waiting
+ * past the pool's reach; never under `WATCHDOG_USAGE_LIMIT_FLOOR_MS`, the
+ * recheck's own floor. No reset known: `WATCHDOG_MAX_WAIT_MS`.
+ */
+export const WATCHDOG_USAGE_LIMIT_FLOOR_MS = 60_000;
+export function usageLimitWaitMs(nearestResetMs: number | null, nowMs: number): number {
+  if (nearestResetMs === null || !Number.isFinite(nearestResetMs)) return WATCHDOG_MAX_WAIT_MS;
+  return Math.max(WATCHDOG_USAGE_LIMIT_FLOOR_MS, Math.min(WATCHDOG_MAX_WAIT_MS, Math.round(nearestResetMs - nowMs)));
+}
+
+/**
+ * The variables phase 6 states for every child (E4, A4, A5). Each is the
+ * inherited value when the parent set one — `sessionEnv` states the run's — and
+ * the console's otherwise. Never `DISABLE_TELEMETRY=0`: the CLI reads ANY value
+ * of it, `0` included, as an opt-out, so writing one would say the opposite of
+ * what it reads as. `CLAUDE_CODE_SUBAGENT_MODEL` has no console default: absent,
+ * the CLI's own rule (the parent's model) stands.
+ */
+function sessionDefaults(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    // How much of a command's output the CLI reads back into the session.
+    BASH_MAX_OUTPUT_LENGTH: base.BASH_MAX_OUTPUT_LENGTH ?? String(DEFAULT_BASH_MAX_OUTPUT),
+    // Forks share the parent's prompt cache; on by default since 2.1.302, said here so a
+    // changed default cannot change the run (phase 33 reports the figure).
+    CLAUDE_CODE_FORK_SUBAGENT: base.CLAUDE_CODE_FORK_SUBAGENT ?? '1',
+    CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS: base.CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS ?? String(WATCHDOG_MAX_WAIT_MS),
+    CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS:
+      base.CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS ?? String(WATCHDOG_USAGE_RECHECK_MS),
+    // The runner states the pool's bound (`sessionEnv`); a child spawned without one waits the request's own.
+    CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS:
+      base.CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS ?? String(WATCHDOG_MAX_WAIT_MS),
+  };
+}
+
+/**
+ * How often a session exports its metrics (`OTEL_METRIC_EXPORT_INTERVAL`, the CLI's default 60 s)
+ * and its events (`OTEL_LOGS_EXPORT_INTERVAL`, default 5 s) to the console's receiver. Ten
+ * seconds for the metrics: a phase's last minute must reach the console before the session ends,
+ * and the CLI's shutdown flush is the only other chance. The events keep the CLI's five.
+ */
+export const OTEL_METRIC_EXPORT_INTERVAL_MS = 10_000;
+export const OTEL_LOGS_EXPORT_INTERVAL_MS = 5_000;
+
+/**
+ * The exporter variables an inherited value could otherwise speak through: the per-signal
+ * endpoint, protocol and headers outrank the general ones in the CLI, a compression the receiver
+ * does not read would lose every export, so a console started from
+ * a shell that exported its own would send a session's events somewhere this run never chose.
+ */
+export const OTEL_SIGNAL_OVERRIDES = [
+  'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT', 'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT',
+  'OTEL_EXPORTER_OTLP_LOGS_PROTOCOL', 'OTEL_EXPORTER_OTLP_METRICS_PROTOCOL',
+  'OTEL_EXPORTER_OTLP_LOGS_HEADERS', 'OTEL_EXPORTER_OTLP_METRICS_HEADERS',
+  // An inherited gzip would reach a receiver that reads plain JSON and 415s it: every export lost.
+  'OTEL_EXPORTER_OTLP_COMPRESSION', 'OTEL_EXPORTER_OTLP_LOGS_COMPRESSION', 'OTEL_EXPORTER_OTLP_METRICS_COMPRESSION',
+] as const;
+
+/**
+ * The telemetry block (measured-console phase 19, §Architecture 9). When the run's spawn stated
+ * a receiver (`PE_OTEL_ENDPOINT` and the run's bearer `PE_OTEL_TOKEN`, `runner-control.ts`
+ * `otelEnv`), the session exports its metrics and events over OTLP/HTTP JSON to it — the CLI
+ * appends the signal's path, so it posts `/otel/v1/logs` and `/otel/v1/metrics` — with the
+ * resource attributes that say whose they are: `plan` (`PE_SLUG`), `phase` (`PE_PHASE`), `run`
+ * (`PE_RUN_ID`), `account` (`PE_ACCOUNT`), `session` (`PE_SESSION_ID`) and, when the account's
+ * cache arm states one, `cache_ttl` — what lifetime the session's cache writes have. Each value is
+ * percent-encoded: the variable is a comma list of `key=value` with no spaces. No receiver, no
+ * block: the operator's own telemetry settings, if any, stand untouched. The bearer leaves the
+ * environment as `PE_OTEL_TOKEN` once it is in the exporter's header.
+ */
+export function telemetryEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const endpoint = base.PE_OTEL_ENDPOINT;
+  const token = base.PE_OTEL_TOKEN;
+  if (!endpoint || !token) return {};
+  const attributes: [string, string | null | undefined][] = [
+    ['plan', base.PE_SLUG], ['phase', base.PE_PHASE], ['run', base.PE_RUN_ID],
+    ['account', base.PE_ACCOUNT], ['session', base.PE_SESSION_ID], ['cache_ttl', cacheTtlOfEnv(base)],
+  ];
+  const cleared = Object.fromEntries(OTEL_SIGNAL_OVERRIDES.map((key) => [key, undefined]));
+  return {
+    ...cleared,
+    CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+    OTEL_METRICS_EXPORTER: 'otlp',
+    OTEL_LOGS_EXPORTER: 'otlp',
+    OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
+    OTEL_EXPORTER_OTLP_ENDPOINT: endpoint,
+    OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer ${token}`,
+    OTEL_METRIC_EXPORT_INTERVAL: String(OTEL_METRIC_EXPORT_INTERVAL_MS),
+    OTEL_LOGS_EXPORT_INTERVAL: String(OTEL_LOGS_EXPORT_INTERVAL_MS),
+    OTEL_RESOURCE_ATTRIBUTES: attributes
+      .filter((pair): pair is [string, string] => typeof pair[1] === 'string' && pair[1] !== '')
+      .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+      .join(','),
+    PE_OTEL_TOKEN: undefined,
   };
 }
 

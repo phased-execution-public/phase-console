@@ -1,0 +1,4 @@
+{
+  "note": "The ratchet row of `npm run coverage:diff` (measured-console phase 15): the share of a diff's changed executable server/shared lines its tests ran must not fall under `floor`; `--write` raises it, nothing lowers it. Nightly, never a gate.",
+  "floor": 0.6
+}

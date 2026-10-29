@@ -13,8 +13,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const { rereadManifest } = await import('../server/prelude.ts');
@@ -24,6 +23,7 @@ const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 import type { ResolvedManifest } from '../server/runner/state.ts';
 import type { SpawnFn, SpawnOutcome } from '../server/runner/spawn.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const LAUNCHED: ResolvedManifest = {
   decisions: [
@@ -84,15 +84,11 @@ test('rereadManifest: an unchanged plan moves nothing and says so', () => {
  * the runner takes it and journals it
  * ------------------------------------------------------------------ */
 
-function repo(): { root: string; scripts: string; state: string } {
-  const root = mkdtempSync(join(tmpdir(), 'pc-reread-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  for (const dir of [scripts, state, join(root, 'docs', 'plans')]) mkdirSync(dir, { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n', 'utf8');
-  writeFileSync(join(state, 'done'), '', 'utf8');
-  const write = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): { root: string; scripts: string; state: string } {
+  const made = stubRepo({
+    prefix: 'pc-reread-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 mode="\${2:-}"; arg="\${3:-}"
@@ -108,10 +104,12 @@ case "$mode" in
   --size) echo S ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && { echo "phase ${3:-?}: free"; exit 0; }\nexit 0\n');
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return { root, scripts, state };
+`,
+      'phase-lock.sh': '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && { echo "phase ${3:-?}: free"; exit 0; }\nexit 0\n',
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function session(r: { state: string }): SpawnFn {
@@ -128,7 +126,7 @@ const PERSON = { by: 'mobin', via: 'browser', origin: 'test', remoteUser: null }
 const CLOCK = { by: 'console', via: 'timer', origin: 'converge', remoteUser: null, door: 'converge-relaunch' };
 
 async function resumed(actor: Record<string, unknown>) {
-  const r = repo();
+  const r = stubbedPlan();
   const first = new Runner({ scriptsDir: r.scripts, spawn: session(r), verificationText: () => '`true`' });
   await first.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', manifest: LAUNCHED });
   await first.wait();
@@ -160,7 +158,7 @@ test('a resume no person pressed applies nothing — the rows are in the tree a 
 });
 
 test('the start door re-reads the plan\'s decisions on every resume — never only at first launch', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const first = new Runner({ scriptsDir: r.scripts, spawn: session(r), verificationText: () => '`true`' });
   await first.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', manifest: LAUNCHED });
   await first.wait();

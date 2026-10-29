@@ -29,6 +29,7 @@ import { resumeAtBootMode, RESUME_AT_BOOT_MODES, type ResumeAtBootMode } from '@
 import { STALL_DEFAULTS, STALL_ESCALATE_MS, STALL_LOCAL_JOB_MS } from '@shared/attention-model.js';
 import { LADDER_PREF_DEFAULTS } from '@/data/api';
 import { BoolSetting, NumberSetting, SettingsGroup, WordSetting, useSetting } from './setting';
+import { formatUsd } from '@/ui/money';
 
 /** A clock is typed in minutes and stored in milliseconds. */
 const MINUTE = 60_000;
@@ -79,7 +80,7 @@ function LadderGroup() {
         unit="dollars"
         min={0}
         step={10}
-        hint={`What the ladder may spend on one phase, every attempt counted (shipped: $${D.ladderPerPhaseUsd}).`}
+        hint={`What the ladder may spend on one phase, every attempt counted (shipped: ${formatUsd(D.ladderPerPhaseUsd, 'short')}).`}
       />
       <NumberSetting
         pref="ladderPerRunRungs"
@@ -95,7 +96,7 @@ function LadderGroup() {
         unit="dollars"
         min={0}
         step={10}
-        hint={`Across every phase of one run (shipped: $${D.ladderPerRunUsd}). The one automatic budget raise stays inside it.`}
+        hint={`Across every phase of one run (shipped: ${formatUsd(D.ladderPerRunUsd, 'short')}). The one automatic budget raise stays inside it.`}
       />
       <NumberSetting
         pref="ladderPerDayUsd"
@@ -103,7 +104,7 @@ function LadderGroup() {
         unit="dollars"
         min={0}
         step={10}
-        hint={`What the ladder may spend in a day across every run this console drives; what the runs themselves cost is not counted (shipped: $${D.ladderPerDayUsd}).`}
+        hint={`What the ladder may spend in a day across every run this console drives; what the runs themselves cost is not counted (shipped: ${formatUsd(D.ladderPerDayUsd, 'short')}).`}
       />
       <NumberSetting
         pref="budgetAutoRaisePct"

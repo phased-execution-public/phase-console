@@ -8,6 +8,7 @@
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { GUIDE_MAX_BYTES, parseGuide, type Guide } from '../../shared/guide-grammar.js';
+import { guideFromWizard, isWizardScript } from './packs.ts';
 
 /**
  * A plan bullet's `guide:` FILE, read for the launch door and for the read-time
@@ -16,7 +17,8 @@ import { GUIDE_MAX_BYTES, parseGuide, type Guide } from '../../shared/guide-gram
  * — so a symlink that escapes it is refused as surely as `../` — a regular file
  * of at most `GUIDE_MAX_BYTES`, read by the one grammar, whose secret screen runs
  * on every line. Every refusal is a sentence that names the file and never a
- * value from it; the caller raises the item without a guide.
+ * value from it; the caller raises the item without a guide. A wizard script is
+ * composed into a guide (`turn/packs.ts` `guideFromWizard`).
  */
 export function readGuideFile(
   docsRoot: string, rel: string, opts: { lang?: string } = {},
@@ -50,7 +52,12 @@ export function readGuideFile(
   }
   let text: string;
   try { text = readFileSync(file, 'utf8'); } catch { return { ok: false, why: `the guide ${name} could not be read` }; }
-  const read = parseGuide(text, opts.lang ? { lang: opts.lang } : {});
+  // A wizard (mattpocock's `wizard/template.sh`, measured-console phase 29) is
+  // read into the Task guide's shape — its stages, each with its commands, a
+  // secret said by where it goes — and held to the same grammar.
+  const read = isWizardScript(text)
+    ? guideFromWizard(text, name, opts.lang ?? 'en')
+    : parseGuide(text, opts.lang ? { lang: opts.lang } : {});
   if (!read.ok) return { ok: false, why: `the guide ${name} was refused: ${read.error}` };
   return { ok: true, guide: read.guide, text };
 }

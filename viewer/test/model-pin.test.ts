@@ -14,8 +14,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
@@ -27,22 +26,17 @@ import { DEFAULT_MODEL_POLICY, MODEL_POLICIES } from '../shared/run-lifecycle.js
 import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS } from '../shared/run-settings.js';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
 import type { LeaveReason, LeaveResult } from '../server/accounts/index.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const PINNED = 'claude-opus-5-5[1m]';
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-model-pin-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-model-pin-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -54,14 +48,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(stub, 'done'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: (phase) => writeFileSync(join(made.state, 'done'), `${phase}\n`) };
 }
 
 const journalled = (events: { event: string; data: Record<string, unknown> }[], name: string) => events
@@ -105,7 +97,7 @@ function reporting(r: Repo, resolved: (request: SpawnRequest) => string, seen: S
 
 test('MP-1: a pinned phase is handed no fallback chain; a ladder phase still is', async () => {
   for (const policy of ['pinned', 'ladder'] as const) {
-    const r = repo();
+    const r = stubbedPlan();
     const seen: SpawnRequest[] = [];
     const { instance } = runner(r, reporting(r, () => PINNED, seen));
     try {
@@ -119,7 +111,7 @@ test('MP-1: a pinned phase is handed no fallback chain; a ladder phase still is'
 });
 
 test('MP-1: the plan\'s `**Model policy:**` pins a run that named none — the plan outranks the run', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance } = runner(r, reporting(r, () => PINNED, seen), {
     phaseDefaults: () => ({ model: PINNED, modelPolicy: 'pinned' }),
@@ -138,7 +130,7 @@ test('MP-1: the plan\'s `**Model policy:**` pins a run that named none — the p
 const OPUS_WALL = ['You\'ve hit your Opus li', 'mit · resets 3pm'].join('');
 
 test('MP-2: a per-model wall under `pinned` switches account on the SAME model and never calls nextModel', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const spawn: SpawnFn = async (request) => {
     seen.push(request);
@@ -164,7 +156,7 @@ test('MP-2: a per-model wall under `pinned` switches account on the SAME model a
 });
 
 test('MP-2: with nowhere to switch and no reset to wait for, a pinned wall parks for a person — it never runs a weaker model', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const spawn: SpawnFn = async (request) => {
     seen.push(request);
@@ -183,7 +175,7 @@ test('MP-2: with nowhere to switch and no reset to wait for, a pinned wall parks
 });
 
 test('MP-2 (control): under `ladder` the same wall steps down one model, as it always did', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const spawn: SpawnFn = async (request) => {
     seen.push(request);
@@ -219,7 +211,7 @@ function strandedRun(root: string, policy: 'pinned' | 'ladder'): RunState {
 
 test('MP-3: "Board fresh, stronger" under `pinned` keeps the model and raises only the effort', async () => {
   for (const policy of ['pinned', 'ladder'] as const) {
-    const r = repo();
+    const r = stubbedPlan();
     const seen: SpawnRequest[] = [];
     const stored = strandedRun(r.root, policy);
     const { instance, events } = runner(r, reporting(r, (request) => request.model ?? '', seen));
@@ -258,7 +250,7 @@ test('MP-3: the other rung, "Fix with a stronger new agent", is a repair session
  * ------------------------------------------------------------------ */
 
 test('MP-4: an init frame that reports another model journals phase.model-mismatch and parks the phase with an errand', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance, events } = runner(r, reporting(r, () => 'claude-opus-6[1m]', seen));
   try {
@@ -284,7 +276,7 @@ test('MP-4: a dated id and an alias that resolves to its canonical id are the SA
     ['claude-fable-5-1[1m]', 'claude-fable-5-1'],
     ['fable[1m]', 'claude-fable-5-1'],
   ] as const) {
-    const r = repo();
+    const r = stubbedPlan();
     const seen: SpawnRequest[] = [];
     const { instance, events } = runner(r, reporting(r, () => reported, seen));
     try {
@@ -297,7 +289,7 @@ test('MP-4: a dated id and an alias that resolves to its canonical id are the SA
 });
 
 test('MP-4 (control): under `ladder` a different model is recorded, never parked', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance, events } = runner(r, reporting(r, () => 'claude-opus-6[1m]', seen));
   try {
@@ -317,7 +309,7 @@ test('MP-5: `modelPolicy` rides the start AND the settings doors; ladder is the 
   assert.equal(DEFAULT_MODEL_POLICY, 'ladder');
   assert.ok(RUN_START_FIELDS.includes('modelPolicy'));
   assert.ok(RUN_SETTINGS_FIELDS.includes('modelPolicy'));
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
@@ -358,7 +350,7 @@ test('MP-6: every session records the model it asked for AND the one the CLI res
 });
 
 test('MP-6: the first time one request resolves to a new model within a run, run.model-resolved says so — once', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const spawn: SpawnFn = async (request) => {
     seen.push(request);

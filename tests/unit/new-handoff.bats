@@ -280,3 +280,19 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
   pe_newho demo 1 root complete >/dev/null
   [ ! -f "$DOCS_ROOT/docs/handoffs/demo/test-status.md" ]
 }
+
+# A handoff is a brief (measured-console phase 4): its summary comes first — the
+# brief hands it to every dependent phase — and it names the skills the NEXT
+# session should call, beside the ones this one used.
+@test "new-handoff: the scaffold carries suggested_skills beside skills_used, and the Summary first" {
+  setup_docs linear linear
+  run pe_newho linear 1 alpha complete
+  [ "$status" -eq 0 ]
+  f="$DOCS_ROOT/docs/handoffs/linear/phase-01-alpha.md"
+  grep -q '^skills_used: \[\]' "$f"
+  grep -q '^suggested_skills: \[\]' "$f"
+  sum="$(grep -n '^## Summary$' "$f" | cut -d: -f1)"
+  did="$(grep -n '^## What this phase did$' "$f" | cut -d: -f1)"
+  [ -n "$sum" ] && [ -n "$did" ] && [ "$sum" -lt "$did" ]
+  [ "$(grep -n '^## ' "$f" | head -1 | cut -d: -f2-)" = "## Summary" ]
+}

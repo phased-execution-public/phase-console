@@ -31,6 +31,7 @@ import { plural } from '@/lib/format';
 import { Banner, Button, Input, Mono, RelativeTime, Skeleton, toast } from '@/ui';
 import { Checkbox } from '@/ui/checkbox';
 import { ConfirmButton } from '@/ui/confirm';
+import { CopyButton } from '@/ui/copy-button';
 import { Disclosure } from '@/ui/disclosure';
 import { SettingRow, SettingsGroup, failureWords } from './setting';
 
@@ -142,6 +143,10 @@ function WebhookItem({
           <Mono value={`${hook.origin}${hook.tail}`} className="min-w-0 wrap-anywhere" />
           <span className="flex min-w-0 flex-wrap gap-x-3 text-meta text-ink-muted">
             <span>{plural(kinds, 'kind')}</span>
+            {hook.secretHint && <span data-testid="webhook-secret-hint">signed with {hook.secretHint}</span>}
+            {(hook.queued ?? 0) > 0 && (
+              <span data-testid="webhook-queued">{plural(hook.queued ?? 0, 'announcement')} waiting</span>
+            )}
             <span>
               {hook.lastOkAt ? (
                 <>
@@ -187,6 +192,8 @@ export function WebhooksGroup() {
   const { busy, run } = usePresses();
   const [url, setUrl] = useState('');
   const [label, setLabel] = useState('');
+  /** The secret a new row was given — shown here once, never again (measured-console phase 17). */
+  const [fresh, setFresh] = useState<{ label: string; secret: string } | null>(null);
 
   // A server that predates webhooks answers 404: say nothing rather than draw presses that would fail.
   if (isError) return null;
@@ -208,6 +215,8 @@ export function WebhooksGroup() {
         }
         setUrl('');
         setLabel('');
+        const made = (result as { hook?: WebhookRow }).hook;
+        if (made?.secret) setFresh({ label: made.label, secret: made.secret });
         toast('Added. Nothing is sent until a matching announcement — send a test to prove it now.', 'ok');
       },
     );
@@ -226,6 +235,24 @@ export function WebhooksGroup() {
           Outbound webhooks are off. Restart the console with{' '}
           <code className="font-mono">--allow-webhooks</code> to add one; until then it sends nothing — to the
           webhooks below included.
+        </Banner>
+      )}
+      {fresh && (
+        <Banner severity="info" data-testid="webhook-secret">
+          <span className="flex min-w-0 flex-col gap-1.5">
+            <span>
+              {fresh.label}&rsquo;s signing secret — shown this once. Every delivery carries{' '}
+              <code className="font-mono">X-Phase-Console-Signature: sha256=…</code>, the HMAC-SHA256 of its
+              body under this secret; give it to the receiver so it can check one.
+            </span>
+            <span className="flex min-w-0 flex-wrap items-center gap-2">
+              <Mono value={fresh.secret} className="min-w-0 wrap-anywhere" />
+              <CopyButton text={fresh.secret} />
+              <Button size="sm" variant="ghost" onClick={() => setFresh(null)}>
+                Done
+              </Button>
+            </span>
+          </span>
         </Banner>
       )}
       {isPending && !data ? (

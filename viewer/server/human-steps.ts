@@ -115,6 +115,8 @@ export type DeclaredStep = {
   decision_key?: string;
   window_minutes?: number;
   tried?: string;
+  /** What raised a CONSOLE's offer (an errand, a preflight, a pack's ask) — dropped from any other birth. */
+  source?: { kind: string; ref?: string };
 };
 
 /** One session this item unblocks — the item's own first, then every lane that met the same wall (G7). */
@@ -1010,7 +1012,7 @@ export class HumanStepLedger {
       ...(extra.escalated ? { escalated: true as const } : {}),
       ...(extra.read ? { read: redactSecrets(extra.read.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, 280) } : {}),
       ...(extra.sent ? { sent: redactSecrets(extra.sent.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, CHECK_NOTE_MAX) } : {}),
-      ...(extra.proof ? { proof: extra.proof.replace(/[\u0000-\u001f]+/g, ' ').slice(0, PROOF_MAX) } : {}),
+      ...(extra.proof ? { proof: redactSecrets(extra.proof.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, PROOF_MAX) } : {}),
     };
     this.append(line);
     const moved = this.get(id)!;

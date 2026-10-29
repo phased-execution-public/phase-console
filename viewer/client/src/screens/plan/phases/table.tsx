@@ -8,11 +8,13 @@
  * stand as columns with the page's Everything on — never a second definition
  * of a column (`table.test.tsx` holds every context to this array).
  *
- * A row is one line at the glance (design.md principle 2): the phase on its
- * station — the line's spine runs down the identity column — its state as a
- * dot and a word with the overlays said in words, what holds it in the
- * engine's own words, its scope, size and estimate, the lane on its labelled
- * clock, QA, the handoff, the gate, the spend and ONE action. Everything else
+ * A row is one line at the glance (design.md principle 2), drawn as a flight
+ * STRIP (2026-10-20, Tower strips): its state's 4 px leading edge, the phase's
+ * plate (`P7`) and its name, its state as the row's ONE lead badge with the
+ * overlays said in words, what holds it in the engine's own words, its scope,
+ * size and estimate, the lane on its labelled clock, QA and the handoff as
+ * outlined badges, the gate, the spend and ONE action. Nothing else on a strip
+ * is coloured; an open strip sits on its state's tint. Everything else
  * is a press away: the row opens in place onto its drawer (why it is not done,
  * its QA, its clocks, every verb), and Inspect puts the phase in the panel
  * with its eight sections.
@@ -39,8 +41,8 @@ import type {
 import { queueEntryFor, queueMarks, waitingLabel } from '@/data/queue-words';
 import { useLockRelease } from '@/data/plans';
 import { cn } from '@/lib/cn';
-import { useNow } from '@/lib/clock';
-import { countdown, duration, elapsed, pad2, plural } from '@/lib/format';
+import { useNow } from '@/ui/clock';
+import { countdown, duration, elapsed, plural } from '@/lib/format';
 import { canQa, isVerdict, liveQa, phaseQaMode, qaReportHref } from '@/lib/qa';
 import { classifyBoardPhase, classifyPhase, liveRecovery } from '@/lib/recovery';
 import { boardStateTitle, phaseStatusTitle, qaResultTitle } from '@/lib/status-vocab';
@@ -60,7 +62,7 @@ import { ACCOUNT_RECOVERY_PARTS } from '@/screens/settings/account-row';
 import { RecoveryButton } from './recovery-button';
 import { LastActivity } from '../run/activity';
 import { DepsCell, LockCell, ScopeWords, SizeCell, scopeTokens } from './cells';
-import { PhaseDrawer } from './drawer';
+import { PhaseDrawer, PhaseRecord } from './drawer';
 import {
   BOARD_WORDS,
   DONE_FOLDED,
@@ -81,6 +83,7 @@ import {
   qaWordOf,
   runningOf,
   spendOf,
+  stripPaintOf,
   type MergedPhase,
   type PhaseRecovery,
   type PhaseTableContext,
@@ -100,7 +103,6 @@ import {
   RulingsCount,
   TaskWords,
 } from './row';
-import './phases.css';
 
 const SILENCE_LABEL = SILENCE_LABELS as Readonly<Record<string, string>>;
 
@@ -291,8 +293,7 @@ export function columnsFor(context: PhaseTableContext): Column<PhaseTableRow>[] 
 const COLUMNS_BY_CONTEXT: Record<PhaseTableContext, Column<PhaseTableRow>[]> = {
   run: columnsFor('run'),
   plan: columnsFor('plan'),
-  'plan-qa': columnsFor('plan-qa'),
-  'plan-handoffs': columnsFor('plan-handoffs'),
+  'plan-record': columnsFor('plan-record'),
 };
 
 const rowKey = (row: PhaseTableRow): string => String(row.p.phase);
@@ -365,7 +366,12 @@ export function PhaseTable({
   const [launchPhase, setLaunchPhase] = useState<number | null>(null);
   // Written HERE, as JSX, so the render-tree guard (`tabs.test.ts`) walks into
   // the detail from the grid — a module-level arrow is invisible to it.
-  const rowDetail = useCallback((row: PhaseTableRow): ReactNode => <PhaseRowDetail row={row} />, []);
+  // The Handoffs & QA reading opens a row onto its record first.
+  const lead = PHASE_TABLE_CONTEXTS[context].lead;
+  const rowDetail = useCallback(
+    (row: PhaseTableRow): ReactNode => <PhaseRowDetail row={row} {...(lead ? { lead } : {})} />,
+    [lead],
+  );
 
   const rulingCounts = useMemo(() => {
     const out: Record<number, number> = {};
@@ -446,6 +452,7 @@ export function PhaseTable({
         getRowKey={rowKey}
         rowProps={rowProps}
         rowClassName={rowTint}
+        rowPaint={stripPaintOf}
         detail={rowDetail}
         tableId={reading.tableId}
         toolbar
@@ -531,21 +538,23 @@ function BoardSentence({ rows, asked }: { rows: MergedPhase[]; asked: Set<number
  * ------------------------------------------------------------------------- */
 
 /**
- * The phase on its station: the line's spine (a leg through the cell, the
- * dot in the phase's paint) beside its number, its name — the row's link —
- * and Inspect. The spine is decoration; the State column says the word.
+ * The phase's plate and its name — the row's link, to the phase's page — and
+ * Inspect. The plate is the strip's number (`P7`): tabular, so a column of
+ * plates reads down; the strip's edge carries its state's hue, and the State
+ * column says the word.
  */
 function IdentityCell({ row }: { row: PhaseTableRow }) {
   const { p, scope } = row;
   const title = plainText(p.title);
   const goal = p.goal ? plainText(p.goal) : '';
-  const showing = displayState(p.state, { running: runningOf(row) });
-  // The hue comes from the status family's paint words (the ratchet reads `paint`).
-  const paint = spinePaint(showing);
   return (
-    <div className="phase-spine flex min-w-0 items-start gap-2" data-spine={showing}>
-      <span aria-hidden className={cn('phase-spine-station', `state-${paint}`)} />
-      <span className="mt-px shrink-0 text-meta text-ink-muted tabular-nums">{pad2(p.phase)}</span>
+    <div className="flex min-w-0 items-start gap-2" data-phase-identity={p.phase}>
+      <span
+        className="mt-px inline-flex min-w-9 shrink-0 justify-center rounded-sm bg-ground-deep px-1.5 text-meta font-semibold text-ink tabular-nums"
+        data-plate=""
+      >
+        P{p.phase}
+      </span>
       <div className="min-w-0 flex-1">
         <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
           <a
@@ -559,7 +568,8 @@ function IdentityCell({ row }: { row: PhaseTableRow }) {
             <Button
               size="sm"
               variant="ghost"
-              className="h-auto shrink px-1 py-0 text-meta text-ink-muted"
+              // 24 px high at least (WCAG 2.5.8): beside the strip's toggle it no longer has the room around it.
+              className="h-auto min-h-6 shrink px-1 py-0 text-meta text-ink-muted"
               onClick={() => scope.onInspect?.(p.phase)}
               aria-label={`Inspect phase ${p.phase}`}
               title={`Inspect phase ${p.phase}`}
@@ -586,22 +596,6 @@ function IdentityCell({ row }: { row: PhaseTableRow }) {
       </div>
     </div>
   );
-}
-
-/** The paint a spine station wears — the board word's own, with the two overlays. */
-function spinePaint(state: string): string {
-  switch (state) {
-    case 'done':
-      return 'done';
-    case 'in-progress':
-      return 'running';
-    case 'stuck':
-      return 'needs-you';
-    case 'ready':
-      return 'queued';
-    default:
-      return 'waiting';
-  }
 }
 
 /**
@@ -642,6 +636,8 @@ function StateCell({ row }: { row: PhaseTableRow }) {
           phase={p.phase}
           state={showing}
           live={p.live}
+          // The strip's ONE lead badge: the row's state, on its tint.
+          chrome="tint"
           title={
             showing !== p.state
               ? `This run is working on phase ${p.phase} now. The board still reads "${p.state}" and catches up when the phase's handoff lands.`
@@ -889,7 +885,7 @@ function QaCell({ row }: { row: PhaseTableRow }) {
             className="rounded-sm"
             aria-label={`QA ${result} — open the report`}
           >
-            <QaStatus result={result as WordOf<'qa-result'>} title={qaResultTitle(result!)} />
+            <QaStatus result={result as WordOf<'qa-result'>} title={qaResultTitle(result!)} chrome="badge" />
           </a>
         ) : (
           <span className="text-ink-muted">{result === 'pending' ? 'pending' : 'no verdict'}</span>
@@ -928,7 +924,7 @@ function HandoffCell({ row }: { row: PhaseTableRow }) {
         className="rounded-sm"
         aria-label={`Handoff ${status} — read it`}
       >
-        <OpsStatus vocab="handoff" word={status as WordOf<'handoff'>} />
+        <OpsStatus vocab="handoff" word={status as WordOf<'handoff'>} chrome="badge" />
       </a>
       {completed && <span className="tabular-nums text-ink-muted">{completed}</span>}
       {index === 'missing' && (
@@ -1174,11 +1170,30 @@ function ReleaseClaim({ slug, phase, owner }: { slug: string; phase: number; own
  * Everything about one phase a column does not carry: what can be done, the
  * runner's notes in full, the drawer (why it is not done, its QA, its clocks,
  * its rulings), the handoff's facts and the phase's prose — fetched on open.
+ *
+ * On the Handoffs & QA reading (`lead="record"`) the detail LEADS with the
+ * phase's record: its handoff and its QA as two cards, side by side where the
+ * row is wide enough — the reading's whole subject, before the verbs and the
+ * rest of the drawer, which then leaves the two out.
  */
-function PhaseRowDetail({ row }: { row: PhaseTableRow }) {
+function PhaseRowDetail({ row, lead }: { row: PhaseTableRow; lead?: 'record' }) {
   const { p, scope } = row;
+  const planQaMode = scope.planQaMode ? { planQaMode: scope.planQaMode } : {};
+  const planSkills = scope.recovery?.planSkills ? { planSkills: scope.recovery.planSkills } : {};
   return (
     <div className="flex min-w-0 flex-col gap-3 py-1">
+      {lead === 'record' && (
+        <PhaseRecord
+          slug={scope.slug}
+          view={p}
+          run={scope.run}
+          holds={row.holds}
+          handoff={row.handoff}
+          index={row.index}
+          {...planQaMode}
+          {...planSkills}
+        />
+      )}
       <PhaseVerbs row={row} />
       <PhaseDrawer
         slug={scope.slug}
@@ -1190,8 +1205,9 @@ function PhaseRowDetail({ row }: { row: PhaseTableRow }) {
         eta={row.eta}
         handoff={row.handoff}
         index={row.index}
-        {...(scope.planQaMode ? { planQaMode: scope.planQaMode } : {})}
-        {...(scope.recovery?.planSkills ? { planSkills: scope.recovery.planSkills } : {})}
+        {...planQaMode}
+        {...planSkills}
+        {...(lead ? { lead } : {})}
       />
     </div>
   );

@@ -38,6 +38,7 @@ import { PageRoutes, pageSurface } from './route-strip';
 import './section';
 import {
   HELP_SECTIONS,
+  PAGE_HELP_ADDRESSES,
   PAGE_HELP_SECTIONS,
   helpPlace,
   helpSectionIds,
@@ -69,7 +70,8 @@ vi.mock('@/data/http', async (importOriginal) => {
 let phone = false;
 vi.mock('@/lib/media', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/media')>();
-  return { ...actual, usePhone: () => phone };
+  // A phone here is one held in a hand: below 640 too, where a drawer is a bottom sheet.
+  return { ...actual, usePhone: () => phone, useNarrow: () => phone };
 });
 
 afterEach(() => {
@@ -195,10 +197,11 @@ describe('the help section registry', () => {
 
 describe("a page's own help", () => {
   it('names only sections the guide holds', () => {
-    for (const [head, id] of Object.entries(PAGE_HELP_SECTIONS)) {
+    for (const [head, id] of Object.entries({ ...PAGE_HELP_SECTIONS, ...PAGE_HELP_ADDRESSES })) {
       expect(helpSectionIds, `${head} → ${id}`).toContain(id);
     }
   });
+
 
   it('opens the Tower over Runs, Your turn over Your turn, and the run section over a plan', () => {
     expect(pageHelp(routeOf(['runs'])).section.id).toBe('tower');

@@ -18,7 +18,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,6 +28,8 @@ import { parseHookPayload, sessionsByAccount } from '../server/sessions/registry
 import { unownedInboxDir } from '../shared/instances.mjs';
 import type { LeaveReason, LeaveResult } from '../server/accounts/index.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
+import { dateClock } from './fixtures/clock.ts';
 
 /* ------------------------------------------------------------------ *
  * Harness
@@ -35,22 +37,12 @@ import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /** A linear three-phase plan whose board is a `done` file the fake session appends to. */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-usage-brake-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-usage-brake-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -72,17 +64,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -110,7 +97,7 @@ function runner(r: Repo, spawn: SpawnFn, extra: Partial<ConstructorParameters<ty
  * ------------------------------------------------------------------ */
 
 test('a live lane reports what its session in flight has cost — replaced per result, and never a finished session\'s booked spend (H7)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: (number | undefined)[] = [];
   let calls = 0;
   let live: () => number | undefined = () => undefined;
@@ -153,12 +140,6 @@ const journalled = (events: { event: string; data: Record<string, unknown> }[], 
   .filter((e) => e.event === 'run:journal' && e.data.event === name)
   .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
 
-/** A clock the test winds by hand, shaped as `RunnerDeps.now`. */
-function fakeClock(from: string) {
-  const state = { at: Date.parse(from) };
-  return { now: () => new Date(state.at), wind: (ms: number) => { state.at += ms; }, set: (iso: string) => { state.at = Date.parse(iso); } };
-}
-
 /** `Accounts.leaveAccount`, stubbed as `runner.test.ts` stubs it: a reset walls until it, none cools for 30 min. */
 function leaveStub(accountId: string | undefined, leaving: LeaveReason): LeaveResult {
   const id = accountId ?? 'default';
@@ -194,9 +175,9 @@ const p2Retry = (delayMs: number): StreamEvent => ({
 } as StreamEvent);
 
 test('P2\'s wall: no account to move to and a reset hours away — the FIRST burst waits on the window, with no `none` decisions (H6)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r, false);
-  const clock = fakeClock('2026-09-16T13:30:04Z');
+  const clock = dateClock('2026-09-16T13:30:04Z');
   const left: LeaveReason[] = [];
   const { instance, events } = runner(r, held.spawn, {
     now: clock.now,
@@ -235,9 +216,9 @@ test('P2\'s wall: no account to move to and a reset hours away — the FIRST bur
 });
 
 test('a wall whose reset only the retry delay reports is still far — the burst waits on now + that delay (H6)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r, false);
-  const clock = fakeClock('2026-09-16T13:41:28Z');
+  const clock = dateClock('2026-09-16T13:41:28Z');
   const left: LeaveReason[] = [];
   const { instance, events } = runner(r, held.spawn, {
     now: clock.now,
@@ -263,9 +244,9 @@ test('a wall whose reset only the retry delay reports is still far — the burst
 });
 
 test('a wall that resets inside the action cooldown keeps the old debounce — the first burst is still `none` (H6)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r, false);
-  const clock = fakeClock('2026-09-16T13:41:28Z');
+  const clock = dateClock('2026-09-16T13:41:28Z');
   const { instance, events } = runner(r, held.spawn, {
     now: clock.now,
     pickAccount: () => null,
@@ -352,9 +333,9 @@ test('releasing the brake admits what it held, at once (H6)', async () => {
  * ------------------------------------------------------------------ */
 
 test('a 95 % warning with no account to move to engages the brake: `enacted` tells the truth, and a new lane on the account waits (H6)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock('2026-09-16T13:30:04Z');
+  const clock = dateClock('2026-09-16T13:30:04Z');
   const scheduler = new Scheduler({ now: () => clock.now().getTime(), locks: () => [] });
   const { instance, events } = runner(r, held.spawn, { now: clock.now, scheduler, pickAccount: () => null });
   try {
@@ -388,9 +369,9 @@ test('a 95 % warning with no account to move to engages the brake: `enacted` tel
 });
 
 test('the brake outlasts a reading of ANOTHER window, and is released at the first reading past its reset (H6)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock('2026-09-16T13:30:04Z');
+  const clock = dateClock('2026-09-16T13:30:04Z');
   const scheduler = new Scheduler({ now: () => clock.now().getTime(), locks: () => [] });
   const { instance, events } = runner(r, held.spawn, {
     now: clock.now, scheduler, pickAccount: () => null, autoAccountSwitch: () => false,
@@ -422,7 +403,7 @@ test('the brake outlasts a reading of ANOTHER window, and is released at the fir
 });
 
 test('with an account that has headroom, nothing is braked — the switch is enacted at the lanes\' boundary (H6, #100)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
   const scheduler = new Scheduler({ locks: () => [] });
   const { instance, events } = runner(r, held.spawn, { scheduler, pickAccount: () => 'spare' });
@@ -439,6 +420,52 @@ test('with an account that has headroom, nothing is braked — the switch is ena
     assert.equal(decision.when, 'boundary');
     assert.deepEqual(journalled(events, 'run.usage-brake'), []);
     assert.equal(scheduler.brakeOf(undefined), null);
+  } finally {
+    held.release();
+    await instance.wait();
+    scheduler.close();
+    r.cleanup();
+  }
+});
+
+test('#420: a 95 % warning never moves the run onto an account whose brake is full with a lane live on it — it stays, and brakes its own (measured-console phase 24)', async () => {
+  const r = stubbedPlan();
+  const held = streamingSession(r);
+  const clock = dateClock('2026-10-21T05:22:53Z');
+  const scheduler = new Scheduler({ now: () => clock.now().getTime(), locks: () => [] });
+  // Hub 2026-10-21: the other run's lane is live on `account-6ffc`, braked at 96 % weekly.
+  const reset = Date.parse('2026-10-24T00:00:00Z');
+  // The other run's lane, counted where it boarded — another plan's scope is not this test's question.
+  let otherLive = 1;
+  const liveOn = scheduler.liveOn.bind(scheduler);
+  scheduler.liveOn = (account) => (account === 'account-6ffc' ? otherLive : 0) + liveOn(account);
+  assert.equal(scheduler.brake('account-6ffc', { untilMs: reset, pct: 96, window: 'seven_day' }), true);
+  const asked: unknown[] = [];
+  const { instance, events } = runner(r, held.spawn, {
+    now: clock.now, scheduler,
+    // The picker's rank, as it read the meters: the braked account looked like room.
+    switchCandidates: (_from, _model, opts) => { asked.push(opts); return { ranked: ['account-6ffc'], declined: [], wake: null }; },
+  });
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch', accountId: 'account-4c23' } as never);
+    await held.inSession;
+    held.say({ kind: 'limits', status: 'allowed_warning', window: 'seven_day', utilization: 0.95, utilizationPct: 95, resetsAt: reset / 1000 });
+    assert.equal(asked.length, 1, 'the picker was asked');
+    const decision = journalled(events, 'run.usage-decision')[0];
+    assert.equal(decision.action, 'switch');
+    assert.equal(decision.headroom, null, 'the braked account is no headroom');
+    assert.match(String(decision.why), /account-6ffc: its usage brake is engaged at 96 % with 1 lane live on it/);
+    assert.equal(decision.enacted, false);
+    assert.equal(decision.brake, true, 'the run stays and brakes its own account instead');
+    assert.equal(instance.current()!.accountId, 'account-4c23', 'no move at the boundary');
+    assert.deepEqual(journalled(events, 'run.account-switch'), []);
+
+    // The other lane ends: the brake holds nothing any more, and the same account is room again.
+    otherLive = 0;
+    clock.wind(60_000);
+    held.say({ kind: 'limits', status: 'allowed_warning', window: 'five_hour', utilization: 0.96, utilizationPct: 96, resetsAt: reset / 1000 - 3600 });
+    const second = journalled(events, 'run.usage-decision')[1];
+    assert.equal(second.headroom, 'account-6ffc', 'with no lane live on it the brake turns nobody away');
   } finally {
     held.release();
     await instance.wait();
@@ -514,7 +541,7 @@ test('live non-run sessions are counted per account only where a config dir name
 
 test('the usage decision says who else is spending the account — or `unknown` when this console cannot see sessions (H6)', async () => {
   for (const seam of [true, false]) {
-    const r = repo();
+    const r = stubbedPlan();
     const held = streamingSession(r);
     const { instance, events } = runner(r, held.spawn, {
       pickAccount: () => null,
@@ -592,7 +619,7 @@ const journalledOn = (events: { event: string; data: Record<string, unknown> }[]
   .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
 
 test('#79: an undelivered wrap-up journals WHY, and is retried on each usage event until it arrives — once', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let open = false;
     const sent: string[] = [];
@@ -634,7 +661,7 @@ test('#79: an undelivered wrap-up journals WHY, and is retried on each usage eve
 });
 
 test('#79: the retries stop where the checkpoint fires — the backstop, not a second steer', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let calls = 0;
     const spawn: SpawnFn = async (request) => {

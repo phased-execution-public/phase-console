@@ -23,10 +23,23 @@
  *     now ORPHANED (its parent is pid 1) and a TEST RUNNER
  *     (`testRunnerCommand`) is ended through the ladder with its group.
  *
- * The rule's one exception is a session that PARKED — declared
+ *     So is an orphan that was SPAWNED BENEATH a test runner — recorded so
+ *     while the runner lived (`Seen.underRunner`): Playwright's `webServer`
+ *     children, the e2e tour's fixture console and vite, a catalog server.
+ *     Once the runner is gone they are neither a runner nor a runner's
+ *     holder, and a usage-limit cut left them on the next attempt's ports
+ *     (measured-console phase 13, #421).
+ *
+ * The rule's exceptions are a session that PARKED — declared
  * `waiting-external`: that is how a phase runs a long suite deliberately
  * detached and waits on its file (the plan's phases 12, 33 and 41), so its
- * jobs are SPARED for `REAP_SPARE_MS`, the longest wait a plan budgets. The
+ * jobs are SPARED for `REAP_SPARE_MS`, the longest wait a plan budgets — and
+ * a job a WATCH names, whoever ended the session (#409): a park tells the
+ * reaper what it waits on (`keep`), and a recorded descendant whose command
+ * names the watched file — or a sibling of its stem, the job's log — or whose
+ * pid the ref probes is spared for the same window. The console's own in-turn
+ * wait checkpoint ends the session with no outcome file, and used to end the
+ * very job its park then waited on. The
  * sweep (`sweep`, every `REAP_SWEEP_MS`) is the second pass: an orphan of an
  * ended session that is still there — one the end missed, one that came
  * back, one whose spare ran out — is an orphan OLDER THAN ITS SESSION, and is
@@ -103,8 +116,12 @@ export function descendantsOf(rows: readonly ProcessRow[], leader: number): Proc
   return out;
 }
 
-/** A descendant as recorded: its identity and what it was. */
-type Seen = { startedMs: number | null; command: string };
+/**
+ * A descendant as recorded: its identity, what it was, and whether a test
+ * runner was above it when it was seen (#421) — once that runner is gone, the
+ * orphan's own command no longer says so.
+ */
+type Seen = { startedMs: number | null; command: string; underRunner?: boolean };
 
 type Tracked = {
   leader: number;
@@ -136,7 +153,46 @@ export function orphansOf(rows: readonly ProcessRow[], seen: ReadonlyMap<number,
     return row.startedMs === null || row.startedMs <= endedAt;
   };
   return rows.filter((row) => row.ppid === 1 && same(row)
-    && (testRunnerCommand(row.command) || descendantsOf(rows, row.pid).some((below) => same(below) && testRunnerCommand(below.command))));
+    && (testRunnerCommand(row.command) || seen.get(row.pid)?.underRunner === true
+      || descendantsOf(rows, row.pid).some((below) => same(below) && testRunnerCommand(below.command))));
+}
+
+/**
+ * What a watch ref names a job by (#409): the absolute paths it reads — each
+ * also as its STEM, `/tmp/p6s3/line7.` for `/tmp/p6s3/line7.exit`, so the job
+ * that writes `line7.log` beside it is named too — and the pids it probes
+ * (`kill -0 N`, `ps -p N`). Pure.
+ */
+export function namedByRefs(refs: readonly string[]): { paths: string[]; pids: number[] } {
+  const paths = new Set<string>();
+  const pids = new Set<number>();
+  for (const ref of refs) {
+    for (const m of ref.matchAll(/(?:^|[\s'"=>(:])(\/[^\s'";&|)<>]+)/g)) {
+      const path = m[1]!.replace(/\\+$/, '');
+      if (path.startsWith('/dev/') || path.split('/').filter(Boolean).length < 2) continue;
+      paths.add(path);
+      const dot = path.lastIndexOf('.');
+      if (dot > path.lastIndexOf('/') + 1) paths.add(path.slice(0, dot + 1));
+    }
+    for (const m of ref.matchAll(/\b(?:kill\s+-0|ps\s+-p)\s+(\d+)\b/g)) pids.add(Number(m[1]));
+  }
+  return { paths: [...paths], pids: [...pids] };
+}
+
+/**
+ * The orphans a watch keeps: one whose pid a ref probes, or which — or
+ * anything recorded below it — names a watched path. Pure.
+ */
+export function keptBy(rows: readonly ProcessRow[], seen: ReadonlyMap<number, Seen>, orphans: readonly ProcessRow[], refs: readonly string[]): Set<number> {
+  const kept = new Set<number>();
+  if (!refs.length) return kept;
+  const { paths, pids } = namedByRefs(refs);
+  const names = (pid: number, command: string): boolean => pids.includes(pid)
+    || paths.some((path) => command.includes(path) || (seen.get(pid)?.command ?? '').includes(path));
+  for (const orphan of orphans) {
+    if (names(orphan.pid, orphan.command) || descendantsOf(rows, orphan.pid).some((below) => names(below.pid, below.command))) kept.add(orphan.pid);
+  }
+  return kept;
 }
 
 export type ReaperDeps = {
@@ -149,6 +205,8 @@ export type ReaperDeps = {
 /** The reaper. One per process: every session this console spawns, in one table read. */
 export class SessionReaper {
   private readonly sessions = new Map<number, Tracked>();
+  /** The watch refs each session's park named, by session id — kept apart, so a keep may come before or after its session is seen (#409). */
+  private readonly keeps = new Map<string, { refs: Set<string>; at: number }>();
   private timer: NodeJS.Timeout | null = null;
   private lastSweep = 0;
   private readonly deps: ReaperDeps;
@@ -181,10 +239,36 @@ export class SessionReaper {
     const table = rows ?? await this.table();
     if (!table) return;
     for (const session of live) {
-      for (const row of descendantsOf(table, session.leader)) {
-        if (!session.seen.has(row.pid)) session.seen.set(row.pid, { startedMs: row.startedMs, command: row.command });
+      const below = descendantsOf(table, session.leader);
+      const byPid = new Map(below.map((row) => [row.pid, row]));
+      // Was a test runner above it, between it and the leader (#421)?
+      const underRunner = (row: ProcessRow): boolean => {
+        for (let up = byPid.get(row.ppid); up; up = byPid.get(up.ppid)) if (testRunnerCommand(up.command)) return true;
+        return false;
+      };
+      for (const row of below) {
+        const was = session.seen.get(row.pid);
+        if (!was) session.seen.set(row.pid, { startedMs: row.startedMs, command: row.command, ...(underRunner(row) ? { underRunner: true } : {}) });
+        else if (!was.underRunner && underRunner(row)) was.underRunner = true;
       }
     }
+  }
+
+  /**
+   * A park names what it waits on (#409): the jobs of session `sessionId`
+   * that these refs name are spared — by `ended` and by the sweep — for
+   * `REAP_SPARE_MS` from the session's end, whoever ended it. Called by the
+   * runner whenever it parks a phase on refs, the console's own checkpoint
+   * included; the order against the session's close does not matter.
+   */
+  keep(sessionId: string | null | undefined, refs: readonly (string | null | undefined)[]): void {
+    if (!sessionId) return;
+    const named = refs.filter((ref): ref is string => typeof ref === 'string' && ref.length > 0);
+    if (!named.length) return;
+    const entry = this.keeps.get(sessionId) ?? { refs: new Set<string>(), at: this.now() };
+    for (const ref of named) entry.refs.add(ref);
+    entry.at = this.now();
+    this.keeps.set(sessionId, entry);
   }
 
   /**
@@ -216,6 +300,7 @@ export class SessionReaper {
     for (const [leader, session] of this.sessions) {
       if (session.endedAt !== undefined && now - session.endedAt > REAP_FORGET_MS) this.sessions.delete(leader);
     }
+    for (const [id, entry] of this.keeps) if (now - entry.at > REAP_FORGET_MS) this.keeps.delete(id);
     const due = [...this.sessions.values()].filter((session) => session.endedAt !== undefined && !(session.spareUntil && session.spareUntil > now));
     if (!due.length) return [];
     const table = await this.table();
@@ -231,7 +316,14 @@ export class SessionReaper {
 
   private async reapOrphans(session: Tracked, table: readonly ProcessRow[]): Promise<Reaped[]> {
     const out: Reaped[] = [];
-    for (const row of orphansOf(table, session.seen, session.endedAt ?? this.now())) {
+    const orphans = orphansOf(table, session.seen, session.endedAt ?? this.now());
+    // A watched job is spared until the spare window from its session's end runs out (#409).
+    const refs = session.sessionId ? [...(this.keeps.get(session.sessionId)?.refs ?? [])] : [];
+    const spared = (session.endedAt ?? this.now()) + REAP_SPARE_MS > this.now()
+      ? keptBy(table, session.seen, orphans, refs) : new Set<number>();
+    if (spared.size) this.reportSpared(session, orphans.filter((row) => spared.has(row.pid)), refs);
+    for (const row of orphans) {
+      if (spared.has(row.pid)) continue;
       const ending = await this.end(row.pid);
       session.seen.delete(row.pid);
       out.push({ pid: row.pid, command: row.command.slice(0, 200), ending });
@@ -247,6 +339,21 @@ export class SessionReaper {
       ...(session.slug ? { slug: session.slug } : {}),
       ...(session.phase !== undefined && session.phase !== null ? { phase: session.phase } : {}),
       pids: reaped.map((row) => row.pid), commands: reaped.map((row) => row.command), endings: reaped.map((row) => row.ending),
+    });
+  }
+
+  /** Once per job: why a job a watch names was left running (#409). */
+  private readonly sparedSaid = new Set<number>();
+
+  private reportSpared(session: Tracked, rows: readonly ProcessRow[], refs: readonly string[]): void {
+    const fresh = rows.filter((row) => !this.sparedSaid.has(row.pid));
+    if (!fresh.length) return;
+    for (const row of fresh) this.sparedSaid.add(row.pid);
+    log.info('reap.spared', {
+      leader: session.leader,
+      ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+      ...(session.slug ? { slug: session.slug } : {}),
+      pids: fresh.map((row) => row.pid), commands: fresh.map((row) => row.command.slice(0, 200)), watch: refs.slice(0, 8),
     });
   }
 
@@ -266,6 +373,11 @@ export class SessionReaper {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+  }
+
+  /** The refs a session's parks named — for a test, and for nothing else. */
+  keptRefs(sessionId: string): string[] {
+    return [...(this.keeps.get(sessionId)?.refs ?? [])];
   }
 
   /** What is tracked — for a test, and for nothing else. */

@@ -83,6 +83,10 @@ const STEP_SOURCES: Readonly<Record<string, TurnSource>> = Object.freeze({
   convert: 'session',
   // A phase's run request (turn-by-turn phase 6): the run's to take.
   'run-request': 'run-request',
+  // What a session's closing words asked a person (measured-console phase 29):
+  // its prose questions, a pack's gate — the session's ask, read by the console.
+  'prose-question': 'session',
+  pack: 'session',
   // A console-raised step with no source of its own is a converted stall
   // reading — the one console birth before this phase.
   console: 'stall',

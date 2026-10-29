@@ -382,7 +382,9 @@ describe('the More sheet', () => {
     expect(within(sheet).getByRole('group', { name: 'The record' })).toBeTruthy();
     expect(within(sheet).getByRole('group', { name: 'The console' })).toBeTruthy();
     const work = within(sheet).queryByRole('group', { name: 'The work' });
-    if (STATE.chat) expect(within(work!).getByRole('button', { name: /^Sessions/ })).toBeTruthy();
+    // Read by name, so the free tree, whose state has no `chat`, typechecks this too.
+    const chat = Boolean((STATE as { chat?: unknown }).chat);
+    if (chat) expect(within(work!).getByRole('button', { name: /^Sessions/ })).toBeTruthy();
     else expect(work).toBeNull();
     expect(within(sheet).getByRole('button', { name: /^Logs/ })).toBeTruthy();
     expect(within(sheet).getByRole('button', { name: /^Settings/ })).toBeTruthy();

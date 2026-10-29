@@ -78,10 +78,13 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { accessSync, constants as fsConstants, existsSync, readdirSync, statSync } from 'node:fs';
-import { constants as osConstants } from 'node:os';
+import {
+  accessSync, constants as fsConstants, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, statSync, unlinkSync,
+} from 'node:fs';
+import { constants as osConstants, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
+import { VIEWER_DIR } from '../config.ts';
 import { log } from '../log.ts';
 import { groupMembers } from '../pid.ts';
 // `signals.ts` and not a local kill: verification children are the one
@@ -92,6 +95,7 @@ import { groupMembers } from '../pid.ts';
 // (it imports this file).
 import { killLadder, type LadderEnding } from './signals.ts';
 import type { VerifyNotRun, VerifyRun, VerifySkip, VerifySummary } from './state.ts';
+import { PHASE_TIER_ENV, type VerifySelection, type VerifyUnselected } from './verify-select.ts';
 
 /**
  * Kept in step with `GATE_CMD_DENY` in scripts/phase-graph.sh — same intent,
@@ -1023,7 +1027,23 @@ function refuseSegment(
  * returns at once and never reads its exit code, so a red suite read green —
  * refused.
  */
-function segments(command: string): { parts: string[]; inner: string[] } | { refusal: Refusal } {
+/**
+ * The quote state of an ANSI-C `$'…'` word (#392): a backslash escapes the next
+ * character — `\'` included — and an unescaped `'` ends it. `$"…"` (the locale
+ * form) reads exactly as `"…"`. Every reader of a command's quoting knows both,
+ * so the reader and bash agree on where a quoted word ends.
+ */
+const ANSI_C = "$'";
+
+/**
+ * The escapes inside `$'…'` the reader decodes exactly as bash does. Any other
+ * — `\xHH`, `\NNN`, `\uHHHH`, `\cX`, … — encodes a character the reader would
+ * have to compute to judge the word, so `segments()` refuses it (fails closed)
+ * rather than read it differently from the shell.
+ */
+const ANSI_C_ESCAPES: ReadonlySet<string> = new Set(['\\', "'", '"', '?', 'n', 't', 'r', 'a', 'b', 'e', 'E', 'f', 'v']);
+
+export function segments(command: string): { parts: string[]; inner: string[] } | { refusal: Refusal } {
   const out: string[] = [];
   const inner: string[] = [];
   let buffer = '';
@@ -1034,8 +1054,11 @@ function segments(command: string): { parts: string[]; inner: string[] } | { ref
     const next = command[i + 1];
 
     if (quote) {
-      // Inside single quotes a backslash is literal; inside double quotes it escapes.
-      if (quote === '"' && ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+      // Inside single quotes a backslash is literal; inside double quotes it escapes,
+      // and inside ANSI-C `$'…'` it escapes too — `\'` there is a quote, not the end (#392).
+      if (quote === ANSI_C && ch === '\\' && next !== undefined && !ANSI_C_ESCAPES.has(next)) return { refusal: UNREADABLE_STRUCTURE };
+      if ((quote === '"' || quote === ANSI_C) && ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+      if (quote === ANSI_C && ch === "'") { quote = null; buffer += ch; continue; }
       if (quote === '"' && ch === '`') return { refusal: UNREADABLE_STRUCTURE };
       if (quote === '"' && ch === '$' && next === '(') {
         const close = closingParen(command, i + 1);
@@ -1051,6 +1074,8 @@ function segments(command: string): { parts: string[]; inner: string[] } | { ref
     }
 
     if (ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+    if (ch === '$' && next === '$') { buffer += '$$'; i++; continue; }
+    if (ch === '$' && (next === "'" || next === '"')) { quote = next === "'" ? ANSI_C : '"'; buffer += ch + next; i++; continue; }
     if (ch === '"' || ch === "'") { quote = ch; buffer += ch; continue; }
     if (ch === '`') return { refusal: UNREADABLE_STRUCTURE };
     if (ch === '$' && next === '(') return { refusal: UNREADABLE_STRUCTURE };
@@ -1082,11 +1107,13 @@ function closingParen(text: string, open: number): number {
   for (let i = open; i < text.length; i++) {
     const ch = text[i];
     if (quote) {
-      if (quote === '"' && ch === '\\') { i++; continue; }
-      if (ch === quote) quote = null;
+      if ((quote === '"' || quote === ANSI_C) && ch === '\\') { i++; continue; }
+      if (ch === quote || (quote === ANSI_C && ch === "'")) quote = null;
       continue;
     }
     if (ch === '\\') { i++; continue; }
+    if (ch === '$' && text[i + 1] === '$') { i++; continue; }
+    if (ch === '$' && (text[i + 1] === "'" || text[i + 1] === '"')) { quote = text[i + 1] === "'" ? ANSI_C : '"'; i++; continue; }
     if (ch === '"' || ch === "'") { quote = ch; continue; }
     if (ch === '(') depth++;
     else if (ch === ')' && --depth === 0) return i;
@@ -1118,12 +1145,14 @@ export function chainMembers(command: string): string[] | null {
     const ch = command[i];
     const next = command[i + 1];
     if (quote) {
-      if (quote === '"' && ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
-      if (ch === quote) quote = null;
+      if ((quote === '"' || quote === ANSI_C) && ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+      if (ch === quote || (quote === ANSI_C && ch === "'")) quote = null;
       buffer += ch;
       continue;
     }
     if (ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+    if (ch === '$' && next === '$') { buffer += '$$'; i++; continue; }
+    if (ch === '$' && (next === "'" || next === '"')) { quote = next === "'" ? ANSI_C : '"'; buffer += ch + next; i++; continue; }
     if (ch === '"' || ch === "'") quote = ch;
     else if (ch === '(') depth++;
     else if (ch === ')') depth--;
@@ -1153,7 +1182,13 @@ function unwrap(command: string): string {
     let quote: string | null = null;
     for (let i = 0; i < text.length; i++) {
       const ch = text[i];
-      if (quote) { if (ch === quote) quote = null; continue; }
+      if (quote) {
+        if ((quote === '"' || quote === ANSI_C) && ch === '\\') { i++; continue; }
+        if (ch === quote || (quote === ANSI_C && ch === "'")) quote = null;
+        continue;
+      }
+      if (ch === '$' && text[i + 1] === '$') { i++; continue; }
+      if (ch === '$' && (text[i + 1] === "'" || text[i + 1] === '"')) { quote = text[i + 1] === "'" ? ANSI_C : '"'; i++; continue; }
       if (ch === '"' || ch === "'") { quote = ch; continue; }
       if (ch === '(') depth++;
       else if (ch === ')') {
@@ -1166,8 +1201,13 @@ function unwrap(command: string): string {
   }
 }
 
-/** Split a segment into words, respecting quotes and dropping the quote marks. */
-function tokenize(segment: string): string[] {
+/** The character an ANSI-C escape `\<ch>` stands for — the common ones; any other is itself. */
+function ansiEscape(ch: string): string {
+  return ({ n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', v: '\v' } as Record<string, string>)[ch] ?? ch;
+}
+
+/** Split a segment into words, respecting quotes (`$'…'` and `$"…"` too) and dropping the quote marks. */
+export function tokenize(segment: string): string[] {
   const out: string[] = [];
   let current = '';
   let started = false;
@@ -1176,12 +1216,16 @@ function tokenize(segment: string): string[] {
   for (let i = 0; i < segment.length; i++) {
     const ch = segment[i];
     if (quote) {
+      if (quote === ANSI_C && ch === '\\' && i + 1 < segment.length) { current += ansiEscape(segment[++i]); continue; }
+      if (quote === ANSI_C && ch === "'") { quote = null; continue; }
       if (quote === '"' && ch === '\\' && i + 1 < segment.length) { current += segment[++i]; continue; }
       if (ch === quote) { quote = null; continue; }
       current += ch;
       continue;
     }
     if (ch === '\\' && i + 1 < segment.length) { current += segment[++i]; started = true; continue; }
+    if (ch === '$' && segment[i + 1] === '$') { current += '$$'; i++; started = true; continue; }
+    if (ch === '$' && (segment[i + 1] === "'" || segment[i + 1] === '"')) { quote = segment[++i] === "'" ? ANSI_C : '"'; started = true; continue; }
     if (ch === '"' || ch === "'") { quote = ch; started = true; continue; }
     if (/\s/.test(ch)) {
       if (started || current) { out.push(current); current = ''; started = false; }
@@ -1878,7 +1922,7 @@ export type VerifyOptions = {
    * boarding, or the attribution of a red `&&` chain — its members, each run
    * alone (`chainMembers`, #103).
    */
-  purpose?: 'verify' | 'baseline' | 'attribution' | 'wip-gate';
+  purpose?: 'verify' | 'baseline' | 'attribution' | 'wip-gate' | 'fast-gate';
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
   /**
@@ -1964,6 +2008,14 @@ export type VerifyOptions = {
    * the line itself names it, and so classified when its red output does.
    */
   inPlace?: string;
+  /**
+   * The phase tier (measured-console phase 15, `runner/verify-select.ts`):
+   * what each command runs AS. A selection runs its `form` under
+   * `PE_VERIFY_TIER=phase` and the row keeps the ORIGINAL command as its
+   * identity, with `tier`, `selected`, `sample` and `covered`; an unselected
+   * answer (or none) runs the command as written. Absent: every line as written.
+   */
+  select?: (command: string) => VerifySelection | VerifyUnselected | undefined;
 };
 
 /**
@@ -2032,8 +2084,28 @@ export function unresolvableLeads(
 }
 
 const DEFAULT_TIMEOUT_MS = 15 * 60_000;
-/** Enough tail to see which assertion failed, not a whole suite log. */
-const KEEP_OUTPUT = 8_000;
+/**
+ * Enough tail to see which assertion failed, not a whole suite log — and the
+ * bound on what a session is ever shown of one line's output (measured-console
+ * phase 6, the audit's A4): a red line's `output` is at most this many
+ * characters, the log's path included, and the WHOLE output is in that log.
+ */
+export const KEEP_OUTPUT = 8_000;
+/**
+ * Where a red line's whole output is kept (`openVerifyLog`): the machine's
+ * temporary directory — never the repository the line ran in, and not the
+ * console's state, because a suite log is evidence for the next session and
+ * not a record anyone keeps.
+ */
+export function verifyLogDir(): string {
+  return join(tmpdir(), 'phase-console-verify');
+}
+/** A kept log older than this is swept when the next one opens. */
+const VERIFY_LOG_KEEP_MS = 7 * 24 * 60 * 60_000;
+/** How often one process sweeps the log directory, at most. */
+const VERIFY_LOG_SWEEP_MS = 60 * 60_000;
+/** A log stops growing here: its tail is in the record, its head in the file. */
+const VERIFY_LOG_MAX = 64 * 1024 * 1024;
 /** What `execFile`'s `maxBuffer` used to be — now a cap on accumulation, not a kill. */
 const MAX_OUTPUT = 16 * 1024 * 1024;
 /**
@@ -2176,6 +2248,22 @@ export async function verifyPhase(
 
   const ran: VerifyRun[] = [];
   let failedRun: VerifyRun | null = null;
+  // The phase tier: a heavy line runs as its selected form, and its row is
+  // still the line's own (measured-console phase 15).
+  const choices = new Map<string, VerifySelection | VerifyUnselected | undefined>();
+  const choiceOf = (command: string) => {
+    if (!choices.has(command)) choices.set(command, opts.select?.(command));
+    return choices.get(command);
+  };
+  const runAs = async (command: string, lineOpts: VerifyOptions): Promise<VerifyRun> => {
+    const choice = choiceOf(command);
+    if (choice?.tier !== 'phase') return runOne(command, lineOpts);
+    const row = await runOne(choice.form, { ...lineOpts, env: { ...(lineOpts.env ?? process.env), ...PHASE_TIER_ENV } });
+    return {
+      ...row, command, tier: 'phase', ranAs: choice.form,
+      selected: choice.selected, sample: choice.sample, covered: choice.covered,
+    };
+  };
   for (const [index, command] of runnable.entries()) {
     if (opts.signal?.aborted) {
       notRun.push({ text: condense(command), reason: STOPPED_SKIP_REASON });
@@ -2218,7 +2306,7 @@ export async function verifyPhase(
           output: `not run: \`!\` over a grep of ${vacuous.join(', ')}, which ${vacuous.length === 1 ? 'does' : 'do'} not exist `
             + `in ${at} — a negated search of nothing passes having read nothing`,
         }
-        : await runOne(command, { ...lineOpts, timeoutMs: limit });
+        : await runAs(command, { ...lineOpts, timeoutMs: limit });
     if (at !== opts.cwd) result = { ...result, ranIn: at };
     // A red that never reached a file it names checked nothing (#357): marked,
     // so the verdict never reads it as inherited from the base tree.
@@ -2264,7 +2352,7 @@ export async function verifyPhase(
       const again = result.timedOut
         ? Math.min(limit * TIMEOUT_RETRY_FACTOR, Math.max(VERIFY_TIMEOUT_CEILING_MS, limit))
         : limit;
-      const second = await runOne(command, { ...lineOpts, timeoutMs: again });
+      const second = await runAs(command, { ...lineOpts, timeoutMs: again });
       const missing = second.ok ? [] : missingFiles(command, at);
       result = { ...second, ...(at !== opts.cwd ? { ranIn: at } : {}), ...(missing.length ? { unreached: missing } : {}) };
       ran.push({ ...result, retry: true });
@@ -2377,6 +2465,90 @@ export function hardenedPath(path: string | undefined): { path: string; added: s
   return { path: [...current, ...added].join(':'), added };
 }
 
+/** One command's whole output, written as it arrives (`runOne`). */
+type VerifyLog = {
+  path: string;
+  write: (chunk: string) => void;
+  /** Flush and close; resolves whether or not the file could be written. */
+  close: () => Promise<void>;
+  /** The file could not be written — it names nothing. */
+  broken: () => boolean;
+  /** Delete it — a green line's log, or one with nothing in it. */
+  discard: () => void;
+};
+
+let verifyLogSeq = 0;
+let verifyLogSweptAt = 0;
+
+/** Sweep the logs older than `VERIFY_LOG_KEEP_MS`, at most once an hour per process. */
+function sweepVerifyLogs(dir: string): void {
+  const now = Date.now();
+  if (now - verifyLogSweptAt < VERIFY_LOG_SWEEP_MS) return;
+  verifyLogSweptAt = now;
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (!name.endsWith('.log')) continue;
+    const path = join(dir, name);
+    try { if (now - statSync(path).mtimeMs > VERIFY_LOG_KEEP_MS) unlinkSync(path); } catch { /* raced, or not ours */ }
+  }
+}
+
+/**
+ * The file one command's whole output streams into, or null when the
+ * directory cannot be made. Mode 0600 under a 0700 directory: a suite's
+ * output can carry whatever the suite printed.
+ */
+function openVerifyLog(): VerifyLog | null {
+  const dir = verifyLogDir();
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return null; }
+  // On a shared temp directory another user could have made the name first,
+  // or made it a link: the directory must be a real one, this user's, closed
+  // to everyone else — else no log is kept (the tail alone reaches the session).
+  try {
+    const held = lstatSync(dir);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (!held.isDirectory() || held.isSymbolicLink() || (uid !== null && held.uid !== uid) || (held.mode & 0o077) !== 0) return null;
+  } catch { return null; }
+  sweepVerifyLogs(dir);
+  verifyLogSeq += 1;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const path = join(dir, `${stamp}-${process.pid}-${verifyLogSeq}.log`);
+  let broken = false;
+  let written = 0;
+  // `wx`: created here or not at all — never a file (or a link) somebody left at the name.
+  const stream = createWriteStream(path, { mode: 0o600, flags: 'wx' });
+  stream.on('error', () => { broken = true; });
+  return {
+    path,
+    write: (chunk) => {
+      if (broken || written > VERIFY_LOG_MAX) return;
+      written += chunk.length;
+      stream.write(written > VERIFY_LOG_MAX ? `${chunk}\n[the log stops here — past ${VERIFY_LOG_MAX} characters]\n` : chunk);
+    },
+    close: () => new Promise((done) => {
+      if (stream.closed || stream.destroyed) { done(); return; }
+      stream.end(() => done());
+      stream.once('error', () => done());
+    }),
+    broken: () => broken,
+    discard: () => { try { unlinkSync(path); } catch { /* never written */ } },
+  };
+}
+
+/**
+ * A red line's output as a session is shown it: the end of it, then the line
+ * that names the whole log — `KEEP_OUTPUT` characters at most, the note
+ * included. Without a log it is the tail alone, as before.
+ */
+export function boundedOutput(text: string, logPath?: string | null, total?: number): string {
+  if (!logPath) return text.slice(-KEEP_OUTPUT);
+  const note = `[the whole output${total != null ? ` (${total} characters)` : ''}: ${logPath}]`;
+  const room = Math.max(0, KEEP_OUTPUT - note.length - 1);
+  const tail = room > 0 ? text.slice(-room) : '';
+  return (tail ? `${tail}\n${note}` : note).slice(-KEEP_OUTPUT);
+}
+
 /** Where `nice` lives on every machine this console runs on (macOS and Linux alike). */
 const NICE_BIN = '/usr/bin/nice';
 
@@ -2400,6 +2572,50 @@ function commandEnv(env: NodeJS.ProcessEnv | undefined): { env: NodeJS.ProcessEn
   const base = { ...(env ?? process.env) };
   const hardened = hardenedPath(base.PATH);
   return { env: { ...base, PATH: hardened.path, NO_COLOR: '1', TERM: 'dumb' }, added: hardened.added };
+}
+
+/**
+ * The suite ledger (measured-console phase 7, the audit's C6): every
+ * §Verification line that runs `node --test` is run with the ledger reporter in
+ * its `NODE_OPTIONS`, so a test file that stops part way — `node --test` reads
+ * that as green — turns the line red, naming the file (`suite gap: …`). Through
+ * the environment, never by rewriting the line: the line a plan wrote is the
+ * line that runs, and the proof ledger keys on its text. A line that names its
+ * own `--test-reporter` chose its reporters and is left alone (`npm test`
+ * carries the ledger in its own script); so is a console whose copy has no
+ * reporter file.
+ */
+export const SUITE_LEDGER_REPORTER = join(VIEWER_DIR, 'server', 'runner', 'suite-ledger.mjs');
+const NODE_TEST_LINE = /(?:^|[\s;&|(])node\s(?:[^;&|]*\s)?--test(?=\s|$)/;
+
+/**
+ * Where the ledger a node test line writes goes: a directory `mkdtemp` made for
+ * this console process (mode 0700, a name nobody could predict), made on first
+ * use. The file is diagnostics — the reporter's verdict is the line's exit code.
+ */
+let ledgerDir: string | null = null;
+function ledgerFile(): string {
+  ledgerDir ??= mkdtempSync(join(tmpdir(), 'phase-console-verify-ledger-'));
+  return join(ledgerDir, 'ledger.tsv');
+}
+
+/** Whether a command runs `node --test` without reporters of its own. */
+export function ledgerApplies(command: string): boolean {
+  return NODE_TEST_LINE.test(command) && !/--test-reporter/.test(command);
+}
+
+/**
+ * The `NODE_OPTIONS` a node test line runs under: the session's own, then the
+ * spec reporter on stdout (naming any reporter replaces the default) and the
+ * ledger into `destination`.
+ */
+export function ledgerNodeOptions(existing: string | undefined, destination: string, reporter = SUITE_LEDGER_REPORTER): string {
+  const quote = (value: string): string => `"${value.replace(/(["\\])/g, '\\$1')}"`;
+  return [
+    existing?.trim() ?? '',
+    '--test-reporter=spec', '--test-reporter-destination=stdout',
+    `--test-reporter=${quote(reporter)}`, `--test-reporter-destination=${quote(destination)}`,
+  ].filter(Boolean).join(' ');
 }
 
 /**
@@ -2448,9 +2664,14 @@ export function verifyEnvDigest(opts: { env?: NodeJS.ProcessEnv; setupText?: str
  * which rung it took, because a 124 that does not say whether the children
  * were reaped is a 124 nobody can act on.
  */
-function runOne(command: string, opts: VerifyOptions, stage: 'setup' | 'verify' = 'verify'): Promise<VerifyRun> {
+function runOne(
+  command: string, opts: VerifyOptions, stage: 'setup' | 'verify' = 'verify', keepLog = true,
+): Promise<VerifyRun> {
   const started = Date.now();
   const { env, added } = commandEnv(opts.env);
+  if (ledgerApplies(command) && existsSync(SUITE_LEDGER_REPORTER)) {
+    env.NODE_OPTIONS = ledgerNodeOptions(env.NODE_OPTIONS, ledgerFile());
+  }
   if (added.length && !pathAmendWarned) {
     pathAmendWarned = true;
     log.warn('verify.path-amended', { added });
@@ -2469,6 +2690,10 @@ function runOne(command: string, opts: VerifyOptions, stage: 'setup' | 'verify' 
     // is never spliced to the other stream's.
     const failingOut = new FailureScanner();
     const failingErr = new FailureScanner();
+    // And the whole stream, to a file (measured-console phase 6): what a
+    // session is shown is a bounded tail, so the rest must be somewhere it can
+    // read. Kept only for a red line; a green line's log is deleted.
+    const sink = keepLog ? openVerifyLog() : null;
 
     // A niced command (a baseline beside a working session, control-tower
     // phase 105) starts under `nice` itself, which execs the shell in place:
@@ -2492,6 +2717,7 @@ function runOne(command: string, opts: VerifyOptions, stage: 'setup' | 'verify' 
     // middle dropped instead of being reported as a failure it was not.
     const take = (chunk: string, into: 'out' | 'err'): void => {
       (into === 'out' ? failingOut : failingErr).push(chunk);
+      sink?.write(chunk);
       bytes += chunk.length;
       if (bytes > MAX_OUTPUT) {
         const keep = chunk.slice(-KEEP_OUTPUT);
@@ -2599,13 +2825,22 @@ function runOne(command: string, opts: VerifyOptions, stage: 'setup' | 'verify' 
       const output = [`${out}${err}`.trim(), ...notes].filter(Boolean).join('\n');
       const failures = [...new Set([...failingOut.end(), ...failingErr.end()])].slice(0, FAILURE_CAP);
       if (stragglers.length) log.warn('verify.stragglers', { command: condense(command), pids: stragglers.map((entry) => entry.pid) });
+      const ok = !killed && code === 0;
+      // The log stays only where it says something a session needs: a red
+      // line with output. Everything else is deleted before the result exists.
+      let logPath: string | null = null;
+      if (sink) {
+        await sink.close();
+        if (!ok && output && bytes > 0 && !sink.broken()) logPath = sink.path;
+        else sink.discard();
+      }
       resolve({
         command,
         // A killed command proves nothing — report it red, but say why.
-        ok: !killed && code === 0,
+        ok,
         code: killed ? 124 : code,
         ms: Date.now() - started,
-        output: (killed ? `[timed out or cancelled]\n${output}` : output).slice(-KEEP_OUTPUT),
+        output: boundedOutput(killed ? `[timed out or cancelled]\n${output}` : output, logPath, bytes),
         ...(how && killed ? { how } : {}),
         // The CLOCK cut it — not the abort signal, and not an exit 124 of its
         // own (control-tower phase 83, #95). Only this is `verify-timeout`.
@@ -2645,7 +2880,8 @@ export async function runSingleCommand(
 ): Promise<{ refused?: string; ok: boolean; code?: number; detail?: string; ms?: number }> {
   const refused = judgeCommand(command);
   if (refused) return { ok: false, refused };
-  const run = await runOne(command, opts);
+  // No log: a watch ref re-runs on a timer, and its detail is 400 characters.
+  const run = await runOne(command, opts, 'verify', false);
   return {
     ok: run.ok,
     code: run.code,

@@ -339,7 +339,7 @@ describe('CL-3 — the free CLI refuses acts by edition; Pro asks the license ga
     const DEAD_PORT = '1';
     for (const row of actRows) {
       const args = row.cli!.args.map((name) => (name === 'phase' ? '1' : name === 'id' ? 'abc123456789' : 'demo'));
-      // eslint-disable-next-line no-await-in-loop -- one child process at a time, deliberately
+       
       const out = await runCli(FREE_CLI, ['run', row.name, ...args, '--console', DEAD_PORT]);
       assert.equal(out.status, CLI_EXIT.usage, `${row.name}: ${out.stderr || out.stdout}`);
       assert.match(out.stderr, /Phase Console Pro/, row.name);

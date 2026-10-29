@@ -174,6 +174,13 @@ const FACTS: MetricsFacts = {
   // which found the three families declared with nothing in the fixture to emit.
   load: { avg5: 3.25, threshold: 21 },
   reservations: { armed: 1, waiting: 2 },
+  // The token family (measured-console phase 19): the ledger's tokens and the events', and the
+  // 24-hour cache hit percent.
+  tokens: {
+    meter: { input: 1200, output: 34_000, cache_read: 2_400_000, cache_write: 180_000 },
+    otel: { input: 1180, output: 33_900, cache_read: 2_390_000, cache_write: 0, cache_write_5m: 150_000, cache_write_1h: 29_000 },
+    cacheHitPct: 92.9,
+  },
   today: { settledUsd: 9.25, ladderUsd: 4, capUsd: 20 },
   version: 'abc1234',
   instanceId: 'hub',
@@ -580,3 +587,4 @@ test('IS-6: a stall shows as the window max and p99 for a whole window, where a 
   assert.equal(healthy.p99Seconds, 0.015);
   assert.equal(histogram.resets, 2);
 });
+

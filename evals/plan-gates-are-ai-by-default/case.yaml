@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: plan-gates-are-ai-by-default
+description: 'mode-plan, It''s working if: every gate is categorized, `ai` unless a person is genuinely required.'
+tags: [plan, working-if]
+context:
+  scaffold_script: fixture.sh

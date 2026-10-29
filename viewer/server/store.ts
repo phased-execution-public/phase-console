@@ -228,6 +228,13 @@ export class Store {
           // phase-graph.sh reads the same file the same way.
           record.decisionsTwin = parseDecisionsTable(readFileSync(full, 'utf8'), { after: /^##\s+decisions/i });
           record.activity = Math.max(record.activity, Math.floor(statSync(full).mtimeMs));
+        } else if (file === 'gate-status.md') {
+          // The clearance record `--gate-status` reads (`gate-approve.sh`): a
+          // gate approved or revoked moves the revision, so every answer held
+          // under it — the inbox's gate answers among them — is asked again
+          // (2026-10-20: an approved gate's card stayed on Your turn, because
+          // its plan's revision never moved and the held answer read shut).
+          record.activity = Math.max(record.activity, Math.floor(statSync(full).mtimeMs));
         } else if (file === '.locks') {
           for (const lockFile of safeList(full)) {
             const lock = parseLock(readFileSync(join(full, lockFile), 'utf8'), lockFile);
@@ -294,8 +301,9 @@ function isPlanFile(name: string): boolean {
  *
  * Every input is an mtime, a size or a count taken during the scan that just
  * ran — no extra syscalls — and every artefact the engine reads is represented:
- * the plan file, each handoff, and the INDEX / test-status files, whose mtimes
- * `attachHandoffs` folds into `engineActivity` as it goes.
+ * the plan file, each handoff, and the INDEX / test-status / decisions /
+ * gate-status files, whose mtimes `attachHandoffs` folds into
+ * `engineActivity` as it goes.
  *
  * The lock files are deliberately NOT in it (#44). Neither script the revision
  * keys reads `.locks/`, and a live run claims, refreshes and releases a lock

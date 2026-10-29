@@ -73,6 +73,8 @@ export const REMEMBERED_FIELDS: readonly RunSetupField[] = Object.freeze([
   'approvalTimeoutMinutes',
   'ladderPerRunRungs',
   'ladderPerPhaseRungs',
+  'subagentModel',
+  'bashMaxOutput',
 ]);
 
 export interface LaunchMemory {

@@ -57,7 +57,7 @@ import {
   RESUME_CACHE_COLD_MS, RESUME_FRESH_MIN_CONTEXT, RESUME_FRESH_PARTIAL_REASONS, tokensLabel,
 } from '../server/runner/usage.ts';
 import { sessionLedgerDefect, sessionRecordOf } from '../server/runner/session-record.ts';
-import type { SpawnOutcome } from '../server/runner/spawn.ts';
+import { sanitize, type SpawnOutcome } from '../server/runner/spawn.ts';
 import { ENDED_BY, SESSION_MODES, START_DOORS } from '../shared/run-lifecycle.js';
 import { fixtureJournals, fixtureRuns } from './journal-fixture.ts';
 
@@ -261,7 +261,7 @@ test('clause 1: one definition each for the derivations that used to disagree', 
  * The session ledger's one door (zero-touch-console phase 4, SES-6)
  * ------------------------------------------------------------------ */
 
-test('clause 1: every claude -p session under runner/ goes through the one door, and the door writes the record', () => {
+test('clause 1: every claude -p session under runner/ goes through the one door — subprocess or SDK behind it — and the door writes the record', () => {
   // Two of seven spawn sites wrote `phase.session`, one wrote three fields
   // under another name, and four wrote nothing: 50 of the 138 sessions the
   // audit's six plans spawned were invisible to every census built on the
@@ -272,6 +272,18 @@ test('clause 1: every claude -p session under runner/ goes through the one door,
     'a session is being spawned outside spawnSession — route it through the door, which writes its phase.session');
   assert.equal(spawns.length, 1, `exactly one raw spawn, inside the door (${spawns.join(', ')})`);
 
+  // Two backends behind the ONE door (measured-console phase 20, B1): the
+  // `claude` subprocess and the Agent SDK's `query()`, each a SpawnFn the door
+  // picks at that one call — and both run the one session core, `spawnVia`, so
+  // the events, the outcome and the record cannot tell them apart.
+  const door = SOURCES.find((s) => s.rel === 'runner/runner-base.ts')!.lines.join('\n');
+  assert.match(door, /\(backend \?\? this\.deps\.spawn \?\? spawnClaude\)\(sent\)/,
+    'the door picks the backend (`spawnBackendFor`) at its one raw spawn');
+  assert.match(door, /const backend = await this\.spawnBackendFor\(phase, mode\)/);
+  const core = SOURCES.find((s) => s.rel === 'runner/spawn.ts')!.lines.join('\n');
+  assert.match(core, /export const spawnClaude: SpawnFn = \(request\) => spawnVia\(request, openSubprocess\)/,
+    'the subprocess backend is the session core over `claude` on PATH');
+
   const writers = hits(/record\(\s*'phase\.session'/);
   assert.deepEqual(writers.map((hit) => hit.split(':')[0]), ['runner/runner-base.ts'],
     'phase.session has ONE writer, so it has one shape (session-record.ts sessionRecordOf)');
@@ -281,6 +293,47 @@ test('clause 1: every claude -p session under runner/ goes through the one door,
   for (const mode of SESSION_MODES) {
     const sites = hits(new RegExp(`spawnSession\\(phase, '${mode}'`));
     assert.equal(sites.length, 1, `SESSION_MODES names '${mode}', and exactly one spawn site says it (${sites.join(', ')})`);
+  }
+});
+
+test('the forbidden flags: `--setting-sources` passes `sanitize()` with ONE value, for ONE caller — the runner\'s door under console-set (measured-console phase 11)', () => {
+  // WHY it may pass at all: `--setting-sources project,local` keeps the
+  // repository's settings and the run's own `--settings` (the deny wall, the
+  // hooks) and leaves out ONLY the operator's user-level ones, so an
+  // unattended session no longer loads their personal hooks, plugins and
+  // skills (§Architecture 6 D2). Any value naming `user`, or any other caller,
+  // would be the flag the rail exists to strip — so both stay refused.
+  assert.deepEqual(sanitize(['--setting-sources', 'project,local', '--verbose']), ['--verbose'], 'no allowance: dropped with its value');
+  assert.deepEqual(sanitize(['--setting-sources', 'project,local'], { allowSettingSources: true }), ['--setting-sources', 'project,local']);
+  for (const value of ['user', 'user,project,local', 'project', 'local', 'project,local,user', '']) {
+    assert.deepEqual(sanitize(['--setting-sources', value, '--verbose'], { allowSettingSources: true }), ['--verbose'], `"${value}" stays refused`);
+  }
+  for (const flag of ['--bare', '--safe-mode', '--dangerously-skip-permissions']) {
+    assert.deepEqual(sanitize([flag], { allowSettingSources: true, allowBypass: true }), [], `${flag} is never let through`);
+  }
+  // One caller: the runner's spawn door is the only server file that SETS a
+  // request's settingSources (spawn.ts reads it, loads.ts names the value).
+  const setters = hits(/\bsettingSources:\s*loads\.|settingSources\s*:\s*['"]project,local/).map((hit) => hit.split(':')[0]);
+  assert.deepEqual([...new Set(setters)], ['runner/runner-base.ts'], `settingSources is set by the door alone (${setters.join(', ')})`);
+});
+
+/**
+ * The NAMED spawn sites (#382, measured-console phase 9): a `claude` the console starts that is
+ * not a phase session and not the runner's — a second BACKEND an operator's verb reaches, never a
+ * second door to a phase. Each is named here by file, by what it spawns and why it may; a new one
+ * is a new row with its reason, and a site that moves fails here first.
+ */
+const NAMED_SPAWN_SITES: { file: string; pattern: RegExp; count: number; why: string }[] = [];
+
+test('clause 1: every `claude plugin eval` is a named spawn site, and none spawns through the runner\'s door', () => {
+  const evalSpawns = hits(/'plugin',\s*'eval'/);
+  assert.deepEqual(filesOf(evalSpawns), NAMED_SPAWN_SITES.map((site) => site.file).sort(),
+    'a `claude plugin eval` is spawned somewhere new — name it in NAMED_SPAWN_SITES with its reason\n'
+    + NAMED_SPAWN_SITES.map((site) => `  ${site.file} — ${site.why}`).join('\n'));
+  for (const site of NAMED_SPAWN_SITES) {
+    assert.equal(hits(site.pattern).filter((hit) => hit.startsWith(`${site.file}:`)).length, site.count, `${site.file}: ${site.why}`);
+    assert.equal(hits(/\bspawnClaude\s*\(|\bdeps\.spawn\b/).filter((hit) => hit.startsWith(`${site.file}:`)).length, 0,
+      `${site.file} is a backend of its own — it never spawns a phase session`);
   }
 });
 
@@ -703,12 +756,13 @@ const RESUME_ID_READERS: Record<string, { count: number; why: string }> = {
       + 'spawn and no --resume (many-plans-one-repo phase 11)',
   },
   'runner/runner.ts': {
-    count: 5,
+    count: 6,
     why: 'the ladder\'s own-session availability (the hint still boards through composeBrief\'s gate), an errand '
       + 'sentence, and the widen-rule card\'s answer, which re-boards through the same hint and the same gate (phase 9); '
       + 'the ladder\'s switch-account rung names the transcript to carry to the new account — a port, no spawn, the '
       + 'boarding still through the hint and the gate; and the phase.reopened line names the session reconcile kept — '
-      + 'a journal decoration (control-tower phase 79)',
+      + 'a journal decoration (control-tower phase 79); and the resume-owner rung reads the OWNER\'s session to hand '
+      + 'it to resumableSession (the gate) before the owner is re-boarded through the same hint (measured-console phase 25)',
   },
   'runner/situation.ts': { count: 2, why: 'the evidence a situation is classified from — display, no spawn' },
   'runner/state.ts': {
@@ -722,7 +776,7 @@ const RESUME_ID_READERS: Record<string, { count: number; why: string }> = {
 test('clause 1: every --resume passes the one gate, the gate reads presence, and the id reaches no spawn around it', () => {
   // The door admits only a vetted resume: `SessionRequest` omits the raw string.
   const core = SOURCES.find((s) => s.rel === 'runner/runner-core.ts')!.lines.join('\n');
-  assert.match(core, /export type SessionRequest = Omit<SpawnRequest, 'resume'> & \{ resumeFrom\?: VettedResume \}/);
+  assert.match(core, /export type SessionRequest = Omit<SpawnRequest, 'resume'> & \{ resumeFrom\?: VettedResume[;,} ]/);
   const base = SOURCES.find((s) => s.rel === 'runner/runner-base.ts')!.lines.join('\n');
   assert.match(base, /protected async spawnSession\(\s*phase: number, mode: SessionMode, request: SessionRequest,/);
 
@@ -763,18 +817,22 @@ test('clause 1: every --resume passes the one gate, the gate reads presence, and
  * and with the numbers the gate really uses — so the sentence is built here from
  * `runner/usage.ts`, and a threshold changed in code without its docs fails.
  */
-test('the resume invariant reads the same in CLAUDE.md, SKILL.md and console-surface.md — with the numbers the gate uses', () => {
+test('the resume invariant reads the same in docs/invariants.md, the phase-start mode and console-surface.md — with the numbers the gate uses', () => {
   const sentence = `a session is resumed only while it is worth resuming: one that ended at ≥ ${tokensLabel(RESUME_FRESH_MIN_CONTEXT)} `
     + `tokens of context and is cold (idle ≥ ${RESUME_CACHE_COLD_MS / 60_000} min) or under another account, that declared `
     + `\`partial --reason ${RESUME_FRESH_PARTIAL_REASONS.join('|')}\`, or that the console checkpointed is boarded FRESH `
     + 'with the resume brief instead';
   const repo = new URL('../../', import.meta.url);
-  for (const doc of ['CLAUDE.md', 'SKILL.md', 'references/console-surface.md']) {
+  for (const doc of ['docs/invariants.md', 'references/mode-phase-start.md', 'references/console-surface.md']) {
     const text = readFileSync(new URL(doc, repo), 'utf8').replace(/\s+/g, ' ');
     assert.ok(text.includes(sentence), `${doc} does not state the amended resume invariant verbatim:\n  ${sentence}`);
   }
-  assert.doesNotMatch(readFileSync(new URL('CLAUDE.md', repo), 'utf8'), /resume is ALWAYS the phase's own/,
-    'the unamended invariant is gone');
+  // CLAUDE.md's invariant paragraphs moved whole to docs/invariants.md (measured-console phase 5);
+  // the unamended sentence stays out of both.
+  for (const doc of ['CLAUDE.md', 'docs/invariants.md']) {
+    assert.doesNotMatch(readFileSync(new URL(doc, repo), 'utf8'), /resume is ALWAYS the phase's own/,
+      'the unamended invariant is gone');
+  }
 });
 
 test('the wait budget is evaluated through ONE expression — at park and at resume, and nowhere else', () => {
@@ -1192,7 +1250,7 @@ test('ACT-3: every exported setter on Accounts has a production caller', () => {
   const facade = SOURCES.find((s) => s.rel === 'accounts/index.ts')!;
   const setters: string[] = [];
   for (const line of facade.lines) {
-    const m = /^  (?:async )?((?:set|mark|leave|retire|clear|note|add|begin|complete|remove|rename|start|stop|refresh)\w*)\(/.exec(line);
+    const m = /^ {2}(?:async )?((?:set|mark|leave|retire|clear|note|add|begin|complete|remove|rename|start|stop|refresh)\w*)\(/.exec(line);
     if (m && !setters.includes(m[1])) setters.push(m[1]);
   }
   assert.ok(setters.includes('setActiveProbe') && setters.includes('leaveAccount') && setters.includes('retire') && setters.includes('clearRetired'),

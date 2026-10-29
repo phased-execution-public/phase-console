@@ -5,8 +5,8 @@
  * every horizontal margin, padding, inset, border, corner radius and alignment
  * in LOGICAL terms — `ms-`/`me-`, `ps-`/`pe-`, `start-`/`end-`, `border-s`/`border-e`,
  * `rounded-s`/`rounded-e` (and `rounded-ss`/`-se`/`-es`/`-ee`), `text-start`/`text-end`,
- * `float-start`/`float-end` — and the stylesheets (`theme.css`, `console.css`,
- * `prose.css`, the track's and the route map's own) declare
+ * `float-start`/`float-end` — and every stylesheet under `src/` (found by a walk,
+ * never listed) declares
  * `margin-inline-*`, `padding-inline-*`, `inset-inline-*`, `border-inline-*`
  * and `text-align: start | end`. Never
  * `ml-`/`mr-`/`pl-`/`pr-`/`left-`/`right-`/`border-l`/`border-r`/`rounded-l`/
@@ -53,15 +53,6 @@ const SRC = resolve(here('..'));
  */
 const TREE = ['ui', 'cards', 'shell', 'screens'];
 const SCOPES = TREE;
-/** Every stylesheet, by its path under `src/` — the three of `styles/`, the track's own and the route map's. */
-const STYLESHEETS = [
-  'styles/theme.css',
-  'styles/console.css',
-  'styles/prose.css',
-  'ui/track/track.css',
-  'screens/plan/map/route-map.css',
-];
-
 /** Shipped source only — a test may NAME a physical utility in order to reject it. */
 function* walk(dir: string): Generator<string> {
   for (const name of readdirSync(dir)) {
@@ -72,6 +63,20 @@ function* walk(dir: string): Generator<string> {
 }
 
 const rel = (path: string) => path.slice(SRC.length + 1).replace(/\\/g, '/');
+
+/**
+ * Every stylesheet the client ships, by its path under `src/` — found, never
+ * listed (measured-console phase 32): a hand list named five of ten, and the
+ * five it did not name were never read.
+ */
+function* sheets(dir: string): Generator<string> {
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) yield* sheets(path);
+    else if (name.endsWith('.css')) yield path;
+  }
+}
+const STYLESHEETS = [...sheets(SRC)].map((path) => rel(path)).sort();
 
 /** Blank a match to spaces, keeping its newlines — line numbers stay the file's own. */
 const blank = (match: string) => match.replace(/[^\n]/g, ' ');
@@ -300,6 +305,23 @@ describe('the stylesheets declare their sides logically', () => {
   it('keeps no allowance the stylesheets have stopped needing', () => {
     const { stale } = judge(hits, (f) => f.startsWith('styles/'));
     expect(stale, 'strike it from KEPT — the stylesheet no longer carries it').toEqual([]);
+  });
+
+  it('reads every stylesheet the client ships', () => {
+    // The guard is only as wide as its list, so the list is the tree's.
+    expect(STYLESHEETS).toEqual(
+      expect.arrayContaining([
+        'styles/theme.css',
+        'styles/console.css',
+        'styles/prose.css',
+        'styles/departures.css',
+        'ui/track/track.css',
+        'screens/plan/map/route-map.css',
+        'screens/turn/turn.css',
+        'cards/guide.css',
+      ]),
+    );
+    expect(STYLESHEETS.length).toBeGreaterThanOrEqual(9);
   });
 
   it('reads track.css and the route map’s sheet as the logical stylesheets they are', () => {

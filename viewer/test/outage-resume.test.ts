@@ -27,28 +27,22 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
 import { ConnectivityProbe, CONNECTIVITY_PROBE_MS } from '../server/connectivity-probe.ts';
 import { CONNECTIVITY_BACKOFF_MS } from '../server/runner/errors.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-outage-resume-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-outage-resume-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -60,14 +54,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(stub, 'done'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: (phase) => writeFileSync(join(made.state, 'done'), `${phase}\n`) };
 }
 
 const journalled = (events: { event: string; data: Record<string, unknown> }[], name: string) => events
@@ -118,7 +110,7 @@ function harness(r: Repo, spawn: SpawnFn, probe: ConnectivityProbe) {
 }
 
 test('OR-1: an outage is waited on the probe, not the clock — the lane boards again at the first look that finds the API answering', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { probe, looks, asked } = scriptedProbe([false, false, true]);
   let calls = 0;
   const { instance, events } = harness(r, async () => {
@@ -151,7 +143,7 @@ test('OR-1: an outage is waited on the probe, not the clock — the lane boards 
 });
 
 test('OR-2: a phase whose handoff is complete when the API comes back is closed out — its §Verification runs and no session boots', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { probe } = scriptedProbe([true]);
   const prompts: string[] = [];
   const { instance, events } = harness(r, async (request: SpawnRequest) => {
@@ -178,7 +170,7 @@ test('OR-2: a phase whose handoff is complete when the API comes back is closed 
 });
 
 test('OR-3: otherwise the SAME session is resumed — with a continuation, never the start boot', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { probe } = scriptedProbe([true]);
   const asked: SpawnRequest[] = [];
   const { instance, events } = harness(r, async (request) => {
@@ -204,7 +196,7 @@ test('OR-3: otherwise the SAME session is resumed — with a continuation, never
 });
 
 test('OR-3: a session that never reached the API has nothing to resume — it boards fresh, as it always did', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { probe } = scriptedProbe([true]);
   const asked: SpawnRequest[] = [];
   const { instance, events } = harness(r, async (request) => {
@@ -225,7 +217,7 @@ test('OR-3: a session that never reached the API has nothing to resume — it bo
 });
 
 test('OR-4: the record keeps the session\'s last words, not the transport error — on the phase and on its session line', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const { probe } = scriptedProbe([true]);
   let saidAtRelaunch: string | undefined;
   let calls = 0;

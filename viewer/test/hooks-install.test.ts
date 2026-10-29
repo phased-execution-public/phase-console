@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const {
-  HOOK_EVENTS, HOOK_TIMEOUT_SECONDS, defaultSettingsPath, hookCommand, hooksStatus, installHooks, uninstallHooks,
+  HOOK_BRIEF_TIMEOUT_SECONDS, HOOK_EVENTS, HOOK_TIMEOUT_SECONDS, defaultSettingsPath, hookCommand, hooksStatus, installHooks, uninstallHooks,
 } = await import('../server/hooks-install.ts');
 
 const SKILL = '/opt/skills/phased-execution';
@@ -91,9 +91,13 @@ test('a fresh install creates the file with exactly the four entries, 2-space in
     for (const event of HOOK_EVENTS) {
       assert.equal(json.hooks[event].length, 1);
       assert.deepEqual(json.hooks[event][0], {
-        hooks: [{ type: 'command', command: `bash "${SKILL}/scripts/session-hook.sh"`, timeout: HOOK_TIMEOUT_SECONDS }],
+        hooks: [{
+          type: 'command', command: `bash "${SKILL}/scripts/session-hook.sh"`,
+          timeout: event === 'SessionStart' ? HOOK_BRIEF_TIMEOUT_SECONDS : HOOK_TIMEOUT_SECONDS,
+        }],
       });
     }
+    assert.equal(out.status.brief, true, 'a fresh install waits long enough for the brief');
     assert.equal(hookCommand(SKILL), `bash "${SKILL}/scripts/session-hook.sh"`);
     assert.match(raw, /^ {2}"hooks": \{/m);
   } finally { cleanup(); }
@@ -165,6 +169,24 @@ test('an entry pointing at another checkout reads stale and is refreshed in plac
       assert.equal(json.hooks[event].length, 1, `${event}: one group, not two`);
       assert.equal(json.hooks[event][0].hooks[0].command, hookCommand(SKILL));
     }
+  } finally { cleanup(); }
+});
+
+test('the brief: an install whose SessionStart waits 3 s reads brief false, and install refreshes the timeout', () => {
+  const { path, cleanup } = scratch();
+  try {
+    writeFileSync(path, JSON.stringify({
+      hooks: Object.fromEntries(HOOK_EVENTS.map((event) => [event, [{ hooks: [{ type: 'command', command: hookCommand(SKILL), timeout: 3 }] }]])),
+    }, null, 2) + '\n', 'utf8');
+    const before = hooksStatus({ settingsPath: path, skillDir: SKILL });
+    assert.equal(before.installed, true, 'a 3 s entry is still installed — presence works');
+    assert.equal(before.brief, false, 'but it would cut the brief, so the prompt stays whole');
+    const out = installHooks({ settingsPath: path, skillDir: SKILL });
+    assert.equal(out.changed, true);
+    assert.equal(out.status.brief, true);
+    const json = JSON.parse(readFileSync(path, 'utf8')) as { hooks: Record<string, { hooks: { timeout: number }[] }[]> };
+    assert.equal(json.hooks.SessionStart[0].hooks[0].timeout, HOOK_BRIEF_TIMEOUT_SECONDS);
+    assert.equal(json.hooks.Stop[0].hooks[0].timeout, HOOK_TIMEOUT_SECONDS);
   } finally { cleanup(); }
 });
 
@@ -309,4 +331,86 @@ test('REG-2 / REG-3 (iv): with no console answering, the hook drains its own inb
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/* ---- the plugin's own hooks: the verifier (measured-console phase 10) ---- */
+
+const { PLUGIN_HOOK_COMMAND, pluginHooksStatus, verifyHooks } = await import('../server/hooks-install.ts');
+const REPO = join(import.meta.dirname, '..', '..');
+
+/** A config dir whose installed skill plugin is `pluginRoot` (a version-2 registry, user scope). */
+function configWithPlugin(dir: string, pluginRoot: string): string {
+  const config = join(dir, 'config');
+  mkdirSync(join(config, 'plugins'), { recursive: true });
+  writeFileSync(join(config, 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'phased-execution@phased-execution-public': [{ scope: 'user', installPath: pluginRoot, version: 'abc', gitCommitSha: 'a'.repeat(40) }] },
+  }));
+  return config;
+}
+
+test('the repository\'s hooks/hooks.json carries the four presence entries at the shipped timeouts, under a top-level "hooks" key', () => {
+  const status = pluginHooksStatus(REPO);
+  assert.equal(status.carries, true, status.problems.join('; '));
+  assert.deepEqual(Object.keys(status.events), [...HOOK_EVENTS]);
+  assert.equal(status.brief, true, `SessionStart waits ${HOOK_BRIEF_TIMEOUT_SECONDS} s for the brief`);
+  const doc = JSON.parse(readFileSync(join(REPO, 'hooks', 'hooks.json'), 'utf8'));
+  for (const event of HOOK_EVENTS) {
+    const entry = doc.hooks[event][0].hooks[0];
+    assert.equal(entry.command, PLUGIN_HOOK_COMMAND, `${event} runs the plugin's own script through \${CLAUDE_PLUGIN_ROOT}`);
+    assert.equal(entry.timeout, event === 'SessionStart' ? HOOK_BRIEF_TIMEOUT_SECONDS : HOOK_TIMEOUT_SECONDS);
+  }
+});
+
+test('the verifier names what is wrong with a plugin\'s hooks: a bare event map, a missing event, a timeout that cuts the brief', () => {
+  const s = scratch();
+  const tree = join(s.dir, 'tree');
+  mkdirSync(join(tree, 'hooks'), { recursive: true });
+  const entry = (timeout: number) => [{ hooks: [{ type: 'command', command: PLUGIN_HOOK_COMMAND, timeout }] }];
+  writeFileSync(join(tree, 'hooks', 'hooks.json'), JSON.stringify({ SessionStart: entry(15) }));
+  assert.match(pluginHooksStatus(tree).problems.join(' '), /no top-level "hooks" object/);
+  writeFileSync(join(tree, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: entry(3), SessionEnd: entry(3), Stop: entry(3) } }));
+  const status = pluginHooksStatus(tree);
+  assert.equal(status.carries, false);
+  assert.equal(status.brief, false);
+  assert.match(status.problems.join(' '), /SessionStart: the entry's timeout is not 15 s/);
+  assert.match(status.problems.join(' '), /Notification: no entry runs/);
+  assert.equal(pluginHooksStatus(join(s.dir, 'nowhere')).exists, false);
+  s.cleanup();
+});
+
+test('a config dir whose installed plugin carries the hooks reads `plugin`; with the old splice beside it `both`; install writes no splice there unless asked', () => {
+  const s = scratch();
+  const config = configWithPlugin(s.dir, REPO);
+  const settingsPath = join(config, 'settings.json');
+  writeFileSync(settingsPath, '{\n  "model": "opus"\n}\n');
+  assert.equal(verifyHooks(config, SKILL).verdict, 'plugin');
+  const status = hooksStatus({ skillDir: SKILL, settingsPath });
+  assert.equal(status.viaPlugin, true);
+  assert.equal(status.installed, false);
+  assert.equal(status.brief, true, 'the plugin\'s SessionStart carries the brief when nothing is spliced');
+
+  const skipped = installHooks({ skillDir: SKILL, settingsPath });
+  assert.equal(skipped.changed, false);
+  assert.equal(skipped.pluginCarries, true);
+  assert.equal(readFileSync(settingsPath, 'utf8'), '{\n  "model": "opus"\n}\n', 'nothing spliced over a plugin that carries the hooks');
+
+  const spliced = installHooks({ skillDir: SKILL, settingsPath, splice: true });
+  assert.equal(spliced.changed, true, '--splice still writes them, for a user who wants the settings entries');
+  assert.equal(verifyHooks(config, SKILL).verdict, 'both');
+  uninstallHooks({ skillDir: SKILL, settingsPath });
+  assert.equal(verifyHooks(config, SKILL).verdict, 'plugin');
+  s.cleanup();
+});
+
+test('with no plugin installed the splice is the presence hook: `spliced`, else `missing`', () => {
+  const s = scratch();
+  const config = join(s.dir, 'bare');
+  mkdirSync(config, { recursive: true });
+  assert.equal(verifyHooks(config, SKILL).verdict, 'missing');
+  installHooks({ skillDir: SKILL, settingsPath: join(config, 'settings.json') });
+  const verdict = verifyHooks(config, SKILL);
+  assert.equal(verdict.verdict, 'spliced');
+  assert.equal(verdict.plugin, null);
+  s.cleanup();
 });

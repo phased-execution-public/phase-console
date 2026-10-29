@@ -9,10 +9,20 @@ plus a per-plan `INDEX.md`. Both are committed. Write one for **every** phase, e
 hand — you batch the next phase into the same session; that's what keeps each phase independently
 resumable. (The console runs one phase per session and never batches.)
 
-## Brevity principle
-Self-contained but tight. Do **not** re-list the phase roadmap — link to `docs/plans/<slug>.md`. Put long
-logs, full diffs, or large snippets in the files themselves (reference paths), not the handoff. Aim for a
-reader to bootstrap in ~2 minutes.
+## Brevity principle — a handoff points, it never copies
+Self-contained but tight: a handoff is a **brief**. It points at the artifacts — the plan's section
+(`phase-graph.sh <slug> --section N`), a report under `reports/`, a commit, a test file — and copies none
+of them. Aim for a reader to bootstrap in ~2 minutes; `validate.sh` names a handoff whose **body** (all
+but the frontmatter and the `▶ Start next phase(s)` section) passes **300 lines**.
+
+What a handoff never contains:
+- **a secret's value** — a key, a token, a password, a one-time code. Name where it is kept (the keychain
+  item, the `--key-file` path) instead; `validate.sh` scans every handoff and every guide under
+  `guides/` for a secret's shape and names the file and line;
+- the plan's roadmap, a phase section, or a boot prompt — link the plan, and let
+  `next-phase-prompt.sh` compose the prompts;
+- long logs, whole diffs, test output or a report's body — reference the file and the line instead;
+- a commit sha from memory — `git log -1` is the truth (§Body sections, 4).
 
 ## Handoff frontmatter (required)
 
@@ -28,6 +38,7 @@ depends_on: [<phases that had to finish before this one>]   # auto-filled from t
 blocks: [<phases that list this one as a dependency>]        # auto-filled from the plan graph
 parallel_safe: [<phases safe to run in a SEPARATE session at the same time as this>]
 skills_used: [<skills actually invoked this phase — a descriptive record; distinct from the plan's prescriptive "Skills (every session)" directive>]
+suggested_skills: [<skills the NEXT session should call — each dependent phase's boot prompt and brief name them on the Skill-tool line>]
 key_files:
   - <repo-relative or absolute path touched>
 memory: project_<slug>      # or pre-existing project_<other> — see conventions.md
@@ -107,13 +118,17 @@ the whole plan. Commit and push it like the QA table; a clearance only exists wh
 ## Body sections (in order)
 
 1. **`# Phase N → next handoff: <title>`**
-2. **`## What this phase did`** — 1–3 sentences + bullets of what shipped.
-3. **`## State now (verified)`** — tests X/Y green; committed (shas); deployed? migration applied?
+2. **`## Summary`** — 2–5 lines the next session starts from: what is true now and where to look. It
+   comes first because the brief (`phase-graph.sh <slug> --brief M`, which the presence hook prints at a
+   supervised session's start) hands this section, cut at 1,500 bytes, to every phase that depends on
+   this one; a handoff without it lends the brief its **What this phase did** instead.
+3. **`## What this phase did`** — 1–3 sentences + bullets of what shipped.
+4. **`## State now (verified)`** — tests X/Y green; committed (shas); deployed? migration applied?
    prisma republished? ⚠️ **Verify against `git log` / `git status` before writing — never copy commit
    shas from memory.** The environment may auto-commit (hooks); confirm the actual sha/message. If
    something is half-done, say so explicitly. Stale "uncommitted" claims are the top recurring defect.
-4. **`## Files changed`** — paths grouped by repo.
-5. **`## Key decisions / gotchas`** — why-this-way notes the next session must not relitigate. **Every
+5. **`## Files changed`** — paths grouped by repo.
+6. **`## Key decisions / gotchas`** — why-this-way notes the next session must not relitigate. **Every
    ruling this phase recorded belongs here in words** (`phase-outcome.sh <slug> <N> ruling …` puts the
    same decision in the ledger the console reads; this section is what a *person* reads). The three
    shapes worth a line each: an instruction that admitted two readings and which one you took; a
@@ -124,13 +139,14 @@ the whole plan. Commit and push it like the QA table; a clearance only exists wh
    `decisions.sh promote --from-ruling <id>` use). A ruling recorded with `--remember plan` is already a
    twin row (source `ruling`), and `--remember global` asked the console to hold it as its
    `policy.<key>` answer — say which here, so a person can find the standing answer it became.
-6. **`## Notes for later phases`** *(optional)* — the only channel that reaches a phase which has
+7. **`## Notes for later phases`** *(optional)* — the only channel that reaches a phase which has
    not started. A phase with no session has no transcript and no inbox; this section, a `deferral`
    ruling and a `--deliver boot` message are the three places anything can be left for it, and
    `scripts/phase-graph.sh <slug> --notes N` is the one reader of all three. What it collects for N
    is folded into N's boot prompt as **`### Notes from earlier phases (K)`**, immediately after the
    board and before the decisions manifest — so a note written now is read by a session that does
-   not exist yet.
+   not exist yet. Under a console that briefs its sessions (`PE_BRIEF=hook`), the same block rides
+   the SessionStart brief instead of the prompt.
 
    **The grammar.** One bullet per note, each **addressed**, in one of three ways:
 
@@ -178,7 +194,7 @@ the whole plan. Commit and push it like the QA table; a clearance only exists wh
    addressee defaults to `next`. Both arrive in one block, oldest to newest, and the boot prompt asks
    the session to say in its own handoff what became of each. A note nobody answers is a note nobody
    writes next time.
-7. **`## ▶ Start next phase(s) (paste into fresh sessions)`** — auto-generated by `scripts/new-handoff.sh`,
+8. **`## ▶ Start next phase(s) (paste into fresh sessions)`** — auto-generated by `scripts/new-handoff.sh`,
    and since one-pool phase 25 (#338) a **pointer, never the prompts themselves**: a short paragraph and
    the command that composes them, `bash "${PE_SCRIPTS:-<skill-root>/scripts}"/next-phase-prompt.sh
    <slug> <N>` (indented, not fenced — a fence there reads as a prompt). The board moves after a handoff
@@ -191,7 +207,7 @@ the whole plan. Commit and push it like the QA table; a clearance only exists wh
    `parse/handoff.ts` still reads them, and the composer, not the copy, is what a booting session
    follows. **Keep the heading literal** — `validate.sh` requires it. Final-phase handoffs get
    **`## 🏁 Final phase — closeout`** instead.
-8. **`## Outstanding / blockers`** — anything unresolved, or "none".
+9. **`## Outstanding / blockers`** — anything unresolved, or "none".
 
 **A ruling is not a status.** The frontmatter's `status:` vocabulary is frozen at
 `complete | in-progress | blocked | pending`, and the outcome protocol's is frozen at
@@ -201,7 +217,7 @@ repair session's word ("I looked, and there was nothing to fix"; see
 DECIDED, not how it ended: nothing acts on one, it never parks a phase, and declaring one is never
 a substitute for declaring an outcome.
 
-## The boot prompt (what section 7 points at)
+## The boot prompt (what section 8 points at)
 
 `next-phase-prompt.sh` prints one boot prompt per ready phase P, to be copy-pasted verbatim into a
 fresh session (Phase Console composes the same at launch):
@@ -221,9 +237,10 @@ fresh session (Phase Console composes the same at launch):
 
     This phase's SCOPE (the repos it touches, from the plan's Repos column): <csv>
     Two sessions may run at once ONLY on disjoint scopes. Before implementing:
-      1. git pull, then: phase-lock.sh <slug> conflicts P --scope "<csv>" --git
+      1. git pull, then: phase-lock.sh <slug> conflicts P --scope "<csv>"
          A reported conflict means STOP AND ASK the user.
-      2. phase-lock.sh <slug> claim P --owner "<account>/<session>" --scope "<csv>" --git
+      2. phase-lock.sh <slug> claim P --scope "<csv>"
+         (file-only under an autopilot: the console mirrors the lock; --owner defaults to $PE_OWNER)
     The invariant: never two live sessions whose scopes intersect; same repo ⇒ serialized;
     `all` ⇒ exclusive against every unqualified claim; disjoint ⇒ parallel. (Handoff/lock commits in the docs repo are NOT part of
     your scope — pull --rebase and retry up to 3 times if one races.)

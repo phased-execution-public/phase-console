@@ -4,198 +4,45 @@
  */
 
 import { request, post, q } from '../http';
-import type { PhaseTask } from './runs';
-import type { HolderEtaView } from './state';
 import type { RecoveryClass } from '@/lib/recovery';
 import type { QaProfile } from '@/lib/qa';
 import type { AgentIntent } from '@shared/run-settings.js';
-import type { Presence, PresenceEndSource } from '@shared/run-lifecycle.js';
-import type { LockHolderKind } from '@shared/lock-model.js';
+import type {
+  LockRow,
+  SessionEventsAnswer,
+  SessionRegistryView,
+  HooksStatusView,
+  HooksView,
+  HooksWriteView,
+  TerminalDeleteAnswer,
+  TerminalState,
+  TerminalTicket,
+  TerminalVerbAnswer,
+} from '@shared/wire/sessions.js';
+import type { LockFilter } from '../sessions';
 
-/* ---------------- the terminal ---------------- */
-
-export interface TerminalSession {
-  id: string;
-  label: string;
-  /** What the session runs. Absent (an older server) means a shell. */
-  kind?: 'shell' | 'claude';
-  cwd: string;
-  shell: string;
-  cols: number;
-  rows: number;
-  pid: number;
-  clients: number;
-  createdAt: number;
-  /** When the pty last printed — how a list tells "working" from "waiting". */
-  lastOutputAt?: number;
-  /** When the last client detached, while none is attached. */
-  detachedSince?: number;
-  /** Claude-session facts the UI shows back — never secret. */
-  meta?: {
-    model?: string;
-    effort?: string;
-    permissionMode?: string;
-    /** What `claude --resume <id>` takes after this pty is gone. */
-    claudeSessionId?: string;
-    /** The briefing the session was composed from — the owner's list (`AGENT_INTENTS`). */
-    intent?: AgentIntent;
-    /** Set by the server on a recovery session — what it was launched to fix. */
-    recovery?: { kind: string; slug?: string; phase?: number; runId?: string };
-    /**
-     * Set by the server on a QA session — which phase it reviews, and what
-     * `test-status.md` said when it started. The snapshot is how the exit check
-     * tells "recorded a verdict" from "ended next to one that was already there".
-     */
-    qa?: {
-      slug: string;
-      phase: number;
-      before?: string;
-      beforeReport?: string;
-      /** Which round this session produces, and the report it was told to write. */
-      round?: number;
-      report?: string;
-    };
-  };
-  /**
-   * Present once the process has gone. The record now OUTLIVES it until it is
-   * dismissed, so this is a state the page renders rather than a moment it
-   * catches.
-   */
-  exited?: { code: number; signal?: number; closedByOperator?: boolean };
-  /** When it ended. */
-  exitedAt?: number;
-  /**
-   * Set while the process group sits under SIGSTOP — who asked, since when,
-   * and WHEN IT CONVERTS.
-   *
-   * `escalateAt` is the promise the card has to be able to make. A freeze is
-   * held, not ended, so the only honest thing to show beside it is the moment
-   * it stops being held: past that deadline the session is stopped gracefully,
-   * on the same clock and through the same verdict a phase lane's freeze uses.
-   * Without it a card can say what a freeze IS and not what happens next, which
-   * is the half of the promise the operator actually needs.
-   */
-  frozen?: { at: number; by: string; escalateAt: string };
-  /** A graceful stop is in flight: SIGTERM sent, SIGKILL armed on a grace. */
-  stopping?: { at: number; by: string };
-  /**
-   * A QA reviewer's own task list, folded server-side from the inbox its
-   * `PE_TASKS_FILE` names — the same shape a lane's record carries, so the
-   * Sessions list and the inspector draw it the same way. Absent on every
-   * session that published none.
-   */
-  tasks?: PhaseTask[];
-}
-
-export interface TerminalState {
-  /** `--allow-terminal` was given. */
-  allowed: boolean;
-  /** `--allow-agent` was given — claude sessions may be minted. */
-  agentAllowed?: boolean;
-  /** Whether `node-pty` actually loaded — `unknown` until something has tried. */
-  available: 'yes' | 'no' | 'unknown';
-  limit: number;
-  /** Live processes — what `limit` caps. `sessions` also carries ended records. */
-  live?: number;
-  sessions: TerminalSession[];
-}
-
-/**
- * A Claude session the session-presence hook reported for this instance — a
- * person's own `claude`, a console agent, an autopilot lane (here or in
- * another console) — with the registry's three-valued presence and, when a
- * lock's `session=` says so (strong) or the owner and the clock suggest it
- * (weak), the plan and phase it works.
- */
-export interface ForeignSession {
-  sessionId: string;
-  kind: 'autopilot' | 'agent' | 'foreign';
-  cwd: string;
-  root?: string;
-  transcript?: string;
-  owner?: string;
-  scope?: string;
-  user?: string;
-  host?: string;
-  pid?: number;
-  startedAt: string;
-  lastSeen: string;
-  /** For a reported end the moment it gave; for an inferred one (`endedBy: 'probe'`) the last evidence of life. */
-  endedAt?: string;
-  /** Who said it ended (REG-9) — the session's SessionEnd, or the probe finding its process gone. */
-  endedBy?: PresenceEndSource;
-  /** When the probe noticed an inferred end. */
-  endedDetectedAt?: string;
-  reason?: string;
-  source?: string;
-  turns: number;
-  /**
-   * Where `turns` came from (REG-9): the run's stream (the Stop hook is
-   * displaced by the run's settings), the hook, or `unknown` — a record that
-   * moved many times and never saw a Stop, whose 0 is not a count. Absent from
-   * a server before 5.0.0.
-   */
-  turnsSource?: 'stream' | 'hook' | 'unknown';
-  presence: Presence;
-  /**
-   * The plan and phase this session works. `strong` when a lock's `session=`
-   * or a run record named it, `false` when only the owner and the clock
-   * suggest it. `runId` is set when a run is what answered.
-   */
-  plan?: { slug: string; phase: number; strong: boolean; runId?: string };
-  /** Set while the session sits blocked on a person — what it wants, since when. */
-  waiting?: { since: string; kind: 'permission' | 'input'; note?: string };
-}
-
-/** One hook event as the presence registry recorded it (`server/sessions/registry.ts`). */
-export interface SessionEventLine {
-  at: string;
-  appliedAt: string;
-  lateMs: number;
-  via: string;
-  event: string;
-  payload: Record<string, unknown>;
-}
-
-
-/**
- * One phase claim, as `GET /api/locks` serves it (#24) — `server/locks.ts`'s
- * `LockRow`. Times are epoch milliseconds; `scope` is empty when the claim
- * named none, which collides with everything.
- */
-export interface LockRow {
-  slug: string;
-  phase: number;
-  phaseTitle: string;
-  owner: string;
-  host?: string;
-  claimedAt?: number;
-  leaseUntil?: number;
-  scope: string[];
-  session?: string;
-  presence: Presence;
-  branch?: string;
-  worktree?: string;
-  /** `lockLapsed` on the server: past its lease, or its session ended. */
-  lapsed: boolean;
-  holderKind: LockHolderKind;
-  runId?: string;
-  /** The queue entries waiting on this claim. */
-  blocking: { slug: string; phase: number | null; runId: string }[];
-  /** The holder's remaining time — its phase's, or its plan's labelled as such (#63). */
-  eta?: HolderEtaView;
-}
-
-/**
- * What `GET /api/locks` narrows to (`server/locks.ts` `parseLockFilter`): only
- * the claims still held, only the lapsed ones, and only those whose scope
- * names a repository. `held` and `lapsed` together answer nothing.
- */
-export interface LockFilter {
-  held?: true;
-  lapsed?: true;
-  scope?: string;
-}
+/* The shapes are the wire's (measured-console phase 32): `@shared/wire/sessions.js`. */
+export type {
+  TerminalSession,
+  TerminalSessionMeta,
+  TerminalState,
+  TerminalTicket,
+  TerminalVerbAnswer,
+  TerminalDeleteAnswer,
+  ForeignSession,
+  SessionEventLine,
+  SessionEventsAnswer,
+  LockRow,
+  SessionRegistryView,
+  HooksStatusView,
+  HookRowView,
+  HookifyRuleView,
+  HookifyOnDiskView,
+  HooksView,
+  HooksWriteView,
+  SessionInventory,
+} from '@shared/wire/sessions.js';
+export type { LockFilter } from '../sessions';
 
 /** The filter as the route's query — empty when it narrows nothing. */
 export function lockQuery(filter: LockFilter): string {
@@ -205,59 +52,6 @@ export function lockQuery(filter: LockFilter): string {
   if (filter.scope) query.set('scope', filter.scope);
   const qs = query.toString();
   return qs ? `?${qs}` : '';
-}
-
-export interface SessionRegistryView {
-  sessions: ForeignSession[];
-}
-
-/** The session-presence hook, as `~/.claude/settings.json` has it. */
-export interface HooksStatusView {
-  path: string;
-  exists: boolean;
-  installed: boolean;
-  partial: boolean;
-  events: Record<'SessionStart' | 'SessionEnd' | 'Stop', boolean>;
-  command: string;
-  stale: boolean;
-  parseError?: string;
-}
-
-export interface HooksWriteView {
-  ok: true;
-  path: string;
-  changed: boolean;
-  status: HooksStatusView;
-}
-
-/** What a shutdown or a restart does to the live sessions. Both dialogs render it. */
-export interface SessionInventory {
-  live: number;
-  agent: number;
-  terminal: number;
-  ended: number;
-  /**
-   * Whether these sessions outlive the console going away.
-   *
-   * True once the ptys belong to the broker (`server/pty/broker.ts`), which is
-   * every real console. The dialogs must READ this rather than assume either
-   * answer — before the broker they were killed and nothing said so, and a
-   * dialog that now claimed to stop them would be the same defect with the
-   * sign flipped.
-   */
-  survives?: boolean;
-  sessions: { id: string; label: string; kind: 'shell' | 'claude' }[];
-}
-
-/** A single-use ticket for one WebSocket upgrade. Never logged, never stored. */
-export interface TerminalTicket {
-  ok: true;
-  sessionId: string;
-  token: string;
-  expiresAt: number;
-  path: string;
-  /** The session as it now is — so the caller never races its own creation. */
-  session: TerminalSession;
 }
 
 /** The session fetchers — merged into `api` by `./index`. */
@@ -310,36 +104,32 @@ export const sessionsApi = {
     accountId?: string;
   }) => post<TerminalTicket>('/api/terminal', { kind: 'claude', ...body }),
   terminalClose: (id: string) =>
-    request<{ closed: boolean; state: TerminalState }>(`/api/terminal?id=${q(id)}`, { method: 'DELETE' }),
+    request<Extract<TerminalDeleteAnswer, { closed: boolean }>>(`/api/terminal?id=${q(id)}`, {
+      method: 'DELETE',
+    }),
   /** Drop the record of a session that has already ended. Refused on a live one. */
   sessionDismiss: (id: string) =>
-    request<{ ok: boolean; reason?: string; state: TerminalState }>(
-      `/api/terminal?id=${q(id)}&action=dismiss`,
-      { method: 'DELETE' },
-    ),
+    request<TerminalVerbAnswer>(`/api/terminal?id=${q(id)}&action=dismiss`, { method: 'DELETE' }),
   /** SIGSTOP the session's process group — the lane-freeze verb at session size. */
-  sessionFreeze: (id: string) =>
-    post<{ ok: boolean; reason?: string; state: TerminalState }>(`/api/terminal/${q(id)}/freeze`),
+  sessionFreeze: (id: string) => post<TerminalVerbAnswer>(`/api/terminal/${q(id)}/freeze`),
   /** SIGCONT — the session picks up exactly where it stopped. */
-  sessionThaw: (id: string) =>
-    post<{ ok: boolean; reason?: string; state: TerminalState }>(`/api/terminal/${q(id)}/thaw`),
+  sessionThaw: (id: string) => post<TerminalVerbAnswer>(`/api/terminal/${q(id)}/thaw`),
   /**
    * End a session politely: SIGTERM, SIGKILL only after a grace it ignored.
    * Unlike `terminalClose`, the record stays — outcome checks and the
    * `--resume` id survive the stop.
    */
-  sessionStop: (id: string) =>
-    post<{ ok: boolean; reason?: string; state: TerminalState }>(`/api/terminal/${q(id)}/stop`),
+  sessionStop: (id: string) => post<TerminalVerbAnswer>(`/api/terminal/${q(id)}/stop`),
 
   /* ---- session presence: the registry the hook feeds, and the hook installer ---- */
   sessionRegistry: () => request<SessionRegistryView>('/api/sessions/registry'),
   /** The raw hook payloads of one session, in order — how its registry record came to say what it says. */
   sessionEvents: (id: string, limit = 50) =>
-    request<{ sessionId: string; events: SessionEventLine[] }>(
-      `/api/sessions/${q(id)}/events?limit=${limit}`,
-    ),
+    request<SessionEventsAnswer>(`/api/sessions/${q(id)}/events?limit=${limit}`),
   /** Every phase claim this console can see, worst-first (#24) — narrowed by the server when asked. */
   locks: (filter: LockFilter = {}) => request<{ rows: LockRow[] }>(`/api/locks${lockQuery(filter)}`),
   hooksStatus: () => request<HooksStatusView>('/api/hooks-install'),
+  /** Every hook the console knows, and each plan's hookify rules — read-only (measured-console phase 28). */
+  hooks: () => request<HooksView>('/api/hooks'),
   hooksInstall: (action: 'install' | 'uninstall') => post<HooksWriteView>('/api/hooks-install', { action }),
 };

@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: start-reads-from-disk
+description: 'mode-phase-start, It''s working if: the session started from disk alone (plan §Phase N, the dependency''s handoff).'
+tags: [phase-start, working-if]
+context:
+  scaffold_script: fixture.sh

@@ -273,6 +273,7 @@ describe('go · find · do', () => {
       'Notifications',
       'Accounts',
       'MCP servers',
+      'Hooks',
       'Permissions',
       'This instance',
       'Everything',

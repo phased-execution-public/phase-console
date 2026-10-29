@@ -24,7 +24,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const { SKILL_DIR } = await import('../server/config.ts');
-const { TIMEOUT_RETRY_FACTOR, VERIFY_TIMEOUT_CEILING_MS, VERIFY_TIMEOUT_MS } = await import('../server/runner/verify.ts');
+const {
+  TIMEOUT_RETRY_FACTOR, VERIFY_TIMEOUT_CEILING_MS, VERIFY_TIMEOUT_MS,
+  SUITE_LEDGER_REPORTER, ledgerApplies, ledgerNodeOptions, runSingleCommand,
+} = await import('../server/runner/verify.ts');
 
 const TRASH: string[] = [];
 process.on('exit', () => { for (const dir of TRASH) rmSync(dir, { recursive: true, force: true }); });
@@ -61,7 +64,7 @@ test('with those two flags a test that never settles ends the run, and is named'
   // The suite's own flags, with its timeout shortened so this test is quick —
   // what is under test is that the PAIR ends the run, not how long the bound is.
   const flags = suiteScript().split(/\s+/)
-    .filter((word) => word.startsWith('--test-') && !word.startsWith('--test-concurrency'))
+    .filter((word) => word.startsWith('--test-') && !word.startsWith('--test-concurrency') && !word.startsWith('--test-reporter'))
     .map((word) => (TIMEOUT_FLAG.test(word) ? '--test-timeout=1500' : word));
   // A `node --test` started inside a test inherits NODE_TEST_CONTEXT and reports
   // to a parent that is not listening — it exits 0 at once, having run nothing.
@@ -107,4 +110,89 @@ test('the console\'s clock on a §Verification command outlasts the bound a suit
     `a §Verification command gets ${VERIFY_TIMEOUT_MS} ms, no more than the ${perTest} ms one test may take`);
   assert.ok(VERIFY_TIMEOUT_MS * TIMEOUT_RETRY_FACTOR <= VERIFY_TIMEOUT_CEILING_MS,
     'a cut command\'s retry at the default fits under the ceiling');
+});
+
+/*
+ * The suite ledger everywhere (measured-console phase 7, the audit's C6): a
+ * file whose process stops part way — `node --test` reads it as green — turns
+ * the run red, in `npm test`, in the gate's node runs and in every §Verification
+ * node line the console runs, where the reporter arrives through NODE_OPTIONS.
+ */
+
+/** A scratch directory holding one file that stops after its first test, and one whole file. */
+function plantedEarlyExit(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-suite-ledger-'));
+  TRASH.push(dir);
+  writeFileSync(join(dir, 'stops.test.mjs'), [
+    "import { test } from 'node:test';",
+    "test('first', () => {});",
+    "test('second stops the process', async () => { await new Promise((r) => setTimeout(r, 100)); process.exit(0); });",
+    "test('third, never reported', () => {});",
+    '',
+  ].join('\n'));
+  writeFileSync(join(dir, 'whole.test.mjs'), "import { test } from 'node:test';\ntest('one', () => {});\n");
+  return dir;
+}
+const childEnv = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  delete env.NODE_OPTIONS;
+  return env;
+};
+
+test('npm test writes the suite ledger beside the spec reporter', () => {
+  const script = suiteScript();
+  assert.match(script, /--test-reporter=spec --test-reporter-destination=stdout/);
+  assert.match(script, /--test-reporter=\.\/test\/suite-ledger\.mjs --test-reporter-destination=\.cache\/suite-ledger\.tsv/);
+  assert.match(script, /^mkdir -p \.cache && /, 'the ledger\'s directory exists before the runner opens it');
+});
+
+test('a planted early exit reads red under the suite\'s own reporters, naming the file and the count', () => {
+  const dir = plantedEarlyExit();
+  const ledger = join(dir, 'ledger.tsv');
+  const flags = ['--test-force-exit', '--test-reporter=spec', '--test-reporter-destination=stdout',
+    `--test-reporter=${join(SKILL_DIR, 'viewer', 'test', 'suite-ledger.mjs')}`, `--test-reporter-destination=${ledger}`];
+  const run = spawnSync(process.execPath, ['--test', ...flags, 'stops.test.mjs', 'whole.test.mjs'], {
+    cwd: dir, encoding: 'utf8', timeout: 60_000, env: childEnv(),
+  });
+  const output = `${run.stdout}${run.stderr}`;
+  assert.equal(run.status, 1, `a file that stopped part way must fail the run:\n${output}`);
+  assert.match(output, /suite gap: stops\.test\.mjs stopped part way — 1 of 3 tests reported/);
+  assert.doesNotMatch(output, /suite gap: whole\.test\.mjs/);
+  const rows = readFileSync(ledger, 'utf8').trim().split('\n');
+  assert.deepEqual(rows, ['stops.test.mjs\t3\t1', 'whole.test.mjs\t1\t1']);
+  // Without the ledger the same run is green — which is the whole defect (#339).
+  const bare = spawnSync(process.execPath, ['--test', '--test-force-exit', 'stops.test.mjs'], {
+    cwd: dir, encoding: 'utf8', timeout: 60_000, env: childEnv(),
+  });
+  assert.equal(bare.status, 0, 'node --test alone reads the stopped file as green');
+});
+
+test('a node test line the console runs carries the ledger through NODE_OPTIONS, and reads a stop as red', async () => {
+  assert.ok(SUITE_LEDGER_REPORTER.endsWith(join('viewer', 'server', 'runner', 'suite-ledger.mjs')));
+  for (const [command, applies] of [
+    ['node --test stops.test.mjs', true],
+    ['node --test --test-timeout=600000 --test-force-exit viewer/test/a.test.ts', true],
+    ['node --test-timeout=5 --test a.test.ts', true],
+    ['cd viewer && node --test test/a.test.ts', true],
+    ['node --test --test-reporter=tap a.test.ts', false],
+    ['npm --prefix viewer test', false],
+    ['node -e "1"', false],
+    ['node scripts/build-free-tree.mjs --out x', false],
+  ] as const) {
+    assert.equal(ledgerApplies(command), applies, command);
+  }
+  const options = ledgerNodeOptions('--max-old-space-size=4096', '/tmp/a b/ledger.tsv', '/x/suite-ledger.mjs');
+  assert.equal(options, '--max-old-space-size=4096 --test-reporter=spec --test-reporter-destination=stdout '
+    + '--test-reporter="/x/suite-ledger.mjs" --test-reporter-destination="/tmp/a b/ledger.tsv"');
+
+  const dir = plantedEarlyExit();
+  const env = childEnv();
+  const red = await runSingleCommand('node --test --test-force-exit stops.test.mjs whole.test.mjs', { cwd: dir, env });
+  assert.equal(red.ok, false, `the injected ledger turns a stop red: ${red.detail}`);
+  assert.equal(red.code, 1);
+  assert.match(red.detail ?? '', /did not report in full/);
+  // A line that names its own reporters chose them: no ledger, and the stop is green again.
+  const own = await runSingleCommand('node --test --test-force-exit --test-reporter=spec stops.test.mjs', { cwd: dir, env });
+  assert.equal(own.ok, true, own.detail);
 });

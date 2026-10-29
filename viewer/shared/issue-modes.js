@@ -21,7 +21,14 @@
  */
 export const ISSUE_MODES = Object.freeze(/** @type {const} */ (['off', 'draft', 'file']));
 
-/** Silence means off — outward writes are never a default. */
+/**
+ * The PLAN's silence: `--issues` reads `off<TAB>default` when no bullet and no
+ * line speak. It is not the last word in Pro — the one resolver
+ * (`resolveIssueMode`, `pro/issues/policy.ts`; `phase-graph.sh --issue-policy`)
+ * asks the run's word and then the console's Settings ▸ Issues
+ * (`consoleIssueMode`, shipped `file`) before it falls back here. The Free
+ * console has neither, so there silence stays `off`.
+ */
 export const DEFAULT_ISSUES = 'off';
 
 /**

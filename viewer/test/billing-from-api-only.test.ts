@@ -19,7 +19,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -27,6 +27,7 @@ import { classify, structuredRefusal, type StopSignal } from '../server/runner/e
 import { spawnClaude, type SpawnFn, type SpawnOutcome } from '../server/runner/spawn.ts';
 import { Runner } from '../server/runner/runner.ts';
 import type { LeaveReason, LeaveResult } from '../server/accounts/index.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 /* The words, assembled — the billing sentence, the 402 title, the credits line, the auth sentences. */
 const PAY_TITLE = ['Pay', 'ment Req', 'uired'].join('');
@@ -216,17 +217,11 @@ test('BA-3: a worked SUCCESS is still believed over an API-channel sentence (pha
 
 type Repo = { root: string; markDone: (phase: number) => void; scripts: string; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-ba-runner-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-ba-runner-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -238,14 +233,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(stub, 'done'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: (phase) => writeFileSync(join(made.state, 'done'), `${phase}\n`) };
 }
 
 const journalled = (events: { event: string; data: Record<string, unknown> }[], name: string) => events
@@ -257,7 +250,7 @@ function leaveStub(accountId: string | undefined, leaving: LeaveReason): LeaveRe
 }
 
 test('BA-6: the halt, the phase\'s cause and the retirement carry what the refusal stood on and whose stop it was', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const left: LeaveReason[] = [];
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const refused: SpawnFn = async () => ({
@@ -287,7 +280,7 @@ test('BA-6: the halt, the phase\'s cause and the retirement carry what the refus
 });
 
 test('BA-6: a switch away from a retired account journals the retirement\'s evidence', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const evidence = { source: 'text' as const, matched: `API Error: 400 ${BALANCE}`, session: 'sess-57', phase: 23 };
   const spawn: SpawnFn = async () => {

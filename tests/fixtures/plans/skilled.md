@@ -10,7 +10,8 @@ memory: project_skilled
 # Skills-directive test plan
 
 Carries a `## Session budget` with a `Skills (every session):` line, so the engine
-must re-inject those skills into every boot prompt + the QA brief.
+must re-inject those skills into every boot prompt + the QA brief. Phase 2's
+`- **Skills:**` bullet adds to the line (measured-console phase 11).
 
 ## Session budget
 **Target model:** `claude-opus-5`  ·  **Budget:** ~1M working set/session  ·  **Branch:** current branch (no new branch)
@@ -30,5 +31,6 @@ must re-inject those skills into every boot prompt + the QA brief.
 
 ### Phase 2 — b
 - **Size:** S
+- **Skills:** `tdd`, `design-system`
 - **Verification:**
   - `true`

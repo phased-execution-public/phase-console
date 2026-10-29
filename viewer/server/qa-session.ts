@@ -39,6 +39,7 @@
 
 import { assemble } from './recovery.ts';
 import { QA_RESULTS } from '../shared/plan-vocab.js';
+import { skillCallsLine } from './skills.ts';
 
 /** A QA brief is a briefing, not a document — and it must fit the agent cap. */
 export const MAX_QA_PROMPT_BYTES = 16 * 1024;
@@ -279,7 +280,7 @@ function intro(facts: QaFacts): string {
   if (facts.skills?.length) {
     lines.push(
       '',
-      `The plan asks every session to invoke these skills first: ${facts.skills.join(', ')}.`,
+      `The plan names these skills for every session — before you start: ${skillCallsLine(facts.skills)}`,
     );
   }
   return lines.join('\n');

@@ -90,7 +90,7 @@ describe('Repo says which corner of the tree it is looking at', () => {
     expect(screen.queryByText(/changed files/i)).toBeNull();
     // The paths themselves are one fold away, under the same words.
     const fold = screen.getByTestId('repo-docs-fold');
-    expect(fold.textContent).toBe('Uncommitted under docs/(1)');
+    expect(fold.textContent).toBe('Uncommitted under docs/ (1)');
     expect(screen.queryByText('docs/plans/a.md')).toBeNull();
     fireEvent.click(fold);
     expect(await screen.findByText('docs/plans/a.md')).toBeTruthy();

@@ -19,6 +19,7 @@
 
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
 import './state-sandbox.ts';
+import { readStoredRun } from '../server/runner/state.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -29,7 +30,7 @@ import { join } from 'node:path';
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
-const { journalFile, runFile } = await import('../server/runner/run-paths.ts');
+const { journalFile } = await import('../server/runner/run-paths.ts');
 const { AccountStore, profileConfigDir } = await import('../server/accounts/store.ts');
 type RunState = import('../server/runner/state.ts').RunState;
 type SessionView = import('../server/sessions/registry.ts').SessionView;
@@ -101,7 +102,7 @@ test('SE-1: a stored-run account switch is journalled, and the active id joins t
     const outcome = svc.switchAccountRun('alpha', 'acct-b', PRESS as never);
     assert.equal(outcome.ok, true, outcome.reason);
 
-    const after = JSON.parse(readFileSync(runFile(root, 'alpha', run.id), 'utf8')) as RunState;
+    const after = readStoredRun(root, 'alpha', run.id)!;
     assert.equal(after.accountId, 'acct-b');
     assert.ok(
       after.accounts?.some((row) => row.id === 'acct-b'),
@@ -198,7 +199,7 @@ test('SE-4: a settings patch on a stored run is journalled on that run, with who
     const run = storedRun(root, { resumeOnRestart: false, relay: 'off' });
     const edited = svc.configureRun('alpha', { resumeOnRestart: true, relay: 'last-resort' }, 'operator');
     assert.equal(edited?.resumeOnRestart, true);
-    const after = JSON.parse(readFileSync(runFile(root, 'alpha', run.id), 'utf8')) as RunState;
+    const after = readStoredRun(root, 'alpha', run.id)!;
     assert.equal(after.resumeOnRestart, true, 'the answer the next restart reads');
     assert.equal(after.relay, 'last-resort');
     const journal = readFileSync(journalFile(root, 'alpha', run.id), 'utf8')

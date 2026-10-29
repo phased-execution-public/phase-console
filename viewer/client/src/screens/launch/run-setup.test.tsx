@@ -19,7 +19,8 @@
 import type { ReactElement } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { clearDom } from '@/test-heavy';
 import { queryClientConfig } from '@/data/keys';
 import type { RunState } from '@/data/api';
 import { EMPTY, type RunSetupValues } from './model/schema';
@@ -103,6 +104,8 @@ async function mount(props: Record<string, unknown>, consoleState: Record<string
     </QueryClientProvider>,
   );
 }
+
+afterEach(clearDom);
 
 beforeEach(() => {
   vi.clearAllMocks();

@@ -30,6 +30,11 @@ done
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$SKILL_DIR/scripts/phase-graph.sh"
+# What this prints is the WHOLE prompt (measured-console phase 4): a person pastes
+# it into a session no presence hook briefs, so a `PE_BRIEF=hook` inherited from a
+# supervised session must not trim it. The prompt's Skill-tool line is the engine's
+# — the plan's skills, then the `suggested_skills:` of the handoffs before it.
+unset PE_BRIEF PE_BRIEF_MAX
 
 # shellcheck source=/dev/null
 . "$SKILL_DIR/scripts/instance.sh"

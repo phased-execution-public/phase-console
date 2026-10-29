@@ -142,6 +142,9 @@ const drawnPhases = (container: HTMLElement) =>
   );
 const station = (container: HTMLElement, phase: number) =>
   container.querySelector<SVGGElement>(`.route-svg .route-station[data-phase="${phase}"]`);
+/** A station's button — the target over the drawing, which holds the tab stop. */
+const button = (container: HTMLElement, phase: number) =>
+  container.querySelector<HTMLButtonElement>(`.route-station-button[data-phase="${phase}"]`);
 const stateOf = (state: string) => ROUTE.nodes.find((node) => node.state === state)!.phase;
 
 const CSS = readFileSync(join(HERE, 'route-map.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, ' ');
@@ -180,7 +183,7 @@ describe('the signature grammar holds', () => {
     const { container } = render(<RouteMap route={ROUTE} drivers={drivers} />);
     const checked = station(container, verifying)!;
     expect(checked.classList.contains('state-verifying')).toBe(true);
-    expect(checked.getAttribute('aria-label')).toMatch(/, Verifying$/);
+    expect(button(container, verifying)!.getAttribute('aria-label')).toMatch(/, Verifying$/);
     expect(checked.querySelector('.state-ring')).not.toBeNull();
     const glyph = (el: Element) =>
       [...el.querySelectorAll('.mark-chip .mark-glyph')]
@@ -280,7 +283,7 @@ describe('names at a size a person can read (#375)', () => {
     expect(labelled(container)).toEqual([]);
     expect(container.querySelectorAll('.route-station-number').length).toBeGreaterThan(0);
     // A pointer on a station asks for its name and its neighbours'.
-    const first = container.querySelector('.route-station')!;
+    const first = container.querySelector('.route-station-button')!;
     fireEvent.mouseEnter(first);
     expect(labelled(container)).toContain(Number(first.getAttribute('data-phase')));
     fireEvent.mouseLeave(first);
@@ -412,7 +415,7 @@ describe('a station search that moves the viewport', () => {
     expect(point.x).toBeGreaterThan(x);
     expect(point.x).toBeLessThan(x + w);
     // And it holds the tab stop now: the keyboard carries on from the answer.
-    expect(found.getAttribute('tabindex')).toBe('0');
+    expect(button(container, far)!.getAttribute('tabindex')).toBe('0');
   });
 
   it('walks the matches with Enter and back with Shift+Enter, and Escape lets go', () => {
@@ -472,14 +475,15 @@ describe('the keyboard reaches every station', () => {
 
   it('is one tab stop, and the arrow keys carry it', () => {
     const { container } = render(<RouteMap route={ROUTE} />);
-    const stops = [...container.querySelectorAll('.route-svg .route-station[tabindex="0"]')];
+    const stops = [...container.querySelectorAll('.route-station-button[tabindex="0"]')];
     expect(stops).toHaveLength(1);
-    const first = stops[0] as SVGGElement;
+    const first = stops[0] as HTMLButtonElement;
     first.focus();
     fireEvent.keyDown(first, { key: 'ArrowRight' });
     const moved = document.activeElement!;
     expect(moved).not.toBe(first);
-    expect(moved.classList.contains('route-station')).toBe(true);
+    expect(moved.tagName).toBe('BUTTON');
+    expect(moved.classList.contains('route-station-button')).toBe(true);
     expect(moved.getAttribute('tabindex')).toBe('0');
     expect(first.getAttribute('tabindex')).toBe('-1');
   });
@@ -505,9 +509,9 @@ describe('the keyboard reaches every station', () => {
     // Right, wave after wave, to the first wave the frame had left behind.
     for (let wave = 0; wave < target; wave++) {
       fireEvent.keyDown(
-        document.activeElement?.classList.contains('route-station')
+        document.activeElement?.classList.contains('route-station-button')
           ? document.activeElement
-          : container.querySelector<SVGGElement>('.route-svg .route-station[tabindex="0"]')!,
+          : container.querySelector<HTMLButtonElement>('.route-station-button[tabindex="0"]')!,
         { key: 'ArrowRight' },
       );
     }
@@ -583,7 +587,7 @@ describe('MapView — the Phases view’s map reading', () => {
     // Where it opened keeps a ring, and holds the map's one tab stop.
     const opened = station(container, stateOf('stuck'))!;
     expect(opened.classList.contains('selected')).toBe(true);
-    expect(opened.getAttribute('tabindex')).toBe('0');
+    expect(button(container, stateOf('stuck'))!.getAttribute('tabindex')).toBe('0');
     // The critical path, joined from each phase's analysis: an edge is on the
     // trunk when both of its ends are.
     const trunk = ROUTE.edges.filter((edge) => critical.has(edge.from) && critical.has(edge.to));
@@ -600,13 +604,13 @@ describe('MapView — the Phases view’s map reading', () => {
 
   it('opens a phase at its own address, by the keyboard and by a link', () => {
     const desk = render(<MapView detail={DETAIL} run={null} />);
-    fireEvent.keyDown(station(desk.container, 7)!, { key: 'Enter' });
+    fireEvent.keyDown(button(desk.container, 7)!, { key: 'Enter' });
     expect(window.location.hash).toBe('#/plan/demo/phase/7');
     desk.unmount();
     // A finger's first tap asks; the strip's Open phase is a real link.
     touch.mockReturnValue(true);
     const phone = render(<MapView detail={DETAIL} run={null} />);
-    fireEvent.click(station(phone.container, 9)!);
+    fireEvent.click(button(phone.container, 9)!);
     expect(screen.getByRole('link', { name: 'Open phase' })).toHaveAttribute('href', '#/plan/demo/phase/9');
   });
 });

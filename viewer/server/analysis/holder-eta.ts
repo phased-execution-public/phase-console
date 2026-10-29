@@ -29,6 +29,7 @@ import { PHASE_WORK_MODES } from '../../shared/phase-clocks.js';
 import type { PhaseSize } from '../parse/plan.ts';
 import { planFacts, recordsFromRuns, scorePairs, type BacktestRecord, type BacktestScore, type PlanPhaseFacts, type SizeWeights } from './eta-backtest.ts';
 import { estimateMs, holderRemaining, rateFor, type EtaSample } from './stats.ts';
+import { journalChainOf } from '../runner/run-paths.ts';
 
 /** One admitted wait, as the back-test replays it — every name already anonymised in the corpus. */
 export type HolderWait = {
@@ -103,7 +104,8 @@ export function holderWaitsFromRuns(
     for (const file of readdirSync(dir).sort()) {
       const match = /^run-([0-9a-z]+)\.jsonl$/.exec(file);
       if (!match) continue;
-      const lines = readLines(join(dir, file));
+      // The whole chain (measured-console phase 17): a rotated journal's segments first.
+      const lines = journalChainOf(join(dir, file)).flatMap((path) => readLines(path));
       journals.push({ slug, runId: match[1]!, lines });
       for (const line of lines) {
         if (line.event !== 'phase.session' || typeof line.phase !== 'number' || !line.time) continue;

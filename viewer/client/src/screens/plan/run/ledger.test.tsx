@@ -87,7 +87,7 @@ describe('<RunCostLedger>', () => {
       />,
     );
     expect(screen.getAllByTestId('ledger-cost').map((node) => node.textContent)).toEqual(['$0.75']);
-    expect(screen.getByTestId('ledger-cost-unknown').textContent).toBe('Unknown');
+    expect(screen.getByTestId('ledger-cost-unknown').textContent).toBe('unavailable');
     expect(screen.queryByText('$0.00')).toBeNull();
     // How it ended is the machine's word; that the console cut it short is said beside it.
     expect(screen.getByText('watchdog').tagName).toBe('CODE');
@@ -116,7 +116,7 @@ describe('<RunCostLedger>', () => {
   it('says what the sessions cost and ran in all, above the rows', () => {
     render(<RunCostLedger ledger={ledger([session({}), session({ sessionId: 's-2' })])} />);
     expect(screen.getByTestId('ledger-total').textContent).toMatch(
-      /^\$2\.25, 16 turns and .+ across 2 sessions\.$/,
+      /^\$2\.25 estimated, 16 turns and .+ across 2 sessions\.$/,
     );
   });
 

@@ -162,14 +162,14 @@ test('a conflict can name the tokens that caused it', () => {
  * decided on TWO dimensions: the branch and the working tree.
  *
  * THE TABLE below is the contract, and it is deliberately duplicated
- * case-for-case in `tests/unit/lock-scope.bats` (§claim qualification).
+ * case-for-case in `tests/unit/lock-claim.bats` (§claim qualification).
  * Two languages decide this — `claimsDisjoint` here, `claim_disjoint`
  * in scripts/scope.sh — and a rule that lives in two places is a rule
  * that drifts unless the same cases are green in both. If you add a
  * row here, add it there in the same commit.
  * ------------------------------------------------------------------ */
 
-/** [branch A, tree A, branch B, tree B, disjoint?, why] — mirrored in lock-scope.bats. */
+/** [branch A, tree A, branch B, tree B, disjoint?, why] — mirrored in lock-claim.bats. */
 const CLAIM_TABLE: [unknown, unknown, unknown, unknown, boolean, string][] = [
   ['pe/a', '/w/a', 'pe/b', '/w/b', true,
     'both dimensions qualified and different — the carve worktree isolation exists for'],

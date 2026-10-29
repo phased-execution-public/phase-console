@@ -7,7 +7,10 @@
  *   CA-2 under a right-to-left document the card's sides are logical (it mirrors)
  *        and every command, code and machine value stays left-to-right;
  *   CA-3 every press on the card is a kit Button, which keeps its thumb floor
- *        on touch (`--tap-min`), and every link carries a tap row.
+ *        on touch (`--tap-min`), and every link carries a tap row;
+ *   CA-4 the card as the panel draws it (Tower strips, 2026-10-20) — its act
+ *        bar pinned, every fold of its record open — still finds nothing, and
+ *        each fold's head keeps the thumb floor.
  *
  * jsdom lays nothing out, so contrast and the 44 px floor are measured in the
  * browser by the tour (`e2e/register.spec.ts`); here the structure is held.
@@ -115,13 +118,13 @@ function item(type: ItemType, status: PersonStatus, record: 'ledger' | 'projecte
   } as TurnItem;
 }
 
-function mount(node: TurnItem, record?: HumanStepRecord) {
+function mount(node: TurnItem, record?: HumanStepRecord, panel = false) {
   const client = new QueryClient(queryClientConfig);
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouterProvider initial="#/turn">
         <main>
-          <ItemCard item={node} record={record} perform={vi.fn()} />
+          <ItemCard item={node} record={record} perform={vi.fn()} inPanel={panel} everything={panel} />
         </main>
       </MemoryRouterProvider>
     </QueryClientProvider>,
@@ -183,4 +186,33 @@ describe('CA-3 presses are kit buttons with a thumb floor; links carry a tap row
     for (const link of view.container.querySelectorAll('a'))
       expect(link.className, link.textContent ?? '').toMatch(/tap-row|tap-area/);
   });
+});
+
+describe('CA-4 the card as the panel draws it', () => {
+  for (const theme of ['light', 'dark'] as const) {
+    it(`${theme}: every type, open and settled, its bar pinned and its record open`, async () => {
+      document.documentElement.setAttribute('data-theme', theme);
+      for (const type of ITEM_TYPES)
+        for (const status of ['todo', 'redo', 'checking', 'passed'] as const)
+          for (const record of ['ledger', 'projected'] as const) {
+            const node = item(type, status, record);
+            const view = mount(
+              node,
+              record === 'ledger' ? ({ state: STATE[status] } as HumanStepRecord) : undefined,
+              true,
+            );
+            try {
+              const folds = view.container.querySelectorAll(
+                '[data-testid="turn-record"] button[aria-expanded]',
+              );
+              expect(folds.length, `${type} ${status} ${record}: its record`).toBeGreaterThan(0);
+              for (const fold of folds) expect(fold.className).toMatch(/min-h-\(--tap-min\)/);
+              await expectNoAxeViolations(view.container);
+            } catch (cause) {
+              throw new Error(`${type} ${status} ${record}: ${(cause as Error).message}`, { cause });
+            }
+            view.unmount();
+          }
+    }, 120_000);
+  }
 });

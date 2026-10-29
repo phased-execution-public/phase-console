@@ -140,7 +140,7 @@ for (*when Phase 13 is done*). A NOT YET card has nothing to press. Second, what
 |---|---|---|
 | **Approval** | A yes or a no on something the AI, a plan or a session wants to do. | **Approve** and **Deny**, each with a note; a permission is approved at a scope. |
 | **Task** | Something only you can do: sign in, type a code, store a secret, pay, act at a device or at the machine. | **I've done this — check**, with the button that opens it beside it. |
-| **Decision** | A choice among named options, the recommended one marked. | The options, a note, and **Send my decision**. |
+| **Decision** | A choice among named options, the recommended one marked. | The options, the last one **Hand it to the AI** where the AI can take it, a note for the AI, and **Send my decision**. |
 | **Heads-up** | Nothing. It is there so you know. | **Got it**. |
 
 Third, where you stand with it:
@@ -279,7 +279,9 @@ press reads *Approve the gate on Phase N — the item closes when the gate opens
 it resume once, whichever way the gate was opened.
 
 - **Passed.** Every session waiting on the item is resumed, once, and told what was proven and what the
-  check read.
+  check read. Since 9.0 a session usually waits at the very call that raised the item (the run's *When a
+  phase needs a person* is *Defer* on a CLI that can): it carries on from that call with the answer, its
+  context intact, where a parked session is boarded again from its handoff.
 - **Back to you.** The item returns to **Do now**. It says *Back to you — attempt 2: …* with exactly what to
   redo, and it resumes nothing. When the check needs one more detail it says *Back to you — attempt 2 needs
   one detail: …*. The card reads **Redo**, shows those steps before the guide, and its button becomes
@@ -308,19 +310,38 @@ Beside the check, an item offers these. Each is a press only you make.
   A decision with a proof has no separate check: *Send my decision* sends your answer, writes it where the
   proof reads it, and then runs the same check as **I've done this — check**. It passes only when the proof
   holds; otherwise it comes back on **Redo**, saying your decision was sent and what the console still
-  cannot see.
+  cannot see. Every decision has a box for your words: the option's own field when the option takes
+  words, else a note for the AI, which reaches whoever the item goes to before your choice is pressed. A
+  stopped phase's card says what its session asked for, in its own words, with its own steps and options,
+  never a pointer to its handoff.
+- **Hand it to the AI.** A decision the AI can take ends with it: a session's decision, a plan's own
+  decision that recommends an option, a stopped phase's ask that its session can clear, a branch
+  conflict. Choose it, say in the box what the AI should know, and send. A session's decision is answered
+  *decide it yourself*, with your note; a plan's own decision goes with the option the plan recommends,
+  written where the plan reads it (`deprecations: deprecate` in its answers file), and your note is pinned
+  for the phases it unblocks; a stopped phase resumes with the choice its own; a conflict goes to
+  **Done**, and its run gets your words as a pinned note. A gate's Approve, which login a run goes on with, a sign-in, a secret and a permission are
+  never handed over. A decision that offers it has no separate *I can't do this*.
 - **Not doing this.** Where the raiser allows it, you can decline, with a reason. The item ends as
   *declined*, which is your own no; *withdrawn* is the console's word for an item nobody needs any more. The
   session is told `The operator declined: <reason>. Do not ask again; …` and finds another way.
-- **Hand it back.** It opens three ways to give the item back instead of doing it. **Give back to Phase
+- **I can't do this.** Every open item offers it, one press from the card, save a decision the AI can
+  take, which hands itself over instead. It asks why. An item a session
+  or a plan raised, a task, a decision or an approval, becomes an errand carrying your words, and it does
+  not repeat. An item the console builds itself, a gate, a sign-in, a conflict or a stopped phase's ask,
+  goes to **Done** as **Not doing** with your reason; the gate stays shut and the sign-in stays undone.
+  Where the console runs phases, its run gets a pinned note with your words, which that phase's next
+  session reads before it starts.
+- **Hand it back.** It opens two ways to give the item back instead of doing it. **Give back to Phase
   N** returns it to the phase that raised it: its session takes it back and finds another way, or raises
   a better version. **Ask the session a question** sends your question; the session reads it when it
-  resumes. **I can't do this** asks why, and the item becomes an errand carrying your words, and it does
-  not repeat.
+  resumes.
 - **Undo.** While an item is **Checking**, **Undo: I'm not finished** takes your press back: the item
   returns to **To do**, or to **Redo** if a check had sent it back, and a verdict that arrives for that
   attempt is dropped. A press that ends an item waits a few seconds on the page with its own **Undo**
-  before it is sent; after that it is settled.
+  before it is sent; after that it is settled. Once it went through, the card reads **Checking** and says
+  what was sent and when, with nothing to press again, until the console moves the item; **Show the
+  choices again** brings them back for an item that stays open.
 - **Attach.** A note, an image or a file as evidence for this attempt: 160 KB a piece and six an attempt,
   screened for secrets, kept on this machine under its hash, and never pushed or journalled.
 - **Snooze.** Holds the next reminder back by an hour, four hours, or until tomorrow.
@@ -390,6 +411,28 @@ comes due at once and says why.
 In a plan, such a step is a `- **Human step:** operator-act · … · due: <ref>` bullet, in a phase or
 under `## Operator errands` for the plan as a whole. A session declares one with `phase-outcome.sh …
 needs-human --act --due-when <ref>`.
+
+## What a session's closing words ask
+
+A session sometimes ends its turn on a question instead of asking it properly. The console reads the
+last message of a session that ended without saying what it needs, so the question still reaches you,
+once, as a **Decision**:
+
+- **A session's questions.** When its last message ends on one or more questions, you get one item that
+  lists them, each with the answer the session recommended. Choose **Go with the recommended answers**,
+  or **Answer them myself** and write your answers in the note. A single question with named choices
+  offers those choices instead, the recommended one marked. The same session carries on from your
+  answer.
+- **A gstack run at its gate.** gstack stops a run at its gate and never approves it for you. When an
+  approval is waiting, you get an **Approval** with gstack's own options, the recommended one marked.
+  When the console cannot read the gate, you get a Decision: **Take every recommendation**, or **Walk me
+  through each item**. The session relays your answer to gstack, and the next approval, if there is
+  one, comes after it.
+
+A setup step a plan describes with a wizard (a script that walks you through stages) reaches you as a
+**Task**, one step per stage, from "Stage 1 of 3" on, each with its commands. A secret never goes into the
+console: the step says where it goes (the repository's GitHub secret, set with `gh secret set`, the
+env file, or the login keychain), and you type it only at that hidden prompt.
 
 ## Handled by the AI
 

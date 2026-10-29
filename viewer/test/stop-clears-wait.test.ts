@@ -26,7 +26,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -35,21 +35,16 @@ import { Scheduler } from '../server/runner/scheduler.ts';
 import { loadRun, newRun, setRunState, type RunState, type RunStatus } from '../server/runner/state.ts';
 import type { SpawnFn } from '../server/runner/spawn.ts';
 import { RUN_STATUSES, runLifecycle } from '../shared/run-lifecycle.js';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 process.env.PHASE_CONSOLE_LOG = '';
 
 /** A repo with the three scripts a runner shells: a one-phase board, a free lock, a clean lint. */
-function repo(): { root: string; scripts: string; cleanup: () => void } {
-  const root = mkdtempSync(join(tmpdir(), 'pc-stop-wait-'));
-  const scripts = join(root, 'scripts');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  const script = (name: string, body: string): void => {
-    writeFileSync(join(scripts, name), body, 'utf8');
-    chmodSync(join(scripts, name), 0o755);
-  };
-  script('phase-graph.sh', `#!/usr/bin/env bash
+function stubbedPlan(): { root: string; scripts: string; cleanup: () => void } {
+  const made = stubRepo({
+    prefix: 'pc-stop-wait-',
+    scripts: () => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 slug="$1"; shift
 mode="\${1:-}"; arg="\${2:-}"
@@ -61,13 +56,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  script('phase-lock.sh', `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  script('validate.sh', '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return { root, scripts, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 const until = async (check: () => boolean, ms = 10_000): Promise<boolean> => {
@@ -80,7 +74,7 @@ const until = async (check: () => boolean, ms = 10_000): Promise<boolean> => {
 };
 
 test('SW-1: stopping a run while its phase is queued on scope leaves waitReason null and no lifecycle.wait — in memory and on disk', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // Another session's claim on the phase's scope, leased for half an hour: the
   // phase queues behind it, and nothing in this test's time frees it.
   const scheduler = new Scheduler({

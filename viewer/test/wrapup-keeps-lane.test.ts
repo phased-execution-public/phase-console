@@ -92,7 +92,7 @@ exit 0
   const spawned: number[] = [];
   const events: { event: string; data: Record<string, unknown> }[] = [];
   const scheduler = new Scheduler({ max: 4, locks: () => [] });
-  // eslint-disable-next-line prefer-const
+   
   let runner: InstanceType<typeof Runner>;
   const spawn = async (req: { prompt: string; env?: Record<string, string> }) => {
     const phase = Number(/BOOT phase (\d+)/.exec(req.prompt)?.[1] ?? 0);

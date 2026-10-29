@@ -432,6 +432,15 @@ export const WORD_ROWS = Object.freeze({
     'timed-out': row('Timed out', 'timer-off', 'skipped', 'settled', { outcome: 'unknown' }),
     skipped: row('Skipped', 'list-minus', 'skipped', 'settled', STOPPED),
   }),
+  // The independent evaluator's word on one exit criterion, or a phase's reading
+  // across both judges (measured-console phase 22). Advisory: `not-met` is a
+  // finding to read, painted as one, and `unknown` is the first-class Unknown —
+  // a judge that could not tell, never a failure.
+  evaluation: said('evaluation', {
+    met: row('Met', 'circle-check', 'done', 'settled', OK),
+    'not-met': row('Not met', 'circle-x', 'failed', 'settled', FAILED),
+    unknown: row('Unknown', UNKNOWN_ICON, 'skipped', 'settled', { outcome: 'unknown' }),
+  }),
   // The Issues desk's three readings of an issue (control-tower phase 118;
   // `shared/issues-model.js` owns the words and derives them from labels).
   // A CATEGORY is a kind, not a condition, so it stays quiet — its icon tells

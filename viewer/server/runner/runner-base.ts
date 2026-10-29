@@ -9,6 +9,7 @@
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
 import { configTreesOf, plantedSince, treeConfigBaseline, type PlantedConfig } from '../git-guard.ts';
+import { originPin, pushFastForward, unpushedIn, type OriginPin } from './unpushed.ts';
 import type { ResolvedPolicy } from '../../shared/policy-model.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -28,8 +29,9 @@ import {
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import {
-  markFor, refusedOutcome, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent,
+  markFor, refusedOutcome, sideAgents, spawnClaude, type SdkDoorAnswer, type SpawnBackend, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent,
 } from './spawn.ts';
+import { sessionSchemaArg } from '../../shared/outcome-schema.js';
 import {
   bookedDelta, creditBooked, MAX_COST_MARKS, permissionPromptsFor, relayArmingFor, resolveCaps, sessionRecordOf, type Cap, type CapTable,
   type SessionCaps,
@@ -69,7 +71,7 @@ import {
 } from './worktree.ts';
 import { standingBranchSync } from './tree-state.ts';
 import {
-  classifySituation, collectEvidence, situation as situationOf, workEvidence,
+  classifySituation, collectEvidence, situation as situationOf, spawnSdkFailure, workEvidence,
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './situation.ts';
 import {
@@ -114,6 +116,7 @@ import type { ResumeVerdict, SessionRequest, VettedResume } from './runner-core.
 import type { ConsoleSkillFacts } from './runner-core.ts';
 import type { AttemptOptions } from './runner-attempt.ts';
 import { dateOfRef } from '../watch-refs.ts';
+import { loadsKey, matchSkills, noteObservedSkills, phasePluginsJournal, type PhasePluginSet, type SessionLoads } from './loads.ts';
 import { DEFAULT_MODEL_POLICY, RUN_PROGRESS_FIELDS, runResumable, type ModelPolicy } from '../../shared/run-lifecycle.js';
 import { taskSummary } from '../../shared/task-model.js';
 import { isolateCompat, runActOf } from '../turn/run-requests.ts';
@@ -134,6 +137,10 @@ import {
  * the other plan's change, and a burst of another plan's lock writes costs one
  * read, not one per write.
  */
+
+/** The tools whose first call is a session's first edit (`phase.first-edit`, measured-console phase 31). */
+const FIRST_EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
+
 export const GATE_DIRTY_MIN_MS = 10_000;
 
 export type RunProgress = {
@@ -206,6 +213,13 @@ export type HaltExtra = {
 
 /** The sessions that ARE a phase's lane — the ones whose hook a tool card holds (#220). */
 const LANE_SESSION_MODES: ReadonlySet<string> = new Set(['phase', 'resume', 'repair', 'closeout']);
+/**
+ * The events the session core makes about a child rather than read from its
+ * stream — its stderr, an idle, a closed input. None of them is the session's
+ * "first event" (measured-console phase 21): a CLI that printed an error and
+ * died has said nothing to the door.
+ */
+const CORE_EVENT_KINDS: ReadonlySet<string> = new Set(['stderr', 'idle', 'input-closed']);
 
 export abstract class RunnerBase {
   /** Set while `ensureRunCheckout` is between the cap check and the finished tree. */
@@ -217,7 +231,7 @@ export abstract class RunnerBase {
   protected abstract armLivenessTicker(): void;
   protected abstract armParkPoke(phase: number, untilIso: string): void;
   /** Re-read every usage wall this run's phases are parked on (control-tower phase 54, #78); answers how many moved. */
-  abstract rereadWalls(trigger: 'reading' | 'spend' | 'reprobe'): number;
+  abstract rereadWalls(trigger: 'reading' | 'spend' | 'reprobe' | 'switch'): number;
   protected abstract clearWallProbe(phase: number): void;
   protected abstract askHuman(
     phase: number,
@@ -231,6 +245,8 @@ export abstract class RunnerBase {
   protected abstract clearLeaseTimer(lane: Lane): void;
   protected abstract clearParkPoke(phase: number): void;
   protected abstract climb(record: PhaseRecord, board: Board, by: string, preset?: { situation?: Situation; declared?: PhaseEvidence['declared']; sessionId?: string; }): Promise<boolean>;
+  /** Resume the owner of a red this phase inherited, when its session is worth resuming (measured-console phase 25). */
+  protected abstract routeOwed(record: PhaseRecord): void;
   protected abstract climbLadder(board: Board, asked: Set<number> | null): Promise<void>;
   protected abstract composeBrief(phase: number, board: Board, hint: BoardingHint, engineText: string): Promise<{ prompt: string; brief: BoardingBrief; resume?: string; vetted?: VettedResume; maxTurns?: number; degraded?: string; }>;
   protected abstract confirmed(phase: number): Promise<boolean>;
@@ -255,6 +271,12 @@ export abstract class RunnerBase {
   protected abstract onStream(phase: number, event: StreamEvent): void;
   protected abstract noteContext(phase: number, event: Extract<StreamEvent, { kind: 'usage' }>): void;
   protected abstract armOutcomeFile(phase: number): string;
+  /**
+   * The outcome each phase's last declaring session returned as
+   * `structured_output` (measured-console phase 12, B4), held for
+   * `takeOutcome`, which reads it FIRST and the file second, and consumes both.
+   */
+  protected readonly structuredOutcomes = new Map<number, { value: unknown; at: string }>();
   /** The declaration already in the outcome file — read, journalled, consumed (#21 §3). */
   protected abstract takeArmedOutcome(phase: number): PhaseOutcome | null;
   protected abstract outcomePath(phase: number): string;
@@ -277,7 +299,9 @@ export abstract class RunnerBase {
   /** Rewrite this run's settings with the relay armed or not, keeping the token (phase 14; `runner-control.ts`). */
   protected abstract rearmRelay(armed: boolean): void;
   /** The settings file a plan-mode session with the relay's host loads, or null (control-tower phase 11). */
-  protected abstract planHostSettingsPath(): string | null;
+  protected abstract planHostSettingsPath(phase?: number, plugins?: readonly string[]): string | null;
+  /** One phase's settings variant with its plugin set switched on (measured-console phase 27); `RunnerControl` writes it. */
+  protected phasePluginsSettingsPath(_phase: number, _plugins: readonly string[]): string | null { return null; }
   protected abstract reboardWith(record: PhaseRecord, hint: BoardingHint): void;
   /** Withdraw the open rung a console re-brief superseded before its first turn (control-tower phase 86, #14). */
   protected abstract supersedeOpenRung(phase: number, why: string): void;
@@ -782,6 +806,10 @@ export abstract class RunnerBase {
       PE_SCOPE: formatScope(scope),
       ...(claim.tree ? { PE_WORKTREE: claim.tree } : {}),
       ...(claim.branch ? { PE_BRANCH: claim.branch } : {}),
+      // Which plan and phase this session works (measured-console phase 4):
+      // what the presence hook reads to print the phase's brief at SessionStart.
+      PE_SLUG: this.state!.slug,
+      PE_PHASE: String(phase),
       // …and that the console, not the session, mirrors the lock to git
       // (control-tower phase 63, #85): the session's lock calls are file-only.
       ...LOCK_MIRROR_ENV,
@@ -807,6 +835,14 @@ export abstract class RunnerBase {
    * said to the next session. A read that throws says nothing rather than
    * stopping a boarding: the directive informs, and the prompt stands without it.
    */
+  protected briefEnv(): Record<string, string> {
+    // The presence hook briefs the session (measured-console phase 4), so the
+    // engine's boot prompt leaves out what the brief carries. A read that
+    // throws keeps the prompt whole: a long prompt costs bytes, a missing
+    // brief costs the session its decisions and notes.
+    try { return this.deps.briefHook?.(this.state?.accountId) ? { PE_BRIEF: 'hook' } : {}; } catch { return {}; }
+  }
+
   protected consoleSkillFacts(): ConsoleSkillFacts | null {
     try { return this.deps.consoleSkill?.(this.state?.accountId) ?? null; } catch { return null; }
   }
@@ -1083,6 +1119,93 @@ export abstract class RunnerBase {
   private promptsSkippedFor: string | null = null;
   /** `run.relay-degraded` once per run per reason (phase 14). */
   private relayDegradedFor = new Set<string>();
+  /**
+   * The loads the run's settings file was last written from (`loadsKey`,
+   * measured-console phase 11) — its `enabledPlugins` must agree with the
+   * argv a spawn sends, so a difference rewrites it first (`loadsChanged`).
+   */
+  protected settingsLoadsKey: string | null = null;
+  /**
+   * The backend the door last said it took, with why (`phase.spawn-backend`,
+   * measured-console phase 20) — said once per run, and again only when the
+   * answer changes.
+   */
+  private spawnBackendSaid: string | null = null;
+  /** The phases whose SDK session this runner lost (phase 21) — the record's `spawnFallback`, for a session with no record. */
+  private sdkLost = new Map<number, string>();
+
+  /**
+   * Which door this session takes (measured-console phase 20, B1): the SDK's
+   * `SpawnFn` when the session asks for `sdk` and the optional dependency
+   * loads, else null — the subprocess. What it asks for is the run's
+   * `spawnBackend` for this phase (`spawnBackendArm`: `alternate` by phase
+   * parity, phase 21); `deps.wanted()` answers a run that says nothing — the
+   * subprocess in the console, a harness's word in a test. Journalled
+   * `phase.spawn-backend` once per run, and again only when the answer
+   * changes; with the SDK uninstalled that is ONE line, `{backend:
+   * 'subprocess', wanted: 'sdk', reason: 'absent'}`, however many sessions
+   * follow. A phase whose SDK session failed before its first event takes the
+   * subprocess from then on (`reason: 'fallback'`, `spawnFallback`).
+   */
+  protected async spawnBackendFor(phase: number, mode: SessionMode): Promise<SpawnFn | null> {
+    const deps = this.deps.spawnBackend;
+    if (!deps) return null;
+    let wanted: SpawnBackend = 'subprocess';
+    try { wanted = deps.wanted(); } catch { wanted = 'subprocess'; }
+    let door: SdkDoorAnswer | null = null;
+    if (wanted === 'sdk') {
+      try { door = await deps.sdk(); } catch (error) { door = { ok: false, reason: 'load-failed', detail: String(error) }; }
+    }
+    const lost = this.state?.phases[String(phase)]?.spawnFallback?.detail ?? this.sdkLost.get(phase);
+    if (door?.ok && lost !== undefined) door = { ok: false, reason: 'fallback', detail: lost };
+    const fields: Record<string, unknown> = door?.ok
+      ? { backend: 'sdk', wanted, version: door.version }
+      : { backend: 'subprocess', wanted, ...(door && !door.ok ? { reason: door.reason, ...(door.detail ? { detail: door.detail.slice(0, 200) } : {}) } : {}) };
+    const key = JSON.stringify(fields);
+    if (key !== this.spawnBackendSaid) {
+      this.spawnBackendSaid = key;
+      this.record('phase.spawn-backend', { mode, ...fields }, phase);
+    }
+    return door?.ok ? door.spawn : null;
+  }
+
+  /**
+   * The Agent SDK's door lost this session before its first event
+   * (measured-console phase 21, B1): the situation `spawn-sdk-failed` and its
+   * one rung, climbed here and at once — the record's `spawnFallback` keeps
+   * every later session of the phase on the subprocess, so the re-attempt is
+   * the door's next turn round its loop. One `phase.spawn-fallback` line says
+   * what failed and what the phase does now. The request goes again as it
+   * was: a fresh session's id is minted by the core at each spawn, never here.
+   */
+  protected fallBackFromSdk(phase: number, mode: SessionMode, lost: Situation, outcome: SpawnOutcome | undefined): void {
+    const rung = rungsFor(lost.key)[0];
+    const detail = lost.why.join('; ').slice(0, 400);
+    const record = this.state?.phases[String(phase)];
+    if (record) record.spawnFallback = { at: this.now().toISOString(), mode, detail, done: false };
+    this.sdkLost.set(phase, detail);
+    this.record('phase.spawn-fallback', {
+      mode,
+      situation: lost.key,
+      rung: rung?.vehicle ?? null,
+      from: 'sdk',
+      to: 'subprocess',
+      detail,
+      ...(outcome ? { sdkMs: outcome.durationMs, sdkCostUsd: outcome.costUsd } : {}),
+    }, phase);
+    this.persist();
+  }
+
+  /** The subprocess re-attempt ran: the record says so, and the classifier stops reading the phase as lost (phase 21). */
+  protected settleSpawnFallback(phase: number): void {
+    const fallback = this.state?.phases[String(phase)]?.spawnFallback;
+    if (!fallback || fallback.done) return;
+    fallback.done = true;
+    this.persist();
+  }
+
+  /** The loads changed since the settings file was written: rewrite it. RunnerControl's to do. */
+  protected loadsChanged(): void { /* no settings file at this level */ }
   /** Idempotency keys of operator messages already written, newest last. */
   protected injected = new Map<string, AskResult>();
   /**
@@ -1101,6 +1224,12 @@ export abstract class RunnerBase {
    * recheck spawns nothing, so it is neither a failed attempt nor a new stop.
    */
   protected rechecking: number | null = null;
+  /**
+   * Each phase's newest session's closing words, whole (measured-console phase
+   * 29) — what the exit-time check reads for a question left to a person; the
+   * record's `said` keeps only the head. Consumed by `closed()`, once.
+   */
+  protected closingWords = new Map<number, string>();
   /**
    * The docs watcher's poke. The FLAG is the truth; the promise only ends the
    * drive loop's sleep — a wake that lands between the race settling and the
@@ -1341,6 +1470,24 @@ export abstract class RunnerBase {
     this.docsDirty = true;
     this.wake.resolve();
   }
+
+  /**
+   * The run's own PLAN file changed (measured-console phase 30, #416): a phase
+   * added live, or a gate rewritten, must be read from the plan as it now
+   * stands. Every open record's gate is read again on the next tick
+   * (`rereadGates`), and a phase admitted after the change re-reads its gate
+   * before it boards (`runPhase`) — the gate it read before was the old plan's.
+   */
+  notePlanChanged(): void {
+    this.planDirty = true;
+    this.planEpoch += 1;
+    this.gatesDirty = true;
+    this.wake.resolve();
+  }
+  /** The plan file changed since `rereadGates` last looked. */
+  protected planDirty = false;
+  /** How many plan-file changes this runner has seen — what a gate read is stamped with. */
+  protected planEpoch = 0;
 
   /**
    * An input the ladder's fingerprint cannot see has moved (control-tower
@@ -1762,19 +1909,26 @@ export abstract class RunnerBase {
    * (`phase.retry-ceiling`, DOC-2 and SES-12) before it starts.
    */
   protected async spawnSession(
-    phase: number, mode: SessionMode, request: SessionRequest, ctx: { caps: SessionCaps; attempt?: number },
+    phase: number, mode: SessionMode, request: SessionRequest, ctx: { caps: SessionCaps; attempt?: number; account?: string },
   ): Promise<SpawnOutcome> {
     // A mirror a final §Verification settled gets its branches back before
-    // anything can commit into it (control-tower phase 62, #47).
+    // anything can commit into it (control-tower phase 62, #47). The FIRST statement of the
+    // door — `verification-gates.test.ts` (VG-4) holds it there.
     await this.restoreIdleMirror('spawn');
+    // The account the session spends: the run's, unless the caller names another — the
+    // evaluator's round runs on its own account (measured-console phase 22), and its model is
+    // mapped and its rows are metered under that one.
+    const accountId = ctx.account ?? this.state?.accountId;
     // `--resume` only ever arrives vetted (`resumableSession`, REG-1/SLF-10):
     // the type admits nothing else, and this is the one line that unwraps it.
-    const { resumeFrom, ...asked } = request;
+    // A phase's plugin set (measured-console phase 27) is the door's to apply —
+    // a settings variant and env — never a field the CLI's request carries.
+    const { resumeFrom, pluginSet, ...asked } = request;
     // The model this session is SENT (one-pool phase 5): on an API-key account the
     // asked model is mapped to an id the account serves, the chain becomes that
     // provider's own and the window of the model it runs is stated; a model
     // nothing on the run's account serves is refused HERE, before a cent is spent.
-    const door = this.deps.sessionModel?.(this.state?.accountId, {
+    const door = this.deps.sessionModel?.(accountId, {
       model: asked.model, fallbackModels: asked.fallbackModels ?? [], effort: asked.effort,
       pinned: this.state ? this.modelPolicyOf(phase) === 'pinned' : false,
     });
@@ -1789,7 +1943,7 @@ export abstract class RunnerBase {
       }
       : asked;
     if (door?.ok && door.mapped && asked.model !== rest.model) {
-      this.record('phase.model-mapped', { mode, asked: asked.model, sent: rest.model, account: this.state?.accountId ?? 'default' }, phase);
+      this.record('phase.model-mapped', { mode, asked: asked.model, sent: rest.model, account: accountId ?? 'default' }, phase);
     }
     // What the pinned and differs checks compare a frame with, beside what was asked.
     if (mode === 'phase') {
@@ -1834,7 +1988,7 @@ export abstract class RunnerBase {
       let initVersion: string | null = null;
       try { initVersion = this.deps.initVersion?.(version) ?? null; } catch { initVersion = null; }
       const arming = relayArmingFor('last-resort', initVersion);
-      if (arming.armed) planHostSettings = this.planHostSettingsPath();
+      if (arming.armed) planHostSettings = this.planHostSettingsPath(phase, pluginSet?.enabled);
       if (planHostSettings) relay = this.relayMcpDoc(rest.mcpConfig);
       this.record('phase.plan-host', {
         armed: Boolean(relay), version: arming.version, floor: arming.floor,
@@ -1874,6 +2028,11 @@ export abstract class RunnerBase {
     // Whether this session started a subagent: its calls are the subagent's own
     // context, which the stream never prices, so they explain a booked excess.
     let delegated = false;
+    // The context at the session's first file write (measured-console phase 31, #418's first ask):
+    // the newest call's context as the `usage` events carry it, journalled once as `phase.first-edit`.
+    let context: number | null = null;
+    let firstEdit = false;
+    let sessionId: string | null = null;
     const lane = mode === 'phase' ? shared : undefined;
     const pollTracker = lane?.signals.pollLoop;
     const pollBefore = pollTracker ? { ...pollTracker.counts } : undefined;
@@ -1883,27 +2042,78 @@ export abstract class RunnerBase {
     let meter: ReturnType<NonNullable<RunnerDeps['sessionMeter']>> = null;
     try {
       meter = this.deps.sessionMeter?.({
-        mode, phase, account: this.state?.accountId ?? 'default', model: rest.model ?? null,
+        mode, phase, account: accountId ?? 'default', model: rest.model ?? null,
         plan: this.state?.slug ?? null, run: this.state?.id ?? null,
+        // Which attempt of the phase this is, for the ledger's `retries` (measured-console phase 24, E3).
+        ...(ctx.attempt !== undefined ? { attempt: ctx.attempt } : {}),
         // A bridged session's meter binds its token and revokes it at the end (one-pool phase 8).
         ...(rest.env ? { env: rest.env } : {}),
       }) ?? null;
     } catch { meter = null; }
+    // What loads (measured-console phase 11, D2): the console's own tree, the
+    // seed and the switched-on personal plugins, under `--setting-sources
+    // project,local` — or, under `operator-config`, nothing added. Asked per
+    // spawn; the run's settings file is rewritten first when its
+    // `enabledPlugins` was written from another answer.
+    let loads: SessionLoads | null = null;
+    try { loads = this.deps.sessionLoads?.() ?? null; } catch { loads = null; }
+    if (this.deps.sessionLoads && loadsKey(loads) !== this.settingsLoadsKey) {
+      try { this.loadsChanged(); } catch { /* the next spawn asks again */ }
+    }
+    const loadsArgv = loads?.mode === 'console-set'
+      ? {
+        ...(loads.pluginDirs.length ? { pluginDirs: loads.pluginDirs } : {}),
+        ...(loads.settingSources ? { settingSources: loads.settingSources } : {}),
+        env: { ...(rest.env ?? process.env), ...loads.env },
+      }
+      : {};
+    // One phase's plugin set (measured-console phase 27, D5): the ids it switches
+    // on ride a settings variant of this session's own — the plan-host variant
+    // already carries them on a plan-mode phase — and its entries' env (a pinned
+    // review model, gstack's unattended word) is set beside the loads' env.
+    const phaseSettings = pluginSet?.enabled.length && !(armedPath && planHostSettings)
+      ? this.phasePluginsSettingsPath(phase, pluginSet.enabled) : null;
+    const pluginEnv = pluginSet && Object.keys(pluginSet.env).length
+      ? { env: { ...(('env' in loadsArgv ? loadsArgv.env : undefined) ?? rest.env ?? process.env), ...pluginSet.env } } : {};
+    // Named against invoked, per session (§Architecture 12): the names the
+    // prompt's Skill-tool line carried, the calls the session made, and the
+    // first of each hook outcome — bounded, one journal line each.
+    const named = skillsNamedIn(rest.prompt);
+    const declares = Boolean(rest.env?.PE_OUTCOME_FILE);
+    const invoked: string[] = [];
+    const hooksSeen = new Set<string>();
+    // Whether the session got as far as one event — what tells an SDK door that
+    // failed to start from a session that ran (measured-console phase 21) — and
+    // whether this spawn already fell back: the loop below turns at most once.
+    let sawEvent = false;
+    let fellBack = false;
     const sent: SpawnRequest = {
       ...rest,
+      ...loadsArgv,
       ...(resumeFrom ? { resume: resumeFrom.sessionId } : {}),
       ...(prompts.flag ? { permissionPrompts: prompts.flag } : {}),
       ...(armedPath ? { permissionPromptTool: RELAY_HOST_TOOL, mcpConfig: armedPath } : {}),
-      ...(armedPath && planHostSettings ? { settings: planHostSettings } : {}),
+      ...(armedPath && planHostSettings ? { settings: planHostSettings } : phaseSettings ? { settings: phaseSettings } : {}),
+      ...pluginEnv,
       caps: ctx.caps,
       maxTurns: ctx.caps.maxTurns.value,
       budgetUsd: ctx.caps.maxBudgetUsd.value,
+      // Side work on the subagent model (measured-console phase 6, A5): when the
+      // session's environment names one, its read-only agents ride with it.
+      ...(!rest.agents && rest.env?.CLAUDE_CODE_SUBAGENT_MODEL
+        ? { agents: JSON.stringify(sideAgents(rest.env.CLAUDE_CODE_SUBAGENT_MODEL)) } : {}),
+      // Typed outcomes (measured-console phase 12, B4): a session that can
+      // declare one — the runner armed its `PE_OUTCOME_FILE` — returns it too.
+      ...(!rest.jsonSchema && declares ? { jsonSchema: sessionSchemaArg() } : {}),
       // What the session's own `system/init` says is read here, at the door:
       // the version every later arming is judged on, and — on an armed session —
       // whether the relay actually has a tool to answer and a host to hold it.
       onEvent: (event) => {
+        // The session's own frames — never the core's words about the child (its stderr, an idle, a closed input).
+        if (!CORE_EVENT_KINDS.has(event.kind)) sawEvent = true;
         try { meter?.onEvent(event); } catch { /* the ledger never costs the stream */ }
         try { this.noteSessionEvent(phase, event, armed, version); } catch { /* bookkeeping never costs the stream */ }
+        try { this.noteLoadsEvent(phase, mode, event, loads, invoked, hooksSeen, pluginSet); } catch { /* bookkeeping never costs the stream */ }
         // The session a phase's boarding prompt was composed for has STARTED:
         // the next-attempt notes that prompt carried are delivered now, to it
         // (control-tower phase 98, #137). A spawn that died before this left
@@ -1912,6 +2122,14 @@ export abstract class RunnerBase {
           try { this.deps.messaging?.confirmBoot?.(this.state.slug, phase, event.sessionId); } catch { /* the mailbox never costs the stream */ }
         }
         if (event.kind === 'tool' && event.delegates) delegated = true;
+        if (event.kind === 'init') sessionId = event.sessionId ?? sessionId;
+        if (event.kind === 'usage') context = event.totals.lastContext;
+        if (event.kind === 'tool' && !event.parent && !firstEdit && FIRST_EDIT_TOOLS.has(event.name)) {
+          firstEdit = true;
+          try {
+            this.record('phase.first-edit', { mode, sessionId, tool: event.name, context, ...(ctx.attempt !== undefined ? { attempt: ctx.attempt } : {}) }, phase);
+          } catch { /* bookkeeping never costs the stream */ }
+        }
         onEvent?.(event);
         // The context thresholds, after the lane has taken the event, and for
         // the phase's OWN sessions only: a closeout, a QA round or a repair is
@@ -1933,6 +2151,15 @@ export abstract class RunnerBase {
       return { ...refusedOutcome(`an orphaned index.lock blocks ${locked.map((l) => l.tree).join(', ')}`, ctx.caps), treeLocked: locked };
     }
     const configBaseline = treeConfigBaseline(configTreesOf(sent.cwd, scope));
+    // Where each tree pushes BEFORE the session runs — the only `origin` the
+    // wrap-up's own push will use (#397; the 2026-10-25 review).
+    const originBaseline = new Map<string, OriginPin>();
+    if (LANE_SESSION_MODES.has(mode)) {
+      for (const tree of configTreesOf(sent.cwd, scope)) {
+        const pin = await originPin(tree).catch(() => null);
+        if (pin) originBaseline.set(tree, pin);
+      }
+    }
     const ceilings = childEnvDecisions(sent.env ?? process.env);
     this.record('phase.retry-ceiling', {
       mode,
@@ -1943,7 +2170,7 @@ export abstract class RunnerBase {
     }, phase);
     // Whose prompt cache this session writes — read at the spawn, because a
     // switch can move the run's account while the session is still running.
-    const account = this.state?.accountId ?? 'default';
+    const account = accountId ?? 'default';
     // Every session that works the phase is worked time (control-tower phase
     // 58, #66). The attempt opens its own window before it spawns — it owns the
     // boarding's stretch — so the door opens one for every OTHER work mode: a
@@ -1955,9 +2182,43 @@ export abstract class RunnerBase {
       : undefined;
     if (worked) openSessionWindow(worked, mode, this.now().toISOString());
     let outcome: SpawnOutcome | undefined;
+    // A structured outcome belongs to the session that returned it: an earlier
+    // session's is dropped the moment a new declaring session starts, as the
+    // armed file is (`armOutcomeFile`).
+    if (declares) this.structuredOutcomes.delete(phase);
     try {
-      outcome = await (this.deps.spawn ?? spawnClaude)(sent);
+      // At most twice (measured-console phase 21, B1): the door this phase asks
+      // for, then — when the Agent SDK's lost the session before its first
+      // event — the subprocess, once, journalled `phase.spawn-fallback`.
+      for (;;) {
+        // The backend (measured-console phase 20, B1): the Agent SDK's door when
+        // this session asks for it and it loads, the subprocess otherwise — both
+        // behind this one call, and nothing above it can tell them apart.
+        const backend = await this.spawnBackendFor(phase, mode);
+        sawEvent = false;
+        let thrown: unknown;
+        try {
+          outcome = await (backend ?? this.deps.spawn ?? spawnClaude)(sent);
+        } catch (error) {
+          if (!backend) throw error;
+          thrown = error ?? new Error('the SDK door threw');
+          outcome = undefined;
+        }
+        const lost = backend && !fellBack ? spawnSdkFailure(outcome ?? null, { sawEvent, aborted: Boolean(sent.signal?.aborted), thrown }) : null;
+        if (!lost) {
+          if (thrown !== undefined) throw thrown;
+          break;
+        }
+        fellBack = true;
+        this.fallBackFromSdk(phase, mode, lost, outcome);
+      }
+      if (!outcome) throw new Error('the spawn door returned no outcome');
+      if (declares && outcome?.structuredOutput !== undefined) {
+        this.structuredOutcomes.set(phase, { value: outcome.structuredOutput, at: this.now().toISOString() });
+      }
     } finally {
+      // The subprocess re-attempt ran, whatever it came to: nothing reads the phase as lost again.
+      if (fellBack) this.settleSpawnFallback(phase);
       try { meter?.end(outcome ?? null); } catch { /* the ledger never costs the session */ }
       // Closed even when the spawn throws: a window left open on a record that
       // still reads `running` would count to now on every read.
@@ -1982,6 +2243,12 @@ export abstract class RunnerBase {
     this.noteSpendProof(phase, account, sent, outcome, booking.booked, shared);
     this.noteEnding(phase, mode, sent, outcome);
     this.record('phase.session', sessionRecordOf({ mode, request: sent, outcome, attempt: ctx.attempt }), phase);
+    if (named.length || invoked.length) {
+      const match = matchSkills(named, invoked);
+      this.record('phase.skill-invoked', {
+        mode, named: match.named, invoked: match.invoked, uncalled: match.uncalled, unasked: match.unasked,
+      }, phase);
+    }
     // Its tool cards die with it (#220): answered nowhere, a later timeout of
     // one would park the run while the phase's next attempt works.
     // A reviewer's or a landing session's ending is not the lane's, whose card it would take.
@@ -2000,7 +2267,64 @@ export abstract class RunnerBase {
       this.haltPlantedConfig(phase, mode, planted);
       return { ...outcome, plantedConfig: planted };
     }
+    // What the session committed and nobody pushed (#397) — read for every
+    // working session; a checkpointed one's fast-forward pushed first, where
+    // the plan allows that push.
+    if (LANE_SESSION_MODES.has(mode)) {
+      await this.noteUnpushed(phase, configTreesOf(sent.cwd, scope), sent.cwd, {
+        push: outcome.signal.endedBy === 'checkpoint', origins: originBaseline,
+      })
+        .catch((error) => log.warn('runner.unpushed-failed', { phase, error: String(error) }));
+    }
     return outcome;
+  }
+
+  /** May the console push `branch` for this phase? The plan's `permission.destructive` row, asked through the service. */
+  protected mayPushBranch(phase: number, branch: string): boolean {
+    const state = this.state;
+    if (!state) return false;
+    try { return Boolean(this.deps.pushAllowed?.(state, phase, `git push origin ${branch}`)); } catch { return false; }
+  }
+
+  /**
+   * Unpushed work, measured (measured-console phase 12; #397, #418): each
+   * tree a session could reach whose `pe/…` branch is ahead of
+   * `origin/<branch>` lands on `record.unpushed` and in `phase.unpushed`; a
+   * read that finds none deletes the record's entry — "until a push lands".
+   * With `push` (the context checkpoint ended the session) each such tree's
+   * fast-forward is pushed first where `mayPushBranch` allows it, journalled
+   * `phase.wrapup-pushed` with git's verdict.
+   */
+  protected async noteUnpushed(
+    phase: number, trees: readonly string[], root: string,
+    opts: { push?: boolean; origins?: ReadonlyMap<string, OriginPin> } = {},
+  ): Promise<void> {
+    const state = this.state;
+    if (!state) return;
+    let ahead = await unpushedIn(trees, root);
+    if (opts.push && ahead.length) {
+      for (const tree of ahead) {
+        if (!this.mayPushBranch(phase, tree.branch)) continue;
+        const dir = join(root, tree.repo);
+        const pushed = await pushFastForward(dir, tree.branch, opts.origins?.get(dir));
+        this.record('phase.wrapup-pushed', { repo: tree.repo, branch: tree.branch, ahead: tree.ahead, ok: pushed.ok, detail: pushed.detail }, phase);
+      }
+      ahead = await unpushedIn(trees, root);
+    }
+    const record = state.phases[String(phase)];
+    if (!record) return;
+    const had = record.unpushed;
+    if (!ahead.length) {
+      if (!had) return;
+      delete record.unpushed;
+      this.record('phase.unpushed', { trees: [], landed: true }, phase);
+    } else {
+      record.unpushed = { at: this.now().toISOString(), trees: ahead };
+      this.record('phase.unpushed', {
+        trees: ahead.map((tree) => ({ repo: tree.repo, branch: tree.branch, ahead: tree.ahead, tracked: tree.tracked, allowed: this.mayPushBranch(phase, tree.branch) })),
+      }, phase);
+    }
+    this.persist();
   }
 
   /**
@@ -2379,6 +2703,44 @@ export abstract class RunnerBase {
    * `system/init.mcp_servers` (the exit code never says, DOC-5) — a
    * `control_request` the CLI sent, and a turn that ended on a `defer`.
    */
+  /**
+   * What loaded, the hooks that ran and the skills called (measured-console
+   * phase 11): `phase.plugins` from `system/init` (names and sources, never
+   * a path), `phase.hook` for the FIRST of each hook, event and outcome a
+   * session reports — a PreToolUse hook answers every tool call, and its
+   * hundredth success says nothing its first did not — and each `Skill` call
+   * gathered for the session's `phase.skill-invoked`.
+   */
+  private noteLoadsEvent(
+    phase: number, mode: SessionMode, event: StreamEvent, loads: SessionLoads | null,
+    invoked: string[], hooksSeen: Set<string>, pluginSet?: PhasePluginSet,
+  ): void {
+    if (event.kind === 'init') {
+      if (!event.plugins && !event.skills) return;
+      if (loads?.mode === 'console-set') noteObservedSkills(event.skills, event.slashCommands);
+      this.record('phase.plugins', {
+        mode,
+        loads: loads?.mode ?? 'operator-config',
+        plugins: event.plugins ?? [],
+        skills: event.skills?.length ?? 0,
+        ...(loads?.missing.length ? { missing: loads.missing } : {}),
+        ...(loads?.carriedDeny.length ? { carriedDeny: loads.carriedDeny.length } : {}),
+        ...(loads?.userHooksLeftOut.length ? { userHooksLeftOut: loads.userHooksLeftOut } : {}),
+        // The phase's own plugin set, when its kinds named one (measured-console phase 27).
+        ...(pluginSet?.kinds.length ? { set: phasePluginsJournal(pluginSet) } : {}),
+      }, phase);
+      return;
+    }
+    if (event.kind === 'hook') {
+      const key = `${event.event}\u0000${event.name}\u0000${event.outcome ?? ''}`;
+      if (hooksSeen.has(key) || hooksSeen.size >= 50) return;
+      hooksSeen.add(key);
+      this.record('phase.hook', { mode, event: event.event, name: event.name, ...(event.outcome ? { outcome: event.outcome } : {}) }, phase);
+      return;
+    }
+    if (event.kind === 'tool' && event.skill && invoked.length < 50) invoked.push(event.skill);
+  }
+
   private noteSessionEvent(phase: number, event: StreamEvent, armed: boolean, binary: string | undefined): void {
     const state = this.state;
     if (!state) return;
@@ -2564,4 +2926,14 @@ export abstract class RunnerBase {
 /** What each of a phase's sessions spent, from its cost high-water marks — the `spentOn` of a phase budget. */
 function sessionSpend(record: { costHighWater?: Record<string, number> }): { what: string; amount: number }[] {
   return Object.entries(record.costHighWater ?? {}).map(([session, usd]) => ({ what: `session ${session.slice(0, 8)}`, amount: usd }));
+}
+
+/**
+ * The skills a prompt's Skill-tool line names (measured-console phase 11) —
+ * every `Call the Skill tool with "<name>"` in it, once each, in order: the
+ * engine's line and `skillDirective`'s spell it the same way.
+ */
+export function skillsNamedIn(prompt: string | undefined): string[] {
+  if (!prompt) return [];
+  return [...new Set([...prompt.matchAll(/Call the Skill tool with "([^"\n]{1,120})"/g)].map((m) => m[1]!))];
 }

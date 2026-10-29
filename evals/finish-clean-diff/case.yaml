@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: finish-clean-diff
+description: '§Architecture 4 (C7): no `[DEBUG-` left — the earlier attempt left one in the committed greeting.'
+tags: [phase-finish]
+context:
+  scaffold_script: fixture.sh

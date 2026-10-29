@@ -8,8 +8,9 @@
  *   DC-2  a decision whose proof the answer cannot satisfy comes back Redo,
  *         carrying its source's steps; the answer stays on the item.
  *   DC-3  the card offers ONE act for a decision with options — no
- *         *I've done this — check* beside *Send my decision* — and its words
- *         never tell a person to press a button the card does not show.
+ *         *I've done this — check* beside *Send my decision*, its options
+ *         ending with *Hand it to the AI* (2026-10-20) — and its words never
+ *         tell a person to press a button the card does not show.
  *   DC-4  a plan item's proof is read from the plan's bullet as it is NOW
  *         when the bullet changed after launch (`turn.proof-reread`, #345).
  *   DC-5  a decision whose proof names a file outside the plan's own
@@ -18,6 +19,12 @@
  *   DC-6  the write goes through no link and a `test -f` file is created,
  *         never overwritten; another plan's folder and the plan file are not
  *         the answers folder.
+ *   DC-7  the value shape (2026-10-20, hub's E-3): a proof `grep -Eq '^<key>:
+ *         *[a-z]'` gains `<key>: <option id>` — the plan's own line, never the
+ *         note — on ONE press, and the card's steps say what the press writes
+ *         rather than a `printf` for the person to run.
+ *   DC-8  a plan decision's note reaches the AI that acts: pinned on the phase
+ *         the decision unblocks, because no session waits on a plan's item.
  */
 
 import './state-sandbox.ts';
@@ -27,6 +34,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { HAND_OFF_OPTION_ID } from '../shared/turn-model.js';
 import { SLUG, call, harness } from './turn-harness.ts';
 
 type HumanStep = import('../server/human-steps.ts').HumanStep;
@@ -115,12 +123,12 @@ test('DC-3 — a decision with options offers ONE act, and its words name no but
     const step = planDecision(h, `cmd:"grep -qi '^store: answered' ${answers}"`);
     const turn = await call(h.svc, 'GET', '/api/turn');
     assert.equal(turn.status, 200);
-    type Item = { item: string; actions?: { verb: string }[]; options?: unknown[] };
+    type Item = { item: string; actions?: { verb: string }[]; options?: { id: string }[] };
     const items = Object.values(turn.body.groups as Record<string, Item[]>).flat();
     const item = items.find((one) => one.item === step.id);
     assert.ok(item, `the item is on Your turn: ${items.map((one) => one.item).join(',')}`);
     assert.ok(!(item!.actions ?? []).some((action) => action.verb === 'check'), `no check beside Send my decision: ${JSON.stringify(item!.actions)}`);
-    assert.ok((item!.options ?? []).length === 2, 'the two options are the act');
+    assert.deepEqual((item!.options ?? []).map((option) => option.id), ['prune', 'accept', HAND_OFF_OPTION_ID], 'the two options are the act, and the AI may take it');
     const words = JSON.stringify(item);
     assert.ok(!/press I've done this — check/.test(words), 'its guide never ends "press I\'ve done this — check"');
     assert.match(words, /send your decision/i);
@@ -196,5 +204,53 @@ test('DC-6 — only the plan\'s own handoffs folder, through no link, and a test
     writeFileSync(lines, 'pending');
     assert.equal(writeAnswer(answerTargetOf(`cmd:"grep -q '^store: answered' ${lines}"`)!, own, h.root, answer).ok, true);
     assert.equal(readFileSync(lines, 'utf8'), 'pending\nstore: answered — Prune once\n');
+  } finally { h.cleanup(); }
+});
+
+test('DC-7 — the value shape: one press writes `<key>: <option id>`, the card says so, and it passes', async () => {
+  const h = harness();
+  try {
+    const answers = join(h.root, 'docs', 'handoffs', SLUG, 'owner-answers.md');
+    mkdirSync(join(h.root, 'docs', 'handoffs', SLUG), { recursive: true });
+    writeFileSync(answers, '## Answers\n\nstore:\n');
+    const step = planDecision(h, `cmd:"grep -Eq '^store: *[a-z]' ${answers}"`, {
+      guide: { text: 'Stop the store growing.\n\n## Steps\n1. Run this command.\n   ```\n   printf \'store: prune\\n\' >> owner-answers.md\n   ```\n' },
+    });
+    const turn = await call(h.svc, 'GET', '/api/turn');
+    type Item = { item: string; steps?: { text: string; code?: string }[]; check?: string };
+    const item = Object.values(turn.body.groups as Record<string, Item[]>).flat().find((one) => one.item === step.id);
+    assert.ok(item, 'the item is on Your turn');
+    assert.ok(!(item!.steps ?? []).some((one) => /printf/.test(`${one.text} ${one.code ?? ''}`)), `no printf for the person: ${JSON.stringify(item!.steps)}`);
+    assert.ok((item!.steps ?? []).some((one) => one.text.includes('`store: <your choice>`')), 'a step names the line the press writes');
+    assert.match(item!.check ?? '', /written to docs\/handoffs\/alpha\/owner-answers\.md as `store: <your choice>`/);
+    const pressed = await call(h.svc, 'POST', `/api/human-steps/${step.id}/answer`, { option: 'prune', note: 'go ahead' });
+    assert.equal(pressed.status, 200, JSON.stringify(pressed.body));
+    assert.equal((pressed.body.check as { state: string }).state, 'passed', JSON.stringify(pressed.body));
+    assert.equal(readFileSync(answers, 'utf8'), '## Answers\n\nstore:\nstore: prune\n', 'one line, the value whole, the note kept off it');
+    const now = h.svc.humanStepsNow().get(step.id)!;
+    assert.equal(now.state, 'proven');
+    assert.equal(now.answer?.note, 'go ahead', 'the note stays on the item');
+  } finally { h.cleanup(); }
+});
+
+test('DC-8 — a plan decision\'s note is pinned on the phase it unblocks', async () => {
+  const { newRun, saveRun } = await import('../server/runner/state.ts');
+  const { runFile } = await import('../server/runner/run-paths.ts');
+  const h = harness();
+  try {
+    const answers = join(h.root, 'docs', 'handoffs', SLUG, 'owner-answers.md');
+    mkdirSync(join(h.root, 'docs', 'handoffs', SLUG), { recursive: true });
+    writeFileSync(answers, '');
+    const run = newRun({ slug: SLUG, root: h.root, onlyPhases: [4] } as never);
+    saveRun(run);
+    const step = planDecision(h, `cmd:"grep -Eq '^store: *[a-z]' ${answers}"`, { unblocks: [4] });
+    const pressed = await call(h.svc, 'POST', `/api/human-steps/${step.id}/answer`, { option: 'accept', note: 'the CFO wants growth' });
+    assert.equal(pressed.status, 200, JSON.stringify(pressed.body));
+    const notes = (JSON.parse(readFileSync(runFile(h.root, SLUG, run.id), 'utf8')) as { notes?: { text: string; pinned: boolean; phase?: number }[] }).notes ?? [];
+    const note = notes.find((one) => /the CFO wants growth/.test(one.text));
+    assert.ok(note, `the note is on the run: ${JSON.stringify(notes)}`);
+    assert.equal(note!.pinned, true, 'read into every boarding of the phase');
+    assert.equal(note!.phase, 4, 'on the phase the decision unblocks');
+    assert.match(note!.text, /they chose Accept the growth until Release H/);
   } finally { h.cleanup(); }
 });

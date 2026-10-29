@@ -597,3 +597,24 @@ test('HR-12 — a bound option names its run: on a superseded or different run e
   } finally { h.cleanup(); }
 });
 
+
+test('HR-13 — a step DEFERRED at its call (measured-console phase 12, B2): the check hands the answer to that call, and the SAME session resumes', async () => {
+  const h = harness();
+  try {
+    const { state, step } = parked(h, BROWSER);
+    // What the hook's defer left on the record: the call, the session that made it.
+    const record = phaseRecord(state, 3);
+    record.deferred = { toolUseId: 'toolu_d1', sessionId: 'sess-own-1', command: 'bash phase-outcome.sh alpha 3 needs-human', at: new Date().toISOString() };
+    saveRun(state);
+    h.svc.watchClock.probeNow = async (ref: string): Promise<WatchState> => ({ ref, state: 'landed', detail: 'exit 0' });
+    const checked = await call(h.svc, 'POST', `/api/human-steps/${step.id}/check`);
+    assert.equal(checked.status, 200);
+    assert.deepEqual(checked.body.resumed, { launched: true });
+    assert.equal(h.resumed.length, 1);
+    assert.equal(h.resumed[0].mode, 'resume', 'the phase’s OWN session — its re-fired hook runs the deferred call');
+    const after = loadRun(h.root, SLUG, state.id)!.phases['3'];
+    assert.equal(after.deferred?.toolUseId, 'toolu_d1', 'the deferral waits for its re-fire');
+    assert.equal(after.deferred?.stepId, step.id);
+    assert.match(String(after.deferred?.answer), /^a person's turn is PROVEN — Sign in in a browser: "Sign the gh CLI in to the acme org"; proof cmd:"gh auth status" read: it holds/);
+  } finally { h.cleanup(); }
+});

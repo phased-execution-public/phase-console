@@ -5,9 +5,17 @@
 
 import { useEffect } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { api, type InboxQuery, type NotificationScope } from './api';
+import { api, type NotificationScope } from './api';
 import { useConsoleState } from './console';
 import { keys } from './keys';
+
+/** What a page of the notification inbox asks `GET /api/notifications` for — its query, not a wire shape. */
+export interface InboxQuery {
+  category?: string;
+  unread?: boolean;
+  limit?: number;
+  before?: string;
+}
 
 /** How long a page has to stay open before opening it counts as reading. */
 const AUTO_READ_DELAY_MS = 1_200;

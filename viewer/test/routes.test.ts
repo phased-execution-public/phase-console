@@ -290,6 +290,55 @@ test('maxConsecutiveFailures is 1..50, and garbage never reaches the runner as N
   assert.ok(!('maxConsecutiveFailures' in empty._configured[0]), 'an empty value changes nothing');
 });
 
+test('the session\'s environment (measured-console phase 6): judged on both doors, stored as asked, cleared by null', async () => {
+  const started = fakeService();
+  const body = { cacheTtlAb: 'alternate', keepWarmSec: 300, subagentModel: 'haiku', bashMaxOutput: 50_000 };
+  assert.equal((await call(started, 'POST', '/api/run/demo/start', { body })).status, 200);
+  const options = started._started[0].options;
+  assert.deepEqual(
+    [options.cacheTtlAb, options.keepWarmSec, options.subagentModel, options.bashMaxOutput],
+    ['alternate', 300, 'haiku', 50_000],
+  );
+
+  for (const [field, bad, words] of [
+    ['cacheTtlAb', 'sometimes', /cacheTtlAb must be one of: off, alternate/],
+    ['keepWarmSec', -1, /keepWarmSec must be a whole number between 0 and 3600/],
+    ['keepWarmSec', 3601, /keepWarmSec must be a whole number between 0 and 3600/],
+    ['subagentModel', 'gpt-nonsense', /subagentModel must name a Claude model/],
+    ['bashMaxOutput', 7_999, /bashMaxOutput must be a whole number between 8000 and 150000/],
+    ['bashMaxOutput', 150_001, /bashMaxOutput must be a whole number between 8000 and 150000/],
+  ] as const) {
+    for (const verb of ['start', 'settings']) {
+      const s = fakeService();
+      const out = await call(s, 'POST', `/api/run/demo/${verb}`, { body: { [field]: bad } });
+      assert.equal(out.status, 400, `${verb} ${field}=${bad}`);
+      assert.match(err(out), words);
+    }
+  }
+
+  // A settings patch moves each, and `null` or '' puts each back to its default.
+  const set = fakeService();
+  assert.equal((await call(set, 'POST', '/api/run/demo/settings', { body })).status, 200);
+  assert.deepEqual(
+    [set._configured[0].cacheTtlAb, set._configured[0].keepWarmSec, set._configured[0].subagentModel, set._configured[0].bashMaxOutput],
+    ['alternate', 300, 'haiku', 50_000],
+  );
+  const cleared = fakeService();
+  await call(cleared, 'POST', '/api/run/demo/settings', {
+    body: { cacheTtlAb: null, keepWarmSec: '', subagentModel: '', bashMaxOutput: null },
+  });
+  assert.deepEqual(
+    [cleared._configured[0].cacheTtlAb, cleared._configured[0].keepWarmSec, cleared._configured[0].subagentModel, cleared._configured[0].bashMaxOutput],
+    [null, null, null, null],
+  );
+  // Silence leaves them alone.
+  const untouched = fakeService();
+  await call(untouched, 'POST', '/api/run/demo/settings', { body: { autonomy: 'keep-going' } });
+  for (const field of ['cacheTtlAb', 'keepWarmSec', 'subagentModel', 'bashMaxOutput']) {
+    assert.equal(field in untouched._configured[0], false, field);
+  }
+});
+
 /* ------------------------------------------------------------------ *
  * Isolation — one word on `start`, and one direction on `settings`
  * ------------------------------------------------------------------ */

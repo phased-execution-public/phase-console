@@ -174,7 +174,7 @@ test('crossing the soft cap writes an IN-BAND journal.full, and the reserve stil
   try {
     // A tiny cap makes the reserve reachable in a handful of lines rather than
     // 32 MB of them; the arithmetic under test is the same.
-    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 4096, reserveBytes: 1024 });
+    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 4096, reserveBytes: 1024, maxSegments: 0 });
 
     const filler = 'x'.repeat(400);
     for (let i = 0; i < 40; i++) journal.append('phase.tool', { filler, i });
@@ -210,7 +210,7 @@ test('crossing the soft cap writes an IN-BAND journal.full, and the reserve stil
 test('append() still returns the entry it wrote, and still returns one it did not', () => {
   const dir = root();
   try {
-    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 1024, reserveBytes: 256 });
+    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 1024, reserveBytes: 256, maxSegments: 0 });
     const first = journal.append('run.start', {});
     assert.equal(first.seq, 1);
 
@@ -270,7 +270,7 @@ test('two callers of Journal.for write one sequence under the run\'s one trace �
 test('a journal cut back under its cap is written to again — the overflow it had went with the lines — and a second crossing marks again', () => {
   const dir = root();
   try {
-    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 4096, reserveBytes: 1024 });
+    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 4096, reserveBytes: 1024, maxSegments: 0 });
     const filler = 'x'.repeat(400);
     for (let i = 0; i < 12; i++) journal.append('phase.tool', { filler, i });
     const full = () => linesOf(dir, 'slug', 'run1').filter((l) => l.event === 'journal.full').length;
@@ -289,6 +289,51 @@ test('a journal cut back under its cap is written to again — the overflow it h
     assert.equal(full(), 1, 'the new file carries its own marker, once');
     const marker = linesOf(dir, 'slug', 'run1').find((l) => l.event === 'journal.full')!;
     assert.equal(marker.data?.lastSeq, marker.seq - 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('B5 (measured-console phase 17): at the cap the journal ROTATES into numbered segments with an index of offsets, and every reader follows the chain', async () => {
+  const { existsSync } = await import('node:fs');
+  const { journalChainOf, journalIndexOf } = await import('../server/runner/run-paths.ts');
+  const { scanBackChain } = await import('../server/runner/transcript.ts');
+  const { readPhaseJournal } = await import('../server/analysis/phase-report.ts');
+  const dir = root();
+  try {
+    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 4096, reserveBytes: 512 });
+    journal.append('phase.progress', { early: true }, 1);
+    for (let i = 0; i < 120; i++) journal.append('phase.tool', { i, pad: 'x'.repeat(60) }, 1);
+    journal.append('run.finished', { ok: true });
+    const live = journalFile(dir, 'slug', 'run1');
+    const index = journalIndexOf(live);
+    assert.ok(index.segments.length >= 2, `the journal rotated (${index.segments.length} segments)`);
+    assert.deepEqual(index.segments.map((s) => s.n), index.segments.map((_, i) => i + 1), 'numbered from 1, oldest first');
+    for (const [i, segment] of index.segments.entries()) {
+      assert.ok(existsSync(journalChainOf(live)[i]!), segment.file);
+      assert.equal(segment.offset, index.segments.slice(0, i).reduce((sum, s) => sum + s.bytes, 0), 'each offset is where the segment starts in the whole journal');
+      assert.ok(segment.firstSeq <= segment.lastSeq);
+    }
+    assert.equal(linesOf(dir, 'slug', 'run1')[0]!.event, 'journal.rotated', 'the live file says there is more behind it');
+    assert.equal(linesOf(dir, 'slug', 'run1').some((l) => l.event === 'journal.full'), false, 'a rotating journal never fills');
+    // The whole chain reads as ONE sequence, with nothing lost.
+    const all = journal.read();
+    const ordinary = all.filter((e) => e.event !== 'journal.rotated');
+    assert.equal(ordinary.length, 122);
+    assert.deepEqual(all.map((e) => e.seq), all.map((_, i) => i + 1), 'seq runs on across every segment');
+    // A bounded read reaches back across the boundary.
+    const tail = journal.read(80);
+    assert.equal(tail.length, 80);
+    assert.equal(tail.at(-1)!.event, 'run.finished');
+    assert.deepEqual(tail.map((e) => e.seq), all.slice(-80).map((e) => e.seq));
+    // A fresh construction numbers on from the chain.
+    const again = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 4096, reserveBytes: 512 });
+    assert.equal(again.append('run.settled').seq, all.at(-1)!.seq + 1);
+    // The backward scanner and the phase report find the first line, in the oldest segment.
+    let early = false;
+    scanBackChain(live, 1 << 20, (line) => { early = line.includes('"early":true'); return early; });
+    assert.equal(early, true, 'scanBackChain walks back into the segments');
+    assert.ok(readPhaseJournal(live, 1).some((row) => row.event === 'phase.progress' && row.seq === 1), 'the phase report reads the chain');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

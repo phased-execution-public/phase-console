@@ -24,8 +24,11 @@ import {
   coverLinks, declareHumanStep, sanitiseStep, type DeclareInput, type HumanStep, type HumanStepLedger, type StepLink, type TurnRefused,
 } from '../human-steps.ts';
 import { HUMAN_STEP_SETTLED_STATES } from '../../shared/human-step-model.js';
-import { TURN_GROUPS, TURN_OPEN_GROUPS, groupOf, type TurnGroup } from '../../shared/turn-model.js';
+import {
+  HAND_OFF_OPTION_ID, HAND_OFF_WORDS, PERSON_STATUS_LABEL, TURN_GROUPS, TURN_OPEN_GROUPS, groupOf, type TurnGroup,
+} from '../../shared/turn-model.js';
 import { recommendedOption } from '../../shared/relay-model.js';
+import { parseInboxItemId } from '../../shared/attention-model.js';
 import { cardWordsOf, ledgerTurn, type CardWords, type TurnView } from './fold.ts';
 import type { InboxAction, InboxItem } from '../inbox.ts';
 import { requestView, type AuthorityRequest, type AuthorityRequestView } from '../owner/requests.ts';
@@ -253,6 +256,10 @@ export type TurnItem = TurnView & CardWords & Words & {
   request?: AuthorityRequestView;
   /** The situation's ASK words, on an errand's item (turn-by-turn phase 4) — read by the composer. */
   ask?: AskFacts;
+  /** The ledger step an errand names when no open item stands behind it (2026-10-20) — its words are the card's. */
+  stepId?: string;
+  /** What the parked phase asked for, in its session's own words — an errand's first step. */
+  asked?: string;
   /**
    * The act's whole words when `title` had to be cut to the title rule (#377,
    * `turn/compose.ts` `shortTitle`): the title is sentence case and at most 80
@@ -439,6 +446,13 @@ export function turnView(
      * item is assigned at its row's own clock.
      */
     firstSeen?: (entries: readonly SeenEntry[]) => ReadonlyMap<string, string>;
+    /**
+     * Whether this console may resume a phase (`--allow-run`, 2026-10-20): an
+     * option that presses a run's own verb, and a hand-off of an item the
+     * console builds, is drawn off with the flag that would turn it on —
+     * the router refuses them without it. Unknown is yes.
+     */
+    allowRun?: boolean;
   } = {},
 ): TurnAnswer {
   const now = ledger.now ?? Date.parse(inbox.generatedAt);
@@ -478,6 +492,11 @@ export function turnView(
       const covers = links.covers.get(step.id);
       item.step = { ...detailOf(step, planWords(ledger.planItem, step)), ...(coveredBy ? { coveredBy } : {}), ...(covers ? { covers } : {}) };
     }
+    // An errand whose step no longer stands draws that step (2026-10-20): the
+    // phase still waits on what it asked, so the card shows the session's own
+    // guide — read open, because the errand is.
+    const named = !step && item.stepId ? byId.get(item.stepId) : undefined;
+    if (named) item.step = { ...detailOf(named, planWords(ledger.planItem, named)), state: 'notified' };
     // A run request (turn-by-turn phase 6) is a yes or a no: its approval block
     // names the act and every phase that asked.
     const approval = step ? runRequestBlock(step) : null;
@@ -519,7 +538,8 @@ export function turnView(
   } catch { /* a store that cannot answer costs the clock, never the page */ }
   for (const item of items.values()) {
     const step = byId.get(item.item);
-    const worded = withWords(withCardWords(item, step, edition, now), step, seenAt.get(item.item) ?? null, now);
+    const named = !step && item.stepId ? byId.get(item.stepId) : undefined;
+    const worded = withWords(withCardWords(item, step, edition, now), step, seenAt.get(item.item) ?? null, now, named, ledger.allowRun);
     // A settled record says how it ended — the person's status is its outcome.
     const final = item.settled ? { ...worded, personStatus: item.settled.outcome } : worded;
     // The groups v2 (turn-by-turn phase 9): what the state already placed
@@ -569,7 +589,7 @@ function settledItem(record: SettledRecord): Draft {
   return {
     item: record.item, record: 'projected', source: record.source, kind: 'decision', why: 'decision', proofType: 'answer',
     group: 'done', rows: [], title: record.title, need: `${record.what}.`,
-    how: `${record.outcome === 'passed' ? 'Passed' : 'Closed'} — ${record.what.charAt(0).toLowerCase()}${record.what.slice(1)} by ${record.by}.`,
+    how: `${PERSON_STATUS_LABEL[record.outcome]} — ${record.what.charAt(0).toLowerCase()}${record.what.slice(1)} by ${record.by}.`,
     severity: 'fyi', ...(record.slug ? { slug: record.slug } : {}), ...(record.phase !== undefined ? { phase: record.phase } : {}),
     ...(record.runId ? { runId: record.runId } : {}), since: record.at, href: '', actions: [],
     settled: { outcome: record.outcome, by: record.by, at: record.at, what: record.what },
@@ -645,7 +665,13 @@ function withCardWords(item: Draft, step: HumanStep | undefined, edition: 'free'
  * from its record merged with what its plan says now, a projected one's from
  * its row — the title, need and how replaced, the card's words added.
  */
-function withWords(item: Omit<TurnItem, keyof Words> & Pick<Draft, 'options' | 'approval'>, step: HumanStep | undefined, firstSeen: string | null, now: number): TurnItem {
+function withWords(
+  item: Omit<TurnItem, keyof Words> & Pick<Draft, 'options' | 'approval'>, step: HumanStep | undefined, firstSeen: string | null, now: number,
+  /** The step an errand names when no open item stands behind it (2026-10-20). */
+  named?: HumanStep,
+  /** Whether this console may resume a phase (`--allow-run`); unknown is yes. */
+  allowRun?: boolean,
+): TurnItem {
   const facts: StepFacts | undefined = step ? { ...step, ...item.step, title: step.title } as StepFacts : undefined;
   // The row's whole words, when its title was cut to the rule (#377) — the composer cuts them once more, the same way.
   const { headline: rowHeadline, ...rest } = item;
@@ -660,12 +686,27 @@ function withWords(item: Omit<TurnItem, keyof Words> & Pick<Draft, 'options' | '
         humanStep: item.humanStep,
         supervisor: item.supervisor,
         ask: item.ask,
+        asked: item.asked,
         options: item.options,
         approval: item.approval,
       },
+      ...(named ? { named: { ...named, ...item.step, title: named.title } as StepFacts } : {}),
     }),
     firstSeen, now,
   });
+  // A gate's Approve the composer offered names the item's run (turn-by-turn
+  // phase 5); a run's own verb is off, with its flag, where runs are.
+  const runsOff = allowRun === false;
+  const options = composed.options.map((option) => ({
+    ...option,
+    verb: boundToRun(option.verb, item),
+    ...(runsOff && !option.flag && RUN_PRESS.test(option.verb.endpoint) ? { flag: 'run' } : {}),
+  }));
+  // Every open decision the AI can take offers two ways on at least (2026-10-20): the last one hands it over —
+  // through a run, for an item the console builds, so off where runs are.
+  if (handsOff(item, options, step) && !options.some((option) => option.id === HAND_OFF_OPTION_ID)) {
+    options.push(handOffOption(item.item, runsOff && item.record !== 'ledger', planHandOffWords(step, options)));
+  }
   return {
     ...rest,
     title: composed.title,
@@ -681,9 +722,78 @@ function withWords(item: Omit<TurnItem, keyof Words> & Pick<Draft, 'options' | '
     timing: composed.timing,
     verdict: step?.verdict ?? null,
     verdicts: step?.verdicts ?? [],
-    // A gate's Approve the composer offered names the item's run (turn-by-turn phase 5).
-    options: composed.options.map((option) => ({ ...option, verb: boundToRun(option.verb, item) })),
+    options,
     approval: composed.approval ?? approvalOf(item.approval),
+  };
+}
+
+/** The person's statuses an item is over at — nothing is left to hand to anyone. */
+const OVER: ReadonlySet<string> = new Set(['passed', 'not-doing', 'closed']);
+
+/**
+ * The errands a phase's own session can take back (2026-10-20): acts it
+ * declared for a person's hands, a blocker it named, a red check, a record it
+ * left unwritten, work it left half done or never began. Never a login, a
+ * secret, a permission, a protected path, a gate, a lock, a wall, an outward
+ * write or the run's own act — those are a person's by what they are.
+ */
+const HANDED_SITUATIONS: ReadonlySet<string> = new Set([
+  'blocked-declared', 'blocked-declared:human-acts', 'blocked-declared:unknown',
+  'verify-red', 'verify-red:reopened', 'done-unrecorded', 'work-in-progress', 'never-started', 'unknown',
+]);
+
+/** A press on a run's own verb — `POST /api/run/<slug>/…`, which the router takes only under `--allow-run`. */
+const RUN_PRESS = /^\/api\/run\/[^/]+\//;
+
+/** A press only a person may make — a gate's Approve, whose login a run goes on with. */
+const PERSON_ONLY = /^\/api\/(?:plans\/[^/]+\/gate\/\d+|run\/[^/]+\/identity)$/;
+
+/**
+ * Does the item take *Hand it to the AI*? An open Decision does (2026-10-20)
+ * when an AI can take it: a session's decision (answered "decide it
+ * yourself"), a plan's own decision that recommends an option (the AI goes
+ * with it), a stopped phase's errand its session can clear, and a branch
+ * conflict (the run is told). Never one whose way on is a person's own press,
+ * the supervisor's card, which ends by its own action, or an owner's request.
+ */
+function handsOff(
+  item: Pick<TurnItem, 'item' | 'type' | 'personStatus' | 'record' | 'source' | 'phase' | 'rows' | 'supervisor' | 'settled'>,
+  options: readonly TurnOption[],
+  step?: HumanStep,
+): boolean {
+  if (item.type !== 'decide' || item.supervisor || item.record === 'request' || item.settled || OVER.has(item.personStatus)) return false;
+  if (options.some((option) => PERSON_ONLY.test(option.verb.endpoint))) return false;
+  if (item.record === 'ledger') return step?.birth !== 'plan' || options.some((option) => option.recommended);
+  if (item.source === 'conflict') return true;
+  if (item.source !== 'errand' || item.phase == null || item.phase <= 0) return false;
+  return HANDED_SITUATIONS.has(parseInboxItemId(item.rows[0] ?? item.item)?.subject ?? '');
+}
+
+/**
+ * What *Hand it to the AI* says on a plan's own decision (2026-10-20): the AI
+ * goes with the option the plan recommends, and the note goes to the phases the
+ * decision unblocks. Undefined for every other item, which says the shared words.
+ */
+function planHandOffWords(step: HumanStep | undefined, options: readonly TurnOption[]): string | undefined {
+  if (step?.birth !== 'plan') return undefined;
+  const recommended = options.find((option) => option.recommended);
+  if (!recommended) return undefined;
+  const phases = [...new Set((step.unblocks ?? []).filter((u) => !u.slug || u.slug === step.slug).map((u) => u.phase))];
+  const where = phases.length === 1 ? `Phase ${phases[0]}` : phases.length ? `Phases ${phases.join(', ')}` : 'the plan’s run';
+  return `The AI goes with its recommendation, “${recommended.label}”; your note goes to ${where}. The item moves to Done.`;
+}
+
+/**
+ * *Hand it to the AI*, bound to the turn's own verb for the item, its note
+ * typed in the box beside it — off, with the run's flag, when it would go
+ * through a run this console may not drive.
+ */
+function handOffOption(id: string, runsOff = false, consequence: string = HAND_OFF_WORDS.consequence): TurnOption {
+  return {
+    id: HAND_OFF_OPTION_ID, label: HAND_OFF_WORDS.label, consequence,
+    verb: { method: 'POST', endpoint: `/api/turn/${encodeURIComponent(id)}/hand-off`, body: {} },
+    says: { field: 'note', label: HAND_OFF_WORDS.note, placeholder: HAND_OFF_WORDS.placeholder },
+    ...(runsOff ? { flag: 'run' } : {}),
   };
 }
 
@@ -733,6 +843,8 @@ function leadOf(row: InboxItem, turn: TurnView): Draft {
     ...(row.category ? { category: row.category } : {}),
     ...(row.supervisor ? { supervisor: row.supervisor } : {}),
     ...(row.ask ? { ask: row.ask } : {}),
+    ...(row.stepId ? { stepId: row.stepId } : {}),
+    ...(row.asked ? { asked: row.asked } : {}),
     ...(row.options?.length ? { options: row.options } : {}),
     ...(row.approval ? { approval: row.approval } : {}),
     ...(row.headline ? { headline: row.headline } : {}),

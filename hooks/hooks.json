@@ -1,0 +1,17 @@
+{
+  "description": "Phase Console session presence: tells the console that owns a session's directory that the session started, ended, stopped or waits on a person (scripts/session-hook.sh). SessionStart waits 15 s, because a supervised session's brief rides on it.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh\"", "timeout": 15 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh\"", "timeout": 3 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh\"", "timeout": 3 }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh\"", "timeout": 3 }] }
+    ]
+  }
+}

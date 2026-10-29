@@ -31,7 +31,7 @@ import type { ReactNode } from 'react';
 import { TASK_STATUSES, TASK_STATUS_META, taskSummary } from '@shared/task-model.js';
 import type { ActivityEvent, PhaseActivity, PhaseReport, PhaseTask, ReportSource } from '@/data/api';
 import { usePhaseActivity, usePhaseReport } from '@/data/runs';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { clockTime, duration, plural, toolTime } from '@/lib/format';
 import { Mono, RelativeTime } from '@/ui';

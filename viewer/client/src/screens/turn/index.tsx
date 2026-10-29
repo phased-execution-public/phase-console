@@ -39,7 +39,7 @@ import './turn.css';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { HUMAN_STEP_SETTLED_STATES } from '@shared/human-step-model.js';
-import { errorWords } from '@/cards/human-step-card';
+import { errorWords } from '@/cards/turn/step-words';
 import { useInboxActions } from '@/cards/inbox-row';
 import type { HumanStepRecord } from '@/data/human-steps';
 import { keys } from '@/data/keys';
@@ -409,6 +409,7 @@ export function TurnBody({ route, base, focus, plan }: TurnBodyProps) {
         focused={focused?.item === item.item}
         folded={folded}
         parts={parts}
+        everything={everything.on}
         onInspect={() => inspectItem({ item, record })}
         moves={
           withdrawable ? (

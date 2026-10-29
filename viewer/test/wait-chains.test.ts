@@ -21,8 +21,6 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -36,6 +34,8 @@ import { SKILL_DIR } from '../server/config.ts';
 import { Service } from '../server/service.ts';
 import { LOCAL_WAIT_LABEL, STALL_LOCAL_JOB_MS, WAIT_CHAIN_GAP_MS } from '../shared/attention-model.js';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
+import { dateClock } from './fixtures/clock.ts';
 
 const MINUTE = 60_000;
 const T0 = Date.parse('2026-09-23T10:00:00.000Z');
@@ -52,20 +52,11 @@ const stallAt = (signals: LaneSignals, at: number) => evaluateStall(signals, sta
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-wait-chains-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  const script = (name: string, body: string) => {
-    writeFileSync(join(scripts, name), body, 'utf8');
-    chmodSync(join(scripts, name), 0o755);
-  };
-  script('phase-graph.sh', `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-wait-chains-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -81,14 +72,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  script('phase-lock.sh', '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  script('validate.sh', '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -97,11 +86,6 @@ function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
     sessionId: 'sess-chain', costUsd: 0.02, turns: 3, resultText: 'done',
     durationMs: 10, argv: ['-p', '<prompt>'], ...partial,
   };
-}
-
-function fakeClock() {
-  const at = { now: T0 };
-  return { now: () => new Date(at.now), wind: (ms: number) => { at.now += ms; } };
 }
 
 /** One session held open, with its event sink and an open stdin a nudge can reach. */
@@ -201,9 +185,9 @@ test('WC-1 — a refused wait ends on the session\'s next call that is not the r
 });
 
 test('WC-2/WC-3 — a watchdog park records no unpollable ref, and its rung settles as the watchdog\'s act', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
-  const clock = fakeClock();
+  const clock = dateClock(T0);
   const { instance, events } = runner(r, held.spawn, clock.now);
   try {
     const state = await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
@@ -313,9 +297,9 @@ test('WC-5 — ten-minute slices of one local wait age as ONE episode and pass t
 });
 
 test('WC-6 — the nudge and the park read the chain\'s age: sanctioned slices reach the 45-minute rung', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
-  const clock = fakeClock();
+  const clock = dateClock(T0);
   const { instance, events } = runner(r, held.spawn, clock.now);
   try {
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
@@ -451,9 +435,9 @@ test('MR-1 — a minted cmd: ref is PARSED, never sliced: each `[ … ]` member 
 
 test('MR-2 — a watchdog park never arms a minted cmd: ref the console will not run; with watchMintedCmdRefs on, it does', async () => {
   const park = async (mintedCmdRefs?: () => boolean) => {
-    const r = repo();
+    const r = stubbedPlan();
     const held = heldSession(r);
-    const clock = fakeClock();
+    const clock = dateClock(T0);
     const events: { event: string; data: Record<string, unknown> }[] = [];
     const instance = new Runner({
       scriptsDir: r.scripts, spawn: held.spawn, now: clock.now,

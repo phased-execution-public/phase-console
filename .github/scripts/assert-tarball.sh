@@ -9,6 +9,8 @@ set -uo pipefail
 
 tgz="${1:?assert-tarball.sh needs the tarball path}"
 [ -f "$tgz" ] || { echo "no such tarball: $tgz" >&2; exit 2; }
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 
 list="$(mktemp)"
 trap 'rm -f "$list"' EXIT
@@ -32,7 +34,9 @@ for p in \
   "viewer/server/watch-unit.ts" \
   "viewer/server/declared-probe.ts" \
   "viewer/server/load-reading.ts" \
+  "viewer/server/health-series.ts" \
   "viewer/server/runner/reap.ts" \
+  "viewer/server/runner/suite-ledger.mjs" \
   "viewer/server/turn/guard.ts" \
   "viewer/server/permissions/walls.ts" \
   "viewer/server/turn/fold.ts" \
@@ -46,6 +50,7 @@ for p in \
   "viewer/server/turn/plan-items.ts" \
   "viewer/server/turn/guide-file.ts" \
   "viewer/server/turn/compose.ts" \
+  "viewer/server/turn/packs.ts" \
   "viewer/server/turn/first-seen.ts" \
   "viewer/server/turn/settled.ts" \
   "viewer/server/turn/run-requests.ts" \
@@ -98,6 +103,8 @@ for p in \
   "viewer/server/pty/scrollback.ts" \
   "viewer/server/pty/spawn-helper.ts" \
   "viewer/shared/scope.js" \
+  "viewer/shared/price-book.js" \
+  "viewer/shared/money-model.js" \
   "viewer/shared/landing-model.js" \
   "viewer/shared/issues-model.js" \
   "viewer/shared/issue-modes.js" \
@@ -107,6 +114,8 @@ for p in \
   "viewer/shared/guide-grammar.js" \
   "viewer/shared/proof-words.js" \
   "viewer/shared/instances.mjs" \
+  "viewer/shared/installed-plugins.js" \
+  "viewer/shared/plugin-sets.js" \
   "viewer/shared/recovery-model.js" \
   "viewer/shared/halt-categories.js" \
   "viewer/shared/situation-model.js" \
@@ -115,6 +124,8 @@ for p in \
   "viewer/shared/ladder-model.js" \
   "viewer/shared/attention-model.js" \
   "viewer/shared/run-lifecycle.js" \
+  "viewer/shared/outcome-schema.js" \
+  "viewer/shared/quarantine-model.js" \
   "viewer/shared/verb-model.js" \
   "viewer/shared/door-model.js" \
   "viewer/shared/supervisor-model.js" \
@@ -122,6 +133,22 @@ for p in \
   "viewer/shared/fact-map.js" \
   "viewer/shared/evidence-model.js" \
   "viewer/shared/routes.js" \
+  "viewer/shared/wire/accounts.js" \
+  "viewer/shared/wire/common.js" \
+  "viewer/shared/wire/debug.js" \
+  "viewer/shared/wire/fleet.js" \
+  "viewer/shared/wire/issues.js" \
+  "viewer/shared/wire/mcp.js" \
+  "viewer/shared/wire/notifications.js" \
+  "viewer/shared/wire/plans.js" \
+  "viewer/shared/wire/policy.js" \
+  "viewer/shared/wire/queue.js" \
+  "viewer/shared/wire/repo.js" \
+  "viewer/shared/wire/runs.js" \
+  "viewer/shared/wire/sessions.js" \
+  "viewer/shared/wire/state.js" \
+  "viewer/shared/wire/system.js" \
+  "viewer/shared/wire/turn.js" \
   "viewer/shared/diff.js" \
   "viewer/shared/run-settings.js" \
   "viewer/shared/status-vocab.js" \
@@ -148,6 +175,9 @@ for p in \
   "viewer/server/runner/models.ts" \
   "viewer/server/runner/liveness.ts" \
   "viewer/server/runner/shell-reading.ts" \
+  "viewer/server/runner/classify-cli.ts" \
+  "viewer/server/runner/unpushed.ts" \
+  "viewer/server/runner/defer-step.ts" \
   "viewer/server/runner/manifest-verdict.ts" \
   "viewer/server/runner/session-record.ts" \
   "viewer/server/runner/wait-budget.ts" \
@@ -160,14 +190,18 @@ for p in \
   "viewer/server/actor.ts" \
   "viewer/server/api/actor.ts" \
   "viewer/server/api/build-check.ts" \
+  "viewer/server/api/loopback.ts" \
   "viewer/server/start-ceiling.ts" \
   "viewer/server/runner/rulings.ts" \
   "viewer/server/runner/proofs.ts" \
   "viewer/server/runner/artefacts.ts" \
   "viewer/server/runner/verify-ledger.ts" \
+  "viewer/server/runner/verify-select.ts" \
   "viewer/server/runner/ultrareview.ts" \
   "viewer/shared/policy-model.js" \
   "viewer/server/runner/policy.ts" \
+  "viewer/server/runner/loads.ts" \
+  "viewer/server/runner/graph-refresh.ts" \
   "viewer/server/prelude.ts" \
   "viewer/server/credentials-probe.ts" \
   "viewer/server/trace.ts" \
@@ -179,6 +213,11 @@ for p in \
   "viewer/server/doctor.ts" \
   "viewer/server/skill-copy.ts" \
   "viewer/server/skill-copy.js" \
+  "viewer/server/plugin-tree.ts" \
+  "viewer/server/plugin-tree.js" \
+  "viewer/server/seed.ts" \
+  "viewer/server/seed.js" \
+  "viewer/server/hookify.ts" \
   "viewer/shared/relay-model.js" \
   "viewer/server/relay.ts" \
   "viewer/server/relay-host.ts" \
@@ -215,6 +254,7 @@ for p in \
   "scripts/next-phase-prompt.sh" \
   "scripts/phase-lock.sh" \
   "scripts/phase-lane.sh" \
+  "scripts/guard-hook.sh" \
   "scripts/new-plan.sh" \
   "scripts/new-handoff.sh" \
   "scripts/qa-record.sh" \
@@ -226,6 +266,7 @@ for p in \
   "scripts/repair-artefacts.sh" \
   "scripts/gate-approve.sh" \
   "scripts/close-plan.sh" \
+  "scripts/amend-plan.sh" \
   "scripts/handoff-status.sh" \
   "scripts/phase-landing.sh" \
   "scripts/scope.sh" \
@@ -234,8 +275,10 @@ for p in \
   "scripts/session-hook.sh" \
   "scripts/sizing.env" \
   "scripts/mcp.env" \
+  "scripts/plugin-sets.env" \
   "scripts/gates.env" \
   "scripts/verify.env" \
+  "scripts/lints.env" \
   "scripts/decisions.env" \
   "scripts/landing.env" \
   "scripts/messages.env" \
@@ -244,10 +287,16 @@ for p in \
   "scripts/turn.env" \
   "scripts/permission.env" \
   "scripts/skill-api.env" \
+  "scripts/build-plugin-tree.mjs" \
+  "hooks/hooks.json" \
   "templates/plan.md" \
   "templates/handoff.md" \
   "templates/INDEX.md" \
   "references/qa-method.md" \
+  "references/mode-plan.md" \
+  "references/mode-phase-start.md" \
+  "references/mode-phase-finish.md" \
+  "references/scripts.md" \
   "assets/report-template.md" \
   "bin/phase-console" \
   "bin/phase-console.mjs" \
@@ -317,6 +366,21 @@ for a in \
     fail=1
   fi
 done
+
+# ---- the client is HEAD's (measured-console phase 7, the audit's C3) ----------
+# `npm pack` packs whatever viewer/client/dist holds, and dist is gitignored, so
+# only its stamp says which commit the client was built from — the v7.1.0 Pro
+# Release shipped the 7.0.0 client that way (#358). The packed `.build-rev` must
+# name HEAD of the tree this gate belongs to; PC_EXPECT_BUILD_REV names it when
+# the pack ran in a stage with no .git of its own (pack-and-assert.sh --dist).
+expect="${PC_EXPECT_BUILD_REV:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)}"
+packed="$(tar -xzOf "$tgz" package/viewer/client/dist/.build-rev 2>/dev/null | tr -d '[:space:]')"
+if [ -z "$expect" ]; then
+  echo "tarball: no git checkout here names HEAD, so the packed .build-rev (${packed:-missing}) is not compared" >&2
+elif [ "$packed" != "$expect" ]; then
+  echo "STALE CLIENT in tarball: viewer/client/dist/.build-rev is ${packed:-missing}, not HEAD $expect" >&2
+  fail=1
+fi
 
 if [ "$fail" -eq 0 ]; then
   echo "tarball assertions PASS ($(wc -l < "$list" | tr -d ' ') files)"

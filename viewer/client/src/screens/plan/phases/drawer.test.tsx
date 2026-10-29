@@ -171,11 +171,11 @@ describe('the phase drawer shows every QA round the run paid for', () => {
     // Each round keeps its OWN report — the fix, visible — and each is the way to its own sheet.
     expect(within(items[0]!).getByRole('link', { name: 'reports/phase-03-qa.md' })).toHaveAttribute(
       'href',
-      '#/plan/alpha/phases?view=qa&report=3',
+      '#/plan/alpha/phases?view=handoffs&report=3',
     );
     expect(within(items[1]!).getByRole('link', { name: 'reports/phase-03-qa-round2.md' })).toHaveAttribute(
       'href',
-      '#/plan/alpha/phases?view=qa&report=3:2',
+      '#/plan/alpha/phases?view=handoffs&report=3:2',
     );
   });
 
@@ -187,6 +187,25 @@ describe('the phase drawer shows every QA round the run paid for', () => {
   it('shows nothing with no run at all — the Phases view, where rounds are not knowable', () => {
     view(null);
     expect(screen.queryByRole('heading', { name: 'QA rounds' })).toBeNull();
+  });
+});
+
+describe('the diagnosis fold (Tower strips)', () => {
+  it('is a fold strip whose one line says what the drawer knows, fetched only once it opens', () => {
+    hooks.diagnosis.mockReturnValue({ data: DIAGNOSIS, error: null, isFetching: false });
+    hooks.rulings.mockReturnValue({ data: { rulings: [] } });
+    hooks.consoleState.mockReturnValue({ data: { allowTerminal: false } });
+    hooks.issues.mockReturnValue({ data: undefined });
+    mount(<PhaseDrawer slug="alpha" phase={3} run={runWith()} />);
+    const why = screen.getByTestId('why-3');
+    expect(why).toHaveAttribute('aria-expanded', 'false');
+    expect(why).toHaveTextContent('Why is this not done?');
+    // The run's record of the phase reads done: the line says so while it is folded.
+    expect(why).toHaveTextContent('this run reads it done');
+    expect(screen.queryByTestId('diagnosis-3')).toBeNull();
+    openWhy();
+    expect(why).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByTestId('diagnosis-3')).toBeInTheDocument();
   });
 });
 
@@ -272,15 +291,15 @@ describe('the drawer’s QA section', () => {
     // The round history, each round a link to its own report sheet.
     expect(within(qa).getByRole('link', { name: 'round 1' })).toHaveAttribute(
       'href',
-      '#/plan/alpha/phases?view=qa&report=3',
+      '#/plan/alpha/phases?view=handoffs&report=3',
     );
     expect(within(qa).getByRole('link', { name: 'round 2' })).toHaveAttribute(
       'href',
-      '#/plan/alpha/phases?view=qa&report=3:2',
+      '#/plan/alpha/phases?view=handoffs&report=3:2',
     );
     expect(within(qa).getByRole('link', { name: 'Open the report' })).toHaveAttribute(
       'href',
-      '#/plan/alpha/phases?view=qa&report=3:2',
+      '#/plan/alpha/phases?view=handoffs&report=3:2',
     );
   });
 

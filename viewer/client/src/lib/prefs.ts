@@ -50,18 +50,24 @@ export interface TableState {
  * The shell's right panel (7.0, quiet-console phase 3) — the one surface that
  * SURVIVES navigation, so its state lives here rather than in the address.
  * `open` is whether it stands (at 1200 and up a column beside the page; a
- * sheet below), `width` its column in px, and `mode` which of its modes it
- * shows: `details` (the inspector) or, in Pro, `supervisor` (the chat —
- * `shell/panel/modes.ts` owns the words).
+ * sheet below), `width` its column — `auto`, as wide as the record it shows
+ * asks within its measure (2026-10-20), or the px a person dragged it to —
+ * and `mode` which of its modes it shows: `details` (the inspector) or, in
+ * Pro, `supervisor` (the chat — `shell/panel/modes.ts` owns the words).
  */
 export interface PanelPref {
   open: boolean;
-  width: number;
+  width: number | 'auto';
   mode: string;
 }
 
-/** The panel's column on a desk, in px: wide enough for a card, narrow enough to leave the page a page. */
-export const PANEL_WIDTH = { min: 320, initial: 400, max: 640 } as const;
+/**
+ * The panel's column on a desk, in px, when a person sets it: wide enough for
+ * a card, narrow enough to leave the page a page. `initial` was the default
+ * until the column learned to fit its record, and a browser still holding it
+ * reads `auto` (`load`): nobody chose it.
+ */
+export const PANEL_WIDTH = { min: 320, initial: 400, max: 896 } as const;
 
 export interface Prefs {
   theme: Theme;
@@ -268,7 +274,7 @@ const DEFAULTS: Prefs = {
   palette: 'quiet',
   // Closed until something is inspected: a page is one calm column, and an
   // empty panel beside it is chrome.
-  panel: { open: false, width: PANEL_WIDTH.initial, mode: 'details' },
+  panel: { open: false, width: 'auto', mode: 'details' },
   sort: 'activity',
   showDocuments: false,
   showClosed: false,
@@ -314,7 +320,10 @@ export const PREF_DEFAULTS: Readonly<Prefs> = DEFAULTS;
 
 function load(): Prefs {
   try {
-    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) ?? '{}') } as Prefs;
+    const stored = { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) ?? '{}') } as Prefs;
+    // The old default width was never a choice: it reads as the column that fits.
+    if (stored.panel?.width === PANEL_WIDTH.initial) stored.panel = { ...stored.panel, width: 'auto' };
+    return stored;
   } catch {
     return { ...DEFAULTS };
   }

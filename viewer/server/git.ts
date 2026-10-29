@@ -550,3 +550,84 @@ async function gitBoth(
   });
   return { ok: run.ok, stdout: run.stdout, stderr: run.stderr };
 }
+
+/* ------------------------------------------------------------------ *
+ * Reviewed-history reads — what the evaluator's agreement measurement asks.
+ *
+ * `server/pro/evaluator/agreement.ts` judges the phases behind the QA verdicts
+ * on file, so it must read the docs root's history: which commit added a
+ * report, the diff of the commits the report names, a file as it stood in the
+ * commit before. The Pro tree holds no git argv (`never-push.test.ts`: "git
+ * lives in the free half"), so the argv literals live HERE, one named question
+ * per function, and the Pro file calls them. Every one is a read; none takes a
+ * lock, moves a ref or writes an object. `exportTreeTo` writes ONE FILE (a tar
+ * of a commit's tree), as `bundleCreate` does.
+ *
+ * Each answers `null` when git cannot — a rev this repository does not have is
+ * the common case, and the caller reads it as "not in this repository".
+ * ------------------------------------------------------------------ */
+
+const REVIEWED = { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 };
+
+/** `<sha>\t<iso date>` of the commit that ADDED `path`, or null when none did. */
+export async function addedBy(root: string, path: string): Promise<string | null> {
+  const out = await gitRaw(root, ['log', '--diff-filter=A', '-1', '--format=%H%x09%cI', '--', path], REVIEWED);
+  return out?.trim() || null;
+}
+
+/** `commit`, `blob`, … — what this repository holds under `rev`, or null when it holds nothing. */
+export async function objectType(root: string, rev: string): Promise<string | null> {
+  const out = await gitRaw(root, ['cat-file', '-t', rev], REVIEWED);
+  return out?.trim() || null;
+}
+
+/**
+ * The newest commit on any branch or remote-tracking ref made at or before `iso`.
+ *
+ * Spelled with the two ref families rather than `--all`: `--all` (like `--tags`)
+ * is a flag a push must never carry, and the gate that holds that bans both by
+ * name in every argv. This is a read, but the same spelling would leave the
+ * gate unable to tell.
+ */
+export async function newestBefore(root: string, iso: string): Promise<string | null> {
+  const out = await gitRaw(root, ['rev-list', '-1', `--before=${iso}`, '--branches', '--remotes'], REVIEWED);
+  return out?.trim() || null;
+}
+
+/** A commit's committer time in seconds, 0 when unknown. */
+export async function commitSeconds(root: string, sha: string): Promise<number> {
+  const out = await gitRaw(root, ['log', '-1', '--format=%ct', sha], REVIEWED);
+  return Number(out?.trim() ?? 0) || 0;
+}
+
+/** The paths `from..tip` changed, or — with no `from` — the paths the one commit `tip` changed. */
+export async function changedPaths(root: string, from: string | null, tip: string): Promise<string[]> {
+  const out = from
+    ? await gitRaw(root, ['diff', '--name-only', `${from}..${tip}`], REVIEWED)
+    : await gitRaw(root, ['show', '--name-only', '--format=', tip], REVIEWED);
+  return (out ?? '').split('\n').filter(Boolean);
+}
+
+/** The stat and patch of `from..tip`, or — with no `from` — of the one commit `tip`, headed by its subject. */
+export async function patchOf(root: string, from: string | null, tip: string): Promise<string> {
+  const out = from
+    ? await gitRaw(root, ['diff', '--stat', '--patch', `${from}..${tip}`], REVIEWED)
+    : await gitRaw(root, ['show', '--stat', '--patch', '--format=commit %h %s', tip], REVIEWED);
+  return out ?? '';
+}
+
+/** A file as it stood at `rev`, or null when it did not exist there. */
+export async function fileAt(root: string, rev: string, path: string): Promise<string | null> {
+  return gitRaw(root, ['show', `${rev}:${path}`], REVIEWED);
+}
+
+/** The paths directly under `dir` (with its trailing slash) at `rev`. */
+export async function pathsAt(root: string, rev: string, dir: string): Promise<string[]> {
+  const out = await gitRaw(root, ['ls-tree', '--name-only', rev, dir], REVIEWED);
+  return (out ?? '').split('\n').filter(Boolean);
+}
+
+/** `rev`'s whole tree as a tar at `file` — a read of the object store that writes only that file. */
+export async function exportTreeTo(root: string, rev: string, file: string): Promise<GitExport> {
+  return gitWrite(root, ['archive', '--format=tar', `--output=${file}`, rev], 300_000);
+}

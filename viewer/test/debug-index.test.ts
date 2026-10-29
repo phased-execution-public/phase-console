@@ -1244,7 +1244,36 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // +3 from one-pool phase 39 (#380): a person's Queue move on a phase, its
   // revert and its lapse (`phase.queue-ordered`, `phase.queue-order-reverted`,
   // `phase.queue-order-lapsed`). Free — landed without this tally too (`9a465b01`).
-  assert.equal(kinds.length, 497 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
+  // +3 from measured-console phase 6: the cache lifetime a session was spawned
+  // under (`phase.cache-arm`), the protected-file guard's refusal
+  // (`phase.guard-denied`) and the Stop hook's fast gate (`phase.fast-gate`).
+  // Free — their rows landed without this tally, which phase 7's boarding found.
+  // +14 from measured-console phases 9–13: the plugin tree, what loads, the
+  // platform's pieces and the runner's register (`plugin.tree-*`, `phase.plugins`,
+  // `phase.hook`, `phase.skill-invoked`, `phase.graph-*`, `phase.compaction*`,
+  // `phase.outcome-disagreed`, `phase.resume-cost`, `phase.deferred*`,
+  // `phase.unpushed`, `phase.wrapup-pushed`, `run.mirror-refreshed`, `reap.spared`,
+  // `restart.update-failed`, …). Free — their rows landed without this tally,
+  // which phase 14's pre-gate run found.
+  // +4 from measured-console phase 17 (B5, EI-23): the journal's rotation
+  // (`journal.rotated`, `journal.rotate-failed`), the record's incremental shape
+  // (`run.persist-v2`, its two log lines) and the learned store's busy lock.
+  // +1 from measured-console phase 20 (B1): the backend the one spawn door took
+  // (`phase.spawn-backend`). Free; the SDK door's own log lines are Pro rows.
+  // +1 from measured-console phase 21 (B1): an SDK session lost before its
+  // first event (`phase.spawn-fallback`). Free; `spawn-sdk.fake-loaded` is Pro.
+  // +1 from measured-console phase 25 (b07c5ba8): a failure that named its owner
+  // and the owner's session being routed to it (`phase.routed-to-owner`). Free; the
+  // other rows phases 22-25 added (`phase.evaluated`, `phase.canary`, `phase.forecast`, …) are Pro.
+  // +3 from measured-console phases 29 and 30: a pack's item and a session's
+  // closing question read as Your turn's words (`phase.pack-item`,
+  // `phase.prose-question`), and a live plan's changed gate read again before a
+  // phase boards (`phase.gate-reread`). Free — their rows landed without this
+  // tally, which phase 35's gate found.
+  // +1 from measured-console phase 35 (2809aade): `phase.first-edit` (phase 31)
+  // moved out of its Pro region, since both editions write it — one Pro row
+  // fewer, one free row more.
+  assert.equal(kinds.length, 525 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]
@@ -1341,7 +1370,14 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // that could not grow to mount what its plan now names, so the run parks —
   // a refusal, and so error through `refused`. (Exclusive bound, so it moves
   // to 67.)
-  assert.ok(tally.error > 0 && tally.error < 67, `${tally.error} kinds read as error — check the vocabulary`);
+  // 67 since measured-console phase 6: `phase.guard-denied` — the protected-file
+  // guard refusing a tool call — reads as error through `denied`, like the
+  // refusals before it. Its row landed without this bound, which phase 7's
+  // boarding found. (Exclusive bound, so it moves to 68.)
+  // 68 since measured-console phase 17: `journal.rotate-failed` — a journal
+  // that could not rotate at its cap — reads as error through `failed`.
+  // (Exclusive bound, so it moves to 69.)
+  assert.ok(tally.error > 0 && tally.error < 69, `${tally.error} kinds read as error — check the vocabulary`);
   assert.ok(tally.warn > 0 && tally.warn < 80, `${tally.warn} kinds read as warn — check the vocabulary`);
 });
 

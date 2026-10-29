@@ -6,7 +6,6 @@
 
 import { useState } from 'react';
 import { useQaReport } from '@/data/plans';
-import { usePhone } from '@/lib/media';
 import { Button, ButtonGroup, Mono, Spinner } from '@/ui';
 import { Markdown } from '@/ui/markdown';
 import { Sheet, SheetContent } from '@/ui/sheet';
@@ -33,7 +32,6 @@ export function QaReportSheet({
 }) {
   const [which, setWhich] = useState<number | undefined>(round);
   const report = useQaReport(slug, phase, which);
-  const phone = usePhone();
   const picker = rounds && rounds > 1 ? Array.from({ length: rounds }, (_, i) => i + 1) : [];
   const shown = report.data?.round ?? which ?? rounds;
   const path = report.data?.path;
@@ -45,7 +43,8 @@ export function QaReportSheet({
       }}
     >
       <SheetContent
-        side={phone ? 'bottom' : 'end'}
+        side="auto"
+        size="wide"
         title={`QA report for phase ${phase}`}
         showTitle
         data-testid="qa-report-sheet"

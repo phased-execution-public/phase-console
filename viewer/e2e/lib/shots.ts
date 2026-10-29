@@ -75,6 +75,8 @@ export const STOPS: readonly Stop[] = [
   // policy for an unreachable server; the grants, the owner keys and the rule editor; the process, the
   // restart and its forms, the launch unit, reach, every retention key, the machine profile and the off switch
   { name: 'settings-mcp', hash: '#/settings/mcp' },
+  // Settings ▸ Hooks (measured-console phase 28, D3): every hook by source, and each plan's hookify rules
+  { name: 'settings-hooks', hash: '#/settings/hooks' },
   { name: 'settings-permissions', hash: '#/settings/permissions' },
   { name: 'settings-instance', hash: '#/settings/instance' },
   { name: 'settings-everything', hash: '#/settings/everything' },

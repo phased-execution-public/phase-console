@@ -126,7 +126,8 @@ const PLACES: readonly Place[] = [
     name: 'turn',
     // The cards view holds the card's own folds and Inspect; the list (the
     // default since one-pool phase 14) opens the card in the panel instead.
-    expand: { hash: '#/turn?view=cards&tab=all', control: fold(/^The history: who raised it/) },
+    // The card's record is fold strips (Tower strips, 2026-10-20): History is one of them.
+    expand: { hash: '#/turn?view=cards&tab=all', control: fold(/^History\b/) },
     inspect: { hash: '#/turn?view=cards&tab=all', control: inspectButton },
     everything: '#/turn',
   },
@@ -211,7 +212,7 @@ for (const place of PLACES) {
       await shoot(page, info.project.name, `doors-${place.name}-expand`);
     });
 
-    test('inspect: the record rises from the bottom, whole, and its tabs take the tap', async ({
+    test('inspect: the record rises from the bottom on a phone, stands at the end on a tablet, whole, and its tabs take the tap', async ({
       page,
     }, info) => {
       skipOffTouch(info.project.name);
@@ -234,14 +235,29 @@ for (const place of PLACES) {
       await expect(record.locator('h2').first()).not.toBeEmpty();
       await still(page);
 
-      // A bottom sheet: the whole width, standing on the bottom edge, never the whole height.
       const box = (await sheet.boundingBox())!;
-      expect(Math.round(box.x), `${place.name}: the sheet starts at the edge`).toBe(0);
-      expect(Math.round(box.width), `${place.name}: the sheet is the screen's width`).toBe(viewport.width);
-      expect(Math.round(box.y + box.height), `${place.name}: the sheet stands on the bottom`).toBe(
-        viewport.height,
-      );
-      expect(box.height, `${place.name}: the page shows above the sheet`).toBeLessThan(viewport.height);
+      if (viewport.width < 640) {
+        // A bottom sheet: the whole width, standing on the bottom edge, never the whole height.
+        expect(Math.round(box.x), `${place.name}: the sheet starts at the edge`).toBe(0);
+        expect(Math.round(box.width), `${place.name}: the sheet is the screen's width`).toBe(viewport.width);
+        expect(Math.round(box.y + box.height), `${place.name}: the sheet stands on the bottom`).toBe(
+          viewport.height,
+        );
+        expect(box.height, `${place.name}: the page shows above the sheet`).toBeLessThan(viewport.height);
+      } else {
+        // From 640 an end drawer (2026-10-20): the whole height, on the end edge, as wide as
+        // its record asks and never past the screen less 2 rem — the page's edge stays in view.
+        expect(Math.round(box.x + box.width), `${place.name}: the drawer stands on the end edge`).toBe(
+          viewport.width,
+        );
+        expect(Math.round(box.y), `${place.name}: the drawer starts at the top`).toBe(0);
+        expect(Math.round(box.height), `${place.name}: the drawer is the screen's height`).toBe(
+          viewport.height,
+        );
+        expect(box.width, `${place.name}: the page's edge shows beside the drawer`).toBeLessThanOrEqual(
+          viewport.width - 32 + 1,
+        );
+      }
 
       await measure(page, `${place.name}, the record in the panel`);
       const tabs = record.getByRole('tab');

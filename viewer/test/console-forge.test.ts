@@ -123,6 +123,10 @@ const ROUTE_PRESSES: [string, string][] = [
   ['console-write', `curl -X POST ${H} http://127.0.0.1:4130/api/write -d '{"action":"gate-approve","slug":"demo","phase":3,"door":"console"}'`],
   ['check-step', 'xh :4130/api/human-steps/s-1/check x-phase-console:1 note=done'],
   ['dismiss-step', `curl --request POST ${H} 'http://[::1]:4130/api/human-steps/s-1/dismiss'`],
+  // EI-7 (measured-console phase 17): the three verbs that were unfenced.
+  ['cannot-step', 'xh :4130/api/human-steps/s-1/cannot x-phase-console:1 reason=no'],
+  ['snooze-step', 'xh :4130/api/human-steps/s-1/snooze x-phase-console:1 minutes:=60'],
+  ['open-step', 'xh :4130/api/human-steps/s-1/open x-phase-console:1 where=host'],
   // The owner's moves (control-tower phase 133, #210): an answer and a decline
   // are the owner's — a supervised session that tries either is denied here.
   ['answer-step', `curl -s -X POST ${H} http://127.0.0.1:4130/api/human-steps/s-1/answer -d '{"option":"o1","note":"go"}'`],
@@ -132,6 +136,10 @@ const ROUTE_PRESSES: [string, string][] = [
   // either is denied here, so no agent marks its own item passed.
   ['override-step', `curl -s -X POST ${H} http://127.0.0.1:4130/api/human-steps/s-1/override -d '{}'`],
   ['rewrite-step', 'xh :4130/api/human-steps/s-1/rewrite x-phase-console:1 note=again'],
+  // *I can't do this* (2026-10-20): a person's word — a session that says it for one is denied here.
+  ['cannot-item', `curl -s -X POST ${H} 'http://127.0.0.1:4130/api/turn/gate%3Ademo%3A3%3A%3A/cannot' -d '{"reason":"no"}'`],
+  ['hand-off-item', `curl -s -X POST ${H} 'http://127.0.0.1:4130/api/turn/s-1/hand-off' -d '{"note":"you decide"}'`],
+  ['note-item', 'xh POST :4130/api/turn/s-1/note x-phase-console:1 text=hello'],
   // A permission item's two answers besides its Grant (control-tower phase
   // 135, #212) — a person's: a session that tries to deny or take over its own
   // item is denied here.
@@ -509,10 +517,16 @@ test('OD-5: every call of an authority method in the router is reached by an AUT
     'console-write': [{ body: { action: 'gate-approve', slug: 'demo', phase: 3 } }],
     'check-step': [{ body: {} }],
     'dismiss-step': [{ body: {} }],
+    'cannot-step': [{ body: { reason: 'no' } }],
+    'snooze-step': [{ body: { minutes: 60 } }],
+    'open-step': [{ body: { where: 'here' } }],
     'answer-step': [{ body: { option: 'o1', note: 'go' } }],
     'decline-step': [{ body: { reason: 'no' } }],
     'override-step': [{ body: {} }],
     'rewrite-step': [{ body: {} }],
+    'cannot-item': [{ body: { reason: 'no' } }],
+    'hand-off-item': [{ body: { note: 'you decide' } }],
+    'note-item': [{ body: { text: 'hello' } }],
     'deny-step': [{ body: { reason: 'no' } }],
     'convert-step': [{ body: {} }],
     'grant-step': [{ body: { scope: 'call' } }],

@@ -30,8 +30,7 @@ import { Journal } from '../server/runner/journal.ts';
 import {
   flushRunSaves, journalFile, listRuns, loadRun, newRun, pendingRunSaves, phaseRecord,
   pruneRuns, runDir, runsGeneration, saveRun, saveRunSoon, setRunSaveDebounce,
-  RETAIN_RUNS_MIN, type RunState,
-} from '../server/runner/state.ts';
+  RETAIN_RUNS_MIN, type RunState, readStoredRun } from '../server/runner/state.ts';
 import { SearchIndex } from '../server/search.ts';
 import { trimOldest, NOTIFIED_CAP } from '../server/service-base.ts';
 
@@ -148,8 +147,10 @@ test('appending N events to a run writes O(N) bytes, not O(N²)', () => {
     assert.equal(flushRunSaves(), 1, 'and paying it must cost exactly one write');
 
     // The record on disk is the LATEST state, not an intermediate one — the
-    // whole reason the pending entry holds the run by reference.
-    const onDisk = JSON.parse(readFileSync(file, 'utf8')) as RunState;
+    // whole reason the pending entry holds the run by reference. Read as a
+    // reader reads it: the base and its delta log (measured-console phase 17).
+    const onDisk = readStoredRun(dir.root, 'demo', state.id)!;
+    assert.ok(file.endsWith('.json'));
     assert.equal(onDisk.phases['1'].note, 'event 199');
 
     // Bytes actually written: two records (the initial save and the flush)
@@ -205,7 +206,7 @@ test('a persist is one durable write, and a burst is still one', () => {
     }
     assert.equal(pendingRunSaves(), 1, '50 persists, one owed write');
     assert.equal(flushRunSaves(), 1, 'and one write pays for all of them');
-    assert.equal((JSON.parse(readFileSync(file, 'utf8')) as RunState).phases['1'].note, 'n49');
+    assert.equal(readStoredRun(dir.root, 'demo', state.id)!.phases['1'].note, 'n49');
   } finally { setRunSaveDebounce(150); flushRunSaves(); dir.cleanup(); }
 });
 
@@ -213,7 +214,7 @@ test('a persist is one durable write, and a burst is still one', () => {
  * Retention: run files were never deleted
  * ------------------------------------------------------------------ */
 
-test('finished runs past the retention window are swept; nothing else is', () => {
+test('runs past the retention window are swept; one in flight, one inside the window and a live one are not', () => {
   const dir = scratch('retain');
   try {
     const day = 24 * 60 * 60_000;
@@ -238,7 +239,8 @@ test('finished runs past the retention window are swept; nothing else is', () =>
     const ancient: string[] = [];
     for (let i = 0; i < RETAIN_RUNS_MIN + 5; i++) ancient.push(make('finished', 400));
     const young = make('finished', 1);
-    const unfinished = make('parked', 400);
+    // A run IN FLIGHT is kept; a parked one ages out since measured-console phase 17 (RET-20).
+    const unfinished = make('running', 400);
     const live = make('finished', 400);
 
     const removed = pruneRuns(dir.root, 'demo', new Set([live]), now);
@@ -247,7 +249,7 @@ test('finished runs past the retention window are swept; nothing else is', () =>
     const left = new Set(readdirSync(runDir(dir.root, 'demo'))
       .map((n) => /^run-([0-9a-f]{8,32})\.json$/.exec(n)?.[1]).filter(Boolean) as string[]);
     assert.ok(left.has(young), 'a run inside the window is kept');
-    assert.ok(left.has(unfinished), 'an UNFINISHED run is never swept, however old — it may still be written to');
+    assert.ok(left.has(unfinished), 'a run IN FLIGHT is never swept, however old — it may still be written to');
     assert.ok(left.has(live), 'a run a live process is driving is never swept');
     assert.ok(left.size >= RETAIN_RUNS_MIN, 'the count floor holds regardless of age');
 

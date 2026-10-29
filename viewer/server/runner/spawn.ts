@@ -32,7 +32,12 @@
  *   --permission-mode bypassPermissions   everything, unreviewed.
  *
  * They are stripped in one place, `sanitize()`, so no future caller can
- * reintroduce them by passing extra arguments.
+ * reintroduce them by passing extra arguments. One value of one of them is let
+ * through, for one caller: `--setting-sources project,local` on an autopilot
+ * session under `autopilotLoads: console-set` (measured-console phase 11) —
+ * it keeps the repository's settings and the run's `--settings` and drops only
+ * the operator's user-level ones, so their hooks and plugins do not load
+ * unattended. Every other value stays forbidden.
  *
  * One flag is passed on the RUN's behalf rather than stripped: `--permission-prompts
  * none` rides every session no relay answers (`permissionPrompts`, decided by
@@ -184,7 +189,18 @@ function noteBypassDowngrade(emit: (event: StreamEvent) => void): void {
 export type SanitizeOptions = {
   /** Let `--permission-mode bypassPermissions` through. `bypass` profile only. */
   allowBypass?: boolean;
+  /**
+   * Let `--setting-sources project,local` through — that value and no other
+   * (measured-console phase 11, D2): an autopilot session under
+   * `autopilotLoads: console-set`, which loads the repository's settings and
+   * the run's own and leaves out only the operator's user-level hooks and
+   * plugins. `user` is never in it, and nothing else unlocks the flag.
+   */
+  allowSettingSources?: boolean;
 };
+
+/** The ONE `--setting-sources` value `sanitize()` can be told to pass (`loads.ts` names it too). */
+export const ALLOWED_SETTING_SOURCES = 'project,local';
 
 /** What the CLI accepts; anything else is only a warning there, so check here. */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -296,6 +312,16 @@ export type StreamEvent =
     version?: string;
     /** `system/init.mcp_servers`, name and status — how a failed connection is known, since `--strict-mcp-config` does not exit on one (DOC-5). */
     mcpServers?: { name: string; status: string }[];
+    /**
+     * `system/init.plugins` — what LOADED, by name and source (`phased-execution@inline`
+     * for a `--plugin-dir` tree, `<name>@<marketplace>`, `@builtin`), never a path
+     * (measured-console phase 11, `phase.plugins`).
+     */
+    plugins?: { name: string; source: string; version?: string }[];
+    /** `system/init.skills` — the skills the model may invoke, as the Skill tool names them. */
+    skills?: string[];
+    /** `system/init.slash_commands` — every command a person could type, the skills among them. */
+    slashCommands?: string[];
   }
   /**
    * The model an assistant frame of the session's OWN conversation names
@@ -341,6 +367,8 @@ export type StreamEvent =
      * be a credential, and a stream event is written to transcripts.
      */
     args?: Record<string, string | number | boolean>;
+    /** A `Skill` call's `skill` — the name it asked for (measured-console phase 11). */
+    skill?: string;
   }
   /**
    * The result of one, paired back by `id`. See above.
@@ -613,6 +641,11 @@ export type SpawnRequest = {
   sessionId?: string;
   /** Continue an existing session instead of starting one. */
   resume?: string;
+  /**
+   * With `resume`: continue it under a NEW session id (`--fork-session`), so
+   * the resumed conversation is a branch and the original stays as it was.
+   */
+  forkSession?: boolean;
   budgetUsd?: number | null;
   maxTurns?: number | null;
   /**
@@ -635,10 +668,30 @@ export type SpawnRequest = {
    * carries secrets, and argv is world-readable in `ps`.
    */
   mcpConfig?: string;
+  /**
+   * Tools served from THIS process (measured-console phase 21, B1): the SDK
+   * door hands them to `query()` as an in-process MCP server
+   * (`createSdkMcpServer`), so they reach the session as
+   * `mcp__<server>__<tool>`, exactly as a stdio server of that name would.
+   * The subprocess door has no such channel and ignores the field; a caller
+   * that may take either door gives that one its stdio server in `mcpConfig`.
+   */
+  inProcessTools?: InProcessTools;
   /** Ignore every MCP server not passed explicitly. */
   strictMcp?: boolean;
   /** JSON passed to `--settings`: the per-run hook and its ask-rules (W3). */
   settings?: string;
+  /**
+   * `--plugin-dir`, one per entry (measured-console phase 11): the console's
+   * own skill tree for its revision, loaded in place for this session only.
+   */
+  pluginDirs?: string[];
+  /**
+   * `--setting-sources project,local` — set by the runner's spawn door alone,
+   * for a session under `autopilotLoads: console-set`, and the one value
+   * `sanitize()` lets through (`ALLOWED_SETTING_SOURCES`).
+   */
+  settingSources?: typeof ALLOWED_SETTING_SOURCES;
   permissionMode?: PermissionMode;
   /**
    * How much this run may do unasked. Only `bypass` changes argv — the other
@@ -707,6 +760,14 @@ export type SpawnRequest = {
   conversation?: boolean;
   /** Text appended to the CLI's own system prompt (`--append-system-prompt`) — the supervisor chat's rules. */
   appendSystemPrompt?: string;
+  /** The `--agents` JSON — the side-work agents on the subagent model (`sideAgents`, measured-console phase 6). */
+  agents?: string;
+  /**
+   * The `--json-schema` value (measured-console phase 12, B4): the outcome's
+   * session schema (`shared/outcome-schema.js`), given to every session that
+   * can declare one — the result frame then carries it as `structured_output`.
+   */
+  jsonSchema?: string;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
   /** Told the pid as soon as there is one, so a checkpoint can record it. */
@@ -759,6 +820,13 @@ export type SpawnOutcome = {
   promptTurns?: number;
   resultText: string;
   /**
+   * The last result frame's `structured_output` (measured-console phase 12,
+   * B4): the outcome a session started with `--json-schema` returned, as the
+   * CLI validated it. Absent when no result carried one. The runner reads it
+   * BEFORE the outcome file (`outcome.ts` `reconcileOutcome`).
+   */
+  structuredOutput?: unknown;
+  /**
    * The last prose the phase's OWN conversation wrote — no subagent's, and no
    * assistant line the CLI flagged as an API error (control-tower phase 80,
    * #108). When the result is the CLI reporting it could not reach the API,
@@ -810,6 +878,29 @@ export type SpawnOutcome = {
 };
 
 export type SpawnFn = (request: SpawnRequest) => Promise<SpawnOutcome>;
+
+/** One argument of an in-process tool — the supervisor chat's `ChatToolArg` shape. */
+export type InProcessToolArg = {
+  name: string; type: 'string' | 'integer' | 'number' | 'boolean'; required: boolean; summary: string; values?: readonly string[];
+};
+/** An in-process MCP server: its tools, and the one function every call of theirs goes to. */
+export type InProcessTools = {
+  server: string;
+  tools: readonly { name: string; description: string; args: readonly InProcessToolArg[] }[];
+  call(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }>;
+};
+
+/**
+ * The backends behind the one door (measured-console phase 20, B1): the
+ * `claude` subprocess, and the Agent SDK's `query()` (`server/pro/spawn-sdk/`).
+ */
+export const SPAWN_BACKENDS = ['subprocess', 'sdk'] as const;
+export type SpawnBackend = (typeof SPAWN_BACKENDS)[number];
+
+/** The SDK door, loaded — or why not: `absent` is the optional dependency not installed. */
+export type SdkDoorAnswer =
+  | { ok: true; spawn: SpawnFn; version: string }
+  | { ok: false; reason: 'absent' | 'load-failed' | 'fallback'; detail?: string };
 
 /**
  * A session's usage meter (one-pool phase 6 — Pro's ledger, `pro/accounts/meter.ts`): fed every
@@ -903,6 +994,11 @@ const MAX_RESULT_TEXT = 200;
  */
 const DELEGATING_TOOLS = new Set(['Agent', 'Task']);
 
+/** A bounded list of short names out of a frame — strings only, each cut to 120. */
+function names(list: unknown[], max: number): string[] {
+  return list.filter((name): name is string => typeof name === 'string' && Boolean(name)).slice(0, max).map((name) => name.slice(0, 120));
+}
+
 export function buildArgv(request: SpawnRequest): string[] {
   // Only the `bypass` profile reaches for it, and `sanitize()` is still what
   // decides — passing the string alone gets it rewritten, as it always has.
@@ -925,8 +1021,10 @@ export function buildArgv(request: SpawnRequest): string[] {
   // and the relay's presence-only host on a session it is armed for. Never both.
   if (request.permissionPrompts === 'none') argv.push('--permission-prompts', 'none');
   else if (request.permissionPromptTool) argv.push('--permission-prompt-tool', request.permissionPromptTool);
-  if (request.resume) argv.push('--resume', request.resume);
-  else argv.push('--session-id', request.sessionId ?? randomUUID());
+  if (request.resume) {
+    argv.push('--resume', request.resume);
+    if (request.forkSession) argv.push('--fork-session');
+  } else argv.push('--session-id', request.sessionId ?? randomUUID());
   if (request.model) argv.push('--model', request.model);
   if (request.effort) {
     // The CLI only warns on an unknown value and carries on at its default, so
@@ -963,8 +1061,16 @@ export function buildArgv(request: SpawnRequest): string[] {
   if (request.subagentText) argv.push('--forward-subagent-text');
   if (request.hookEvents) argv.push('--include-hook-events');
   if (request.settings) argv.push('--settings', request.settings);
+  // What loads (measured-console phase 11): the console's tree, then the one
+  // allowed value of the one allowed source list. Blanks are dropped, as
+  // `--add-dir`'s are, so an unresolved path never swallows the next flag.
+  for (const dir of (request.pluginDirs ?? []).filter((d) => Boolean(d?.trim()))) argv.push('--plugin-dir', dir);
+  const settingSources = request.settingSources === ALLOWED_SETTING_SOURCES;
+  if (settingSources) argv.push('--setting-sources', ALLOWED_SETTING_SOURCES);
   if (request.appendSystemPrompt?.trim()) argv.push('--append-system-prompt', request.appendSystemPrompt);
-  return sanitize(argv, { allowBypass: bypass });
+  if (request.agents) argv.push('--agents', request.agents);
+  if (request.jsonSchema) argv.push('--json-schema', request.jsonSchema);
+  return sanitize(argv, { allowBypass: bypass, allowSettingSources: settingSources });
 }
 
 /** The one place a forbidden flag can be removed, so it is the only place to audit. */
@@ -979,6 +1085,13 @@ export function sanitize(argv: string[], opts: SanitizeOptions = {}): string[] {
     }
 
     if (FORBIDDEN_WITH_VALUE.includes(arg)) {
+      // The one allowance (measured-console phase 11): this flag, this value,
+      // asked for by the caller. Anything else under it is dropped as before.
+      if (arg === '--setting-sources' && opts.allowSettingSources && argv[i + 1] === ALLOWED_SETTING_SOURCES) {
+        out.push(arg, argv[i + 1]);
+        i++;
+        continue;
+      }
       // Drop the value with it. Left behind, it becomes a loose positional.
       log.warn('spawn.refused-flag', { flag: arg, droppedValue: argv[i + 1] });
       i++;
@@ -1007,6 +1120,37 @@ export function sanitize(argv: string[], opts: SanitizeOptions = {}): string[] {
   return out;
 }
 
+/**
+ * The read-only agents a session hands side work to, on the plan's subagent
+ * model (measured-console phase 6, A5): `Explore` — named so it overrides the
+ * built-in, which `CLAUDE_CODE_SUBAGENT_MODEL` alone does not move — a log
+ * reader and a docs reader. Read-only tools only: side work reads and reports,
+ * and the session that asked does every edit on its own model. Nothing here
+ * switches the session's own model mid-run.
+ */
+export const SIDE_AGENT_TOOLS: readonly string[] = Object.freeze(['Read', 'Grep', 'Glob']);
+
+export function sideAgents(model: string): Record<string, { description: string; prompt: string; tools: string[]; model: string }> {
+  const tools = [...SIDE_AGENT_TOOLS];
+  return {
+    Explore: {
+      description: 'Read-only search across many files: finds where something is and returns the conclusion with paths, not file dumps.',
+      prompt: 'You search a codebase read-only. Answer the question with file paths and line numbers and a short conclusion. Never edit a file.',
+      tools, model,
+    },
+    'log-reader': {
+      description: 'Reads a long log or test output and returns only what failed, with the ids and the lines that say why.',
+      prompt: 'You read logs read-only. Return the failing test ids, the error lines that explain each, and the log path. Never edit a file.',
+      tools, model,
+    },
+    'docs-reader': {
+      description: 'Reads documentation pages or reference files and returns the exact facts asked for, quoted, with where they came from.',
+      prompt: 'You read documentation read-only. Quote the exact sentences that answer the question and say which file or page each came from. Never edit a file.',
+      tools, model,
+    },
+  };
+}
+
 /** One NDJSON user message, the shape the CLI reads in streaming-input mode. */
 export function userMessage(text: string): string {
   return `${JSON.stringify({
@@ -1015,7 +1159,61 @@ export function userMessage(text: string): string {
   })}\n`;
 }
 
-export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((resolve) => {
+/**
+ * What the session core drives: the `claude` child itself, or a backend's
+ * stand-in for one (measured-console phase 20, B1). The core writes stream-json
+ * user lines to `stdin`, reads the CLI's stream-json frames from `stdout`, and
+ * signals `pid`'s group — so a stand-in hands it the frames of the session it
+ * runs and the pid of the `claude` it started. A stand-in whose process starts
+ * a moment later announces the pid with `'spawn'`, as a `ChildProcess` does.
+ */
+export type SessionChild = {
+  readonly pid?: number;
+  stdin: NodeJS.WritableStream & { writable: boolean } | null;
+  stdout: NodeJS.ReadableStream & { setEncoding(encoding: BufferEncoding): unknown } | null;
+  stderr: NodeJS.ReadableStream & { setEncoding(encoding: BufferEncoding): unknown } | null;
+  kill(signal?: NodeJS.Signals): boolean;
+  on(event: 'error', listener: (error: NodeJS.ErrnoException) => void): unknown;
+  on(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  once(event: 'spawn', listener: () => void): unknown;
+};
+
+/**
+ * A backend: how a session's process is started, given the argv and the
+ * environment the door decided. The one interpreter above it reads whatever
+ * it starts — which is what makes two backends indistinguishable to everything
+ * above the door (`invariants.test.ts` clause 1).
+ */
+export type SessionOpener = (request: SpawnRequest, argv: string[], env: NodeJS.ProcessEnv) => SessionChild;
+
+/** The subprocess backend: `claude` on PATH, piped, in its own process group. */
+const openSubprocess: SessionOpener = (request, argv, env) => spawn('claude', argv, {
+  cwd: request.cwd,
+  env,
+  // stdin is a pipe now: it carries the boot prompt, and it stays open so an
+  // operator can put a question to a phase that is already running.
+  stdio: ['pipe', 'pipe', 'pipe'],
+  // Its own process group, so a teardown can address `-pid` and reach what
+  // the CLI started — bash, MCP servers, subagents — instead of leaving them
+  // behind. Without it the child joins the CONSOLE's group: an orphan was
+  // found sitting in the group of a console that had already died, by which
+  // point nothing could address it as a group at all.
+  //
+  // `detached` sets the group and nothing else here; the child is still
+  // waited on, still piped, and still ends with this process by way of the
+  // teardown paths in `signals.ts`.
+  detached: true,
+});
+
+export const spawnClaude: SpawnFn = (request) => spawnVia(request, openSubprocess);
+
+/**
+ * The session core, over any backend (measured-console phase 20): the argv and
+ * environment are decided here for both, the opener starts the process, and
+ * every event, watchdog, signal and outcome below is the same code whichever
+ * started it.
+ */
+export const spawnVia = (request: SpawnRequest, open: SessionOpener): Promise<SpawnOutcome> => new Promise<SpawnOutcome>((resolve) => {
   const started = Date.now();
   if (Buffer.byteLength(request.prompt) > MAX_PROMPT_BYTES) {
     resolve(fail(`the boot prompt is over ${MAX_PROMPT_BYTES / 1024}KB — the plan is malformed`, started, [], resolveCaps(request)));
@@ -1033,32 +1231,23 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   const argv = buildArgv(request);
   const shown = [...argv];
 
-  const child = spawn('claude', argv, {
-    cwd: request.cwd,
-    env: childEnv({ ...request.env, PE_SESSION_ID: sessionIdForChild }),
-    // stdin is a pipe now: it carries the boot prompt, and it stays open so an
-    // operator can put a question to a phase that is already running.
-    stdio: ['pipe', 'pipe', 'pipe'],
-    // Its own process group, so a teardown can address `-pid` and reach what
-    // the CLI started — bash, MCP servers, subagents — instead of leaving them
-    // behind. Without it the child joins the CONSOLE's group: an orphan was
-    // found sitting in the group of a console that had already died, by which
-    // point nothing could address it as a group at all.
-    //
-    // `detached` sets the group and nothing else here; the child is still
-    // waited on, still piped, and still ends with this process by way of the
-    // teardown paths in `signals.ts`.
-    detached: true,
-  });
+  const child = open(request, argv, childEnv({ ...request.env, PE_SESSION_ID: sessionIdForChild }));
   // Its descendants are recorded while it lives, and the test runners among
-  // them that outlive it are ended with it (one-pool phase 26, #222).
-  if (child.pid) sessionReaper.begin(child.pid, { sessionId: sessionIdForChild });
+  // them that outlive it are ended with it (one-pool phase 26, #222). A
+  // backend whose `claude` starts a moment later says so with `'spawn'`.
+  const noteChildPid = (pid: number): void => {
+    sessionReaper.begin(pid, { sessionId: sessionIdForChild });
+    request.onPid?.(pid);
+  };
+  if (child.pid) noteChildPid(child.pid);
+  else child.once('spawn', () => { if (child.pid) noteChildPid(child.pid); });
 
   let sessionId = request.resume ?? undefined;
   let costUsd = 0;
   let creditFromUsd: number | undefined;
   let turns = 0;
   let resultText = '';
+  let structuredOutput: unknown;
   // The phase's own last prose (#108) — never a subagent's, never an assistant
   // line the CLI flagged as the API speaking.
   let lastText = '';
@@ -1228,8 +1417,6 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     if (parseErrors) log.warn('spawn.parse-errors', { pid: child.pid, count: parseErrors });
     resolve(outcome);
   };
-
-  if (child.pid) request.onPid?.(child.pid);
 
   const emit = (event: StreamEvent) => {
     lastEventAt = Date.now();
@@ -1555,6 +1742,9 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     escalation.push(term, kill);
   };
   request.signal?.addEventListener('abort', onAbort, { once: true });
+  // An abort that landed before the listener did — the door awaits its backend
+  // between the run's stop and this line — is acted on now, not never.
+  if (request.signal?.aborted) onAbort();
 
   /* ---- the first-event backstop ---- *
    *
@@ -1726,6 +1916,22 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         ...(typeof message.claude_code_version === 'string' && message.claude_code_version
           ? { version: message.claude_code_version.slice(0, 40) } : {}),
         ...(servers ? { mcpServers: servers } : {}),
+        // What loaded (measured-console phase 11): names and sources, bounded,
+        // never a path — a tree's path names the state directory.
+        ...(Array.isArray(message.plugins) ? {
+          plugins: message.plugins.flatMap((entry) => {
+            const plugin = entry as { name?: unknown; source?: unknown; version?: unknown } | null;
+            return typeof plugin?.name === 'string' && plugin.name
+              ? [{
+                name: plugin.name.slice(0, MAX_TOOL_NAME),
+                source: typeof plugin.source === 'string' ? plugin.source.slice(0, 120) : plugin.name.slice(0, MAX_TOOL_NAME),
+                ...(typeof plugin.version === 'string' && plugin.version ? { version: plugin.version.slice(0, 40) } : {}),
+              }]
+              : [];
+          }).slice(0, MAX_TOOL_NAMES),
+        } : {}),
+        ...(Array.isArray(message.skills) ? { skills: names(message.skills, 300) } : {}),
+        ...(Array.isArray(message.slash_commands) ? { slashCommands: names(message.slash_commands, 300) } : {}),
       });
       return;
     }
@@ -1987,6 +2193,10 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
             ...(agent ? { agent } : {}),
             ...(parent ? { parent } : {}),
             ...(item.name.startsWith(CHAT_TOOL_PREFIX) ? { args: chatToolArgs(input) } : {}),
+            // Which skill a Skill-tool call asked for (measured-console phase
+            // 11, `phase.skill-invoked`): a name, never its arguments.
+            ...(item.name === 'Skill' && typeof input.skill === 'string' && input.skill
+              ? { skill: input.skill.slice(0, 120) } : {}),
           });
           // The task list is in the stream and was being thrown away one
           // function call before it would have been kept: `summarise` reduces
@@ -2146,6 +2356,9 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       stepsAtResult = turnIds.size + anonymousTurns;
       const text = message.result ?? message.error;
       if (typeof text === 'string') resultText = text;
+      // The outcome a `--json-schema` session returned (B4) — the newest wins,
+      // as the newest result's words do.
+      if (message.structured_output !== undefined && message.structured_output !== null) structuredOutput = message.structured_output;
       // The error subtypes' own `errors` are the CLI's words, not the model's.
       if (Array.isArray(message.errors)) {
         for (const entry of message.errors) if (typeof entry === 'string' && entry) noteApiPart(entry);
@@ -2335,6 +2548,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       turns: bookedTurns,
       promptTurns,
       resultText,
+      ...(structuredOutput !== undefined ? { structuredOutput } : {}),
       ...(lastText ? { lastText } : {}),
       durationMs: Date.now() - started,
       argv: shown,

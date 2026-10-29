@@ -91,7 +91,7 @@ import {
   type PlanStats, type Portfolio, type PlanContext, type EtaEstimate, type EtaSample,
   type PhaseEta, type RateReading, type Forecast,
 } from './analysis/stats.ts';
-import { landFor, mcpServersFor, waitsOnFor, type Plan, type PhaseDetail, type PhaseRow, type PhaseSize } from './parse/plan.ts';
+import { landFor, mcpServersFor, pluginKindsFor, waitsOnFor, type Plan, type PhaseDetail, type PhaseRow, type PhaseSize } from './parse/plan.ts';
 import {
   bootFloorLine, FORECAST_UNIT, forecastLine, forecastSessions, sessionsPerPhaseOf, shippedContextModel,
 } from './analysis/sizing-model.ts';
@@ -448,6 +448,11 @@ export abstract class ServiceLive extends ServiceBase {
     // slept past its own 02:53Z clock until a person pressed Recheck at
     // 06:52Z. `armLimitResume` is a no-op when the clock is already armed.
     if (state.status === 'waiting' && state.waitUntil) this.armLimitResume(state.slug, state);
+    // A run paused on a usage window resumes from its clock too (`resumeLimitPaused`), and a
+    // re-read moves that clock (measured-console phase 24, #388): armed again on every emit.
+    else if (state.status === 'paused' && state.waitReason === 'usage-limit' && !state.pause && state.waitUntil) {
+      this.armLimitResume(state.slug, state);
+    }
     // Dedupe on the run *and* its status. Keying on the run alone — which this
     // did — meant a run announced once as parked could later halt, or finish,
     // in silence.
@@ -1250,10 +1255,10 @@ export abstract class ServiceLive extends ServiceBase {
     // session saving a plan each minute kept that queue from ever draining.
     // A plan is forgotten when it MOVED (new or deleted counts) or a path
     // NAMED it: the fingerprint does not cover every file the engine reads
-    // (`gate-status.md`, `landing.md`), so a terminal's `gate-approve.sh` must
-    // still drop that plan's cached gate status. A path no plan owns is a
-    // directory flush — something changed, not what — and still forgets every
-    // plan (PR-1c).
+    // (`landing.md`; `gate-status.md` moves the revision since 2026-10-20), so
+    // a write to one must still drop that plan's cached answers. A path no plan
+    // owns is a directory flush — something changed, not what — and still
+    // forgets every plan (PR-1c).
     const named = new Set(relevant.map(slugOf).filter((s): s is string => Boolean(s)));
     const flush = relevant.some((p) => !slugOf(p));
     const before = new Map(store.list().map((r) => [r.slug, r.revision]));
@@ -1289,6 +1294,8 @@ export abstract class ServiceLive extends ServiceBase {
     // settled — hours, on a one-lane run.
     if (paths.some((p) => p.includes('/.locks/'))) this.scheduler.poll();
     for (const slug of slugs) this.runners.get(slug)?.noteDocsChanged();
+    // …and a run whose PLAN file moved reads every open gate again (measured-console phase 30, #416).
+    for (const slug of slugs) if (paths.some((p) => p.endsWith(`/plans/${slug}.md`))) this.runners.get(slug)?.notePlanChanged();
     // …and every OTHER live run holding a phase on a gate (one-pool phase 23,
     // #239): a `plan <slug>:<N>` gate reads another plan's handoff, so the
     // change that opens it is never this run's own slug.
@@ -1511,6 +1518,12 @@ export abstract class ServiceLive extends ServiceBase {
       // this instance has registered. Always passed, for the same reason as
       // `mcpServers` — empty is a real answer, absent is a bare install.
       credentials: heldIdsCached(),
+      // …and the skills its sessions load, for F47 (measured-console phase 11)
+      // — only under `console-set`, the set the console owns.
+      ...((): { skills?: string[] } => {
+        const loads = this.sessionLoads();
+        return loads.mode === 'console-set' ? { skills: loads.skills } : {};
+      })(),
       accounts: [DEFAULT_ACCOUNT_ID, ...this.accounts.accountIds()],
       // F36 is told the workflow timeouts this console has learned (phase 14).
       waitTimeouts: waitTimeoutsCached(),
@@ -1884,6 +1897,16 @@ export abstract class ServiceLive extends ServiceBase {
     return [];
   }
 
+  /**
+   * A gate's answer the console just read after writing it (2026-10-20) —
+   * the newest there is, handed to the inbox, which holds its gate answers
+   * off the request path (`Service.inboxGates`) and would otherwise draw the
+   * gate a press just opened as shut until its refill lands.
+   */
+  protected gateRead(_slug: string, _phase: number, _gate: GateStatus | null): void {
+    /* the inbox's, in Service */
+  }
+
   async gateStatus(slug: string, phase: number) {
     const record = this.store?.get(slug);
     if (!record) return null;
@@ -1975,11 +1998,15 @@ export abstract class ServiceLive extends ServiceBase {
       return { ok: false, gate: null, detail: (error as Error).message };
     }
 
+    // The write touched one file of one plan (`gate-status.md`, which moves
+    // that plan's revision), so that plan alone is read again — never the
+    // portfolio: dropping every plan's cached board made the next page read
+    // re-shell 186 plans on the hub, ~45 s after each press (2026-10-20).
     this.reread(slug);
     const gate = await this.gateStatus(slug, phase);
+    this.gateRead(slug, phase, gate);
     const ok = opts.approve ? Boolean(gate?.clear) : outcome.ok;
     log.info('gate.approve', { slug, phase, approve: opts.approve, ok, by: opts.by, code: outcome.code });
-    if (ok) this.invalidateAll();
     // Every Your turn item bound to this gate settles with it (#371): its
     // proof reads the gate's row, and the gate now reads clear.
     if (ok && opts.approve) {
@@ -2862,6 +2889,8 @@ export abstract class ServiceLive extends ServiceBase {
         exitCriteria: detail?.exitCriteria,
         verification: detail?.verification,
         mcpServers: detail?.mcpServers,
+        // The plan's kinds for this phase, line ∪ bullet — what the launch's chips start from (measured-console phase 27).
+        ...(pluginKindsFor(plan, row.phase).length ? { plugins: pluginKindsFor(plan, row.phase) } : {}),
         handoffMustRecord: detail?.handoffMustRecord,
         bullets: detail?.bullets ?? [],
         row,

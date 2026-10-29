@@ -38,7 +38,7 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 import { INSTANCE_STATE_DIR } from './config.ts';
@@ -47,6 +47,7 @@ import {
   CATEGORIES, categoryOf, defaultCategories, sanitiseCategories, type CategoryId,
 } from './push/catalogue.ts';
 import { endpointRefusal } from './push/index.ts';
+import type { DeliveryTestAnswer, WebhooksState } from '../shared/wire/notifications.js';
 
 const FILE = join(INSTANCE_STATE_DIR, 'webhooks.json');
 
@@ -55,6 +56,31 @@ export const WEBHOOK_TIMEOUT_MS = 10_000;
 
 /** First backoff step after a failure; doubled per consecutive failure. */
 export const WEBHOOK_BACKOFF_BASE_MS = 30_000;
+
+/**
+ * The header a delivery is signed in (measured-console phase 17, EI-24):
+ * `sha256=<hex HMAC-SHA256 of the exact body bytes, keyed by the destination's
+ * secret>`. A receiver recomputes it over the raw body and compares in constant
+ * time; `docs/webhooks.md` shows how.
+ */
+export const WEBHOOK_SIGNATURE_HEADER = 'x-phase-console-signature';
+
+/** Events held for one destination while it backs off — far past any real outage's traffic. */
+export const WEBHOOK_QUEUE_MAX = 1000;
+
+/** The signature of one body under one secret, as the header carries it. */
+export function webhookSignature(secret: string, body: string): string {
+  return `sha256=${createHmac('sha256', secret).update(body, 'utf8').digest('hex')}`;
+}
+
+/** The visible half of a secret: enough to tell which one a receiver holds. */
+export function secretHint(secret: string | undefined): string | null {
+  return secret ? `…${secret.slice(-4)}` : null;
+}
+
+function newSecret(): string {
+  return `whsec_${randomBytes(24).toString('hex')}`;
+}
 
 /**
  * The ceiling on backoff, and deliberately not a death sentence.
@@ -120,10 +146,17 @@ export type Webhook = {
   quietUntil?: number;
   /** A row read from the machine profile (`fleet.json`) — delivered to, never persisted or removed here. */
   profile?: true;
+  /**
+   * The destination's signing secret (EI-24): every delivery carries
+   * `X-Phase-Console-Signature` over its body under it. Made when the row is,
+   * shown whole once — the add's answer — and as a hint after. A machine-profile
+   * row signs only when its `fleet.json` entry names one.
+   */
+  secret?: string;
 };
 
-/** A row as the API serves it: everything except the URL, which is a secret. */
-export type PublicWebhook = Omit<Webhook, 'url'> & { origin: string; tail: string };
+/** A row as the API serves it: everything except the URL and the secret, which are secrets; the secret's hint. */
+export type PublicWebhook = Omit<Webhook, 'url' | 'secret'> & { origin: string; tail: string; secretHint: string | null; queued: number };
 
 export type WebhookDelivery = {
   status: number;
@@ -387,18 +420,31 @@ export type WebhooksOptions = {
   fetch?: WebhookFetch;
   now?: () => number;
   /** The machine profile's rows (`fleet.json` `webhooks[]`), this console's override first. */
-  profileHooks?: readonly { url: string; name?: string; categories?: readonly string[] }[];
+  profileHooks?: readonly { url: string; name?: string; categories?: readonly string[]; secret?: string }[];
+  /** How a queue's drain is scheduled — `setTimeout`, unref'd; a test passes its own. */
+  schedule?: (run: () => void, ms: number) => void;
 };
 
 export class Webhooks {
   private hooks: Webhook[] = [];
   private readonly options: WebhooksOptions;
+  /**
+   * Per destination, what it has not been given yet (EI-24): an event that met
+   * the destination in backoff, or whose delivery failed, waits here in order
+   * and is delivered when the backoff ends — before anything newer. In memory:
+   * a restart starts every queue empty.
+   */
+  private readonly queues = new Map<string, WebhookPayload[]>();
+  private readonly draining = new Set<string>();
+  private readonly scheduled = new Set<string>();
   /** Fired after a row is added or removed — the delivery-channel check re-reads the count. */
   onRowsChanged?: () => void;
 
   constructor(options: WebhooksOptions) {
     this.options = options;
     this.hooks = read();
+    // A row that was just given its secret keeps it from this boot on.
+    if (mintedOnRead) { mintedOnRead = false; this.persist(); }
     // The machine profile's rows (`fleet.json` `webhooks[]`, FLT-3): every
     // console delivers to them, none persists or removes them — they are the
     // file's, changed where the file is. A URL this console registered itself
@@ -417,6 +463,7 @@ export class Webhooks {
         lastOkAt: null,
         failures: 0,
         profile: true,
+        ...(typeof row.secret === 'string' && row.secret.length >= 16 ? { secret: row.secret } : {}),
       });
     }
   }
@@ -430,7 +477,7 @@ export class Webhooks {
     return this.hooks.map((hook) => this.publicOf(hook));
   }
 
-  state(): { allowWebhooks: boolean; hooks: PublicWebhook[]; categories: readonly unknown[] } {
+  state(): WebhooksState & { hooks: PublicWebhook[] } {
     return { allowWebhooks: this.enabled, hooks: this.list(), categories: CATEGORIES };
   }
 
@@ -441,7 +488,7 @@ export class Webhooks {
    * one row, exactly as a repeat push subscription does, so an operator who
    * cannot remember whether they already added it does not end up with two.
    */
-  add(url: unknown, label: unknown, categories: unknown): PublicWebhook | { error: string } {
+  add(url: unknown, label: unknown, categories: unknown): (PublicWebhook & { secret?: string }) | { error: string } {
     const refusal = webhookUrlRefusal(url);
     if (refusal) return { error: refusal };
     const href = String(url).trim();
@@ -455,7 +502,9 @@ export class Webhooks {
       existing.failures = 0;
       delete existing.quietUntil;
       delete existing.lastFailure;
+      existing.secret ??= newSecret();
       this.persist();
+      void this.drain(existing);
       return this.publicOf(existing);
     }
 
@@ -467,11 +516,13 @@ export class Webhooks {
       createdAt: new Date().toISOString(),
       lastOkAt: null,
       failures: 0,
+      secret: newSecret(),
     };
     this.hooks.push(hook);
     this.persist();
     this.rowsChanged();
-    return this.publicOf(hook);
+    // The secret whole, this once: the receiver needs it to check a signature.
+    return { ...this.publicOf(hook), secret: hook.secret };
   }
 
   remove(id: unknown): boolean {
@@ -510,8 +561,7 @@ export class Webhooks {
   announce(category: CategoryId, event: WebhookEvent): Promise<void> | null {
     if (!this.enabled) return null;
     const now = this.options.now?.() ?? Date.now();
-    const targets = this.hooks.filter((hook) => hook.categories[category]
-      && !(hook.quietUntil && hook.quietUntil > now));
+    const targets = this.hooks.filter((hook) => hook.categories[category]);
     if (!targets.length) return null;
 
     const payload = composeWebhookPayload(category, event, {
@@ -519,14 +569,64 @@ export class Webhooks {
       link: this.options.link,
       at: new Date(now),
     });
-    // Fire-and-forget for every caller but the shutdown announcement, which
-    // awaits the settled posts before its process exits (SHD-4). Null above
-    // means nothing was sent at all.
-    return Promise.allSettled(targets.map((hook) => this.post(hook, payload))).then(() => undefined);
+    // Every target queues the event and drains: a destination in backoff keeps
+    // it for later (EI-24 — nothing is dropped), one that is up delivers what
+    // it was owed first, then this. Fire-and-forget for every caller but the
+    // shutdown announcement, which awaits the settled drains before its
+    // process exits (SHD-4).
+    for (const hook of targets) this.enqueue(hook, payload);
+    return Promise.allSettled(targets.map((hook) => this.drain(hook))).then(() => undefined);
+  }
+
+  /** Hold one event for one destination, in order; past the cap the oldest goes, said in the log. */
+  private enqueue(hook: Webhook, payload: WebhookPayload): void {
+    const queue = this.queues.get(hook.id) ?? [];
+    queue.push(payload);
+    while (queue.length > WEBHOOK_QUEUE_MAX) {
+      queue.shift();
+      log.warn('webhook.queue-full', { id: hook.id, origin: maskUrl(hook.url).origin, max: WEBHOOK_QUEUE_MAX });
+    }
+    this.queues.set(hook.id, queue);
+  }
+
+  /**
+   * Deliver what one destination is owed, oldest first, while it accepts. A
+   * failure keeps the event at the head and backs the destination off; the
+   * drain is then scheduled for when the backoff ends.
+   */
+  private async drain(hook: Webhook): Promise<void> {
+    if (this.draining.has(hook.id)) return;
+    this.draining.add(hook.id);
+    try {
+      const queue = this.queues.get(hook.id) ?? [];
+      while (queue.length && this.enabled && this.hooks.includes(hook)) {
+        const now = this.options.now?.() ?? Date.now();
+        if (hook.quietUntil && hook.quietUntil > now) { this.later(hook, hook.quietUntil - now); return; }
+        const result = await this.post(hook, queue[0]!);
+        if (!result.ok) { this.later(hook, backoffMs(hook.failures)); return; }
+        queue.shift();
+      }
+    } finally {
+      this.draining.delete(hook.id);
+    }
+  }
+
+  /** One drain per destination, when its backoff ends. */
+  private later(hook: Webhook, ms: number): void {
+    if (this.scheduled.has(hook.id)) return;
+    this.scheduled.add(hook.id);
+    const run = () => { this.scheduled.delete(hook.id); void this.drain(hook); };
+    if (this.options.schedule) { this.options.schedule(run, ms); return; }
+    setTimeout(run, Math.max(0, ms)).unref?.();
+  }
+
+  /** What one destination has not been given yet — the destination sheet's count. */
+  queued(id: unknown): number {
+    return this.queues.get(String(id))?.length ?? 0;
   }
 
   /** The Settings button: prove one URL, on demand, whatever its categories say. */
-  async test(id: unknown): Promise<{ ok: boolean; detail: string }> {
+  async test(id: unknown): Promise<DeliveryTestAnswer> {
     if (!this.enabled) {
       return { ok: false, detail: 'webhooks are disabled. Restart with --allow-webhooks to enable them.' };
     }
@@ -550,6 +650,7 @@ export class Webhooks {
     const send = this.options.fetch ?? defaultFetch;
     const now = () => this.options.now?.() ?? Date.now();
     let result: WebhookDelivery;
+    const body = JSON.stringify(payload);
     try {
       const response = await send(hook.url, {
         method: 'POST',
@@ -560,8 +661,10 @@ export class Webhooks {
           'user-agent': 'phase-console',
           'x-phase-console-category': payload.category,
           'x-phase-console-instance': payload.instance,
+          // EI-24: the body, signed with the destination's secret.
+          ...(hook.secret ? { [WEBHOOK_SIGNATURE_HEADER]: webhookSignature(hook.secret, body) } : {}),
         },
-        body: JSON.stringify(payload),
+        body,
         signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
       });
       result = { status: response.status, ok: response.ok };
@@ -591,8 +694,8 @@ export class Webhooks {
   }
 
   private publicOf(hook: Webhook): PublicWebhook {
-    const { url, ...rest } = hook;
-    return { ...rest, ...maskUrl(url) };
+    const { url, secret, ...rest } = hook;
+    return { ...rest, ...maskUrl(url), secretHint: secretHint(secret), queued: this.queued(hook.id) };
   }
 
   private persist(): void {
@@ -615,6 +718,9 @@ function reasonOf(error: unknown): string {
   return typeof message === 'string' && message ? message.slice(0, 120) : 'unreachable';
 }
 
+/** Set by `read()` when it gave a row its first secret, so the constructor writes it. */
+let mintedOnRead = false;
+
 function read(): Webhook[] {
   try {
     const parsed = JSON.parse(readFileSync(FILE, 'utf8')) as Webhook[];
@@ -625,6 +731,8 @@ function read(): Webhook[] {
         ...hook,
         categories: sanitiseCategories(hook.categories),
         failures: Number(hook.failures) || 0,
+        // A row written before EI-24 is given its secret on first read, and the register is written.
+        secret: typeof hook.secret === 'string' && hook.secret ? hook.secret : ((mintedOnRead = true), newSecret()),
       }));
   } catch {
     return [];

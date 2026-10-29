@@ -9,9 +9,10 @@
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
 import { handoffHalfWritten, siblingLintSkip, type SiblingLintSkip } from './lint-siblings.ts';
-import { parkOnStep, stepJournalFields } from '../human-steps.ts';
+import { parkOnStep, stepJournalFields, type DeclaredStep } from '../human-steps.ts';
 import { refusalFields } from '../turn/guard.ts';
 import { composeStepErrand } from '../turn/compose.ts';
+import { closingAskOf } from '../turn/packs.ts';
 import { comparedClause, stampTrees, type TreeStamp } from './tree-state.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
@@ -19,7 +20,7 @@ import { homedir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 import { log } from '../log.ts';
 import { onShutdown, offShutdown } from '../lifecycle.ts';
-import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, readVerifyTimeout, type Board } from '../engine.ts';
+import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, readVerificationTier, readVerifyTimeout, type Board } from '../engine.ts';
 import { mcpDirective, skillDirective } from '../skills.ts';
 import {
   classify, connectivityBackoffMs, fallbackChain, limitBucket, nextModel, resetWaitUntil, structuredRefusal,
@@ -42,6 +43,7 @@ import {
   verificationsFile, wipAttribution, wipOwners, WHOLE_COMMAND,
   type LedgerRow, type RedRow, type RedShare, type SessionWindow, type WipOwner,
 } from './verify-ledger.ts';
+import { changedSince, readSelectTable, selectLine, type VerifySelection, type VerifyUnselected } from './verify-select.ts';
 import { qaVerdictInstruction } from '../qa-session.ts';
 import type { QueueKind } from '../../shared/run-lifecycle.js';
 import { closeAttemptWindow, openAttemptWindow, phaseClocks } from '../../shared/phase-clocks.js';
@@ -52,7 +54,7 @@ import {
   roundBudgetUsd, type QaFixStrategy, type QaRecoverVerb,
 } from './qa-recover.ts';
 import { policyForKey } from './policy.ts';
-import { capsFor, lastWords, phaseCaps, raiseCap, type Cap, type SessionCaps } from './session-record.ts';
+import { capsFor, consoleEnded, lastWords, phaseCaps, raiseCap, type Cap, type SessionCaps } from './session-record.ts';
 import { CONNECTIVITY_PROBE_MS } from '../connectivity-probe.ts';
 import {
   evaluateWait, openWaitEntry, parkedMsOf, spendsWaitBudget, WAIT_FLOOR_MS, waitApproaching, waitBudgetFact,
@@ -100,6 +102,7 @@ import {
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome, needsOf } from './outcome.ts';
 import { PLAN_APPROVAL_NEED } from './plan-approval.ts';
+import { sessionReaper } from './reap.ts';
 import {
   AdmissionAborted, autopilotOwner, errandFoldTarget, type HeavyJobGrant, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
@@ -116,7 +119,7 @@ import {
   CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, PINNED_CAPACITY_RETRY_MS, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TAIL_CHARS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
 } from './runner-core.ts';
 import type { Runner } from './runner.ts';
-import { RunnerLoop } from './runner-loop.ts';
+import { KEEPER_STATUSES, RunnerLoop } from './runner-loop.ts';
 import { allLeadsMissingPark, approvalsForPhase, reviewPhase } from './verify-review.ts';
 import type { VerifyApprovals } from './verify.ts';
 import { withSpan } from '../trace.ts';
@@ -194,6 +197,8 @@ type BaselineJob = {
   text: string;
   commands: string[];
   setupText?: string;
+  /** The phase tier's selector (measured-console phase 15) — absent: every line as written. */
+  select?: (command: string) => VerifySelection | VerifyUnselected | undefined;
   approvals?: VerifyApprovals;
   /** Where its commands run: a clean checkout of the boarding head, or the tree in place. */
   cwd: string;
@@ -322,7 +327,12 @@ export abstract class RunnerAttempt extends RunnerLoop {
         } finally {
           this.rebriefing.delete(phase);
         }
-        if (!settled.rebrief) return settled;
+        if (!settled.rebrief) {
+          // Before the lane is released (`runPhase`), so the keep holds in the
+          // very pass that frees it (#192's window).
+          if (!settled.completed) await this.keepLaneAtAttemptEnd(phase);
+          return settled;
+        }
         const { policy, instruction, why, sessionId, unspawned } = settled.rebrief;
         current = await opts.rebrief!(reboardResumeBrief(instruction ?? resumePolicyInstruction(policy!, sessionId)), {
           sessionId, why: why ?? resumePolicyWhy(policy!), unspawned,
@@ -576,6 +586,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // The account this session will spend, stamped as it is asked for
       // (control-tower phase 92): a later boundary switch moves the run, not it.
       lane.accountId = state.accountId ?? 'default';
+      const pluginSet = this.pluginSetFor(phase, chosen);
       const outcome = await this.spawnSession(phase, 'phase', {
         prompt: sessionPrompt,
         // The lane's own worktree when this plan opted into them, the shared root
@@ -620,6 +631,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // Only when the phase asked for servers and got none of them. See
         // `resolveMcp`: an emptied set still has to be a CLOSED set.
         ...(opts.mcp?.strict ? { strictMcp: true } : {}),
+        // Its plugin set (measured-console phase 27), resolved per attempt like
+        // the MCP file, so an install made between attempts reaches the retry.
+        ...(pluginSet ? { pluginSet } : {}),
         permissionMode: chosen.permissionMode as never,
         // Read fresh each attempt, so a profile changed mid-run is in force for
         // the next phase rather than for the next run.
@@ -766,6 +780,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // stand.
       const words = lastWords(outcome);
       if (words.said || !words.transportError) record.said = words.said;
+      // …and whole, for the exit-time check (measured-console phase 29): the
+      // questions a session ends on are at its END, past what `said` keeps.
+      this.closingWords.set(phase, words.transportError ? (words.said ? String(outcome.lastText ?? '') : '') : String(outcome.resultText ?? ''));
       // `phase.session` — attempt, caps, ending, the session's own closing
       // words — was written by `spawnSession` the moment the child exited.
 
@@ -1566,6 +1583,41 @@ export abstract class RunnerAttempt extends RunnerLoop {
   /* ---- the verification's clock and ledger (control-tower phase 83, #95 #103) ---- */
 
   /** The plan's `Verify timeout:` for this phase, as the engine reads it — undefined is silence. */
+  /**
+   * The phase tier's selector (measured-console phase 15): under
+   * `**Verification tier:** impact`, what each heavy line of this phase runs
+   * AS — its selected form over the files changed since `base` (the boarding
+   * head, which also seeds the sample), journalled once per line as
+   * `phase.verify-selected`. Undefined — every line as written — under `full`,
+   * silence, a cwd below its repository's top (the forms' paths are the top's),
+   * a repository with no table, or a base git cannot diff against.
+   */
+  protected async verifySelectorFor(
+    phase: number, cwd: string, base: string | null | undefined, purpose: 'verify' | 'baseline',
+  ): Promise<((command: string) => VerifySelection | VerifyUnselected | undefined) | undefined> {
+    if (!base) return undefined;
+    let tier: ReturnType<typeof readVerificationTier>;
+    try { tier = readVerificationTier(await this.engine(['--verification-tier', String(phase)])); } catch { return undefined; }
+    if (tier?.tier !== 'impact') return undefined;
+    const tree = await workingTreeOf(cwd).catch(() => null);
+    if (!tree || withinRepo(tree.top, cwd) !== '') return undefined;
+    const table = readSelectTable(tree.top);
+    const changed = table ? changedSince(tree.top, base) : null;
+    if (!table || !changed) return undefined;
+    const said = new Set<string>();
+    return (command) => {
+      const folded = foldCommand(command);
+      const choice = selectLine({ table, repoRoot: tree.top, folded, changed, base, seed: base });
+      if (choice && !said.has(folded)) {
+        said.add(folded);
+        this.record('phase.verify-selected', choice.tier === 'phase'
+          ? { purpose, line: folded, tier: 'phase', row: choice.row, ranAs: choice.form, selected: choice.selected, sample: choice.sample, covered: choice.covered, base }
+          : { purpose, line: folded, tier: 'full', row: choice.row, reason: choice.reason, base }, phase);
+      }
+      return choice;
+    };
+  }
+
   private async verifyTimeoutDirective(phase: number): Promise<{ minutes: number; source: 'phase' | 'plan' } | undefined> {
     try {
       return readVerifyTimeout(await this.engine(['--verify-timeout', String(phase)]));
@@ -1582,13 +1634,18 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   protected async verifyLimitsFor(
     phase: number, text: string | undefined, approvals?: VerifyApprovals,
+    select?: (command: string) => VerifySelection | VerifyUnselected | undefined,
   ): Promise<{ timeoutFor: (command: string) => number; limit: NonNullable<PhaseRecord['verifyLimit']> }> {
     const state = this.state!;
     const directive = await this.verifyTimeoutDirective(phase);
     const rows = directive ? [] : readLedger(verificationsFile(state.root, state.slug), state.slug);
     const commands = extractCommands(text, 'verify', approvals).commands;
     const each = commands.map((command) => {
-      const resolved = resolveVerifyLimit({ command, rows, ...(directive ? { directive } : {}) });
+      const resolved = resolveVerifyLimit({
+        command, rows, ...(directive ? { directive } : {}),
+        // A selected line's clock is measured from selected runs alone (phase 15).
+        ...(select?.(command)?.tier === 'phase' ? { tier: 'phase' as const } : {}),
+      });
       return { command, ms: resolved.ms, source: resolved.source };
     });
     const byLine = new Map(each.map((entry) => [foldCommand(entry.command), entry.ms]));
@@ -1634,6 +1691,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
         ...(!row.ok && row.output?.trim() ? { tail: outputTail(row.output) } : {}),
         ...(row.environment ? { environment: row.environment } : {}),
         ...(kind === 'verify' ? { own: mine ? (mine.failures.length ? [...mine.failures] : [WHOLE_COMMAND]) : [] } : {}),
+        // The phase tier (measured-console phase 15): the key stays the line's own text.
+        ...(row.tier === 'phase' ? {
+          tier: 'phase' as const, ...(row.ranAs ? { ranAs: row.ranAs } : {}),
+          selected: row.selected ?? [], sample: row.sample ?? [], covered: row.covered ?? 0,
+        } : {}),
       };
     });
   }
@@ -1909,6 +1971,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
       dir: base ? withinRepo(base.top, cwd) : '',
       rows: readConsoleLedgers(state.root),
     };
+    // The phase tier (measured-console phase 15): the baseline runs the same
+    // selected forms the verdict will, seeded by the same boarding head.
+    const select = await this.verifySelectorFor(phase, inPlace, base?.head, 'baseline');
+    if (select) job.select = select;
     const missing = commands.filter((command) => !this.reuseBaselineLine(job, command));
     if (beside && missing.length) {
       // BESIDE the session: the boarding goes on at once.
@@ -1953,7 +2019,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
   private reuseBaselineLine(job: BaselineJob, command: string, chain?: string): boolean {
     if (!job.base) return false;
     const now = Date.now();
-    const prior = reusableRun(job.rows, { command, tree: job.base.tree, env: job.env, dir: job.dir, now });
+    const choice = chain ? undefined : job.select?.(command);
+    const prior = reusableRun(job.rows, {
+      command, tree: job.base.tree, env: job.env, dir: job.dir, now,
+      ...(choice?.tier === 'phase' ? { tier: 'phase' as const, ranAs: choice.form } : {}),
+    });
     if (!prior) return false;
     job.lines.push({
       command: prior.command, ...(chain ? { chain: foldCommand(chain) } : {}), ok: prior.ok, code: prior.code,
@@ -1980,7 +2050,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const file = verificationsFile(state.root, state.slug);
     let loadWaitMs = 0;
     let limits: { timeoutFor: (command: string) => number; limit: NonNullable<PhaseRecord['verifyLimit']> } | null = null;
-    const limitsFor = async () => (limits ??= await this.verifyLimitsFor(phase, job.text, job.approvals));
+    const limitsFor = async () => (limits ??= await this.verifyLimitsFor(phase, job.text, job.approvals, job.select));
     // Before boarding the commands own the lane: the stall detector stands
     // down and the restart drain waits on their limit, as for a verification.
     // Beside a session they own nothing — the session's silence still counts.
@@ -2032,6 +2102,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
           onStart: (command, index, total) => this.noteVerifying(phase, 'baseline', { command, index, total }, { startedAt: job.at, exported: job.exported }),
           onSetupStart: (command, index, total) => this.noteVerifying(phase, 'baseline', { command, index, total }, { startedAt: job.at, exported: job.exported, stage: 'setup' }),
           ...(job.setupText ? { setupText: job.setupText } : {}),
+          ...(job.select ? { select: job.select } : {}),
           timeoutMs: VERIFY_TIMEOUT_MS, timeoutFor,
         });
         // A stop cut it: nothing was learned, and the next boarding asks again.
@@ -2435,7 +2506,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // restart drain reads it, and the tree the commands are about to read —
     // what the ledger files this run under, for the next phase's baseline.
     const measuring = !waived && !allWaived;
-    const limits = measuring ? await this.verifyLimitsFor(phase, text, approvals) : null;
+    // The phase tier (measured-console phase 15): heavy lines run selected,
+    // over what changed since the boarding head the baseline measured.
+    const select = measuring ? await this.verifySelectorFor(phase, cwd, record.baseline?.head, 'verify') : undefined;
+    const limits = measuring ? await this.verifyLimitsFor(phase, text, approvals, select) : null;
     if (limits) record.verifyLimit = limits.limit;
     // The tree the commands read must be the PHASE's (control-tower phase 89,
     // #103, #41): a working tree carrying changes that are not its own — a
@@ -2477,6 +2551,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // limit wins over it (#95): the plan's word, else its measured history.
       timeoutMs: VERIFY_TIMEOUT_MS,
       ...(limits ? { timeoutFor: limits.timeoutFor } : {}),
+      ...(select ? { select } : {}),
       signal: this.abort?.signal ?? undefined,
       onStart: (command, index, total) => {
         this.noteVerifying(phase, 'verify', { command, index, total }, { startedAt, exported: Boolean(exported) });
@@ -2864,6 +2939,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
       ...(record.verification?.export ? { exported: true } : {}),
     }, phase);
     this.emit('phase', { phase, status: 'done' });
+    // A red that is another phase's names its owner: when that phase's session
+    // is worth resuming it is resumed with the failure now (phase 25).
+    if (inheritedOnly) this.routeOwed(record);
     // AFTER the phase reads done and its `phase.done` line is journalled, and
     // deliberately: the reviewer reads the diff bracketed by the handoff this
     // phase just wrote, so it cannot run before the phase has finished landing
@@ -3041,7 +3119,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     let prompt = brief;
     const boardFresh = async (): Promise<boolean> => {
       let boot = '';
-      try { boot = (await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV, ...this.issuePolicyEnv() })).stdout; } catch { boot = ''; }
+      try { boot = (await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV, ...this.issuePolicyEnv(), ...this.briefEnv() })).stdout; } catch { boot = ''; }
       if (!boot.trim()) {
         this.record('phase.qa-session-skipped', {
           reason: `the engine produced no boot prompt for phase ${phase}, so no fresh session could be boarded`,
@@ -4036,6 +4114,30 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * session that did the work and stopped one step short of recording it should
    * be asked to finish rather than have the run halted under it.
    */
+  /**
+   * What the newest session's closing words ask a person, as the declaration
+   * it never wrote (measured-console phase 29), or null. Read once per ending,
+   * and only for a session that ended on its own — the console's cut, an error
+   * ending, a recheck or a `stuck` board says nothing about a question.
+   */
+  private closingAsk(phase: number, boardState: string | undefined): PhaseOutcome | null {
+    const text = this.closingWords.get(phase);
+    this.closingWords.delete(phase);
+    if (!text || this.rechecking === phase || boardState === 'stuck') return null;
+    if (this.stopRequested || this.shuttingDown || this.abort?.signal.aborted) return null;
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    const last = record.lastSession;
+    if (consoleEnded(last?.endedBy) || (last?.subtype && last.subtype !== 'success')) return null;
+    const ask = closingAskOf(text, { ref: record.sessionId ?? `${state.id}:${phase}` });
+    if (!ask) return null;
+    this.record(ask.event, { ...ask.data, title: ask.step.title }, phase);
+    return {
+      version: 1, slug: state.slug, phase, status: 'needs-human', needs: 'ambiguity', reason: ask.reason,
+      step: ask.step as DeclaredStep, watch: [], written_at: new Date().toISOString(), raisedBy: 'console',
+    };
+  }
+
   private async closed(
     phase: number, declared: PhaseOutcome | null, raises = 0,
   ): Promise<'done' | 'waiting' | 'halted' | 'frozen' | 'interrupted'> {
@@ -4064,6 +4166,18 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // answered in the same holding pattern, thirty seconds later, and halted.
     if (declared) {
       const routed = await this.routeOutcome(phase, declared, board);
+      if (routed) return routed;
+    }
+
+    // The prose-question rule (measured-console phase 29, §Architecture 6 D7):
+    // a session that ENDED on a question for a person — prose the relay never
+    // saw (it catches only AskUserQuestion), or a gstack run stopped at its
+    // gate — and declared nothing is read as the `needs-human` it did not
+    // write: ONE item, raised by the console, the phase parked on it, and the
+    // same session resumed with the answer.
+    const ask = declared ? null : this.closingAsk(phase, board.states[phase]);
+    if (ask) {
+      const routed = await this.routeOutcome(phase, ask, board);
       if (routed) return routed;
     }
 
@@ -4476,7 +4590,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // waits on a PERSON and charges no external-wait budget (`parkOnStep`).
         const raised = declared.step
           ? this.deps.humanStep?.({
-            slug: state.slug, phase, birth: 'session', step: declared.step, runId: state.id,
+            slug: state.slug, phase, birth: declared.raisedBy === 'console' ? 'console' : 'session', step: declared.step, runId: state.id,
             ...(record.sessionId ? { sessionId: record.sessionId } : {}),
           }) ?? null
           : null;
@@ -4742,6 +4856,57 @@ export abstract class RunnerAttempt extends RunnerLoop {
   }
 
   /**
+   * The Stop hook's fast gate (measured-console phase 6, C4): before a session
+   * that is ENDING its work lets its turn go, the console runs the phase's fast
+   * lines (`fastGateLines` — its own §Verification lines measured at five
+   * minutes or less, ten in all) on the tree as the session leaves it, in
+   * place, uncommitted work included: what it is about to hand off. Answers the
+   * red lines with their failing ids, `[]` when every line is green, or null
+   * when nothing ran (no line measured fast, the phase's `- **Fast gate:**
+   * off`, the run stopping) — journalled `phase.fast-gate` either way but the
+   * last. The caller (`Service.decideStop`) blocks at most once per session.
+   */
+  async stopGate(phase: number): Promise<{ command: string; failures: string[] }[] | null> {
+    const state = this.state;
+    if (!state || this.abort?.signal.aborted || this.stopRequested) return null;
+    if (!this.fastGateOn(phase)) {
+      this.record('phase.fast-gate', { skipped: 'the phase says `- **Fast gate:** off`', lines: 0 }, phase);
+      return null;
+    }
+    const text = await this.deps.verificationText(state.slug, phase);
+    const approvals = this.verifyApprovalsFor(phase);
+    const commands = extractCommands(text, 'verify', approvals).commands;
+    const gate = fastGateLines(commands, readLedger(verificationsFile(state.root, state.slug), state.slug));
+    if (!gate.lines.length) {
+      this.record('phase.fast-gate', { skipped: 'no line of this phase\'s §Verification is measured fast', lines: 0 }, phase);
+      return null;
+    }
+    const cwd = await this.verifyCwd(phase);
+    const startedAt = this.now().toISOString();
+    const verify = this.deps.verify ?? verifyPhase;
+    let ran: VerifyRun[] = [];
+    try {
+      const summary = await verify(gate.lines.map((line) => `- \`${line}\``).join('\n'), {
+        cwd, purpose: 'fast-gate', cascade: false,
+        ...(approvals ? { approvals } : {}),
+        preflightSkip: this.verifyEnv().preflightSkip,
+        timeoutMs: FAST_GATE_BUDGET_MS, timeoutFor: (command) => gate.limitMs[foldCommand(command)] ?? FAST_GATE_BUDGET_MS,
+        signal: this.abort?.signal ?? undefined,
+        onStart: (command, index, total) => this.noteVerifying(phase, 'fast-gate', { command, index, total }, { startedAt }),
+      });
+      ran = RunnerAttempt.finalRows(summary.ran).filter((row) => !row.proven);
+    } finally {
+      this.noteVerifying(phase, null);
+    }
+    if (this.abort?.signal.aborted || this.stopRequested) return null;
+    const red = ran.filter((row) => !row.ok && !row.timedOut && !row.environment)
+      .map((row) => ({ command: foldCommand(row.command), failures: (row.failures ?? []).slice(0, 20) }));
+    const ms = ran.reduce((sum, row) => sum + row.ms, 0);
+    this.record('phase.fast-gate', { ok: !red.length, lines: ran.length, ms, ...(red.length ? { red } : {}) }, phase);
+    return red;
+  }
+
+  /**
    * What a booting lane must be told about its tree (control-tower phase 89):
    *  - a sibling's committed WIP that its wrap-up gate found RED (`wipRed`,
    *    #127) — the lines, the failing tests, the files, and whose they are;
@@ -4965,6 +5130,28 @@ export abstract class RunnerAttempt extends RunnerLoop {
     record.keepsLane = { at, reason: job && !paths ? 'detached-verify' : reason, sessionId, paths, ...(job ? { watch: job } : {}) };
     this.record('phase.lane-kept', { reason: record.keepsLane.reason, paths, sessionId, ...(job ? { watch: job } : {}) }, phase);
     return true;
+  }
+
+  /**
+   * The keep an attempt's END owes (measured-console phase 13, #417 — a
+   * regression of #354). `keepsLane` is spent the moment the phase boards
+   * again, and until now only the outcome arms wrote it back — a `partial`, a
+   * `waiting-external`, the wrap-up — so an attempt the console ended from
+   * OUTSIDE, with no declaration, kept nothing: hub run 29fb3925d4d9's phase
+   * 12 re-boarded over its own 39 staged paths, its retry was rate limited
+   * mid-session (the live wall checkpointed the child and parked the phase
+   * `waiting` on the window), and phase 13 of the same run boarded into the
+   * staged work. So whatever ended the attempt — a live usage wall, a cap, an
+   * account switch, a watchdog's checkpoint — a phase it leaves resumable
+   * (`KEEPER_STATUSES`) with its own WIP still uncommitted in a shared tree
+   * keeps its lane again (`phase.lane-kept`, reason `usage-wall` when it waits
+   * on a usage window, else `interrupted`). An outcome arm that already kept
+   * it is left alone; a phase parked for a person, failed or done keeps nothing.
+   */
+  private async keepLaneAtAttemptEnd(phase: number): Promise<void> {
+    const record = this.state?.phases[String(phase)];
+    if (!record || record.keepsLane || !KEEPER_STATUSES.includes(record.status)) return;
+    if (await this.keepLaneIfOwed(phase, record, record.usageWall ? 'usage-wall' : 'interrupted')) this.persist();
   }
 
   private wrapupAsked(record: PhaseRecord, reason: string | null | undefined): boolean {
@@ -5287,6 +5474,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
       }
     }
     declared = { ...declared, watch: watchList };
+    // The jobs these refs name outlive the session, whoever ends it — the
+    // reaper spares them for its spare window (measured-console phase 13, #409).
+    sessionReaper.keep(declared.session_id ?? record.sessionId, watchList);
     // Refs nothing will ever probe are named, not dropped (WAI-11): the session
     // said how to know its wait was over, and a silent clock is not that.
     const unpollable = unpollableRefs(declared.watch);

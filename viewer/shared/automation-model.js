@@ -92,6 +92,13 @@ export const AUTOMATION_MAP = Object.freeze({
   watchCmdRefs: ['watch', 'cmdRefs'],
   watchMintedCmdRefs: ['watch', 'mintedCmdRefs'],
 
+  // What an unattended session loads (measured-console phase 11, `runner/loads.ts`):
+  // the console's own tree or the operator's config dir, the personal plugins
+  // switched on for autopilot, and the per-repository knowledge-graph tool.
+  autopilotLoads: ['loads', 'mode'],
+  autopilotPlugins: ['loads', 'plugins'],
+  graphTool: ['loads', 'graphTool'],
+
   // When a lane stops being work.
   stallSilentMs: ['stall', 'silentMs'],
   stallSpinTurns: ['stall', 'spinTurns'],

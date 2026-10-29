@@ -12,9 +12,13 @@
  * 1.1–5.0.
  *
  * SM-1..3 hold the new model to the measured corpus
- * (`fixtures/sizing/sessions-corpus.json`, two consoles of this machine,
- * anonymised) and the shipped numbers in `sizing.env` to the model's own fit
- * of that corpus, so neither can drift from what was measured.
+ * (`fixtures/sizing/sessions-corpus.json`, anonymised): console-a and
+ * console-b are the audit week (2026-09-16 → 2026-09-25) the model was first
+ * fitted on, console-c is measured-console phases 15–32 on the lean skill
+ * (2026-10-26 → 2026-10-28). The shipped numbers in `sizing.env` are the
+ * model's own fit of console-c (measured-console phase 33,
+ * `reports/p33-after.json` `boot_floor_fit`), so neither can drift from
+ * what was measured.
  */
 import './state-sandbox.ts';
 
@@ -41,6 +45,10 @@ type Corpus = {
 };
 const CORPUS: Corpus = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', 'sizing', 'sessions-corpus.json'), 'utf8'));
 const SHIPPED = loadSizing(join(SKILL_DIR, 'scripts'));
+/** The audit week — the corpus the 8.0 model was fitted on, and the caps' window. */
+const AUDIT = CORPUS.sessions.filter((s) => s.instance === 'console-a' || s.instance === 'console-b');
+/** measured-console phases 15–32: what `sizing.env` is fitted on since phase 33. */
+const LEAN = CORPUS.sessions.filter((s) => s.instance === 'console-c');
 const WEIGHT = { S: SHIPPED.S, M: SHIPPED.M, L: SHIPPED.L } as const;
 
 /** "Near 1": the measured median peak within a fifth of what the model says, for every tag. */
@@ -49,14 +57,17 @@ const NEAR = 0.2;
 const consoles = [
   ['console-a', CORPUS.sessions.filter((s) => s.instance === 'console-a')],
   ['console-b', CORPUS.sessions.filter((s) => s.instance === 'console-b')],
-  ['both', CORPUS.sessions],
+  ['both', AUDIT],
+  ['console-c', LEAN],
 ] as const;
 
 test('SM-1: the measured peak ÷ (floor + slope × weight) sits near 1 for every tag — on each console and on both', () => {
   for (const [name, sessions] of consoles) {
     const model = fitContextModel(sessions, SHIPPED);
     assert.equal(model.basis, 'measured', name);
-    assert.deepEqual(model.sizes.map((s) => s.size), ['S', 'M', 'L'], `${name}: every tag measured`);
+    // console-c's phases 15–32 held no S phase: it measures the two tags it ran.
+    const tags = name === 'console-c' ? ['M', 'L'] : ['S', 'M', 'L'];
+    assert.deepEqual(model.sizes.map((s) => s.size), tags, `${name}: every tag it ran measured`);
     for (const row of model.sizes) {
       assert.ok(Math.abs(row.ratio - 1) <= NEAR, `${name} ${row.size}: median peak ${row.medianPeak} is ${row.ratio.toFixed(3)} × the model`);
     }
@@ -64,7 +75,7 @@ test('SM-1: the measured peak ÷ (floor + slope × weight) sits near 1 for every
 });
 
 test('SM-1: the model it replaces — context ≈ 3 × weight — missed every tag, the smallest by 7×', () => {
-  const model = fitContextModel(CORPUS.sessions, SHIPPED);
+  const model = fitContextModel(AUDIT, SHIPPED);
   const old = model.sizes.map((row) => ({ size: row.size, ratio: row.medianPeak / (3 * WEIGHT[row.size as 'S' | 'M' | 'L']) }));
   for (const row of old) assert.ok(row.ratio > 1.8, `${row.size} ran ${row.ratio.toFixed(2)} × the old line`);
   assert.ok(old[0]!.ratio > 7, 'an S phase peaked at more than seven times its 3 × weight');
@@ -75,7 +86,7 @@ test('SM-1: the model it replaces — context ≈ 3 × weight — missed every t
 });
 
 test('SM-2: the floor is the boot the first call read, plus the work above it — and a batch pays it ONCE', () => {
-  const model = fitContextModel(CORPUS.sessions, SHIPPED);
+  const model = fitContextModel(AUDIT, SHIPPED);
   assert.ok(model.bootMeasured, 'the boot is measured from the first calls');
   assert.equal(model.boot, model.bootMeasured.tokens);
   assert.equal(Math.round(model.boot + model.work), Math.round(model.floor));
@@ -87,14 +98,28 @@ test('SM-2: the floor is the boot the first call read, plus the work above it �
   assert.ok(two < 2 * contextOf(model, WEIGHT.L));
 });
 
-test('SM-2: the shipped sizing.env IS the corpus\'s fit — boot, work floor and slope, to the rounding', () => {
-  const model = fitContextModel(CORPUS.sessions, SHIPPED);
+test('SM-2: the shipped sizing.env IS console-c\'s fit — boot, work floor and slope, to the rounding', () => {
+  const model = fitContextModel(LEAN, SHIPPED);
+  assert.equal(model.samples, 20, 'the twenty fresh phase sessions of measured-console phases 15–32');
   assert.ok(Math.abs(SHIPPED.bootFloor - model.boot) <= 1_000, `boot ${model.boot} vs SESSION_BOOT_FLOOR ${SHIPPED.bootFloor}`);
   assert.ok(Math.abs(SHIPPED.workFloor - model.work) <= 1_000, `work ${model.work} vs SESSION_WORK_FLOOR ${SHIPPED.workFloor}`);
   assert.ok(Math.abs(SHIPPED.slopePct - model.slope * 100) <= 1, `slope ${model.slope} vs SESSION_SLOPE_PCT ${SHIPPED.slopePct}`);
   // And the shipped model sits near 1 on the corpus as well.
   const shipped = shippedContextModel(SHIPPED);
   for (const row of model.sizes) assert.ok(Math.abs(row.medianPeak / contextOf(shipped, row.weight) - 1) <= NEAR, row.size);
+});
+
+test('SM-2: the lean skill halved the boot and lowered the whole line — the audit week still fits the 8.0 numbers', () => {
+  const audit = fitContextModel(AUDIT, SHIPPED);
+  const lean = fitContextModel(LEAN, SHIPPED);
+  // 8.0 shipped 121K + 198K + 2.17 × weight, the audit week's own fit.
+  assert.ok(Math.abs(audit.boot - 121_000) <= 1_000, `audit boot ${audit.boot}`);
+  assert.ok(Math.abs(audit.work - 198_000) <= 1_000, `audit work ${audit.work}`);
+  assert.ok(Math.abs(audit.slope * 100 - 217) <= 1, `audit slope ${audit.slope}`);
+  // measured-console's target (§2): a floor under 90K. The boot is it.
+  assert.ok(lean.boot < 90_000, `the lean boot ${lean.boot}`);
+  assert.ok(lean.boot < audit.boot / 2, 'the boot more than halved');
+  for (const weight of [WEIGHT.M, WEIGHT.L]) assert.ok(contextOf(lean, weight) < contextOf(audit, weight), `a ${weight} phase peaks lower`);
 });
 
 test('SM-2: a repository that has measured its boot but not yet a fit takes its own boot and the shipped work', () => {
@@ -157,7 +182,7 @@ test('SM-3: the control-tower-sized plan — the forecast a plan can quote inste
  * ------------------------------------------------------------------ */
 
 type CorpusSession = SizingSession & { instance: string; at: string; turns: number; usd: number; bookedUsd?: number };
-const LINES: CapSample[] = (CORPUS.sessions as CorpusSession[]).map((s) => ({
+const LINES: CapSample[] = (AUDIT as CorpusSession[]).map((s) => ({
   mode: s.mode, at: s.at, turns: s.turns, costUsd: s.usd, bookedUsd: s.bookedUsd, resumed: s.resumed,
 }));
 const NOW = Date.parse('2026-09-25T12:00:00Z');
@@ -184,7 +209,7 @@ test('SM-4: a mode\'s caps are its p99 + 50 % over the window, rounded up — an
 
 test('SM-4: a correct cap binds on a runaway and never on the p90 — the per-size rows it replaces did the opposite', () => {
   const table = deriveCapTable(LINES, NOW);
-  const fresh = (CORPUS.sessions as CorpusSession[]).filter((s) => s.mode === 'phase' && !s.resumed);
+  const fresh = (AUDIT as CorpusSession[]).filter((s) => s.mode === 'phase' && !s.resumed);
   const q = (values: number[], p: number) => { const a = [...values].sort((x, y) => x - y); return a[Math.floor((a.length - 1) * p)]!; };
   const turnsP90 = q(fresh.map((s) => s.turns), 0.9);
   const usdP90 = q(fresh.map((s) => s.usd), 0.9);

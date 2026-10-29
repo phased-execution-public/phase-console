@@ -309,3 +309,49 @@ describe('the second palette, Departures, clears AA in both lights (#362)', () =
     });
   }
 });
+
+describe('Tower strips: each state’s edge and tint read in both lights and both rooms (2026-10-20)', () => {
+  /** A room token in Quiet, and as Departures paints it. */
+  const rooms = {
+    quiet: (token: string) => pair(token)!,
+    departures: (token: string) => pair(token, DEPARTURES) ?? pair(token)!,
+  };
+  for (const state of STATES) {
+    const base = pair(`--status-${state}`)!;
+    const vivid = pair(`--status-${state}-vivid`);
+    const tint = pair(`--status-${state}-tint`);
+
+    it(`${state}'s edge and tint are light-dark pairs at its own hue, inside sRGB`, () => {
+      expect(vivid, `--status-${state}-vivid`).toBeTruthy();
+      expect(tint, `--status-${state}-tint`).toBeTruthy();
+      for (const theme of THEMES) {
+        // The same hue as the state: the edge and the tint are the state, louder
+        // or quieter — never a ninth colour, and never a second amber.
+        expect(vivid![theme].h, `${state} vivid hue (${theme})`).toBe(base[theme].h);
+        expect(tint![theme].h, `${state} tint hue (${theme})`).toBe(base[theme].h);
+        expect(inGamut(vivid![theme]), `${state} vivid (${theme}) inside sRGB`).toBe(true);
+        expect(inGamut(tint![theme]), `${state} tint (${theme}) inside sRGB`).toBe(true);
+      }
+    });
+
+    for (const theme of THEMES) {
+      it(`${state}'s word on its tint (${theme}) ≥ 4.5:1, and its edge's icon on it ≥ 3:1`, () => {
+        const word = contrast(base[theme], tint![theme]);
+        expect(word, `${state} on its tint ${theme}: ${word.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+        const icon = contrast(vivid![theme], tint![theme]);
+        expect(icon, `${state} vivid on its tint ${theme}: ${icon.toFixed(2)}:1`).toBeGreaterThanOrEqual(3);
+      });
+      for (const [name, room] of Object.entries(rooms)) {
+        it(`${state}'s edge against every surface (${theme}, ${name}) ≥ 3:1`, () => {
+          for (const surface of TEXT_SURFACES) {
+            const ratio = contrast(vivid![theme], room(surface)[theme]);
+            expect(
+              ratio,
+              `${state} edge on ${surface} ${theme} ${name}: ${ratio.toFixed(2)}:1`,
+            ).toBeGreaterThanOrEqual(3);
+          }
+        });
+      }
+    }
+  }
+});

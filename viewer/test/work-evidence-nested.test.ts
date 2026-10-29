@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
+import { repo } from './fixtures/repo.ts';
 import { classifySituation, gitIn, nestedSubmodules, workEvidence, type PhaseEvidence } from '../server/runner/situation.ts';
 import { newRun, type RunState } from '../server/runner/state.ts';
 import { journalFile } from '../server/runner/run-paths.ts';
@@ -46,14 +47,6 @@ function git(cwd: string, args: string[], date = SETUP_DATE): void {
   });
 }
 
-function repo(dir: string, file = 'README.md'): void {
-  mkdirSync(dir, { recursive: true });
-  git(dir, ['init', '-q', '-b', 'main']);
-  writeFileSync(join(dir, file), `# ${file}\n`);
-  git(dir, ['add', file]);
-  git(dir, ['commit', '-qm', 'seed']);
-}
-
 /**
  * `<root>/shop` — a repository holding two submodules, `shop-api` and
  * `shop-web`, cloned from sources outside the tree. Nothing committed
@@ -62,9 +55,9 @@ function repo(dir: string, file = 'README.md'): void {
 function superproject(): { root: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), 'pc-nested-'));
   const sources = join(root, '.sources');
-  repo(join(sources, 'backend'));
-  repo(join(sources, 'frontend'));
-  repo(join(root, 'shop'));
+  repo({ dir: join(sources, 'backend'), date: SETUP_DATE });
+  repo({ dir: join(sources, 'frontend'), date: SETUP_DATE });
+  repo({ dir: join(root, 'shop'), date: SETUP_DATE });
   git(join(root, 'shop'), ['submodule', 'add', '-q', join(sources, 'backend'), 'shop-api']);
   git(join(root, 'shop'), ['submodule', 'add', '-q', join(sources, 'frontend'), 'shop-web']);
   git(join(root, 'shop'), ['commit', '-qm', 'the two submodules']);

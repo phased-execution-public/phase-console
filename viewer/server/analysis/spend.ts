@@ -120,6 +120,8 @@ export type PhaseCostRecordView = {
   model?: string;
   actualModel?: string;
   costUnknown?: boolean;
+  /** What the phase was forecast to cost when it first boarded (`phase.forecast`, measured-console phase 23). */
+  forecastUsd?: number | null;
 };
 
 /** The slice of a run file this module reads. Everything optional: old run files predate most of it. */
@@ -434,6 +436,42 @@ export type PhaseCost = {
   endedAt?: string;
   /** How many runs contributed money to this phase. */
   runs: number;
+  /** Its forecast at its first boarding (the oldest record that carries one), `estimated`; absent when none was made. */
+  forecastUsd?: number | null;
+};
+
+/**
+ * The phase statuses whose money bought no verified phase: verification red or
+ * the ladder gave up (`failed`), the console died with it open (`interrupted`),
+ * or the board overtook it (`skipped`) — what `costOfFailedAttempts` counts.
+ */
+export const FAILED_ATTEMPT_STATUSES: readonly string[] = Object.freeze(['failed', 'interrupted', 'skipped']);
+
+/**
+ * A plan's money after the fact (measured-console phase 23, §Architecture 9 A6):
+ * what it spent, set against what its phases were forecast to cost.
+ */
+export type PlanActuals = {
+  /** Σ `run.spentUsd` — the plan's whole spend, the same figure as `totalUsd`. */
+  actualUsd: number;
+  /** Phases a record reads `done` — finished and verified. */
+  verifiedPhases: number;
+  /** `actualUsd` / `verifiedPhases`: every dollar, failed attempts and the ladder included, per verified phase; null before the first. */
+  costPerVerifiedPhaseUsd: number | null;
+  /** Σ the cost of every record that ended `failed`, `interrupted` or `skipped` — money that verified nothing. */
+  costOfFailedAttemptsUsd: number;
+  /** How many such records. */
+  failedAttempts: number;
+  /** Σ the forecasts of the verified phases that carry one; null when none does. `estimated`. */
+  forecastUsd: number | null;
+  /** What those same phases actually cost, every attempt included. */
+  forecastActualUsd: number | null;
+  /** `forecastActualUsd − forecastUsd`: over is positive. */
+  deltaUsd: number | null;
+  /** The delta as a share of the forecast, one decimal; null when the forecast is zero or absent. */
+  deltaPct: number | null;
+  /** How many verified phases the forecast and the delta read over. */
+  forecastPhases: number;
 };
 
 export type PlanCostFacts = {
@@ -467,6 +505,8 @@ export type PlanCostView = {
   /** True when `byDay` dropped older buckets to fit the cap — never truncate silently. */
   byDayTruncated: boolean;
   runs: { runId: string; spentUsd: number; budgetUsd: number | null; status?: string }[];
+  /** The plan's money after the fact, against its forecasts (measured-console phase 23). */
+  actuals: PlanActuals;
 };
 
 /**
@@ -502,10 +542,31 @@ export function planCost(facts: PlanCostFacts): PlanCostView {
   const byPhase = new Map<number, PhaseCost>();
   const byModel = new Map<string, { usd: number; phases: Set<number> }>();
   const byDay = new Map<DayKey, number>();
+  const verified = new Set<number>();
+  // The forecast a phase first boarded with: the oldest record (by when it ended) that carries one.
+  const forecasts = new Map<number, { usd: number | null; at: string }>();
+  let failedUsd = 0;
+  let failedAttempts = 0;
 
   for (const run of runs) {
     if (!run || typeof run.id !== 'string') continue;
     totalUsd += money(run.spentUsd);
+    for (const [key, record] of Object.entries(run.phases ?? {})) {
+      const phase = Number(key);
+      if (!Number.isInteger(phase) || !record) continue;
+      if (record.status === 'done') verified.add(phase);
+      if (record.forecastUsd !== undefined) {
+        const at = record.endedAt ?? run.createdAt ?? '\uffff';
+        const prev = forecasts.get(phase);
+        const usd = typeof record.forecastUsd === 'number' && Number.isFinite(record.forecastUsd) ? record.forecastUsd : null;
+        if (!prev || at < prev.at) forecasts.set(phase, { usd, at });
+      }
+      const cost = money(record.costUsd);
+      if (cost > 0 && FAILED_ATTEMPT_STATUSES.includes(record.status ?? '')) {
+        failedUsd += cost;
+        failedAttempts += 1;
+      }
+    }
 
     for (const [key, record] of Object.entries(run.phases ?? {})) {
       const phase = Number(key);
@@ -566,6 +627,26 @@ export function planCost(facts: PlanCostFacts): PlanCostView {
     .map((p) => ({ ...p, usd: cents(p.usd) }))
     .sort((a, b) => b.usd - a.usd || a.phase - b.phase);
   const attributedUsd = [...byPhase.values()].reduce((sum, p) => sum + p.usd, 0);
+  for (const p of phases) {
+    const forecast = forecasts.get(p.phase);
+    if (forecast) p.forecastUsd = forecast.usd;
+  }
+  const forecastable = [...verified].filter((phase) => typeof forecasts.get(phase)?.usd === 'number');
+  const forecastUsd = forecastable.length ? cents(forecastable.reduce((sum, phase) => sum + forecasts.get(phase)!.usd!, 0)) : null;
+  const forecastActualUsd = forecastable.length ? cents(forecastable.reduce((sum, phase) => sum + (byPhase.get(phase)?.usd ?? 0), 0)) : null;
+  const deltaUsd = forecastUsd !== null && forecastActualUsd !== null ? cents(forecastActualUsd - forecastUsd) : null;
+  const actuals: PlanActuals = {
+    actualUsd: cents(totalUsd),
+    verifiedPhases: verified.size,
+    costPerVerifiedPhaseUsd: verified.size ? cents(totalUsd / verified.size) : null,
+    costOfFailedAttemptsUsd: cents(failedUsd),
+    failedAttempts,
+    forecastUsd,
+    forecastActualUsd,
+    deltaUsd,
+    deltaPct: deltaUsd !== null && forecastUsd ? Math.round((deltaUsd / forecastUsd) * 1000) / 10 : null,
+    forecastPhases: forecastable.length,
+  };
 
   const days = [...byDay.keys()].sort();
   const filled = days.length
@@ -597,6 +678,7 @@ export function planCost(facts: PlanCostFacts): PlanCostView {
         ...(typeof run.status === 'string' ? { status: run.status } : {}),
       }))
       .sort((a, b) => b.spentUsd - a.spentUsd || a.runId.localeCompare(b.runId)),
+    actuals,
   };
 }
 
@@ -613,4 +695,34 @@ function dayRange(from: DayKey, to: DayKey): DayKey[] {
   const keys: DayKey[] = [];
   for (let at = start; at <= end; at += DAY) keys.push(new Date(at).toISOString().slice(0, 10));
   return keys;
+}
+
+/**
+ * A session's dollars as the usage ledger booked them (measured-console phase 31, F2 — one
+ * source). `usd` sums the session's priced rows and is null when every row was unpriced, never
+ * $0; `byAccount` splits the priced dollars by the account each row was paid from.
+ */
+export type LedgerSessionDollars = { usd: number | null; byAccount: Record<string, number> };
+
+/**
+ * Every session's dollars from the usage ledger's rows — what Settings ▸ Accounts ▸ History and
+ * Insights ▸ Accounts sum. "What each session cost" reads a session's figure HERE whenever the
+ * ledger holds it, and the journal's `phase.session` line only for a session the ledger never
+ * saw (a free tree, a row folded into the daily rollup), so the two pages cannot disagree.
+ */
+export function sessionDollarsOf(
+  rows: readonly { session: string; account: string; costUsd: number | null }[],
+): Map<string, LedgerSessionDollars> {
+  const out = new Map<string, LedgerSessionDollars>();
+  for (const row of rows) {
+    let slot = out.get(row.session);
+    if (!slot) {
+      slot = { usd: null, byAccount: {} };
+      out.set(row.session, slot);
+    }
+    if (row.costUsd == null || !Number.isFinite(row.costUsd)) continue;
+    slot.usd = (slot.usd ?? 0) + row.costUsd;
+    slot.byAccount[row.account] = (slot.byAccount[row.account] ?? 0) + row.costUsd;
+  }
+  return out;
 }

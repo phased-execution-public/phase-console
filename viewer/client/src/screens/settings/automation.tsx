@@ -10,9 +10,11 @@
  *   4. the answers the console gives by itself (policy, relay rules);
  *   5. whether a phase may start at all (the schedule) and in what order
  *      (the queue);
- *   6. the input every one of those acts on (the session hook);
- *   7. the supervisor's own (Pro);
- *   8. last, a reading of everything above: how often it stops for a person.
+ *   6. the supervisor's own (Pro);
+ *   7. last, a reading of everything above: how often it stops for a person.
+ *
+ * The session hook, the input every one of those acts on, moved to Settings ▸
+ * Hooks with every other hook (measured-console phase 28).
  *
  * Every key here has exactly one control in this section — held by
  * `automation-coverage.test.tsx` — and every one governs the SERVER process,
@@ -21,7 +23,6 @@
 
 import { AutomationDefaults } from './automation-card';
 import { CeilingGroup } from './ceiling';
-import { HooksGroup } from './hooks';
 import { LadderGroups } from './ladder';
 import { PolicyGroup } from './policy';
 import { PostureGroup } from './posture';
@@ -37,7 +38,6 @@ export function AutomationSection() {
       <PolicyGroup />
       <ScheduleGroup />
       <QueueGroup />
-      <HooksGroup />
       <PostureGroup />
     </div>
   );

@@ -24,6 +24,7 @@ import {
   UNKNOWN_ICON,
   WORD_ROWS,
 } from '@shared/status-model.js';
+import { BOARD_BUCKETS, BOARD_STATE_UI } from '@shared/status-vocab.js';
 import { expectNoAxeViolations } from '@/test/axe';
 import {
   AccountStatus,
@@ -32,7 +33,9 @@ import {
   McpStatus,
   NOTE_ICONS,
   OpsStatus,
+  PhaseShare,
   PhaseStatus,
+  PlanProgress,
   PlanStatus,
   QaStatus,
   RunStatus,
@@ -40,8 +43,10 @@ import {
   STATUS_ICONS,
   TurnReadiness,
   TurnStatus,
+  sharePaint,
   statusIcon,
   type OpsVocab,
+  type ShareWord,
   type WordOf,
 } from './index';
 
@@ -328,6 +333,75 @@ describe('the badge chrome — an outlined pill with the icon and the word in th
         <RunStatus run={{ id: 'r', slug: 's', status: 'running' }} chrome="badge" />
       </div>,
     );
+    await expectNoAxeViolations(container);
+  });
+});
+
+describe('a plan’s phases counted — the legend of its line as badges, and its percentage', () => {
+  const SHARES: readonly ShareWord[] = [...BOARD_BUCKETS, 'gated', 'held-by-qa', 'never'];
+
+  it('draws every share as the family’s badge: its icon, its count in words, the line’s own paint', () => {
+    for (const share of SHARES) {
+      const { container, unmount } = render(<PhaseShare share={share} count={3} label={`3 of ${share}`} />);
+      const el = mark(container);
+      expectComplete(el);
+      expect(el.getAttribute('data-chrome')).toBe('badge');
+      expect(el.getAttribute('data-share')).toBe(share);
+      expect(el.getAttribute('data-count')).toBe('3');
+      expect(el.textContent).toBe(`3 of ${share}`);
+      expect(el.querySelector('svg[data-icon]'), `${share} draws its icon`).not.toBeNull();
+      expect(el.className).not.toMatch(/\bbg-/);
+      // A count asks nobody for anything: the plan's status beside it does that.
+      expect(el.getAttribute('data-attention')).toBe('none');
+      expect(el.getAttribute('data-paint')).toBe(sharePaint(share));
+      unmount();
+    }
+  });
+
+  it('wears the paint the line draws its segment in — the board’s table, QA’s fail, a skipped phase', () => {
+    for (const bucket of BOARD_BUCKETS) expect(sharePaint(bucket)).toBe(BOARD_STATE_UI[bucket]);
+    expect(sharePaint('gated')).toBe(BOARD_STATE_UI.gated);
+    expect(sharePaint('held-by-qa')).toBe(WORD_ROWS['qa-result'].fail.paint);
+    expect(sharePaint('never')).toBe(WORD_ROWS.phase.skipped.paint);
+  });
+
+  it('says its count in words when no label is given, from the board word’s own label', () => {
+    const el = mark(render(<PhaseShare share="ready" count={2} />).container);
+    expect(el.textContent).toBe('2 next up');
+  });
+
+  it('keeps a done share’s hue, muted, and a bad share at full weight', () => {
+    const done = mark(render(<PhaseShare share="done" count={41} />).container);
+    expect(done.hasAttribute('data-quiet')).toBe(true);
+    expect(done.className).toContain('border-state/30');
+    const held = mark(render(<PhaseShare share="held-by-qa" count={1} />).container);
+    expect(held.getAttribute('data-paint')).toBe('failed');
+    expect(held.className).toContain('border-state/60');
+  });
+
+  it('draws the percentage as a badge in done’s hue, quiet once the plan is over', () => {
+    const open = mark(render(<PlanProgress percent={56} />).container);
+    expectComplete(open);
+    expect(open.getAttribute('data-chrome')).toBe('badge');
+    expect(open.getAttribute('data-paint')).toBe('done');
+    expect(open.getAttribute('data-attention')).toBe('none');
+    expect(open.textContent).toBe('56 %');
+    expect(open.className).toContain('border-state/60');
+    expect(open.querySelector('svg[data-icon]')).not.toBeNull();
+    const over = mark(render(<PlanProgress percent={100} settled />).container);
+    expect(over.hasAttribute('data-quiet')).toBe(true);
+    expect(over.className).toContain('border-state/30');
+  });
+
+  it('is no tab stop when it is part of a picture, and has no axe violations', async () => {
+    const { container } = render(
+      <div role="img" aria-label="Alpha plan, 4 phases: 2 done, 2 waiting, 50 %">
+        <PhaseShare share="done" count={2} tabIndex={-1} />
+        <PhaseShare share="waiting" count={2} tabIndex={-1} />
+        <PlanProgress percent={50} tabIndex={-1} />
+      </div>,
+    );
+    for (const el of container.querySelectorAll<HTMLElement>('[data-status]')) expect(el.tabIndex).toBe(-1);
     await expectNoAxeViolations(container);
   });
 });

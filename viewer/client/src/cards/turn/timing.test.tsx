@@ -12,11 +12,17 @@
  *   TG-4 past the deadline the grid says how overdue, in the failed hue, and the
  *        bar from assigned to deadline is a real meter;
  *   TG-5 the clock's rule: 1 s while a grid is on screen, 30 s otherwise, none
- *        when nothing reads it, and never 1 s under reduced motion.
+ *        when nothing reads it, and never 1 s under reduced motion;
+ *   TG-6 on the card the grid is the record's *Timing* fold (Tower strips,
+ *        2026-10-20), one press in: folded, its head says the deadline — what
+ *        is left, how overdue in the failed hue, or that none is set — and the
+ *        grid asks for no second-by-second tick until it is opened.
+ *
+ * TG-1 to TG-4 read the grid on the card, so each opens the fold first.
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { Profiler, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -72,6 +78,11 @@ function wrap(node: ReactNode) {
   );
 }
 
+/** The card's grid is its record's Timing fold: one press in. */
+function openTiming() {
+  fireEvent.click(screen.getByTestId('turn-timing-fold'));
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
@@ -81,6 +92,7 @@ afterEach(() => vi.useRealTimers());
 describe('TG-1 the grid, from the item', () => {
   it('Assigned, Do it, Deadline, Open until, You sent it and Checked', () => {
     wrap(<ItemCard item={item()} perform={vi.fn()} />);
+    openTiming();
     const grid = screen.getByTestId('turn-timing');
     expect(within(grid).getByTestId('turn-assigned').textContent).toContain('3 h ago');
     expect(within(grid).getByTestId('turn-do-it').textContent).toBe('Do itNow');
@@ -93,6 +105,7 @@ describe('TG-1 the grid, from the item', () => {
 
   it('a missing deadline is said, not hidden', () => {
     wrap(<ItemCard item={item({ timing: { assignedAt: '2026-10-13T09:00:00.000Z' } })} perform={vi.fn()} />);
+    openTiming();
     expect(screen.getByTestId('turn-deadline').textContent).toContain('None set');
     expect(screen.queryByTestId('turn-open-until')).toBeNull();
   });
@@ -112,6 +125,7 @@ describe('TG-2 NOT YET states its when', () => {
     const head = screen.getByTestId('turn-readiness');
     expect(head.getAttribute('data-readiness')).toBe('not-yet');
     expect(within(head).getByTestId('turn-readiness-when').textContent).toBe('when Phase 13 of demo is done');
+    openTiming();
     expect(screen.getByTestId('turn-do-it').textContent).toContain('When Phase 13 of demo is done');
     expect(screen.queryByTestId('turn-primary')).toBeNull();
     expect(screen.getByTestId('turn-nothing').textContent).toMatch(/opens when it is due/);
@@ -131,6 +145,7 @@ describe('TG-2 NOT YET states its when', () => {
         perform={vi.fn()}
       />,
     );
+    openTiming();
     expect(screen.getByTestId('turn-do-it').textContent).toContain('in 10 m 0 s');
   });
 
@@ -156,6 +171,7 @@ describe('TG-3 it ticks without re-rendering the card or the page', () => {
         <ItemCard item={item()} perform={vi.fn()} />
       </Profiler>,
     );
+    openTiming();
     const deadline = () => screen.getByTestId('turn-deadline').textContent;
     expect(deadline()).toContain('30 m 0 s left');
     const before = renders.mock.calls.filter(([phase]) => phase === 'mount').length;
@@ -199,6 +215,7 @@ describe('TG-4 overdue', () => {
         perform={vi.fn()}
       />,
     );
+    openTiming();
     const cell = screen.getByTestId('turn-deadline');
     const reading = cell.querySelector('[data-overdue="true"]')!;
     expect(reading.textContent).toBe('overdue by 1 h');
@@ -208,6 +225,7 @@ describe('TG-4 overdue', () => {
 
   it('a settled item draws no countdown and no bar', () => {
     wrap(<ItemCard item={item({ personStatus: 'passed' })} perform={vi.fn()} />);
+    openTiming();
     expect(within(screen.getByTestId('turn-deadline')).queryByRole('meter')).toBeNull();
     expect(screen.getByTestId('turn-deadline').textContent).not.toMatch(/left|overdue/);
   });
@@ -254,5 +272,41 @@ describe('TG-5 the clock’s rule', () => {
     expect(clockSpan(90_000, true)).toBe('1 m 30 s');
     expect(clockSpan(90_000, false)).toBe('2 m');
     expect(clockSpan(2 * 3_600_000, true)).toBe('2 h');
+  });
+});
+
+describe('TG-6 the Timing fold', () => {
+  it('folded, its head says the deadline; the grid is one press in', () => {
+    wrap(<ItemCard item={item()} perform={vi.fn()} />);
+    expect(screen.queryByTestId('turn-timing')).toBeNull();
+    const fold = screen.getByTestId('turn-timing-fold');
+    expect(fold.getAttribute('aria-expanded')).toBe('false');
+    expect(within(fold).getByTestId('turn-timing-summary').textContent).toBe('Deadline in 30 m');
+    openTiming();
+    expect(screen.getByTestId('turn-timing')).toBeTruthy();
+  });
+
+  it('says how overdue in the failed hue, and that none is set', () => {
+    const view = wrap(
+      <ItemCard
+        item={item({
+          timing: { assignedAt: '2026-10-13T09:00:00.000Z', deadline: '2026-10-13T11:00:00.000Z' },
+        })}
+        perform={vi.fn()}
+      />,
+    );
+    const late = screen.getByTestId('turn-timing-summary');
+    expect(late.textContent).toBe('Overdue by 1 h');
+    expect(late.className).toMatch(/\bstate-failed\b/);
+    view.unmount();
+    wrap(<ItemCard item={item({ timing: { assignedAt: '2026-10-13T09:00:00.000Z' } })} perform={vi.fn()} />);
+    expect(screen.getByTestId('turn-timing-summary').textContent).toBe('No deadline set');
+  });
+
+  it('asks for the second-by-second tick only once it is opened', () => {
+    wrap(<ItemCard item={item()} perform={vi.fn()} />);
+    expect(clockState().fine).toBe(0);
+    openTiming();
+    expect(clockState().fine).toBe(1);
   });
 });

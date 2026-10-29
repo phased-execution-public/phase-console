@@ -1012,6 +1012,7 @@ export function classifyBoardPhase(state) {
 export function leadActionFor(id, sub, resumable) {
   switch (id) {
     case 'never-started':
+    case 'spawn-sdk-failed':
       return 'retry';
     case 'work-in-progress':
       return resumable ? 'resume' : 'retry';

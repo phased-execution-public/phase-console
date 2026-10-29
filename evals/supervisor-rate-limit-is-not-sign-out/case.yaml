@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: supervisor-rate-limit-is-not-sign-out
+description: '#387: a rate-limited usage poll (429) was read as a sign-out and a person was asked to sign in again.'
+tags: [halt, supervisor, unattended]
+context:
+  scaffold_script: fixture.sh

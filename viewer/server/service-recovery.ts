@@ -135,7 +135,7 @@ import { GRANT_SCOPE_WORDS, RISK_TIERS, riskOf, type GrantScope } from '../share
 import { SETTLED_WELL } from '../shared/run-lifecycle.js';
 import { EVIDENCE_DIR, EVIDENCE_PER_ATTEMPT, isEvidenceRefusal, readEvidence, screenEvidence, storeEvidence } from './turn/evidence.ts';
 import { checkRouteOf, probeReadWords, returnedSentence, shapeVerdict, type StepVerdict } from './turn/verdict.ts';
-import { answerTargetOf, writeAnswer } from './turn/answer-target.ts';
+import { answerLineFor, answerTargetOf, writeAnswer } from './turn/answer-target.ts';
 import { composePlanItem, type PlanItemWords } from './turn/plan-items.ts';
 import { proofWords } from '../shared/proof-words.js';
 import { guideCommands } from '../shared/guide-grammar.js';
@@ -3549,6 +3549,16 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (record.declared?.status !== 'needs-human' || record.declared.step?.id !== step.id) {
       return { launched: false, why: 'the phase is no longer parked on this step' };
     }
+    // A step deferred at its call (measured-console phase 12, B2): the resumed
+    // session's re-fired hook hands this answer to the very call that asked.
+    if (record.deferred) {
+      const said = step.answer === undefined || step.answer === null ? ''
+        : `; the answer: ${typeof step.answer === 'string' ? step.answer : JSON.stringify(step.answer)}`;
+      const answer = `${provenDetail(step, read, by)}${said}`;
+      if (!this.runnerByRunId(state.id)?.answerDeferred(step.phase, answer, step.id)) {
+        record.deferred = { ...record.deferred, answer, stepId: step.id };
+      }
+    }
     const key = record.situation?.key ?? 'blocked-declared:human-acts';
     const parsed = parseSituationKey(key);
     const driven = this.resumeOnWatchLanded(
@@ -3747,7 +3757,10 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // or Redo with the source's steps.
     if (!runAct) {
       const checked = await this.answerThenCheck(step, answer, note, opts);
-      if (checked) return checked;
+      if (checked) {
+        if (checked.ok && this.humanStepsNow().get(id)?.state === 'proven') await this.tellPlanDecision(step, answer, opts);
+        return checked;
+      }
     }
     const moved = this.humanStepsNow().move(id, 'proven', {
       by: opts.by, verb: 'answer', note: option ? `answered ${option.label}` : 'answered with a note', answer,
@@ -3769,11 +3782,42 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // would undo it. Every other answer goes back to the phases that asked.
     const resumes = runAct === 'stop' && option?.id === 'approve' ? [] : await this.roadBack(moved, 'proven', told, opts,
       `${opts.by} answered ${option ? `"${option.label}"` : 'with a note'}${note ? ` — "${note.slice(0, 200)}"` : ''}`);
+    if (!runAct) await this.tellPlanDecision(step, answer, opts);
     return {
       ok: true, answered: answer, resumes,
       ...(step.decisionKey ? { decision: { key: step.decisionKey, written: true } } : {}),
       step: this.stepView(id),
     };
+  }
+
+  /**
+   * A plan's own decision, answered with words (2026-10-20). No session waits
+   * on a plan-born item — its one waiter is the plan itself — so the note,
+   * which is the person's word to the AI, reached nobody: it is pinned on every
+   * phase the item unblocks, read into that phase's next boot prompt, behind
+   * the run flag as the notes route is. In Pro the supervisor is told as well
+   * (`Service`). Never for a session's own question: its waiter hears the
+   * answer, note and all, when it resumes.
+   */
+  protected async tellPlanDecision(
+    step: HumanStep, answer: StepAnswer, opts: { by: string; actor?: StartActor },
+  ): Promise<{ notes: string[]; chat: string | null }> {
+    const said = answer.note?.trim();
+    if (step.birth !== 'plan' || !said || !this.flags.allowRun) return { notes: [], chat: null };
+    const actor = opts.actor ?? pressActor(asActor(opts.by, 'human-step-answer'));
+    const text = `The owner's note with their decision on “${step.title}”${answer.label ? ` (they chose ${answer.label})` : ''}: ${said}`;
+    const lanes = new Map<string, { slug: string; phase?: number }>();
+    for (const unblocked of step.unblocks ?? []) {
+      const slug = unblocked.slug || step.slug;
+      lanes.set(`${slug}#${unblocked.phase}`, { slug, phase: unblocked.phase });
+    }
+    if (!lanes.size) lanes.set(step.slug, { slug: step.slug });
+    const notes: string[] = [];
+    for (const lane of lanes.values()) {
+      const noted = this.noteRun(lane.slug, { text, pinned: true, ...(lane.phase ? { phase: lane.phase } : {}) }, actor);
+      if (noted.ok) notes.push(noted.note.id);
+    }
+    return { notes, chat: null };
   }
 
   /**
@@ -3791,7 +3835,15 @@ export abstract class ServiceRecovery extends ServiceRuns {
   ): Promise<StepVerbResult | null> {
     const proof = this.rereadProof(step) ?? step.proof;
     if (!proof || !parseWatchRef(proof)) return null;
-    const target = answerTargetOf(proof);
+    const words = {
+      ...(answer.option ? { option: answer.option } : {}),
+      ...(answer.label ? { label: answer.label } : {}),
+      ...(answer.note ? { note: answer.note } : {}),
+    };
+    // A place the proof reads only counts when the proof would accept a line
+    // this answer can say; else nothing is written and the proof decides alone.
+    const found = answerTargetOf(proof);
+    const target = found && answerLineFor(found, words) !== null ? found : null;
     let wrote: string | undefined;
     if (target) {
       const root = this.root?.ok ? this.root.path : null;
@@ -3803,7 +3855,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         };
       }
       const handoffs = this.root?.ok ? (this.root.handoffsDir ?? (this.root.docsDir ? join(this.root.docsDir, 'handoffs') : join(root, 'docs', 'handoffs'))) : join(root, 'docs', 'handoffs');
-      const written = writeAnswer(target, join(handoffs, step.slug), root, { ...(answer.label ? { label: answer.label } : {}), ...(answer.note ? { note: answer.note } : {}) });
+      const written = writeAnswer(target, join(handoffs, step.slug), root, words);
       if (!written.ok) return { ok: false, status: 409, error: `Your decision was not sent: ${written.why}.` };
       wrote = written.file;
     }

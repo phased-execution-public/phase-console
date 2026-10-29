@@ -115,6 +115,16 @@ export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.fr
   permissionMode: 'how',
   // An approval card is the permission ask, so its clock is asked beside the profile.
   approvalTimeoutMinutes: 'how',
+  // The session's environment (measured-console phase 6) — what every session
+  // is started with, asked beside the model.
+  cacheTtlAb: 'how',
+  keepWarmSec: 'how',
+  subagentModel: 'how',
+  bashMaxOutput: 'how',
+  // The platform's pieces (measured-console phase 12), beside them.
+  humanStepMode: 'how',
+  compaction: 'how',
+  compactionWindow: 'how',
   accountId: 'how',
   // The account pool is asked beside the account (control-tower phase 22): the
   // Accounts tile nests in one stage, and it is this one.
@@ -217,6 +227,13 @@ export const FIELD_LABELS: Readonly<Record<RunSetupField, string>> = Object.free
   // for what they bound, since this form has no ladder card around them.
   ladderPerRunRungs: 'Recovery rungs per run',
   ladderPerPhaseRungs: 'Recovery rungs per phase',
+  cacheTtlAb: 'Cache lifetime test',
+  keepWarmSec: 'Keep cache warm (seconds)',
+  subagentModel: 'Model for side work (subagents)',
+  bashMaxOutput: 'Bash output read back (characters)',
+  humanStepMode: 'When a phase needs a person',
+  compaction: 'Who compacts a long session',
+  compactionWindow: 'The CLI compacts at (tokens)',
   onlyPhases: 'Only these phases',
   phaseOptions: 'Per-phase overrides',
   prompt: 'First prompt',

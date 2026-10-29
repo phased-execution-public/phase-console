@@ -33,6 +33,6 @@ test('GD-3 — a mirror session is told to read other repositories at the root, 
   assert.ok(prompt.includes(`read it there if you need\n  it (\`${root}/<repo>\`, READ-ONLY)`),
     'the out-of-scope read path is not named');
   assert.match(prompt, /NEVER `git clone` \(or `gh repo clone`\) into this tree/);
-  assert.match(prompt, /NEVER\n  run `git submodule update --init` in it/);
-  assert.match(prompt, /the console refuses the first and\n  asks a person about the second/);
+  assert.match(prompt, /NEVER\n {2}run `git submodule update --init` in it/);
+  assert.match(prompt, /the console refuses the first and\n {2}asks a person about the second/);
 });

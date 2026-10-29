@@ -10,9 +10,10 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -27,6 +28,7 @@ const { parseFlags } = await import('../server/config.ts');
 const { Runner } = await import('../server/runner/runner.ts');
 const { seedSkills } = await import('../server/service.ts');
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 /* ------------------------------------------------------------------ *
  * The flag and the environment variable
@@ -126,17 +128,11 @@ type Repo = { root: string; scripts: string; cleanup: () => void };
  * The smallest repo the runner will drive: a one-phase linear board and a stub
  * engine that answers the four things `attempt()` asks it.
  */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-defskills-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-defskills-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 shift
@@ -156,18 +152,14 @@ case "$mode" in
   --repos) echo "demo-repo" ;;
   *) echo "" ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  write(join(scripts, 'next-phase-prompt.sh'), '#!/usr/bin/env bash\nexit 0\n');
-  write(join(scripts, 'new-handoff.sh'), '#!/usr/bin/env bash\nexit 0\n');
-
-  return { root, scripts, cleanup: () => rmSync(root, { recursive: true, force: true }) };
-}
-
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
+`,
+      'phase-lock.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'validate.sh': VALIDATE_OK_SH,
+      'next-phase-prompt.sh': '#!/usr/bin/env bash\nexit 0\n',
+      'new-handoff.sh': '#!/usr/bin/env bash\nexit 0\n',
+    }),
+  });
+  return made;
 }
 
 /**
@@ -227,39 +219,41 @@ async function promptFor(
 }
 
 test("a run's skills reach the boot prompt of its phases", async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompt = await promptFor(r, { skills: ['graph-tool'] });
-    assert.match(prompt, /\/graph-tool/);
-    // And the directive that rides with any list of skills.
-    assert.match(prompt, /knowledge graph/i);
+    assert.match(prompt, /Call the Skill tool with "graph-tool"/);
+    // The knowledge-graph directive no longer rides with a list of skills: it
+    // is said only when the console names a graph tool (`graphTool`, off by
+    // default — measured-console phase 11, D6).
+    assert.doesNotMatch(prompt, /knowledge graph/i);
   } finally {
     r.cleanup();
   }
 });
 
 test('skillsOff drops the run list for that phase and keeps the phase its own', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompt = await promptFor(r, {
       skills: ['graph-tool'],
       phaseOptions: { 1: { skillsOff: true, skills: ['investigate'] } },
     });
-    assert.doesNotMatch(prompt, /\/graph-tool/, 'the run default was excluded here');
-    assert.match(prompt, /\/investigate/, '"not the default" is not "nothing at all"');
+    assert.doesNotMatch(prompt, /Call the Skill tool with "graph-tool"/, 'the run default was excluded here');
+    assert.match(prompt, /Call the Skill tool with "investigate"/, '"not the default" is not "nothing at all"');
   } finally {
     r.cleanup();
   }
 });
 
 test('skillsOff with no extras of its own leaves the phase with no skill line', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompt = await promptFor(r, {
       skills: ['graph-tool'],
       phaseOptions: { 1: { skillsOff: true } },
     });
-    assert.doesNotMatch(prompt, /\/graph-tool/);
+    assert.doesNotMatch(prompt, /Call the Skill tool with "graph-tool"/);
     // The whole directive hangs off a list of skills, so an empty list means the
     // prompt is the engine's text and nothing else.
     assert.doesNotMatch(prompt, /Also invoke/);
@@ -270,13 +264,13 @@ test('skillsOff with no extras of its own leaves the phase with no skill line', 
 });
 
 test('a phase that says nothing still inherits the run list', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompt = await promptFor(r, {
       skills: ['graph-tool'],
       phaseOptions: { 2: { skillsOff: true } },     // a DIFFERENT phase
     });
-    assert.match(prompt, /\/graph-tool/, 'skillsOff on phase 2 must not reach phase 1');
+    assert.match(prompt, /Call the Skill tool with "graph-tool"/, 'skillsOff on phase 2 must not reach phase 1');
   } finally {
     r.cleanup();
   }

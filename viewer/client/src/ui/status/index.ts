@@ -11,6 +11,7 @@
  */
 export { AccountStatus, type AccountStatusProps } from './account';
 export { AttentionMark } from './attention';
+export { CountBadge } from './count';
 export { DotWord, FactPart } from './dot-word';
 export { FactMark } from './fact';
 export { McpStatus } from './mcp';
@@ -19,6 +20,7 @@ export { PhaseStatus, type PhaseStatusProps } from './phase';
 export { PlanStatus } from './plan';
 export { QaStatus, type QaStatusProps } from './qa';
 export { RunStatus, type RunStatusProps } from './run';
+export { PhaseShare, PlanProgress, shareName, sharePaint, type ShareWord } from './share';
 export { SeverityMark } from './severity';
 export { SessionStatus, type SessionVocab } from './session';
 export { TurnReadiness, TurnStatus } from './turn';

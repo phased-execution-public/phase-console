@@ -57,7 +57,7 @@ exit 0
   const LINES = ['pnpm lint', 'pnpm verify:local'];
   const seen: (VerifyingLane | undefined)[] = [];
   let slim: ReturnType<typeof projection.slimRun> | undefined;
-  // eslint-disable-next-line prefer-const
+   
   let runner: Runner;
   runner = new Runner({
     scriptsDir: scripts,

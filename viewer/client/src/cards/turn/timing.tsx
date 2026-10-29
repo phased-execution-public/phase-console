@@ -22,7 +22,7 @@ import { cn } from '@/lib/cn';
 import { reducedMotion } from '@/lib/media';
 import { PAGE_CLOCK, useFineClock, usePageNow } from '@/ui/clock';
 import { LoadMeter } from '@/ui/track/meter';
-import { span, stamp } from '../human-step-card';
+import { span, stamp } from './step-words';
 
 export type Timing = NonNullable<TurnItem['timing']>;
 
@@ -188,7 +188,7 @@ export function TimingGrid({
       ref={box}
       data-testid="turn-timing"
       data-tick={counting ? String(PAGE_CLOCK.fineMs) : String(PAGE_CLOCK.coarseMs)}
-      className="grid min-w-0 grid-cols-2 gap-x-6 gap-y-3 rounded-md bg-ground px-3 py-2.5 sm:grid-cols-3"
+      className="grid min-w-0 grid-cols-2 gap-x-6 gap-y-3 rounded-md bg-ground px-3 py-2.5 @md/card:grid-cols-3"
     >
       <Cell label="Assigned" testId="turn-assigned">
         <Ago at={timing.assignedAt} />

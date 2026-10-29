@@ -14,27 +14,22 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
 import type { SpawnFn, SpawnOutcome, StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 type Repo = { root: string; scripts: string; markDone: () => void; cleanup: () => void };
 
 /** A one-phase plan the stub engine reads as done once the session marks it. */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-ledger-writer-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-ledger-writer-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -46,14 +41,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: () => writeFileSync(join(stub, 'done'), '1\n'),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: () => writeFileSync(join(made.state, 'done'), '1\n') };
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -71,7 +64,7 @@ function outcome(partial: Partial<SpawnOutcome>): SpawnOutcome {
 
 
 test('RL-3: a door with no meter writes nothing, and the session runs exactly as before', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const spawn: SpawnFn = async (request) => {
     request.onEvent?.({ kind: 'init', sessionId: 'sess-free', tools: 0 } as StreamEvent);
     request.onEvent?.({ kind: 'result', subtype: 'success', costUsd: 0.3 } as StreamEvent);

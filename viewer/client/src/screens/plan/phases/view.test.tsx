@@ -7,9 +7,10 @@
  * `table.test.tsx`, and every datum of the tabs this one replaced is walked in
  * `../detail.datums.test.tsx`:
  *
- *   - the six readings are ADDRESSES — links, with the current one marked;
- *   - `table`, `qa` and `handoffs` are three readings of the ONE grid, and
- *     `map` draws the route and no grid;
+ *   - the five readings are ADDRESSES — links, with the current one marked;
+ *   - `table` and `handoffs` (Handoffs & QA — one reading of each phase's
+ *     record since 2026-10-20) are two readings of the ONE grid, and `map`
+ *     draws the route and no grid;
  *   - Inspect opens a row's phase in the panel, and its prose is asked for
  *     only then;
  *   - the QA report sheet opens where `?report=` says, and closing it keeps
@@ -128,20 +129,27 @@ function mount(view: PhasesViewId = 'table', extra: { report?: string; everythin
 /** The reads that cost an engine run or a prose payload — none of them is the grid's. */
 const costly = () => sent.filter((path) => /\?include=|\/prompt\/|\/next-prompt\/|\/qa-prompt\//.test(path));
 
+
 describe('the Phases view', () => {
-  it('opens on the grid, and offers its six readings as addresses', async () => {
+  it('opens on the grid, and offers its five readings as addresses', async () => {
     mount();
     expect(await screen.findByRole('table', { name: 'Phases' })).toBeInTheDocument();
     const nav = screen.getByRole('navigation', { name: 'Readings of the phases' });
     const links = within(nav).getAllByRole('link');
-    expect(links.map((a) => [a.textContent, a.getAttribute('href')])).toEqual([
+    expect(links.map((a) => [a.textContent?.split(/\d/)[0], a.getAttribute('href')])).toEqual([
       ['Table', '#/plan/alpha/phases'],
       ['Map', '#/plan/alpha/phases?view=map'],
-      ['QA', '#/plan/alpha/phases?view=qa'],
-      ['Handoffs', '#/plan/alpha/phases?view=handoffs'],
+      ['Handoffs & QA', '#/plan/alpha/phases?view=handoffs'],
       ['Schedule', '#/plan/alpha/phases?view=schedule'],
       ['Burn-up', '#/plan/alpha/phases?view=burnup'],
     ]);
+    // Each reading wears its glyph; the record's reading counts its QA fails —
+    // in the failed hue, and said in words, never the number alone.
+    for (const link of links) expect(link.querySelector('svg'), link.textContent ?? '').not.toBeNull();
+    const record = within(nav).getByRole('link', { name: /^Handoffs & QA/ });
+    expect(record).toHaveAccessibleName(/1 QA fail$/);
+    expect(record.querySelector('[data-count="1"]')).toHaveClass('state-failed');
+    expect(links.filter((a) => a.querySelector('[data-count]'))).toEqual([record]);
     expect(within(nav).getByRole('link', { name: 'Table' })).toHaveAttribute('aria-current', 'page');
     // The plan's own folds are under the grid: what is left and the landing.
     const foot = screen.getByTestId('phases-foot');
@@ -165,13 +173,13 @@ describe('the Phases view', () => {
     }
   });
 
-  it('reads QA and Handoffs as readings of the one grid, and the map as no grid at all', async () => {
-    const { unmount } = mount('qa');
-    expect(await screen.findByRole('table', { name: 'QA by phase' })).toBeInTheDocument();
+  it('reads Handoffs & QA as a reading of the one grid, and the map as no grid at all', async () => {
+    const { unmount } = mount('handoffs');
+    expect(await screen.findByRole('table', { name: 'Handoffs and QA by phase' })).toBeInTheDocument();
+    // One reading where there were two: its QA column and its handoff column both lead.
+    const heads = screen.getAllByRole('columnheader').map((h) => h.textContent?.trim());
+    expect(heads).toEqual(expect.arrayContaining(['QA', 'Handoff']));
     unmount();
-    const second = mount('handoffs');
-    expect(await screen.findByRole('table', { name: 'Handoffs by phase' })).toBeInTheDocument();
-    second.unmount();
     mount('map');
     expect(await screen.findByTestId('route-map')).toBeInTheDocument();
     expect(screen.queryByRole('table')).toBeNull();
@@ -197,14 +205,14 @@ describe('the Phases view', () => {
   });
 
   it('opens the report sheet the address names, and closing it keeps the reading', async () => {
-    mount('qa', { report: '1:2' });
+    mount('handoffs', { report: '1:2' });
     expect(await screen.findByText('findings two')).toBeInTheDocument();
     expect(sent).toContain('/api/plans/alpha/qa-report/1?round=2');
     // A round picker over the ledger — both rounds, the addressed one pressed.
     expect(screen.getByRole('button', { name: 'Round 1' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Round 2' })).toHaveAttribute('aria-pressed', 'true');
     fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
-    await waitFor(() => expect(location.hash).toBe('#/plan/alpha/phases?view=qa'));
+    await waitFor(() => expect(location.hash).toBe('#/plan/alpha/phases?view=handoffs'));
   });
 });
 
@@ -213,7 +221,8 @@ describe('the foot — what the plan owes beyond its rows', () => {
     mount();
     await screen.findByRole('table', { name: 'Phases' });
     const prompts = screen.getByTestId('foot-prompts');
-    expect(prompts).toHaveTextContent('Boot prompts(1)');
+    // A fold strip: its name, and its count in a pill — heard as "Boot prompts (1)".
+    expect(prompts).toHaveTextContent('Boot prompts (1)');
     fireEvent.click(prompts);
     // The fold names each ready phase's prompt; opening it is still not a read.
     expect(

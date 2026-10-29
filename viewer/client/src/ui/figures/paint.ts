@@ -72,6 +72,35 @@ export function inside(
 }
 
 /**
+ * The tick labels that fit, each where `inside` will draw it: walked from the
+ * newest (the right edge, which a reader looks at first) leftwards, a label
+ * whose drawn extent would meet the one kept to its right is dropped (#415 —
+ * at 390 px `Oct 19 16:00` and `Oct 19 23:00` were written over each other).
+ */
+export function unclashed<T>(
+  ticks: readonly T[],
+  at: (tick: T) => number,
+  wide: (tick: T) => number,
+  width: number,
+  gap = 4,
+): T[] {
+  const kept: T[] = [];
+  let left = Infinity;
+  for (let i = ticks.length - 1; i >= 0; i--) {
+    const tick = ticks[i]!;
+    const w = wide(tick);
+    const centre = at(tick);
+    const { textAnchor, dx } = inside(centre, w, width);
+    const anchor = centre + dx;
+    const start = textAnchor === 'end' ? anchor - w : textAnchor === 'start' ? anchor : anchor - w / 2;
+    if (start + w + gap > left) continue;
+    kept.unshift(tick);
+    left = start;
+  }
+  return kept;
+}
+
+/**
  * A tick label as a plain `<text>`. visx's own `Text` wraps every label in a
  * nested `<svg>` — an unnamed svg per tick, which is exactly what the chart
  * guard's "every svg is a named chart or decoration" rule exists to catch, and

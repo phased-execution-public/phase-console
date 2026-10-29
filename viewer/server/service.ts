@@ -9,17 +9,21 @@
 
 import { EVIDENCE_GIT, evidenceTreeOf, wallCommand } from './permissions/walls.ts';
 import { forcedPush, grantEndWords, type GrantRow } from './permissions/grants.ts';
-import { GRANT_SCOPE_WORDS, TURN_OPEN_GROUPS } from '../shared/turn-model.js';
+import { GRANT_SCOPE_WORDS, HAND_OFF_OPTION_ID, TURN_OPEN_GROUPS } from '../shared/turn-model.js';
 import type { IncomingMessage } from 'node:http';
-import { basename, join, resolve as resolvePath } from 'node:path';
+import { execFile } from 'node:child_process';
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, releasePhasesOf, sanitisePolicyPrefs } from '../shared/policy-model.js';
 import { DECISION_KEYS, mergeDecisions } from '../shared/decisions-model.js';
 import { policyForKey, policyPrefsOf } from './runner/policy.ts';
 import {
   planApprovedInstruction, planContinueReason, planHeldReason, planOf, planTextFile, type PlanDecision,
 } from './runner/plan-approval.ts';
-import { homedir } from 'node:os';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import {
+  closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync,
+  statSync, watch, writeFileSync, type FSWatcher,
+} from 'node:fs';
 
 import { configDir, instanceId, stateHome } from '../shared/instances.mjs';
 import {
@@ -43,7 +47,8 @@ import {
   type GateStatus,
 } from './engine.ts';
 import { QA_DIRECTIVES } from '../shared/plan-vocab.js';
-import { QA_CONFIRM } from '../shared/run-settings.js';
+import { humanStepModeFor, QA_CONFIRM } from '../shared/run-settings.js';
+import { deferableDeclaration, resumedCommand } from './runner/defer-step.ts';
 import { MCP_LOGIN_ENDS, MCP_LOGIN_WINDOW_MS, RELOGIN_CONFIRM } from '../shared/ops-vocab.js';
 import { SearchIndex, type SearchResult } from './search.ts';
 import { listSkills, type SkillInfo } from './skills.ts';
@@ -68,7 +73,7 @@ import {
 } from './analysis/graph.ts';
 import { loadGateVocab, gateKindOf, type GateVocab, type GateKind } from './analysis/gates.ts';
 import {
-  planCost, rungsToday, spendSummary, type SpendRunView, type SpendView,
+  planCost, rungsToday, sessionDollarsOf, spendSummary, type SpendRunView, type SpendView,
 } from './analysis/spend.ts';
 import { renderMetrics, type MetricsProcess } from './analysis/metrics.ts';
 import { etagOf, type Encoding } from './http/compress.ts';
@@ -96,6 +101,8 @@ import {
 } from './runner/runner.ts';
 import { Scheduler, lockLapsed, type LockView } from './runner/scheduler.ts';
 import { offeredModels } from './runner/models.ts';
+import { autopilotPluginsOf, isAutopilotLoads } from './runner/loads.ts';
+import { graphToolOf } from './runner/graph-refresh.ts';
 import {
   continueMcpParkedRecord, mcpParkDueAt, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult,
 } from './runner/mcp-park.ts';
@@ -107,7 +114,7 @@ import {
   accountRung, errandFor, ladderCaps, nextRung, rungsFor, settleRung, type Rung,
 } from './runner/ladder.ts';
 import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
-import { asActor, doorActor, pressActor, pressDoorOf } from './actor.ts';
+import { asActor, doorActor, pressActor, pressDoorOf, type StartActor } from './actor.ts';
 import { doorOfRequest, ownerState, type DoorReading } from './owner/door.ts';
 import { relyingPartyOf, type RelyingParty } from './owner/passkey.ts';
 import { answerRequest, ownerPress, type OwnerAnswer, type OwnerPressInput } from './owner/presses.ts';
@@ -146,6 +153,7 @@ import type { CeilingView } from './start-ceiling.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { foldInboxTasks, type TaskItem } from './runner/tasks.ts';
 import { Journal } from './runner/journal.ts';
+import { HEALTH_SERIES_DAYS, type HealthPoint, type HealthSeriesView } from './health-series.ts';
 import { journalFile } from './runner/run-paths.ts';
 import { projectLedger, summariseLedgers, type LedgerSummary, type RunLedger } from './analysis/ledger.ts';
 import {
@@ -159,7 +167,7 @@ import {
 } from './runner/freeze.ts';
 import type { BackgroundTask, LaneLiveness } from './runner/liveness.ts';
 import { inTurnWait, selfMatchingProbe, waitScope } from './runner/liveness.ts';
-import { backgroundExitRefusal, pollLoopNotice, selfMatchReason, waitProcedure } from './runner/runner-core.ts';
+import { backgroundExitRefusal, fastGateRefusal, pollLoopNotice, selfMatchReason, stopBlock, waitProcedure } from './runner/runner-core.ts';
 import { isStatusCapable, type PollVerdict } from '../shared/poll-loop.js';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
@@ -206,7 +214,7 @@ import {
   signInCall, signInJournalCommand, signInRefusal, type SignInCall,
   editPolicy, planPolicyPath, effectivePlanPolicyPath, notifyOutOfBand, carvedPolicy, suggestedRule,
   autoApproveFor, neverAutoApproves, hitsHidden, matchedAskRule, publishingRule, questionRule, questionsOf, planRule, reshapeReason,
-  gateForgeCall, GATE_FORGE_RULE,
+  gateForgeCall, GATE_FORGE_RULE, protectedFileCall, PROTECTED_FILE_RULE,
   consoleForgeCall, consoleForgeException, consoleForgeRefusal, consolePorts, CONSOLE_FORGE_RULE, type ConsoleForge,
   parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED, EXTEND_CHOICES_MIN,
   PERMISSION_PROFILES, PROFILE_LABELS,
@@ -234,10 +242,13 @@ import { CONFLICT_POLICIES, LAND_POLICIES } from '../shared/landing-model.js';
 import { MESSAGING_WORDS } from '../shared/message-model.js';
 import { ISSUE_MODES, issueReposOf } from '../shared/issues-model.js';
 import { TURN_DONE_MS, turnView, type TurnAnswer, type TurnItem } from './turn/index.ts';
+import type { SettledRecord } from './turn/settled.ts';
+import { redactSecrets } from '../shared/human-step-model.js';
 import type { HandledRow } from './turn/handled.ts';
-import { PlanItems } from './turn/plan-items.ts';
+import { PlanItems, type HeadsUp } from './turn/plan-items.ts';
 import { FirstSeen, FIRST_SEEN_FILE } from './turn/first-seen.ts';
-import { bodyCarriesSecret, type HumanStep } from './human-steps.ts';
+import { bodyCarriesSecret, type HumanStep, type StepAnswer } from './human-steps.ts';
+import type { InboxView as WireInboxView } from '../shared/wire/turn.js';
 
 export {
   HOOK_EVENTS_PER_MINUTE,
@@ -288,6 +299,9 @@ const SPEND_POOL_MAX_MS = 60_000;
  * threshold, a ledger line a session appended — at one refetch beat's worth.
  */
 export const INBOX_MAX_AGE_MS = 10_000;
+
+/** The longest reason *I can't do this* keeps — a sentence or two, said on the item and to its run. */
+export const TURN_CANNOT_REASON_MAX = 500;
 
 /** `GET /api/inbox`'s body as the route sends it — built once per memo. */
 export type InboxEntity = {
@@ -347,6 +361,24 @@ function relayHookReply(reply: Exclude<RelayReply, { kind: 'not-relayed' }>): Re
   };
 }
 
+/** The most of a guide file the console copies for a deferred step — the script's own cap (24 KB) and no more. */
+const GUIDE_COPY_MAX = 24_576;
+
+/**
+ * A run's unpushed work as Your turn's heads-ups (measured-console phase 12,
+ * #397): one per phase whose record names commits no push has carried to
+ * `origin` — nothing checks it, and it goes the moment a read finds none.
+ */
+export function unpushedHeadsUp(state: RunState | null | undefined): HeadsUp[] {
+  if (!state) return [];
+  return Object.entries(state.phases ?? {}).flatMap(([phase, record]) => {
+    const trees = record?.unpushed?.trees ?? [];
+    if (!trees.length) return [];
+    const said = trees.map((tree) => `${tree.ahead} commit${tree.ahead === 1 ? '' : 's'} on ${tree.branch} in ${tree.repo}`).join(', ');
+    return [{ slug: state.slug, id: `unpushed-p${phase}`, what: `Phase ${phase} left unpushed work in its checkout: ${said} — not on origin until a push lands` }];
+  });
+}
+
 /** A decision key's place in the manifest's own order; an unknown key sorts last. */
 function keyRank(key: string): number {
   const at = (DECISION_KEYS as readonly string[]).indexOf(key);
@@ -373,6 +405,8 @@ export class Service extends ServiceRecovery {
   private inboxGateAnswers = new Map<string, { revision: number; gates: Map<number, GateStatus | null> }>();
   /** The refills in flight, as `<slug>@<revision>`. */
   private inboxGateFills = new Set<string>();
+  /** Gate answers a press read for itself, at the revision it read them — see `gateRead`. */
+  private inboxGateSeeds = new Map<string, { revision: number; gates: Map<number, GateStatus | null> }>();
   /** The week in numbers, remembered five minutes per question — see `weekReport`. */
   private readonly reportMemo = new ReportMemo();
 
@@ -2170,12 +2204,18 @@ export class Service extends ServiceRecovery {
       // A plan item's words from its plan NOW (turn-by-turn phase 2).
       planItem: (step) => this.planItems.wordsFor(step),
       // The open plans' heads-ups — errands rows no bullet names (turn-by-turn phase 4).
-      headsUp: (this.store?.list() ?? []).filter((record) => !this.isClosedPlan(record.slug))
-        .flatMap((record) => { try { return this.planItems.headsUp(record.slug); } catch { return []; } }),
+      headsUp: [
+        ...(this.store?.list() ?? []).filter((record) => !this.isClosedPlan(record.slug))
+          .flatMap((record) => { try { return this.planItems.headsUp(record.slug); } catch { return []; } }),
+        // …and each run's unpushed work (measured-console phase 12, #397): until a push lands.
+        ...[...this.runners.values()].flatMap((runner) => { try { return unpushedHeadsUp(runner.current()); } catch { return []; } }),
+      ],
       // What a person pressed on a projected item, for Done (turn-by-turn phase 5).
       settled: (() => { try { return this.settledNow().recent(TURN_DONE_MS, now); } catch { return []; } })(),
       // A projected item's assigned clock, kept across a restart (turn-by-turn phase 3).
       firstSeen: (entries) => (this.firstSeenMemo ??= new FirstSeen(join(INSTANCE_STATE_DIR, FIRST_SEEN_FILE))).stamp(entries, now),
+      // What a run's own verb needs (2026-10-20): the card draws it off without `--allow-run`.
+      allowRun: this.flags.allowRun === true,
     });
   }
 
@@ -2205,6 +2245,260 @@ export class Service extends ServiceRecovery {
   }
 
   /**
+   * The open item of Your turn an id names — the item's own id or any row it
+   * stands for — or the refusal that says why there is none to press.
+   */
+  private async openTurnItem(id: string): Promise<{ ok: true; item: TurnItem } | { ok: false; status: number; error: string }> {
+    const turn = await this.turnAnswer();
+    const named = (one: TurnItem) => one.item === id || one.rows.includes(id);
+    const item = Object.entries(turn.groups).filter(([group]) => group !== 'done').flatMap(([, items]) => items).find(named);
+    if (item) return { ok: true, item };
+    return turn.groups.done.some(named)
+      ? { ok: false, status: 409, error: 'This item is settled already — there is nothing left to press on it.' }
+      : { ok: false, status: 404, error: `No open item ${id} on Your turn.` };
+  }
+
+  /** A person's words for a turn verb: one line, secrets redacted, bounded. */
+  private static turnWords(raw: unknown): string {
+    return typeof raw === 'string' ? redactSecrets(raw.replace(/\s+/g, ' ').trim()).slice(0, TURN_CANNOT_REASON_MAX) : '';
+  }
+
+  /** A projected item settled by a person's press: its rows marked seen, and Done says how it ended. */
+  private settleProjected(item: TurnItem, outcome: SettledRecord['outcome'], what: string, by: string): SettledRecord {
+    for (const row of item.rows) this.ackInbox(row, by);
+    const settled: SettledRecord = {
+      item: item.item, at: new Date().toISOString(), source: item.source, outcome, by, title: item.title, what,
+      ...(item.slug ? { slug: item.slug } : {}), ...(item.phase != null ? { phase: item.phase } : {}),
+      ...(item.runId ? { runId: item.runId } : {}),
+    };
+    this.recordSettled(settled);
+    return settled;
+  }
+
+  /**
+   * Tell whoever an item goes to (2026-10-20): a pinned note on its plan's run,
+   * filed on its phase, which that phase's next session reads at boarding —
+   * behind the run flag, as the notes route is, because a pinned note reaches
+   * every boot prompt — and in Pro the supervisor, a chat opened on the item in
+   * the person's words, where this console offers the chat.
+   */
+  private async tellItemOwner(
+    item: TurnItem, actor: Actor, words: { note: string; chat: { title: string; message: string } },
+  ): Promise<{ note: string | null; chat: string | null }> {
+    let note: string | null = null;
+    if (item.slug && this.flags.allowRun) {
+      const noted = this.noteRun(item.slug, {
+        text: words.note, pinned: true, ...(item.phase != null && item.phase > 0 ? { phase: item.phase } : {}),
+      }, actor);
+      if (noted.ok) note = noted.note.id;
+    }
+    let chat: string | null = null;
+    return { note, chat };
+  }
+
+  /**
+   * A plan decision's note (2026-10-20), told as `tellItemOwner` tells: pinned
+   * on the phases it unblocks (`ServiceRecovery`), and in Pro the supervisor,
+   * a chat opened on the item in the person's words.
+   */
+  protected override async tellPlanDecision(
+    step: HumanStep, answer: StepAnswer, opts: { by: string; actor?: StartActor },
+  ): Promise<{ notes: string[]; chat: string | null }> {
+    const told = await super.tellPlanDecision(step, answer, opts);
+    return told;
+  }
+
+  /**
+   * *I can't do this* on any open item of Your turn (2026-10-20) — the owner's
+   * word that an act is not theirs to do, and why: `POST /api/turn/:id/cannot`.
+   *
+   * A ledger item takes the verb it always had (`cannotHumanStep`: the step
+   * settles, and an errand on its phase carries the reason). An item the
+   * console PROJECTS — a gate, a sign-in, a conflict, a ladder's errand — has
+   * no step to settle: its rows are marked seen and a settled record moves it
+   * to Done as Not doing, with the reason, while the blocker itself stands (a
+   * shut gate stays shut), and whoever it goes to is told (`tellItemOwner`).
+   */
+  async cannotTurnItem(
+    id: string, input: Record<string, unknown>, opts: { by: string; actor: Actor },
+  ): Promise<
+    | { ok: true; item: string; settled: SettledRecord | null; told: { note: string | null; chat: string | null } }
+    | { ok: false; status: number; error: string }
+  > {
+    if (bodyCarriesSecret(input)) {
+      return { ok: false, status: 400, error: 'A reason never carries a token, a password or a code — nothing was handed back.' };
+    }
+    const reason = Service.turnWords(input.reason);
+    if (!reason) return { ok: false, status: 400, error: 'Say why — whoever takes it from here reads your reason.' };
+    const found = await this.openTurnItem(id);
+    if (!found.ok) return found;
+    const { item } = found;
+    if (item.record === 'ledger') {
+      const settled = this.cannotHumanStep(item.item, { reason }, { by: opts.by });
+      return settled.ok
+        ? { ok: true, item: item.item, settled: null, told: { note: null, chat: null } }
+        : { ok: false, status: settled.status, error: settled.error };
+    }
+    // An owner's request and the supervisor's own card each end through their own press.
+    if (item.record === 'request' || item.supervisor) {
+      return { ok: false, status: 409, error: 'This item ends through its own press — confirm or refuse it, or dismiss the supervisor’s card.' };
+    }
+    const settled = this.settleProjected(item, 'not-doing', `Can't do it — ${reason}`, opts.by);
+    // Said as what the person said then, because the note outlives the moment
+    // (a gate somebody opens later boards a phase that reads it).
+    const told = await this.tellItemOwner(item, opts.actor, {
+      note: `Said on Your turn — can't do “${item.title}”: ${reason}. `
+        + 'If this phase still needs it, find another way, or say exactly what it needs from a person.',
+      chat: {
+        title: `Can't do: ${item.title}`,
+        message: `I can't do this item from Your turn: “${item.title}”. My reason: ${reason}. `
+          + 'Find another way, or tell me exactly what you need from me instead.',
+      },
+    });
+    log.info('turn.cannot', {
+      item: item.item, source: item.source, slug: item.slug ?? null, phase: item.phase ?? null, by: opts.by, ...told,
+    });
+    this.emit('inbox', { at: settled.at });
+    return { ok: true, item: item.item, settled, told };
+  }
+
+  /**
+   * *Hand it to the AI* (2026-10-20) — the last way on of every open Decision:
+   * the AI decides it, with the person's note, where the item goes. `POST
+   * /api/turn/:id/hand-off {note?}`.
+   *
+   *   - a session's decision is ANSWERED: "decide it yourself", the note with
+   *     it — the waiting session resumes with that answer;
+   *   - a plan's own decision is answered with the option the plan recommends
+   *     (the owner's ruling) — its answer file gains the line its phases read,
+   *     and the note goes to the phases it unblocks (`tellPlanDecision`);
+   *   - a stopped phase's errand RESUMES its session, the act its own now — the
+   *     acts a plan keeps for a person through Delegate (`delegatePhase`, which
+   *     records the ruling), any other through the errand's answer;
+   *   - anything else the console builds (a conflict, a question) is settled as
+   *     handed over, and its run — and in Pro the supervisor — is told.
+   */
+  async handOffTurnItem(
+    id: string, input: Record<string, unknown>, opts: { by: string; actor: Actor },
+  ): Promise<
+    | { ok: true; item: string; how: 'answered' | 'recommended' | 'resumed' | 'told'; told: { note: string | null; chat: string | null } }
+    | { ok: false; status: number; error: string }
+  > {
+    if (bodyCarriesSecret(input)) {
+      return { ok: false, status: 400, error: 'A note never carries a token, a password or a code — nothing was handed over.' };
+    }
+    const note = Service.turnWords(input.note);
+    const found = await this.openTurnItem(id);
+    if (!found.ok) return found;
+    const { item } = found;
+    if (item.record === 'request' || item.supervisor) {
+      return { ok: false, status: 409, error: 'This item ends through its own press — confirm or refuse it, or dismiss the supervisor’s card.' };
+    }
+    // The card's own offer is the rule (`turn/index.ts` `handsOff`): a gate's
+    // Approve, a login, a secret or a permission is never handed over.
+    if (!item.options?.some((option) => option.id === HAND_OFF_OPTION_ID)) {
+      return {
+        ok: false, status: 409,
+        error: 'Only you can make this choice — the AI cannot take it. Choose one of its options, or press I can’t do this.',
+      };
+    }
+    const yourself = 'within the plan and the run’s permission policy, and say in your handoff what you chose and why';
+    // An item the console builds goes to the AI through its run — a phase
+    // resumed, or a pinned note — which is `--allow-run`'s, as the run's own
+    // verbs are (`guardRun`); a ledger decision is answered as its own card is.
+    if (item.record !== 'ledger' && !this.flags.allowRun) {
+      return { ok: false, status: 403, error: 'Runs are disabled. Restart with --allow-run to enable the autopilot.' };
+    }
+    if (item.record === 'ledger') {
+      // A plan's own decision has no session waiting to decide it, and the
+      // phases it unblocks read the answer from the plan's file before they
+      // board: the AI goes with the recommendation the plan was written with
+      // (the owner's ruling, 2026-10-20), and the note goes to those phases.
+      const step = this.humanStepsNow().get(item.item);
+      if (step?.birth === 'plan') {
+        const recommended = step.options?.find((option) => option.recommended);
+        if (!recommended) {
+          return { ok: false, status: 409, error: 'This is the plan’s own decision and it recommends no option — choose one yourself.' };
+        }
+        const chose = await this.answerHumanStep(item.item, { option: recommended.id, ...(note ? { note } : {}) }, {
+          by: opts.by, actor: pressActor(opts.actor),
+        });
+        if (!chose.ok) return { ok: false, status: chose.status, error: chose.error };
+        log.info('turn.hand-off', {
+          item: item.item, source: item.source, slug: item.slug ?? null, phase: item.phase ?? null, by: opts.by, how: 'recommended', option: recommended.id,
+        });
+        return { ok: true, item: item.item, how: 'recommended', told: { note: null, chat: null } };
+      }
+      const answered = await this.answerHumanStep(item.item, {
+        note: `Decide it yourself, ${yourself}.${note ? ` The owner's note: ${note}` : ''}`,
+      }, { by: opts.by, actor: pressActor(opts.actor) });
+      if (!answered.ok) return { ok: false, status: answered.status, error: answered.error };
+      log.info('turn.hand-off', { item: item.item, source: item.source, slug: item.slug ?? null, phase: item.phase ?? null, by: opts.by, how: 'answered' });
+      return { ok: true, item: item.item, how: 'answered', told: { note: null, chat: null } };
+    }
+    const situation = parseInboxItemId(item.rows[0] ?? item.item)?.subject ?? '';
+    if (item.source === 'errand' && item.slug && item.phase != null && item.phase > 0) {
+      const press = pressActor(opts.actor);
+      const resumed = situation === 'blocked-declared:human-acts'
+        ? await this.delegatePhase(item.slug, item.phase, note, press)
+        : await this.resumeAnsweredErrand(item.slug, item.phase, note, press, undefined,
+          `The owner handed this to you on Your turn: “${item.title}”. Do or decide it yourself, ${yourself}.`
+            + `${note ? ` Their note: ${note}` : ''}`);
+      if (!resumed.ok) return { ok: false, status: resumed.status, error: resumed.error };
+      const settled = this.settleProjected(item, 'closed', `Handed to the AI${note ? ` — ${note}` : ''}`, opts.by);
+      log.info('turn.hand-off', { item: item.item, source: item.source, slug: item.slug, phase: item.phase, by: opts.by, how: 'resumed' });
+      this.emit('inbox', { at: settled.at });
+      return { ok: true, item: item.item, how: 'resumed', told: { note: null, chat: null } };
+    }
+    const settled = this.settleProjected(item, 'closed', `Handed to the AI${note ? ` — ${note}` : ''}`, opts.by);
+    const told = await this.tellItemOwner(item, opts.actor, {
+      note: `Handed to the AI on Your turn — “${item.title}”: decide or resolve it yourself, ${yourself}.`
+        + `${note ? ` The owner's note: ${note}` : ''}`,
+      chat: {
+        title: `Handed over: ${item.title}`,
+        message: `I'm handing this item from Your turn to you: “${item.title}”. Decide or resolve it yourself, within the run's `
+          + `policy, and tell me what you chose.${note ? ` My note: ${note}` : ''}`,
+      },
+    });
+    log.info('turn.hand-off', { item: item.item, source: item.source, slug: item.slug ?? null, phase: item.phase ?? null, by: opts.by, how: 'told', ...told });
+    this.emit('inbox', { at: settled.at });
+    return { ok: true, item: item.item, how: 'told', told };
+  }
+
+  /**
+   * A comment on an item, to the AI (2026-10-20) — `POST /api/turn/:id/note
+   * {text}`, the decision card's box when the chosen way on carries no words of
+   * its own: whoever the item goes to is told (`tellItemOwner`), and the item
+   * stays exactly as open as it was.
+   */
+  async noteTurnItem(
+    id: string, input: Record<string, unknown>, opts: { by: string; actor: Actor },
+  ): Promise<
+    | { ok: true; item: string; told: { note: string | null; chat: string | null } }
+    | { ok: false; status: number; error: string }
+  > {
+    if (bodyCarriesSecret(input)) {
+      return { ok: false, status: 400, error: 'A note never carries a token, a password or a code — nothing was sent.' };
+    }
+    const text = Service.turnWords(input.text);
+    if (!text) return { ok: false, status: 400, error: 'Write the note — an empty one tells nobody anything.' };
+    const found = await this.openTurnItem(id);
+    if (!found.ok) return found;
+    const { item } = found;
+    const told = await this.tellItemOwner(item, opts.actor, {
+      note: `A note from Your turn, about “${item.title}”: ${text}`,
+      chat: { title: `A note: ${item.title}`, message: `A note about this item from Your turn: “${item.title}”. ${text}` },
+    });
+    // A note nobody can read is not sent: no run of a plan stands behind the
+    // item to pin it on, and no supervisor reads this console.
+    if (!told.note && !told.chat) {
+      return { ok: false, status: 409, error: 'No AI can read a note on this item here — choose an option; the ones that take words carry yours.' };
+    }
+    log.info('turn.note', { item: item.item, source: item.source, slug: item.slug ?? null, phase: item.phase ?? null, by: opts.by, ...told });
+    return { ok: true, item: item.item, told };
+  }
+
+  /**
    * Your turn, counted for the hourly digest (control-tower phase 138, #215) —
    * from the page's own answer, so the digest says what the page says: the
    * items that need the person now (*Approve*, *Do now* and *Decide*), the ones a check
@@ -2223,7 +2517,7 @@ export class Service extends ServiceRecovery {
   async attentionEntity(all = false): Promise<InboxEntity> {
     const memo = await this.inboxMemoFor(all);
     if (!memo.entity) {
-      const body = Buffer.from(JSON.stringify(memo.view), 'utf8');
+      const body = Buffer.from(JSON.stringify(memo.view satisfies WireInboxView), 'utf8');
       memo.entity = { etag: etagOf(body), body, packed: {} };
     }
     return memo.entity;
@@ -2289,7 +2583,22 @@ export class Service extends ServiceRecovery {
   private inboxGates(slug: string, revision: number, phases: readonly number[]): Map<number, GateStatus | null> {
     const held = this.inboxGateAnswers.get(slug);
     if (phases.length && (!held || held.revision !== revision)) this.refillInboxGates(slug, revision, phases);
-    return held?.gates ?? new Map();
+    // A gate a press just wrote reads as the press read it back, at once — the
+    // refill brings the plan's other gates (2026-10-20: the card of a gate
+    // just approved was drawn shut again until the refill landed).
+    const seeded = this.inboxGateSeeds.get(slug);
+    if (seeded?.revision !== revision) return held?.gates ?? new Map();
+    return new Map([...(held?.gates ?? []), ...seeded.gates]);
+  }
+
+  /** The inbox takes the answer a gate press read back — see `ServiceLive.gateRead`. */
+  protected override gateRead(slug: string, phase: number, gate: GateStatus | null): void {
+    const revision = this.store?.get(slug)?.revision;
+    if (revision === undefined) return;
+    const seeded = this.inboxGateSeeds.get(slug);
+    const gates = seeded?.revision === revision ? seeded.gates : new Map<number, GateStatus | null>();
+    gates.set(phase, gate);
+    this.inboxGateSeeds.set(slug, { revision, gates });
   }
 
   private refillInboxGates(slug: string, revision: number, phases: readonly number[]): void {
@@ -2302,6 +2611,9 @@ export class Service extends ServiceRecovery {
       const held = this.inboxGateAnswers.get(slug);
       if (held && held.revision > revision) return;
       this.inboxGateAnswers.set(slug, { revision, gates });
+      // A refill at the seed's revision read after the write, so it holds the
+      // seed's answers too; one at an older revision leaves the seed standing.
+      if ((this.inboxGateSeeds.get(slug)?.revision ?? Infinity) <= revision) this.inboxGateSeeds.delete(slug);
       this.emit('inbox', { at: new Date().toISOString() });
     })()
       .catch((error) => log.warn('inbox.source-failed', { what: 'gates', error }))
@@ -2554,7 +2866,10 @@ export class Service extends ServiceRecovery {
         title: row.title, what: option.label,
         ...(row.slug ? { slug: row.slug } : {}), ...(row.phase != null ? { phase: row.phase } : {}), ...(row.runId ? { runId: row.runId } : {}),
       });
-      this.invalidateAll();
+      // The turn reads its settled records on every read, so the page is told
+      // and nothing else is forgotten: dropping every plan's cached board here
+      // made the next read re-shell the portfolio (2026-10-20, hub: ~45 s).
+      this.emit('inbox', { at: new Date().toISOString() });
     } catch { /* the ack is the press; its Done line is a convenience */ }
   }
 
@@ -3053,6 +3368,9 @@ export class Service extends ServiceRecovery {
   /** Per-session Stop-hook block counter — the loop guard. Bounded; cleared wholesale. */
   private stopBlocks = new Map<string, number>();
 
+  /** The sessions the fast gate has held once already (C4) — never twice. Bounded; cleared wholesale. */
+  private fastGateBlocked = new Set<string>();
+
   /**
    * The Stop hook's decision: may this session end its turn?
    *
@@ -3068,6 +3386,172 @@ export class Service extends ServiceRecovery {
    * `hook.stop-seen` in the log doubles as the runtime probe for whether the
    * CLI fires Stop hooks in `-p` at all — designed not to matter either way.
    */
+  /**
+   * The defer half of a person's step (measured-console phase 12, B2) — the
+   * hook's answer to a `phase-outcome.sh … needs-human` call, or null for the
+   * ordinary path:
+   *
+   *   - the RE-FIRE of a call this console deferred (`record.deferred`, same
+   *     `tool_use_id`): `allow`, the command given `--resumed-with <answer>`
+   *     when the person's check supplied one — else null, and the call runs as
+   *     written and parks the phase as 8.0 did;
+   *   - a first call under `defer` (`humanStepModeFor` — the run's word, else
+   *     the CLI's version) that `deferableDeclaration` can read: the console
+   *     runs ITS OWN script with the call's words into the phase's outcome
+   *     file, so the item is raised exactly as the session would have raised
+   *     it, then answers `defer` (exit 0); a declaration the script refused or
+   *     found already landed (exit 2, 3, 4) is `allow`ed so the session meets
+   *     that verdict itself; anything else is null.
+   */
+  private async deferHumanStep(
+    run: RunState, phase: number, sessionId: string | null, toolUseId: string, input: unknown, cwd: string | null,
+  ): Promise<Record<string, unknown> | null> {
+    const runner = this.runnerByRunId(run.id);
+    if (!runner) return null;
+    const command = (input as { command?: unknown } | null)?.command;
+    if (typeof command !== 'string') return null;
+    const refire = runner.takeDeferred?.(phase, toolUseId);
+    if (refire) {
+      if (!refire.answer) return null;
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse', permissionDecision: 'allow',
+          permissionDecisionReason: 'the person’s step is done — this call now hands its answer back',
+          updatedInput: { ...(input as Record<string, unknown>), command: resumedCommand(command, refire.answer) },
+        },
+      };
+    }
+    if (humanStepModeFor(run.humanStepMode, this.cliVersionSeen) !== 'defer') return null;
+    const args = deferableDeclaration(command, { slug: run.slug, phase });
+    if (!args) return null;
+    // The console runs its script with the SESSION's reach, never its own: the
+    // directory must be inside the run's trees, and a file the call names
+    // (`--guide`) must be too and be readable under the run's own policy — a
+    // session may not have the console read for it what its deny rules refuse.
+    // Every path canonical (`realpath`), so a symlink in a tree names where it
+    // really points; a guide is read HERE, without following a final link, and
+    // the script is handed a private copy — never a path a session can swap.
+    const real = (path: string): string | null => { try { return realpathSync(path); } catch { return null; } };
+    const trees = [run.root, run.workRoot].filter((tree): tree is string => typeof tree === 'string' && isAbsolute(tree))
+      .map(real).filter((tree): tree is string => Boolean(tree));
+    const inside = (path: string) => trees.some((tree) => path === tree || path.startsWith(`${tree.replace(/\/+$/, '')}/`));
+    const here = real(cwd && isAbsolute(cwd) ? cwd : run.root);
+    if (!here || !inside(here)) return null;
+    const { profile, policy } = this.policyForRun(run);
+    let scratch: string | null = null;
+    const cleanup = () => { if (scratch) rmSync(scratch, { recursive: true, force: true }); };
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] !== '--guide') continue;
+      const written = resolvePath(here, args[i + 1] ?? '');
+      let text: Buffer | null = null;
+      try {
+        // Opened FIRST — no final link followed, never blocking on a FIFO — and
+        // then judged by what was opened: a regular file within the cap, the
+        // same inode its realpath names now, inside the trees, readable under
+        // the policy by the path as written AND as it really is.
+        const fd = openSync(written, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+        try {
+          const opened = fstatSync(fd);
+          const file = real(written);
+          const named = file ? statSync(file) : null;
+          const denied = (path: string) => classifyTool('Read', { file_path: path }, policy, profile) === 'deny';
+          if (opened.isFile() && opened.size <= GUIDE_COPY_MAX && file && named
+            && named.dev === opened.dev && named.ino === opened.ino && inside(file) && !denied(written) && !denied(file)) {
+            const buf = Buffer.alloc(GUIDE_COPY_MAX + 1);
+            text = buf.subarray(0, readSync(fd, buf, 0, buf.length, 0));
+          }
+        } finally { closeSync(fd); }
+      } catch { text = null; }
+      if (!text) { cleanup(); return null; }
+      scratch ??= mkdtempSync(join(tmpdir(), 'pc-defer-guide-'));
+      const copy = join(scratch, `guide-${i}.md`);
+      writeFileSync(copy, text, { mode: 0o600 });
+      args[i + 1] = copy;
+    }
+    const keep = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'USER', 'LOGNAME', 'SHELL', 'XDG_STATE_HOME', 'XDG_CONFIG_HOME', 'PHASE_OUTCOME_PROBE'];
+    const env: NodeJS.ProcessEnv = Object.fromEntries(keep.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]));
+    const exit = await new Promise<number>((resolve) => {
+      execFile('/bin/bash', [join(this.flags.scriptsDir, 'phase-outcome.sh'), ...args], {
+        cwd: here, timeout: 60_000, maxBuffer: 1 << 20,
+        env: {
+          ...env, DOCS_ROOT: run.root, PE_OUTCOME_FILE: runner.declarationFile(phase),
+          PE_SESSION_ID: sessionId ?? '', PE_RUN_ID: run.id, PHASE_OUTCOME_UNPUSHED: '0',
+        },
+      }, (error) => resolve(error ? (typeof (error as { code?: unknown }).code === 'number' ? (error as { code: number }).code : 1) : 0));
+    });
+    cleanup();
+    // 2, 3, 4 — refused, already landed, guarded: nothing was written, and the
+    // session's own run of the call meets the same verdict. Anything else too.
+    if (exit !== 0) return null;
+    runner.noteDeferred(phase, { toolUseId, sessionId, command, exit });
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse', permissionDecision: 'defer',
+        permissionDecisionReason: 'held for a person: the console raised this step and resumes this very call, with their answer, when it is done',
+      },
+    };
+  }
+
+  /**
+   * The run-token hooks answered IN PROCESS (measured-console phase 20, B1):
+   * the Agent SDK door's hooks and its `canUseTool` hand the bearer the run's
+   * settings carried, and are answered by the same token check and the same
+   * four methods the `/hooks/*` routes call — so the classifier, its words and
+   * its journal are one, whichever door the session came through. A bad token
+   * is the route's 401, said and noted as the route says it.
+   */
+  async answerRunHook(
+    hook: RelayMechanism | 'stop' | 'compact', authorization: string | undefined, body: unknown,
+  ): Promise<{ status: number; body: Record<string, unknown> }> {
+    if (!this.approvals.verify(authorization)) {
+      const reason = this.approvals.armed() ? 'bad token' : 'no run is armed';
+      log.warn('hook.rejected', hook === 'compact' ? { reason, hook } : { reason });
+      if (hook !== 'compact') this.noteHookUnauthorised(hook, body, reason);
+      return { status: 401, body: { error: 'bad or expired run token' } };
+    }
+    const runId = this.approvals.runIdFor(authorization);
+    const input = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+    switch (hook) {
+      case 'pre-tool-use': return { status: 200, body: await this.decideToolUse(input, runId) };
+      case 'permission-request': return { status: 200, body: await this.decidePermissionRequest(input, runId) };
+      case 'stop': return { status: 200, body: await this.decideStop(input, runId) };
+      case 'compact': return { status: 200, body: this.noteCompaction(input, runId) };
+    }
+  }
+
+  /**
+   * A `PreCompact` / `PostCompact` hook (measured-console phase 12, A10):
+   * handed to the phase's runner, matched by session id as the Stop hook is,
+   * and answered `{}` — it decides nothing.
+   */
+  noteCompaction(body: Record<string, unknown>, runId?: string | null): Record<string, unknown> {
+    const event = body.hook_event_name;
+    const sessionId = typeof body.session_id === 'string' ? body.session_id : null;
+    if (!runId || !sessionId || (event !== 'PreCompact' && event !== 'PostCompact')) return {};
+    const state = this.runForToken(runId);
+    if (!state) return {};
+    const phase = Object.values(state.phases).find((record) => record.sessionId === sessionId)?.phase ?? state.activePhase;
+    if (phase == null) return {};
+    try {
+      this.runnerByRunId(state.id)?.noteCompactionHook?.(phase, event, typeof body.trigger === 'string' ? body.trigger : 'auto');
+    } catch (error) { log.warn('hook.compact-failed', { runId: state.id, phase, error: String(error) }); }
+    return {};
+  }
+
+
+  /**
+   * `POST /otel/v1/logs` and `/otel/v1/metrics` (measured-console phase 19): a session's
+   * OpenTelemetry export, already read to its bound, folded by the receiver. A console with no
+   * receiver answers 404 — the free tree's, whose sessions are never pointed here.
+   */
+  otelExport(
+    signal: 'logs' | 'metrics', authorization: string | undefined, contentType: string | undefined, body: Buffer,
+    contentEncoding?: string,
+  ): { status: number; body: Record<string, unknown> } {
+    let answer: { status: number; body: Record<string, unknown> } | null = null;
+    return answer ?? { status: 404, body: { error: 'this console has no telemetry receiver' } };
+  }
+
   async decideStop(body: Record<string, unknown>, runId?: string | null): Promise<Record<string, unknown>> {
     const allow = {};
     const sessionId = typeof body.session_id === 'string' ? body.session_id : null;
@@ -3103,12 +3587,24 @@ export class Service extends ServiceRecovery {
         slug: state.slug, phase, sessionId, blocks: blocks + 1,
         tasks: awaiting.map((task) => ({ id: task.id, type: task.taskType ?? null, tool: task.tool ?? null })),
       });
-      return {
-        hookSpecificOutput: {
-          hookEventName: 'Stop', decision: 'block',
-          reason: backgroundExitRefusal(phase, state.slug, awaiting, Date.now()),
-        },
-      };
+      return stopBlock(backgroundExitRefusal(phase, state.slug, awaiting, Date.now()));
+    };
+
+    // The fast gate (measured-console phase 6, C4): a session ENDING its work —
+    // the board done, or `complete` declared — is held ONCE on its phase's red
+    // fast lines, named with their failing ids. Never while the CLI is already
+    // continuing for a Stop hook (`stop_hook_active`), never a second time for
+    // the same session, never on a phase that says `- **Fast gate:** off`, and
+    // never on a gate that could not run: fail open, like the rest of this hook.
+    const fastGate = async (): Promise<Record<string, unknown> | null> => {
+      if (body.stop_hook_active === true || this.fastGateBlocked.has(sessionId)) return null;
+      let red: { command: string; failures: string[] }[] | null = null;
+      try { red = await this.runnerByRunId(state.id)?.stopGate?.(phase) ?? null; } catch { red = null; }
+      if (!red?.length) return null;
+      if (this.fastGateBlocked.size > 512) this.fastGateBlocked.clear();
+      this.fastGateBlocked.add(sessionId);
+      log.info('hook.stop-fast-gate', { slug: state.slug, phase, sessionId, red: red.length });
+      return stopBlock(fastGateRefusal(phase, state.slug, red));
     };
 
     let qaOwed = false;
@@ -3131,7 +3627,7 @@ export class Service extends ServiceRecovery {
             qaOwed = verdict === 'pending' || verdict === 'none' || verdict === '';
           }
         } catch { qaOwed = false; }
-        if (!qaOwed) return refuseExit() ?? allow;
+        if (!qaOwed) return refuseExit() ?? await fastGate() ?? allow;
       }
     } catch {
       return allow;
@@ -3140,7 +3636,10 @@ export class Service extends ServiceRecovery {
     const declared = readOutcome(outcomeFileFor(state.root, state.slug, state.id, phase), {
       slug: state.slug, phase, ...(entry?.startedAt ? { notBefore: entry.startedAt } : {}),
     });
-    if (declared) return (declared.status === 'partial' || declared.status === 'complete' ? refuseExit() : null) ?? allow;
+    if (declared) {
+      return (declared.status === 'partial' || declared.status === 'complete' ? refuseExit() : null)
+        ?? (declared.status === 'complete' ? await fastGate() : null) ?? allow;
+    }
 
     // A turn that ends while this session's own agents or monitors are still
     // working is a WAIT, not an exit (autopilot-token-drain phase 1): measured
@@ -3167,35 +3666,23 @@ export class Service extends ServiceRecovery {
       // Stop hook names a filename to a live session, and naming an occupied
       // one is how a committed report gets overwritten.
       const owed = nextQaRound(this.store?.get(state.slug)?.handoffDir, phase);
-      return {
-        hookSpecificOutput: {
-          hookEventName: 'Stop',
-          decision: 'block',
-          reason: `Phase ${phase} of ${state.slug} is done on the board but its QA verdict is still owed — `
-            + 'this plan gates on QA, and a pending row holds every dependent phase exactly as a '
-            + 'failure does. Dispatch a FRESH-context QA subagent now, in the FOREGROUND, so the call '
-            + 'returns with its verdict — get its brief with '
-            + `\`bash ${SCRIPTS_REF}/phase-graph.sh ${state.slug} --qa-prompt ${phase}\` — and `
-            + `record what it finds with \`bash ${SCRIPTS_REF}/qa-record.sh ${state.slug} ${phase} `
-            + `<pass|fail|waived> --report ${owed.report} --round ${owed.round}\`. Then stop.`,
-        },
-      };
+      return stopBlock(`Phase ${phase} of ${state.slug} is done on the board but its QA verdict is still owed — `
+        + 'this plan gates on QA, and a pending row holds every dependent phase exactly as a '
+        + 'failure does. Dispatch a FRESH-context QA subagent now, in the FOREGROUND, so the call '
+        + 'returns with its verdict — get its brief with '
+        + `\`bash ${SCRIPTS_REF}/phase-graph.sh ${state.slug} --qa-prompt ${phase}\` — and `
+        + `record what it finds with \`bash ${SCRIPTS_REF}/qa-record.sh ${state.slug} ${phase} `
+        + `<pass|fail|waived> --report ${owed.report} --round ${owed.round}\`. Then stop.`);
     }
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'Stop',
-        decision: 'block',
-        reason: `Phase ${phase} of ${state.slug} is not closed: the board does not read done and no `
-          + 'outcome is declared. If you are WAITING on an external process (a CI build, a deploy '
-          + 'window), declare it now and stop — prose is invisible to the supervisor: '
-          + `\`bash ${SCRIPTS_REF}/phase-outcome.sh ${state.slug} ${phase} `
-          + 'waiting-external --wait-minutes <M> --reason "<what>" --watch <ref>` '
-          + '(write the handoff `in-progress` first). Otherwise finish the closeout — run the '
-          + 'plan\'s §Verification commands, commit with explicit paths, then run '
-          + `\`bash ${SCRIPTS_REF}/new-handoff.sh ${state.slug} ${phase} <kebab-title> complete\` `
-          + 'and fill it in.',
-      },
-    };
+    return stopBlock(`Phase ${phase} of ${state.slug} is not closed: the board does not read done and no `
+      + 'outcome is declared. If you are WAITING on an external process (a CI build, a deploy '
+      + 'window), declare it now and stop — prose is invisible to the supervisor: '
+      + `\`bash ${SCRIPTS_REF}/phase-outcome.sh ${state.slug} ${phase} `
+      + 'waiting-external --wait-minutes <M> --reason "<what>" --watch <ref>` '
+      + '(write the handoff `in-progress` first). Otherwise finish the closeout — run the '
+      + 'plan\'s §Verification commands, commit with explicit paths, then run '
+      + `\`bash ${SCRIPTS_REF}/new-handoff.sh ${state.slug} ${phase} <kebab-title> complete\` `
+      + 'and fill it in.');
   }
 
   async decideToolUse(
@@ -3387,6 +3874,36 @@ export class Service extends ServiceRecovery {
       }
     }
 
+    // The protected-file guard (measured-console phase 6, C4): a baseline, a
+    // ratchet, the known reds, the quarantine or a snapshot is never written by
+    // a session, and a test file is deleted only where the phase's plan section
+    // says `- **May delete tests:** yes`. Outside `policy` like `gate-forge` —
+    // no profile, strike or allow rule reaches it — and the local guard hook
+    // (`scripts/guard-hook.sh`) answers the same with the console unreachable.
+    if (verdict !== 'deny' && run) {
+      let guarded: string | null = null;
+      try {
+        const mayDeleteTests = phase != null && Boolean(this.runnerByRunId(run.id)?.mayDeleteTests?.(phase));
+        guarded = protectedFileCall(toolName, input, { mayDeleteTests });
+      } catch { guarded = null; }
+      if (guarded) {
+        const bashCommand = (input as { command?: unknown } | null)?.command;
+        try {
+          this.runnerByRunId(run.id)?.note('phase.guard-denied', {
+            tool: toolName, rule: PROTECTED_FILE_RULE, why: guarded,
+            ...deniedCommandField(bashCommand),
+          }, phase ?? undefined);
+        } catch { /* the deny stands */ }
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: `blocked by the console (rule: ${PROTECTED_FILE_RULE}): ${guarded}.`,
+          },
+        };
+      }
+    }
+
     // The console-forge guard (control-tower phase 129, #218): a session never
     // presses its own console. A supervised call to a route or CLI verb in
     // `AUTHORITY_ROUTES` — answering a card, editing the policy, raising its
@@ -3424,6 +3941,17 @@ export class Service extends ServiceRecovery {
           },
         };
       }
+    }
+
+    // A person's step, deferred at its call (measured-console phase 12, B2):
+    // the `phase-outcome.sh … needs-human` call under `humanStepMode: defer`
+    // is answered `defer` once the console has raised the item from it, and
+    // its re-fire on the resume is answered `allow` with the person's answer.
+    if (verdict === 'allow' && run && typeof phase === 'number' && toolName === 'Bash' && !body.agent_id
+      && typeof body.tool_use_id === 'string' && body.tool_use_id) {
+      const deferred = await this.deferHumanStep(run, phase, sessionId, body.tool_use_id, input,
+        typeof body.cwd === 'string' ? body.cwd : null);
+      if (deferred) return deferred;
     }
 
     // The question class (TRS-1): a question, not a permission — held on every
@@ -4413,6 +4941,11 @@ export class Service extends ServiceRecovery {
    * `pe/<slug>` under the new-branch strategy, so "the run branch" in a row
    * reads as that.
    */
+  /** The wrap-up's push (measured-console phase 12, #397): exactly the verdict a session's own `git push` would get. */
+  protected override runBranchPushAllowed(run: RunState, phase: number, command: string): boolean {
+    return this.manifestAnswerFor(run, phase, 'Bash', { command })?.answer === 'allow';
+  }
+
   private manifestAnswerFor(run: RunState, phase: number | null, toolName: string, input: unknown): ManifestCheck | null {
     const rule = publishingRule(toolName, input);
     if (!rule) return null;
@@ -4676,7 +5209,20 @@ export class Service extends ServiceRecovery {
           this.ledgerCache.set(key, { stamp, ledger });
           return { slug, ledger };
         }));
-    return summariseLedgers(ledgers);
+    // One source (measured-console phase 31): a session the usage ledger holds is counted at the
+    // ledger's dollars, so this and Settings ▸ Accounts ▸ History agree to the cent.
+    let dollars: ReturnType<typeof sessionDollarsOf> | undefined;
+    return summariseLedgers(ledgers, { dollars });
+  }
+
+
+  /**
+   * Logs ▸ Health over time (measured-console phase 31, F2): the bounded series, with — Pro —
+   * the reconciliation's delta read from `reconciliation.ndjson` as a fourth measure.
+   */
+  healthSeriesView(): HealthSeriesView {
+    const extra: HealthPoint[] = [];
+    return this.healthSeries.view(HEALTH_SERIES_DAYS, extra);
   }
 
   /* ------------------------------------------------------------------ *
@@ -4924,6 +5470,7 @@ export class Service extends ServiceRecovery {
   }
 
 
+
   savePreferences(input: Partial<Prefs> & { automation?: unknown }, opts: { by?: string } = {}): Prefs {
     // 🔑 **Either shape, one allowlist.** 3.5.0's `automation` object is
     // FLATTENED here and then picked apart exactly as a flat patch is, so the
@@ -5032,6 +5579,13 @@ export class Service extends ServiceRecovery {
     if (typeof patch.watchCmdRefs === 'boolean') picked.watchCmdRefs = patch.watchCmdRefs;
     if (typeof patch.watchMintedCmdRefs === 'boolean') picked.watchMintedCmdRefs = patch.watchMintedCmdRefs;
     if (isMcpPolicy(patch.mcpPolicy)) picked.mcpPolicy = patch.mcpPolicy;
+    // What an unattended session loads (measured-console phase 11): one of the
+    // two words, and an array REPLACES the plugin list through the one filter
+    // a plugin id must pass. Anything else is dropped.
+    if (isAutopilotLoads(patch.autopilotLoads)) picked.autopilotLoads = patch.autopilotLoads;
+    if (Array.isArray(patch.autopilotPlugins)) picked.autopilotPlugins = autopilotPluginsOf(patch.autopilotPlugins);
+    // A bare command name or nothing: '' is the setting off, anything else is dropped.
+    if (typeof patch.graphTool === 'string' && (patch.graphTool === '' || graphToolOf(patch.graphTool))) picked.graphTool = graphToolOf(patch.graphTool);
     // The ladder caps and toggles: numbers must be finite and non-negative,
     // booleans booleans — the same rule `sanitiseAutomation` applies on load.
     const cap = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;

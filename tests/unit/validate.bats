@@ -422,11 +422,11 @@ PLAN
   refute_contains "$output" "F33"
 }
 
-# HF-4 (control-tower phase 85, #115): the `▶ Start next phase(s)` section is a
-# hand-off to OTHER sessions, and a handoff it dominates no longer reads as one
-# document — tfar phase 32's ran 1,090 of 1,350 lines and buried `## Outstanding`
-# at line 1,333. validate.sh names such a handoff; it is a warning, never a
-# problem: the exit code is untouched.
+# A8 (measured-console phase 4; HF-4 before it, #115): a handoff is a brief that
+# points at artifacts. Its BODY — everything but the frontmatter and the
+# `▶ Start next phase(s)` section, which new-handoff.sh writes — is held to 300
+# lines; validate.sh names one past it. A warning, never a problem: the exit code
+# is untouched.
 #
 # oversized_handoff <body-lines> <start-section-lines> — phase 1 of the linear plan.
 oversized_handoff() {
@@ -477,31 +477,46 @@ errand_handoff() {
   case "$output" in *"points into a console run tree"*) false ;; esac
 }
 
-@test "HF-4: a start section over 300 lines is named, and validate still passes" {
+@test "A8: a handoff whose BODY passes 300 lines is named, and validate still passes" {
   setup_docs linear linear
-  oversized_handoff 700 320
+  oversized_handoff 320 10
   run pe_validate linear
   [ "$status" -eq 0 ]
-  assert_contains "$output" "phase-01-alpha.md"
-  assert_contains "$output" "section is 325 of"
-  assert_contains "$output" "over 300 lines"
+  assert_contains "$output" "phase-01-alpha.md: its body is 325 lines — over 300"
   assert_contains "$output" "VALIDATE OK"
 }
 
-@test "HF-4: a start section over 40% of its handoff is named, however short" {
+@test "A8: a long start section over a short body says nothing — the pointer section is not the body" {
   setup_docs linear linear
-  oversized_handoff 40 80
+  oversized_handoff 40 400
   run pe_validate linear
   [ "$status" -eq 0 ]
-  assert_contains "$output" "phase-01-alpha.md"
-  assert_contains "$output" "over 40% of the handoff"
+  refute_contains "$output" "its body is"
+  refute_contains "$output" "section is"
 }
 
-@test "HF-4: a start section under both bounds says nothing" {
+@test "A8: a body under 300 lines says nothing" {
   setup_docs linear linear
-  oversized_handoff 300 100
+  oversized_handoff 280 100
   run pe_validate linear
   [ "$status" -eq 0 ]
   refute_contains "$output" "phase-01-alpha.md"
-  refute_contains "$output" "section is"
+}
+
+@test "A8: a secret's shape in a guide or a handoff is named by file and line, never echoed" {
+  setup_docs linear linear
+  oversized_handoff 20 5
+  key="sk-ant-$(printf 'A%.0s' $(seq 1 30))"
+  printf '\n## Key decisions / gotchas\nthe token was %s\n' "$key" >> "$DOCS_ROOT/docs/handoffs/linear/phase-01-alpha.md"
+  mkdir -p "$DOCS_ROOT/docs/handoffs/linear/guides"
+  printf '# Store the key\n\n1. Paste it:\n\n    export ANTHROPIC_API_KEY=%s\n' "$key" > "$DOCS_ROOT/docs/handoffs/linear/guides/e-1-key.md"
+  printf '# A task page\n\nThe task-page-the-board-and-the-cards words stay.\n' > "$DOCS_ROOT/docs/handoffs/linear/guides/e-2-words.md"
+  run pe_validate linear
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "guides/e-1-key.md:5: a secret's shape"
+  assert_contains "$output" "phase-01-alpha.md:"
+  [ "$(printf '%s\n' "$output" | grep -c "a secret's shape")" -eq 2 ]
+  refute_contains "$output" "e-2-words.md"
+  refute_contains "$output" "$key"
+  assert_contains "$output" "VALIDATE OK"
 }

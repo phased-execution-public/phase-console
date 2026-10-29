@@ -428,7 +428,7 @@ test('THE FINDING: the admission check asks `lockPresenceFor`, not the raw regis
   // Pinned at the source because the behaviour needs a live runner holding a
   // real lease, and a test that fakes one would be asserting the fake.
   const source = readFileSync(new URL('../server/service-runs.ts', import.meta.url), 'utf8');
-  const body = /private claimHolders\([\s\S]*?\n  \}/.exec(source)?.[0] ?? '';
+  const body = /private claimHolders\([\s\S]*?\n {2}\}/.exec(source)?.[0] ?? '';
   assert.ok(body, 'claimHolders must exist — it is the one predicate behind both doors');
   assert.match(body, /this\.lockPresenceFor\(lock\)/,
     'the claim check must ask the presence that carves out our own live runs');

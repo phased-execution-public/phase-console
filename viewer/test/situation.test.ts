@@ -27,7 +27,7 @@ import {
 import {
   SITUATIONS as SERVER_SITUATIONS, MCP_PARK_RE, VERIFICATION_PARK_RE,
   blockerStatement, blockerSubKind, classifySituation, collectEvidence, declaredSubKind, parseLockStatus,
-  summariseEvidence, workEvidence, type PhaseEvidence,
+  spawnSdkFailure, summariseEvidence, workEvidence, type PhaseEvidence,
 } from '../server/runner/situation.ts';
 import { SITUATIONS as LADDER_SITUATIONS, RUNGS_BY_SITUATION, errandFor, rungsFor } from '../server/runner/ladder.ts';
 import { MCP_PARK_NOTE, VERIFICATION_PARK_NOTE } from '../server/runner/runner.ts';
@@ -903,6 +903,42 @@ function exited(said: string): PhaseEvidence {
     record: { ...P12_NEVER_STARTED.record!, status: 'interrupted', turns: 0, costUsd: 0, said },
   };
 }
+
+/* ------------------------------------------------------------------ *
+ * The Agent SDK's door (measured-console phase 21, B1)
+ * ------------------------------------------------------------------ */
+
+test('spawn-sdk-failed: an SDK session with no event, no turn and no model is lost — one rung, the subprocess; a session that worked, or that the console ended, is not', () => {
+  const lostOutcome = { turns: 0, resultText: '', signal: { text: 'spawn claude ENOENT' } };
+  const s = spawnSdkFailure(lostOutcome, { sawEvent: false, aborted: false });
+  assert.ok(s);
+  assert.equal(s!.key, 'spawn-sdk-failed');
+  assert.equal(s!.actor, 'machine');
+  assert.ok(s!.why.some((w) => /spawn claude ENOENT/.test(w)), s!.why.join(' | '));
+  const rungs = rungsFor(s!.key);
+  assert.deepEqual(rungs.map((rung) => rung.vehicle), ['reboard-subprocess'], 'ONE rung: the same session on the subprocess');
+  assert.equal(rungs[0]!.label, 'Re-attempt on the subprocess');
+  // A throw before the session started is the same loss.
+  assert.match(spawnSdkFailure(null, { sawEvent: false, aborted: false, thrown: new Error('query() is not a function') })!.why.join(' '), /threw before the session started.*query\(\) is not a function/);
+  // Never a loss: an event arrived, the console ended it, it worked, or the CLI named its model.
+  assert.equal(spawnSdkFailure(lostOutcome, { sawEvent: true, aborted: false }), null);
+  assert.equal(spawnSdkFailure(lostOutcome, { sawEvent: false, aborted: true }), null);
+  assert.equal(spawnSdkFailure({ ...lostOutcome, turns: 2 }, { sawEvent: false, aborted: false }), null);
+  assert.equal(spawnSdkFailure({ ...lostOutcome, resolvedModel: 'claude-opus-5-5' }, { sawEvent: false, aborted: false }), null);
+  assert.equal(spawnSdkFailure({ ...lostOutcome, endedBy: 'watchdog' }, { sawEvent: false, aborted: false }), null);
+});
+
+test('spawn-sdk-failed: a record whose subprocess re-attempt never ran (a console that died between) reads as the situation; once it ran, as what it is', () => {
+  const lost: PhaseEvidence = {
+    ...P12_NEVER_STARTED,
+    record: { ...P12_NEVER_STARTED.record!, status: 'failed', turns: 0, costUsd: 0, spawnFallback: { detail: 'it ended before its first event', done: false } },
+  };
+  const s = classifySituation(lost);
+  assert.equal(s.key, 'spawn-sdk-failed', s.why.join(' | '));
+  assert.ok(s.why.some((w) => /has not run/.test(w)));
+  const ran = classifySituation({ ...lost, record: { ...lost.record!, spawnFallback: { detail: 'x', done: true } } });
+  assert.equal(ran.id, 'never-started', 'the re-attempt ran: the phase is whatever it is now');
+});
 
 test('a laptop that slept resumes the same session, not a fresh one (D26)', () => {
   const s = classifySituation(exited('The session ended because the computer went to sleep mid-response.'));

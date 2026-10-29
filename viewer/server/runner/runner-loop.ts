@@ -21,7 +21,8 @@ import {
   DEFAULT_REVIEWER_POLICY, parseReviewerReport, reviewerLabel, reviewerPrompt,
   type ReviewerVerdictPolicy,
 } from '../reviewer.ts';
-import { credentialsDirective, mcpDirective, skillDirective, ultracodeDirective } from '../skills.ts';
+import { credentialsDirective, freshGraphs, knowledgeGraphDirective, mcpDirective, skillDirective, ultracodeDirective } from '../skills.ts';
+import { graphToolOf, refreshGraphs } from './graph-refresh.ts';
 import { policyForKey } from './policy.ts';
 import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
@@ -50,12 +51,13 @@ import {
   type LaneLiveness, type LaneSignals, type StallState, type StallThresholds,
 } from './liveness.ts';
 import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
+import type { PhasePluginSet } from './loads.ts';
 import {
   acquireLane, checkAvailable, copyEnvFiles, discardFreshMounts, discardFreshTree,
   ensureIntegration, ensureDetachedIntegration, ensureMirror, landLane, holdsBranch, landIntegration, pruneRun, reclaimBranch, defaultBranchOf, sweepUnmanaged, deleteMergedBranches,
   lockTree, resolveBase, worktreeLockReason, copyIncluded, type BaseResolution, type ForeignLock,
   baseBranch, checkedOutIn, commitOf, commitsWithPaths, parseGitmodulesPaths, realish, runBranches, holdsDetached, type Reclaim,
-  pruneRunTree, reattachMirror, repairMirror, resolveMounts, runSetup, scopeConfined, sweepStale, validateMirror,
+  pruneRunTree, reattachMirror, refreshMirrorMounts, repairMirror, resolveMounts, runSetup, scopeConfined, sweepStale, validateMirror,
   partitionScope,
   ISOLATION_PARKS, REFUSAL_FIX, REFUSAL_REASON, UNUSABLE_TREE, heldElsewhere, detachHandTree, worktreesRoot,
   type LandResult, type LaneNames, type MirrorMount, type Quarantined, type StructuralConflict, type WorktreeRefusal,
@@ -63,7 +65,7 @@ import {
   landingProofs, reseatLandedBranch, reseatLandedMounts, type LandingProof, type Reseat,
 } from './worktree.ts';
 import {
-  foreignTrees, foreignTreeWarning, readHolds, readTrees, removeHold, writeHold, type TreeHold,
+  foreignTrees, foreignTreeWarning, readHolds, readTrees, reposUnder, removeHold, writeHold, type TreeHold,
 } from './tree-state.ts';
 import { runFile } from './run-paths.ts';
 import {
@@ -130,9 +132,11 @@ import type { HumanStep } from '../human-steps.ts';
  * The statuses in which a kept lane holds its tree (one-pool phase 21): the
  * phase is resumable by the console itself — re-boarding, queued, or parked on
  * a clock or a watch. A phase parked for a person, failed or settled holds
- * nothing; its `keepsLane` is spent the next time it boards.
+ * nothing; its `keepsLane` is spent the next time it boards. Exported for the
+ * attempt's end, which re-keeps a lane in exactly these (measured-console
+ * phase 13, #417).
  */
-const KEEPER_STATUSES: readonly PhaseStatus[] = ['pending', 'queued', 'waiting'];
+export const KEEPER_STATUSES: readonly PhaseStatus[] = ['pending', 'queued', 'waiting'];
 
 /** A closeout brief's turn cap, as the brief composed it. */
 const closeoutBriefTurns = (value: number): Cap => ({ value, source: 'closeout', basis: 'a closeout brief' });
@@ -398,6 +402,7 @@ export const GATE_HELD_NOTE = 'gate not clear:';
  * read is one engine call, and a docs change anywhere reads it at once besides.
  */
 export const GATE_REREAD_MS = 60_000;
+
 
 export abstract class RunnerLoop extends RunnerControl {
   /* ---------------------------------------------------------------- *
@@ -1124,6 +1129,19 @@ export abstract class RunnerLoop extends RunnerControl {
       // A boundary, no lane live: the moment a branch a release squash-merged
       // can be put on what landed without moving a tree under a session (#183).
       await this.reseatLanded(state);
+      // …and the moment a mount no phase scopes follows its fetched trunk
+      // (measured-console phase 13, #403): a sibling's tests read it, and one
+      // left at the run-start commit read them red for a day. Never fatal.
+      if (state.mountedRepos?.length) {
+        const fresh = await refreshMirrorMounts({
+          integration: state.workRoot, runBranch: this.laneNamesFor(0).runBranch,
+          root: state.root, scope: this.deps.planScope?.(state.slug) ?? [],
+        }).catch(() => null);
+        if (fresh && (fresh.moved.length || fresh.warnings.length)) {
+          this.record('run.mirror-refreshed', { dir: state.workRoot, moved: fresh.moved, warnings: fresh.warnings });
+          this.persist();
+        }
+      }
       return true;
     }
     const was = state.checkout;
@@ -2246,13 +2264,16 @@ export abstract class RunnerLoop extends RunnerControl {
         // A hold that lifted is forgotten, so the same unmet set held again
         // later — a dependency re-opened — is said again.
         for (const key of this.admissionRefused) if (!heldKeys.has(key)) this.admissionRefused.delete(key);
-        const boardable = this.boardingOrder(candidates.filter((p) => !fenced.has(p) && !held.has(p) && !laneHeld.has(p) && !depHeld.has(p)));
+        let boardable = this.boardingOrder(candidates.filter((p) => !fenced.has(p) && !held.has(p) && !laneHeld.has(p) && !depHeld.has(p)));
+        // The canary (measured-console phase 24): a changed model or effort boards one S phase
+        // alone first; the rest wait for its verdict — held, not settled, and not undriven.
+        const canaryHeld = new Set<number>();
         // What nothing drives, named (control-tower phase 79, #114): a phase the
         // board reads in progress that no lane, queue entry, hint, park or
         // errand of this run holds. Stamped every tick, so it is never stale.
         // A lane still settling is driven (#192): its attempt has not returned.
         // A phase held on its dependency is driven by that dependency.
-        this.noteUndriven(board, new Set([...boardable, ...inFlight.keys(), ...depHeld]));
+        this.noteUndriven(board, new Set([...boardable, ...inFlight.keys(), ...depHeld, ...canaryHeld]));
 
         // Nothing to start, but something is running: it may be about to make
         // more phases ready. Concluding "finished" here is the fastest way to
@@ -2954,8 +2975,33 @@ export abstract class RunnerLoop extends RunnerControl {
     const now = this.now().getTime();
     const dirty = this.gatesDirty;
     this.gatesDirty = false;
+    const planChanged = this.planDirty;
+    this.planDirty = false;
     let anyHeld = false;
     for (const record of Object.values(state.phases)) {
+      // The plan itself changed (measured-console phase 30, #416): an OPEN record
+      // that is not held on a gate reads its gate again too, so a phase added to a
+      // live plan — or one whose Gate-check was rewritten — shows its true kind
+      // before it boards. Only the record's gate moves here; whether it boards is
+      // still `runPhase`'s gate read, which re-reads after an admission that
+      // outlived a plan change.
+      if (planChanged && (record.status === 'pending' || record.status === 'queued') && !this.lanes.has(record.phase)
+        && (record.gate || board.states[record.phase] === 'ready')) {
+        let gate: ReturnType<typeof readGateStatus>;
+        try {
+          gate = readGateStatus(await this.engine(['--gate-status', String(record.phase)], { PHASE_EXEC_GATES: '1' }));
+        } catch (error) {
+          log.warn('runner.gate-reread-failed', { slug: state.slug, phase: record.phase, error });
+          continue;
+        }
+        const was = record.gate ?? null;
+        if (!was || was.kind !== gate.kind || was.clear !== gate.clear || was.detail !== gate.detail) {
+          record.gate = gate;
+          this.record('phase.gate-reread', { gate, was, by: 'plan-change' }, record.phase);
+          this.emit('phase', { phase: record.phase, status: record.status, gate });
+        }
+        continue;
+      }
       if (record.status !== 'gated' || !record.note?.startsWith(GATE_HELD_NOTE)) continue;
       if (board.states[record.phase] !== 'ready' || this.lanes.has(record.phase)) continue;
       anyHeld = true;
@@ -3036,6 +3082,7 @@ export abstract class RunnerLoop extends RunnerControl {
     });
     return ordered.map((row) => row.phase);
   }
+
 
   /**
    * Every park this run holds has its clock armed (control-tower phase 86,
@@ -3225,6 +3272,8 @@ export abstract class RunnerLoop extends RunnerControl {
      * the one caller that forgot to say so, leaving every cmd gate reporting
      * "not executed" forever. Page views still never execute plan-authored
      * commands: Service.gateStatus passes no env. */
+    // The plan as this read sees it: an admission that outlives a change to it reads again (#416).
+    const gateEpoch = this.planEpoch;
     const gate = readGateStatus(await this.engine(['--gate-status', String(phase)], { PHASE_EXEC_GATES: '1' }));
     record.gate = gate;
     // A `human` gate the operator has DELEGATED behaves like an ai-clearable
@@ -3376,6 +3425,19 @@ export abstract class RunnerLoop extends RunnerControl {
       grant = null;
       this.record('phase.admission-held', { after, age: record.queueSince ?? null }, phase);
       this.persist();
+    }
+    // The plan changed while it queued (measured-console phase 30, #416): the gate
+    // it read was the old plan's — a phase appended live read its graph row before
+    // its section existed, and an `ai` gate with no detail boarded a person's
+    // release. The grant goes back and the phase stays startable; the next pass
+    // boards it through this same gate read, over the plan as it now stands.
+    if (this.planEpoch !== gateEpoch) {
+      if (grant) this.deps.scheduler?.release(grant);
+      grant = null;
+      if (record.status === 'queued') record.status = endingPark ? 'waiting' : 'pending';
+      this.record('phase.gate-reread', { gate: record.gate ?? null, was: record.gate ?? null, by: 'admitted-after-plan-change' }, phase);
+      this.persist();
+      return true;
     }
     // Compare-and-set: a word somebody else wrote during the wait (a skip, a
     // per-phase stop) is theirs, and `runPhaseAdmitted` answers it on arrival.
@@ -3852,7 +3914,10 @@ export abstract class RunnerLoop extends RunnerControl {
     this.record('phase.worktree-landed', {
       branch: names.laneBranch, into: names.runBranch, ...result,
     }, phase);
-    if (result.kind === 'merged') this.landedLanes.add(phase);
+    if (result.kind === 'merged') {
+      this.landedLanes.add(phase);
+      await this.refreshGraphsAt(phase, existsSync(names.integration) ? names.integration : state.root);
+    }
     // The one event that moves every number on the Git card at once: the run
     // branch gained commits, a lane branch stopped being ahead, and a pair the
     // radar was watching may have just resolved — or, on a conflict, may have
@@ -3861,6 +3926,34 @@ export abstract class RunnerLoop extends RunnerControl {
     // agrees with it.
     await this.refreshGit();
     return result;
+  }
+
+
+  /**
+   * The landing refreshes the knowledge graphs of the repositories it moved
+   * (measured-console phase 11, D6): `<tool> update .` in each one under
+   * `root` the phase reaches that keeps a `<tool>-out/`, bounded, never red
+   * — one `phase.graph-refresh` line per repository that has a graph. Nothing
+   * while the console's `graphTool` setting names no tool.
+   */
+  private async refreshGraphsAt(phase: number, root: string): Promise<void> {
+    const tool = this.graphToolNamed();
+    if (!tool) return;
+    try {
+      const repos = await reposUnder(root, await this.scopeFor(phase).catch((): string[] => []));
+      const done = await (this.deps.graphRefresh ?? ((dirs: string[], name: string) => refreshGraphs(dirs, { tool: name })))(
+        repos.map((repo) => repo.dir), tool,
+      );
+      for (const one of done) {
+        if (one.result === 'no-graph') continue;
+        const rel = repos.find((repo) => repo.dir === one.repo)?.rel || '.';
+        this.record('phase.graph-refresh', {
+          repo: rel, result: one.result, ms: one.ms, ...(one.detail ? { detail: one.detail } : {}),
+        }, phase);
+      }
+    } catch (error) {
+      this.record('phase.graph-refresh', { repo: '.', result: 'failed', ms: 0, detail: String((error as Error)?.message ?? error).slice(0, 200) }, phase);
+    }
   }
 
   /**
@@ -3997,6 +4090,43 @@ export abstract class RunnerLoop extends RunnerControl {
    * phase was admitted past it only by an operator's word), or left behind by
    * one. Empty in a tree of the run's own.
    */
+  /** The skills the console's sessions load, when it owns the set (`console-set`) — what qualifies a run-chosen skill. */
+  private loadedSkills(): string[] {
+    try {
+      const loads = this.deps.sessionLoads?.();
+      return loads?.mode === 'console-set' ? loads.skills : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** The operator's knowledge-graph tool (`graphTool`), or '' — off. */
+  private graphToolNamed(): string {
+    try { return graphToolOf(this.deps.graphTool?.() ?? ''); } catch { return ''; }
+  }
+
+  /**
+   * The knowledge-graph directive for this phase's repositories whose
+   * `<tool>-out/graph.json` is newer than their last landing (measured-console
+   * phase 11, D6), named relative to the session's root. Empty when none is,
+   * or when no tool is named.
+   */
+  private async graphBlock(phase: number): Promise<string> {
+    const tool = this.graphToolNamed();
+    if (!tool) return '';
+    try {
+      const root = this.laneRoot(phase);
+      const repos = await reposUnder(root, await this.scopeFor(phase));
+      const fresh = freshGraphs(repos.map((repo) => repo.dir), tool);
+      if (!fresh.length) return '';
+      const named = fresh.map((dir) => repos.find((repo) => repo.dir === dir)?.rel || '.');
+      this.record('phase.graph-fresh', { repos: named }, phase);
+      return knowledgeGraphDirective(named);
+    } catch {
+      return '';
+    }
+  }
+
   private async foreignTreeBlock(phase: number, lane: Lane): Promise<string> {
     const state = this.state!;
     if (!this.sharesTheCheckout(lane)) return '';
@@ -4546,7 +4676,7 @@ export abstract class RunnerLoop extends RunnerControl {
     // (control-tower phase 63, #85): this console mirrors the lock to git
     // itself, outside the session's turn. The copyable prompt a person reads
     // (`Service.bootPrompt`) never carries it, and keeps `--git`.
-    const engineText = readText(await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV, ...this.issuePolicyEnv() }));
+    const engineText = readText(await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV, ...this.issuePolicyEnv(), ...this.briefEnv() }));
     if (!engineText.trim()) {
       await this.release(phase, owner);
       this.halt(`the engine produced no boot prompt for phase ${phase}`, phase, 'plan-unreadable');
@@ -4716,7 +4846,11 @@ export abstract class RunnerLoop extends RunnerControl {
       // (control-tower phase 89): a sibling's red WIP, its uncommitted files,
       // reds owed here, a job a checkpoint killed.
       + await this.boardingWipBlock(phase, lane)
-      + skillDirective(extraSkills) + mcpDirective(ownMcp, mcp.degraded)
+      + skillDirective(extraSkills, { loaded: this.loadedSkills() }) + mcpDirective(ownMcp, mcp.degraded)
+      // A knowledge graph newer than its repository's last landing
+      // (measured-console phase 11, D6) — said only then, for the repositories
+      // this phase reaches.
+      + await this.graphBlock(phase)
       + credentialsDirective(record.credentialsMissing ?? [])
       + ultracodeDirective(ultracodeOn(state, own))
       + unattendedDirective(SCRIPTS_REF, state.slug, phase, {
@@ -5830,6 +5964,7 @@ export abstract class RunnerLoop extends RunnerControl {
     this.persist();
   }
 
+
   /**
    * The cloud review, when the run asked for one at this moment.
    *
@@ -6263,9 +6398,15 @@ export abstract class RunnerLoop extends RunnerControl {
     const chosen = state.phaseOptions?.[String(phase)] ?? {};
     const plan = this.deps.phaseDefaults?.(state.slug, phase) ?? {};
     const source: Record<string, string> = {};
+    // The paying account's own defaults (EI-21): asked only when nothing above them speaks.
+    const account = this.deps.accountDefaults?.(state.accountId) ?? {};
 
     const pick = (key: 'model' | 'effort', fallback?: string): string | undefined => {
-      const resolved = resolvePhaseChoice({ retry: attempt[key], run: chosen[key], plan: plan[key], fallback });
+      // A run default the run never named is the shipped word, which the account's own outranks.
+      const shipped = state.unnamed?.includes(key) && account[key] !== undefined;
+      const resolved = resolvePhaseChoice({
+        retry: attempt[key], run: chosen[key], plan: plan[key], fallback: shipped ? undefined : fallback, account: account[key],
+      });
       if (resolved.source) source[key] = resolved.source;
       return resolved.value;
     };
@@ -6303,6 +6444,9 @@ export abstract class RunnerLoop extends RunnerControl {
       // plan BEFORE the run, which is the opposite of this function's
       // run-beats-plan rule, and folding it in would hide that reversal.
       mcpPolicy: attempt.mcpPolicy ?? chosen.mcpPolicy,
+      // The kinds this phase's set adds (measured-console phase 27): the
+      // attempt's list WHOLE when it has one, like the other lists.
+      plugins: attempt.plugins ?? chosen.plugins,
       // Absence inherits the RUN's answer rather than defaulting to off, which
       // is why this stops at the phase levels — `ultracodeOn` is the one place
       // the run is consulted, so a reader never has to ask which of two
@@ -6322,6 +6466,22 @@ export abstract class RunnerLoop extends RunnerControl {
    * statement is versioned and survives, because a phase that says it needs
    * Playwright is describing the work, not somebody's preference for one run.
    */
+  /**
+   * This phase's plugin set (measured-console phase 27, D5): the plan's kinds
+   * for it and the run's per-phase choice, resolved by the service against
+   * what the session loads. One phase's — never a union across phases — and
+   * `undefined` when no kind is named or the service cannot say.
+   */
+  protected pluginSetFor(phase: number, chosen: PhaseOptions): PhasePluginSet | undefined {
+    const state = this.state!;
+    try {
+      const set = this.deps.phasePlugins?.(state.slug, phase, chosen.plugins ?? [], chosen.permissionMode) ?? null;
+      return set?.kinds.length ? set : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   protected mcpFor(phase: number, chosen: PhaseOptions): string[] {
     const state = this.state!;
     const fromPlan = this.deps.planMcp?.(state.slug, phase) ?? [];

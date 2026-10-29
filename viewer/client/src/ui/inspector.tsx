@@ -1,7 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { cn } from '@/lib/cn';
-import { usePhone } from '@/lib/media';
-import { Sheet, SheetContent } from './sheet';
+import { Sheet, SheetContent, type SheetSize } from './sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './tabs';
 
 /**
@@ -11,7 +10,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './tabs';
  * for is not drawn.
  *
  * Where it stands is the shell's decision, not the page's: the right panel at
- * 1200 and up, an end sheet between 900 and 1200, a bottom sheet below. So the
+ * 1200 and up, an end drawer from 640, a bottom sheet below (2026-10-20). So the
  * inspector comes in two hosts — `sheet`, which opens itself on the edge the
  * width calls for, and `inline`, the bare frame the shell docks into its
  * panel. The title is always visible: an inspector that hides its name is a
@@ -39,6 +38,14 @@ export interface InspectorProps {
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   className?: string;
+  /** The record's measure — how wide its content may make a drawer (`ui/sheet.tsx`). */
+  size?: SheetSize;
+  /**
+   * The record draws its own head (a Your turn card, 2026-10-20): the frame
+   * draws no heading, description or meta row over it, so one record wears
+   * ONE title and ONE status. The title still names the region.
+   */
+  headless?: boolean;
 }
 
 const TAB_LABELS: Readonly<Record<InspectorTab, string>> = {
@@ -127,17 +134,26 @@ export function Inspector({
   open = true,
   onOpenChange,
   className,
+  size = 'reading',
+  headless = false,
+  meta,
   ...body
 }: InspectorProps) {
-  const phone = usePhone();
   if (host === 'inline') {
     return (
-      <section data-inspector aria-label={title} className={cn('flex h-full min-h-0 flex-col', className)}>
-        <header className="shrink-0 px-(--pad-x) pb-2 pt-(--pad-y)">
-          <h2 className="text-section font-semibold text-ink">{title}</h2>
-          {description != null && <p className="mt-0.5 text-body text-ink-muted">{description}</p>}
-        </header>
-        <InspectorBody {...body} />
+      <section
+        data-inspector
+        data-headless={headless ? '' : undefined}
+        aria-label={title}
+        className={cn('flex h-full min-h-0 flex-col', className, headless && 'pt-(--pad-y)')}
+      >
+        {!headless && (
+          <header className="shrink-0 px-(--pad-x) pb-2 pt-(--pad-y)">
+            <h2 className="text-section font-semibold text-ink">{title}</h2>
+            {description != null && <p className="mt-0.5 text-body text-ink-muted">{description}</p>}
+          </header>
+        )}
+        <InspectorBody {...body} meta={headless ? undefined : meta} />
       </section>
     );
   }
@@ -145,13 +161,14 @@ export function Inspector({
     <Sheet open={open} onOpenChange={onOpenChange ?? (() => {})}>
       <SheetContent
         title={title}
-        side={phone ? 'bottom' : 'end'}
-        showTitle
-        {...(description != null ? { description } : {})}
+        side="auto"
+        size={size}
+        showTitle={!headless}
+        {...(description != null && !headless ? { description } : {})}
         className={className}
         bodyClassName="flex flex-col p-0"
       >
-        <InspectorBody {...body} />
+        <InspectorBody {...body} meta={headless ? undefined : meta} />
       </SheetContent>
     </Sheet>
   );

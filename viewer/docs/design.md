@@ -15,8 +15,10 @@ is silent.**
 
 **The one bold thing: the line and its stations.** A plan is a line, its phases are stations — a
 transit motif drawn from the subject, because phases really are sequential stops. It is the only
-graphic in the console: a run row's phase track, a plan's route map, a guide's step track, the
-phase table's spine (`client/src/ui/track/`, §7). Everything else is type, space and rules.
+graphic in the console: a run row's phase track, a plan's route map, a guide's step track
+(`client/src/ui/track/`, §7). Its sibling since 2026-10-20 is the strip (§8.1): a phase or a turn
+item seen from the tower, its leading edge in its state's hue — which is why the phase table drew
+its spine of stations until then and draws strips now. Everything else is type, space and rules.
 
 **Refused by name**, so no page re-argues them: a warm paper with a serif and a clay accent; a
 near-black ground with one acid accent; a broadsheet of hairlines and square corners; the SaaS card
@@ -40,8 +42,8 @@ Ten principles; each is held by a guard named in §12.
 3. **Three doors to depth, the same on every page.** **Expand** — in place, remembered per person
    (`ui/disclosure.tsx`, a `Row`'s children, the `.expand-region` transition). **Inspect** — the
    full account of one record in four tabs, Overview · Actions · History · Raw
-   (`ui/inspector.tsx`): the right panel at 1200 and up, an end sheet from 900 to 1200, a bottom
-   sheet below. **Everything** — a per-page persisted switch that turns essentials into all
+   (`ui/inspector.tsx`): the right panel at 1200 and up, an end drawer from 640 to 1200, a bottom
+   sheet below 640 (2026-10-20). **Everything** — a per-page persisted switch that turns essentials into all
    columns, all facts, all sections, all keys (`useEverything(page)` in `ui/everything.ts`, kept
    in `prefs.everything` by page id; the toolbar's last slot draws it, `EverythingSwitch`).
    *No datum removed; every datum within two interactions* stays law, proven by the datum ledgers.
@@ -54,6 +56,10 @@ Ten principles; each is held by a guard named in §12.
    (Plans cards and list, the plan header, the Phases table, the Run view's phase rows, Sessions).
    A settled dot is hollow and loses its hue; a settled badge keeps its hue at a 30 % border so
    Done and Complete do not read as grey text; a bad ending keeps its red. Amber is the one summons.
+   The **lead badge** (`chrome="tint"`, 2026-10-20, Tower strips — the owner's ruling) is that
+   pill on its state's TINT: ONE per row or card, the thing the row is about, its word still in
+   the state's AA hue and its icon in the state's vivid shade (§3, §8.1). Every other badge on the
+   row stays outlined.
 5. **Mono for machine values only** — shas, paths, commands, keys, ids (`Mono`). Money, durations,
    counts and percentages are the sans with tabular numerals (`Money`, `Duration`, `RelativeTime`).
 6. **Four sizes on a page.** Title 22/600 · section 15/600 · body 14/400 · meta 12.5/400; the 12 px
@@ -65,9 +71,10 @@ Ten principles; each is held by a guard named in §12.
    on every list page; below 900 the search and one View sheet holding the other six in the same
    order and words (`ui/toolbar.tsx`). A page hands each slot as a panel; the desk shows it in a
    popover under the slot's button, the phone as a section of the sheet — one set of controls.
-9. **Motion answers an act:** the expand (grid rows 0fr → 1fr), one arrival (`rise`; `fade` for an
-   overlay's scrim and box), one live pulse on an observed running thing. Reduced motion kills all
-   three.
+9. **Motion answers an act:** the expand (grid rows 0fr → 1fr, or a fold strip's measured
+   height), one arrival (`rise`; `fade` for an overlay's scrim and box), one live pulse on an
+   observed running thing, and the bay's tile sliding to the tab or section chosen (§8.1). Reduced
+   motion kills all of it.
 10. **Copy is for acting.** A sentence appears only where a person must read it to act; empty
     states are one line and an action; explanations live in Help, reached from the page.
 
@@ -138,6 +145,16 @@ all at ONE OKLCH weight per light — Paper 48 % / 0.08, Night 75 % / 0.12; the 
 ≥ 4.5:1 as text on the four text surfaces and ≥ 3:1 as a mark on the track, in both lights, inside
 sRGB. `verifying` is running's family, told apart by a dashed segment; `running` alone may pulse.
 
+**Each state has an edge and a tint** (2026-10-20, Tower strips): `--status-<x>-vivid` is the
+same hue at lightness 56 % (Paper) / 76 % (Night) and the most chroma that hue holds in sRGB there,
+to 0.16 — a strip's 4 px edge and a lead badge's icon, a MARK held to ≥ 3:1 on all four surfaces
+in both lights and both rooms; `--status-<x>-tint` is the same hue at 95.5 % / 27 % and chroma
+≤ 0.055 — the ground of a lead badge and of an open strip, on which the state's own word clears
+≥ 4.5:1. They are the state, louder or quieter, never a ninth colour: `theme.test.ts` holds each at
+its state's hue (so amber stays in needs-you's family alone), declared once for both lights, and
+`.state-<ui>` sets them as `--state-vivid` and `--state-tint` beside `--state`
+(`border-state-vivid`, `bg-state-tint`, `text-state-vivid`).
+
 **Amber is a summons.** `--accent` = `--status-needs-you` is the ONE door to amber, and amber means
 *a person is needed*; every other hue keeps ≥ 40° away. `--action` (the primary button) and
 `--focus` (the ring) are high-contrast **ink**: a primary button, a focused control, a selection and
@@ -157,6 +174,15 @@ Never: a literal hex (ESLint bans it; the terminal's ANSI slots are the one file
 utility from the raw namespace (`bg-status-done` compiles to NOTHING), an undeclared colour name, a
 new hue, a `var(--track-…)` for anything but the colour (`track` is a colour family, and the theme
 guard reads any other name in it as an undeclared colour — the track's sizes are `--station-*`).
+
+**The second palette — Departures** (#362). `prefs.palette` (`quiet` · `departures`, Settings ▸
+Appearance) sets `data-palette` on the root, and `quiet` — the room above — is the attribute's
+absence. `styles/departures.css` re-declares ONLY the room — the grounds, the surfaces, the rules, the
+three inks and the track — with 6.2.1's values: a cool grey-blue page under white cards in Paper, a
+blue slate in Night, hues 204–233 at chroma ≤ 0.045. The eight status hues, the accent, the hatch, the
+type and the spacing are the same in both palettes, so a status reads the same in either room;
+`theme.test.ts` holds the block to the room tokens and that family, and `contrast.test.ts` measures
+every status and ink against its surfaces in both palettes and both lights.
 
 ### 3.1 The signal law — one model, one family, a dot and a word
 
@@ -186,6 +212,8 @@ a 6 px dot wearing `.state-<paint>` and a precise word in ink, with `data-status
 | `McpStatus` | a server's connection | `mcp` |
 | `OpsStatus` | `vocab="…" word="…"` — every other vocabulary, typed by the one named beside it | the rest |
 | `FactMark` | a fact beside a status (a count, a reason), its own icon and paint, never attention | `FACT_KINDS` |
+| `PhaseShare` | one share of a plan's phases as a badge — a count in words, the board word's icon, the paint its segment of the plan's line wears (`sharePaint`), never attention | the board buckets, `gated`, `held-by-qa`, `never` |
+| `PlanProgress` | the share of a plan's phases done, as a badge in done's hue, quiet once the plan is over | a percentage |
 | `AttentionMark` | the attention axis alone, through the inbox's `SEVERITY_UI`; nothing for `none` | `ATTENTION_LEVELS` |
 | `SeverityMark` | an inbox item's kind as the word, its severity as the dot — FIRST PAINT, reads no table; import it by its own path | the inbox severities |
 
@@ -203,8 +231,13 @@ drawn by the same `DotWord`, as an outlined pill carrying `data-chrome="badge"` 
 facts — the view's icon (`statusIcon(view.icon)`) and word in `text-state`, a `border-state/60` outline
 (`/30` when settled and quiet, dashed `--ink-faint` when Unknown), no fill. The hue as text clears AA on
 every surface in both lights (`contrast.test.ts`), which is why the word may wear it here and not in
-the dot chrome, where ink keeps the page calm. `ui/status/family.test.tsx` holds
-every member, the icon map, Unknown, the quiet rule and the family's axe.
+the dot chrome, where ink keeps the page calm. **The lead badge** is `chrome="tint"`
+(`data-chrome="tint"`): the same pill on `bg-state-tint` with a `border-state/40` edge, the word
+`font-medium` in `text-state` and the icon in `text-state-vivid` — one per row or card. A count the
+family paints is `CountBadge` (`ui/status/count.tsx`): a number in a pill, quiet ink by default, a
+state's tint when it counts a state (a reading's QA fails), its words for a screen reader in
+`label`. `ui/status/family.test.tsx` holds every member, the icon map, Unknown, the quiet rule and
+the family's axe.
 
 **The ratchet holds at zero.** `ui/status/ratchet.test.ts` counts every legacy status site per
 file under `src/` — `<StatusBadge`, `<StatusDot`, `statusBadgeClass(`, `uiState(`, `STATE_META[`, a
@@ -238,6 +271,9 @@ pads content consumes these tokens, never a literal `p-*`.
   TRANSITION, not an animation: `.expand-region` grows its one grid row from `0fr` to `1fr` on
   `duration-medium`, and `@starting-style` gives a region that mounts as it opens its first frame.
   `--ease-transit` throughout; `duration-fast|medium|draw` backed by `--transition-duration-*`.
+  Two more TRANSITIONS answer a press (2026-10-20): the bay's raised tile slides to the tab or
+  section chosen (`duration-medium`), and a fold strip of an `Accordion` opens by its measured
+  height (`--accordion-panel-height`, from 0 while it starts and ends).
   The route map keeps its draw-in on `--duration-draw` (620 ms) in its own `route-map.css`, and its
   one breath is `pulse-soft` over a live running station. Reduced motion kills it all (the global
   rule, and `track.css`'s and the map's own); a new animation is an identity change.
@@ -258,11 +294,12 @@ unlayered under a coarse pointer so no size utility beats it.
 | Surface | Below 1200 | Below 900 (phone shell) | Below 640 (one column) |
 |---|---|---|---|
 | **Row** | — | — | the fact and the clock drop under the name; the action stays on the first line |
-| **Inspect** | an end `Sheet` | a bottom `Sheet` | — |
+| **Inspect** | an end drawer, as wide as its record's measure asks | still an end drawer — a tablet held upright reads the record beside the page's edge | a bottom sheet, its handle a control (§8.1) |
+| **Drawer** (every `Sheet` with `side="auto"`) | an end drawer fitting its content inside its `size` (§8.1) | the same | a bottom sheet: up to 85 % of `--app-height`, the whole of it when grown, its footer pinned above the keyboard |
 | **Dialog** | centred in `--app-height`, never wider than the viewport less 2 rem | — | — |
-| **Tabs** | — | one row that scrolls sideways, never wraps; its trailing edge fades (flipped under `rtl:`), the active tab scrolls itself into view by moving the list's own `scrollLeft` | — |
+| **Tabs** and **bays** | — | one track that scrolls sideways, never wraps; its trailing edge fades (flipped under `rtl:`), the current tab or section scrolls itself into view by moving the track's own `scrollLeft`, and its tile rides with it | — |
 | **Table** | — | scrolls inside its own box only when measured to overflow (`TableWrap scrolls`); a sticky header reaches `<main>` only on the branch that does not scroll | — |
-| **Grid** | folds what the box cannot fit into the row's counted `+N`, lowest priority first; with Everything on, nothing folds and the wrapper scrolls with the identity pinned | the same column array as a list of records: one line each — the headline, the quiet `meta` line, the one action — every other column one press away in the record's fold | — |
+| **Grid** | folds what the box cannot fit into the row's counted `+N`, lowest priority first; with Everything on, nothing folds and the wrapper scrolls with the identity pinned. A table whose glance columns are all `priority: 1` (Plans) never folds them: on a desk too it scrolls inside its own box, the run up to the identity — the status and the name — pinned, the header put rather than sticky | the same column array as a list of records: one line each — the headline, the quiet `meta` line, the one action — every other column one press away in the record's fold | — |
 | **Toolbar** | — | the search and one View sheet; the slots' panels become its sections, in order | — |
 | **Toast** | the bottom end corner | above the tab bar and the keyboard (`--bottom-bars`, `--app-height`) | — |
 
@@ -283,8 +320,9 @@ The kit (`client/src/ui/**`), the cards, the shell and the screens set every hor
 padding, inset, border, corner and alignment logically — `ms-`/`me-`, `ps-`/`pe-`, `start-`/`end-`,
 `border-s`/`border-e`, `rounded-s`/`rounded-e`, `text-start`/`text-end` — and the stylesheets
 declare `margin-inline-*`, `padding-inline-*`, `inset-inline-*`, `border-inline-*` and `text-align:
-start | end`. The sheet's sides are `end`, `bottom` and `full` — a logical word, so no call site
-names a physical edge. `styles/logical.test.ts` is the ratchet: it fails an `ml-`, `pr-`, `left-`,
+start | end`. The sheet's sides are `end`, `bottom`, `full` and `auto` (bottom below 640, end
+from 640) — a logical word, so no call site names a physical edge. The bay's tile is placed by a
+`translateX` from the track's start edge, measured in the reading direction, so it mirrors. `styles/logical.test.ts` is the ratchet: it fails an `ml-`, `pr-`, `left-`,
 `border-r`, `rounded-l` or `text-left` — or its arbitrary-property or inline-style twin — and holds
 `KEPT`, a short list of sides physical by nature (a centring pair, a device's safe-area insets),
 both ways. **No file of the client has an entry in it**, and the test says so. `e2e/rtl.spec.ts` throws the
@@ -344,19 +382,27 @@ the only carrier. The grammar:
 - The motif may appear small (a run row's track, the rail's mark), never as decoration on a surface
   with no structure: restraint is what keeps it a signature.
 
-**A plan's line is drawn in proportion** (one-pool phase 17, #360; `screens/plans/track-bar.tsx`,
-`PlanTrack`). On Plans' cards and list, the panel, the plan's glance and Your turn's *Where the plans
-stand*, a plan is one 6 px bar on the track's ground: each board bucket a segment whose length is
-its share of the phases, painted `.state-<paint>` from `BOARD_STATE_UI`, in one order — done, held
-by QA, in progress, stuck, next up, waiting, then what no bucket accounts for as the bare track. Under
-it, one worded legend names every non-zero count in that order and the percentage (`41 done · 1 held
-by QA · 1 in progress · 2 stuck · 3 waiting · 25 left · 56 %`); the whole is one `role="img"` whose
-name reads the same counts, so colour is never the only carrier. The counts are `countsOf` over the
+**A plan's line is drawn in proportion, as a pipeline** (one-pool phase 17, #360;
+`screens/plans/track-bar.tsx`, `PlanTrack`). On Plans' cards and list, the panel, the plan's glance and
+Your turn's *Where the plans stand*, a plan is one 8 px bar on the track's ground: each board bucket a
+segment whose length is its share of the phases, painted `.state-<paint>` from `BOARD_STATE_UI`, in one
+order — done, held by QA, in progress, stuck, next up, waiting, then what no bucket accounts for as the
+bare track. Up to `PIPELINE_MAX` (48) phases every phase is its own cell of its segment, a hairline
+apart, so the plan reads as the stops of a line; past it a row cannot tell cells apart and each share is
+one stretch. Given the phases in their own order (`pipelineOf` over the plan's detail — the panel's
+line), each cell stands where its phase does, titled with its phase, a gate hatched over it. At the bar's
+end the share done is the family's badge (`PlanProgress`, `56 %`); under it the legend names every
+non-zero share as the family's badge (`PhaseShare`) — its count in words, the board word's icon, the
+paint its segment wears, so the legend and the line are one colour per share — the gate's badge after
+the shares it marks and what no bucket accounts for in plain words (`25 left`). The whole is one
+`role="img"` whose name reads the same counts (`41 done, 1 held by QA, 1 in progress, 2 stuck, 3
+waiting, 25 left, 56 %`), so colour is never the only carrier, and no badge inside it is a tab stop
+(`tabIndex={-1}`: a pointer and a tap still read its meaning). The counts are `countsOf` over the
 `/api/plans` row, no fetch of its own, and the segments always sum to the phase count. The two
 overlays never double-count: a phase QA failed is carved out of done as its own segment (QA's fail
 paint), and a gated phase stays in its bucket, the gate a needs-you hatch drawn over next up and
 waiting. A closed plan draws what got done and what never ran (`skipped`); an unread board its last
-good reading and the rest hatched, its legend the shared reading (#96) — never a bar at 0 %.
+good reading and the rest hatched, its legend the shared reading (#96) — never a badge at 0 %.
 
 `ui/track/track.test.tsx` holds the paint through `.state-*`, the pulse, the ring, the
 reduced-motion rule and the legs. **The route map** (`screens/plan/map/`: `dag.tsx`, `map-view.tsx`,
@@ -364,7 +410,11 @@ reduced-motion rule and the legs. **The route map** (`screens/plan/map/`: `dag.t
 glyph and a ring treatment, so no state is told by hue; the 0.45 zoom floor; the minimap and the
 station search of a crowded plan; one tab stop and the arrow keys — on these tokens: four sizes,
 sentence case, numbers in the sans, `pulse-soft` over a live running station, the gate's amber
-through `--accent`, a keyboard focus in the focus ring's ink. Its stylesheet rides the map's lazy
+through `--accent`, a keyboard focus in the focus ring's ink. Its stations are HTML `<button>`s in a
+layer over the painted SVG: each named `Phase N: title, state`, a transparent 44 px square (the mark's
+size when that is larger) placed by the view transform, in phase order, one tab stop with the arrow
+keys between; the SVG is `aria-hidden` paint with nothing to focus, and the button's keyboard focus is worn
+as the drawn station's halo. Its stylesheet rides the map's lazy
 chunk and styles only `route-` names (or names under one); loaded, it is global for the visit, so
 the kit's classes are `ui-` names and the test holds the kit to none of the map's. Its tools (one-pool
 phase 16, #376, `map/tools.tsx`) are the address, never state: filter chips with counts dim what they
@@ -401,10 +451,12 @@ draws, and `check-dist` fails the build whose first paint passes 170 KB served:
 **The heavy pieces are imported by path, never re-exported** (`ui/kit.test.tsx` holds the barrel
 to it): `ui/dialog.tsx` (`Dialog`, `DialogContent` with `frame`, `DialogFooter`; centred in
 `--app-height` with no physical side), `ui/sheet.tsx` (`Sheet`, `SheetContent` with `side` `end` ·
-`bottom` · `full`), `ui/popover.tsx`, `ui/dropdown.tsx` (the `⋯` menu; a destructive item says so),
+`bottom` · `full` · `auto` and `size` `narrow` · `reading` · `form` · `wide`; `ui/sheet-width.ts`
+the width that never narrows while open), `ui/accordion.tsx` (`Accordion`, `AccordionItem`: fold
+strips, Base UI), `ui/popover.tsx`, `ui/dropdown.tsx` (the `⋯` menu; a destructive item says so),
 `ui/command.tsx` (cmdk; `CommandDialog` is the palette shape), `ui/tooltip.tsx` (`Tooltip`,
 `InfoTip` — nothing load-bearing rides in a hover), `ui/select.tsx`, `ui/combobox.tsx`,
-`ui/tabs.tsx`, `ui/table.tsx` (`TableWrap scrolls`, `Table`, `THead` in sentence case, `TBody`,
+`ui/tabs.tsx` (a bay, Base UI Tabs), `ui/table.tsx` (`TableWrap scrolls`, `Table`, `THead` in sentence case, `TBody`,
 `TR`, `TH`, `TD`, `stickyHeadCell`, `stickyIdentityCell`), `ui/markdown.tsx` (`Markdown`,
 `MarkdownInline`, `toFragment`, `sweep` — the sanitizer is the 6.x one VERBATIM, because a
 sanitizer is the one place "identical" is worth everything), `ui/disclosure.tsx`, `ui/inspector.tsx`
@@ -434,6 +486,46 @@ Table imported only by `ui/grid/engine.ts`, which is itself reached only through
 and holds each rule both ways. The 6.x client is gone, and `sweep.test.ts` holds it gone: no path of
 it, no file importing, loading or mocking one, no door file, and one exported name per thing across
 the client (`data/`'s wire types aside).
+
+## 8.1 Tower strips — the strip, the bay, the fold, the drawer (2026-10-20)
+
+The owner asked for colour that tells things apart and tabs and folds that do not read as plain
+text. The answer grows out of the console's own vocabulary — phases *board*, lanes are *held*, the
+6.x *departures board*, the control tower: the unit of a list is an air-traffic **flight-progress
+strip**. Spend the boldness there; everything around it stays Quiet.
+
+- **The strip.** A row (a phase in the Phases table, a Your turn card) carries a 4 px leading edge
+  in its state's vivid shade, a neutral **plate** for its number (`P17`, tabular semibold on
+  `--ground-deep`), its name, and ONE lead badge (`chrome="tint"`) for the thing it is about; its
+  other badges are outlined. Nothing else on it is coloured. An OPEN strip — the row expanded in
+  place — sits on its state's tint with the edge running down. A table opts in (`Grid` `rowPaint`);
+  the paint is the one its status badge wears.
+- **The bay.** Tabs (`ui/tabs.tsx`, Base UI Tabs — it gives the tile its place as
+  `--active-tab-left`/`-right`/`-width`) and section links (`shell/section-nav.tsx`) are a recessed
+  track on `--ground-deep` whose current tab or section is a raised tile on `--surface` with a
+  `--rule-strong` hairline, sliding to the one chosen. A section may carry a glyph and a count in a
+  pill, the count in a state's tint when it counts a state. Section links stay LINKS with
+  `aria-current` — a view is an address — and tabs stay tabs.
+- **The fold.** A `Disclosure` is a full-width fold strip by default: the chevron on a round plate,
+  the label in ink, the count in a pill, a rule running out to the edge, and the body on a rule down
+  from the chevron (`variant="inline"` is the small toggle, for a fold inside a row). Folds that
+  belong to one record are an `Accordion` (`ui/accordion.tsx`, Base UI): the arrow keys move between
+  heads, several may be open, each head carries a one-line summary of what is folded, and a folded
+  body unmounts — a fold is not a cache.
+- **The drawer.** Every drawer fits its content: an end drawer is `max-content` wide inside the
+  bounds of its `size` — `narrow` 20–28 rem, `reading` 30–44 rem, `form` 34–52 rem, `wide`
+  44–72 rem, never past the viewport less 2 rem (`.sheet-fit`) — and never narrows while open
+  (`--sheet-settled`). `side="auto"` is the end drawer from 640 and the bottom sheet below it, so a
+  tablet held upright reads a record beside the page. The panel's column fits its record the same
+  way (`prefs.panel.width` `auto`, the record's `measure`, capped at 56 rem and so that the page beside it keeps 50 rem, the room every desk page is laid out to hold); a person's
+  drag sets a width, and a double-click on the edge or Home lets it go. A drawer's body is a
+  container (`@container/drawer`), and a card lays itself out by its own width (`@container/card`),
+  never the viewport's. A bottom sheet's handle is a button: press it to grow the sheet to the
+  whole screen or shrink it back, drag it up to grow, drag it down past 96 px to let it go.
+- **Libraries.** Base UI (`@base-ui/react`, pinned exactly) for the tabs and the accordion: the
+  maintained successor by Radix's own authors, imported by subpath only. Every OVERLAY stays on
+  Radix — a drawer, a dialog, a popover, a select, a menu, a tooltip share one root, and a drawer
+  from one family over a select from another reads a press in the select's portal as "outside".
 
 ## 8.2 Figures and marks — where the chart library line sits
 
@@ -471,8 +563,9 @@ painted through `.state-<tone>` and `var(--state)`; every axis is drawn with `AX
 `ui/figures/figures.test.tsx` sweeps for a literal colour); every figure keeps its numbers and the
 drawing equals them (`data-datum`/`data-value`); the page keeps its scroll (a plain wheel and a
 vertical swipe are the page's, every figure surface is `touch-action: pan-y`); the crosshair is a
-`role="slider"`; the drawings stay lazy (`check-dist` finds them by `data-figure`). The figures' SVG
-axis labels are still 9 px, under the 12 px floor; phase 27's sweep raises them with the gutters.
+`role="slider"`; the drawings stay lazy (`check-dist` finds them by `data-figure`). Every SVG label a
+figure draws is `FIGURE_TYPE`, 12.5 px (`ui/figures/paint.ts`) — over the 12 px floor, in every
+figure.
 
 ## 9. Copy — the console's voice
 
@@ -503,7 +596,8 @@ of the screen.
    focus mark, no amber selection, and a pulse on nothing but an observed live `running`.
 4. No status outside the typed family: no legacy site (the ratchet is zero), no `dot-word` import
    outside `ui/status/**`, no filled chip behind a status word (the outlined badge is the family's
-   own `chrome="badge"`, never a page's), no status in colour alone.
+   own `chrome="badge"`, and the ONE tinted lead badge per row or card its `chrome="tint"` — never a
+   page's), no status in colour alone.
 5. No second face, no width clamp on the sans, no `--font-display`; no second shadow, no card
    shadow; no new animation, easing, radius step, z-index or font file without amending this file
    AND the guards in the same change.
@@ -540,45 +634,86 @@ of the screen.
    stop at 360, 768, 1024 and 1280 is held to the EMPTY register: the fix is the page, never the
    baseline. Open the pictures in `e2e/.shots/` and READ them.
 
+## Plans — every status says why
+
+The Plans list (`screens/plans/`) is §11's recipe with two rules of its own.
+
+- **A status is a button that says why.** Every row's status — the plan's badge and, when one
+  leads, a run's or a person's word beside it — is ONE button with *Why* beside the marks
+  (`PlanStatusButton`, named "Why <plan> says <words>"); the marks inside it are no tab stops of
+  their own. It opens the plan's record in the panel, the door Inspect opens, whose Overview leads
+  with the reasons behind the word (`screens/plans/why.ts` `whyOf`, drawn live by
+  `screens/plans/why-panel.tsx`): *What needs you* (each item of Your turn the plan asks now, with its
+  card words and the way to it; a gate only a person opens; what more is coming up), *What stopped it*
+  (the run's stop is the halt card's — its family, its sentence and its one recommended recovery —
+  then the board's stuck phases and QA's verdicts), *Running now* (each phase a session or a check is
+  on, since when), *What it waits on* (the run's wait and its clock, a usage window's reset, a lane
+  that is not working, its place in the queue, another session's claim and its lease, a phase in
+  progress nobody is on, a gate that clears itself, the dependency at the front of the chain),
+  *What can start next* and, for a plan that is over, *How it ended*. Every reason is a sentence a
+  person can act on with where to act, never the bare word again; the plan's phases follow as the
+  pipeline in their own order, then its facts.
+- **The table carries the plan's live facts, and scrolls rather than folds.** Beside the status,
+  the name and the line: *Now* (what a session is on), *Waiting on* (the one thing that holds it —
+  `waitsOnOf`, the drawer's own order), *Next up*, *Your turn* (its open items, and those to do now,
+  read off the inbox), *Left* (sessions, the estimate under them), *Spent* (every run's booked
+  spend), *Account* and *Model* (who pays for the newest run, on what), *Moved*. Each is
+  `priority: 1`, so a desk that cannot fit them scrolls the table inside its own box with the
+  status and the name pinned (§6.1); Everything adds the rest.
+
+Guards: `screens/plans/why.test.ts` (a reason for every status), `screens/plans/list.test.tsx` (the
+button on every row, the panel on its reasons, the columns, the scroll with its pinned rail),
+`screens/plans/track-bar.test.tsx` (the pipeline, the badges in their segment's paint, the picture's
+one name), `ui/status/family.test.tsx` (`PhaseShare`, `PlanProgress`).
+
 ## Your turn — the card's law
 
 Turn-by-turn phase 8 drew every item on Your turn as ONE card in the anatomy of the Owner To-Do Board.
 A card wraps an item because the item is acted on as a unit (§1, principle 7). The server decides
 every word: `GET /api/turn` gives each item its type, the person's status, whether it is due, where
 a press goes and the composed words. The card only draws them (`client/src/cards/item-card.tsx` and
-its parts under `client/src/cards/turn/`). Each rule names its guard.
+its parts under `client/src/cards/turn/`). `item-card.tsx` is the ONE human-step card: a surface that
+holds a step only as its inbox row — the bell, a run strip's expansion — draws it through the same
+file's `StepCard`, reached lazily through `client/src/cards/lazy-step-card.tsx` (the old
+`human-step-card.tsx` was folded into it, measured-console phase 32). Each rule names its guard.
 
-**The anatomy, top to bottom** (`client/src/cards/turn/head.tsx`, `timing.tsx`, `verdict.tsx`,
-`steps.tsx`, `act.tsx`):
+**The anatomy, top to bottom** — since 2026-10-20 a STRIP whose act comes before its record
+(`client/src/cards/turn/head.tsx`, `verdict.tsx`, `act.tsx`, `record.tsx`, `timing.tsx`,
+`steps.tsx`). The card is a container (`@container/card`): it lays itself out by its own width in a
+drawer, the panel's column or the page, never the viewport's, and its prose is held to `--measure`.
+In the panel it is the ONLY head — the inspector draws no title and no status of its own for a card
+(`headless`) — and the panel opens at the `form` measure (§8.1).
 
-1. **The head.** NOW, or NOT YET with its *when* in words. The type's mark: a glyph and a word,
-   Approval, Task, Decision or Heads-up (`TYPE_META`). The person's status as a dot and a word. Inspect.
-   Readiness is drawn only while the act is still the person's (`readinessShown`: To do or Redo). The
-   status and the readiness are the typed family's `turn` member, `TurnStatus` and `TurnReadiness`
-   (`client/src/ui/status/turn.tsx`). Their words are rows of `shared/status-model.js` (vocabularies
-   `turn` and `readiness`), and their labels are `PERSON_STATUS_LABEL` and `READINESS_LABEL`, held
-   equal by `test/status-model.test.ts`. Amber paints only To do, Redo and Now.
-2. **The title**, which names the act, and **the meta**: plan, phase, run, what it unblocks and
-   the effort. Each is its own fact and a link where it can be. Never a dotted string.
-3. **The timing grid**, on one page clock. *Assigned*, *Do it* and *Deadline* are always drawn: a
-   missing deadline reads "None set". *Open until*, *You sent it* and *Checked* are drawn when the
-   item has them. The window is *Open until* and is never called a deadline. A deadline carries
-   what is left (or how overdue, in the failed hue) and a bar from assigned to deadline, which is
-   the line's mark `LoadMeter`.
-4. **Why, once.** "Only you:" with the reason's sentence, or the composer's need on a projected
-   item. Never both.
-5. **The verdict, BEFORE the steps.** A verdict changes what the steps are for. Redo shows what the
-   check found and the exact fixes, numbered. A running check says the verdict lands here. A settled
-   item says how it ended, by whom and when. Back with the person, the box wears the summons as a
-   leading rule, never a filled band.
-6. ***From the AI***: what it tried first and its last word.
-7. **The numbered steps on the line.** These are the guide's track (§7). The card uses the authored
-   guide whole, else the composer's steps. A plan item and the session item that covers it are
-   linked ("Steps from Phase N's session") and never merged.
-8. ***How it's checked***, in words, then ***Goes to*** (`ROUTE_META`, with who resumes) and
-   ***Checked by*** (`CHECKED_BY_LABEL`).
-9. **ONE act form**, by the move table.
-10. **The history**, one press in, and **the raw record**, one more (the datum ledger).
+1. **The strip head.** A 4 px leading edge in the person's status hue (the same view `TurnStatus`
+   draws, so the edge and the word are one colour). One row: the type as a neutral plate — a glyph and
+   a word, Approval, Task, Decision or Heads-up (`TYPE_META`), never a colour — NOW, or NOT YET with
+   its *when*, the ONE lead badge, `TurnStatus chrome="tint"` (with *Attempt N* beside it on Redo),
+   and the errand's ref as an outlined chip. Readiness is drawn only while the act is still the
+   person's (`readinessShown`). The status and the readiness are the typed family's `turn` member
+   (`client/src/ui/status/turn.tsx`); their words are rows of `shared/status-model.js` (vocabularies
+   `turn` and `readiness`), and their labels `PERSON_STATUS_LABEL` and `READINESS_LABEL`, held equal by
+   `test/status-model.test.ts`. Amber paints only To do, Redo and Now.
+2. **The title**, which names the act, and **the meta** as outlined chips that wrap: plan, phase,
+   what it unblocks, assigned, open until. Each its own fact and a link where it can be.
+3. **The verdict, right after the head.** A verdict changes what everything under it is for: a lead
+   line ("Back to you — attempt N"), what the check found and read, then the exact fixes, numbered.
+   A running check says the verdict lands here; a settled item says how it ended, by whom and when.
+   Back with the person, the box wears the summons as a leading rule, never a filled band.
+4. **The act, before the record**, under a label per type — *What you decide*, *What you do*, *What
+   you approve*, *What to know*: why, once, then for a Decision its option strips (§ below), for a
+   Task its numbered steps on the line (the guide's track, §7) then its form, for an Approval its
+   what / who asked / if approved / if denied as a two-column grid. *From the AI* sits with the act it
+   explains. In the panel the act bar — the one primary and its ghost secondaries — is pinned to the
+   drawer's foot (`sticky`, a hairline above it), so the primary is reachable on a phone and in a long
+   card.
+5. **The record, after the act**, as fold strips (`record.tsx`, `ui/accordion.tsx`), each head saying
+   in one line what it holds: *How it's checked* (and *Checked by*, `CHECKED_BY_LABEL`), *Where it
+   goes* (`ROUTE_META`, with who resumes), *Timing* (the grid on one page clock: *Assigned*, *Do it*
+   and *Deadline* always, a missing deadline "None set"; *Open until*, *You sent it* and *Checked*
+   when the item has them; a deadline carries what is left, or how overdue in the failed hue, and the
+   line's `LoadMeter` — its head says the deadline), the *Steps* of a Decision or an Approval (the
+   console's own, short, OPEN at first) and *History* (who raised it, every move and attempt, the
+   answer, then the raw record — the datum ledger). *Everything* opens every fold.
 
 **The move table** (`client/src/cards/turn/moves.ts`, `cardMoveOf`) is the contract. Every type ×
 status × readiness × record has exactly one primary:
@@ -601,8 +736,10 @@ status × readiness × record has exactly one primary:
   the check. *Attach evidence*. Then three folded choices. *Not doing this* appears where the
   raiser allows it. *Snooze* offers an hour, four hours or until tomorrow. *Hand it back* offers the
   phase that raised it, a question for its session, or "I can't do this".
-- **Decision.** Radio options, each with what choosing it means. The recommended one is named in
-  words and never pre-selected. Then a note and *Send my decision*. A projected decision's option
+- **Decision.** Option strips — a radio, the option's label, what choosing it means under it, and a
+  neutral ★ *Recommended* badge named in words and never pre-selected; the chosen strip wears an ink
+  edge on the raised surface, and *Hand it to the AI* stands apart under an "or", dashed, with its
+  glyph. Then a note and *Send my decision*. A projected decision's option
   that takes words opens its own box. A flagged option is disabled and names its flag.
 - **Approval.** *Approve* and *Deny*, with a note. A run request's raise of money says beside the note
   that the note is the amount. A permission is its own card's approval: *Approve* at a scope, the
@@ -625,7 +762,13 @@ never a plain *Copy*. A shell redirect is never read as a placeholder.
 The clock ticks every second while a timing grid is on screen (an IntersectionObserver, through
 `useFineClock`) and every thirty seconds otherwise. It runs no timer when nothing reads it. Under
 `prefers-reduced-motion: reduce` it never takes the one-second tick: a second-by-second countdown
-is motion, and the figures say minutes.
+is motion, and the figures say minutes. It is the ONLY clock (measured-console phase 32): a figure
+that states its own cadence — a live run's elapsed seconds, a lane's minute, a relayed question's
+window (`useNow`, `useWindowLeft`) — reads the same store, re-rendered only when its own cadence's
+bucket of wall time turns over, and the page runs one interval at the finest cadence anything on it
+asks for. The second clock that once lived beside it in `lib/` was folded into it, and ESLint
+refuses an import of that path (`eslint.config.js`, `ONE_CLOCK_MESSAGE`); `ui/clock.test.tsx` holds
+the one interval.
 
 **The page** (turn-by-turn phase 9; organised as a page a person works FROM by one-pool phase 14,
 #377 #366, `client/src/screens/turn/`). The headline is the heading, and it counts rather than
@@ -713,6 +856,19 @@ and 1280.
 
 
 
+## 9.0's pages — Hooks, and what the tokens bought (measured-console phases 28, 30, 31)
+
+- **Settings ▸ Hooks** (`screens/settings/hooks.tsx`, every edition) is read-only. The session-presence
+  hook comes first, with its one action (install or remove). Then every hook a session meets, filtered
+  by where it came from (Plugin · User · Project · Run). Each hook is one row: its event, its kind,
+  what it runs, its matcher, its timeout, and its `onFailure` as a word — *blocks the call* or *carries
+  on*. Last come the hookify rules a run's start writes, one row a rule with its state (*written,
+  current*). The page edits nothing: a rule is changed in the plan that writes it.
+- **Logs ▸ Health ▸ Over time** draws four measures as bounded series: the gate's seconds, the
+  machine's load, a run save's milliseconds and (Pro) the reconciliation's delta
+  (`server/health-series.ts`). A measure with no points says in words what it has not seen, never a
+  zero.
+
 ## 12. The guards — what holds each rule
 
 Paths are from `viewer/`; `tests/unit/gates.bats` is the repository root's.
@@ -737,7 +893,7 @@ Paths are from `viewer/`; `tests/unit/gates.bats` is the repository root's.
 | `*.datums.test.tsx` | the datum ledger: every fact within two presses, the raw record whole (§1) |
 | `test/status-model.test.ts` | the decision table: every row held to its owner list, amber only from `PERSON_WORDS` or an inbox item, every bay reachable |
 | `test/status-vocab.test.ts`, `test/vocab-owners.test.ts` | the eight UI states, and a row for every word the server writes; each vocabulary imported by identity, never re-spelled, in the server, the shared modules and the whole client |
-| `test/docs-parity.test.ts` | §8.2 names every chart, every installed `@visx/*` module and the four refused; every backticked path in this document, `viewer/README.md` and its twin, CLAUDE.md, `docs/`, `references/` and the guides resolves |
+| `test/docs-parity.test.ts` | §8.2 names every chart, every installed `@visx/*` module and the four refused; every backticked path in this document, `viewer/README.md` and its twin, CLAUDE.md, `viewer/docs/architecture.md` (the long form CLAUDE.md points to), `docs/`, `references/` and the guides resolves |
 | `client/src/ui/figures/figures.test.tsx` | the closed figure/mark split against the door's exports; no literal colour in a figure, its key or its numbers; every figure's numbers table, and the drawing equal to it; the crosshair a slider, the zoom's way back outside it, the page's own scroll |
 | `client/src/ui/track/meter.test.tsx` | the mark: a real meter read as words, its fill clamped to the track, paint through a state, a reading and no bar when there is no whole |
 | `screens/plan/map/dag.test.tsx`, `screens/plan/map/map.test.tsx` | the route map: the zoom floor's derivation, windowed drawing, the minimap, the station search, every station by the arrow keys, no state told by hue, the Phases view's joins; its sheet on the tokens — no hue outside `.state-*` but the machine's own marks, amber through `--accent`, four sizes, one pulse, `--app-height`, no bare 6.x name |

@@ -299,11 +299,28 @@ export async function answerRequest(
     return { status: 200, body: { request: settled ? requestView(settled) : null } };
   }
   if (request.risk === HIGH_RISK && reading.fresh !== true) return needFresh(request.summary.split(' — ')[0]!);
-  const pressed = await deps.press(request);
-  const failed = pressed.status >= 400;
-  const error = failed && pressed.answer && typeof pressed.answer === 'object' ? String((pressed.answer as { error?: unknown }).error ?? '') : '';
-  const settled = state.requests.settle(request.id, failed ? 'failed' : 'confirmed', who,
-    { status: pressed.status, ...(error ? { error: error.slice(0, 400) } : {}) }, now);
-  deps.note(failed ? 'failed' : 'confirmed', { ...record, status: pressed.status });
-  return { status: failed ? 409 : 200, body: { request: settled ? requestView(settled) : null, result: pressed } };
+  // In flight before it presses (EI-7c): a second confirm arriving while the
+  // first awaits its press reads the request as taken, never presses it twice.
+  const flying = inFlight(state);
+  if (flying.has(request.id)) return { status: 409, body: { error: 'that request is being pressed already', request: requestView(request) } };
+  flying.add(request.id);
+  try {
+    const pressed = await deps.press(request);
+    const failed = pressed.status >= 400;
+    const error = failed && pressed.answer && typeof pressed.answer === 'object' ? String((pressed.answer as { error?: unknown }).error ?? '') : '';
+    const settled = state.requests.settle(request.id, failed ? 'failed' : 'confirmed', who,
+      { status: pressed.status, ...(error ? { error: error.slice(0, 400) } : {}) }, now);
+    deps.note(failed ? 'failed' : 'confirmed', { ...record, status: pressed.status });
+    return { status: failed ? 409 : 200, body: { request: settled ? requestView(settled) : null, result: pressed } };
+  } finally {
+    flying.delete(request.id);
+  }
+}
+
+/** The requests a confirm is pressing right now, per owner state. */
+const IN_FLIGHT = new WeakMap<OwnerState, Set<string>>();
+function inFlight(state: OwnerState): Set<string> {
+  let set = IN_FLIGHT.get(state);
+  if (!set) IN_FLIGHT.set(state, (set = new Set()));
+  return set;
 }

@@ -41,6 +41,7 @@ import type { ReactElement } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { HEAVY_CASE_TIMEOUT } from '@/test-heavy';
 import { queryClientConfig } from '@/data/keys';
 import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS } from '@shared/run-settings.js';
 import { shows } from './model/modes';
@@ -196,6 +197,13 @@ describe('every option has a control an operator can actually reach', () => {
     maxConsecutiveFailures: /^Stop after N failures$/,
     ladderPerRunRungs: /^Recovery rungs per run$/,
     ladderPerPhaseRungs: /^Recovery rungs per phase$/,
+    cacheTtlAb: /^Cache lifetime test$/,
+    keepWarmSec: /^Keep cache warm \(seconds\)$/,
+    subagentModel: /^Model for side work \(subagents\)$/,
+    bashMaxOutput: /^Bash output read back \(characters\)$/,
+    humanStepMode: /^When a phase needs a person$/,
+    compaction: /^Who compacts a long session$/,
+    compactionWindow: /^The CLI compacts at \(tokens\)$/,
     gitMode: /^Branch$/,
     priority: /^Queue priority$/,
     onlyPhases: /^Only these phases$/,
@@ -228,44 +236,48 @@ describe('every option has a control an operator can actually reach', () => {
     reviewerPolicy: /^Review each phase/,
   };
 
-  it.each(Object.keys(LABELS))('renders a control for %s', async (field) => {
-    const mode = RUN_MODES.find((m) => shows(m, field as never));
-    expect(mode, `${field} is offered by no run mode`).toBeTruthy();
-    // The plan's git lines are answered only where the plan and the launch
-    // disagree (control-tower phase 22) — so the prelude says they do.
-    if (field === 'gitStrategyAck') runPrelude.mockResolvedValue({ prelude: MISMATCH });
-    await mount({
-      mode,
-      context: { slug: 'alpha', run: null },
-      planPhases: [{ phase: 1, title: 'one' }],
-      planMcp: ['ctx'],
-      // The QA toggle is offered only while the PLAN's own gate is off; a plan
-      // that declares one gets a note instead, deliberately. `off` is the state
-      // in which every control is legal, which is what this file measures.
-      qaMode: 'off',
-    });
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: /Start|Save|Apply|Run phase/ })).toBeTruthy(),
-    );
+  it.each(Object.keys(LABELS))(
+    'renders a control for %s',
+    async (field) => {
+      const mode = RUN_MODES.find((m) => shows(m, field as never));
+      expect(mode, `${field} is offered by no run mode`).toBeTruthy();
+      // The plan's git lines are answered only where the plan and the launch
+      // disagree (control-tower phase 22) — so the prelude says they do.
+      if (field === 'gitStrategyAck') runPrelude.mockResolvedValue({ prelude: MISMATCH });
+      await mount({
+        mode,
+        context: { slug: 'alpha', run: null },
+        planPhases: [{ phase: 1, title: 'one' }],
+        planMcp: ['ctx'],
+        // The QA toggle is offered only while the PLAN's own gate is off; a plan
+        // that declares one gets a note instead, deliberately. `off` is the state
+        // in which every control is legal, which is what this file measures.
+        qaMode: 'off',
+      });
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /Start|Save|Apply|Run phase/ })).toBeTruthy(),
+      );
 
-    const unlock = UNLOCK[field];
-    if (unlock) {
-      // A `<select>` is set; a `ToggleField` is a Radix checkbox inside a
-      // wrapping label, so its accessible name carries the hint and the
-      // provenance too — it is found by ROLE, never by an anchored label.
-      const select = screen.queryAllByLabelText(unlock).find((el) => el instanceof HTMLSelectElement);
-      if (select) fireEvent.change(select, { target: { value: 'new-branch' } });
-      else fireEvent.click(screen.getByRole('checkbox', { name: unlock }));
-    }
+      const unlock = UNLOCK[field];
+      if (unlock) {
+        // A `<select>` is set; a `ToggleField` is a Radix checkbox inside a
+        // wrapping label, so its accessible name carries the hint and the
+        // provenance too — it is found by ROLE, never by an anchored label.
+        const select = screen.queryAllByLabelText(unlock).find((el) => el instanceof HTMLSelectElement);
+        if (select) fireEvent.change(select, { target: { value: 'new-branch' } });
+        else fireEvent.click(screen.getByRole('checkbox', { name: unlock }));
+      }
 
-    await waitFor(() => {
-      const found =
-        screen.queryAllByLabelText(LABELS[field]!).length > 0 ||
-        screen.queryAllByRole('button', { name: LABELS[field]! }).length > 0 ||
-        screen.queryAllByText(LABELS[field]!).length > 0;
-      expect(found, `no control found for ${field} in mode ${mode}`).toBe(true);
-    });
-  });
+      await waitFor(() => {
+        const found =
+          screen.queryAllByLabelText(LABELS[field]!).length > 0 ||
+          screen.queryAllByRole('button', { name: LABELS[field]! }).length > 0 ||
+          screen.queryAllByText(LABELS[field]!).length > 0;
+        expect(found, `no control found for ${field} in mode ${mode}`).toBe(true);
+      });
+    },
+    HEAVY_CASE_TIMEOUT,
+  );
 });
 
 describe('every field has a category, and every one is within two interactions of the quick view', () => {
@@ -298,6 +310,13 @@ describe('every field has a category, and every one is within two interactions o
     maxConsecutiveFailures: /^Stop after N failures$/,
     ladderPerRunRungs: /^Recovery rungs per run$/,
     ladderPerPhaseRungs: /^Recovery rungs per phase$/,
+    cacheTtlAb: /^Cache lifetime test$/,
+    keepWarmSec: /^Keep cache warm \(seconds\)$/,
+    subagentModel: /^Model for side work \(subagents\)$/,
+    bashMaxOutput: /^Bash output read back \(characters\)$/,
+    humanStepMode: /^When a phase needs a person$/,
+    compaction: /^Who compacts a long session$/,
+    compactionWindow: /^The CLI compacts at \(tokens\)$/,
     gitMode: /^Branch$/,
     baseBranch: /^Base branch$/,
     maxConcurrentPerRepo: /^Runs beside it in the repository$/,
@@ -405,7 +424,7 @@ describe('every field has a category, and every one is within two interactions o
         expect(interactions).toBeLessThanOrEqual(2);
       }
     },
-    60_000,
+    HEAVY_CASE_TIMEOUT,
   );
 });
 

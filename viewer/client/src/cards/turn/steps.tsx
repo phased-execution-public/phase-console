@@ -8,13 +8,16 @@
  *     guide), with "If it goes wrong";
  *   - the link between a plan's item and the session item that covers it —
  *     "Steps from Phase N's session" — linked, never merged;
- *   - *How it's checked*, in words;
- *   - *Goes to* and *Checked by*.
+ *   - *How it's checked*, in words, with *Checked by*;
+ *   - *Goes to*.
+ *
+ * Since Tower strips (2026-10-20) the last two are the record's folds
+ * (`record.tsx`), each named by a line of what it holds.
  */
 
 import type { ReactNode } from 'react';
 import { KIND_META, type HumanStepKind } from '@shared/human-step-model.js';
-import { ROUTE_META, type ProofType } from '@shared/turn-model.js';
+import { CHECKED_BY_LABEL, ROUTE_META, type ProofType } from '@shared/turn-model.js';
 import { GUIDE_DEFAULT_LANG, type Guide } from '@shared/guide-grammar.js';
 import type { TurnItem } from '@/data/turn';
 import { turnHref } from '@/shell/routes';
@@ -35,7 +38,7 @@ export function FromTheAI({
     <section
       data-testid="turn-ai-note"
       aria-label="From the AI"
-      className="flex max-w-prose flex-col gap-1 border-s-2 border-rule-strong ps-3 text-body text-ink"
+      className="flex max-w-(--measure) flex-col gap-1 border-s-2 border-rule-strong ps-3 text-body text-ink"
     >
       <p className="text-meta font-medium text-ink-muted">From the AI</p>
       {tried && (
@@ -68,12 +71,34 @@ export function composedGuide(item: Pick<TurnItem, 'steps' | 'trouble'>): Guide 
   };
 }
 
+/**
+ * How many steps the card draws — the guide's (its own, else the composer's),
+ * else the step's own lines — and whether there is anything to draw at all,
+ * the trouble list and a lone command block included. A record's *Steps* fold
+ * is drawn only when there is.
+ */
+export function stepsOf(
+  item: Pick<TurnItem, 'steps' | 'trouble'>,
+  guide: Guide | null,
+  lines: readonly string[],
+): { count: number; first: string | undefined; any: boolean } {
+  const drawn = guide ?? composedGuide(item);
+  if (drawn)
+    return {
+      count: drawn.steps.length,
+      first: drawn.steps[0]?.text,
+      any: drawn.steps.length > 0 || drawn.trouble.length > 0,
+    };
+  return { count: lines.length, first: lines[0], any: lines.length > 0 };
+}
+
 /** The steps: the item's guide, else the composer's, else the step's own lines. */
 export function Steps({
   item,
   guide,
   lines,
   fallback,
+  withSummary = true,
 }: {
   item: TurnItem;
   /** The item's own guide, whole, when it carries one. */
@@ -82,15 +107,17 @@ export function Steps({
   lines: readonly string[];
   /** What to draw when there are no steps at all (a command block, say). */
   fallback?: ReactNode;
+  /** The guide's why above its steps — off where the card said it already. */
+  withSummary?: boolean;
 }) {
   const drawn = guide ?? composedGuide(item);
-  if (drawn) return <GuideView guide={drawn} itemId={item.item} />;
+  if (drawn) return <GuideView guide={drawn} itemId={item.item} withSummary={withSummary} />;
   return (
     <>
       {lines.length > 0 && (
         <ol
           data-testid="turn-lines"
-          className="flex max-w-prose list-decimal flex-col gap-1 ps-5 text-body text-ink"
+          className="flex max-w-(--measure) list-decimal flex-col gap-1 ps-5 text-body text-ink"
         >
           {lines.map((line, index) => (
             <li key={`${index}-${line}`}>{line}</li>
@@ -120,7 +147,7 @@ export function CoverLinks({
 }) {
   if (!coveredBy && !covers?.length) return null;
   return (
-    <div data-testid="turn-cover-links" className="flex max-w-prose flex-col gap-1 text-body text-ink">
+    <div data-testid="turn-cover-links" className="flex max-w-(--measure) flex-col gap-1 text-body text-ink">
       {coveredBy && (
         <p data-testid="turn-covered-by">
           <span className="font-medium">Steps from Phase {coveredBy.phase}’s session. </span>
@@ -190,35 +217,53 @@ export function HowChecked({
     }
   }
   return (
-    <p data-testid="turn-check-words" className="max-w-prose text-body text-ink">
+    <p data-testid="turn-check-words" className="max-w-(--measure) text-body text-ink">
       <span className="font-medium">How it’s checked. </span>
       {words}
     </p>
   );
 }
 
-/** *Goes to* and *Checked by* — where a press goes and who decides it is done. */
-export function Routing({ route, checkedBy }: { route: TurnItem['route']; checkedBy: string | undefined }) {
-  const goes = route
+/** Where a press goes — the route's words (`ROUTE_META`), when the item names one. */
+export function goesToOf(route: TurnItem['route']): { label: string; resumes: string } | undefined {
+  return route
     ? (ROUTE_META as Partial<Record<string, { label: string; resumes: string }>>)[route]
     : undefined;
-  if (!goes && !checkedBy) return null;
+}
+
+/** Who or what decides it is done: the composer's words, else the proof type's (`CHECKED_BY_LABEL`). */
+export function checkedByOf(
+  checkedBy: string | undefined,
+  proofType: ProofType | null | undefined,
+): string | undefined {
+  return checkedBy ?? (proofType ? CHECKED_BY_LABEL[proofType] : undefined);
+}
+
+/** *Goes to* — where a press goes, and who resumes. */
+export function GoesTo({ route }: { route: TurnItem['route'] }) {
+  const goes = goesToOf(route);
+  if (!goes) return null;
   return (
-    <dl data-testid="turn-routing" className="grid min-w-0 gap-x-6 gap-y-1.5 sm:grid-cols-[auto_1fr]">
-      {goes && (
-        <div data-testid="turn-goes-to" className="contents">
-          <dt className="text-meta text-ink-muted">Goes to</dt>
-          <dd className="min-w-0 text-body text-ink">
-            <span className="font-medium">{goes.label}</span> — {goes.resumes}.
-          </dd>
-        </div>
-      )}
-      {checkedBy && (
-        <div data-testid="turn-checked-by" className="contents">
-          <dt className="text-meta text-ink-muted">Checked by</dt>
-          <dd className="min-w-0 text-body text-ink">{checkedBy}</dd>
-        </div>
-      )}
+    <dl data-testid="turn-routing" className="grid min-w-0 gap-x-6 gap-y-1.5 @md/card:grid-cols-[auto_1fr]">
+      <div data-testid="turn-goes-to" className="contents">
+        <dt className="text-meta text-ink-muted">Goes to</dt>
+        <dd className="min-w-0 text-body text-ink">
+          <span className="font-medium">{goes.label}</span> — {goes.resumes}.
+        </dd>
+      </div>
+    </dl>
+  );
+}
+
+/** *Checked by* — who decides it is done. */
+export function CheckedBy({ checkedBy }: { checkedBy: string | undefined }) {
+  if (!checkedBy) return null;
+  return (
+    <dl className="grid min-w-0 gap-x-6 gap-y-1.5 @md/card:grid-cols-[auto_1fr]">
+      <div data-testid="turn-checked-by" className="contents">
+        <dt className="text-meta text-ink-muted">Checked by</dt>
+        <dd className="min-w-0 text-body text-ink">{checkedBy}</dd>
+      </div>
     </dl>
   );
 }

@@ -22,7 +22,12 @@ import { mcpDirective, skillDirective } from '../skills.ts';
 import { FOLLOW_UP_RUNG, FOLLOW_UP_SITUATION, MAX_FOLLOW_UP_BYTES } from '../review.ts';
 import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition, lostResume,
+  WATCHDOG_MAX_WAIT_MS,
 } from './errors.ts';
+import { compactionEnv, usageLimitWaitMs } from './errors.ts';
+import {
+  cacheArmTtl, cacheTtlEnv, cacheTtlOfEnv, compactionArm, DEFAULT_CACHE_TTL_AB, DEFAULT_COMPACTION, DEFAULT_COMPACTION_WINDOW,
+} from '../../shared/run-settings.js';
 
 /**
  * `resumeWithInstruction`'s third answer: the session it was asked to resume is
@@ -89,7 +94,7 @@ import {
   holdersKey, isCappableBlocker, isOwnLiveLane,
   type AdmitRequest, type Holder, type Promotion, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
-import type { LeaveReason, LeaveResult } from '../accounts/index.ts';
+import type { LeaveReason, LeaveResult, SwitchCandidates } from '../accounts/index.ts';
 import type { PortResult } from '../accounts/transcripts.ts';
 import { formatScope, SHARED_CHECKOUT_TOKEN } from '../../shared/scope.js';
 import { ISOLATED, SETTLE_PUSHES, settleOf } from '../../shared/worktree-model.js';
@@ -97,9 +102,11 @@ import { Journal } from './journal.ts';
 import { type ReplayLimit, Transcript } from './transcript.ts';
 import { checkAuth, type AuthStatus } from './auth.ts';
 import {
-  buildSettings, writeSettingsFile, loadPolicyFor, dropSettingsFileFor, PLAN_HOST_SETTINGS_SUFFIX,
+  buildSettings, memoryDirFor, writeSettingsFile, loadPolicyFor, dropSettingsFileFor, PLAN_HOST_SETTINGS_SUFFIX,
+  phasePluginsSettingsName, withPhasePlugins,
   type Approvals, type PermissionProfile,
 } from './approvals.ts';
+import { loadsKey, type SessionLoads } from './loads.ts';
 import { dropMcpConfigsFor } from '../mcp/config.ts';
 import {
   CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, declarationCooldownFor, declaredClock, ladderClassifies, RECOVER_MAX_PER_PHASE, REPAIR_MAX_TURNS, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, QUEUE_SEEN_PERSIST_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MAX_OPEN_ASKS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applyRungCaps, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameRelayNotice, frameSteer, prBlockText, preflight, reasonOf, settingsBefore, settingsOverridden, settingsSnapshot, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions, type ResumeVerdict, type VettedResume,
@@ -184,6 +191,16 @@ export abstract class RunnerControl extends RunnerBase {
       qaModel: options.qaModel,
       qaEffort: options.qaEffort,
       qaMaxRounds: options.qaMaxRounds,
+      // The approval card's timeout and the session's environment (measured-
+      // console phase 6) — by hand, for the reason above; `null` is silence here.
+      approvalTimeoutMinutes: options.approvalTimeoutMinutes,
+      cacheTtlAb: options.cacheTtlAb ?? undefined,
+      keepWarmSec: options.keepWarmSec ?? undefined,
+      subagentModel: options.subagentModel ?? undefined,
+      bashMaxOutput: options.bashMaxOutput ?? undefined,
+      humanStepMode: options.humanStepMode ?? undefined,
+      compaction: options.compaction ?? undefined,
+      compactionWindow: options.compactionWindow ?? undefined,
       // The run's own ladder rung caps (control-tower phase 5, #14) — by
       // hand, for the reason above.
       ladderPerRunRungs: options.ladderPerRunRungs,
@@ -498,6 +515,14 @@ export abstract class RunnerControl extends RunnerBase {
         ...(options.qaModel !== undefined ? { qaModel: options.qaModel } : {}),
         ...(options.qaEffort !== undefined ? { qaEffort: options.qaEffort } : {}),
         ...(options.qaMaxRounds !== undefined ? { qaMaxRounds: options.qaMaxRounds } : {}),
+        // The session's environment (measured-console phase 6): named, it moves; `null` clears.
+        ...(options.cacheTtlAb !== undefined ? { cacheTtlAb: options.cacheTtlAb } : {}),
+        ...(options.keepWarmSec !== undefined ? { keepWarmSec: options.keepWarmSec } : {}),
+        ...(options.subagentModel !== undefined ? { subagentModel: options.subagentModel } : {}),
+        ...(options.bashMaxOutput !== undefined ? { bashMaxOutput: options.bashMaxOutput } : {}),
+        ...(options.humanStepMode !== undefined ? { humanStepMode: options.humanStepMode } : {}),
+        ...(options.compaction !== undefined ? { compaction: options.compaction } : {}),
+        ...(options.compactionWindow !== undefined ? { compactionWindow: options.compactionWindow } : {}),
         ...(options.baseBranch !== undefined ? { baseBranch: options.baseBranch } : {}),
         ...(options.maxConcurrentPerRepo !== undefined ? { maxConcurrentPerRepo: options.maxConcurrentPerRepo } : {}),
         ...(options.worktreeRetention !== undefined ? { worktreeRetention: options.worktreeRetention } : {}),
@@ -615,9 +640,11 @@ export abstract class RunnerControl extends RunnerBase {
       }
     }
     if (refusal) {
+      // Through `halt()` like every other ending (EI-22): the journal's
+      // `run.halt`, the halt signal, `finishedReason` and a cleared resolution —
+      // then parked, since a preflight refusal waits on an account, not a person.
+      this.halt(refusal, undefined, 'run-preflight');
       setRunState(this.state, 'parked');
-      this.state.stoppedBy = 'system';
-      this.state.halt = { at: new Date().toISOString(), reason: refusal, kind: 'run-preflight' };
       // The run's pool, named in the ask when it declared one (#55): the
       // failover above never left it, so the person is told which accounts
       // were the candidates and how to widen them.
@@ -2045,6 +2072,15 @@ export abstract class RunnerControl extends RunnerBase {
       // saw — the plugin's clone, or one an old handoff wrote down — while the
       // console that launched it enforced its own newer copy.
       PE_SCRIPTS: this.deps.scriptsDir,
+      // …and WHICH node runs the local guard hook (measured-console phase 6):
+      // this console's own, so a session whose PATH has none is still guarded
+      // rather than blocked by a hook that cannot start.
+      PE_NODE: process.execPath,
+      // How long a request waits on a usage limit (measured-console phase 24, B9): until the run's
+      // pool next has room, bounded — an operator's own value stands.
+      ...(process.env.CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS === undefined && this.deps.poolNearestReset
+        ? { CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS: String(this.usageLimitWait()) }
+        : {}),
       // Sessions run `validate.sh`/`phase-graph.sh` themselves per the skill's
       // protocol; under launchd the parent env has no registry, so F15's MCP
       // advisory was silently dead inside every unattended session. Resolved
@@ -2096,8 +2132,154 @@ export abstract class RunnerControl extends RunnerBase {
       // as `undefined` outside a span, so the delete happens either way.
       ...envCarrier(),
       ...account,
+      // The session's own environment (measured-console phase 6): how much
+      // Bash output it reads back, its subagents' model, how long one request
+      // may wait out a 429, and — an API-key account's — its cache lifetime.
+      ...await this.phaseSessionEnv(extra.PE_PHASE, account),
+      ...this.otelEnv(),
       ...extra,
     };
+  }
+
+  /**
+   * Where this run's sessions export their OpenTelemetry (measured-console phase 19): the
+   * console's receiver and the run's telemetry bearer, with the run and the account the
+   * resource attributes name. `childEnv` turns them into the exporter's variables. Always stated:
+   * with no receiver every key is `undefined`, so an inherited one never points a session at a
+   * console that did not start it.
+   */
+  protected otelEnv(): NodeJS.ProcessEnv {
+    const state = this.state;
+    const origin = this.deps.origin;
+    let token: string | null = null;
+    if (!state || !origin || !token) {
+      return { PE_OTEL_ENDPOINT: undefined, PE_OTEL_TOKEN: undefined, PE_RUN_ID: undefined, PE_ACCOUNT: undefined };
+    }
+    return {
+      PE_OTEL_ENDPOINT: `${origin}/otel`,
+      PE_OTEL_TOKEN: token,
+      PE_RUN_ID: state.id,
+      PE_ACCOUNT: state.accountId ?? 'default',
+    };
+  }
+
+  /**
+   * What phase 6 puts in a phase session's environment beside the account's
+   * (A3, A4, A5, E4). `childEnv` fills what is left with the console's own
+   * defaults, so a value here is always the RUN's or the PLAN's:
+   *  - `BASH_MAX_OUTPUT_LENGTH` — the run's `bashMaxOutput`;
+   *  - `CLAUDE_CODE_SUBAGENT_MODEL` — the run's `subagentModel`, else the
+   *    plan's `- **Subagent model:**` / `**Subagent model:**`; nothing switches
+   *    a live session's own model;
+   *  - `CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS` — the phase's wait budget when
+   *    it is shorter than the console's half hour;
+   *  - the cache arm — only when the ACCOUNT's environment states a lifetime
+   *    (an API key; a login states none): its own, or under `cacheTtlAb:
+   *    alternate` on an odd phase the other one, journalled `phase.cache-arm`.
+   * A read that fails says nothing: the defaults stand.
+   */
+  /** Each phase's guard words as its last spawn read them (`phaseSessionEnv`). */
+  protected readonly guardWords = new Map<number, { mayDeleteTests: boolean; fastGate: boolean }>();
+
+  /** Whether this phase may delete a test file (`- **May delete tests:** yes`) — false until its spawn has read it. */
+  mayDeleteTests(phase: number): boolean {
+    return this.guardWords.get(phase)?.mayDeleteTests ?? false;
+  }
+
+  /** Whether the Stop hook runs this phase's fast lines — on unless its plan section says `- **Fast gate:** off`. */
+  fastGateOn(phase: number): boolean {
+    return this.guardWords.get(phase)?.fastGate ?? true;
+  }
+
+  protected async phaseSessionEnv(phaseWord: string | undefined, account: NodeJS.ProcessEnv | null): Promise<NodeJS.ProcessEnv> {
+    const state = this.state;
+    if (!state) return {};
+    const env: NodeJS.ProcessEnv = {};
+    if (Number.isInteger(state.bashMaxOutput)) env.BASH_MAX_OUTPUT_LENGTH = String(state.bashMaxOutput);
+    const phase = phaseWord !== undefined && /^\d+$/.test(phaseWord) ? Number(phaseWord) : null;
+    // Each read at once — a spawn waits on the slowest, not the sum. A read
+    // that fails answers null, and the default it would have replaced stands.
+    const read = async (args: string[]): Promise<string | null> => {
+      try {
+        const out = await this.engine(args);
+        return out.code === 0 ? out.stdout.split('\t')[0]?.trim() ?? null : null;
+      } catch { return null; }
+    };
+    const [subagentModel, mayDelete, fastGate, budget] = await Promise.all([
+      state.subagentModel ? Promise.resolve(state.subagentModel)
+        : read(phase === null ? ['--subagent-model'] : ['--subagent-model', String(phase)]),
+      phase === null ? null : read(['--may-delete-tests', String(phase)]),
+      phase === null ? null : read(['--fast-gate', String(phase)]),
+      phase === null ? null : this.waitBudgetOf(phase).catch(() => null),
+    ]);
+    if (subagentModel) env.CLAUDE_CODE_SUBAGENT_MODEL = subagentModel;
+    if (phase !== null) {
+      // The phase's two guard words (C4), read at its spawn and kept for the
+      // hook, which must answer synchronously: `- **May delete tests:** yes`
+      // lifts the test half of the protected-file deny — and reaches the local
+      // guard hook as `PE_MAY_DELETE_TESTS` — and `- **Fast gate:** off` stops
+      // the Stop hook running the phase's fast lines.
+      this.guardWords.set(phase, { mayDeleteTests: mayDelete === 'yes', fastGate: fastGate !== 'off' });
+      env.PE_MAY_DELETE_TESTS = mayDelete === 'yes' ? 'yes' : undefined;
+      if (budget && budget.budgetMs > 0 && budget.budgetMs < WATCHDOG_MAX_WAIT_MS) {
+        env.CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS = String(budget.budgetMs);
+      }
+    }
+    // Who compacts this phase's sessions (measured-console phase 12, A10):
+    // the arm, its window, and — for phase 33 — the arm journalled per spawn.
+    const arm = compactionArm({ mode: state.compaction, phase });
+    const compactAt = state.compactionWindow ?? DEFAULT_COMPACTION_WINDOW;
+    Object.assign(env, compactionEnv(arm, compactAt));
+    if (phase !== null && (state.compaction ?? DEFAULT_COMPACTION) !== DEFAULT_COMPACTION) {
+      this.record('phase.compaction-arm', { arm, mode: state.compaction, ...(arm === 'native' ? { window: compactAt } : {}) }, phase);
+    }
+    const own = cacheTtlOfEnv(account);
+    if (own) {
+      const ttl = cacheArmTtl({ ttl: own, ab: state.cacheTtlAb, phase });
+      Object.assign(env, cacheTtlEnv(ttl));
+      if (phase !== null) {
+        this.record('phase.cache-arm', {
+          ttl, account: own, ab: state.cacheTtlAb ?? DEFAULT_CACHE_TTL_AB,
+          ...(state.keepWarmSec ? { keepWarmSec: state.keepWarmSec } : {}),
+        }, phase);
+      }
+    }
+    return env;
+  }
+
+  /**
+   * The switch picker as every automatic mover asks it (`deps.switchCandidates`),
+   * less every account whose usage brake is engaged with a lane live on it
+   * (measured-console phase 24, #420): the brake admits no new lane there, so a
+   * run moved onto it sat idle at every boundary while the account it left had
+   * room for exactly its lane. Each one passed over joins `declined`, and with
+   * nothing left the caller stays where it is.
+   */
+  protected switchPlan(
+    from: string | undefined, forModel: string | undefined,
+    opts: { until: number | null; pool: readonly string[] | null; floors?: Readonly<Record<string, number>> | null; usage?: boolean },
+  ): SwitchCandidates | null {
+    if (!this.deps.switchCandidates) return null;
+    const plan = this.deps.switchCandidates(from, forModel, opts);
+    const scheduler = this.deps.scheduler;
+    if (!scheduler || opts.usage === false) return plan;
+    const ranked: string[] = [];
+    const declined = [...plan.declined];
+    for (const id of plan.ranked) {
+      const account = id === 'default' ? undefined : id;
+      const brake = scheduler.brakeOf(account);
+      const live = brake ? scheduler.liveOn(account) : 0;
+      if (brake && live > 0 && id !== (from ?? 'default')) {
+        declined.push({
+          id, bucket: brake.window ?? 'brake', pct: brake.pct, lastsMs: null,
+          resetsAt: brake.untilMs === null ? null : new Date(brake.untilMs).toISOString(),
+          why: `its usage brake is engaged at ${Math.round(brake.pct)} % with ${live} ${live === 1 ? 'lane' : 'lanes'} live on it — it admits no new lane`,
+        });
+        continue;
+      }
+      ranked.push(id);
+    }
+    return { ...plan, ranked, declined };
   }
 
   /**
@@ -2110,6 +2292,14 @@ export abstract class RunnerControl extends RunnerBase {
    * and the caller falls back to waiting exactly as if no second account
    * existed.
    */
+  /** `usageLimitWaitMs` for this run's pool (measured-console phase 24): its nearest reset, from the facade. */
+  protected usageLimitWait(): number {
+    const now = this.now().getTime();
+    let nearest: number | null = null;
+    try { nearest = this.deps.poolNearestReset?.(this.state ? accountPool(this.state) : null, now) ?? null; } catch { nearest = null; }
+    return usageLimitWaitMs(nearest, now);
+  }
+
   protected trySwitchAccount(
     phase: number, record: PhaseRecord, reason: string, model?: string, horizon?: Date | string | null,
   ): boolean {
@@ -2137,7 +2327,7 @@ export abstract class RunnerControl extends RunnerBase {
       // 78, #100): an account that would wall before then is passed over, and
       // with none left the caller waits on the soonest reset instead of moving
       // the work somewhere it would be held for days.
-      const plan = this.deps.switchCandidates(from, forModel, { until, pool, floors: this.accountFloors() });
+      const plan = this.switchPlan(from, forModel, { until, pool, floors: this.accountFloors() })!;
       next = plan.ranked.find((id) => (!pool || pool.includes(id)) && id !== (from ?? 'default'));
       if (!next) {
         this.noteSwitchDeclined(phase, from, until, plan);
@@ -2637,7 +2827,7 @@ export abstract class RunnerControl extends RunnerBase {
     // 78, #100): the same picker the mid-run wall uses, so an account that
     // would wall before this one resets is never probed, only named in `tried`.
     const plan = reason === 'quota' && this.deps.switchCandidates
-      ? this.deps.switchCandidates(from, state.model, { until: this.wallResetMs(null, from, state.model), pool, floors: this.accountFloors() })
+      ? this.switchPlan(from, state.model, { until: this.wallResetMs(null, from, state.model), pool, floors: this.accountFloors() })
       : null;
     const passedOver = new Set(plan?.declined.map((row) => row.id) ?? []);
     for (const row of plan?.declined ?? []) tried.push(`switch-account → ${row.id}: ${row.why}`);
@@ -2660,7 +2850,10 @@ export abstract class RunnerControl extends RunnerBase {
         // retired, a spent window is a wall until its reset.
         const verdict = this.deps.accountHeadroom?.(from, state.model);
         const resetsAt = verdict && !verdict.ok && verdict.resetsAt ? new Date(verdict.resetsAt) : null;
-        if (!(verdict && !verdict.ok && verdict.kind === 'retired')) {
+        // Read again AFTER the probes (measured-console phase 24, #389): a window that reset while
+        // they ran is no wall, and cooling it on the reading from before its reset held two runs
+        // queued for half an hour on an account at 4 %.
+        if (verdict && !verdict.ok && verdict.kind !== 'retired') {
           this.leaveAccount(undefined, {
             kind: 'usage', reason: detail ?? 'no headroom at preflight', by: 'preflight',
             ...(resetsAt ? { bucket: 'five_hour', resetsAt } : {}),
@@ -3810,9 +4003,19 @@ export abstract class RunnerControl extends RunnerBase {
   }
 
   private writeSettings(
-    runId: string, token: string, origin: string, variant: { relay?: boolean; file?: string } = {},
+    runId: string, token: string, origin: string, variant: { relay?: boolean; file?: string; plugins?: readonly string[] } = {},
   ): string {
+    // What the run's sessions load (measured-console phase 11): its
+    // `enabledPlugins`, from the answer the spawn door will send argv from.
+    let loads: SessionLoads | null = null;
+    try { loads = this.deps.sessionLoads?.() ?? null; } catch { loads = null; }
+    // A variant's key never stands for the run's own file, which the next spawn compares against.
+    if (!variant.file) this.settingsLoadsKey = loadsKey(loads);
+    // One phase's set (measured-console phase 27) rides its own variant only.
+    const enabledPlugins = withPhasePlugins(loads?.enabledPlugins, variant.plugins);
     return writeSettingsFile(variant.file ?? runId, buildSettings({
+      ...(enabledPlugins ? { enabledPlugins } : {}),
+      ...(loads?.carriedDeny.length ? { carriedDeny: loads.carriedDeny } : {}),
       runId,
       token,
       origin,
@@ -3828,10 +4031,17 @@ export abstract class RunnerControl extends RunnerBase {
       // unless the plan says otherwise, because an accepted inbox nobody sends
       // to costs the session nothing.
       messaging: this.messagingOn(),
+      // The plan's memory, under the docs root (measured-console phase 4).
+      ...(this.state?.root && this.state.slug ? { memoryDir: memoryDirFor(this.state.root, this.state.slug) } : {}),
       // This run's live grants below plan scope (control-tower phase 149): the
       // rule lowered for this run only while the grant lives; the next write
       // after it ends raises it again.
       ...(this.deps.grantsLowered ? { lowered: this.deps.grantsLowered(runId) } : {}),
+      // The local guard hook (measured-console phase 6, C4): the console's own
+      // scripts, so the classifier it asks is this console's.
+      guardHook: join(this.deps.scriptsDir, 'guard-hook.sh'),
+      // The compaction hooks ride a run whose arm can be native (A10).
+      compactionHooks: (this.state?.compaction ?? DEFAULT_COMPACTION) !== DEFAULT_COMPACTION,
     }));
   }
 
@@ -3855,6 +4065,11 @@ export abstract class RunnerControl extends RunnerBase {
     this.rearmSettings();
   }
 
+  /** The loads changed (a setting, a rebuilt tree or seed): the next child loads a file that agrees with its argv. */
+  protected override loadsChanged(): void {
+    this.rearmSettings();
+  }
+
   /**
    * The settings a plan-mode session loads (control-tower phase 11): the run's
    * own, plus the relay's `PermissionRequest` hook, in a file of its own so the
@@ -3863,14 +4078,39 @@ export abstract class RunnerControl extends RunnerBase {
    * host that never answers needs the hook to answer every call that prompts,
    * or one would sit on it for an hour. Same token as the run's file.
    */
-  protected planHostSettingsPath(): string | null {
+  protected planHostSettingsPath(phase?: number, plugins?: readonly string[]): string | null {
     const { approvals, origin } = this.deps;
     if (!approvals || !origin || !this.state) return null;
     const token = approvals.liveToken?.(this.state.id);
     if (!token) return null;
     try {
       return this.writeSettings(this.state.id, token, origin, {
-        relay: true, file: `${this.state.id}${PLAN_HOST_SETTINGS_SUFFIX}`,
+        relay: true,
+        file: plugins?.length && phase !== undefined
+          ? phasePluginsSettingsName(this.state.id, phase, true) : `${this.state.id}${PLAN_HOST_SETTINGS_SUFFIX}`,
+        ...(plugins?.length ? { plugins } : {}),
+      });
+    } catch (error) {
+      log.error('runner.settings', { error });
+      return null;
+    }
+  }
+
+  /**
+   * The settings ONE phase's session loads when its plugin set switches
+   * plugins on (measured-console phase 27, D5): the run's own, with those ids
+   * added to `enabledPlugins`, in `run-<id>-p<N>.json` — so every other
+   * session keeps exactly the run's set. Same token. `null` without a broker,
+   * and the session loads the run's file.
+   */
+  protected override phasePluginsSettingsPath(phase: number, plugins: readonly string[]): string | null {
+    const { approvals, origin } = this.deps;
+    if (!approvals || !origin || !this.state || !plugins.length) return null;
+    const token = approvals.liveToken?.(this.state.id);
+    if (!token) return null;
+    try {
+      return this.writeSettings(this.state.id, token, origin, {
+        file: phasePluginsSettingsName(this.state.id, phase), plugins,
       });
     } catch (error) {
       log.error('runner.settings', { error });
@@ -4284,6 +4524,11 @@ export abstract class RunnerControl extends RunnerBase {
    *   - `seniority`: nothing — first come, first served.
    */
   protected promotionOf(phase: number): Promotion | null {
+    return this.policyPromotion(phase);
+  }
+
+  /** The scheduling policy's promotion of one phase of this run — the queue forecast asks it for each row's reason (#407). */
+  policyPromotion(phase: number): Promotion | null {
     const state = this.state;
     if (!state) return null;
     const policy = this.schedulingPolicy();
@@ -4902,6 +5147,10 @@ export abstract class RunnerControl extends RunnerBase {
     // `by: "console"` because the route defaulted what the client never sent.
     this.record('run.account-switch', { from, to: target ?? 'default', checkpointed, deferred, when, rekeyed, ...actor });
     if (!isPersonsAct(actor)) this.noteReversal(from, target ?? 'default', by, `${actor.by} switched the run`);
+    // The walls its phases are parked on move with the run (measured-console phase 24, #388): a
+    // park keyed to the account the run left is judged again against the one it is on now, and
+    // lifts at once when that one can pay.
+    this.rereadWalls('switch');
     // Durable NOW, not on the debounce: a switch is a person's decision, and
     // the next thing to read the account may be a Continue that loads the run
     // off disk (#56 — the stored run still read the old account when the

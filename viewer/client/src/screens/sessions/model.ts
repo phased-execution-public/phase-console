@@ -170,7 +170,7 @@ export interface SessionRow {
   /** Its own word, through the one status model. */
   view: StatusView;
   /** Stopped on a PERSON — a pending permission card (lanes) or the registry's waiting flag — and since when. */
-  attention?: { kind: 'permission' | 'input'; since?: string };
+  attention?: { kind: 'permission' | 'elicitation' | 'input'; since?: string };
   /** The session's own task list, on the rows that carry one (a lane's record, a QA reviewer's pty). */
   tasks?: readonly PhaseTask[];
 

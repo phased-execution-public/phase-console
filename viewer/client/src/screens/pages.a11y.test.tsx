@@ -1,6 +1,6 @@
 /**
  * The accessibility smoke — every destination's page, every Settings section,
- * the Pro sections that are addresses of their own, and the human-step card.
+ * the Pro sections that are addresses of their own, and the step card (`StepCard`).
  *
  * The SHELL's chrome around each destination is `screens/a11y.test.tsx`'s, and
  * its own contracts — names, landmarks, the skip link — are
@@ -28,6 +28,7 @@ import { Suspense } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { HEAVY_CASE_TIMEOUT } from '@/test-heavy';
 import { DESTINATIONS as SHELL_DESTINATIONS, ROUTE_HEADS } from '@shared/route-meta.js';
 import { queryClientConfig } from '@/data/keys';
 import { schemaAnswer } from '@/screens/settings/test-kit';
@@ -405,9 +406,71 @@ const ROUTES: [RegExp, unknown][] = [
   ],
   [/^\/api\/sessions/, { sessions: [], max: 8 }],
   [/^\/api\/terminal/, { sessions: [], max: 8 }],
+  // Settings ▸ Hooks (measured-console phase 28): one hook of each source, and one plan's rules.
+  [
+    /^\/api\/hooks$/,
+    {
+      hooks: [
+        {
+          source: 'plugin',
+          file: '/opt/skill/hooks/hooks.json',
+          event: 'SessionStart',
+          type: 'command',
+          runs: 'bash "${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh"',
+          timeout: 15,
+        },
+        {
+          source: 'run',
+          file: 'run-<id>.json',
+          event: 'PreToolUse',
+          matcher: 'Bash',
+          type: 'http',
+          runs: '<console>/hooks/pre-tool-use',
+          timeout: 3600,
+          onFailure: 'block',
+        },
+      ],
+      hookify: [
+        {
+          slug: 'demo',
+          rules: [
+            {
+              rule: 'publish',
+              name: 'pe-demo-publish',
+              file: 'hookify.pe-demo-publish.local.md',
+              event: 'bash',
+              action: 'block',
+              pattern: 'git\\s+push',
+              source: 'permission.destructive',
+              words: 'This plan (demo) denies publishing.',
+            },
+          ],
+          onDisk: [],
+        },
+      ],
+    },
+  ],
   [/^\/api\/mcp\/catalog/, { entries: [] }],
   [/^\/api\/mcp/, { servers: [], allowMcp: false }],
   [/^\/api\/policy/, POLICY],
+  // Logs ▸ Health's over-time series (measured-console phase 31).
+  [
+    /^\/api\/health\/series/,
+    {
+      from: '2026-09-01T00:00:00.000Z',
+      to: '2026-09-29T10:00:00.000Z',
+      bounds: { maxPoints: 2100, days: 30, sampleMs: 300_000 },
+      measures: {
+        gate: [{ at: '2026-09-20T12:00:00.000Z', v: 410 }],
+        load: [
+          { at: '2026-09-29T09:55:00.000Z', v: 0.75 },
+          { at: '2026-09-29T10:00:00.000Z', v: 0.5 },
+        ],
+        persist: [{ at: '2026-09-29T09:55:00.000Z', v: 12.4 }],
+        reconcile: [],
+      },
+    },
+  ],
   [/^\/api\/accounts/, ACCOUNTS],
   [/^\/api\/push/, PUSH],
   [/^\/api\/webhooks/, WEBHOOKS],
@@ -633,6 +696,8 @@ const SECTION_SETTLED: Readonly<Record<string, () => Promise<unknown>>> = {
   // editor's scope (drawn once the policy is read), this process's facts.
   mcp: () => screen.findByText(/No server is registered/, undefined, { timeout: WAIT }),
   permissions: () => screen.findByTestId('rules-scope', undefined, { timeout: WAIT }),
+  // Phase 28: the run's PreToolUse is fixtured, and the plugin list once read.
+  hooks: () => screen.findByTestId('hooks-list', undefined, { timeout: WAIT }),
   instance: () => screen.findByTestId('process-facts', undefined, { timeout: WAIT }),
 };
 
@@ -668,7 +733,7 @@ async function mountAt(segments: string[], query: Record<string, string> = {}) {
  * genuinely never resolves must still fail, and a retry would hide exactly
  * that — as would leaving the default in place and calling the result flaky.
  */
-const TIMEOUT = 40_000;
+const TIMEOUT = HEAVY_CASE_TIMEOUT;
 const WAIT = 30_000;
 
 describe('axe — every destination', () => {
@@ -730,7 +795,11 @@ describe('axe — every settings section', () => {
         });
         await expectNoAxeViolations(container);
       },
-      TIMEOUT,
+      // `everything` draws every section at once, so axe walks the whole of
+      // Settings in one pass: 44.7 s beside the gate's concurrent suites at a
+      // load of 30 (measured-console phase 7's boarding red), where a single
+      // section takes seconds. The bound scales with what the case walks.
+      section.id === 'everything' ? TIMEOUT * 3 : TIMEOUT,
     );
   }
 });
@@ -741,12 +810,12 @@ describe('axe — every settings section', () => {
  * phone's answer page is walked here in both its variants — the device code,
  * the WHERE badge, the one action and the folds all included.
  */
-describe('the human-step card', () => {
+describe('the step card from an inbox row', () => {
   it(
     'has no accessibility violations, full or folded to its row',
     async () => {
       const { humanStepView } = await import('@shared/human-step-model.js');
-      const { HumanStepCard } = await import('@/cards/human-step-card');
+      const { StepCard } = await import('@/cards/item-card');
       const { TooltipProvider } = await import('@/ui/tooltip');
       const item = {
         id: 'human-step:demo:2:s1',
@@ -776,10 +845,10 @@ describe('the human-step card', () => {
           <TooltipProvider>
             <ul>
               <li>
-                <HumanStepCard item={item} />
+                <StepCard item={item} />
               </li>
               <li>
-                <HumanStepCard item={item} variant="row" />
+                <StepCard item={item} variant="row" />
               </li>
             </ul>
           </TooltipProvider>

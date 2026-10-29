@@ -46,7 +46,6 @@ import { useAttentionInbox, useInbox } from '@/data/inbox';
 import { keys } from '@/data/keys';
 import { press } from '@/data/press';
 import { plural } from '@/lib/format';
-import { usePhone } from '@/lib/media';
 import { cn } from '@/lib/cn';
 import { useInboxActions } from '@/cards/inbox-row';
 import { TurnRowWords } from '@/cards/turn/row-words';
@@ -118,7 +117,6 @@ const failed = (cause: unknown) =>
  */
 export function BellDrawer({ route }: { route: Route }) {
   const navigate = useNavigate();
-  const phone = usePhone();
   const open = route.query[OVERLAY_KEYS.bell] != null;
   // Needs-you first: the bell is opened from a count of things still
   // waiting. `#/notifications` — the retired page — asks for its half by name.
@@ -139,7 +137,8 @@ export function BellDrawer({ route }: { route: Route }) {
           spelling that displaces the sheet's own `overflow-y-auto`), and one
           box inside each half does. */}
       <SheetContent
-        side={phone ? 'bottom' : 'end'}
+        side="auto"
+        size="reading"
         title="Inbox"
         showTitle
         bodyClassName="flex flex-col overflow-y-hidden p-0"

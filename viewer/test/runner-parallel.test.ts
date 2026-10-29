@@ -16,9 +16,10 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { execFileSync, spawn as spawnProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -92,6 +93,7 @@ const { loadRun, journalFile, newRun, saveRun } = await import('../server/runner
 import type { SpawnFn, SpawnOutcome } from '../server/runner/spawn.ts';
 import type { PhaseRecord } from '../server/runner/state.ts';
 import type { ScopeGrant } from '../server/runner/scheduler.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const PHASES = [1, 2, 3];
 
@@ -104,17 +106,11 @@ type Repo = { root: string; scripts: string; state: string; doneList: () => numb
  * it is the wrong shape here, because a graph that only ever offers one
  * candidate cannot tell a lane table from a `while` loop.
  */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-lanes-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-lanes-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -132,29 +128,22 @@ case "$mode" in
   --boot-prompt) echo "BOOT phase $arg of $slug" ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
+`,
+      'phase-lock.sh': `#!/usr/bin/env bash
 set -u
 echo "$*" >> "${state}/locks"
 [ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
 exit 0
-`);
-
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-
-  const made: Repo = {
-    root, scripts, state,
-    doneList: () => readFileSync(join(state, 'done'), 'utf8').split('\n').filter(Boolean).map(Number),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
+`,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  const lanes: Repo = {
+    ...made,
+    doneList: () => readFileSync(join(made.state, 'done'), 'utf8').split('\n').filter(Boolean).map(Number),
   };
-  liveRepos.push(made);
-  return made;
-}
-
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
+  liveRepos.push(lanes);
+  return lanes;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -230,7 +219,7 @@ function runnerOn(
  * ------------------------------------------------------------------ */
 
 test('two phases in different repos run at the same time, proven by a barrier only concurrency opens', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // Three ready phases, three disjoint repos. Two have to be inside the
   // barrier together before either can leave it.
   const held = barrierSpawn(r, 2);
@@ -246,7 +235,7 @@ test('two phases in different repos run at the same time, proven by a barrier on
 });
 
 test('phases that share a repo serialise, however many lanes are allowed', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // Same three ready phases, same three lanes — but one scope between them.
   const held = barrierSpawn(r, 2, 400);
   const { instance, scheduler } = runnerOn(r, held.spawn, () => ['one-repo']);
@@ -273,7 +262,7 @@ test('phases that share a repo serialise, however many lanes are allowed', async
 });
 
 test('the lane cap holds even when every scope is disjoint', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // Three disjoint phases but only two lanes: the third waits for a free one.
   const held = barrierSpawn(r, 3, 400);
   const { instance, scheduler } = runnerOn(r, held.spawn, (phase) => [`repo-${phase}`], 2);
@@ -292,7 +281,7 @@ test('the lane cap holds even when every scope is disjoint', async () => {
  * ------------------------------------------------------------------ */
 
 test('every live lane is in `children`, and `child` mirrors one of them', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const gate = deferred<void>();
   let live = 0;
   const seen: { children: number; child: number | null }[] = [];
@@ -350,7 +339,7 @@ test('every live lane is in `children`, and `child` mirrors one of them', async 
  * ------------------------------------------------------------------ */
 
 test('a stop reaches every open lane, not just the one being mirrored', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const started = deferred<void>();
   let live = 0;
   const aborted: number[] = [];
@@ -387,7 +376,7 @@ test('a stop reaches every open lane, not just the one being mirrored', async ()
  * ------------------------------------------------------------------ */
 
 test("a stranger's live lock holds a phase back, and releasing it lets the phase through", async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['repo-1'] }];
   const scheduler = new Scheduler({ max: 3, locks: () => locks });
 
@@ -431,7 +420,7 @@ test("a stranger's live lock holds a phase back, and releasing it lets the phase
 });
 
 test('a phase blocked at admission reads `queued`, and says what it is waiting on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['all'] }];
   const scheduler = new Scheduler({ max: 3, locks: () => locks });
 
@@ -474,7 +463,7 @@ test('a phase blocked at admission reads `queued`, and says what it is waiting o
  * ------------------------------------------------------------------ */
 
 test('a halt in one lane stops admitting, drains the rest, and reads halting on the way', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const gate = deferred<void>();
   let live = 0;
   const seen: number[] = [];
@@ -542,7 +531,7 @@ test('criterion 3: a phase-level ending settles ONE phase — the queued sibling
   // `phase.not-started` "the run was stopped / halted while this phase waited
   // for its scope" — 125 of those in the corpus, later re-read as
   // `never-started` and answered by re-boarding a phase that never had a chance.
-  const r = repo();
+  const r = stubbedPlan();
   const seen: number[] = [];
   const spawn: SpawnFn = async (request) => {
     const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
@@ -582,7 +571,7 @@ test('criterion 3: a phase-level ending settles ONE phase — the queued sibling
 });
 
 test('a lane sleeping on a retry backoff stands down when another lane halts', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const gate = deferred<void>();
   let live = 0;
   const spawnsPerPhase = new Map<number, number>();
@@ -615,7 +604,7 @@ test('a lane sleeping on a retry backoff stands down when another lane halts', a
 });
 
 test('a lane sleeping on a usage window stands down when another lane halts', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const gate = deferred<void>();
   let live = 0;
   const spawnsPerPhase = new Map<number, number>();
@@ -648,7 +637,7 @@ test('a lane sleeping on a usage window stands down when another lane halts', as
 });
 
 test('a pause armed while a phase waits for its scope abandons it back to pending', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let locks: { slug: string; phase: number; owner: string; expired: boolean; scope: string[] }[] =
     [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['blocked-repo'] }];
   const scheduler = new Scheduler({ max: 3, locks: () => locks });
@@ -690,7 +679,7 @@ test('a pause armed while a phase waits for its scope abandons it back to pendin
 });
 
 test('a sibling behind its own run’s lane is serial, not queued, and the run keeps reading running (#64)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const gate = deferred<void>();
   let sampled: { run?: string; waiting?: string; serialBehind?: number } = {};
   let driving: number | undefined;
@@ -787,7 +776,7 @@ function sleeperLanes(r: Repo) {
 }
 
 test('freeze with no phase freezes EVERY lane, and thaw with none frees them all', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = sleeperLanes(r);
   const { instance, scheduler } = runnerOn(r, held.spawn, (phase) => [`repo-${phase}`]);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -818,7 +807,7 @@ test('freeze with no phase freezes EVERY lane, and thaw with none frees them all
 });
 
 test('freezing one lane of three leaves the run running, with the mirror on the frozen one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = sleeperLanes(r);
   const { instance, scheduler } = runnerOn(r, held.spawn, (phase) => [`repo-${phase}`]);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -844,7 +833,7 @@ test('freezing one lane of three leaves the run running, with the mirror on the 
 });
 
 test('stopping one lane records interrupted, spares the streak, and the rest carries on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = sleeperLanes(r);
   const { instance, scheduler } = runnerOn(r, held.spawn, (phase) => [`repo-${phase}`]);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -892,7 +881,7 @@ async function queuedPhase(instance: InstanceType<typeof Runner>): Promise<numbe
 }
 
 test('a queued phase can be taken out of the line, and never spawns on arrival', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = sleeperLanes(r);
   const { instance, scheduler } = runnerOn(r, held.spawn, () => ['one-repo']);
   const foreign = await foreignHolder(scheduler, ['one-repo']);
@@ -914,7 +903,7 @@ test('a queued phase can be taken out of the line, and never spawns on arrival',
 });
 
 test('a phase skipped while queued does not spawn when its admission arrives', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = sleeperLanes(r);
   const { instance, scheduler } = runnerOn(r, held.spawn, () => ['one-repo']);
   const foreign = await foreignHolder(scheduler, ['one-repo']);
@@ -936,7 +925,7 @@ test('a phase skipped while queued does not spawn when its admission arrives', a
 });
 
 test('a phase serial behind its own lane can be skipped, and never spawns (#64)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = sleeperLanes(r);
   // One scope between three phases: one runs, the others are serial behind it.
   const { instance, scheduler } = runnerOn(r, held.spawn, () => ['one-repo']);
@@ -963,7 +952,7 @@ test('a phase serial behind its own lane can be skipped, and never spawns (#64)'
 });
 
 test('two frozen lanes escalate independently — one checkpoints, the others stay frozen', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = sleeperLanes(r);
   const { instance, scheduler } = runnerOn(r, held.spawn, (phase) => [`repo-${phase}`]);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
@@ -1033,7 +1022,7 @@ function git(cwd: string, ...args: string[]): string {
  * would assert against the shared-checkout path and pass for the wrong reason.
  */
 function isolatedRepo(slug: string): Repo {
-  const r = repo();
+  const r = stubbedPlan();
   writeFileSync(join(r.root, 'docs', 'plans', `${slug}.md`), `# ${slug}\n`);
   // 🔴 The scope token these tests claim (`hub`) must be a PATH under the root,
   // as every real plan's Repos token is. Since console-parallel-repaint P1
@@ -1060,7 +1049,7 @@ test('P8: two isolated runs naming ONE repo drive together, proven by a barrier 
   const gate = deferred<void>();
   let live = 0;
   let peak = 0;
-  const spawn = (r: Repo): SpawnFn => async (request) => {
+  const spawn = (r: Repo): SpawnFn => async (_request) => {
     live += 1;
     peak = Math.max(peak, live);
     if (live >= 2) gate.resolve();
@@ -1418,7 +1407,7 @@ function landingRunner(
 }
 
 test("a watch landing on a live run resumes the phase's own session in the run's own lane, ahead of a sibling queued first", async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // A stranger holds the landing's repository, and phase 2 — the same
   // repository — queues behind it FIRST, which is what a first-come queue rewards.
   let locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['repo-a'] }];
@@ -1505,7 +1494,7 @@ test("a watch landing on a live run resumes the phase's own session in the run's
 });
 
 test('a landing stopped while it waits for its scope stays a wait, and the next loop resumes it as the landing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['repo-a'] }];
   const scheduler = new Scheduler({ max: 3, locks: () => locks });
   const sessions: { phase: number; prompt: string; resume?: string }[] = [];
@@ -1560,7 +1549,7 @@ test('a landing stopped while it waits for its scope stays a wait, and the next 
 });
 
 test('landWatch leaves alone a phase holding no declaration, and one already in a lane: false, and not one event', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const scheduler = new Scheduler({ max: 3, locks: () => [] });
   const release = deferred<void>();
   const inSession = new Set<number>();
@@ -1604,7 +1593,7 @@ test('landWatch leaves alone a phase holding no declaration, and one already in 
 });
 
 test('a landing on a wait already queued for its scope is given the reservation there, and still resumes as the landing', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   let locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['repo-a'] }];
   const scheduler = new Scheduler({ max: 4, locks: () => locks });
   const hold3 = deferred<void>();

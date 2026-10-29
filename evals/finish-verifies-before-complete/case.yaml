@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: finish-verifies-before-complete
+description: 'mode-phase-finish, It''s working if: every §Verification line ran green and was recorded before `complete` was written.'
+tags: [phase-finish, working-if]
+context:
+  scaffold_script: fixture.sh

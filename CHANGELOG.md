@@ -20,6 +20,317 @@ into a web form at the moment of release.
 
 ## [Unreleased]
 
+## [9.0.0] - 2026-10-28
+
+**The session made cheaper, measured.** 9.0 is the work of plan `measured-console`: the skill is a
+core and three mode files, a supervised session is told what it starts from at its start, the gate
+runs every suite once and a phase verifies what it changed, the plugin is the skill alone, and a
+phase session boots on 55K tokens where 8.0's booted on 111K. The free tree stays MIT. `PE_API` is
+3: nothing an 8.x plan, session or script says changes meaning, except where *Migration* says so.
+
+### Migration
+
+Every entry names the file that owns what it changes. Nothing an 8.x plan says changes meaning: each new
+plan line below is optional, read by both engines, and silent where a plan says nothing.
+
+- **The skill is a core and three mode files** (`PE_API` 3, `PE_API_MIN` 2). `SKILL.md` is the console
+  contract, the modes as pointers and the guardrails (under 16 KB); Mode 1–3 are
+  `references/mode-plan.md`, `references/mode-phase-start.md` and `references/mode-phase-finish.md`,
+  each read whole in its mode; the helper catalogue is `references/scripts.md`, and the engine prints
+  its own (`phase-graph.sh --help`, `--explain`, `--section`); the maintainers' scripts are
+  `docs/maintainers.md`. A console at `PE_API` 3 still runs a skill at 2, and a console at 2 runs this
+  skill, so the 8.0 plugin and an updated console work together either way round. A flag added to a
+  session-facing script is now a stamp bump, held by `viewer/test/skill-api-ratchet.test.ts`. Owner:
+  `scripts/skill-api.env`.
+- **The plugin is a materialized tree, and it carries its own hooks.** The skill installs as a
+  skill-only tree of about 2.0 MB, and `assets/console.gif` is gone (the READMEs link the v8.0.0 tag's
+  copy). `hooks/hooks.json` carries the four presence events, so `install-hooks` writes nothing over a
+  config dir whose installed plugin already has them; `phase-console install-hooks --splice` keeps
+  splicing them into `settings.json`, and while a spliced entry exists the plugin's copy stays silent
+  (`PE_PLUGIN_HOOKS=1` overrides). `phase-console update-plugin` installs the tree (`--tree`).
+  Owners: `scripts/build-plugin-tree.mjs`, `hooks/hooks.json`, `viewer/server/hooks-install.ts`.
+- **`autopilotLoads` defaults to `console-set`**: an unattended session loads the console's own skill
+  tree and the plugins in `autopilotPlugins` (default none, `name@marketplace` only), under
+  `--setting-sources project,local` — the operator's user-level plugins, hooks and settings no longer
+  load; their deny rules still do. Set `autopilotLoads: operator-config` to keep 8.0's behaviour.
+  Owner: `viewer/shared/prefs-model.js` (resolved by `viewer/server/runner/loads.ts`).
+- **The run's hooks block on failure** (`onFailure: "block"` on every hook the console registers): a
+  hook that errors refuses the call instead of letting it through. The Stop hook's refusal now takes
+  effect, so a session ending on red fast lines is held once; `- **Fast gate:** off` on a phase turns
+  that off. Owner: `viewer/server/runner/approvals.ts` (`HOOK_ON_FAILURE`).
+- **The gate's marker is a record in the common gitdir.** It was a bare sha at `git rev-parse
+  --git-path phase-console-gates-ok`; it is now `phase-console-gates-ok` and
+  `phase-console-gates-ok.json` under `git rev-parse --git-common-dir`, so a linked worktree counts for
+  the repository. Only a green full-matrix `gates.sh` run on an unmoved, clean HEAD writes it (a dirty
+  tree exits 2; a phase-tier run writes nothing), and the pre-push hook and the release's
+  `--gates-passed` check refuse a bare sha or a record whose stages do not cover `gates.sh --list`. A
+  `.build-rev` that is not HEAD fails both tarball gates. Owner: `scripts/gates-marker.sh` (written by
+  `scripts/gates.sh`).
+- **New optional plan lines**: `**Subagent model:**`, `- **Fast gate:**` and `- **May delete tests:**`
+  (measured-console phase 6), `- **Skills:**` (11), `**Verification tier:**` (15), `**Evaluator:**`
+  (22), `**Canary:**` (24), `**Plugins:**` / `- **Plugins:**` (27), `- **Out of scope:**`, `## Not yet
+  specified` and `- **Amendment:**` (30) — each with a fixture, and each printed by its
+  `phase-graph.sh` mode. Owner: `references/plan-format.md` (read by `scripts/phase-graph.sh` and
+  `viewer/server/parse/plan.ts`).
+- **The session model is re-fit**: 55K + 183K + 1.91 × weight, where it was 121K + 198K + 2.17
+  (`reports/p33-after.json`), so `--session-plan` batches more weight into a session than it did under
+  8.0. Owner: `scripts/sizing.env`.
+- **`humanStepMode` defaults to `defer` on a CLI at 2.1.306 or later** (and `park` below it): a run
+  that says nothing now pauses a person's step at its call instead of ending the turn. Set
+  `humanStepMode: park` on a run to keep 8.0's behaviour, which is byte-identical in the journal.
+  Owner: `viewer/shared/run-settings.js`.
+- **`compaction` defaults to `console`**: nothing changes until a run chooses `native` or `alternate`.
+  Owner: `viewer/shared/run-settings.js`.
+- **The presence hook's SessionStart entry waits 15 seconds** (the brief). An install from before
+  reads `brief: false` in `hooks-status` — presence still works and the boot prompt stays whole — until
+  `phase-console install-hooks` refreshes the entry in place. Owner: `viewer/server/hooks-install.ts`.
+- **A run's journal is a chain at its cap** (measured-console phase 17): at 32 MB `run-<id>.jsonl` is
+  renamed `run-<id>.jsonl.<n>` (n from 1) and indexed in `run-<id>.jsonl.index` — `{n, file, firstSeq,
+  lastSeq, bytes, offset}` per segment — and the fresh file opens with `journal.rotated`. `seq` runs on
+  unbroken and every reader follows the chain; a tool that parsed `run-<id>.jsonl` alone should read
+  the index's segments first. `journal.full` applies only past eight segments. Owner:
+  `viewer/server/runner/journal.ts`.
+- **A run's record persists incrementally** (`persistModel` 2): `run-<id>.json` is the base, and a save
+  appends the records it changed to `run-<id>.json.delta` — one fsync — rewriting the whole file at
+  most every minute, on a status change, or past a 4 MB delta. The first 9.0 boot rewrites every stored
+  run once into the new shape and journals `run.persist-v2` on it. A tool that parsed `run-<id>.json`
+  by hand sees every status change at once and other fields within a minute; fold the delta's lines
+  past the base's `persistGen` for the rest. Owner: `viewer/server/runner/state.ts`.
+- **Runs that never finished age out**: a halted, parked, paused or interrupted run untouched for
+  `runRetainDays` (30) is pruned with its files, as a finished one always was. Owner:
+  `viewer/server/retention.ts`.
+- **Webhooks are signed and queued**: every POST carries `X-Phase-Console-Signature: sha256=<hmac>`
+  over its body with the destination's secret (shown once at add; older rows get one at first boot),
+  and a destination in backoff holds every announcement and delivers them in order when it is back.
+  Owner: `viewer/server/webhooks.ts`.
+- **`validate.sh`'s size warning is about the handoff's body now**, not its start section: a long
+  generated section over a short body says nothing. Owner: `scripts/validate.sh`.
+- **Words settled where they live:** nineteen decision keys everywhere (`issues` included); an
+  unsupervised declaration lands as `outcomes/phase-NN-<stamp>.json`; a lock's branch AND tree carve
+  two intersecting scopes apart; `**Wait budget:**` is the total one phase may spend parked; the
+  default target model is `claude-opus-5-5`; Haiku is for subagents (a 200K window cannot hold a phase
+  session's floor); `BUDGET_BIG`'s note says it is a preset, not a measurement; a session commits after
+  each green step and leaves pushed history alone; the plugin listing's description is a paragraph,
+  not a changelog. Owners: `references/plan-format.md` (the keys and the plan lines),
+  `scripts/models.env` (the model ids) and `scripts/sizing.env` (`BUDGET_BIG`).
+
+### Added
+- **A person's step pauses the session at its call and resumes it in place.** Under the run setting
+  `humanStepMode: defer` the hook defers the `phase-outcome.sh … needs-human` call itself, the console
+  raises the item from the call, and when the person's check passes the SAME session carries on from
+  that call: the script prints the answer (`--resumed-with`) and declares nothing. `park` keeps 8.0's
+  park-and-resume. `phase.deferred`, `phase.deferred-resumed`.
+- **A session's outcome arrives typed.** Every session that can declare runs under `--json-schema`
+  (`viewer/shared/outcome-schema.js`, which owns the file's shape too); its `structured_output` is read
+  before the outcome file, and a file naming a different word journals `phase.outcome-disagreed`. The
+  script keeps writing the file, so a hand session declares exactly as before.
+- **Native compaction is an arm.** `compaction: console | native | alternate` and `compactionWindow`
+  (350,000): under `native` the session gets `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, the console's
+  `PreCompact`/`PostCompact` hooks journal `phase.compaction` (before, after, the re-cache), the 0.8×
+  checkpoint is off and the 0.6× line is a notice; `alternate` gives odd phases `native`. A resumed
+  session's own `SessionStart` cost is kept (`phase.resume-cost`) and quoted by the next resume brief.
+- **A wrap-up pushes what is green.** The 0.6× notice says commit AND push where the plan's
+  `permission.destructive` row allows `git push origin <branch>`; `phase-outcome.sh partial` warns of
+  every scope tree ahead of `origin/<branch>`; a checkpointed session's fast-forward is pushed by the
+  console (to the origin it had before the session, under the hardened git); and the phase shows its
+  unpushed commits — the inspector's *Unpushed* and a heads-up on Your turn — until a push lands (#397).
+- **A supervised session is told what it starts from at its start, not in its prompt.** The presence
+  hook prints the phase's brief at SessionStart — `phase-graph.sh <slug> --brief N`: the mode file to
+  read, the phase's section head, the decisions still open, the notes earlier phases left, the scope and
+  lock lines, the previous handoff's summary, the plan's errands and the memory index — within 10,000
+  characters, stable content first and the session id last. With the hook installed and patient enough
+  (`hooks-status` reads `brief`), the boot prompt leaves out what the brief carries (`PE_BRIEF=hook`):
+  11,455 → 7,801 bytes on a 40-phase plan's phase 5. `next-phase-prompt.sh` still prints the whole prompt.
+- **A plan's memory travels with the plan.** A run's settings file points the sessions' auto memory at
+  `docs/memory/<slug>/` under the docs root — one directory for every config dir and lane, versioned
+  beside the handoffs (`docs/memory/README.md` in the docs root says the layout). Mode 3 step 5 writes
+  dated, commit-cited lines there, and `close-plan.sh` names every claim in `index.md` with neither a
+  date nor a commit.
+- **A handoff is a brief again.** It opens on a `## Summary` the brief hands to every dependent phase, and
+  names `suggested_skills:` beside `skills_used:` — the next boot prompt's Skill-tool line reads them.
+  `validate.sh` names a handoff whose body (without the frontmatter and the generated start section)
+  passes 300 lines, and a secret's shape in any handoff or guide, by file and line.
+- **I can't do this on every card of Your turn.** It is one press from the card, never folded under
+  another. A task's, a decision's or an approval's turns the item into an errand carrying your reason,
+  as before. On an item the console builds itself (a gate, a sign-in, a conflict, a stopped phase's ask)
+  it is new: `POST /api/turn/:id/cannot {reason}` moves the item to Done as **Not doing** with your
+  reason, leaves the blocker as it stands, and (on a console started with `--allow-run`) pins a note
+  with your words on its run for that phase's next session. It is an authority press, fenced from a
+  session like *Not doing this*.
+- **A plan's own decision passes on one press, whatever key its answers file reads.** A decision
+  whose proof greps a plan's answers file for a value (`grep -Eq '^deprecations: *[a-z]' …
+  owner-answers.md`, the shape of every owner decision in a plan that keeps one `key: value` line per
+  answer) came back on **Redo**: *Send my decision* recorded the choice, wrote nothing, and its proof
+  read nothing. The press now writes the first line the proof's own pattern accepts — `<key>: <option
+  id>`, which a plan's gate tool reads whole, then `<key>: answered — <label>` — and runs the proof,
+  so the card goes to Done and the phases that wait on the key can board. A pattern no answer can
+  satisfy is not written to. The card's steps say what the press writes instead of the `printf` they
+  used to ask for. *Hand it to the AI* on a plan's own decision goes with the option the plan
+  recommends (a plan decision that recommends nothing is not handed over), and the note on a plan's
+  decision, which no session was waiting to hear, is pinned for the phases it unblocks.
+- **Every decision on Your turn offers two ways on at least, and a box for your words.** An open
+  decision the AI can take ends with *Hand it to the AI* (`POST /api/turn/:id/hand-off {note}`): a
+  session's or a plan's decision is answered *decide it yourself* with your note, a stopped phase's ask
+  resumes its session with the choice its own, and a branch conflict goes to Done with your words
+  pinned on its run. A gate's Approve, which login a run goes on with, a sign-in, a secret and a
+  permission are never handed over: the route refuses them with a 409. A note typed beside an option
+  that takes no words of its own goes to the AI before the option is pressed
+  (`POST /api/turn/:id/note {text}`, pinned on the item's phase), and the item stays as open as it was.
+  A decision that can be handed over offers no separate *I can't do this*. A hand-off of an item the
+  console builds goes through its run, so like the run's own verbs it needs `--allow-run`: without it
+  the option is drawn off with the flag, and so is every option that presses a run's verb, and the
+  route answers 403.
+- **Every plan's status says why.** On Plans, a plan's status (its badge, and a run's or a person's
+  word beside it) is a button: **Why** opens the panel on the reasons behind the word — what needs
+  you, each item with the way to it on Your turn; what stopped its run, as the halt card with its one
+  recommended recovery; which phases are running and since when; what it waits on and until when (a
+  usage window's reset, its place in the queue, another session's claim, the phase before it, a gate
+  that clears itself); what can start next; and, for a plan that is over, how it ended. The same
+  record is Inspect's, and its Overview reads the plan live.
+- **The plans table carries the plan's live facts.** Beside the status, the name and the line: *Now*,
+  *Waiting on*, *Next up*, *Your turn* (its open items, and those to do now), *Left* with the estimate,
+  *Spent* over every run, *Account*, *Model* and *Moved*. A desk that cannot fit them scrolls the table
+  sideways with the status and the name pinned, rather than folding them away.
+- **The engine prints its own catalogue** (measured-console phase 2): `phase-graph.sh --help` (every
+  mode, one line), `--explain <F-code>` (one lint's paragraph, no plan needed), `--section N` (a phase's
+  section, its graph row and the §Session budget lines that bind it) and `--brief N`. Three advisory
+  lints: F50 `directive-mid-line`, F51 `path-no-dir`, F52 `verification-shared-checkout`.
+- **A session's environment is set by the console, and a guard keeps its hands off the baselines**
+  (measured-console phase 6). `BASH_MAX_OUTPUT_LENGTH` comes from `bashMaxOutput` (32,000); the
+  subagents' model from a plan's `**Subagent model:**` line; `Explore`, `log-reader` and `docs-reader`
+  run read-only. `scripts/guard-hook.sh` refuses a write to the baselines, ratchets, known reds,
+  quarantine and snapshots, and a test file's deletion unless the phase says `- **May delete tests:**
+  yes` (`phase.guard-denied`). The Stop hook runs a phase's fast lines once and holds a red exit
+  (`phase.fast-gate`; `- **Fast gate:** off` turns it off).
+- **The gate runs every suite once, and its marker is a record** (measured-console phase 7): the client
+  is built once a commit, a run whose test file stopped part way fails (the suite ledger, in `npm
+  test`, the gate and §Verification), `gates.sh --drain` holds the console's own work for at most an
+  hour, and the bats suites run in four shards (`RUN_TESTS_JOBS`). The full gate took 6,443 s where
+  8.0.0's took 12,611 s (0.51, `reports/p8-gate.json`).
+- **A phase verifies what it changed** (measured-console phase 15): `**Verification tier:** impact`
+  runs a heavy §Verification line in the form its diff selects (`scripts/verify-select.env`); a
+  quarantined test is a gate stage whose expired row fails; the known reds (`viewer/known-reds.json`),
+  `typecheck:test` and `lint:test` are ratchets that only tighten; `test:mutation` and
+  `coverage:diff` report nightly and gate nothing.
+- **The plugin is the skill and nothing else** (measured-console phase 10): a materialized tree of about
+  2.0 MB (`scripts/build-plugin-tree.mjs`), its presence hooks in `hooks/hooks.json`, the GIF gone;
+  `phase-console update-plugin` installs it.
+- **What an unattended session loads is the console's choice** (measured-console phase 11): the
+  console's own skill tree and the plugins switched on for autopilot (`autopilotPlugins`), under
+  `--setting-sources project,local` (`phase.plugins`, `phase.hook`, `phase.skill-invoked`). A phase's
+  `- **Skills:**` bullet and a handoff's `suggested_skills` become one *Call the Skill tool* line in
+  its prompt, and F47 names a skill the sessions cannot load.
+- **Settings ▸ Hooks** (measured-console phase 28): every hook a session meets, whose it is and what it
+  does (`#/settings/hooks`, `GET /api/hooks`). A run's start writes its never list and its
+  `permission.destructive` rows as hookify rules (`.claude/hookify.pe-<slug>-<rule>.local.md`).
+- **Your turn reads what a pack leaves** (measured-console phase 29): a session that ends on prose
+  questions and no outcome raises one Decision; gstack's `gate_pending` result raises an Approval (or a
+  Decision on the gate), relayed back by the session; a wizard-shaped `guide:` file becomes a Task's
+  numbered steps (`phase.pack-item`).
+- **A plan says what it leaves out, and amends itself in writing** (measured-console phase 30): a
+  phase's `- **Out of scope:**` bullet, a plan's `## Not yet specified` section (`close-plan.sh
+  --status complete` refuses while it holds a line, `--force` included) and `scripts/amend-plan.sh`
+  with the `- **Amendment:**` grammar (F49 `amendment-malformed`).
+- **Logs ▸ Health keeps its history** (measured-console phase 31): *Over time* draws the health
+  readings as a series (`GET /api/health/series`), and a phase journals its first edit
+  (`phase.first-edit`).
+
+### Changed
+- **A phase session boots on half the tokens** (measured-console phases 3, 4, 5 and 33). `SKILL.md`
+  is a core of 14.5 KB (it was 142 KB) with three mode files; the brief arrives at SessionStart; both
+  `CLAUDE.md` files are pointer files. Measured over 20 sessions (`reports/p33-after.json`): the boot
+  floor fell from 111K tokens to 55K, and `scripts/sizing.env` ships the re-fit 55K + 183K + 1.91 ×
+  weight (it was 121K + 198K + 2.17), so `--session-plan` fits about 190K of weight into a 1M session
+  where it fitted 129K.
+- **The words agree with the code** (measured-console phase 16): eight destinations, the phone's tab
+  bar, the four hook events, the journal's fields, the Issues default and the Queue sheet's *nearest
+  order* (#412), the gauge's help and the halt table (#408) say what the console does.
+- **One dated price book** (measured-console phase 18): `viewer/shared/price-book.js` (15 rows, read
+  2026-10-17) prices every token the console counts, and a model it does not list reads *unpriced*
+  instead of borrowing another's price; every dollar on a page is drawn by one component with one word
+  for what it is.
+- **Tower strips: colour that tells things apart.** Every status keeps its colour and its meaning,
+  and gains two shades of the same hue: a vivid edge, the 4 px leading edge of a row or a card, and a
+  tint, the ground of the ONE lead badge a row or a card carries (the thing it is about) and of a row
+  opened in place. Every other badge stays outlined. Each shade is held to contrast in both lights and
+  both rooms: the word on its tint at 4.5:1, the edge at 3:1 on every surface.
+- **Tabs and section links are a bay.** The panel's tabs (Overview · Actions · History · Raw) and every
+  page's section links are a recessed track whose current tab is a raised tile that slides to the one
+  chosen; a section may carry a glyph and a count in a pill, in a state's tint when it counts one.
+  Section links stay links, each an address.
+- **Folds are strips.** A fold is a full-width head (the chevron on a round plate, the label, the count
+  in a pill and a rule to the edge), its body on a rule down from the chevron, so a fold reads as a
+  section rather than a grey line. Folds that belong to one record open as an accordion whose heads
+  move with the arrow keys, each saying in one line what is folded.
+- **Every drawer fits its content, on a phone and a tablet too.** A drawer is as wide as its content
+  asks inside the bounds of what it holds (a picker, a reading, a form, a table), never past the
+  screen less 2 rem, and never narrows while it is open. From 640 px it is a side drawer, so a tablet
+  held upright reads a record beside the page; below 640 a bottom sheet whose handle grows it to the
+  whole screen and back, and lets it go when dragged down. The panel's column fits the record it
+  shows (a Your turn card opens at 34–52 rem where it was 400 px); dragging its edge sets a width, and
+  a double-click on the edge, or Home, lets it go. A width the panel only ever had by default reads as
+  the column that fits.
+- **A Your turn card reads as a strip: the act first, the record after.** Its leading edge wears the
+  person's status, its head carries the type as a neutral plate, NOW or NOT YET, the status as the one
+  lead badge (with the attempt on Redo) and the errand's ref; its meta are chips. A verdict comes right
+  after the head; then what you decide, do or approve — a decision's options as strips, the
+  recommended one named, *Hand it to the AI* set apart under an "or" — and in the panel its primary is
+  pinned to the drawer's foot. How it's checked, where it goes, its timing, a decision's steps and its
+  history follow as folds that each say in a line what they hold. In the panel the card is the one
+  title and the one status, and it lays itself out by its own width, wherever it is drawn.
+- **One Handoffs & QA reading.** A plan's Phases readings are Table · Map · Handoffs & QA · Schedule ·
+  Burn-up: QA and Handoffs were one table with two column sets, and are one now, in plan order, with a
+  phase's handoff and its QA verdict side by side. An opened row leads with two record cards — the
+  handoff (its status, when it completed, the link to read it, its size and skills) and the QA (its
+  verdict, its round, what it holds, its reports and *Run QA*). `?view=qa`, `#/plan/<slug>/qa` and
+  every report link open the merged reading, and the reading's tile counts its QA fails in red.
+- **The phases grid is a rack of strips.** Each row's leading edge wears its state's hue, its number is
+  a plate (`P17`) before its name, its state is the row's one lead badge and its QA, handoff and gate
+  badges are outlined; an opened row sits on its state's tint with the edge running down its detail.
+  The plan's two bays carry a glyph per view. A phase's and a run's record open as one accordion of
+  fold strips, and *Why is this not done?* says in one line what it found.
+- **Base UI joins Radix** (`@base-ui/react` 1.8.0, pinned exactly) for the tabs and the accordion; every
+  overlay stays on Radix.
+- **A plan's line is a pipeline with badges.** Every phase is a cell of the bar in its share's colour
+  (up to 48 phases; past that each share is one stretch), the share done is a badge at the bar's end,
+  and the legend under it is one badge per share — `41 done`, `1 in progress`, `3 waiting` — in the
+  colour of its stretch, where it was one line of words. In the panel the cells stand in the phases'
+  own order, each named on hover. The same line draws on the plan's glance, Your turn's *Where the
+  plans stand* and the cards.
+
+### Fixed
+- **An approved gate leaves Your turn at once.** A gate approved on its card, or by `gate-approve.sh`
+  in a terminal, stayed on the page until some other file of its plan changed, because
+  `gate-status.md` did not move the plan's revision and the inbox kept its old answer.
+- **A press on Your turn re-reads one plan, not every plan.** Approving a gate, or a conflict's *Leave
+  them*, dropped every plan's cached board, so the next page read re-ran the engine for the whole
+  portfolio (about 45 s on a console of 186 plans).
+- **A press says it was sent.** *Approve* reads *Sending…* while it travels, and a press that went
+  through holds its card as **Checking** with what was sent and when, with nothing to press again,
+  until the console moves the item. *Show the choices again* brings them back.
+- **A decision bound to a gate presses the gate.** Its own options were sent as an answer, which the
+  console refuses for an item only its gate opens.
+- **A stopped phase's card says what its session asked for.** An errand that names its session's
+  decision draws that decision: its guide's numbered steps, its summary and its own options, each
+  answered through the errand with the choice (`errand-answered {choice, note}`), even after the
+  decision itself was closed. The ladder's own steps never send a person to read the handoff, and a
+  branch conflict says in numbered steps what conflicts and how it can end.
+- **The runner's register** (measured-console phase 13), each with the test that was red first: the
+  reaper keeps a parked phase's watched processes and reaps a cut session's test servers (#409, #421);
+  a mirror forks at the fetched trunk (#383, #403); a lane is re-kept (#417); a failed fetch on an
+  asked-for update restarts nothing (#414); a phase's own credential and MCP policy hold on a retry
+  (#379, #424, #425); `./start` refuses a bare argument that is not a directory (exit 2, #385).
+- **The defects, durability and I/O** (measured-console phase 17): an open person's step survives the
+  ledger's rotation; the `cannot`, `snooze` and `open` verbs are fenced from a session, a proof is
+  redacted and a second confirm answers 409; an account's own defaults outrank the shipped
+  `opus`/`max`; a refused preflight parks the run through its halt; no lock waits on `Atomics.wait`;
+  one loopback test guards every local-only route.
+- **A plan reads the same under every locale** (`LC_ALL=C`, #410), every directive on a shared
+  §Session budget line is read (#419), `$'…'` quoting survives a §Verification line (#392) and a heavy
+  test has its own timeout (#404).
+- **Every sheet closes on Escape, and the route map is one Tab stop** whose stations the arrow keys
+  move between (measured-console phase 32, #413).
+
 ## [8.0.0] - 2026-10-19
 
 **Every open issue, fixed.** 8.0 fixes every issue that was open on 2026-10-17: Your turn becomes a

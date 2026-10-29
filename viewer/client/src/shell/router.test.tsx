@@ -392,9 +392,12 @@ describe('the redirects — one hop, with what the old address said', () => {
     // The server still mints `#/plan/:slug/route`, so that one is load-bearing.
     expect(redirectTarget(at('#/plan/demo/route'))).toBe(planViewHref('demo', 'map'));
     expect(redirectTarget(at('#/plan/demo/handoffs'))).toBe(planViewHref('demo', 'handoffs'));
-    // An open report sheet survives the move — `?report=` rides along.
+    // QA and Handoffs are one reading since 2026-10-20 (Tower strips): the QA
+    // tab lands there too, and an open report sheet survives the move —
+    // `?report=` rides along.
+    expect(redirectTarget(at('#/plan/demo/qa'))).toBe(planViewHref('demo', 'handoffs'));
     expect(redirectTarget(at('#/plan/demo/qa?report=3%3A2'))).toBe(
-      hrefOf(planHref('demo', 'phases'), { view: 'qa', report: '3:2' }),
+      hrefOf(planHref('demo', 'phases'), { view: 'handoffs', report: '3:2' }),
     );
   });
 

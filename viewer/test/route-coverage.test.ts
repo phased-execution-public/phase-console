@@ -228,7 +228,10 @@ test('every verb a person presses on a step has a data/ caller — a permission 
   for (const verb of ['deny', 'convert']) assert.ok(verbs.includes(verb), `the dispatcher answers ${verb}`);
   const callers = readFileSync(join(VIEWER, 'client', 'src', 'data', 'human-steps.ts'), 'utf8');
   const missing = [...new Set(verbs)].filter((verb) => !callers.includes(`at(id, '${verb}')`));
-  assert.deepEqual(missing, [], 'a step verb no page can press');
+  // *I can't do this* is pressed through Your turn's fenced verb (measured-console
+  // phase 17, EI-7), which settles a ledger item as its step's own `cannot`.
+  assert.deepEqual(missing, ['cannot'], 'a step verb no page can press');
+  assert.ok(callers.includes('`/api/turn/${q(id)}/cannot`'), "the step's cannot goes through /api/turn");
   // `dismiss` is the console's withdrawal — "Withdrawn", what it does to an item
   // nobody needs any more (§Architecture 19). Control-tower phase 139 retired the
   // person's Dismiss (a person declines, with a reason the session reads); 7.0
@@ -239,4 +242,14 @@ test('every verb a person presses on a step has a data/ caller — a permission 
   assert.ok(!callers.includes('humanStepDismiss'), 'the dead Dismiss fetcher stays gone');
   const turn = readFileSync(join(VIEWER, 'client', 'src', 'data', 'turn.ts'), 'utf8');
   assert.ok(turn.includes('export function withdrawItem'), 'Withdraw goes through data/turn, through the owner door');
+});
+
+test('EI-39 (measured-console phase 17): the loopback check is ONE function — the router compares no socket address of its own', () => {
+  const source = readFileSync(join(VIEWER, 'server', 'api', 'routes.ts'), 'utf8');
+  assert.doesNotMatch(source, /remoteAddress\s*===|remote\s*===\s*'127\.0\.0\.1'|address\s*===\s*'127\.0\.0\.1'/, 'no copy of the comparison is left in the router');
+  // Seven doors in Pro; the chat's tool callback and the message door are Pro's, so five in Free.
+  // The fifth is the OpenTelemetry receiver (measured-console phase 19), dispatched in both trees.
+  let doors = 5;
+  assert.equal((source.match(/isLoopbackRequest\(req/g) ?? []).length, doors, 'every loopback door asks the one function');
+  assert.match(source, /import \{ isLoopbackRequest \} from '\.\/loopback\.ts';/, 'imported from its one home');
 });

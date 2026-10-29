@@ -49,7 +49,7 @@ import { basename, dirname, join } from 'node:path';
 
 import { log } from '../log.ts';
 import { looksLikeSecret, redactSecrets } from '../../shared/human-step-model.js';
-import { journalFile, runDir, transcriptFile, transcriptPhase } from './run-paths.ts';
+import { journalChainOf, journalFile, runDir, transcriptFile, transcriptPhase } from './run-paths.ts';
 
 export { transcriptFile } from './run-paths.ts';
 
@@ -461,6 +461,23 @@ export function scanBack(
   }
 }
 
+/**
+ * `scanBack` over a journal's whole chain (measured-console phase 17, B5): the
+ * live file, then each segment newest first, inside ONE budget — so a reader
+ * that walks back for a line still finds it after the file it was in rotated.
+ */
+export function scanBackChain(
+  live: string, budget: number, accept: (line: string) => boolean, maxLine = MAX_LINE_BYTES,
+): number {
+  let spent = 0;
+  let done = false;
+  for (const file of journalChainOf(live).reverse()) {
+    if (done || spent >= budget) break;
+    spent += scanBack(file, budget - spent, (line) => (done = accept(line)), maxLine);
+  }
+  return spent;
+}
+
 function parseEntry(line: string): TranscriptEntry | null {
   try {
     const entry = JSON.parse(line) as TranscriptEntry;
@@ -531,7 +548,7 @@ function fromJournal(root: string, slug: string, id: string, options: { limit?: 
   const want = clampLimit(options.limit);
   const { phase } = options;
   const rows: JournalRow[] = [];
-  scanBack(journalFile(root, slug, id), READ_BUDGET, (line) => {
+  scanBackChain(journalFile(root, slug, id), READ_BUDGET, (line) => {
     let row: JournalRow;
     try {
       row = JSON.parse(line) as JournalRow;

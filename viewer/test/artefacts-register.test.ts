@@ -30,15 +30,13 @@ import {
   artefactsMade, artefactWords, consoleBranch, instanceSlugs, type ArtefactSnapshot,
 } from '../server/runner/artefacts.ts';
 import { checkouts, managedRoots } from '../server/runner/worktree.ts';
+import { repo } from './fixtures/repo.ts';
 
 const run = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' }).toString();
 
-function repo(): { root: string; consoleDir: string } {
+function hubRepo(): { root: string; consoleDir: string } {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'pc-artefacts-')));
-  const root = join(base, 'hub');
-  mkdirSync(root);
-  run(root, 'init', '-q', '-b', 'main');
-  run(root, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'root');
+  const root = repo({ dir: join(base, 'hub'), files: {}, message: 'root' });
   const consoleDir = join(base, 'state', 'runs', 'abcd1234-hub');
   // Two plans of this instance have run state: this one (A) and another (B).
   mkdirSync(join(consoleDir, 'plan-a'), { recursive: true });
@@ -58,7 +56,7 @@ async function scan(root: string, consoleDir: string): Promise<ArtefactSnapshot>
 }
 
 test('AR-1 (#262): another run\'s lane trees and pe/<slug> branches in a shared repository are not this phase\'s', async () => {
-  const { root, consoleDir } = repo();
+  const { root, consoleDir } = hubRepo();
   const slugs = instanceSlugs(consoleDir);
   assert.deepEqual(slugs.sort(), ['plan-a', 'plan-b']);
   const before = await scan(root, consoleDir);
@@ -73,7 +71,7 @@ test('AR-1 (#262): another run\'s lane trees and pe/<slug> branches in a shared 
 });
 
 test('AR-2 (#262): a tree outside every managed root appeared while the phase ran — named, maker unknown, never credited', async () => {
-  const { root, consoleDir } = repo();
+  const { root, consoleDir } = hubRepo();
   const before = await scan(root, consoleDir);
   // A supervisor terminal session's scratch trees (the measured row 4).
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'pc-artefacts-scratch-')));
@@ -88,7 +86,7 @@ test('AR-2 (#262): a tree outside every managed root appeared while the phase ra
 });
 
 test('AR-3 (#262): a tree the phase\'s session makes inside its own lane, and a branch no lane names, are still registered', async () => {
-  const { root, consoleDir } = repo();
+  const { root, consoleDir } = hubRepo();
   const lane = join(root, '.worktrees', 'runs', 'plan-a', 'aaaaaaaaaaaa', 'p7');
   run(root, 'worktree', 'add', '-q', '-b', 'pe/plan-a-p7', lane);
   const before = await scan(root, consoleDir);

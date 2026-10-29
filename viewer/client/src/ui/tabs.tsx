@@ -1,33 +1,44 @@
-import * as TabsPrimitive from '@radix-ui/react-tabs';
+import { DirectionProvider } from '@base-ui/react/direction-provider';
+import { Tabs as BaseTabs } from '@base-ui/react/tabs';
 import { useEffect, useRef, type ComponentProps } from 'react';
 import { cn } from '@/lib/cn';
-import { mirrorUnless, useDocumentDir } from './direction';
+import { mirrorUnless, useDocumentDir, type Direction } from './direction';
 
 /**
- * Tabs — the views of one page (Phases · Run · Source), the panel's modes.
- * Radix owns the roving tabindex and the arrow keys; what is added here is
- * that the strip scrolls sideways on a phone rather than wrapping, the active
- * trigger scrolls itself into view by moving the list's own `scrollLeft`
- * (never `scrollIntoView`, which drags the page), and the underline is ink.
- * The rule under the strip is an inset shadow, not a border a trigger reaches
- * down over: a scroll box clips whatever leaves it.
+ * Tabs — the views of one record (the Inspector's Overview · Actions · History
+ * · Raw), as a BAY (2026-10-20, Tower strips): a recessed track whose current
+ * tab is a raised tile that slides to the tab chosen. Base UI owns the roving
+ * focus, the arrow keys and the tile's place (`Tabs.Indicator`, which sets
+ * `--active-tab-left`, `-right` and `-width` from the active tab's box); what
+ * is added here is the look, that the track scrolls sideways on a phone
+ * rather than wrapping, and that the active tab scrolls itself into view by
+ * moving the track's own `scrollLeft` (never `scrollIntoView`, which drags
+ * the page). The tile is logical: it is placed from the start edge of the
+ * reading direction, so it mirrors under `dir="rtl"` with the arrow keys.
  */
-export function Tabs({ dir, ...props }: ComponentProps<typeof TabsPrimitive.Root>) {
-  // Told the document's direction, or Radix draws `dir="ltr"` and the strip
-  // stays unmirrored — its arrow keys backwards — in a right-to-left page.
+export function Tabs({
+  dir,
+  ...props
+}: Omit<ComponentProps<typeof BaseTabs.Root>, 'dir'> & { dir?: Direction | undefined }) {
+  // Told the document's direction, or the arrow keys run backwards in a
+  // right-to-left page.
   const page = useDocumentDir();
-  return <TabsPrimitive.Root dir={dir ?? page} {...mirrorUnless(dir)} {...props} />;
+  return (
+    <DirectionProvider direction={dir ?? page}>
+      <BaseTabs.Root dir={dir ?? page} {...mirrorUnless(dir)} {...props} />
+    </DirectionProvider>
+  );
 }
 
-export function TabsList({ className, ...props }: ComponentProps<typeof TabsPrimitive.List>) {
+export function TabsList({ className, children, ...props }: ComponentProps<typeof BaseTabs.List>) {
   const list = useRef<HTMLDivElement>(null);
   const lastActive = useRef<string | null>(null);
-  // Runs after every render (the active trigger is DOM state Radix owns, not a
-  // prop), so it must SCROLL only when the active tab actually changed.
+  // Runs after every render (the active tab is DOM state the primitive owns,
+  // not a prop), so it must SCROLL only when the active tab actually changed.
   useEffect(() => {
     const node = list.current;
     if (!node) return;
-    const active = node.querySelector<HTMLElement>('[data-state="active"]');
+    const active = node.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
     if (!active) return;
     const key = active.id || active.textContent || '';
     if (key === lastActive.current) return;
@@ -38,28 +49,45 @@ export function TabsList({ className, ...props }: ComponentProps<typeof TabsPrim
     else if (right > node.scrollLeft + node.clientWidth) node.scrollLeft = right - node.clientWidth;
   });
   return (
-    <TabsPrimitive.List
+    <BaseTabs.List
       ref={list}
       className={cn(
-        'flex items-stretch gap-1 overflow-x-auto shadow-[inset_0_-1px_0_var(--rule)]',
+        'relative flex max-w-full items-stretch gap-0.5 self-start overflow-x-auto rounded-lg bg-ground-deep p-1',
         '[scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
         'max-md:[mask-image:linear-gradient(90deg,black_88%,transparent)]',
         'rtl:max-md:[mask-image:linear-gradient(270deg,black_88%,transparent)]',
         className,
       )}
       {...props}
-    />
+    >
+      {/* The raised tile under the active tab — first, so every tab paints above it. */}
+      <BaseTabs.Indicator
+        data-tab-tile=""
+        className={cn(
+          'absolute inset-y-1 w-(--active-tab-width) rounded-md border border-rule-strong bg-surface',
+          'ltr:start-(--active-tab-left) rtl:start-(--active-tab-right)',
+          'transition-[inset-inline-start,width] duration-medium ease-transit',
+        )}
+      />
+      {children}
+    </BaseTabs.List>
   );
 }
 
-export function TabsTrigger({ className, ...props }: ComponentProps<typeof TabsPrimitive.Trigger>) {
+export function TabsTrigger({ className, onMouseDown, ...props }: ComponentProps<typeof BaseTabs.Tab>) {
   return (
-    <TabsPrimitive.Trigger
+    <BaseTabs.Tab
+      // A tab is taken on the press, as the kit's tabs always were (Radix's
+      // habit), not on the release: the panel answers the finger's first touch.
+      onMouseDown={(event) => {
+        onMouseDown?.(event);
+        if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || props.disabled) return;
+        event.currentTarget.click();
+      }}
       className={cn(
-        'relative shrink-0 whitespace-nowrap px-3 py-2 text-body text-ink-muted',
-        'border-b-2 border-transparent transition-colors duration-fast ease-transit',
-        'hover:text-ink',
-        'data-[state=active]:border-action data-[state=active]:text-ink',
+        'relative inline-flex shrink-0 items-center gap-1.5 rounded-md px-3 py-1.5 whitespace-nowrap',
+        'text-body text-ink-muted transition-colors duration-fast ease-transit',
+        'hover:text-ink data-[active]:font-medium data-[active]:text-ink',
         '[@media(hover:none)]:min-h-(--tap-min)',
         className,
       )}
@@ -68,6 +96,6 @@ export function TabsTrigger({ className, ...props }: ComponentProps<typeof TabsP
   );
 }
 
-export function TabsContent({ className, ...props }: ComponentProps<typeof TabsPrimitive.Content>) {
-  return <TabsPrimitive.Content className={cn('pt-3', className)} {...props} />;
+export function TabsContent({ className, ...props }: ComponentProps<typeof BaseTabs.Panel>) {
+  return <BaseTabs.Panel className={cn('pt-3', className)} {...props} />;
 }

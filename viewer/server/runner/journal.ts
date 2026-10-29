@@ -11,14 +11,14 @@
  * worth having are the ones written just before something dies.
  */
 
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
 
 import { INSTANCE } from '../config.ts';
 import { count } from '../counters.ts';
 import { log } from '../log.ts';
 import { current, runTraceId } from '../trace.ts';
-import { journalFile } from './run-paths.ts';
+import { journalChainOf, journalFile, journalIndexFile, journalIndexOf, journalSegmentFile, type JournalSegment } from './run-paths.ts';
 
 export type JournalEntry = {
   seq: number;
@@ -53,6 +53,15 @@ export type JournalEntry = {
 
 /** A single phase can emit a lot of tool traffic; keep one run's file sane. */
 const MAX_BYTES = 32 * 1024 * 1024;
+
+/**
+ * How many full files a run's journal may rotate into (measured-console phase
+ * 17, B5) before the live file is allowed to fill: at the cap the live file is
+ * renamed `run-<id>.jsonl.<n>` and a fresh one begun, so a long run keeps its
+ * whole trail. Past this many segments — 256 MB at the default cap — the old
+ * `journal.full` marker and its reserve apply to the live file.
+ */
+const MAX_SEGMENTS = 8;
 
 /**
  * Held back so a full journal can still say how the run ended.
@@ -117,6 +126,7 @@ export type JournalOptions = {
   instanceId?: string;
   maxBytes?: number;
   reserveBytes?: number;
+  maxSegments?: number;
 };
 
 /**
@@ -166,6 +176,7 @@ export class Journal {
   private overflowed = false;
   private readonly maxBytes: number;
   private readonly reserveBytes: number;
+  private readonly maxSegments: number;
 
   /**
    * THE way to reach a run's journal: the one instance this process keeps for
@@ -191,6 +202,7 @@ export class Journal {
     this.traceId = runTraceId(options.instanceId ?? INSTANCE.id, slug, id);
     this.maxBytes = options.maxBytes ?? MAX_BYTES;
     this.reserveBytes = Math.min(options.reserveBytes ?? RESERVE_BYTES, this.maxBytes);
+    this.maxSegments = options.maxSegments ?? MAX_SEGMENTS;
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       // Resuming an existing run continues its numbering rather than restarting
@@ -247,7 +259,8 @@ export class Journal {
    */
   private lastSeq(): number {
     const tail = this.tail(TAIL_BYTES);
-    if (tail === null) return 0;
+    // A live file not begun yet, behind a chain: the last segment's last number.
+    if (tail === null || tail.text === '') return journalIndexOf(this.path).segments.at(-1)?.lastSeq ?? 0;
     const lines = tail.text.split('\n').filter(Boolean);
     // A window that starts mid-file almost certainly starts mid-line; that
     // first fragment is dropped rather than parsed.
@@ -286,10 +299,72 @@ export class Journal {
     }
   }
 
+  /** Every line of the chain, oldest first — the segments, then the live file. */
   private readAll(): JournalEntry[] {
-    let text: string;
-    try { text = readFileSync(this.path, 'utf8'); } catch { return []; }
-    return parseLines(text.split('\n').filter(Boolean));
+    const entries: JournalEntry[] = [];
+    for (const file of journalChainOf(this.path)) {
+      let text: string;
+      try { text = readFileSync(file, 'utf8'); } catch { continue; }
+      entries.push(...parseLines(text.split('\n').filter(Boolean)));
+    }
+    return entries;
+  }
+
+  /**
+   * Rotate at the cap (B5): the live file becomes the next numbered segment,
+   * the index gains its row — the offset it starts at, its first and last
+   * `seq`, its bytes — and the fresh live file opens with `journal.rotated`,
+   * so a reader of it alone still learns there is more behind it.
+   */
+  private rotate(size: number): boolean {
+    const index = journalIndexOf(this.path);
+    if (index.segments.length >= this.maxSegments) return false;
+    const n = (index.segments.at(-1)?.n ?? 0) + 1;
+    const segment = journalSegmentFile(this.path, n);
+    let firstSeq = 0;
+    try {
+      const head = this.headLine();
+      firstSeq = head ? (JSON.parse(head) as JournalEntry).seq ?? 0 : 0;
+    } catch { /* a torn head: the index says 0 */ }
+    try {
+      renameSync(this.path, segment);
+    } catch (error) {
+      log.warn('journal.rotate-failed', { path: this.path, error });
+      return false;
+    }
+    const last = index.segments.at(-1);
+    const row: JournalSegment = {
+      n, file: basename(segment), firstSeq, lastSeq: this.seq, bytes: size, offset: last ? last.offset + last.bytes : 0,
+    };
+    const next = { version: 1 as const, segments: [...index.segments, row] };
+    try {
+      const tmp = `${journalIndexFile(this.path)}.tmp.${process.pid}`;
+      writeFileSync(tmp, `${JSON.stringify(next)}\n`, 'utf8');
+      renameSync(tmp, journalIndexFile(this.path));
+    } catch (error) {
+      log.warn('journal.rotate-failed', { path: this.path, error, stage: 'index' });
+    }
+    this.seen = 0;
+    this.writeLine(this.entryFor('journal.rotated', { segment: n, file: row.file, firstSeq, lastSeq: row.lastSeq, bytes: size, offset: row.offset }));
+    log.info('journal.rotated', { path: this.path, segment: n, bytes: size, lastSeq: row.lastSeq });
+    return true;
+  }
+
+  /** The live file's first line — at most one tail window's read. */
+  private headLine(): string | null {
+    let fd: number | undefined;
+    try {
+      fd = openSync(this.path, 'r');
+      const buffer = Buffer.allocUnsafe(TAIL_BYTES);
+      const read = readSync(fd, buffer, 0, TAIL_BYTES, 0);
+      const text = buffer.subarray(0, read).toString('utf8');
+      const end = text.indexOf('\n');
+      return end > 0 ? text.slice(0, end) : null;
+    } catch {
+      return null;
+    } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch { /* already gone */ } }
+    }
   }
 
   /** Build the next entry, stamping the columns from the ambient span. */
@@ -347,6 +422,8 @@ export class Journal {
   private checkOverflow(size: number): void {
     if (this.overflowed) return;
     if (size <= this.maxBytes - this.reserveBytes) return;
+    // At the cap the file rotates; only a chain at its last segment fills.
+    if (this.rotate(size)) return;
 
     this.overflowed = true;
     count('journal_overflow_total', []);
@@ -396,9 +473,19 @@ export class Journal {
       if (tail === null) return [];
       const lines = tail.text.split('\n').filter(Boolean);
       if (tail.partial && lines.length) lines.shift();
-      // Enough entries, or the window already covers the file: this is the answer.
+      // Enough entries, or the window already covers the file: this is the answer —
+      // with the chain's segments before it, newest first, while it is short.
       if (lines.length >= limit || !tail.partial || window >= MAX_BYTES) {
-        return parseLines(lines.length > limit ? lines.slice(-limit) : lines);
+        const live = parseLines(lines.length > limit ? lines.slice(-limit) : lines);
+        if (live.length >= limit || tail.partial) return live;
+        const older: JournalEntry[] = [];
+        for (const file of journalChainOf(this.path).slice(0, -1).reverse()) {
+          if (older.length + live.length >= limit) break;
+          let text: string;
+          try { text = readFileSync(file, 'utf8'); } catch { continue; }
+          older.unshift(...parseLines(text.split('\n').filter(Boolean)));
+        }
+        return [...older, ...live].slice(-limit);
       }
       window = Math.min(MAX_BYTES, window * 4);
     }

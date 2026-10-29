@@ -36,8 +36,12 @@
 #     console that is up and slow), drains that inbox itself with
 #     `phase-console sessions ingest` (REG-2) — in the background, except at
 #     SessionStart, where it waits for the one line it needs;
+#   - on SessionStart for a session the console supervises (PE_OUTCOME_FILE
+#     set, not a resume) prints the phase's BRIEF first — `phase-graph.sh
+#     <slug> --brief <N>` — cut so the whole context stays within 10,000
+#     characters (measured-console phase 4);
 #   - on SessionStart prints additionalContext naming the session id and the
-#     `phase-lock.sh --session <id>` instruction, so a hand-driven session can
+#     `phase-lock.sh --session <id>` instruction, LAST, so a hand-driven session can
 #     claim its lock as itself — and the other live sessions the registry
 #     shows in the same repository (REG-3 iv), from the console's answer or the
 #     drain's;
@@ -63,6 +67,21 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Run as the PLUGIN's hook (`hooks/hooks.json`, measured-console phase 10)
+# while the user's settings still carry the spliced entry (`install-hooks`):
+# both would answer the same event, and SessionStart would print its brief
+# twice. The settings entry is the older contract, so the plugin's copy steps
+# aside for it — until a person removes it (`phase-console uninstall-hooks`),
+# or the console says the plugin's hooks are the only ones a session loads
+# (`PE_PLUGIN_HOOKS=1`: `--setting-sources` without `user`, phase 11).
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ "${PE_PLUGIN_HOOKS:-}" != 1 ]; then
+  case "$SCRIPT_DIR/" in
+    "${CLAUDE_PLUGIN_ROOT%/}/"*)
+      settings_="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+      [ -f "$settings_" ] && grep -q 'session-hook\.sh' "$settings_" 2>/dev/null && exit 0
+      ;;
+  esac
+fi
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/instance.sh"
 
@@ -75,6 +94,13 @@ input="$(head -c 65536 2>/dev/null || true)"
 # payload, and the fields this reads all precede it in the CLI's own output.
 # BSD sed: no `\|`, so "non-specials, then (escape + non-specials)*".
 _jget() { _jget_in "$input" "$1"; }
+# _jword <key> — a number or a boolean the hook input carries, verbatim; empty
+# when the key is absent or holds anything else (measured-console phase 12).
+_jword() {
+  local rest="${input#*\"$1\"}"
+  [ "$rest" != "$input" ] || { printf ''; return 0; }
+  printf '%s' "$rest" | sed -En 's/^[[:space:]]*:[[:space:]]*(true|false|-?[0-9]+(\.[0-9]+)?)([^0-9A-Za-z.].*)?$/\1/p' | head -1
+}
 # _jget_in <json> <key> — the same, over any string (the console's answer).
 _jget_in() {
   local rest="${1#*\"$2\"}"
@@ -220,7 +246,20 @@ fi
 # arrival and its run could only be matched by cwd and clock. Always stated
 # (empty when there is none), because the body is a fixed-shape object every
 # field of which the registry reads positionally by name.
-body="{\"version\":1,\"session_id\":\"$session_id\",\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"trace\":\"$(_js "${PE_TRACE_ID:-}")\",\"span\":\"$(_js "${PE_SPAN_ID:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"config_dir\":\"$(_js "$config_dir")\",\"auth_env\":$auth_env_,\"messaging_socket\":\"$(_js "$messaging_socket")\",\"messaging_token\":\"$(_js "$messaging_token")\",\"owner_kind\":\"$(_js "$owner_kind")\",\"owner_how\":\"$(_js "$owner_how")\",\"at\":\"$at\"}"
+# What a resumed session's first request costs (CLI 2.1.251+, SessionStart on
+# `resume`/`fork`; measured-console phase 12): its staleness and the cache it
+# writes again, carried as `resume_cost` only when the CLI said them.
+resume_cost=""
+if [ "$event" = SessionStart ]; then
+  for k in seconds_since_last_response context_tokens prompt_cache_likely_expired estimated_cache_write_usd; do
+    v="$(_jword "$k")"
+    [ -n "$v" ] && resume_cost="${resume_cost:+$resume_cost,}\"$k\":$v"
+  done
+fi
+# Built apart: a brace inside `${x:+…}` would close the expansion early.
+resume_json=""
+[ -n "$resume_cost" ] && resume_json="\"resume_cost\":{$resume_cost},"
+body="{\"version\":1,\"session_id\":\"$session_id\",$resume_json\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"trace\":\"$(_js "${PE_TRACE_ID:-}")\",\"span\":\"$(_js "${PE_SPAN_ID:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"config_dir\":\"$(_js "$config_dir")\",\"auth_env\":$auth_env_,\"messaging_socket\":\"$(_js "$messaging_socket")\",\"messaging_token\":\"$(_js "$messaging_token")\",\"owner_kind\":\"$(_js "$owner_kind")\",\"owner_how\":\"$(_js "$owner_how")\",\"at\":\"$at\"}"
 
 # ---- deliver: POST to the console, else the inbox ------------------------------
 delivered=0
@@ -293,6 +332,38 @@ elif [ "$delivered" = 0 ] && [ "$owner_kind" = registered ] && [ "$curl_rc" != 2
   fi
 fi
 
+# ---- the brief (measured-console phase 4) ----------------------------------------
+# BRIEF_MAX is the whole context's ceiling, in bytes — so in characters too.
+BRIEF_MAX=10000
+# _js_text <text> — a JSON string body that KEEPS its lines (`_js` folds every
+# control character to a space, which is right for one line and wrong for a brief).
+_js_text() {
+  printf '%s' "$1" | tr '\000-\010\013\014\016-\037' ' ' \
+    | LC_ALL=C awk 'BEGIN { ORS = "" } { gsub(/\r/, ""); gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); if (NR > 1) printf "\\n"; printf "%s", $0 }'
+}
+# _brief_for <peer line> <presence line> — the engine's brief for this phase,
+# cut to what is left once the two lines it ends on are counted; empty when the
+# plan or phase cannot be told, or the engine says nothing.
+_brief_for() {
+  local slug_ phase_ scripts_ tail_ max_ base_
+  slug_="${PE_SLUG:-}"; phase_="${PE_PHASE:-}"
+  if [ -z "$slug_" ] || [ -z "$phase_" ]; then
+    # The runner's own name for the channel: <state>/runs/<instance>/<slug>/run-<id>-p<N>-outcome.json
+    base_="$(basename "$PE_OUTCOME_FILE")"
+    phase_="$(printf '%s' "$base_" | sed -n 's/^run-[A-Za-z0-9]*-p\([0-9][0-9]*\)-.*/\1/p')"
+    slug_="$(basename "$(dirname "$PE_OUTCOME_FILE")")"
+  fi
+  case "$phase_" in ''|*[!0-9]*) return 0 ;; esac
+  case "$slug_" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
+  scripts_="${PE_SCRIPTS:-$SCRIPT_DIR}"
+  [ -f "$scripts_/phase-graph.sh" ] || scripts_="$SCRIPT_DIR"
+  tail_="$2"; [ -n "$1" ] && tail_="$1
+$2"
+  max_=$(( BRIEF_MAX - $(printf '%s\n' "$tail_" | wc -c) ))
+  [ "$max_" -gt 1000 ] || return 0
+  DOCS_ROOT="${docs_root:-$root}" PE_BRIEF_MAX="$max_" bash "$scripts_/phase-graph.sh" "$slug_" --brief "$phase_" 2>/dev/null || true
+}
+
 # ---- what the session is told ---------------------------------------------------
 # Only at SessionStart, and only for a directory a console owns or could own —
 # a shell in an unrelated directory is not told about phase locks.
@@ -311,15 +382,34 @@ if [ "$event" = SessionStart ] && [ -n "$root" ]; then
   # actually acted on was "somebody else is here, carry on", which is how a
   # hand-driven session came to be told "safe to start" against a console lane
   # that had been granted and not yet claimed (S1-a's other half).
+  peer_line=""
   if [ -n "$peers" ]; then
-    ctx="$ctx $(printf '%s' "$peers" | cut -c1-1200)"
-    ctx="$ctx Before you claim a phase, check that nothing live shares your working tree: scripts/phase-lock.sh <slug> conflicts <N> --scope \"<csv>\" --here — exit 0 is clear, 1 names the holders. Never build over a live session."
+    peer_line="$(printf '%s' "$peers" | cut -c1-1200)"
+    peer_line="$peer_line Before you claim a phase, check that nothing live shares your working tree: scripts/phase-lock.sh <slug> conflicts <N> --scope \"<csv>\" --here — exit 0 is clear, 1 names the holders. Never build over a live session."
+  fi
+  # The brief (measured-console phase 4, A2): a session the console supervises
+  # (`PE_OUTCOME_FILE` set) is told what it starts from here, not in its
+  # prompt — the engine's `--brief N`, cut so that the whole context stays
+  # within BRIEF_MAX characters with the peers and the presence line appended
+  # LAST, so the prefix two sessions of one phase share is byte-stable and the
+  # session id is the final line. A resumed session already holds its brief.
+  brief=""
+  if [ -n "${PE_OUTCOME_FILE:-}" ] && [ "$source_" != resume ]; then
+    brief="$(_brief_for "$peer_line" "$ctx")"
+  fi
+  if [ -n "$brief" ]; then
+    ctx_json="$(_js_text "$brief")"
+    [ -n "$peer_line" ] && ctx_json="$ctx_json\\n$(_js "$peer_line")"
+    ctx_json="$ctx_json\\n$(_js "$ctx")"
+  else
+    [ -n "$peer_line" ] && ctx="$ctx $peer_line"
+    ctx_json="$(_js "$ctx")"
   fi
   if [ -n "$notice" ]; then
     printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' \
-      "$(_js "$notice")" "$(_js "$ctx")"
+      "$(_js "$notice")" "$ctx_json"
   else
-    printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$(_js "$ctx")"
+    printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$ctx_json"
   fi
 elif [ -n "$notice" ]; then
   printf '{"systemMessage":"%s"}\n' "$(_js "$notice")"

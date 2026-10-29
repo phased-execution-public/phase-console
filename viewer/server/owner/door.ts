@@ -280,6 +280,15 @@ export const AUTHORITY_METHODS: Readonly<Record<string, AuthorityVerb>> = Object
   revokeAllGrants: 'decline',
   overrideHumanStep: 'override',
   rewriteHumanStep: 'decline',
+  // The three verbs fenced last (measured-console phase 17, EI-7).
+  cannotHumanStep: 'decline',
+  snoozeHumanStep: 'decline',
+  openHumanStep: 'decline',
+  // *I can't do this* on any item of Your turn (2026-10-20): a person's refusal of the act.
+  cannotTurnItem: 'decline',
+  // *Hand it to the AI* and a comment to it (2026-10-20).
+  handOffTurnItem: 'trust',
+  noteTurnItem: 'answer',
   performInboxAction: 'answer',
   // The owner key (control-tower phase 148): every press of `/api/owner/…`
   // but a read, and the owner's answer to a request.

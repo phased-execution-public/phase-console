@@ -125,6 +125,8 @@ async function zoom(page: Page): Promise<number> {
 }
 
 const stations = (page: Page) => page.locator('.route-svg .route-station');
+/** A station's button — the HTML target over the drawing, which holds the tab stop. */
+const button = (page: Page, phase: number) => page.locator(`.route-station-button[data-phase="${phase}"]`);
 
 async function openMap(page: Page): Promise<void> {
   await serveFixture(page);
@@ -290,11 +292,12 @@ test.describe('the route map at 71 stations', () => {
     const opened = PLAN.route.nodes.find((n) => n.state === 'stuck')!.phase;
     const station = page.locator(`.route-svg .route-station[data-phase="${opened}"]`);
     await expect(station).toHaveClass(/\bselected\b/);
-    await expect(station).toHaveAttribute('tabindex', '0');
+    await expect(button(page, opened)).toHaveAttribute('tabindex', '0');
     expect((await halo(page, opened)).painted).toBe(true);
-    // A keyboard focus is the focus ring's ink, never the station's own hue.
+    // A keyboard focus is the focus ring's ink, never the station's own hue —
+    // the button's focus, worn by the drawn station's halo.
     if (!touch(info.project.name)) {
-      await station.focus();
+      await button(page, opened).focus();
       await page.keyboard.press('ArrowRight');
       const focused = await page.evaluate(() => Number(document.activeElement?.getAttribute('data-phase')));
       expect(focused).toBeGreaterThan(0);
@@ -387,14 +390,17 @@ test.describe('the route map at 71 stations', () => {
   test('every station is keyboard reachable, from one tab stop', async ({ page }, info) => {
     test.skip(touch(info.project.name), 'a keyboard');
     await openMap(page);
-    await expect(page.locator('.route-svg .route-station[tabindex="0"]')).toHaveCount(1);
+    await expect(page.locator('.route-station-button[tabindex="0"]')).toHaveCount(1);
+    // The drawing holds nothing to focus: every station is an HTML button over it.
+    await expect(page.locator('.route-svg [tabindex], .route-svg [role="button"]')).toHaveCount(0);
     // Tab from the search, through the toolbar and the map's tools (phase 16's
     // chips, trace, colour, layers, layouts and export — #394), onto the map's
     // one stop. Bounded, so a tab trap still fails here rather than hanging.
     await page.getByRole('searchbox', { name: 'Find a station' }).focus();
     for (let press = 0; press < 80; press++) {
       await page.keyboard.press('Tab');
-      if (await page.evaluate(() => document.activeElement?.classList.contains('route-station'))) break;
+      if (await page.evaluate(() => document.activeElement?.classList.contains('route-station-button')))
+        break;
     }
     const active = () => page.evaluate(() => Number(document.activeElement?.getAttribute('data-phase')));
     expect(await active()).toBeGreaterThan(0);
@@ -413,7 +419,7 @@ test.describe('the route map at 71 stations', () => {
     expect(await insideFrame(page, `.route-station[data-phase="${at}"]`)).toBe(true);
     await page.keyboard.press('ArrowUp');
     await page.keyboard.press('ArrowDown');
-    expect(await page.locator('.route-svg .route-station[tabindex="0"]').count()).toBe(1);
+    expect(await page.locator('.route-station-button[tabindex="0"]').count()).toBe(1);
   });
 
   test('a station search moves the window to the station and rings it', async ({ page }, info) => {

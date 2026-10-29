@@ -37,7 +37,7 @@ const { READ_ONLY_LEADS, judgeCommand } = await import('../server/runner/verify.
 const { CHECK_MAX_TURNS, CHECK_MAX_USD, CHECK_OWNER, CHECK_SESSION_KIND, CHECK_TOOLS, checkerSettings, TurnChecker } =
   await import('../server/turn/checker.ts');
 const { parseCheckerVerdict } = await import('../server/turn/verdict.ts');
-const { TOKEN_PRICES_USD, priceUsage } = await import('../server/runner/usage.ts');
+const { measuredRatesOf, priceUsage } = await import('../server/runner/usage.ts');
 const { START_DOORS, CAP_SOURCES } = await import('../shared/run-lifecycle.js');
 type SpawnRequest = import('../server/runner/spawn.ts').SpawnRequest;
 
@@ -242,7 +242,7 @@ const COLD_RESUME = { input: 0, cacheWrite: 300_000, cacheRead: 0, output: 2_000
 const PRICED_AS = 'claude-opus-5-5';
 
 test('CK-7 — eight attempts through the checker cost under a tenth of eight cold resumes of a 300k-token session', async () => {
-  assert.ok(TOKEN_PRICES_USD[PRICED_AS], 'the price table names the model');
+  assert.ok(measuredRatesOf(PRICED_AS), 'the price book\'s measured rows name the model');
   const perCheck = priceUsage(PRICED_AS, CHECKER_FIXTURE)!;
   const perResume = priceUsage(PRICED_AS, COLD_RESUME)!;
   const h = harness();

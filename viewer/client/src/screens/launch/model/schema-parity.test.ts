@@ -73,6 +73,7 @@ describe('the schema covers the server, and nothing more', () => {
       'mcpServers',
       'model',
       'permissionMode',
+      'plugins',
       'skills',
       'skillsOff',
       'tools',

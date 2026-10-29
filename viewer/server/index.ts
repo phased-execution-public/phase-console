@@ -19,7 +19,7 @@ import { execFile, spawn as spawnChild, spawnSync } from 'node:child_process';
 
 import { instanceForPort, instanceUrl, updateInstance } from '../shared/instances.mjs';
 import {
-  INSTANCE, INSTANCE_STATE_DIR, claimInstance, electInstance, flagsRefusal, flagsWarning, parseFlags,
+  INSTANCE, INSTANCE_STATE_DIR, SKILL_DIR, claimInstance, electInstance, flagsRefusal, flagsWarning, parseFlags,
   probeConsole, resolvePort,
   staticRoot, staticRootDir, VIEWER_DIR,
 } from './config.ts';
@@ -32,6 +32,7 @@ import {
   selfRestartPlan, stopPlan, supervisor, unload, type SelfRestartPlan, type ShutdownContext,
 } from './lifecycle.ts';
 import { openerCandidates } from './platform.ts';
+import { ensurePluginTree } from './plugin-tree.ts';
 import { Service } from './service.ts';
 import { handleApi } from './api/routes.ts';
 import { accessLedger, classify } from './api/access.ts';
@@ -568,6 +569,9 @@ server.listen(flags.port, flags.host, () => {
   // to every reader, and a clean exit below says `stopped` (FLT-5).
   service.heartbeat.start();
   void service.checkDeliveryReachable();
+  // The skill this console hands its sessions, built for its own revision
+  // (measured-console phase 10) — in a child process, never awaited.
+  void ensurePluginTree({ root: SKILL_DIR, stateDir: INSTANCE_STATE_DIR });
   const address = `http://${flags.host}:${flags.port}`;
   process.stdout.write(`\n  Phase Console  ${address}\n`);
   process.stdout.write(`  instance      ${INSTANCE.name}${INSTANCE.default ? ' (default)' : ''}  ${INSTANCE.id}\n`);

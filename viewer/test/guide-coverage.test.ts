@@ -291,6 +291,18 @@ test('turn-by-turn phase 12: both Your turn guides explain the timing grid, Goes
   }
 });
 
+test('measured-console phase 29: both Your turn guides name what a session\'s closing words raise, in the words the composer writes', async () => {
+  const { proseQuestionStep, gstackGateStep } = await import('../server/turn/compose.ts');
+  const prose = proseQuestionStep([{ question: 'Keep it?', recommended: 'yes', choices: [] }, { question: 'Ship it?', recommended: 'no', choices: [] }], 's')!;
+  const gate = gstackGateStep({ skill: 'autoplan', run: '/tmp/run' });
+  const words = [...prose.options, ...gate.options].map((option) => option.label);
+  assert.deepEqual(words, ['Go with the recommended answers', 'Answer them myself', 'Take every recommendation', 'Walk me through each item']);
+  for (const id of ['your-turn', 'your-turn.fa']) {
+    const text = flat(read(id));
+    for (const word of [...words, 'Stage 1 of 3', 'gh secret set']) assert.ok(text.includes(word), `${id}.md names "${word}"`);
+  }
+});
+
 test('the permissions guide says what a grant is — its scopes, its tiers, the never list and the three publishing asks', async () => {
   const { RISK_TIERS, HOST_COMMANDS, GRANT_SCOPES } = await import('../shared/turn-model.js');
   const { OPEN_PR_ASK, PUBLISH_ASK } = await import('../server/runner/approvals.ts');

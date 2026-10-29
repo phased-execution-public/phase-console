@@ -11,11 +11,15 @@ write_plan() {  # write_plan <slug> <<EOF-content on stdin>
 @test "batching: parallel-safe siblings batch with their parent while the floor + slope fits" {
   setup_docs diamond diamond
   # diamond: 1 → (2 ∥ 3) → 4, no Size tags (all M). Siblings still batch like
-  # anything else; what cuts is the session model (control-tower phase 59):
-  # 319K + 2.17 × 120K = 579K fits the 600K target, the join's 160K (666K) does not.
+  # anything else; what cuts is the session model (control-tower phase 59,
+  # re-fitted by measured-console phase 33): 238K + 1.91 × 160K = 544K fits the
+  # 600K target, so the join batches too; at a 150K budget (a 450K target) the
+  # join's 160K (544K) does not, and 120K (467K) does not either — 80K (391K) does.
   run pg diamond --session-plan opus
-  assert_contains "$output" "Session 1  batch  (~120K):  1 → 2 → 3"
-  assert_contains "$output" "Session 2  solo   (~40K):  Phase 4"
+  assert_contains "$output" "Session 1  batch  (~160K):  1 → 2 → 3 → 4"
+  refute_contains "$output" "Session 2"
+  run pg diamond --session-plan 150000
+  assert_contains "$output" "Session 1  batch  (~80K):  1 → 2"
 }
 
 @test "batching: a GATED phase is always its own session and is never joined" {

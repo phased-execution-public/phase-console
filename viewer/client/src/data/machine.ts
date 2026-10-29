@@ -5,7 +5,7 @@
  */
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ProbeStatus } from '@shared/ops-vocab.js';
+import type { HeldCredentials, StartCeilingCounters, StrayConsoles } from '@shared/wire/system.js';
 import { api, type RestartReadiness } from './api';
 import { post, request } from './http';
 import { keys } from './keys';
@@ -146,22 +146,7 @@ export function useRootCheck(path: string) {
  * Settings ▸ Accounts draw them (phase 26)
  * ------------------------------------------------------------------ */
 
-/** One start ceiling's sliding hour: its counts, its limits (0 is none), and the limit the next automatic start would meet. */
-export interface CeilingWindow {
-  starts: number;
-  usd: number;
-  limits: { startsPerHour: number; usdPerHour: number };
-  windowMs: number;
-  doors: Record<string, number>;
-  full: 'startsPerHour' | 'usdPerHour' | null;
-  until: string | null;
-}
-
-/** The work ceiling every automatic start is counted against, and the MCP probe's own. */
-export interface StartCeilingCounters {
-  work: CeilingWindow;
-  probe: CeilingWindow;
-}
+export type { CeilingWindow, StartCeilingCounters } from '@shared/wire/system.js';
 
 export const readStartCeiling = (): Promise<StartCeilingCounters> =>
   request<StartCeilingCounters>('/api/ceiling');
@@ -186,20 +171,7 @@ export function useStartCeiling(enabled = true) {
   });
 }
 
-/** One credential id: held or not, why, whether the registry knows its kind, and the plans that name it — never a value. */
-export interface HeldCredential {
-  id: string;
-  status: ProbeStatus;
-  reason: string;
-  known: boolean;
-  named: { slug: string; phase?: number }[];
-}
-
-export interface HeldCredentials {
-  at: string;
-  cacheMs: number;
-  credentials: HeldCredential[];
-}
+export type { HeldCredential, HeldCredentials } from '@shared/wire/system.js';
 
 export const readCredentials = (): Promise<HeldCredentials> => request<HeldCredentials>('/api/credentials');
 
@@ -237,20 +209,7 @@ export function useCredentialProbe() {
   });
 }
 
-/** A console process on this machine whose code is gone. */
-export interface StrayConsole {
-  pid: number;
-  pgid: number;
-  command: string;
-  root: string;
-}
-
-/** The strays, listed — `stop` is the command line that stops them; no page does. */
-export interface StrayConsoles {
-  at: string;
-  strays: StrayConsole[];
-  stop: string;
-}
+export type { StrayConsole, StrayConsoles } from '@shared/wire/system.js';
 
 export const readStrayConsoles = (): Promise<StrayConsoles> => request<StrayConsoles>('/api/doctor/strays');
 

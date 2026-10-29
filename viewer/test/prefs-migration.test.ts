@@ -57,7 +57,10 @@ test('every automation key the loader coerces has a home in the object', () => {
   );
 });
 
-test('the round-trip is lossless for all forty', () => {
+// Named "all forty" once; the count kept growing (measured-console phase 11's
+// three `loads` keys took it past sixty), and the Free tree holds fewer than
+// Pro, so the name says "every" and the subject is whatever FLAT holds.
+test('the round-trip is lossless for every coerced key', () => {
   const back = fromAutomation(toAutomation(FLAT));
   assert.deepEqual(back, FLAT, 'flat → object → flat changed a value');
   // …and it is stable, so a config re-saved twice does not drift.
@@ -67,7 +70,8 @@ test('the round-trip is lossless for all forty', () => {
 test('the groups are the ones the plan named, and nothing is stranded', () => {
   const object = toAutomation(FLAT);
   // `check` is the check's own group (control-tower phase 134, #211).
-  const groups = ['accounts', 'caps', 'check', 'defaults', 'git', 'mcp', 'policy', 'recover', 'schedule', 'stall', 'watch'];
+  // `loads` is what an unattended session loads (measured-console phase 11).
+  const groups = ['accounts', 'caps', 'check', 'defaults', 'git', 'loads', 'mcp', 'policy', 'recover', 'schedule', 'stall', 'watch'];
   assert.deepEqual(Object.keys(object).sort(), groups);
   // The schedule is the one group that IS its value rather than a bag of
   // scalars — it is coerced by `sanitiseSchedule` beside the rules it has to

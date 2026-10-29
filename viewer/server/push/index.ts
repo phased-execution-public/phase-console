@@ -24,6 +24,7 @@ import { deliver, origin, type PushMessage, type Subscription } from './send.ts'
 import { loadVapid, vapidSubject, PUSH_DIR, type Vapid, type VapidRefusal } from './vapid.ts';
 import { inQuietHours, parseQuietHours, type QuietHours } from './quiet.ts';
 import type { DeliveryOutcome } from '../notifications.ts';
+import type { DeliveryTestAnswer, PushState } from '../../shared/wire/notifications.js';
 
 // The quiet-hours parser and clock live in `./quiet.ts` (control-tower phase
 // 138), import-free so `config.ts` can migrate a window with the register's
@@ -232,7 +233,7 @@ export class Push {
     return this.devices.map((device) => this.publicOf(device));
   }
 
-  state(): { publicKey: string; devices: PublicDevice[]; categories: readonly unknown[] } {
+  state(): PushState & { devices: PublicDevice[] } {
     return { publicKey: this.publicKey, devices: this.list(), categories: CATEGORIES };
   }
 
@@ -470,7 +471,7 @@ export class Push {
   }
 
   /** The Settings button: prove the whole chain, on one device, on demand. */
-  async test(id: string): Promise<{ ok: boolean; detail: string }> {
+  async test(id: string): Promise<DeliveryTestAnswer> {
     const device = this.devices.find((d) => d.id === id);
     if (!device) return { ok: false, detail: 'no such device' };
     if (!this.vapid) {

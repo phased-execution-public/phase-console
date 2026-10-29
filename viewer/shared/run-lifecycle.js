@@ -1202,6 +1202,8 @@ export const ENDED_BY = Object.freeze(
  *   - `landing` (Pro) — the session that opens ONE phase's pull request after
  *     the console pushed its branch, and records the landing ledger row.
  *   - `review` — the automatic reviewer over a finished phase.
+ *   - `evaluate` (Pro) — the independent evaluator over a finished phase:
+ *     its exit criteria graded in two dimensions, advisory (phase 22).
  */
 export const SESSION_MODES = Object.freeze(
   /** @type {const} */ ([

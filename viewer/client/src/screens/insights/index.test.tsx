@@ -214,7 +214,7 @@ const UNSCOPED = [
   'On what',
 ];
 
-/** All eleven, a plan's own two after what each session cost. */
+/** Every question, a plan’s own two after what each session cost. */
 const SCOPED = [...UNSCOPED.slice(0, 3), 'What this plan cost', 'This plan’s record', ...UNSCOPED.slice(3)];
 
 /** Each question's id (`data-insight`), in the same order. */
@@ -288,7 +288,7 @@ beforeEach(() => {
 });
 
 describe('the questions', () => {
-  it('unscoped: the nine every plan answers, in their order, and neither of one plan’s', async () => {
+  it('unscoped: the questions every plan answers, in their order, and neither of one plan’s', async () => {
     mount();
     expect(questions()).toEqual(UNSCOPED);
     expect(
@@ -303,7 +303,7 @@ describe('the questions', () => {
     await screen.findByTestId('insights-mix');
   });
 
-  it('scoped: all eleven — the plan’s cost and record after what each session cost — and the note names the plan', async () => {
+  it('scoped: every question — the plan’s cost and record after what each session cost — and the note names the plan', async () => {
     mount('demo');
     expect(questions()).toEqual(SCOPED);
     expect(
@@ -322,6 +322,7 @@ describe('the questions', () => {
     expect(await screen.findByTestId('insights-plan-record')).toBeInTheDocument();
   });
 });
+
 
 describe('a question keeps its place while it is read', () => {
   it('one whose answer has not arrived holds an aria-busy placeholder; the others answer', async () => {

@@ -81,6 +81,7 @@ import { CredentialsGroup } from './credentials';
 import { CreditsControl, creditWords, spendWords } from './credits';
 import { SettingRow, SettingsGroup, failureWords, useSetting } from './setting';
 import { TombstonesGroup } from './tombstones';
+import { formatUsd } from '@/ui/money';
 
 /** Why a press that changes what a run may spend cannot be made here. */
 const NEEDS_FLAG = 'Start the console with --allow-accounts to change an account.';
@@ -485,7 +486,9 @@ function EntitlementFacts({ account, allowed }: { account: AccountView; allowed:
             <span className="text-meta text-ink-muted">by {probe.by}</span>
             <span className="text-meta text-ink-muted">{plural(probe.count, 'check')} in all</span>
             {typeof probe.costUsd === 'number' && (
-              <span className="text-meta tabular-nums text-ink-muted">${probe.costUsd.toFixed(4)}</span>
+              <span className="text-meta tabular-nums text-ink-muted">
+                {formatUsd(probe.costUsd, 'precise')}
+              </span>
             )}
           </span>
           <span className="max-w-(--measure) break-words text-meta text-ink-muted">{probe.reason}</span>

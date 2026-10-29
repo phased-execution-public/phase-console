@@ -42,7 +42,6 @@ import { useState, type ReactNode } from 'react';
 import type { AttemptComparison, AttemptSummary, VerificationFlip } from '@/data/api';
 import { useAttempts } from '@/data/runs';
 import { clockTime, duration, money, plural } from '@/lib/format';
-import { usePhone } from '@/lib/media';
 import { Button, Empty, Mono, Spinner } from '@/ui';
 import { TreeLine, verdictTree } from '@/cards/verify-tree';
 import type { Column } from '@/ui/grid/column';
@@ -394,7 +393,6 @@ export function RunAttempts({
   runId?: string;
   onClose: () => void;
 }) {
-  const phone = usePhone();
   const { data, isLoading } = useAttempts(slug, phase ?? undefined, runId, phase !== null);
   const comparisons = data?.comparisons ?? [];
   // The NEWEST pair unless the reader picked another for this phase: the
@@ -415,12 +413,12 @@ export function RunAttempts({
       }}
     >
       <SheetContent
-        side={phone ? 'bottom' : 'end'}
+        side="auto"
+        size="wide"
         title={phase === null ? 'Attempts' : `Phase ${phase}'s attempts`}
         showTitle
         description="Read from this run's journal: one boarding is one attempt, its inner session retries counted inside it."
         data-testid="run-attempts"
-        {...(phone ? {} : { className: 'w-[min(42rem,calc(100%-2rem))]' })}
         subheader={
           comparisons.length ? (
             <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 py-2 text-meta text-ink-muted">

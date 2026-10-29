@@ -146,6 +146,9 @@ export const SITUATION_FACTS = Object.freeze({
   /** A session of this console is on it right now. Nothing to ask. */
   'work-in-progress': Object.freeze({ inboxKind: null, pushCategory: null }),
 
+  /** The SDK's door lost a session before its first event: the door re-attempts it on the subprocess. Nothing to ask. */
+  'spawn-sdk-failed': Object.freeze({ inboxKind: null, pushCategory: null }),
+
   /** The session produced nothing. Its sub-kinds are the three measured shapes. */
   'never-started': Object.freeze({ inboxKind: 'errand', pushCategory: 'needs-you' }),
 

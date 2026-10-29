@@ -607,6 +607,14 @@ export function relativePathIn(command: string): string | null {
   // and so does everything after `cd /abs`, never the console's root.
   let lead = '';
   let anchored = false;
+  // `gh api <endpoint>`: the first word that is neither a flag nor a flag's
+  // value is an endpoint (`marketplace_listing/plans/x`, `rate_limit`), never a
+  // path, whatever its first segment — GitHub's route roots are not ours to
+  // list. A header's value may hold a space (`-H 'Accept: x'`), so it reads as
+  // two words. Twin: `_relative_path_in` in scripts/cmd-ref.sh.
+  let api = false;
+  let apiEndpoint = false;
+  let apiPending = '';
   for (const raw of words) {
     // A chain's separator ends a command, spaced or stuck to its word.
     const word = raw.replace(/(;|&&|\|\|)+$/, '');
@@ -616,10 +624,30 @@ export function relativePathIn(command: string): string | null {
     if (!word || word === '|') { lead = ''; continue; }
     // The lead is the command's first word; it is still read as a path below.
     const first = !lead;
-    if (first) lead = word;
+    if (first) { lead = word; api = false; apiEndpoint = false; apiPending = ''; }
     const of = lead;
     if (ends) lead = '';
     if (!first) {
+      if (of === 'gh') {
+        if (!api) {
+          if (word === 'api' && after === 'gh') api = true;
+        } else if (apiPending) {
+          const was = apiPending;
+          apiPending = was === 'h' && word.endsWith(':') ? 'v' : '';
+          // `--input <file>` names a file of the session's cwd: read it as a path.
+          if (was !== 'p') continue;
+        } else if (word === '-H' || word === '--header') {
+          apiPending = 'h'; continue;
+        } else if (word === '--input') {
+          apiPending = 'p'; continue;
+        } else if (/^(-X|--method|-f|-F|--field|--raw-field|-q|--jq|-t|--template|--cache|--hostname|-p|--preview)$/.test(word)) {
+          apiPending = 'v'; continue;
+        } else if (word.startsWith('-')) {
+          continue;
+        } else if (!apiEndpoint) {
+          apiEndpoint = true; continue;
+        }
+      }
       if (after === 'cd' && word.startsWith('/')) { anchored = true; continue; }
       if (after === '-C' && of === 'git' && word.startsWith('/')) { anchored = true; continue; }
       if (after === '-R' || after === '--repo') continue;

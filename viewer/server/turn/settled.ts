@@ -42,8 +42,12 @@ export const SETTLED_MAX = 500;
 /** A record older than this is forgotten. */
 export const SETTLED_TTL_MS = 2 * 24 * 60 * 60_000;
 
-/** How a pressed item ended, as Done says it. */
-export type SettledOutcome = 'passed' | 'closed';
+/**
+ * How a pressed item ended, as Done says it — `not-doing` is the person's *I
+ * can't do this* on an item the console projects (2026-10-20), the word a
+ * ledger step's `cannot` reads as too.
+ */
+export type SettledOutcome = 'passed' | 'closed' | 'not-doing';
 
 /** One press that settled a projected item. */
 export type SettledRecord = {

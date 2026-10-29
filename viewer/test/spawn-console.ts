@@ -95,6 +95,10 @@ export function sandbox(label = 'console'): ConsoleSandbox {
       // tour's fixture imports no sandbox, so the marker is handed over here.
       PHASE_CONSOLE_KEYCHAIN: '0',
       NODE_OPTIONS: [process.env.NODE_OPTIONS, STEADY_LOAD].filter(Boolean).join(' '),
+      // …and never a launching session's account config, whose installed
+      // plugins the Skills page would list (measured-console phase 35).
+      CLAUDE_CONFIG_DIR: undefined,
+      CLAUDE_CODE_PLUGIN_SEED_DIR: undefined,
     },
     cleanup: () => {
       // A console under test is KILLED, not shut down, and since Phase 7 its

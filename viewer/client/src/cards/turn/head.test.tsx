@@ -12,9 +12,11 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
+import { describeWord } from '@shared/status-model.js';
+import { PERSON_STATUSES } from '@shared/turn-model.js';
 import type { TurnItem } from '@/data/api';
 import { expectNoAxeViolations } from '@/test/axe';
-import { Head, filesWords } from './head';
+import { Head, Meta, edgeOf, filesWords } from './head';
 
 function item(over: Partial<TurnItem> = {}): TurnItem {
   return {
@@ -103,5 +105,82 @@ describe('TH-3 a landing errand’s files under Details', () => {
   it('draws no Details on an item with no files', () => {
     head();
     expect(screen.queryByTestId('turn-files-toggle')).toBeNull();
+  });
+});
+
+describe('TH-4 a strip’s head', () => {
+  it('one row: the type as a plate, NOW outlined, the status the one tinted lead badge, the errand chip', async () => {
+    const { container } = head({ errandRef: 'E-3' });
+    const row = screen.getByTestId('turn-head-row');
+    expect(within(row).getByTestId('turn-type').hasAttribute('data-plate')).toBe(true);
+    // Exactly one lead badge on the head, and it is the person's status.
+    const tinted = container.querySelectorAll('[data-chrome="tint"]');
+    expect(tinted).toHaveLength(1);
+    expect(tinted[0]!.getAttribute('data-vocab')).toBe('turn');
+    expect(tinted[0]!.getAttribute('data-status')).toBe('todo');
+    expect(within(row).getByTestId('turn-readiness').querySelector('[data-chrome="badge"]')).toBeTruthy();
+    expect(within(row).getByTestId('turn-errand-ref').textContent).toBe('E-3');
+    await expectNoAxeViolations(container);
+  });
+
+  it('a Redo says the attempt it sent back, beside its badge', () => {
+    render(<Head item={item({ personStatus: 'redo' })} titleId="t1" title="Store the token" attempt={2} />);
+    expect(screen.getByTestId('turn-state-attempt').textContent).toBe('Attempt 2');
+  });
+
+  it('the edge wears the lead badge’s own paint, for every status', () => {
+    for (const status of PERSON_STATUSES)
+      expect(edgeOf(status), status).toBe(`state-${describeWord('turn', status).paint}`);
+    expect([edgeOf('todo'), edgeOf('redo'), edgeOf('checking'), edgeOf('passed')]).toEqual([
+      'state-needs-you',
+      'state-needs-you',
+      'state-verifying',
+      'state-done',
+    ]);
+    expect([edgeOf('not-doing'), edgeOf('closed'), edgeOf('owner')]).toEqual([
+      'state-skipped',
+      'state-skipped',
+      'state-waiting',
+    ]);
+  });
+});
+
+describe('TH-5 the meta as chips', () => {
+  it('draws each fact as its own chip, a link where it can be one', () => {
+    const node = item({
+      phase: 4,
+      runId: '9c66853e1db3',
+      step: { unblocks: [{ slug: 'demo', phase: 5 }] } as TurnItem['step'],
+    });
+    render(
+      <Meta
+        item={node}
+        record={undefined}
+        timing={{
+          assignedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+          openUntil: '2026-10-20T15:00:00.000Z',
+        }}
+      />,
+    );
+    const meta = screen.getByTestId('turn-meta');
+    expect(within(meta).getAllByRole('listitem').length).toBeGreaterThanOrEqual(5);
+    expect(within(meta).getByRole('link', { name: 'demo' })).toBeTruthy();
+    expect(within(meta).getByRole('link', { name: 'Phase 4' })).toBeTruthy();
+    expect(within(meta).getByRole('link', { name: '9c66853e' })).toBeTruthy();
+    expect(within(screen.getByTestId('turn-unblocks')).getByRole('link', { name: 'phase 5' })).toBeTruthy();
+    expect(screen.getByTestId('turn-meta-assigned').textContent).toContain('2 h ago');
+    expect(screen.getByTestId('turn-meta-open-until').textContent).toContain('Open until');
+  });
+
+  it('says no window on an item that is no longer open', () => {
+    render(
+      <Meta
+        item={item()}
+        record={undefined}
+        live={false}
+        timing={{ assignedAt: '2026-10-13T09:00:00.000Z', openUntil: '2026-10-20T15:00:00.000Z' }}
+      />,
+    );
+    expect(screen.queryByTestId('turn-meta-open-until')).toBeNull();
   });
 });

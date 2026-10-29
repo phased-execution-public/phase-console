@@ -1,5 +1,6 @@
 import { useSyncExternalStore, type ReactNode } from 'react';
 import { Inspector, type InspectorTab } from '@/ui/inspector';
+import type { SheetSize } from '@/ui/sheet';
 import { openPanel } from './modes';
 
 /**
@@ -24,6 +25,16 @@ export interface Inspected {
   history?: ReactNode;
   raw?: ReactNode;
   tab?: InspectorTab;
+  /**
+   * The record's measure (2026-10-20): how wide its content may make the panel
+   * — a Your turn card is a `form`, a log a `wide` — `reading` when unsaid.
+   */
+  measure?: SheetSize;
+  /**
+   * The Overview draws the record's own head (a Your turn card): the frame
+   * draws no heading or meta row of its own (`ui/inspector.tsx`).
+   */
+  headless?: boolean;
 }
 
 let current: Inspected | null = null;
@@ -73,6 +84,8 @@ export function InspectorHost() {
       </div>
     );
   }
-  const { key, tab, ...rest } = record;
+  // The measure is the frame's to read (`frame.tsx`), never the inspector's.
+  const { key, tab, measure, ...rest } = record;
+  void measure;
   return <Inspector key={key} host="inline" defaultTab={tab} {...rest} />;
 }

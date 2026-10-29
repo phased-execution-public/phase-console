@@ -57,7 +57,8 @@ const QUESTION: Readonly<Record<FigureName, string>> = {
 };
 
 /** The questions an unscoped Insights asks — all of them drawn is the page settled. */
-const QUESTIONS = 9;
+const proQuestions: string[] = [];
+const QUESTIONS = 9 + proQuestions.length;
 
 const touch = (project: string): boolean => VIEWPORTS.find((v) => v.name === project)?.touch ?? false;
 

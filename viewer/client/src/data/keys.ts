@@ -122,6 +122,8 @@ export const keys = {
   converge: () => ['converge'] as const,
   /** Is the session-presence hook in `~/.claude/settings.json`? */
   hooksStatus: () => ['hooks-status'] as const,
+  hooks: () => ['hooks'] as const,
+  plugins: () => ['plugins'] as const,
   approvals: () => ['approvals'] as const,
   runs: () => ['runs'] as const,
   run: (slug: string) => ['run', slug] as const,

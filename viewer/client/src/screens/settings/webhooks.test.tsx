@@ -52,6 +52,8 @@ function row(over: Partial<WebhookRow> = {}): WebhookRow {
     createdAt: '2026-10-01T00:00:00.000Z',
     lastOkAt: null,
     failures: 0,
+    secretHint: '…1a2b',
+    queued: 0,
     ...over,
   };
 }
@@ -259,6 +261,35 @@ describe('without --allow-webhooks', () => {
 describe('adding a webhook', () => {
   /** What a person pastes: a credential, whose path is what authorises. */
   const PASTED = 'https://hooks.example.com/services/T0000/B0000/abcdefabcdefabcdefabcdef';
+
+  it("shows the new row's signing secret ONCE, with the header it signs, and only its hint after (measured-console phase 17)", async () => {
+    const SECRET = `whsec_${'9f'.repeat(24)}`;
+    serve({ hooks: [row({ queued: 3 })] });
+    server.reads['POST /api/webhooks/add'] = (body: { url: string; label: string }) => {
+      const hook = row({
+        id: 'w2',
+        label: body.label,
+        origin: 'https://hooks.example.com',
+        tail: '…abcdef',
+        secretHint: '…9f9f',
+      });
+      register = { ...register, hooks: [...register.hooks, hook] };
+      return { hook: { ...hook, secret: SECRET }, state: register };
+    };
+    mount();
+    expect(await screen.findByText('signed with …1a2b')).toBeInTheDocument();
+    expect(within(item('w1')).getByTestId('webhook-queued')).toHaveTextContent('3 announcements waiting');
+    fireEvent.change(screen.getByLabelText('Webhook URL'), { target: { value: PASTED } });
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: '#deploys' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add webhook' }));
+    const shown = await screen.findByTestId('webhook-secret');
+    expect(shown).toHaveTextContent(SECRET);
+    expect(shown).toHaveTextContent('X-Phase-Console-Signature: sha256=…');
+    fireEvent.click(within(shown).getByRole('button', { name: 'Done' }));
+    expect(screen.queryByTestId('webhook-secret')).toBeNull();
+    expect(document.body.innerHTML).not.toContain(SECRET);
+    expect(await screen.findByText('signed with …9f9f')).toBeInTheDocument();
+  });
 
   it('posts the URL and the name, trimmed, then empties both and draws the new row as the server masked it', async () => {
     serve();

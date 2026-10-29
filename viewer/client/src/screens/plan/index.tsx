@@ -22,6 +22,7 @@
  */
 
 import { Suspense, lazy } from 'react';
+import { Activity, FileText, Hand, ListTree, type LucideIcon } from 'lucide-react';
 import { useAutoReadNotifications } from '@/data/inbox';
 import { useEngineQueue, usePlan } from '@/data/plans';
 import { useTurn, type TurnAnswer } from '@/data/turn';
@@ -45,6 +46,14 @@ import {
   sourceViewOf,
   tabLabel,
 } from './tabs';
+
+/** Each view's glyph in the bay — the Phases list, the run's pulse, the hand that is yours, the file. */
+const VIEW_ICONS: Readonly<Record<string, LucideIcon>> = {
+  phases: ListTree,
+  run: Activity,
+  turn: Hand,
+  source: FileText,
+};
 
 /**
  * The bodies nobody opens first, each its own chunk: the phase page pulls every
@@ -188,6 +197,7 @@ export default function PlanPage({ route }: { route: Route }) {
     id,
     label: tabLabel(id),
     href: planHref(s.slug, id),
+    ...(VIEW_ICONS[id] ? { icon: VIEW_ICONS[id] } : {}),
     ...(id === 'phases' && data.phases.length ? { count: data.phases.length } : {}),
     ...(id === 'turn' ? { count: openTurnOf(turn.data, s.slug) } : {}),
   }));

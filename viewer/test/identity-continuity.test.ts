@@ -25,11 +25,12 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { STATE_SANDBOX } from './state-sandbox.ts';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
@@ -57,21 +58,11 @@ const INFO: RunIdentity = { account: 'default', key: 'k-info', email: 'info@exam
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-identity-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-identity-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -92,18 +83,16 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
+`,
+      'phase-lock.sh': `#!/usr/bin/env bash
 set -u
 if [ "\${2:-}" = "status" ]; then echo "phase \${3:-?}: free"; fi
 exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -207,7 +196,7 @@ function haltedOnDefault(root: string, over: (state: RunState) => void = () => {
  * ------------------------------------------------------------------ */
 
 test('ID-1: a run binds the identity behind its account id at start, and journals it once', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const spawn: SpawnFn = async (request) => { r.markDone(phaseOf(request)); return ok(); };
     const { instance, events } = runner(r, spawn, { identityOf: () => ADMIN });
@@ -230,7 +219,7 @@ test('ID-1: a run binds the identity behind its account id at start, and journal
  * ------------------------------------------------------------------ */
 
 test('ID-2: the machine login changing identity mid-run parks the run before its next boarding — journalled was/now, with an errand offering both ways on', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let who: RunIdentity = ADMIN;
     const boarded: number[] = [];
@@ -348,7 +337,7 @@ test('ID-3: an identity-changed park is relaunched by no trigger but a person\'s
  * ------------------------------------------------------------------ */
 
 test('ID-4: a refusal met after the machine login changed identity halts on the change — not "expired or signed out" — and retires no credential', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let who: RunIdentity = ADMIN;
     const left: { kind: string }[] = [];
@@ -480,6 +469,89 @@ test('ID-2: "move to the same-identity profile" switches the run to the register
     assert.equal(after.identity?.email, 'admin@example.com', 'the same person, on a login that is theirs');
     assert.equal(after.halt ?? null, null);
     assert.equal(starts.length, 1);
+  } finally {
+    (svc as unknown as { accounts: unknown }).accounts = real;
+    svc.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A fake loop behind the run: `busy()` until `release()`, its record the one
+ * on disk with the status the test names. The window the rehearsal's press
+ * met (measured-console phase 14): the park already reads `halted` — its card
+ * on the page — while the loop it landed in is still unwinding.
+ */
+function loopBehind(state: RunState, status: RunState['status']) {
+  let release: () => void = () => {};
+  let driving: Promise<void> | null = new Promise<void>((resolve) => { release = resolve; }).then(() => { driving = null; });
+  const live = { ...state, status };
+  return {
+    runner: { busy: () => driving !== null, current: () => live, wait: async () => { await driving; } },
+    release: () => release(),
+  };
+}
+
+test('ID-2: a press on an identity park that already reads halted waits for the loop it landed in to let go — and resumes that run', async () => {
+  const root = scratch();
+  const svc = service(root);
+  const real = (svc as unknown as { accounts: unknown }).accounts;
+  try {
+    const run = haltedOnDefault(root, (state) => {
+      state.halt = { at: '2026-09-25T12:17:00.000Z', reason: 'the machine login changed identity', phase: 2, kind: 'identity-changed' };
+    });
+    (svc as unknown as { accounts: unknown }).accounts = Object.assign(Object.create(Object.getPrototypeOf(real)), real, {
+      identityOf: () => INFO,
+    });
+    const loop = loopBehind(run, 'halted');
+    (svc as unknown as { runners: Map<string, unknown> }).runners.set('alpha', loop.runner);
+    const starts: Record<string, unknown>[] = [];
+    (svc as unknown as { startRun: (slug: string, options: Record<string, unknown>) => Promise<RunState> }).startRun =
+      async (_slug, options) => { starts.push(options); return loadRun(root, 'alpha', String(options.resumeRunId), null)!; };
+    const pressed = (svc as unknown as {
+      answerIdentity: (slug: string, choice: string, actor: unknown) => Promise<{ ok: boolean; reason?: string; status?: number }>;
+    }).answerIdentity('alpha', 'continue', pressActor(PERSON as never));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(starts.length, 0, 'nothing resumes while the loop is still unwinding');
+    loop.release();
+    const answer = await pressed;
+    assert.equal(answer.ok, true, answer.reason);
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].resumeRunId, run.id);
+    assert.equal(journalOn(root, run.id).filter((line) => line.event === 'run.identity-accepted').length, 1);
+  } finally {
+    (svc as unknown as { accounts: unknown }).accounts = real;
+    svc.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ID-2: a press on an identity park whose run still drains a live lane is refused, and moves nothing', async () => {
+  const root = scratch();
+  const svc = service(root);
+  const real = (svc as unknown as { accounts: unknown }).accounts;
+  try {
+    const run = haltedOnDefault(root, (state) => {
+      state.halt = { at: '2026-09-25T12:17:00.000Z', reason: 'the machine login changed identity', phase: 2, kind: 'identity-changed' };
+    });
+    (svc as unknown as { accounts: unknown }).accounts = Object.assign(Object.create(Object.getPrototypeOf(real)), real, {
+      identityOf: () => INFO,
+    });
+    const loop = loopBehind(run, 'halting');
+    (svc as unknown as { runners: Map<string, unknown> }).runners.set('alpha', loop.runner);
+    let started = 0;
+    (svc as unknown as { startRun: () => Promise<RunState> }).startRun = async () => { started += 1; return run; };
+    const answer = await (svc as unknown as {
+      answerIdentity: (slug: string, choice: string, actor: unknown) => Promise<{ ok: boolean; reason?: string; status?: number }>;
+    }).answerIdentity('alpha', 'continue', pressActor(PERSON as never));
+    assert.equal(answer.ok, false);
+    assert.equal(answer.status, 409);
+    assert.match(answer.reason ?? '', /still draining its lanes/);
+    assert.equal(started, 0);
+    assert.equal(loadRun(root, 'alpha', run.id, null)!.halt?.kind, 'identity-changed', 'the park stands');
+    assert.ok(!existsSync(journalFile(root, 'alpha', run.id))
+      || !journalOn(root, run.id).some((line) => line.event === 'run.identity-accepted'), 'no choice is journalled');
+    loop.release();
   } finally {
     (svc as unknown as { accounts: unknown }).accounts = real;
     svc.close();

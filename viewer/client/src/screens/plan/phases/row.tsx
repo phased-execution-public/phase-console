@@ -58,6 +58,7 @@ export const PhaseMark = memo(function PhaseMark({
   pty = false,
   title,
   size = 'sm',
+  chrome = 'badge',
   className,
 }: {
   slug: string;
@@ -67,13 +68,15 @@ export const PhaseMark = memo(function PhaseMark({
   pty?: boolean;
   title?: string | undefined;
   size?: 'sm' | 'md';
+  /** `tint` where the mark is a strip's ONE lead badge (the phases grid's State column). */
+  chrome?: 'badge' | 'tint';
   className?: string;
 }) {
   const href = phaseSessionHref({ slug, phase, live: live ?? null, pty });
   const mark = (
     <PhaseStatus
       board={state as WordOf<'board'>}
-      chrome="badge"
+      chrome={chrome}
       live={Boolean(live)}
       size={size}
       title={title ?? boardStateTitle(state)}

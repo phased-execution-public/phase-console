@@ -565,8 +565,6 @@ export const INBOX_AGE_REFUSE_MS = 7 * 24 * 60 * 60_000;
 
 /** A drain lock whose holder is gone, or older than this, is reclaimed. */
 const INBOX_LOCK_STALE_MS = 60_000;
-/** How long `load()` waits for another process's drain to finish before reading the records. */
-const INBOX_LOCK_WAIT_MS = 3_000;
 
 /** How a change reached `onChange` — only an event from the inbox (or the verb) carries lateness. */
 export type ChangeMeta = { via: IngestVia; lateMs: number; history: boolean };
@@ -673,10 +671,6 @@ export function readSessionEvents(dir: string, sessionId: string, limit?: number
  * Pure pieces
  * ------------------------------------------------------------------ */
 
-/** Block this thread for `ms` — the drain lock's wait. `Atomics.wait` sleeps without spinning. */
-function sleepSync(ms: number): void {
-  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no SAB: do not wait */ }
-}
 
 function str(value: unknown, max: number): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -1190,16 +1184,16 @@ export class SessionRegistry {
    *
    * Under the drain lock (see `lockInbox`): a verb draining the same inbox in
    * the instant this console boots would otherwise write records this read
-   * misses. A live holder is waited for, briefly; past that the records are
-   * read and the drops left to the next poll — a boot is never blocked on
-   * another process, and no drop is applied twice.
+   * misses. A live holder is never waited for (EI-23): the records are read
+   * and the drops left to the next poll — a boot is never blocked on another
+   * process, and no drop is applied twice.
    */
   load(opts: { via?: IngestVia } = {}): this {
     try { mkdirSync(this.inboxDir, { recursive: true }); } catch { /* a read-only state dir keeps an in-memory registry */ }
-    const lock = this.lockInbox(INBOX_LOCK_WAIT_MS);
+    const lock = this.lockInbox();
     try {
       this.readRecords();
-      // Still held after the wait: the records are read, and the drops are
+      // Held by another drain: the records are read, and the drops are
       // left for the next pass rather than applied twice beside the holder.
       if (lock !== 'held') this.ingestInbox({ via: opts.via ?? 'inbox', locked: true });
     } finally {
@@ -1541,7 +1535,7 @@ export class SessionRegistry {
   ingestInbox(opts: { via?: IngestVia; locked?: boolean } = {}): number {
     const via = opts.via ?? 'inbox';
     if (via !== 'cli' && !this.watcher && !this.closed) this.arm();
-    const lock = opts.locked ? 'caller' : this.lockInbox(0);
+    const lock = opts.locked ? 'caller' : this.lockInbox();
     if (lock === 'held') return 0;
     try {
       return this.drainInbox(via);
@@ -1640,15 +1634,14 @@ export class SessionRegistry {
   private get lockFile(): string { return join(this.opts.dir, 'inbox.lock'); }
 
   /**
-   * Take the drain lock — `O_EXCL`, holding `<pid> <epoch ms>` — waiting up to
-   * `waitMs` for a live holder. `taken`: ours, release it; `held`: another
+   * Take the drain lock — `O_EXCL`, holding `<pid> <epoch ms>` — or be told a
+   * live holder has it, never waiting (EI-23). `taken`: ours, release it; `held`: another
    * process is draining right now; `unavailable`: the lock cannot be made (a
    * read-only state directory), so the caller proceeds as it always did. A lock
    * whose holder is gone, or older than a minute, is reclaimed.
    */
-  private lockInbox(waitMs: number): 'taken' | 'held' | 'unavailable' {
-    const deadline = Date.now() + waitMs;
-    for (let attempt = 0; attempt < 1_000; attempt++) {
+  private lockInbox(): 'taken' | 'held' | 'unavailable' {
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
         mkdirSync(this.opts.dir, { recursive: true });
         const fd = openSync(this.lockFile, 'wx', 0o600);
@@ -1661,9 +1654,9 @@ export class SessionRegistry {
         try { rmSync(this.lockFile, { force: true }); } catch { return 'unavailable'; }
         continue;
       }
-      const left = deadline - Date.now();
-      if (left <= 0) return 'held';
-      sleepSync(Math.min(25, left));
+      // A live holder is never waited for on the event loop (EI-23): `held` is
+      // the refusal, and the caller leaves the drops to its next poll.
+      return 'held';
     }
     return 'held';
   }

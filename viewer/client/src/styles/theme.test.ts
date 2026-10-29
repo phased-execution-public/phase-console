@@ -287,6 +287,33 @@ describe('theme tokens', () => {
     expect(THEME).not.toMatch(/::selection\s*\{[^}]*accent/);
   });
 
+  it('gives every state an edge and a tint at its own hue, declared once for both lights (Tower strips)', () => {
+    // A strip's 4 px edge and a lead badge's ground are the state itself,
+    // louder or quieter — so each sits at its state's hue, which keeps amber in
+    // needs-you's family alone and every other hue 40° from it.
+    for (const token of STATUS_TOKENS) {
+      const hueOf = (name: string) => {
+        const line = THEME.split('\n').find((l) => l.trim().startsWith(`${name}:`)) ?? '';
+        expect(line, `${name} should carry both lights`).toContain('light-dark(');
+        expect(
+          [...THEME.matchAll(new RegExp(`^\\s*\\${name}:`, 'gm'))],
+          `${name} declared once`,
+        ).toHaveLength(1);
+        return [...line.matchAll(/oklch\([\d.]+% [\d.]+ ([\d.]+)\)/g)].map(([, h]) => Number(h));
+      };
+      const [hue] = hueOf(token);
+      for (const shade of [`${token}-vivid`, `${token}-tint`]) {
+        expect(hueOf(shade), `${shade} keeps ${token}'s hue`).toEqual([hue, hue]);
+      }
+      const ui = token.replace('--status-', '');
+      expect(THEME, `.state-${ui} sets its edge and tint`).toMatch(
+        new RegExp(
+          `\\.state-${ui}\\s*\\{[^}]*--state-vivid:\\s*var\\(${token}-vivid\\);\\s*--state-tint:\\s*var\\(${token}-tint\\)`,
+        ),
+      );
+    }
+  });
+
   it('never draws a focus mark in amber', () => {
     // A focused control is not a person being summoned. The ring is `--focus`
     // (ink), painted by `:focus-visible` in theme.css; a component that narrows

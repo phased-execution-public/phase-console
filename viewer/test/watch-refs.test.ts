@@ -315,6 +315,33 @@ test('#350 — refs/heads/… after git is a ref, a gh api route is a route, an 
   assert.equal(relativePathIn('test -f ./x'), './x');
 });
 
+test('after gh api the first non-flag word is an endpoint, never a path — whatever its first segment', async () => {
+  const { relativePathIn, cmdRefProblem } = await import('../server/watch-refs.ts');
+  for (const command of [
+    'gh api repos/o/r/releases/latest',
+    'gh api marketplace_listing/plans/x',
+    'gh api licenses/mit/x',
+    'gh api rate_limit',
+    'gh api -H \'Accept: x\' marketplace_listing/plans/x',
+    'gh api -H Accept:application/vnd.github.v3.raw licenses/mit/x',
+    'gh api -H \'Accept: application/vnd.github.v3.raw\' user/repos',
+    'gh api -X GET --jq .name codes_of_conduct/x/y',
+    'gh api --paginate -f per_page=100 meta/octo/cat',
+    'gh api marketplace_listing/plans/x --jq .a/b/c; true',
+  ]) {
+    assert.equal(relativePathIn(command), null, command);
+    assert.equal(cmdRefProblem(command), null, command);
+  }
+  // Only the endpoint is spared: --input names a file of the session's cwd,
+  // and the next command of a chain is not gh.
+  assert.equal(relativePathIn('gh api meta/o/c --input out/body.json'), 'out/body.json');
+  assert.equal(relativePathIn('gh api --input out/body.json meta/o/c'), 'out/body.json');
+  assert.equal(relativePathIn('gh api marketplace_listing/plans/x; cat docs/x/y.md'), 'docs/x/y.md');
+  assert.equal(relativePathIn('gh api marketplace_listing/plans/x | tee out/a/b.json'), 'out/a/b.json');
+  assert.equal(relativePathIn('gh pr diff docs/a/b.md'), 'docs/a/b.md');
+  assert.equal(relativePathIn('echo api marketplace_listing/plans/x'), 'marketplace_listing/plans/x');
+});
+
 test('#374 — exit 126 or 127 reads unrunnable, naming the missing script; any other miss stays pending', async () => {
   const { probeWatchRef, scriptOfCommand, unrunnableDetail } = await import('../server/watch-refs.ts');
   const script = '/home/me/work/hub/scripts/vpn/status.sh';
@@ -355,6 +382,14 @@ test('cmd-ref parity — scripts/cmd-ref.sh reads every ref as shared/proof-word
     'gh pr view 3 -R acme/widgets',
     'bash /home/me/hub/scripts/vpn/status.sh --assert ok',
     'python3 -u /x/y.py',
+    'gh api marketplace_listing/plans/x',
+    "gh api -H 'Accept: application/vnd.github.v3.raw' licenses/mit/x",
+    'gh api -H Accept:application/vnd.github.v3.raw licenses/mit/x',
+    'gh api --paginate -f per_page=100 meta/octo/cat --jq .a/b/c; true',
+    'gh api meta/o/c --input out/body.json',
+    'gh api --input out/body.json meta/o/c',
+    'gh api marketplace_listing/plans/x | tee out/a/b.json',
+    'echo api marketplace_listing/plans/x',
   ];
   const program = `. "${script}"\nwhile IFS= read -r line; do b="$(_cmd_body "cmd:$line")"; printf '%s\\t%s\\t%s\\n' "$b" "$(_relative_path_in "$b")" "$(_cmd_script "$b")"; done`;
   const out = execFileSync('/bin/bash', ['-c', program], { input: `${bodies.join('\n')}\n`, encoding: 'utf8' });

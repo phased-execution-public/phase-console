@@ -27,7 +27,7 @@
 
 import { useMemo, type ReactNode } from 'react';
 import type { LockRow } from '@/data/api';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { clockTime, countdown, plural } from '@/lib/format';
 import { Empty, Mono, RelativeTime } from '@/ui';
 import { FigureNumbers } from '@/ui/figures/numbers';

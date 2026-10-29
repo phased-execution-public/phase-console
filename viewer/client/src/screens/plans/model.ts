@@ -5,9 +5,11 @@
  *
  * A `PlanRow` is the `/api/plans` summary flattened and finished: counts
  * resolved, the title through `plainText`, idle days computed once, the
- * newest run joined on as its view in context, and how many things wait on a
- * person. Everything a sort, a filter, a column or a card needs is a property
- * of the row, so the list and the cards cannot disagree about what a plan is.
+ * newest run joined on as its view in context, how many things wait on a
+ * person, the plan's own inbox rows and its items on Your turn, what every
+ * run of it spent and who pays for the newest. Everything a sort, a filter, a
+ * column or a card needs is a property of the row, so the list, the cards and
+ * the panel's reasons (`./why`) cannot disagree about what a plan is.
  *
  * It reads the SLIM run list (#234): a run's word in context needs its status,
  * its lifecycle, its halt and one word per phase, which is what the slim row
@@ -20,9 +22,12 @@
 import { describeRun, describeWord, type RunCtx, type StatusView } from '@shared/status-model.js';
 import { countsTowardAttention } from '@shared/attention-model.js';
 import { PLAN_STATUS_ORDER, progressReading } from '@shared/plan-vocab.js';
-import { BOARD_STATE_UI, type BOARD_BUCKETS, type UiState } from '@shared/status-vocab.js';
-import type { EtaEstimate, InboxItem, PlanSummaryFull } from '@/data/api';
+import { BOARD_BUCKETS, BOARD_STATE_UI, type UiState } from '@shared/status-vocab.js';
+import type { AccountView, EtaEstimate, InboxItem, PhaseView, PlanSummaryFull } from '@/data/api';
+import type { ShareWord } from '@/ui/status';
 import { asRunLike, type RunLike } from '@/data/lanes';
+import { itemRows, itemsNow } from '@/data/turn';
+import { payerProvider, payerWho } from '@/lib/account-line';
 import { isClosed as readClosed } from '@/lib/closure';
 import { plural } from '@/lib/format';
 import { defineFilters, defineSorts, matchesWords, words, type SortSpec } from '@/lib/list-model';
@@ -99,6 +104,18 @@ export interface PlanRow {
    * nobody is waiting on it. Zero on a closed plan.
    */
   needsYou: number;
+  /**
+   * Its items on Your turn, read off the same inbox — every one still open
+   * (every group but Done, as the plan's own Your turn view counts them), and
+   * those that ask a person now. Zero on a closed plan.
+   */
+  turn: { open: number; now: number };
+  /** The inbox rows about this plan — what its reasons and its columns read. Empty on a closed plan. */
+  inbox: InboxItem[];
+  /** What its runs have spent — booked, and still in flight — and how many runs there were. */
+  spend: { usd: number; liveUsd: number; runs: number };
+  /** Who pays for its newest run, in the account's own words. */
+  account?: { id: string; who: string; provider: string };
 
   run?: RowRun;
   /** The summary as the server sent it — the inspector's raw tab. Absent on a row built by hand. */
@@ -128,17 +145,32 @@ export function toRows(
   now = Date.now(),
   /** The unified inbox, or nothing on a console that cannot answer for it. */
   inbox: readonly InboxItem[] = [],
+  /** The accounts this console may spend, to name who pays — absent, an account is named by its id. */
+  accounts?: readonly AccountView[],
 ): PlanRow[] {
   const waiting = new Map<string, number>();
+  const rowsOf = new Map<string, InboxItem[]>();
   for (const item of inbox) {
-    if (!item.slug || !countsTowardAttention(item.severity)) continue;
+    if (!item.slug) continue;
+    const mine = rowsOf.get(item.slug);
+    if (mine) mine.push(item);
+    else rowsOf.set(item.slug, [item]);
+    if (!countsTowardAttention(item.severity)) continue;
     waiting.set(item.slug, (waiting.get(item.slug) ?? 0) + 1);
   }
 
   const newest = new Map<string, RunLike>();
+  const spent = new Map<string, { usd: number; liveUsd: number; runs: number }>();
   for (const run of runs) {
     const held = newest.get(run.slug);
     if (!held || stamp(run.createdAt) > stamp(held.createdAt)) newest.set(run.slug, run);
+    const sum = spent.get(run.slug) ?? { usd: 0, liveUsd: 0, runs: 0 };
+    const live = (run as { liveUsd?: number }).liveUsd ?? 0;
+    spent.set(run.slug, {
+      usd: sum.usd + (run.spentUsd ?? 0),
+      liveUsd: sum.liveUsd + live,
+      runs: sum.runs + 1,
+    });
   }
   const rowRun = (run: RunLike | undefined, planClosed: boolean): RowRun | undefined =>
     run && {
@@ -203,11 +235,33 @@ export function toRows(
       firstIssue: plan.engineError ?? worst?.message,
       claim: claim ? { owner: claim.owner, phase: claim.phase, expired: claim.expired } : undefined,
       needsYou: closed ? 0 : (waiting.get(plan.slug) ?? 0),
+      turn: closed ? { open: 0, now: 0 } : turnCountsOf(rowsOf.get(plan.slug) ?? []),
+      inbox: closed ? [] : (rowsOf.get(plan.slug) ?? []),
+      spend: spent.get(plan.slug) ?? { usd: 0, liveUsd: 0, runs: 0 },
+      ...accountOf(newest.get(plan.slug), accounts),
 
       run: rowRun(newest.get(plan.slug), closed),
       summary: plan,
     };
   });
+}
+
+/** Who pays for a run, in the account's own words — its name, its provider. */
+function accountOf(
+  run: RunLike | undefined,
+  accounts: readonly AccountView[] | undefined,
+): Pick<PlanRow, 'account'> {
+  if (!run) return {};
+  const id = run.accountId ?? 'default';
+  return { account: { id, who: payerWho(id, accounts), provider: payerProvider(id, accounts) } };
+}
+
+/** Its items on Your turn, read off the inbox: every open one, and those it asks now. */
+export function turnCountsOf(rows: readonly InboxItem[]): { open: number; now: number } {
+  return {
+    open: itemRows(rows.filter((row) => row.turn && row.turn.group !== 'done')).length,
+    now: itemsNow(rows).length,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -473,6 +527,62 @@ export function legendOf(row: CountsSource, nowMs?: number): string {
 /** The track's accessible name: the plan, its phase count and every count in words. */
 export function countsLabel(row: CountsSource & Pick<PlanRow, 'title'>, nowMs?: number): string {
   return `${row.title}, ${plural(row.phases, 'phase')}: ${legendWords(row, nowMs).join(', ')}`;
+}
+
+/* ------------------------------------------------------------------ *
+ * The pipeline — the phases in their own order
+ * ------------------------------------------------------------------ */
+
+/** One phase on the line, where it stands: its share of the plan, its gate, its title. */
+export interface PipelineStop {
+  phase: number;
+  /** A word no share holds is `null` — drawn as the bare track. */
+  share: ShareWord | null;
+  /** An open gate holds it: next up or waiting behind its gate. */
+  gated?: boolean;
+  /** Already through `plainText`. */
+  title?: string;
+}
+
+const BUCKET_WORDS: ReadonlySet<string> = new Set(BOARD_BUCKETS);
+
+/**
+ * The plan's phases in their OWN order, each placed the way `countsOf` places
+ * it — so the line the panel draws from a plan's detail (`phases[].state`) and
+ * the line the list draws from its counts say the same thing, one in phase
+ * order and one grouped. A phase QA failed is held by QA unless it stands (in
+ * progress, stuck, next up); a gate marks an open phase only; a closed plan's
+ * phases are done or never ran. Null when the board could not be read: an
+ * order made up of guesses is not drawn at all.
+ */
+export function pipelineOf(
+  row: CountsSource,
+  phases: readonly Pick<PhaseView, 'phase' | 'state' | 'gated' | 'title'>[] | undefined,
+): PipelineStop[] | null {
+  if (!phases?.length || row.progress === 'unknown') return null;
+  const held = new Set(row.qaFailures);
+  return [...phases]
+    .sort((a, b) => a.phase - b.phase)
+    .map((p) => {
+      const done = p.state === 'done';
+      const open = p.state === 'ready' || p.state === 'waiting';
+      const share: ShareWord | null = row.isClosed
+        ? done
+          ? 'done'
+          : 'never'
+        : held.has(p.phase) && (done || p.state === 'waiting')
+          ? 'held-by-qa'
+          : BUCKET_WORDS.has(p.state)
+            ? (p.state as BoardBucket)
+            : null;
+      const title = p.title ? plainText(p.title) : '';
+      return {
+        phase: p.phase,
+        share,
+        ...(p.gated && open && !row.isClosed ? { gated: true } : {}),
+        ...(title ? { title } : {}),
+      };
+    });
 }
 
 /**

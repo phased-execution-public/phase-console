@@ -51,6 +51,25 @@ const settingsOf = (dir: string): Settings => JSON.parse(readFileSync(join(dir, 
 const commands = (settings: Settings): string[] =>
   Object.values(settings.hooks ?? {}).flatMap((groups) => groups.flatMap((group) => (group.hooks ?? []).map((hook) => hook.command)));
 
+/**
+ * `envFor` provisions a profile from the machine's own login (`~/.claude`:
+ * its `plugins` dir is linked in). Once that login's INSTALLED phased-execution
+ * plugin carries the presence hooks itself (measured-console phase 10), the
+ * installer splices nothing — correctly — so a test of the splice must not meet
+ * the machine's plugin. These run `fn` with a `HOME` that has no login.
+ */
+async function withBareLogin<T>(scratch: string, fn: () => Promise<T>): Promise<T> {
+  const real = process.env.HOME;
+  const home = join(scratch, 'bare-home');
+  mkdirSync(home, { recursive: true });
+  process.env.HOME = home;
+  try {
+    return await fn();
+  } finally {
+    if (real === undefined) delete process.env.HOME; else process.env.HOME = real;
+  }
+}
+
 /** A stand-in for `~/.claude`: plugins on, the presence hook installed, and hooks of the person's own. */
 function login(scratch: string): string {
   const dir = join(scratch, 'login');
@@ -135,7 +154,7 @@ test('PP-2 — a profile account\'s env is provisioned with presence on the way 
     (accounts as unknown as { store: { add(meta: Record<string, unknown>): void } }).store.add({
       id: 'work', kind: 'profile', name: 'work', createdAt: new Date().toISOString(),
     });
-    const env = await accounts.envFor('work', ['/repo/a']);
+    const env = await withBareLogin<NodeJS.ProcessEnv | null>(scratch, () => accounts.envFor('work', ['/repo/a']));
     const dir = profileConfigDir('work', join(scratch, 'accounts'));
     assert.equal(env?.CLAUDE_CONFIG_DIR, dir);
     const status = hooksStatus({ skillDir: SKILL_DIR, settingsPath: join(dir, 'settings.json') });
@@ -260,7 +279,7 @@ test('PP-3 — a phase session on a profile account appears in /api/sessions/reg
     saveRun(state);
 
     // What the runner hands a lane on this account (`accountEnv` → `envFor`), and what it adds itself.
-    const accountEnv = await accounts.envFor('work', [root]);
+    const accountEnv = await withBareLogin<NodeJS.ProcessEnv | null>(base, () => accounts.envFor('work', [root]));
     assert.ok(accountEnv?.CLAUDE_CONFIG_DIR, 'a profile runs under its own config dir');
     const env: NodeJS.ProcessEnv = {};
     for (const [key, value] of Object.entries(process.env)) {

@@ -311,7 +311,7 @@ that are next up, `insights` for the numbers, `help` or `guide` for this sheet.
 
 ## The route map
 
-A plan's **Phases** has a **Map** view beside **Table**, **QA** and **Handoffs**, and it draws the plan as
+A plan's **Phases** has a **Map** view beside **Table** and **Handoffs & QA**, and it draws the plan as
 a route: a station per phase, a line per dependency. It opens locked, as a picture the page scrolls past;
 press **Pan and zoom** (the lock) to drag and pinch it, and this browser remembers which you chose. The
 zoom readout, **−**, **+** and **Fit** work either way, and double-clicking the map fits it too. A plan too
@@ -347,7 +347,11 @@ The tools above the map change what it shows, and each is a part of the address
 On a desk, a station's hover card gives its state, size, estimate, cost, attempts, claim and gate, with
 **Open phase**, **Inspect** and **Trace**.
 
-Two more readings sit beside **Table** and **Map**. **Schedule** (`?view=schedule`) draws when each phase
+**Handoffs & QA** (`?view=handoffs`) is each phase's record in plan order: what its session handed off and
+what its review found, side by side, and a row opens onto the two as cards — the handoff and its word, the
+QA regime, verdict, rounds and report. An old `?view=qa` address opens it too.
+
+Two more readings sit beside **Table**, **Map** and **Handoffs & QA**. **Schedule** (`?view=schedule`) draws when each phase
 still to run is expected to start and end, *if nothing waits for a seat*: each starts once everything it
 waits on is expected to end, and takes its estimate. **Burn-up** (`?view=burnup`) draws the phases done, and
 their weight done, over time against the plan's whole, with the forecast's band from now to its earliest
@@ -472,6 +476,7 @@ phase, and the phases already queued or in flight keep their places. A run-level
 | `phase-blocked` | phase | The session declared itself blocked. |
 | `waiting-external-timeout` | phase | A declared external wait was not resumed. |
 | `needs-human` | phase | An errand only a person can settle. |
+| `plan-approval` | phase | A plan-mode session presented its plan, and the plan waits for you to approve or reject it. |
 | `awaiting-person` | phase | A person was asked — a verification or permission card — and its clock ran out unanswered. |
 | `phase-crashed` | phase | The phase failed inside the runner. |
 | `verification-preflight` | phase | The phase's §Verification gave the runner nothing it could run. |
@@ -493,6 +498,10 @@ phase, and the phases already queued or in flight keep their places. A run-level
 | `nothing-ready` | run | Phases remain, each behind a gate, an errand, a Retry or another plan's lock. |
 | `interrupted-by-restart` | run | The run was found in flight with no live session after the console driving it went away. |
 | `operator-stop` | run | Stop was pressed on a run this console was not driving. |
+| `credential-refused` | run | The run's Claude account was refused. The account is retired for its organisation, and the errand names the sign-in. |
+| `identity-changed` | run | The run's account now signs in as somebody else. The errand offers both ways on — continue on the new login, or move to a profile of the identity the run started on — and only your press resumes it. |
+| `isolation-refused` | run | The run asked for a checkout of its own and could not have one. Dropping isolation is your act; the halt names the refusal and its fix. |
+| `unlanded` | run | Every phase is done and the run's branch is not on its trunk. One errand: a merge errand tree, then a landing — never *finished* over unlanded work. |
 | `credential-refused` | run | The API refused the credential the run spends, and the account is retired for its organisation. Only a person's press relaunches it. |
 
 ## Board state

@@ -1,0 +1,4 @@
+{
+  "note": "The reds a release carries — a ratchet (measured-console phase 15). A gate stage whose every failing test is listed here passes and says so; one red not listed fails it. A listed red that passes is FIXED: `node scripts/reds-ratchet.mjs lower <stage> <log>` takes it out, and nothing ever adds one but a person with an issue to name. viewer/test/reds-ratchet.test.ts holds the shape.",
+  "reds": []
+}

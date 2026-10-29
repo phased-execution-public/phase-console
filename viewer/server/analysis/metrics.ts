@@ -162,6 +162,8 @@ export type MetricsFacts = {
   load?: { avg5: number; threshold: number | null };
   /** The lanes kept for a phase (control-tower phase 100), armed or waiting for their lane. Absent ⇒ nothing. */
   reservations?: { armed: number; waiting: number };
+  /** The token family (measured-console phase 19). Absent ⇒ both families emit nothing. */
+  tokens?: MetricsTokens;
 };
 
 /**
@@ -170,6 +172,19 @@ export type MetricsFacts = {
  * is null until measured; `wallsInSeconds` null when the window is flat,
  * unmeasured, or resets before it walls.
  */
+/**
+ * The token family's facts (measured-console phase 19): tokens by kind from the usage ledger
+ * (`meter`) and from the attribution file (`otel`), and the ledger's 24-hour cache hit percent.
+ */
+export type MetricsTokens = {
+  meter: Readonly<Record<string, number>>;
+  otel: Readonly<Record<string, number>>;
+  cacheHitPct: number | null;
+};
+
+/** The kinds `phase_console_tokens_total` is labelled by, in emission order. */
+export const TOKEN_KINDS = Object.freeze(['input', 'output', 'cache_read', 'cache_write', 'cache_write_5m', 'cache_write_1h'] as const);
+
 /** One account's credit spend (control-tower phase 93, #146). */
 export type MetricsAccountCredit = { account: string; currency: string; used: number };
 
@@ -250,12 +265,13 @@ export const METRIC_FAMILIES: readonly (readonly [string, 'gauge' | 'counter', s
   ['phase_console_account_credit_used', 'gauge',
     'Credits an account has used this month, in its currency\'s major unit, by account id and currency. Absent while its credit state is unknown.'],
   // Lanes, policies and capacity (control-tower phase 100, #135 D and G): the
-  // load the guard reads, the line it holds new admissions at, and the lanes
-  // kept for a phase.
+  // load average the guard reads as its ceiling (CPU busy is its reading since
+  // one-pool phase 26, #243), the line it holds new admissions at, and the
+  // lanes kept for a phase.
   ['phase_console_load_average', 'gauge',
-    'The machine\'s 5-minute load average — the reading the load guard holds new admissions on.'],
+    'The machine\'s 5-minute load average — the load guard\'s ceiling, not its reading: the guard holds new admissions on the CPU busy over the last 30 s, and on this average only above the threshold.'],
   ['phase_console_load_guard_threshold', 'gauge',
-    'The 5-minute load above which new admissions wait: the guard\'s factor times the machine\'s cores. Absent when the guard is off.'],
+    'The 5-minute load above which new admissions wait whatever the CPU reads: the guard\'s factor times the machine\'s cores times 2. Absent when the guard is off.'],
   ['phase_console_lane_reservations', 'gauge',
     'Lanes kept for a phase, by `armed` — `yes` once the lane each waits for has ended and it is holding its scope and slot.'],
   // The console's OWN runtime (control-tower phase 7). Every family above is
@@ -289,7 +305,7 @@ export const METRIC_FAMILIES: readonly (readonly [string, 'gauge' | 'counter', s
   // from the next.
   ['phase_console_log_lines_total', 'counter', 'Console log lines written, by level. A line the level dropped is not counted.'],
   ['phase_console_journal_appends_total', 'counter', 'Journal lines appended across every run this process drove.'],
-  ['phase_console_journal_overflow_total', 'counter', 'Journals that crossed the soft cap and fell back to the terminal reserve.'],
+  ['phase_console_journal_overflow_total', 'counter', 'Journals that filled their last segment (eight rotations of 32 MB) and fell back to the terminal reserve.'],
   ['phase_console_transcript_shed_total', 'counter', 'Transcript records dropped rather than stored, by kind.'],
   ['phase_console_git_commands_total', 'counter', 'Git commands run through the seam, by verb and whether they exited 0.'],
   ['phase_console_git_command_seconds_total', 'counter', 'Seconds spent inside git, by verb.'],
@@ -557,6 +573,7 @@ export function renderMetrics(facts: MetricsFacts): string {
   emit('phase_console_lane_reservations', 'gauge', facts?.reservations
     ? [{ labels: { armed: 'yes' }, value: facts.reservations.armed }, { labels: { armed: 'no' }, value: facts.reservations.waiting }]
     : []);
+
 
   emitCounters();
 

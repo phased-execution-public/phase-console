@@ -53,8 +53,10 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: 'every phase each phase must wait for — a DAG, never a line' },
   { field: 'Size', flags: ['--size'], home: '- **Size:** S|M|L on each phase',
     question: "each phase's weight against the session budget (default M)" },
-  // `--model [N]` (one-pool phase 4) reads back the target line and a phase's `- **Model:**`.
-  { field: 'Target model', flags: ['--session-plan', '--model'], home: '## Session budget, **Target model:**',
+  // `--model [N]` (one-pool phase 4) reads back the target line and a phase's `- **Model:**`;
+  // `--subagent-model [N]` (measured-console phase 6) the side work's model beside it, asked
+  // with it — the template is held under 10 KB, and a row of its own would not fit.
+  { field: 'Target model', flags: ['--session-plan', '--model', '--subagent-model'], home: '## Session budget, **Target model:** (**Subagent model:**)',
     question: 'the model that will EXECUTE the phases — it sets the budget' },
   { field: 'Gate-check', flags: ['--gated', '--gate-kind', '--gate-status'], home: '*(GATED)* headings with - **Gates:** and - **Gate-check:**',
     question: 'which phases wait on something outside the plan, and who can clear it (default ai)' },
@@ -83,8 +85,8 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: "the longest a phase may stay parked on an external clock, and how many waits (default the console's)" },
   { field: 'Waits on', flags: ['--waits-on'], home: '- **Waits on:** <ref> · <max>',
     question: 'the external clocks a phase is known to wait on, each with its --watch ref' },
-  { field: 'Verify timeout', flags: ['--verify-timeout'], home: '**Verify timeout:** and - **Verify timeout:**',
-    question: "how long one §Verification command may run before its clock cuts it (default 3× the line's longest recent run, 30 min to 4 h)" },
+  { field: 'Verify timeout', flags: ['--verify-timeout', '--verification-tier'], home: '**Verify timeout:**, **Verification tier:**',
+    question: "how long one §Verification command may run (default 3× its longest recent run); impact|full: heavy suites selected to the diff, or as written" },
   { field: 'Wall-clock floor', flags: ['--floor'], home: '- **Wall-clock floor:** <duration>',
     question: "the least wall-clock time a phase takes whatever its Size — a full gates.sh run, a CD wait (default none)" },
   { field: 'Decisions', flags: ['--decisions'], home: '## Decisions',
@@ -113,8 +115,10 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: 'whether sessions of this plan may message each other mid-phase (default on)' },
   { field: 'Issues', flags: ['--issues'], home: `**Issues:** ${ISSUE_MODES.join('|')} and - **Issues:**`,
     question: 'whether a session may open an issue for something outside its phase (default off)' },
-  { field: 'Skills', flags: [], home: '**Skills (every session):**',
-    question: 'skills every session re-invokes before implementing (default none)' },
+  // `--plugins [N]` (measured-console phase 27) reads back the plugin kinds beside the skills,
+  // asked with them — the template is held under 10 KB, and a row of its own would not fit.
+  { field: 'Skills', flags: ['--skills', '--plugins'], home: '**Skills (every session):**, **Plugins:**',
+    question: 'skills every session re-invokes, and plugin kinds it loads (default none)' },
   { field: 'Worktrees', flags: [], home: '- **Worktrees:** on|off',
     question: 'whether disjoint lanes each get their own checkout (default off)' },
   { field: 'Branch', flags: [], home: '**Branch:**',
@@ -135,6 +139,16 @@ export const STATE_FLAGS: Readonly<Record<string, string>> = Object.freeze({
   '--qa-prompt': "composes the reviewer's brief from the fields above",
   '--boot-prompt': "composes a session's boot prompt from the fields above (Skills reaches a session only through it)",
   '--boot-fanout': "composes a fan-out handoff's shared boot once and each phase's own block — the same prompts, written once (#115)",
+  // measured-console phase 2: what a session used to read out of the skill or grep from the plan.
+  '--section': "prints a phase's own section, its graph row and the budget lines that bind it — authored as the phase, never asked",
+  // measured-console phase 6: two per-phase guards whose defaults are the safe answer, so a
+  // plan states one only to lift it for the phase that needs it — never a wizard question.
+  '--fast-gate': "a phase's `- **Fast gate:** off` — the Stop hook's fast gate is on unless a phase turns it off, never asked",
+  '--may-delete-tests': "a phase's `- **May delete tests:** yes` — the guard's deny stands unless a phase lifts it, never asked",
+  // measured-console phase 4: the SessionStart brief, composed like the boot prompt.
+  '--brief': "composes the SessionStart brief the presence hook prints from the fields above",
+  '--help': "the engine's mode list, one line each — reads no plan",
+  '--explain': "a lint's paragraph from scripts/lints.env — reads no plan",
   '--plan-status': 'the frontmatter status, written by close-plan.sh, never asked',
   '--closed': 'the predicate over that status',
   // control-tower phase 41: asked once, by the manifest's `human-acts`
@@ -144,6 +158,8 @@ export const STATE_FLAGS: Readonly<Record<string, string>> = Object.freeze({
   // the wizard writes for every phase — so it is authored with that block,
   // never asked as a field of its own.
   '--verify-in': "the `**Verify in:**` directory a phase's §Verification runs from — written with that block, which every phase carries",
+  '--out-of-scope': "a phase's `- **Out of scope:**` bullet and its continuation lines — written by the plan's author or an amendment, never asked",
+  '--not-yet-specified': "the plan's `## Not yet specified` section — written by the plan's author or an amendment, never asked",
 });
 
 /** The question the wizard asks for each manifest key, in `DECISION_KEYS` order. */

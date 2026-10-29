@@ -248,6 +248,9 @@ const plan = (over: Partial<PlanRow> & Pick<PlanRow, 'slug'>): PlanRow => ({
   errors: 0,
   warnings: 0,
   needsYou: 0,
+  turn: { open: 0, now: 0 },
+  inbox: [],
+  spend: { usd: 0, liveUsd: 0, runs: 0 },
   ...over,
 });
 

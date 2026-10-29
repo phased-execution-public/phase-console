@@ -38,7 +38,7 @@ const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const { Runner } = await import('../server/runner/runner.ts');
 const { lockLapsed } = await import('../server/runner/scheduler.ts');
-const { classifySituation, collectEvidence } = await import('../server/runner/situation.ts');
+const { collectEvidence } = await import('../server/runner/situation.ts');
 const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
 
 type RunState = import('../server/runner/state.ts').RunState;
@@ -194,7 +194,7 @@ test('both evidence builders produce identical PhaseEvidence for one fixture pha
     const runner = new Runner({
       scriptsDir: SCRIPTS,
       now: () => FIXED,
-      evidenceDeps: (slug: string) => shared,
+      evidenceDeps: (_slug: string) => shared,
     } as never);
     (runner as unknown as { state: RunState }).state = state;
     const fromRunner = await (runner as unknown as {

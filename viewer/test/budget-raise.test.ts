@@ -20,6 +20,7 @@
  */
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
 import './state-sandbox.ts';
+import { readStoredRun } from '../server/runner/state.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -34,7 +35,7 @@ import {
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
-const { journalFile, runFile } = await import('../server/runner/run-paths.ts');
+const { journalFile } = await import('../server/runner/run-paths.ts');
 const { spentBudgetPark } = await import('../server/runner/runner-loop.ts');
 const { capErrand, errandFor, budgetFirst } = await import('../server/runner/ladder.ts');
 const {
@@ -352,7 +353,7 @@ test('BR-4: a wait raise writes the plan, journals who and by how much, re-arms 
     );
     assert.equal(line!.data?.reason, 'the build moved to the slow box');
     assert.equal(line!.phase, 2);
-    const after = JSON.parse(readFileSync(runFile(root, 'alpha', state.id), 'utf8')) as RunState;
+    const after = readStoredRun(root, 'alpha', state.id)!;
     assert.equal(after.phases['2'].declared?.budgetSpent, undefined, 'the watch is re-armed: no spent stamp holds its clock');
     assert.equal(after.recoveries?.['2']?.errand, undefined, 'the budget errand is answered');
     assert.deepEqual(retried, [{ slug: 'alpha', phase: 2 }], 'and it retries, in the same press');
@@ -402,7 +403,7 @@ test('BR-5: a dollar raise writes the run setting, journals, clears the halt and
     saveRun(state);
     const answer = await svc.raiseBudget('alpha', { budget: 'run-usd', add: 10 }, PRESS);
     assert.equal(answer.ok, true, JSON.stringify(answer));
-    const after = JSON.parse(readFileSync(runFile(root, 'alpha', state.id), 'utf8')) as RunState;
+    const after = readStoredRun(root, 'alpha', state.id)!;
     assert.equal(after.runBudgetUsd, 30);
     assert.equal(after.halt, null);
     assert.equal(after.errand ?? null, null);
@@ -412,7 +413,7 @@ test('BR-5: a dollar raise writes the run setting, journals, clears the halt and
 
     const phase = await svc.raiseBudget('alpha', { budget: 'phase-usd', phase: 2, to: 25 }, PRESS);
     assert.equal(phase.ok, true, JSON.stringify(phase));
-    const again = JSON.parse(readFileSync(runFile(root, 'alpha', state.id), 'utf8')) as RunState;
+    const again = readStoredRun(root, 'alpha', state.id)!;
     assert.equal(again.phaseBudgetUsd, 25);
     assert.deepEqual(retried.at(-1), { slug: 'alpha', phase: 2 }, 'a phase cap retries the phase');
   } finally {
@@ -432,7 +433,7 @@ test('BR-6: a ladder raise writes ladderPerRunRungs and retries; the streak is c
     saveRun(state);
     const answer = await svc.raiseBudget('alpha', { budget: 'ladder', phase: 2, add: 4 }, PRESS);
     assert.equal(answer.ok, true, JSON.stringify(answer));
-    const after = JSON.parse(readFileSync(runFile(root, 'alpha', state.id), 'utf8')) as RunState;
+    const after = readStoredRun(root, 'alpha', state.id)!;
     assert.equal(after.ladderPerRunRungs, 16);
     assert.equal(after.recoveries?.['2']?.errand, undefined);
     const line = journal(root, state.id).find((entry) => entry.event === 'run.budget-raised');

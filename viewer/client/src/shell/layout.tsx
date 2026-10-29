@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
 import { cn } from '@/lib/cn';
-import { BP_WIDE, useMediaQuery } from '@/lib/media';
+import { BP_WIDE, useMediaQuery, useNarrow } from '@/lib/media';
 import { usePrefs } from '@/lib/prefs';
 import { useKeyboardOpen } from '@/lib/viewport';
 import type { ConsoleState } from '@/data/api';
@@ -58,6 +58,9 @@ export function ShellLayout({
   const main = useRef<HTMLElement>(null);
   const [prefs] = usePrefs();
   const wide = useMediaQuery(`(min-width: ${BP_WIDE}px)`);
+  // Below 640 the panel is a bottom sheet; from 640 an end drawer, so a tablet
+  // held upright reads a record beside the page's edge (2026-10-20).
+  const narrow = useNarrow();
   // The panel stands only where its mode has something to show: Details once
   // something is inspected, the Supervisor where a server offers one.
   const panel = panelStands(prefs.panel, state, head, phone);
@@ -100,7 +103,7 @@ export function ShellLayout({
   // The panel beside the page at 1200 and up; a sheet below, in either shape.
   const panelNode = panel ? (
     <Suspense fallback={null}>
-      <Panel state={state} route={route} host={wide && !phone ? 'column' : phone ? 'bottom' : 'end'} />
+      <Panel state={state} route={route} host={wide && !phone ? 'column' : narrow ? 'bottom' : 'end'} />
     </Suspense>
   ) : null;
 
@@ -126,6 +129,8 @@ export function ShellLayout({
         // `.is-phone` is the shell contract: the class the layout, the tests
         // and the browser checks all agree means "header + tab bar, no rail".
         className={cn(
+          // A container, so the panel's column can leave the page a desk's room (`frame.tsx`).
+          '@container/shell',
           'grid h-(--app-height) overflow-hidden bg-ground',
           phone ? 'is-phone grid-rows-[auto_minmax(0,1fr)_auto]' : 'grid-cols-[auto_minmax(0,1fr)_auto]',
         )}

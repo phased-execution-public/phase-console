@@ -314,7 +314,7 @@ async function call(svc: unknown, method: 'GET' | 'POST', path: string, body: un
   return out;
 }
 
-function repo(): string {
+function plansRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'pc-lane-verbs-'));
   trash.push(root);
   mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
@@ -338,7 +338,7 @@ const lines = (root: string, run: RunState) =>
     .map((line) => JSON.parse(line) as { event: string; phase?: number; data?: Record<string, unknown> });
 
 test('LP-1: a yield reserves the yielding lane for the named phase, asks the session to hand off, and is journalled on the yielding run', async () => {
-  const root = repo();
+  const root = plansRoot();
   const svc = service(root);
   try {
     const alpha = stored(root, 'alpha');
@@ -392,7 +392,7 @@ test('LP-2: the lane verbs are rows of the one verb table, beside isolate-phase 
   }
   assert.equal(new Set(OPERATOR_VERBS.map((row) => row.name)).size, OPERATOR_VERBS.length, 'one row per verb');
 
-  const root = repo();
+  const root = plansRoot();
   const svc = service(root);
   try {
     const alpha = stored(root, 'alpha');

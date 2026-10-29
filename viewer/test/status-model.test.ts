@@ -78,6 +78,7 @@ import { LANDING_STATES } from '../shared/landing-model.js';
 import { HANDOFF_WORDS, VERIFICATION_LINE_WORDS, VERIFICATION_WORDS } from '../shared/evidence-model.js';
 import { INBOX_SEVERITIES } from '../shared/attention-model.js';
 import { ISSUE_CATEGORIES, ISSUE_PLAN_STATES, ISSUE_SEVERITY_WORDS } from '../shared/issues-model.js';
+import { CRITERION_VERDICTS } from '../shared/run-settings.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const sorted = (xs: readonly string[]) => [...xs].sort();
@@ -116,6 +117,8 @@ const OWNERS: Record<string, readonly string[]> = {
   'checkout-role': CHECKOUT_ROLES,
   landing: LANDING_STATES,
   verification: VERIFICATION_WORDS,
+  // The independent evaluator's word on a criterion (measured-console phase 22, 6257f2b8).
+  evaluation: CRITERION_VERDICTS,
   'verification-line': VERIFICATION_LINE_WORDS,
   'issue-category': ISSUE_CATEGORIES,
   'issue-severity': ISSUE_SEVERITY_WORDS,

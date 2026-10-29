@@ -70,7 +70,7 @@ import {
   type PlanStats, type Portfolio, type PlanContext, type EtaEstimate, type EtaSample,
   type PhaseEta, type RateReading, type Forecast, type EtaShape, type RemainingFloor,
 } from './analysis/stats.ts';
-import { mcpServersFor, type Plan, type PhaseDetail, type PhaseRow, type PhaseSize } from './parse/plan.ts';
+import { mcpServersFor, type Plan, type PhaseDetail, type PhaseRow, type PhaseSize, type SessionBudget } from './parse/plan.ts';
 import {
   Runner, applySettings, VERIFICATION_PARK_NOTE, MCP_PARK_NOTE,
   type AskResult, type RecoverMode, type RunSettingsPatch, type StartOptions,
@@ -251,6 +251,8 @@ export type PhaseView = {
   steps?: string;
   exitCriteria?: string;
   verification?: string;
+  /** The plugin kinds the plan gives this phase — its `**Plugins:**` line ∪ its bullet (measured-console phase 27). */
+  plugins?: string[];
   handoffMustRecord?: string;
   /** `?include=prose` — see `shared/projection.js`. Absent on the board projection. */
   bullets?: { label: string; body: string }[];
@@ -375,7 +377,7 @@ export type PlanDetail = {
    */
   plan: {
     slug: string; title: string; provenance?: string; context?: string; architecture?: string;
-    endToEnd?: string; sessionBudget: unknown; graph?: PhaseRow[]; callouts?: string[];
+    endToEnd?: string; sessionBudget: SessionBudget; graph?: PhaseRow[]; callouts?: string[];
     sections?: { title: string; body: string }[];
     /** The `## Decisions` manifest as it holds (plan ⊕ twin); `?include=document`. */
     decisions?: DecisionRow[];
@@ -598,17 +600,8 @@ export class RunBusyError extends Error {
  * it — the client mirrors this in `lib/evidence.ts` and the identity test in
  * `test/evidence-model.test.ts` is what stops the two drifting.
  */
-export type EvidenceView = {
-  board: string;
-  handoff: string;
-  verification: string;
-  qa: string;
-  /** Whether the claim is backed. Never named `done`. */
-  evidenced: boolean;
-  /** The board paints work in flight and nothing live was found behind it. */
-  stale: boolean;
-  why: string[];
-};
+/** What `deriveEvidence` answers — the wire's `EvidenceProof`, one shape both sides read. */
+export type EvidenceView = import('../shared/wire/runs.js').EvidenceProof;
 
 /* ------------------------------------------------------------------ *
  * Liveness — the fact the board word is a claim about
@@ -829,6 +822,10 @@ export const INBOX_SOURCES = [
   // A person's turn moved (control-tower phase 42): a step declared, opened,
   // checked, proven or settled is an inbox row appearing, changing or leaving.
   'human-step',
+  // A restart's update moved (measured-console phase 14, #414): the health row
+  // for an update that could not fetch is read from it, and leaves when the
+  // next update replaces it — the memo must not serve the row past that.
+  'restart',
 ];
 
 /**

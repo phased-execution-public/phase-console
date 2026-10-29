@@ -34,7 +34,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,6 +44,7 @@ import type { RunState } from '../server/runner/state.ts';
 import { withWallReadings } from '../shared/situation-model.js';
 import type { HeadroomVerdict } from '../server/accounts/index.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 process.env.PHASE_CONSOLE_LOG = '';
 
@@ -254,23 +255,13 @@ test('UW-4: the card over the runner\'s own wait-window park is re-derived at ev
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /** Phase 1's handoff reads in-progress; 2 and 3 wait on it. */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-wall-rung-live-'));
-  const scripts = join(root, 'scripts');
-  const S = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(S, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(S, 'done'), '');
-  writeFileSync(join(S, 'inprog'), '1\n');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-wall-rung-live-',
+    state: { 'inprog': '1\n' },
+    scripts: ({ state: S }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${S}"
 slug="$1"; shift
@@ -293,19 +284,17 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
   return {
-    root, scripts,
+    ...made,
     markDone: (phase) => {
-      writeFileSync(join(S, 'done'), `${readFileSync(join(S, 'done'), 'utf8')}${phase}\n`);
-      writeFileSync(join(S, 'inprog'), '');
+      made.markDone(phase);
+      writeFileSync(join(made.state, 'inprog'), '');
     },
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
 }
 
@@ -318,7 +307,7 @@ function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
 }
 
 test('UW-1: at the reset the parked phase boards by itself, resuming the session it was checkpointed from', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   // The wall has to still stand when the runner's first ladder pass reads it,
   // or the phase is rightly resumed in place (UW-2's lifted wall) and no
   // `wait-window` rung is ever climbed. That pass lands ~0.6–0.8 s in on a busy

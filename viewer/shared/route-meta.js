@@ -208,20 +208,42 @@ export const PLAN_TABS = Object.freeze(['phases', 'run', 'turn', 'source']);
 /**
  * The views of the `phases` tab — the `?view=` of `#/plan/:slug/phases`.
  *
- * One table, four readings: `table` (every column the window fits, grouped by
- * need), `map` (the route drawn as a network — phase 30 decides its engine),
- * `qa` (the same rows with the QA columns forward) and `handoffs` (the same
- * rows with the handoff columns forward). `table` is the default, so it is the
- * one view whose address carries no `?view=`. Six since one-pool phase 16
- * (#376): `schedule` (the plan as a Gantt — what ran, from the run record, and
- * when what is left is expected to start and end) and `burnup` (phases and
- * weight done over time, against the forecast).
+ * One table, its readings: `table` (every column the window fits, grouped by
+ * need), `map` (the route drawn as a network — phase 30 decides its engine)
+ * and `handoffs` — Handoffs & QA, the same rows in plan order with each
+ * phase's record forward: its handoff and its QA side by side (2026-10-20,
+ * Tower strips; before it `qa` and `handoffs` were two readings of one
+ * record, and `?view=qa` still reads as this one). `table` is the default,
+ * so it is the one view whose address carries no `?view=`. Since one-pool
+ * phase 16 (#376) also `schedule` (the plan as a Gantt — what ran, from the
+ * run record, and when what is left is expected to start and end) and
+ * `burnup` (phases and weight done over time, against the forecast).
  *
  * Shared for the same reason `LEGACY_PLAN_TABS` is: three retired tabs redirect
  * INTO these views, and the server's `#/plan/:slug/route` lands on `map`.
  * @type {readonly string[]}
  */
-export const PLAN_PHASE_VIEWS = Object.freeze(['table', 'map', 'qa', 'handoffs', 'schedule', 'burnup']);
+export const PLAN_PHASE_VIEWS = Object.freeze([
+  'table',
+  'map',
+  'handoffs',
+  'schedule',
+  'burnup',
+]);
+
+/**
+ * The sections of Insights, each an address: `#/insights` (the questions) and
+ * — Pro — `#/insights/accounts` (one-pool phase 10: what every account spent)
+ * and `#/insights/tokens` (measured-console phase 31, F2: Tokens & cache —
+ * cache hit per session and account, tokens per tool, skill and hook,
+ * forecast against actual, retry overhead, the side spend, the model mix and
+ * the boot prefix and first-edit context per lane). The first is the default,
+ * so its address carries no segment.
+ * @type {readonly string[]}
+ */
+export const INSIGHT_SECTIONS = Object.freeze([
+  'questions',
+]);
 
 /**
  * Short addresses for two readings of the phases (one-pool phase 16, #376):
@@ -275,7 +297,9 @@ export const LEGACY_PLAN_TABS = Object.freeze({
   // server still MINTS `#/plan/:slug/route` (`server/push/catalogue.ts`), so
   // this entry is load-bearing for every plan push already on a phone.
   route: Object.freeze({ tab: 'phases', view: 'map' }),
-  qa: Object.freeze({ tab: 'phases', view: 'qa' }),
+  // QA and Handoffs are one reading since 2026-10-20 (Tower strips): a
+  // phase's handoff and its QA verdict are halves of one record.
+  qa: Object.freeze({ tab: 'phases', view: 'handoffs' }),
   handoffs: Object.freeze({ tab: 'phases', view: 'handoffs' }),
 });
 
@@ -322,7 +346,9 @@ export const LEGACY_SETTINGS_SECTIONS = Object.freeze({
  * section explained: `quick-start` (the one screen that starts a run),
  * `destinations` (every page on the rail and every overlay), `tower` (the Runs home), `halts` (a run that stopped itself, and the one press back),
  * and — Pro — `supervisor` and `license`; 8.0 (one-pool phase 32) adds — Pro — `accounts` (the
- * kinds, the keys, the pool and its policies, the caps, the picker and Insights ▸ Accounts). Every id has a Persian twin beside its
+ * kinds, the keys, the pool and its policies, the caps, the picker and Insights ▸ Accounts); 9.0 (measured-console
+ * phase 28) adds `settings` (Settings ▸ Skills & plugins and Settings ▸ Hooks), and phase 31 `insights` (Logs ▸ Health
+ * over time and — Pro — Insights ▸ Tokens & cache and the trend). Every id has a Persian twin beside its
  * English file (`<id>.fa.md`); `test/guide-coverage.test.ts` holds both.
  * @type {readonly string[]}
  */
@@ -340,6 +366,8 @@ export const GUIDE_SECTIONS = Object.freeze([
   'your-turn',
   'permissions',
   'mcp',
+  'settings',
+  'insights',
   'mobile',
   'troubleshooting',
   'reference',

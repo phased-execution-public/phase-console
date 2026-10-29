@@ -172,11 +172,6 @@ if (entryMatch) {
     `entry ${entryMatch[1]} is under the budget (${(gz / 1024).toFixed(1)} KB gz of ${BUDGET_GZ / 1024} KB)`,
     gz <= BUDGET_GZ,
   );
-  check(
-    'the entry registers the worker at /sw.js',
-    /["'`]\/sw\.js["'`]/.test(entry),
-    'the registration URL is the contract the two live subscriptions depend on',
-  );
 }
 
 const assets = existsSync(join(DIST, 'assets')) ? readdirSync(join(DIST, 'assets')) : [];
@@ -319,6 +314,22 @@ function chunkClosure(entry) {
     queue.push(...staticImportsOf(chunk));
   }
   return seen;
+}
+
+/* The registration — in the entry or a chunk it imports STATICALLY, which the
+   browser has loaded before the entry runs (measured-console phase 32: the
+   bundler may lift `lib/pwa` into a shared chunk the entry imports, once a lazy
+   page imports it too). A dynamic import would not do: it may never load. */
+if (entryMatch) {
+  const firstPaint = [...chunkClosure(entryMatch[1])];
+  const registers = firstPaint.filter((name) =>
+    /["'`]\/sw\.js["'`]/.test(readFileSync(join(DIST, 'assets', name), 'utf8')),
+  );
+  check(
+    `the entry registers the worker at /sw.js (${registers.join(', ') || 'nowhere'} of ${firstPaint.length} first-paint chunks)`,
+    registers.length > 0,
+    'the registration URL is the contract the two live subscriptions depend on',
+  );
 }
 
 // `plan-vocab-*` (shared/plan-vocab.js) shares the prefix; the page's chunk is `plan-<hash>`.

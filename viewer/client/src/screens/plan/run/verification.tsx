@@ -38,7 +38,7 @@
 
 import { useId, useMemo, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import type { OwedRed, PhaseView, RunState } from '@/data/api';
+import type { OwedRed, PhaseEvaluation, PhaseView, RunState } from '@/data/api';
 import { runsApi, type VerifyWaiver } from '@/data/api/runs';
 import { keys } from '@/data/keys';
 import { press } from '@/data/press';
@@ -53,6 +53,7 @@ import {
 import { cn } from '@/lib/cn';
 import { plural } from '@/lib/format';
 import { Button, Duration, Label, Mono, RelativeTime, toast } from '@/ui';
+import { Money } from '@/ui/money';
 import { Disclosure } from '@/ui/disclosure';
 import { NativeSelect } from '@/ui/native-select';
 import { OpsStatus } from '@/ui/status';
@@ -93,6 +94,8 @@ interface PhaseShare {
   owedByOthers: OwedRed[];
   /** The operator's mid-run waivers of this phase's lines (one-pool phase 21, #267). */
   waivers: VerifyWaiver[];
+  /** The independent evaluator's newest verdict — advisory (measured-console phase 22). */
+  evaluation?: PhaseEvaluation;
 }
 
 const ms = (at: string): number => {
@@ -137,6 +140,7 @@ function sharesOf(
   proofs: readonly RunProof[],
   owed: ReadonlyMap<number, OwedRed[]>,
   waivers: readonly VerifyWaiver[] = [],
+  evaluations: ReadonlyMap<number, PhaseEvaluation> = new Map(),
 ): PhaseShare[] {
   const by = new Map<number, PhaseShare>();
   const share = (phase: number): PhaseShare => {
@@ -175,6 +179,11 @@ function sharesOf(
     const one = share(phase);
     one.owedByOthers = reds;
     for (const red of reds) one.latest = Math.max(one.latest, ms(red.at));
+  }
+  for (const [phase, evaluation] of evaluations) {
+    const one = share(phase);
+    one.evaluation = evaluation;
+    one.latest = Math.max(one.latest, ms(evaluation.at));
   }
   for (const one of by.values()) {
     const waived = new Set(one.waivers.map((waiver) => waiver.text));
@@ -223,9 +232,17 @@ export function RunVerificationFold({
     () => (run?.verifyWaivers ?? []).filter((one) => phase === undefined || one.phase === phase),
     [run, phase],
   );
+  const evaluations = useMemo(() => {
+    const out = new Map<number, PhaseEvaluation>();
+    for (const record of Object.values(run?.phases ?? {})) {
+      if (record.evaluation && (phase === undefined || record.phase === phase))
+        out.set(record.phase, record.evaluation);
+    }
+    return out;
+  }, [run, phase]);
   const shares = useMemo(
-    () => sharesOf(ledger.data?.rows ?? [], proofs.data?.proofs ?? [], owed, waivers),
-    [ledger.data, proofs.data, owed, waivers],
+    () => sharesOf(ledger.data?.rows ?? [], proofs.data?.proofs ?? [], owed, waivers, evaluations),
+    [ledger.data, proofs.data, owed, waivers, evaluations],
   );
 
   const choose = (value: string) => {
@@ -411,6 +428,8 @@ function PhaseVerification({
         )}
       </Part>
 
+      {share.evaluation ? <EvaluationPart evaluation={share.evaluation} /> : null}
+
       {share.verdicts.length > 0 && (
         <Part title="The console’s verdicts, newest first" testId="verification-verdicts">
           {share.verdicts.map((row, index) => (
@@ -427,6 +446,74 @@ function PhaseVerification({
         </Part>
       )}
     </section>
+  );
+}
+
+/** What each of the evaluator's two judges is called. */
+const JUDGE_LABEL: Readonly<Record<'spec' | 'standards', string>> = {
+  spec: 'Spec — did it do what the plan said',
+  standards: 'Standards — did it keep the repository’s rules',
+};
+
+/**
+ * The independent evaluator's verdict (measured-console phase 22): the phase's
+ * reading across both judges, then each judge's word on every numbered exit
+ * criterion with its one evidence line — never merged into one score, and
+ * advisory unless the plan says hold.
+ */
+function EvaluationPart({ evaluation }: { evaluation: PhaseEvaluation }) {
+  const judges = (['spec', 'standards'] as const).filter((one) => evaluation.dimensions[one]);
+  return (
+    <Part title="The independent evaluator" testId="verification-evaluation">
+      <li className={LINE} data-testid="evaluation-verdict" data-verdict={evaluation.verdict}>
+        <OpsStatus vocab="evaluation" word={evaluation.verdict} title="Its reading across both judges" />
+        <span className="min-w-0 break-words text-meta text-ink">
+          {evaluation.mode === 'hold'
+            ? 'Holds the phases after it on a not met'
+            : 'Advisory — it holds nothing'}{' '}
+          · attempt <span className="tnum">{evaluation.attempt}</span> · {evaluation.model} on{' '}
+          {evaluation.account}
+          {evaluation.costUsd > 0 ? (
+            <>
+              {' '}
+              · <Money usd={evaluation.costUsd} source="cli" />
+            </>
+          ) : null}
+        </span>
+        <When at={evaluation.at} />
+      </li>
+      {evaluation.why ? (
+        <li className="min-w-0 break-words text-meta text-ink-muted" data-testid="evaluation-why">
+          {evaluation.why}
+        </li>
+      ) : null}
+      {evaluation.browser ? (
+        <li className="min-w-0 break-words text-meta text-ink-muted" data-testid="evaluation-browser">
+          {evaluation.browser.used
+            ? `Judged in a browser against the seeded console at ${evaluation.browser.url ?? 'a free port'}.`
+            : `It touched the client, but no browser could be had${evaluation.browser.why ? `: ${evaluation.browser.why}` : ''}.`}
+        </li>
+      ) : null}
+      {judges.map((judge) => (
+        <li
+          key={judge}
+          data-testid="evaluation-judge"
+          data-judge={judge}
+          className="flex min-w-0 flex-col gap-1"
+        >
+          <span className="text-meta font-medium text-ink">{JUDGE_LABEL[judge]}</span>
+          <ul className="flex min-w-0 flex-col gap-1">
+            {evaluation.dimensions[judge]!.criteria.map((criterion) => (
+              <li key={criterion.id} data-testid="evaluation-criterion" className={LINE}>
+                <OpsStatus vocab="evaluation" word={criterion.verdict} />
+                <span className="tnum text-meta text-ink">Criterion {criterion.id}</span>
+                <span className="min-w-0 break-words text-meta text-ink-muted">{criterion.evidence}</span>
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))}
+    </Part>
   );
 }
 

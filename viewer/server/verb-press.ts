@@ -35,9 +35,16 @@ const phaseOf = (body: Record<string, unknown>): number | null => {
 
 const refused = (status: number, error: string): VerbAnswer => ({ ok: false, status, error });
 
-/** A press's answer (`PressAnswer`), folded to the one shape. */
-function pressed(answer: { ok: true; launched?: unknown; queued?: unknown } | { ok: false; status: number; error: string }): VerbAnswer {
+/**
+ * A press's answer (`PressAnswer`), folded to the one shape — and a Retry's
+ * addendum delivered to a live session as a message (measured-console phase
+ * 13, #424), which is neither a launch nor a queue entry.
+ */
+function pressed(
+  answer: { ok: true; launched?: unknown; queued?: unknown; delivered?: unknown; message?: unknown } | { ok: false; status: number; error: string },
+): VerbAnswer {
   if (!answer.ok) return refused(answer.status, answer.error);
+  if ('delivered' in answer && answer.delivered) return { ok: true, status: 200, body: { delivered: answer.delivered, message: answer.message } };
   return { ok: true, status: 200, body: 'launched' in answer && answer.launched ? { launched: answer.launched } : { queued: answer.queued } };
 }
 

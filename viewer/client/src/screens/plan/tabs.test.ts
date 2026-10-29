@@ -108,7 +108,8 @@ describe('the retired tabs', () => {
     // The server still mints `#/plan/:slug/route` — it must land on the map.
     const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
     expect(legacy.route).toEqual({ tab: 'phases', view: 'map' });
-    expect(legacy.qa).toEqual({ tab: 'phases', view: 'qa' });
+    // QA and Handoffs are ONE reading since 2026-10-20 (Tower strips): both land on it.
+    expect(legacy.qa).toEqual({ tab: 'phases', view: 'handoffs' });
     expect(legacy.handoffs).toEqual({ tab: 'phases', view: 'handoffs' });
     for (const id of ['route', 'qa', 'handoffs']) {
       expect(resolveTab(id), id).toBe('phases');
@@ -145,17 +146,26 @@ describe('the retired tabs', () => {
 });
 
 describe('the readings of each view', () => {
-  it('Phases: the shared six, each with a word of its own', () => {
-    expect([...PHASES_VIEW_IDS]).toEqual(['table', 'map', 'qa', 'handoffs', 'schedule', 'burnup']);
+  it('Phases: the shared five, each with a word of its own', () => {
+    expect([...PHASES_VIEW_IDS]).toEqual([
+      'table',
+      'map',
+      'handoffs',
+      'schedule',
+      'burnup',
+    ]);
     expect([...PHASES_VIEW_IDS]).toEqual([...PLAN_PHASE_VIEWS]);
     for (const id of PHASES_VIEW_IDS) expect(PHASES_VIEW_LABELS[id], id).toBeTruthy();
+    expect(PHASES_VIEW_LABELS.handoffs).toBe('Handoffs & QA');
   });
 
   it('Phases: reads an unknown or absent ?view= as the table', () => {
     expect(phasesViewOf(undefined)).toBe('table');
     expect(phasesViewOf('raw')).toBe('table');
     expect(phasesViewOf('map')).toBe('map');
-    expect(phasesViewOf('qa')).toBe('qa');
+    // The QA reading's old address opens the reading it became.
+    expect(phasesViewOf('qa')).toBe('handoffs');
+    expect(phasesViewOf('handoffs')).toBe('handoffs');
   });
 
   it('Run and Source: the shared run readings, and anything unknown is the default reading', () => {

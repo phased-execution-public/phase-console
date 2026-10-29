@@ -548,6 +548,28 @@ test('RET-19 — pruneRuns removes the run’s five sidecars, not just the recor
   rmSync(plan, { recursive: true, force: true });
 });
 
+test('RET-20 (measured-console phase 17, B5) — a run that never finished is pruned by age too, with its journal chain; one in flight never is', async () => {
+  const { pruneRuns, runDir } = await import('../server/runner/state.ts');
+  const slug = `retention-unfinished-${Date.now()}`;
+  const plan = runDir('/tmp/retention-fixture-root', slug);
+  mkdirSync(plan, { recursive: true });
+  const old = new Date(Date.parse('2026-01-01T00:00:00.000Z')).toISOString();
+  const runs: [string, string][] = [['aaaaaaa1', 'halted'], ['aaaaaaa2', 'parked'], ['aaaaaaa3', 'interrupted'], ['aaaaaaa4', 'running']];
+  for (const [id, status] of runs) {
+    writeFileSync(join(plan, `run-${id}.json`), JSON.stringify({ id, status, updatedAt: old }));
+    writeFileSync(join(plan, `run-${id}.jsonl`), 'x');
+  }
+  writeFileSync(join(plan, 'run-aaaaaaa1.jsonl.1'), 'x');
+  writeFileSync(join(plan, 'run-aaaaaaa1.jsonl.index'), '{}');
+  const removed = pruneRuns('/tmp/retention-fixture-root', slug, null, NOW, 30 * DAY, 0).sort();
+  assert.deepEqual(removed, ['aaaaaaa1', 'aaaaaaa2', 'aaaaaaa3'], 'halted, parked and interrupted age out; running is in flight');
+  for (const name of ['run-aaaaaaa1.json', 'run-aaaaaaa1.jsonl', 'run-aaaaaaa1.jsonl.1', 'run-aaaaaaa1.jsonl.index']) {
+    assert.equal(existsSync(join(plan, name)), false, `${name} goes with its run`);
+  }
+  assert.equal(existsSync(join(plan, 'run-aaaaaaa4.json')), true);
+  rmSync(plan, { recursive: true, force: true });
+});
+
 test('RP-7b — per-phase and archived replays age with their run record, and go with it', async () => {
   // control-tower phase 94, #133: the replay is one file per PHASE now, and the
   // 2026-09-25 workaround left full files moved aside as `.old` and
@@ -791,3 +813,4 @@ test('RET-HD — the handled log is a sink (control-tower phase 136): rotated pa
   assert.deepEqual(rows.map((row) => row.path.slice(instance.length + 1)).sort(), ['handled-sessions.ndjson', 'handled.ndjson']);
   assert.equal(actionsFor(planRetention(inventory, sanitiseRetention({}), NOW), 'handled').length, 0);
 });
+

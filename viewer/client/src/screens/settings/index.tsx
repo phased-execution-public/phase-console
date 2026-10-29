@@ -56,6 +56,7 @@ const PermissionSettingsSection = lazy(() =>
   import('./permissions').then((m) => ({ default: m.PermissionSettingsSection })),
 );
 const InstanceSection = lazy(() => import('./instance').then((m) => ({ default: m.InstanceSection })));
+const HooksSection = lazy(() => import('./hooks').then((m) => ({ default: m.HooksSection })));
 
 /** Every section's body, by id. */
 const BODIES: Readonly<Record<string, ElementType<{ query: string }>>> = {
@@ -65,6 +66,7 @@ const BODIES: Readonly<Record<string, ElementType<{ query: string }>>> = {
   notifications: NotificationsSection,
   accounts: AccountsSection,
   mcp: McpServersSection,
+  hooks: HooksSection,
   permissions: PermissionSettingsSection,
   instance: InstanceSection,
   everything: EverythingSection,

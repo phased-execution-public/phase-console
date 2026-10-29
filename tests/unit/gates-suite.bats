@@ -9,8 +9,10 @@ load ../helpers/test_helper
 setup() {
   command -v node >/dev/null 2>&1 || skip "node is not installed"
   VIEWER_DIR="$BATS_TEST_TMPDIR/viewer"
-  mkdir -p "$VIEWER_DIR/test"
+  mkdir -p "$VIEWER_DIR/test" "$VIEWER_DIR/server/runner"
+  # The suites' re-export and the reporter it names, which the console ships.
   cp "$PE_DIR/viewer/test/suite-ledger.mjs" "$VIEWER_DIR/test/"
+  cp "$PE_DIR/viewer/server/runner/suite-ledger.mjs" "$VIEWER_DIR/server/runner/"
   cat > "$VIEWER_DIR/test/whole.test.ts" <<'TS'
 import test from 'node:test';
 test('one', () => {});

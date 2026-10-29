@@ -2,17 +2,19 @@
  * The plans as cards — the browsing view (7.0, quiet-console phase 9).
  *
  * ```
- * ▌● Running (Active)                            2h ago
+ * ▌● Running ◎ Active  Why                       2h ago
  * ▌storefront redesign
- * ▌████████████████▌█▐▒▒▒▒░░░░░░░░░░░
- * ▌41 done · 1 in progress · 1 next up · 4 waiting · 25 left · 56 %
+ * ▌▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▯▯▯▯▯▯   (56 %)
+ * ▌(41 done) (1 in progress) (1 next up) (4 waiting)  25 left
  * ▌5 sessions  ~2–3 h of work left (estimate)
+ * ▌Waiting on  You, on phase 43
  * ▌P43 next up
  * ```
  *
  * One plan at a time, with room the list does not have: the plan's own
- * status badge beside the run's word (#361), the phases in proportion at
- * their own width with every count in words (#360), the estimate in full,
+ * status badge beside the run's word (#361) as the button whose *Why* opens
+ * the reasons behind it in the panel, the phases as a pipeline at their own
+ * width with every share a badge (#360), what it waits on, the estimate in full,
  * the phases next up as their own ways in, and what is wrong said in a
  * sentence. The same row, the same pieces
  * (`row.tsx`) — only the room differs. A card is a tone, never a shadow; its
@@ -24,20 +26,27 @@ import { etaLabel, etaTitle } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import { Button, KeyValue, Mono, RelativeTime } from '@/ui';
 import { planHref } from '@/shell/routes';
+import { planRecordKey } from './inspector';
 import { leftWords, markPaint, repoLabel, type PlanRow } from './model';
-import { ConcernLines, NextUpLinks, PlanLine, PlanMark, RunLink } from './row';
+import { ConcernLines, NextUpLinks, PlanLine, PlanMark, PlanStatusButton, RunLink } from './row';
+import { waitsOnOf } from './why';
 
 export function PlanCard({
   row,
   onInspect,
+  inspected,
   everything = false,
 }: {
   row: PlanRow;
+  /** Inspect, and the status's *Why* — the plan in the panel. */
   onInspect?: (row: PlanRow) => void;
+  /** The key of the record the panel holds now. */
+  inspected?: string | undefined;
   /** Everything on: the facts the list draws as extra columns, on the card. */
   everything?: boolean;
 }) {
   const paint = markPaint(row);
+  const waits = waitsOnOf(row);
   return (
     <article
       data-plan-card={row.slug}
@@ -48,7 +57,11 @@ export function PlanCard({
       )}
     >
       <div className="flex min-w-0 items-center justify-between gap-3">
-        <PlanMark row={row} />
+        {onInspect ? (
+          <PlanStatusButton row={row} onWhy={onInspect} pressed={inspected === planRecordKey(row.slug)} />
+        ) : (
+          <PlanMark row={row} />
+        )}
         {row.activity > 0 && (
           <RelativeTime at={row.activity} live={false} className="shrink-0 text-meta text-ink-faint" />
         )}
@@ -65,6 +78,18 @@ export function PlanCard({
           <span title={etaTitle(row.eta)}>{etaLabel(row.eta.lowMs, row.eta.highMs, row.eta.basis)}</span>
         )}
       </p>
+      {waits && (
+        <div
+          className="flex min-w-0 flex-wrap items-baseline gap-x-2 text-meta"
+          data-testid="plan-card-waits"
+        >
+          <span className="text-ink-muted">Waiting on</span>
+          <span className="min-w-0 break-words text-ink">{waits.lead}</span>
+          {waits.detail && (
+            <span className="line-clamp-2 min-w-0 basis-full break-words text-ink-muted">{waits.detail}</span>
+          )}
+        </div>
+      )}
       <NextUpLinks row={row} />
       <ConcernLines row={row} skipWaiting />
       {everything && (
@@ -93,11 +118,13 @@ export function PlanCard({
 export function PlanCards({
   rows,
   onInspect,
+  inspected,
   label,
   everything = false,
 }: {
   rows: readonly PlanRow[];
   onInspect?: (row: PlanRow) => void;
+  inspected?: string | undefined;
   label: string;
   everything?: boolean;
 }) {
@@ -105,7 +132,7 @@ export function PlanCards({
     <ul aria-label={label} className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
       {rows.map((row) => (
         <li key={row.slug} className="min-w-0">
-          <PlanCard row={row} onInspect={onInspect} everything={everything} />
+          <PlanCard row={row} onInspect={onInspect} inspected={inspected} everything={everything} />
         </li>
       ))}
     </ul>

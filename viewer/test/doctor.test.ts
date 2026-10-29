@@ -66,7 +66,7 @@ const HEAP = '--max-old-space-size=6144';
 
 test('every row answers ok|fail|skip with a reason, in the documented order; a clean machine is ok', async () => {
   const report = await doctorReport(deps());
-  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'presence', 'skill', 'node', 'pty', 'cli', 'gh', 'publish', 'git', 'environment', 'console'];
+  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'presence', 'skill', 'seed', 'node', 'pty', 'cli', 'gh', 'publish', 'git', 'environment', 'console'];
   assert.deepEqual(report.rows.map((r) => r.id), order);
   for (const row of report.rows) {
     assert.ok((PROBE_STATUSES as readonly string[]).includes(row.status), `${row.id}: ${row.status}`);

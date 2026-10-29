@@ -34,7 +34,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -48,6 +48,8 @@ import { Service } from '../server/service.ts';
 import { loadRun, newRun, phaseRecord, runDir, saveRun } from '../server/runner/state.ts';
 import { phaseLifecycle } from '../shared/run-lifecycle.js';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
+import { dateClock } from './fixtures/clock.ts';
 
 const MINUTE = 60_000;
 const T0 = Date.parse('2026-09-23T10:00:00.000Z');
@@ -72,17 +74,11 @@ const CI_WAIT = 'while sleep 30; do gh api repos/acme/api/actions/runs >/dev/nul
 
 type Repo = { root: string; scripts: string; markDone: () => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-clock-guard-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  const script = (name: string, body: string) => { writeFileSync(join(scripts, name), body, 'utf8'); chmodSync(join(scripts, name), 0o755); };
-  script('phase-graph.sh', `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-clock-guard-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${state}"; slug="$1"; shift; mode="\${1:-}"; arg="\${2:-}"
 case "$mode" in
   --memory-block)
@@ -94,14 +90,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  script('phase-lock.sh', '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  script('validate.sh', '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: () => writeFileSync(join(state, 'done'), '1\n'),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: () => writeFileSync(join(made.state, 'done'), '1\n') };
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -109,11 +103,6 @@ function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
     signal: { subtype: 'success', code: 0, text: '' },
     sessionId: 'sess-guard', costUsd: 0.02, turns: 3, resultText: 'done', durationMs: 10, argv: ['-p', '<prompt>'], ...partial,
   };
-}
-
-function fakeClock() {
-  const at = { now: T0 };
-  return { now: () => new Date(at.now), wind: (ms: number) => { at.now += ms; } };
 }
 
 /** One session held open; `deaf` makes its stdin refuse every write (no nudge can arrive). */
@@ -165,9 +154,9 @@ test('CG-1: a loop on the session\'s own clock is its own job — P34\'s call re
 });
 
 test('CG-1: the P34 loop gets the own-job rungs — no park at 5 minutes, a nudge at 10, still running', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
-  const clock = fakeClock();
+  const clock = dateClock(T0);
   const { instance, events } = runner(r, held.spawn, clock.now);
   try {
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
@@ -191,9 +180,9 @@ test('CG-1: the P34 loop gets the own-job rungs — no park at 5 minutes, a nudg
  * ------------------------------------------------------------------ */
 
 test('CG-2: an external clock is nudged first and parked only if the call is still open after the grace', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
-  const clock = fakeClock();
+  const clock = dateClock(T0);
   const { instance, events } = runner(r, held.spawn, clock.now);
   try {
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
@@ -223,9 +212,9 @@ test('CG-2: an external clock is nudged first and parked only if the call is sti
 });
 
 test('CG-2: a session that cannot be told is parked at once, as before', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r, { deaf: true });
-  const clock = fakeClock();
+  const clock = dateClock(T0);
   const { instance } = runner(r, held.spawn, clock.now);
   try {
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
@@ -240,9 +229,9 @@ test('CG-2: a session that cannot be told is parked at once, as before', async (
 });
 
 test('CG-2: a park on a loop with a known target resumes at that target, not a fixed window', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
-  const clock = fakeClock();
+  const clock = dateClock(T0);
   const { instance } = runner(r, held.spawn, clock.now);
   try {
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
@@ -417,9 +406,9 @@ test('CG-5: a window closes when its call returns once the session is in another
  * ------------------------------------------------------------------ */
 
 test('CG-6: while the session\'s own background job runs, an external wait is not checkpointed — the own-job rungs apply', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = heldSession(r);
-  const clock = fakeClock();
+  const clock = dateClock(T0);
   const { instance, events } = runner(r, held.spawn, clock.now);
   try {
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });

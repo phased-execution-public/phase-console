@@ -25,6 +25,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+import { parseInstalledPlugins } from '../shared/installed-plugins.js';
 import type { ProbeVerdict } from './prelude.ts';
 
 /** The plugin the skill ships as — `.claude-plugin/marketplace.json`'s one entry, under its marketplace. */
@@ -119,39 +120,47 @@ export function claudeConfigDirs(env: NodeJS.ProcessEnv = process.env, home: str
 /** Every install of the plugin one config dir registered, any scope — or why the file could not be read. */
 export function readPluginInstalls(configDir: string): { installs: PluginInstall[]; parseError?: string } {
   const file = join(configDir, 'plugins', 'installed_plugins.json');
-  let doc: unknown;
+  let text: string;
   try {
-    doc = JSON.parse(readFileSync(file, 'utf8'));
+    text = readFileSync(file, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { installs: [] };
     return { installs: [], parseError: String((error as Error)?.message ?? error) };
   }
-  const plugins = (doc as { plugins?: unknown })?.plugins;
-  if (!plugins || typeof plugins !== 'object') return { installs: [] };
-  const installs: PluginInstall[] = [];
-  // Any marketplace: a machine that installed the skill from another catalog
-  // still runs THIS skill, and the question is which commit of it.
-  for (const [id, raw] of Object.entries(plugins as Record<string, unknown>)) {
-    if (id.split('@')[0] !== SKILL_PLUGIN) continue;
-    // Version 2 keys a LIST of installs (one per scope); version 1 keyed one.
-    for (const entry of Array.isArray(raw) ? raw : raw ? [raw] : []) {
-      if (!entry || typeof entry !== 'object') continue;
-      const e = entry as Record<string, unknown>;
-      if (typeof e.installPath !== 'string') continue;
-      installs.push({
-        id,
-        scope: typeof e.scope === 'string' ? e.scope : 'user',
-        installPath: e.installPath,
-        version: typeof e.version === 'string' ? e.version : null,
-        commit: typeof e.gitCommitSha === 'string' ? e.gitCommitSha : null,
-        ...(typeof e.projectPath === 'string' ? { projectPath: e.projectPath } : {}),
-      });
-    }
-  }
+  // The one reader (`shared/installed-plugins.js`) knows both shapes: version 2
+  // keys a LIST of installs (one per scope), version 1 keyed one.
+  const parsed = parseInstalledPlugins(text);
+  if (parsed.parseError) return { installs: [], parseError: parsed.parseError };
+  const installs: PluginInstall[] = parsed.installs
+    // Any marketplace: a machine that installed the skill from another catalog
+    // still runs THIS skill, and the question is which commit of it.
+    .filter((one) => one.plugin === SKILL_PLUGIN)
+    .map((one) => ({
+      id: one.id,
+      scope: one.scope,
+      installPath: one.installPath,
+      version: one.version,
+      // A materialized tree (`scripts/build-plugin-tree.mjs`, measured-console
+      // phase 10) is a commit of its own on the clone's `plugin` branch; the
+      // revision it was built FROM is in its stamp, and that is the commit to
+      // hold against the console's.
+      commit: stampedRev(one.installPath) ?? one.commit,
+      ...(one.projectPath ? { projectPath: one.projectPath } : {}),
+    }));
   // The canonical catalog first, so a machine with two names for the plugin
   // reports the one this product ships.
   installs.sort((a, b) => Number(b.id === SKILL_PLUGIN_ID) - Number(a.id === SKILL_PLUGIN_ID));
   return { installs };
+}
+
+/** The revision a materialized plugin tree names in its `plugin-stamp.json`; null for any other copy. */
+export function stampedRev(installPath: string): string | null {
+  try {
+    const stamp = JSON.parse(readFileSync(join(installPath, 'plugin-stamp.json'), 'utf8')) as { rev?: unknown };
+    return typeof stamp.rev === 'string' && /^[0-9a-f]{40}$/.test(stamp.rev) ? stamp.rev : null;
+  } catch {
+    return null;
+  }
 }
 
 /** The copy one config dir carries: its user-scope install, and any second copy under `skills/`. */
@@ -279,7 +288,11 @@ export type SkillApi = { api: number; min: number; file: string };
  */
 export type SkillApiMismatch = { update: 'skill' | 'console'; reason: string };
 
-/** Read `<scriptsDir>/skill-api.env`; null when it is absent or says no numbers. */
+/**
+ * Read `<scriptsDir>/skill-api.env`; null when it is absent, says no numbers, or contradicts itself
+ * (a `PE_API_MIN` above its own `PE_API`, or under 1 — the floor). This tree speaks 3 and works with a
+ * half at 2 since measured-console phase 3 (the lean skill), so an 8.0 plugin and a 9.0 console meet.
+ */
 export function readSkillApi(scriptsDir: string): SkillApi | null {
   const file = join(scriptsDir, SKILL_API_FILE);
   let text: string;
@@ -291,6 +304,7 @@ export function readSkillApi(scriptsDir: string): SkillApi | null {
   const api = value('PE_API');
   const min = value('PE_API_MIN');
   if (api === null || min === null) return null;
+  if (min < 1 || min > api) return null;
   return { api, min, file };
 }
 

@@ -29,7 +29,10 @@ import {
 import { DEFAULT_ISSUES, type IssueMode } from '../../shared/issues-model.js';
 import { DEFAULT_MESSAGING, type MessagingWord } from '../../shared/message-model.js';
 import { HALT_KINDS, isAdjudicatedHalt, isPlanHalt } from '../../shared/recovery-model.js';
-import type { QaFixStrategy, RelayMode } from '../../shared/run-settings.js';
+import {
+  DEFAULT_CACHE_TTL_AB, DEFAULT_COMPACTION, DEFAULT_COMPACTION_WINDOW,
+  type CacheTtlAb, type CompactionMode, type HumanStepMode, type QaFixStrategy, type RelayMode,
+} from '../../shared/run-settings.js';
 import type { RungCause } from '../../shared/ladder-model.js';
 import type { LadderCap, LadderCapSetting } from './ladder.ts';
 import type { TreeStamp } from './tree-state.ts';
@@ -42,7 +45,7 @@ import {
   DEFAULT_SETTLE, ISOLATED,
   type CheckoutState, type IsolationMode, type SettleStrategy,
 } from '../../shared/worktree-model.js';
-import { consoleRunsDir, isRunSidecar, journalFile, runDir, runFile } from './run-paths.ts';
+import { consoleRunsDir, isRunSidecar, journalFile, runDeltaFile, runDir, runFile } from './run-paths.ts';
 import type { BudgetFact, BudgetKind } from '../../shared/budget-model.js';
 import { adoptionHeld } from '../crash-ledger.ts';
 import type { LandingProof, WorktreeRefusal } from './worktree.ts';
@@ -509,6 +512,18 @@ export type VerifyRun = {
    * Metro holding its stdout passed.
    */
   stragglers?: { pid: number; comm?: string }[];
+  /**
+   * The phase tier ran this line in its SELECTED form (measured-console phase
+   * 15, `runner/verify-select.ts`): `command` is still the line as the plan
+   * wrote it, `ranAs` what actually ran, `selected` the test files its diff
+   * mapped to (with the invariants), `sample` the seeded rest, `covered` the
+   * share of the line's planned files that ran, 0–1. Absent: run as written.
+   */
+  tier?: 'phase';
+  ranAs?: string;
+  selected?: string[];
+  sample?: string[];
+  covered?: number;
 };
 
 /**
@@ -964,6 +979,7 @@ export type PhaseLandingRepo = {
   };
 };
 
+
 export type PhaseRecord = {
   phase: number;
   status: PhaseStatus;
@@ -979,6 +995,12 @@ export type PhaseRecord = {
   costUsd: number;
   /** The part of `costUsd` spent on credit past a plan window (control-tower phase 93, #146). */
   creditUsd?: number;
+  /**
+   * What the phase was forecast to cost when it first boarded, `estimated`
+   * (measured-console phase 23, `phase.forecast`) — null when nothing priced its
+   * model; absent on a record that boarded before the forecast, or in the free tree.
+   */
+  forecastUsd?: number | null;
   /**
    * Each session's mark: the last `total_cost_usd` booked for it. A `--resume`
    * re-reports the conversation's running total, so a spawn books only its rise
@@ -1361,7 +1383,7 @@ export type PhaseRecord = {
    */
   usageWall?: {
     account: string; bucket: string; latest: string; probes: number;
-    lastReading?: { at: string; by: 'reading' | 'spend' | 'reprobe'; ok: boolean; resetsAt?: string };
+    lastReading?: { at: string; by: 'reading' | 'spend' | 'reprobe' | 'switch'; ok: boolean; resetsAt?: string };
   };
   /** When the last attempt's session ended — the other meaning `endedAt` carried. */
   attemptEndedAt?: string;
@@ -2068,9 +2090,42 @@ export type PhaseRecord = {
    * `detached-verify` when no path is uncommitted). Until it boards again it
    * ranks right after a person's re-board (`boardingOrder`), and its scope is
    * held against every sibling whose scope meets it — in the very pass its lane
-   * was released in, too. Written by `resumeAfterWrapup`, spent at boarding.
+   * was released in, too. Written by the outcome arms (`partial`, `waiting-external`, `resumeAfterWrapup`) and, since measured-console phase 13 (#417), by an attempt that ends undeclared — a usage wall, a cap, a checkpoint; spent at boarding.
    */
   keepsLane?: { at: string; reason: string; sessionId: string | null; paths: number; watch?: string };
+  /**
+   * Commits this phase's sessions made that no push has carried to `origin`
+   * yet (measured-console phase 12, #397): each tree of the session's scope on
+   * a `pe/…` branch ahead of `origin/<branch>`, read when every working
+   * session ends (`Runner.noteUnpushed`). Shown on the phase — the Run view and
+   * Your turn's heads-up — until a push lands, when the next read deletes it.
+   */
+  unpushed?: { at: string; trees: { repo: string; branch: string; ahead: number; tracked: boolean }[] };
+  /**
+   * What this phase's newest RESUMED session said its resume cost, from its
+   * own `SessionStart` (CLI 2.1.251+; measured-console phase 12, A10): how
+   * stale the conversation was, how much it re-sent and whether the prompt
+   * cache had likely expired, with the CLI's estimate of the cache write in
+   * dollars. Journalled `phase.resume-cost`; the next resume brief cites it.
+   */
+  resumeCost?: ResumeCost & { at: string; sessionId: string };
+  /**
+   * The Agent SDK's door failed one of this phase's sessions before its first
+   * event (measured-console phase 21, B1), and the door re-attempted it on the
+   * subprocess — once: every later session of the phase takes the subprocess
+   * for the rest of the run (`phase.spawn-fallback`). `done` is false between
+   * the two; a console that died there leaves the situation `spawn-sdk-failed`,
+   * whose one rung boards the phase again, on the subprocess.
+   */
+  spawnFallback?: { at: string; mode: string; detail: string; done: boolean };
+  /**
+   * A person's step deferred at its tool call (measured-console phase 12,
+   * B2): the `phase-outcome.sh … needs-human` call the hook answered `defer`
+   * — its `tool_use_id`, the session that made it and the call itself — and,
+   * once the person's check passed, the `answer` the re-fired hook hands back
+   * through `--resumed-with`. Spent by that re-fire; absent under `park`.
+   */
+  deferred?: { toolUseId: string; sessionId: string | null; command: string; at: string; answer?: string; stepId?: string };
   /**
    * The background agents this phase's last session ended with still running,
    * stopped by the CLI's ceiling mid-work (control-tower phase 109, #188):
@@ -2761,7 +2816,7 @@ export type FreezeRef = { at: string; by: string; escalateAt?: string };
 export type VerifyingLane = {
   phase: number;
   /** Which pass: the phase's verdict, its baseline at boarding, or a wrap-up's fast gate. */
-  purpose: 'verify' | 'baseline' | 'wip-gate';
+  purpose: 'verify' | 'baseline' | 'wip-gate' | 'fast-gate';
   /** The command running now, and where it sits in the pass. */
   command: string;
   index: number;
@@ -2999,6 +3054,13 @@ export type PhaseOptions = {
    */
   mcpPolicy?: McpPolicy;
   /**
+   * Plugin kinds (`shared/plugin-sets.js`) this phase's session loads on top of
+   * the plan's `**Plugins:**` line and its bullet (measured-console phase 27) —
+   * a union, like `skills`; there is no run-wide set, because a set is one
+   * phase's and never a union across phases.
+   */
+  plugins?: string[];
+  /**
    * Whether the console answers this phase's permission asks itself.
    *
    * BOTH values are stored, like `mcpPolicy` and unlike `skillsOff`: this is
@@ -3099,6 +3161,12 @@ export type RunNote = {
    * person's decision (`pinnedNotesBlock`). Absent on a note written before.
    */
   door?: PressDoor;
+  /**
+   * The supervisor's decision it records (measured-console phase 25): a row
+   * of `supervisor-decisions.ndjson`, so a session that reads the note can
+   * name the decision, and `phase-console supervisor decisions` says why.
+   */
+  decisionId?: string;
 };
 
 /** The longest note a run keeps — a paragraph, not a file. */
@@ -3114,6 +3182,14 @@ export function keepNotes(notes: readonly RunNote[]): RunNote[] {
   return notes.filter((note) => !drop.has(note));
 }
 
+/** A resumed session's own account of its resume (`SessionStart`, CLI 2.1.251+). */
+export type ResumeCost = {
+  secondsSinceLastResponse?: number;
+  contextTokens?: number;
+  cacheLikelyExpired?: boolean;
+  estimatedCacheWriteUsd?: number;
+};
+
 export type RunState = {
   id: string;
   slug: string;
@@ -3124,6 +3200,12 @@ export type RunState = {
   model: string;
   /** The reasoning effort each phase starts at, unless the phase overrides it. */
   effort?: string;
+  /**
+   * The run's defaults it did NOT name (EI-21): `model: 'opus'` and `effort: 'max'`
+   * are the shipped words, so a paying account's own `defaultModel` /
+   * `defaultEffort` answers before them. Absent on a run that named both.
+   */
+  unnamed?: ('model' | 'effort')[];
   /**
    * QA's own model and effort. Absent means "the phase's, then the run's" —
    * exactly what QA got before these existed, so a run file written without
@@ -3155,6 +3237,38 @@ export type RunState = {
    * open, so a longer wait is an Extend and a card that stands, never this.
    */
   approvalTimeoutMinutes?: number;
+  /**
+   * The session's environment (measured-console phase 6, A3 A4 A5) — each
+   * absent is its default and each read at a session's spawn, so a patch
+   * lands on the next phase to board. `shared/run-settings.js` owns the words
+   * and the bounds:
+   *  - `cacheTtlAb` — `alternate` runs ODD phases on the other prompt-cache
+   *    lifetime than the account's (`cacheArmTtl`); absent is `off`;
+   *  - `keepWarmSec` — how long a parked session's cache is kept warm, whole
+   *    seconds 0..`KEEP_WARM_MAX_SEC`; absent is 0, off;
+   *  - `subagentModel` — the model the session's subagents run; absent, the
+   *    plan's `**Subagent model:**` line decides;
+   *  - `bashMaxOutput` — how much of a command's output the CLI reads back
+   *    (`BASH_MAX_OUTPUT_LENGTH`); absent is `DEFAULT_BASH_MAX_OUTPUT`.
+   */
+  cacheTtlAb?: CacheTtlAb;
+  keepWarmSec?: number;
+  subagentModel?: string;
+  bashMaxOutput?: number;
+  /**
+   * The platform's pieces (measured-console phase 12, B2 A10), each read at a
+   * session's spawn; `shared/run-settings.js` owns the words:
+   *  - `humanStepMode` — `park` or `defer` (a person's step deferred at its
+   *    tool call and resumed in place); absent, `defer` on a CLI at
+   *    `DEFER_CLI_FLOOR`, else `park` (`humanStepModeFor`);
+   *  - `compaction` — `native` or `alternate` (odd phases `native`); absent is
+   *    `console`, the 0.6 / 0.8 checkpoints;
+   *  - `compactionWindow` — the tokens `native` compacts at; absent is
+   *    `DEFAULT_COMPACTION_WINDOW`.
+   */
+  humanStepMode?: HumanStepMode;
+  compaction?: CompactionMode;
+  compactionWindow?: number;
   /**
    * QA RECOVERY's two: how a fix session is boarded, and what ONE ROUND of the
    * loop may spend. `shared/run-settings.js` owns both vocabularies and the
@@ -3325,6 +3439,15 @@ export type RunState = {
    * A new run is born `2`; a stored run is re-priced to `2` once, at boot.
    */
   costModel?: number;
+  /**
+   * The record's on-disk shape (measured-console phase 17, B5): absent or `1`
+   * is one whole JSON file rewritten on every save; `2` is that file as the
+   * BASE plus `run-<id>.json.delta`, whose lines carry the records a save
+   * changed. `persistGen` numbers the writes: the base holds the generation it
+   * was written at, and a reader folds only the delta lines after it.
+   */
+  persistModel?: number;
+  persistGen?: number;
   /**
    * The clock model every `PhaseRecord.attemptWindows` was kept under
    * (`CLOCK_MODEL`, control-tower phase 58, #66): absent is `1`, where only a
@@ -4088,6 +4211,15 @@ export type NewRunOptions = {
   qaMaxRounds?: number;
   /** An approval card's timeout, in minutes — see `RunState`. */
   approvalTimeoutMinutes?: number;
+  /** The session's environment (measured-console phase 6) — see `RunState`. */
+  cacheTtlAb?: CacheTtlAb;
+  keepWarmSec?: number;
+  subagentModel?: string;
+  bashMaxOutput?: number;
+  /** The platform's pieces (measured-console phase 12) — see `RunState`. */
+  humanStepMode?: HumanStepMode;
+  compaction?: CompactionMode;
+  compactionWindow?: number;
   /** QA recovery's fix strategy and per-round stop — see `RunState`. */
   qaFixStrategy?: QaFixStrategy;
   qaRoundBudgetUsd?: number | null;
@@ -4195,6 +4327,9 @@ export function newRun(opts: NewRunOptions): RunState {
     // things on disk. An explicit empty string is a caller saying "this
     // machine's default" and must survive as one.
     ...(opts.effort === '' ? {} : { effort: opts.effort ?? 'max' }),
+    ...(opts.model && opts.effort !== undefined ? {} : {
+      unnamed: [...(opts.model ? [] : ['model' as const]), ...(opts.effort !== undefined ? [] : ['effort' as const])],
+    }),
     // QA's own three, all conditional spreads: absence is a real state here.
     // An absent `qaModel`/`qaEffort` means "the reviewer inherits the builder's",
     // which is not the same fact as any particular model, and storing a default
@@ -4206,6 +4341,17 @@ export function newRun(opts: NewRunOptions): RunState {
     ...(opts.qaEffort ? { qaEffort: opts.qaEffort } : {}),
     ...(typeof opts.qaMaxRounds === 'number' ? { qaMaxRounds: opts.qaMaxRounds } : {}),
     ...(typeof opts.approvalTimeoutMinutes === 'number' ? { approvalTimeoutMinutes: opts.approvalTimeoutMinutes } : {}),
+    // The session's environment (phase 6), each absent at its default — `off`,
+    // 0 and the plan's word are stored as no key, so a run file says only what
+    // the operator chose.
+    ...(opts.cacheTtlAb && opts.cacheTtlAb !== DEFAULT_CACHE_TTL_AB ? { cacheTtlAb: opts.cacheTtlAb } : {}),
+    ...(typeof opts.keepWarmSec === 'number' && opts.keepWarmSec > 0 ? { keepWarmSec: opts.keepWarmSec } : {}),
+    ...(opts.subagentModel ? { subagentModel: opts.subagentModel } : {}),
+    ...(typeof opts.bashMaxOutput === 'number' ? { bashMaxOutput: opts.bashMaxOutput } : {}),
+    ...(opts.humanStepMode ? { humanStepMode: opts.humanStepMode } : {}),
+    ...(opts.compaction && opts.compaction !== DEFAULT_COMPACTION ? { compaction: opts.compaction } : {}),
+    ...(typeof opts.compactionWindow === 'number' && opts.compactionWindow !== DEFAULT_COMPACTION_WINDOW
+      ? { compactionWindow: opts.compactionWindow } : {}),
     // QA recovery's two, conditional for the same reason: an absent strategy
     // means `resume` resolved at the point of use, and an absent round budget
     // means no per-round stop — neither is a number worth freezing into a file.
@@ -4798,6 +4944,31 @@ export function resetForRetry(
  * already covers the torn-write case on its own.
  */
 export function saveRun(state: RunState): void {
+  const started = performance.now();
+  try {
+    writeRun(state);
+  } finally {
+    const ms = performance.now() - started;
+    persistTiming.saves++;
+    persistTiming.totalMs += ms;
+    persistTiming.maxMs = Math.max(persistTiming.maxMs, ms);
+  }
+}
+
+/**
+ * How long run saves took since the last read (measured-console phase 31, F2): the health
+ * series' `persist` measure takes it every sample and starts the next window from zero.
+ */
+const persistTiming = { saves: 0, totalMs: 0, maxMs: 0 };
+export function takePersistTiming(): { saves: number; meanMs: number | null; maxMs: number | null } {
+  const { saves, totalMs, maxMs } = persistTiming;
+  persistTiming.saves = 0;
+  persistTiming.totalMs = 0;
+  persistTiming.maxMs = 0;
+  return saves ? { saves, meanMs: Math.round((totalMs / saves) * 100) / 100, maxMs: Math.round(maxMs * 100) / 100 } : { saves: 0, meanMs: null, maxMs: null };
+}
+
+function writeRun(state: RunState): void {
   state.updatedAt = new Date().toISOString();
   // The write half of the dual-write. Every run reaches disk through here, so
   // no file can carry a lifecycle that disagrees with its status — whichever of
@@ -4806,26 +4977,141 @@ export function saveRun(state: RunState): void {
   const target = runFile(state.root, state.slug, state.id);
   const dir = runDir(state.root, state.slug);
   mkdirSync(dir, { recursive: true });
+  state.persistModel = PERSIST_MODEL;
+  const last = persisted.get(target);
+  // Monotonic per FILE, not per object: two copies of one run saved in turn
+  // never write a generation the base already holds.
+  state.persistGen = Math.max(state.persistGen ?? 0, last?.gen ?? 0) + 1;
+  const parts = recordParts(state);
+  const now = Date.now();
+  // A full write: the first this process makes, one past `persistFullEveryMs`,
+  // a status change (so a reader of the base alone — a script, another console —
+  // sees every transition at once), or a delta grown past its cap.
+  const full = !last || !existsSync(target) || now - last.fullAt >= persistFullEveryMs
+    || parts.get('top:status') !== last.parts.get('top:status') || last.deltaBytes >= PERSIST_DELTA_MAX_BYTES;
+  if (full) writeRunFull(state, target, dir, parts, now);
+  else writeRunDelta(state, target, parts, last);
+  pendingSaves.delete(target);
+  runsGen++;
+}
+
+/* ------------------------------------------------------------------ *
+ * Incremental persistence (measured-console phase 17, B5)
+ * ------------------------------------------------------------------ */
+
+/** The on-disk shape a save writes — `RunState.persistModel`. */
+export const PERSIST_MODEL = 2;
+
+/** A delta log past this many bytes is folded by the next save. */
+const PERSIST_DELTA_MAX_BYTES = 4 * 1024 * 1024;
+
+/** How long the base file may go unrewritten while deltas carry the moves. */
+let persistFullEveryMs = 60_000;
+
+/** Tests and the benchmark set the clock; `0` makes every save a full one (the old shape). */
+export function setPersistFullEvery(ms: number): void {
+  persistFullEveryMs = Math.max(0, ms);
+}
+
+/** What this process last wrote of each run: every part's JSON, when the base was written, the delta's size. */
+const persisted = new Map<string, { fullAt: number; parts: Map<string, string>; deltaBytes: number; gen: number }>();
+
+/** Bytes written and fsyncs made by run saves in this process — the benchmark's seam. */
+const persistCounters = { bytes: 0, fsyncs: 0, full: 0, delta: 0 };
+export function persistStats(): Readonly<typeof persistCounters> {
+  return { ...persistCounters };
+}
+
+/** A record as its parts: each top-level field (`top:<key>`) and each phase record (`phase:<n>`), as JSON. */
+function recordParts(state: RunState): Map<string, string> {
+  const parts = new Map<string, string>();
+  for (const [key, value] of Object.entries(state)) {
+    if (key === 'phases' || value === undefined) continue;
+    parts.set(`top:${key}`, JSON.stringify(value));
+  }
+  for (const [phase, record] of Object.entries(state.phases ?? {})) {
+    if (record !== undefined) parts.set(`phase:${phase}`, JSON.stringify(record));
+  }
+  return parts;
+}
+
+function writeRunFull(state: RunState, target: string, dir: string, parts: Map<string, string>, now: number): void {
   // The directory entry only needs flushing when the rename CREATES it. On
   // every later save the name is already durable and the second fsync buys
   // nothing — and it was being paid on a path that runs once per stream event.
   const creating = !existsSync(target);
   const tmp = `${target}.tmp`;
+  const text = `${JSON.stringify(state, null, 2)}\n`;
   const fd = openSync(tmp, 'w');
   try {
-    writeSync(fd, `${JSON.stringify(state, null, 2)}\n`);
+    writeSync(fd, text);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
   renameSync(tmp, target);
-  pendingSaves.delete(target);
-  runsGen++;
+  persistCounters.bytes += Buffer.byteLength(text, 'utf8');
+  persistCounters.fsyncs += 1;
+  persistCounters.full += 1;
+  // The base now holds every generation up to its own: the delta's lines are
+  // all at or below it, so it goes. A crash before this unlink leaves lines a
+  // reader skips by their generation.
+  try { rmSync(runDeltaFile(target), { force: true }); } catch { /* skipped by generation on read */ }
+  persisted.set(target, { fullAt: now, parts, deltaBytes: 0, gen: state.persistGen ?? 0 });
   if (!creating) return;
   try {
     const dirFd = openSync(dir, 'r');
     try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   } catch { /* best-effort */ }
+}
+
+function writeRunDelta(state: RunState, target: string, parts: Map<string, string>, last: { fullAt: number; parts: Map<string, string>; deltaBytes: number; gen: number }): void {
+  const set: string[] = [];
+  for (const [key, json] of parts) {
+    if (last.parts.get(key) !== json) set.push(`${JSON.stringify(key)}:${json}`);
+  }
+  const unset = [...last.parts.keys()].filter((key) => !parts.has(key));
+  const line = `{"gen":${state.persistGen},"set":{${set.join(',')}},"unset":${JSON.stringify(unset)}}\n`;
+  const fd = openSync(runDeltaFile(target), 'a');
+  try {
+    writeSync(fd, line);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  const bytes = Buffer.byteLength(line, 'utf8');
+  persistCounters.bytes += bytes;
+  persistCounters.fsyncs += 1;
+  persistCounters.delta += 1;
+  persisted.set(target, { fullAt: last.fullAt, parts, deltaBytes: last.deltaBytes + bytes, gen: state.persistGen ?? 0 });
+}
+
+/**
+ * Fold a delta log over the base it follows: each line after the base's
+ * generation sets and unsets its parts; a torn last line is skipped. A base
+ * with no delta file is answered as it is.
+ */
+function foldRunDelta(raw: RunState, text: string): RunState {
+  const base = raw.persistGen ?? 0;
+  const lines = text.split('\n');
+  lines.pop();
+  for (const line of lines) {
+    let delta: { gen?: number; set?: Record<string, unknown>; unset?: string[] };
+    try { delta = JSON.parse(line) as typeof delta; } catch { continue; }
+    if (typeof delta.gen !== 'number' || delta.gen <= base) continue;
+    const record = raw as unknown as Record<string, unknown>;
+    raw.phases ??= {};
+    for (const [key, value] of Object.entries(delta.set ?? {})) {
+      if (key.startsWith('top:')) record[key.slice(4)] = value;
+      else if (key.startsWith('phase:')) raw.phases[key.slice(6)] = value as PhaseRecord;
+    }
+    for (const key of delta.unset ?? []) {
+      if (key.startsWith('top:')) delete record[key.slice(4)];
+      else if (key.startsWith('phase:')) delete raw.phases[key.slice(6)];
+    }
+    raw.persistGen = delta.gen;
+  }
+  return raw;
 }
 
 /* ------------------------------------------------------------------ *
@@ -4946,9 +5232,12 @@ export const RETAIN_RUNS_MIN = 20;
  * Age AND count, both floors rather than either: a plan that ran twice a year
  * ago keeps both records, and a plan that ran two hundred times this week keeps
  * the newest 20 whatever the clock says. A run still in flight is never a
- * candidate — `keep` names the ones a live process is driving, and any status
- * other than `finished` is left alone because only a finished run is certain
- * to have nothing more to say.
+ * candidate — `keep` names the ones a live process is driving, and a status
+ * in flight (`RUN_IN_FLIGHT`) is left alone because it may still be written to.
+ * A run that stopped short of `finished` — halted, parked, interrupted, paused —
+ * ages out on the same clock since measured-console phase 17 (B5): untouched
+ * for `retainMs`, it is a record nobody came back to, and it used to be kept
+ * for ever.
  */
 export function pruneRuns(
   root: string,
@@ -4970,9 +5259,9 @@ export function pruneRuns(
     const file = join(dir, name);
     let state: RunState | null = null;
     try { state = JSON.parse(readFileSync(file, 'utf8')) as RunState; } catch { /* unreadable */ }
-    // An unreadable or unfinished record is never swept: the first is evidence
-    // of something worth keeping to look at, the second may still be written to.
-    if (!state || state.status !== 'finished') continue;
+    // An unreadable record is never swept — it is evidence of something worth
+    // keeping to look at — nor one in flight, which may still be written to.
+    if (!state || (RUN_IN_FLIGHT as readonly string[]).includes(state.status)) continue;
     let at = Date.parse(state.updatedAt ?? state.createdAt ?? '');
     if (!Number.isFinite(at)) { try { at = statSync(file).mtimeMs; } catch { continue; } }
     candidates.push({ id, file, at });
@@ -6492,11 +6781,24 @@ export function clearRunFileCache(): void {
   parseCache.clear();
 }
 
+/**
+ * A stored run's record as it is on disk — the base with its delta log folded
+ * (`persistModel` 2), never settled. What a test or a tool that used to parse
+ * `run-<id>.json` by hand reads now.
+ */
+export function readStoredRun(root: string, slug: string, id: string): RunState | null {
+  return readRunFile(runFile(root, slug, id));
+}
+
 function readRunFile(target: string): RunState | null {
   let stamp: string;
+  let delta: string | null = null;
   try {
     const info = statSync(target);
     stamp = `${info.mtimeMs}:${info.size}`;
+    // `persistModel` 2 (B5): the delta log is part of the record's version.
+    const moved = statSync(runDeltaFile(target), { throwIfNoEntry: false });
+    if (moved && moved.size > 0) { stamp += `:${moved.mtimeMs}:${moved.size}`; delta = runDeltaFile(target); }
   } catch {
     // No file is not a cache miss to retry — it is an answer, and a stale entry
     // for a run that has been pruned must not outlive it.
@@ -6511,6 +6813,7 @@ function readRunFile(target: string): RunState | null {
   try {
     runFileReadCount += 1;
     raw = JSON.parse(readFileSync(target, 'utf8')) as RunState;
+    if (delta) { try { raw = foldRunDelta(raw, readFileSync(delta, 'utf8')); } catch { /* the base alone, until the next full write */ } }
   } catch {
     parseCache.delete(target);
     return null;

@@ -32,6 +32,7 @@
  */
 
 import '../e2e/fixture/steady-load.mjs';
+import './signed-in.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -46,7 +47,7 @@ process.env.PHASE_CONSOLE_LOG = '';
 
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
-const { POLICY_PATH, planPolicyPath } = await import('../server/runner/approvals.ts');
+const { POLICY_PATH } = await import('../server/runner/approvals.ts');
 const { destructivePushBranches } = await import('../shared/policy-model.js');
 const { manifestPushVerdict, manifestVerdict } = await import('../server/runner/manifest-verdict.ts');
 

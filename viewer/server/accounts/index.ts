@@ -51,7 +51,8 @@ import {
   keepAliveDueAt, loginFix, renewLogin, tokenExpiresAt, tokenLoginState, KEEP_ALIVE_TICK_MS, UNATTENDED_OFFER, type Renewal,
 } from './keep-alive.ts';
 import {
-  ALERT_PCT, AUTH_STATES, CREDIT_SESSION_FRESH_MS, FORECAST_LEAD_HOURS, METER_STATES, ORG_SCOPED_CLASSES, WALL_PCT, WARN_PCT, creditReasonPhrase,
+  ALERT_PCT, AUTH_STATES, CREDIT_SESSION_FRESH_MS, FORECAST_LEAD_HOURS, METER_STATES, ORG_SCOPED_CLASSES, SPILL_COOLDOWN_MIN,
+  SPILL_LAND_MAX_PCT, WALL_PCT, WARN_PCT, creditReasonPhrase,
 } from '../../shared/ops-vocab.js';
 
 export { DEFAULT_ACCOUNT_ID, ACCOUNT_ID_RE, profileConfigDir } from './store.ts';
@@ -94,7 +95,8 @@ export type SwitchDecline = {
  * account — and it buys nothing once the run's own wall has reset, so a target
  * has to carry the work at least that long. Each shared window (`five_hour`,
  * `seven_day`, and the model's own `seven_day_<family>` when one is named) that
- * resets AFTER `untilMs` must have headroom for the whole horizon at the burn
+ * resets AFTER `untilMs` must have headroom for the whole horizon (or `SWITCH_CARRY_ENOUGH_MS`,
+ * when that is shorter — #388) at the burn
  * `burn` gives it, in percent per hour — MEASURED, since control-tower phase 92
  * (#141): the target's own burn plus the moving work's (`switchCandidates`).
  * Phase 78 assumed a constant 20 %/h five-hour and 4 %/h weekly
@@ -121,7 +123,9 @@ export function carriesUntil(
     const rate = burn[name];
     if (typeof rate !== 'number' || !(rate > 0)) continue;
     const lastsMs = Math.max(0, 100 - bucket.utilization) / rate * 3_600_000;
-    if (lastsMs >= horizon) continue;
+    // Enough is the wait OR `SWITCH_CARRY_ENOUGH_MS`, whichever is shorter (#388): a weekly wall
+    // 25 h off declined an account with hours of room, and the run waited the day out.
+    if (lastsMs >= Math.min(horizon, SWITCH_CARRY_ENOUGH_MS)) continue;
     if (first && first.lastsMs <= lastsMs) continue;
     const shown = rate >= 10 ? Math.round(rate) : Math.round(rate * 10) / 10;
     first = {
@@ -133,6 +137,16 @@ export function carriesUntil(
   }
   return first;
 }
+
+/**
+ * How long a target must carry the work for a move to be worth its price when the wall being left
+ * resets later than that (measured-console phase 24, #388). The horizon rule asked a target to
+ * outlast the whole wait, and a weekly wall 25 h off asked that of an account at 81 % weekly and
+ * 11 % five-hour — so two phases waited a day with a pool account able to carry hours of work.
+ * Two hours is past what one S phase spends, and work that walls there moves on again: the
+ * account it left is the first a switch goes back to once its window resets (`switchBackTarget`).
+ */
+export const SWITCH_CARRY_ENOUGH_MS = 2 * 3_600_000;
 
 /** One account's room NOW (`Accounts.roomOf`). */
 export type AccountRoom = { ok: boolean; headroomPct: number | null; resetsAt: string | null; why?: string };
@@ -1667,7 +1681,12 @@ export class Accounts {
     let throttleUntilMs: number | null = null;
     let until: string | undefined;
 
-    if (leaving.kind === 'usage') {
+    if (leaving.kind === 'usage' && leaving.resetsAt && Number.isFinite(leaving.resetsAt.getTime())
+      && leaving.resetsAt.getTime() <= nowMs) {
+      // A reading older than its own reset is void (measured-console phase 24, #389): the window
+      // it walled has reopened, so nothing cools — the meter is read again instead (`kick` below).
+      log.info('accounts.leave-past-reset', { account: id, bucket: leaving.bucket ?? null, resetsAt: leaving.resetsAt.toISOString(), by: leaving.by });
+    } else if (leaving.kind === 'usage') {
       const resets = leaving.resetsAt && Number.isFinite(leaving.resetsAt.getTime()) && leaving.resetsAt.getTime() > nowMs
         ? leaving.resetsAt : null;
       if (leaving.bucket && resets) {
@@ -1726,6 +1745,9 @@ export class Accounts {
           });
         }
       } else {
+        // The second refusal in a day quarantines a dead token (measured-console phase 24): no
+        // green read argues it out of `retired` again; a person's clearance does.
+        this.learned.noteCredentialStrike(fingerprint, at, leaving.reason, label);
         this.learned.setEntitlement(fingerprint, {
           state: 'retired', at, by: leaving.by, reason: leaving.reason,
           ...(leaving.class ? { class: leaving.class } : {}),
@@ -1987,9 +2009,11 @@ export class Accounts {
     const label = this.labelFor(id);
     const entitlement = this.entitlementOf(id, nowMs);
     if (entitlement.state === 'retired') {
+      const quarantine = this.learned.quarantineOf(this.fingerprintOf(id));
       return {
         ok: false, accountId: id, kind: 'retired',
-        reason: `${label} is retired${entitlement.via === 'org' ? ' with its organisation' : ''}`
+        reason: `${label} is ${quarantine ? `quarantined — ${quarantine.strikes} credential refusals in a day` : 'retired'}`
+          + `${entitlement.via === 'org' ? ' with its organisation' : ''}`
           + `${entitlement.reason ? ` — ${entitlement.reason}` : ''}. Clear it under Settings ▸ Accounts once the organisation allows it again.`,
         ...(entitlement.evidence ? { evidence: entitlement.evidence } : {}),
       };
@@ -2208,6 +2232,13 @@ export class Accounts {
    * is the rank, untouched. `wake` is the soonest a pool member that is walled
    * or cooling NOW frees up, when that is before `until`: the moment a run that
    * found nowhere to go should look again, rather than at its own reset.
+   *
+   * A spill (measured-console phase 24, #420) — any switch that leaves a usage
+   * window — also never lands on a login whose fullest live shared window reads
+   * above `SPILL_LAND_MAX_PCT`, nor on one an automatic move left less than
+   * `SPILL_COOLDOWN_MIN` minutes ago; and of the logins it keeps, the one whose
+   * weekly window resets soonest goes first (consume-first: what a weekly window
+   * still holds at its reset is lost), in the slots the rank gave the logins.
    */
   switchCandidates(
     excluding: string | null | undefined, forModel?: string,
@@ -2251,6 +2282,25 @@ export class Accounts {
         });
         continue;
       }
+      if (opts.usage !== false) {
+        // The hysteresis: a spill at `ALERT_PCT` lands only where a whole band of room stands.
+        const fullest = (['five_hour', 'seven_day'] as const)
+          .map((name) => ({ name, bucket: live[name] }))
+          .filter((w) => w.bucket && w.bucket.utilization > SPILL_LAND_MAX_PCT)
+          .sort((a, b) => b.bucket!.utilization - a.bucket!.utilization)[0];
+        if (fullest?.bucket) {
+          declined.push({
+            id, bucket: fullest.name, pct: fullest.bucket.utilization, lastsMs: null, resetsAt: fullest.bucket.resetsAt,
+            why: `its ${fullest.name} window reads ${Math.round(fullest.bucket.utilization)} % — a spill never lands above ${SPILL_LAND_MAX_PCT} %`,
+          });
+          continue;
+        }
+        const left = this.leftRecently(id, nowMs);
+        if (left) {
+          declined.push({ id, bucket: 'cooldown', pct: null, lastsMs: null, resetsAt: left.until, why: left.why });
+          continue;
+        }
+      }
       const floor = opts.floors?.[id] ?? 0;
       const under = floor > 0
         ? windows.map((name) => ({ name, bucket: live[name] })).find((w) => w.bucket && 100 - w.bucket.utilization < floor)
@@ -2278,6 +2328,7 @@ export class Accounts {
       }
       kept.push(id);
     }
+    this.consumeFirst(kept, nowMs);
     if (!horizon) return { ranked: kept, declined, wake: null };
     let wake: number | null = null;
     for (const id of this.accountIds()) {
@@ -2288,6 +2339,65 @@ export class Accounts {
       if (Number.isFinite(at) && at > nowMs && at < until && (wake === null || at < wake)) wake = at;
     }
     return { ranked: kept, declined, wake: wake === null ? null : new Date(wake).toISOString() };
+  }
+
+  /**
+   * The soonest a usage window of `ids` (every account when null) resets after
+   * `nowMs` — a live five-hour or weekly reading, or a learned shared wall —
+   * epoch ms, or null when nothing is known (measured-console phase 24): the
+   * bound on how long a session waits on a usage limit.
+   */
+  nearestReset(ids: readonly string[] | null, nowMs = this.now()): number | null {
+    let soonest: number | null = null;
+    const note = (iso: string | undefined) => {
+      const at = Date.parse(iso ?? '');
+      if (Number.isFinite(at) && at > nowMs && (soonest === null || at < soonest)) soonest = at;
+    };
+    for (const id of ids?.length ? ids : this.accountIds()) {
+      const live = liveBuckets(this.poller.snapshot(id), nowMs);
+      note(live.five_hour?.resetsAt);
+      note(live.seven_day?.resetsAt);
+      const walls = this.limitedUntil(id, nowMs);
+      for (const name of SHARED_WALLS) note(walls[name]);
+    }
+    return soonest;
+  }
+
+  /**
+   * Did an automatic move leave this account less than `SPILL_COOLDOWN_MIN`
+   * minutes ago (measured-console phase 24, #420)? The cooldown's end and its
+   * sentence, or null. A person's move holds nothing against the account it
+   * left — the operator may be moving to a fuller quota on purpose.
+   */
+  private leftRecently(id: string, nowMs: number): { until: string; why: string } | null {
+    const left = this.learned.credential(this.fingerprintOf(id))?.lastLeftAt;
+    if (!left || left.by === 'operator') return null;
+    const until = Date.parse(left.at) + SPILL_COOLDOWN_MIN * 60_000;
+    if (!Number.isFinite(until) || until <= nowMs) return null;
+    return {
+      until: new Date(until).toISOString(),
+      why: `a run left it at ${left.at} (${left.kind}) — not re-entered for ${SPILL_COOLDOWN_MIN} min, until ${new Date(until).toISOString()}`,
+    };
+  }
+
+  /**
+   * Consume-first (measured-console phase 24): the logins in `ids` re-ordered,
+   * in place and inside the slots they already hold, by the soonest live weekly
+   * reset — what a weekly window still holds when it resets is lost, so the one
+   * that resets first is spent first. A login with no live weekly reading keeps
+   * its place after those that have one; an API key never moves.
+   */
+  private consumeFirst(ids: string[], nowMs: number): void {
+    const slots: number[] = [];
+    const logins: { id: string; resets: number; at: number }[] = [];
+    ids.forEach((id, at) => {
+      const weekly = liveBuckets(this.poller.snapshot(id), nowMs).seven_day;
+      const resets = weekly ? Date.parse(weekly.resetsAt) : Number.NaN;
+      slots.push(at);
+      logins.push({ id, resets: Number.isFinite(resets) ? resets : Number.POSITIVE_INFINITY, at });
+    });
+    logins.sort((a, b) => a.resets - b.resets || a.at - b.at);
+    slots.forEach((slot, n) => { ids[slot] = logins[n]!.id; });
   }
 
   /**
@@ -2318,6 +2428,12 @@ export class Accounts {
    * window — 0 under a learned wall or a breaker, null when nothing live was
    * read — and `resetsAt` when the wall it is under lifts.
    */
+  /** The account's own default model and effort (EI-21) — what a phase boards on when the run and the plan name none. */
+  defaultsOf(accountId: string | undefined): { model?: string; effort?: string } {
+    const defaults: { model?: string; effort?: string } = {};
+    return defaults;
+  }
+
   roomOf(accountId: string | undefined, forModel?: string, nowMs = this.now()): AccountRoom {
     const id = accountId ?? DEFAULT_ACCOUNT_ID;
     const family = familyOf(forModel);

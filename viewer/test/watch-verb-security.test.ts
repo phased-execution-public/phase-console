@@ -68,9 +68,8 @@ test('WV-2: a form that prints the secret is refused, and the reason names the f
 });
 
 test('WV-2: an expansion is refused — the shell, not the judge, would decide what `security` is passed', () => {
-  // `$'-w'` and `$FLAG` reach `security` as `-w`; the judge reads neither.
+  // `$FLAG` reaches `security` as `-w`; the judge cannot read it.
   for (const command of [
-    "security find-generic-password -s demo-token $'-w'",
     'security find-generic-password -s demo-token $FLAG',
     'security find-generic-password -s demo-token "${FLAG}"',
     'security find-generic-password -s "$SERVICE"',
@@ -79,12 +78,16 @@ test('WV-2: an expansion is refused — the shell, not the judge, would decide w
     assert.ok(why, `${command} must be refused`);
     assert.match(why!, /expansion the judge cannot read/, command);
   }
-  // Quotes and escapes are read through, so a quoted flag is still the flag.
+  // Quotes and escapes are read through, so a quoted flag is still the flag —
+  // ANSI-C `$'-w'` too since #392 (measured-console phase 15).
   for (const command of [
     "security find-generic-password -s demo-token '-w'",
+    "security find-generic-password -s demo-token $'-w'",
     'security find-generic-password -s demo-token -\\w',
     'security find-generic-password -s demo-token -"w"',
   ]) assert.match(judgeCommand(command) ?? '', /prints the secret/, command);
+  // An ANSI-C escape the reader will not decode is refused, never guessed at.
+  assert.ok(judgeCommand("security find-generic-password -s demo-token $'\\x2dw'"));
 });
 
 test('WV-2: every other security subcommand is refused, and says it is not a read-only lookup', () => {

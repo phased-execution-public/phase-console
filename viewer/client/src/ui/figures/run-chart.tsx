@@ -27,6 +27,7 @@ import type { TimelineSeriesPoint } from '@/data/api';
 
 import { AXIS_PAINT, FIGURE_ASCENT, useWidth } from './paint';
 import { linear, valueTicksWithin, type AxisWindow } from './scales';
+import { formatUsd } from '../money';
 
 /**
  * A dollar label as short as it can honestly be: `$5`, `$0.25`. Written here
@@ -34,7 +35,7 @@ import { linear, valueTicksWithin, type AxisWindow } from './scales';
  * split into a chunk of its own by the bundler the moment a lazy chunk imports
  * it, and that chunk is preloaded — first paint grew by one for a formatter.
  */
-export const dollars = (usd: number): string => (Number.isInteger(usd) ? `$${usd}` : `$${usd.toFixed(2)}`);
+export const dollars = (usd: number): string => formatUsd(usd, 'short');
 
 /** How far over its line a dollar label's baseline sits, px: it rests on the line it names. */
 const LIFT = 2;

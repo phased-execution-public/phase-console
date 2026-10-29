@@ -101,14 +101,36 @@ function useTicks(item: string): [Set<number>, (step: number) => void] {
  * The guide
  * ------------------------------------------------------------------ */
 
+/**
+ * The guide's why alone — the paragraph a decision's card reads first, under
+ * *What you decide*, where its steps are the record's fold (Tower strips,
+ * 2026-10-20). In the guide's own language and direction.
+ */
+export function GuideSummary({ guide, className }: { guide: Guide; className?: string }) {
+  if (!guide.summary) return null;
+  return (
+    <div
+      data-testid="guide-why"
+      lang={guide.lang}
+      dir={guide.dir}
+      className={cn('max-w-(--measure) text-body text-ink', className)}
+    >
+      <Markdown text={guide.summary} lang={guide.lang} dir={guide.dir} className="md-guide" />
+    </div>
+  );
+}
+
 export function GuideView({
   guide,
   itemId,
   className,
+  withSummary = true,
 }: {
   guide: Guide;
   itemId: string;
   className?: string;
+  /** Draw the guide's why above its steps — off where the card says it already (`GuideSummary`). */
+  withSummary?: boolean;
 }) {
   const [ticks, toggle] = useTicks(itemId);
   const { dir, lang } = guide;
@@ -120,8 +142,8 @@ export function GuideView({
       aria-label="The guide"
       className={cn('flex min-w-0 flex-col gap-4', className)}
     >
-      {guide.summary && (
-        <div data-testid="guide-why" className="max-w-prose text-body text-ink">
+      {withSummary && guide.summary && (
+        <div data-testid="guide-why" className="max-w-(--measure) text-body text-ink">
           <Markdown text={guide.summary} lang={lang} dir={dir} className="md-guide" />
         </div>
       )}
@@ -150,12 +172,18 @@ export function GuideView({
                 }}
               >
                 <div className="flex min-w-0 flex-col gap-2 pt-1">
-                  <p data-testid="guide-step-text" className="max-w-prose text-body font-medium text-ink">
+                  <p
+                    data-testid="guide-step-text"
+                    className="max-w-(--measure) text-body font-medium text-ink"
+                  >
                     <MarkdownInline text={step.text} lang={lang} dir={dir} />
                   </p>
                   {step.code && <CodeBlock code={step.code} testId="guide-command" />}
                   {step.expect && (
-                    <p data-testid="guide-expect" className="flex max-w-prose items-start gap-1.5 text-body">
+                    <p
+                      data-testid="guide-expect"
+                      className="flex max-w-(--measure) items-start gap-1.5 text-body"
+                    >
                       <CircleCheck size={14} aria-hidden className="mt-1 shrink-0 text-done" />
                       <span className="min-w-0 text-ink">
                         <span className="font-medium">Expect: </span>
@@ -164,7 +192,10 @@ export function GuideView({
                     </p>
                   )}
                   {step.warn && (
-                    <p data-testid="guide-warning" className="flex max-w-prose items-start gap-1.5 text-body">
+                    <p
+                      data-testid="guide-warning"
+                      className="flex max-w-(--measure) items-start gap-1.5 text-body"
+                    >
                       <TriangleAlert size={14} aria-hidden className="mt-1 shrink-0 text-ink" />
                       <span className="min-w-0 text-ink">
                         <span className="font-medium">Warning: </span>
@@ -201,7 +232,7 @@ export function GuideView({
         </Track>
       )}
       {guide.trouble.length > 0 && (
-        <section data-testid="guide-trouble" className="flex max-w-prose flex-col gap-1.5">
+        <section data-testid="guide-trouble" className="flex max-w-(--measure) flex-col gap-1.5">
           <h4 className="text-body font-semibold text-ink">If it goes wrong</h4>
           <ul className="flex list-disc flex-col gap-1 ps-5 text-body text-ink">
             {guide.trouble.map((t, index) => (

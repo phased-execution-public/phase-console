@@ -59,9 +59,10 @@ _to_mjs() {
 # console: the same defect the header describes for `stop`, in three verbs that
 # nobody had typed yet. `diagnostics` joined them in 5.1.0, and would fall the
 # same way: `--run` reads as neither a flag this script knows nor a path. So did
-# `report`, `run`, `owner`, `grants` and `mcp`, which both editions' .mjs take.
+# `report`, `run`, `owner`, `grants` and `mcp`, which both editions' .mjs take —
+# and `eval`, which the free .mjs refuses by name (measured-console phase 14).
 case "${1:-}" in
-  install-skill|--install-skill|uninstall-skill|--uninstall-skill|install-hooks|uninstall-hooks|hooks-status|doctor|--doctor|sessions|diagnostics|report|run|owner|grants|mcp)
+  install-skill|--install-skill|uninstall-skill|--uninstall-skill|install-hooks|uninstall-hooks|hooks-status|doctor|--doctor|sessions|diagnostics|report|run|owner|grants|mcp|eval)
     _to_mjs "$@" ;;
 esac
 

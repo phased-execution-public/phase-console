@@ -199,12 +199,12 @@ const COLUMNS: Column<LedgerSession>[] = [
         <span
           className="text-ink-muted"
           data-testid="ledger-cost-unknown"
-          title="The session never reported a cost — unknown, not $0."
+          title="The session never reported a cost — unavailable, not $0."
         >
-          Unknown
+          unavailable
         </span>
       ) : (
-        <Money usd={session.costUsd} data-testid="ledger-cost" />
+        <Money usd={session.costUsd} source={session.costSource ?? 'result'} data-testid="ledger-cost" />
       ),
   },
   {
@@ -332,8 +332,8 @@ export function RunCostLedger({
       {sessions.length ? (
         <>
           <p data-testid="ledger-total" className="text-meta text-ink-muted">
-            <Money usd={totals.sessionsUsd} />, {plural(totals.turns, 'turn')} and <Duration ms={totals.ms} />{' '}
-            across {plural(totals.sessions, 'session')}.
+            <Money usd={totals.sessionsUsd} word="estimated" showWord />, {plural(totals.turns, 'turn')} and{' '}
+            <Duration ms={totals.ms} /> across {plural(totals.sessions, 'session')}.
           </p>
           <Grid
             columns={COLUMNS}

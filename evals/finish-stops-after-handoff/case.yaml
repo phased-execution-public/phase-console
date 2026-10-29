@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: finish-stops-after-handoff
+description: 'mode-phase-finish, It''s working if: a supervised session stopped after its handoff, its lock released.'
+tags: [phase-finish, working-if, unattended]
+context:
+  scaffold_script: fixture.sh

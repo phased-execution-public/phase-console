@@ -39,7 +39,7 @@ import { describePhase, describeWord, type StatusView } from '@shared/status-mod
 import type { PhaseEta, PhaseReport, PlanDetail, RunState } from '@/data/api';
 import { isLiveRun, laneSilent, nowLanes, type NowLane } from '@/data/lanes';
 import { usePhaseReport } from '@/data/runs';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { clockTime, clockWords, etaPoint, money } from '@/lib/format';
 import { scrollBehavior } from '@/lib/media';

@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: errand-owner-second-factor
+description: 'the record: E-1/E-2 in one-pool, turn-by-turn and quiet-console — the owner''s `npm stage approve` with their second factor.'
+tags: [errand, unattended]
+context:
+  scaffold_script: fixture.sh

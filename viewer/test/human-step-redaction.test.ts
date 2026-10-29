@@ -206,3 +206,23 @@ test('a guide, proof words and what was tried never carry a planted value into t
   }
 });
 
+test('a check carrying the proof the plan says NOW writes it redacted — no planted value reaches the ledger (EI-7b, measured-console phase 17)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turn-redaction-'));
+  try {
+    const file = join(dir, 'human-steps.ndjson');
+    const ledger = new HumanStepLedger(file);
+    const raised = declareHumanStep({ ledger, announce: () => true }, {
+      slug: 'demo', phase: 4, birth: 'session',
+      step: { kind: 'operator-act', title: 'Rotate the deploy key', proof_type: 'attest' },
+    });
+    assert.ok(raised && !('refused' in raised));
+    const moved = ledger.move((raised as { id: string }).id, 'opened', {
+      proof: `cmd:"gh auth status --token ${TOKEN}" password=${PASSWORD}`,
+    });
+    assert.ok(!('refused' in moved));
+    assert.deepEqual(scan('ledger', readFileSync(file, 'utf8')), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

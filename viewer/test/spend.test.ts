@@ -524,3 +524,42 @@ test('#202: Opus 5 and Opus 5.5 are two models here, each at what it BOOKED — 
   ]);
   assert.equal(view.residualUsd, 0, 'the phases sum to the run');
 });
+
+test('A6: after a phase settles, the plan reads its actual, the delta to its forecast, the cost per verified phase and the cost of failed attempts (measured-console phase 23)', () => {
+  const view = planCost({
+    slug: 'demo',
+    tz: TZ,
+    runs: [
+      // Run 1: phase 1 verified ($20 against a $24.32 forecast); phase 2 failed its verification ($9).
+      costRun('r1', 29, {
+        1: { costUsd: 20, endedAt: '2026-10-24T01:00:00Z', attempts: 1, status: 'done', forecastUsd: 24.32 },
+        2: { costUsd: 9, endedAt: '2026-10-24T02:00:00Z', attempts: 2, status: 'failed', forecastUsd: 12 },
+      }),
+      // Run 2: phase 2 boarded again and verified ($15) — its forecast stays its FIRST one.
+      costRun('r2', 15, {
+        2: { costUsd: 15, endedAt: '2026-10-25T02:00:00Z', attempts: 1, status: 'done', forecastUsd: 13 },
+        3: { costUsd: 0, attempts: 0, status: 'pending' },
+      }),
+    ],
+  });
+  assert.deepEqual(view.actuals, {
+    actualUsd: 44,
+    verifiedPhases: 2,
+    costPerVerifiedPhaseUsd: 22,
+    costOfFailedAttemptsUsd: 9,
+    failedAttempts: 1,
+    forecastUsd: 36.32,
+    forecastActualUsd: 44,
+    deltaUsd: 7.68,
+    deltaPct: 21.1,
+    forecastPhases: 2,
+  });
+  assert.equal(view.phases.find((p) => p.phase === 2)?.forecastUsd, 12, 'the forecast it first boarded with');
+  // A plan with no forecast on any record, and no verified phase, reads nulls — never a zero that means unknown.
+  const bare = planCost({ slug: 'demo', runs: [costRun('r1', 5, { 1: { costUsd: 5, attempts: 1, status: 'failed' } })] });
+  assert.equal(bare.actuals.costPerVerifiedPhaseUsd, null);
+  assert.equal(bare.actuals.forecastUsd, null);
+  assert.equal(bare.actuals.deltaUsd, null);
+  assert.equal(bare.actuals.costOfFailedAttemptsUsd, 5);
+});
+

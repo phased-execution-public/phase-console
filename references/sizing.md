@@ -60,9 +60,9 @@ auto-compaction threshold.
 ## Step 1 — know your model
 
 You (the running agent) already know your own model from your system context (e.g. "powered by Opus
-5 / `claude-opus-5`"). Use it. Phases are *executed* in future sessions that may run a **different**
+5.5 / `claude-opus-5-5`"). Use it. Phases are *executed* in future sessions that may run a **different**
 model than the one planning now — the common split is **Fable plans (Mode 1), Opus executes** — so the
-plan records a **target execution model** in its `## Session budget` note (default `claude-opus-5`
+plan records a **target execution model** in its `## Session budget` note (default `claude-opus-5-5`
 when the user hasn't said otherwise), and each phase-start re-checks it. If the target is genuinely
 unknown, ask with `AskUserQuestion` ("Which Claude model will run these phases?").
 
@@ -93,10 +93,10 @@ from a multiple of its weight: every session pays a floor before its weight coun
 
 | Model | Max window | Max output | $ in / out per MTok (as of 2026-07) | Session budget preset (weight) | Use for |
 |---|---|---|---|---|---|
-| Opus 5 / 4.8 / 4.7 | 1M | 128K | 5 / 25 | **~200K** (its target, 60% of the window, is 600K of context) | the default execution model (Opus 5 is the latest); hard reasoning / architecture |
+| Opus 5.5 / 5 / 4.8 | 1M | 128K | 5 / 25 | **~200K** (its target, 60% of the window, is 600K of context) | the default execution model (Opus 5.5 is the latest: `opus` → `claude-opus-5-5`); hard reasoning / architecture |
 | Fable 5 | 1M | 128K | 10 / 50 | **~200K** | planning (Mode 1) + the most demanding long-horizon phases; priciest |
 | Sonnet 5 / 4.6 | 1M | 64K | 2 / 10 intro (→3 / 15) · 4.6: 3 / 15 | **~200K** | balanced execution / implementation phases |
-| Haiku 4.5 | **200K** | 64K | 1 / 5 | **~40K** | mechanical / cheap phases → smaller phases, more of them |
+| Haiku 4.5 | **200K** | 64K | 1 / 5 | **~40K** | subagents and side work — on a 200K window the shipped floor alone passes the target, so a phase session does not fit |
 
 > **Tokenizer caveat.** Opus 4.7+, Fable 5, and Sonnet 5 tokenize ~30% denser text into ~30% *more*
 > tokens than older models — don't reuse working-set counts measured on pre-4.7 models; the S/M/L bands
@@ -122,11 +122,14 @@ Four budget classes, one `sizing.env` key each:
 alias may resolve to a window smaller than 1M — which is precisely why the CLI takes a `[1m]` suffix at
 all — so `BUDGET_1M` is the one rating that is measured rather than assumed. Re-rating the bare aliases
 down would change how every existing plan batches, so it is an operator decision (one edit, `BUDGET_BIG`)
-and not a cleanup.
+and not a cleanup. **What is measured:** under the session model below as phase 33 re-fitted it, a 1M
+session holds about 190K of weight before its peak passes the target
+(`p33-after.json` `boot_floor_fit.weight_at_target_1m`), so `BUDGET_BIG`'s 200K over-promises by about
+5% — under the 8.0 floor it held 129K, a third short. It stays at 200K: the re-fit measured M and L only.
 
 **Per-phase model selection is a lever too.** You don't have to run every phase on one model. Put hard
-reasoning/architecture phases on Opus or Fable, balanced implementation on Sonnet, and mechanical phases
-(rename sweeps, codegen, boilerplate) on cheap fast Haiku. A phase can name its preferred model in the
+reasoning/architecture phases on Opus or Fable and balanced implementation on Sonnet; cheap fast Haiku
+earns its place in subagents and side work, since a 200K window cannot hold a phase session's floor. A phase can name its preferred model in the
 plan — alias, full id, or a `[1m]` variant; just remember switching models mid-*session* busts the
 cache, so keep one model per session — a wanted model switch is one of the few boundaries that *earns*
 a fresh session.
@@ -155,9 +158,9 @@ cache warm. This is **batching**, and by hand it is encouraged, not a forfeit:
   serial, so even same-scope siblings are safe that way. Pick ONE to continue into. The rest run in later
   sessions — **at the same time as this one if their scopes are disjoint** (`conflicts` before each).
 - **L-size phases batch like any other** — only the session model decides: the floor, paid once, plus
-  the slope × the summed weight, against the target. Measured, that is about 129K of weight in a
-  1M-window session — three Ms, or an L with an S (an L and an M miss by a hair) — not the 200K a
-  pure multiple allowed.
+  the slope × the summed weight, against the target. Measured (phase 33's re-fit), that is about 190K
+  of weight in a 1M-window session — two Ls, or an L with two Ms (two Ls and an S miss) — where the
+  8.0 floor allowed 129K.
 - **This is a person's move, not the console's.** The console's autopilot boards every phase in a
   session of its own and never batches (`1 phase ≥ 1 session`); what it runs is forecast below.
 
@@ -168,16 +171,18 @@ mid-batch — that's what keeps each phase independently resumable.
 
 ### The session model: a floor paid once, plus a slope
 
-Measured over 264 fresh phase sessions on two consoles (control-tower phase 59, #83), a session's
-PEAK context is:
+A session's PEAK context is, as measured-console phase 33 re-fitted it over the 20 fresh phase sessions
+of its own phases 15–32 (`docs/handoffs/measured-console/reports/p33-after.json`, `boot_floor_fit`):
 
 ```
-peak ≈ boot floor + work floor + slope × weight          shipped: 121K + 198K + 2.17 × weight
+peak ≈ boot floor + work floor + slope × weight          shipped: 55K + 183K + 1.91 × weight
 ```
 
 - **Boot floor** — the first API call's context: the system prompt, the tool listing, CLAUDE.md, the
-  rules, the memory index and the boot prompt, read before any work. It is per REPOSITORY (the two
-  consoles measured 121K and 89K), recorded on every `phase.tokens` line as `firstContext`, and
+  rules, the memory index and the boot prompt, read before any work. It is per REPOSITORY: 55K on the
+  lean skill, the SessionStart brief and the two pointer `CLAUDE.md` files (`boot_floor_median`
+  55,353 over the last ten, p90 57,063), against 8.0's 111K on the same console
+  (`p1-before.json`) and the 121K the 8.0 model shipped. It is recorded on every `phase.tokens` line as `firstContext`, and
   reported as its own line — by `--session-plan` and on the plan page — because it is the part a
   repository can shrink, and a smaller one lowers every session it will ever run.
 - **Work floor** — what every phase session adds above its boot whatever its size: the plan and
@@ -186,8 +191,10 @@ peak ≈ boot floor + work floor + slope × weight          shipped: 121K + 198K
 
 `boot + work` is the per-session FLOOR (`SESSION_BOOT_FLOOR` + `SESSION_WORK_FLOOR` in `sizing.env`),
 paid ONCE by every session. The line goes through the per-size median peaks with every tag weighing
-once — median S 325K, M 447K, L 501K, each within 10% of it — and the console re-fits it on its own
-sessions (`analysis/sizing-model.ts`). The model it replaced — "real context ≈ 3 × the summed weight" —
+once — median M 315K and L 410K, each on it; the range held no S phase — and the console re-fits it on
+its own sessions (`analysis/sizing-model.ts`). The 8.0 line (121K + 198K + 2.17, median S 325K, M 447K,
+L 501K over 264 sessions on two consoles, control-tower phase 59, #83) is still that audit week's fit.
+The model it replaced — "real context ≈ 3 × the summed weight" —
 was under 107 of 108 audited phases, S peaks ran 21.6× their weight, and `--session-plan` proposed
 pairs a lone L already overflowed.
 
@@ -222,8 +229,8 @@ Tag a phase's rough working-set in its `### Phase N` heading block, mirroring th
 | `L` | ~50–120K | a substantial subsystem, heavy exploration, large diffs |
 
 A phase whose predicted peak — the floor plus the slope × its weight — passes the target is too big for
-one session: split it (on a 1M window that is past ≈129K of weight, so an `L` fits and an `L` with an `M`
-does not; on a 200K window — Haiku, or an unknown model — the shipped floor alone passes the target, and
+one session: split it (on a 1M window that is past ≈190K of weight, so two `L`s fit and two `L`s with an
+`S` do not; on a 200K window — Haiku, or an unknown model — the shipped floor alone passes the target, and
 `--session-plan` says so). Phases with **no** `Size:` tag are treated as `M`. These map to token weights
 `S=15K`, `M=40K`, `L=90K` for batch math (kept in sync with `scripts/phase-graph.sh` via
 `scripts/sizing.env`).
@@ -233,7 +240,7 @@ does not; on a 200K window — Haiku, or an unknown model — the shipped floor 
 Every session the console spawns carries both a dollar and a turn cap (`--max-budget-usd`,
 `--max-turns`), and since control-tower phase 59 they are MEASURED, not chosen: each mode's p99 over
 the console's own `phase.session` lines of the last two weeks, plus 50%, rounded up — re-derived hourly
-as sessions accrue (`deriveCapTable`, `viewer/server/runner/session-record.ts`). A mode with fewer than
+as sessions accrue (`deriveCapTable`, `server/runner/session-record.ts`). A mode with fewer than
 twenty sessions in the window takes the table shipped with the release, measured the same way:
 
 | Mode | Dollars | Turns | Measured over (shipped) |

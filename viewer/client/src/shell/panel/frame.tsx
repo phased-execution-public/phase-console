@@ -3,9 +3,10 @@ import { X } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { usePrefs, PANEL_WIDTH } from '@/lib/prefs';
 import { Sheet, SheetContent } from '@/ui/sheet';
+import { useSettledWidth } from '@/ui/sheet-width';
 import type { ConsoleState } from '@/data/api';
 import type { Route } from '../routes';
-import { InspectorHost } from './inspector-host';
+import { InspectorHost, useInspected } from './inspector-host';
 import {
   MODE_LABEL,
   PANEL_MODES,
@@ -42,6 +43,13 @@ export default function Panel({
   const [prefs] = usePrefs();
   const mode = panelMode(prefs.panel);
   const label = MODE_LABEL[mode];
+  // How wide its record may make it (2026-10-20): the inspected record's
+  // measure in Details, a reading measure for the Supervisor.
+  const inspected = useInspected();
+  const measure = mode === 'details' ? (inspected?.measure ?? 'reading') : 'reading';
+  const fit = prefs.panel.width === 'auto';
+  const aside = useRef<HTMLElement>(null);
+  const settled = useSettledWidth<HTMLElement>(host === 'column' && fit, inspected?.key ?? mode);
   const modes = offeredModes(
     host,
   );
@@ -82,6 +90,7 @@ export default function Panel({
       >
         <SheetContent
           side={host}
+          size={measure}
           title={label}
           showTitle
           subheader={switcher ? <div className="py-2">{switcher}</div> : undefined}
@@ -96,12 +105,33 @@ export default function Panel({
 
   return (
     <aside
+      ref={(node) => {
+        aside.current = node;
+        settled(node);
+      }}
       aria-label={label}
       data-panel={mode}
-      className="relative flex min-h-0 min-w-0 flex-col overflow-hidden border-s border-rule bg-ground"
-      style={{ width: clampWidth(prefs.panel.width) }}
+      {...(fit ? { 'data-sheet-size': measure } : {})}
+      className={cn(
+        'relative flex min-h-0 min-w-0 flex-col overflow-hidden border-s border-rule bg-ground',
+        // As wide as its record asks, within its measure — and never so wide that
+        // the page beside it has under 50 rem — the room a desk page had beside the
+        // old 400 px column, which every page is laid out to hold (`100cqi` is the shell's own width, `@container/shell`).
+        fit && 'sheet-fit [--sheet-cap:min(56rem,calc(100cqi_-_var(--rail-width)_-_50rem))]',
+      )}
+      style={
+        fit
+          ? undefined
+          : {
+              width: clampWidth(prefs.panel.width as number),
+              maxWidth: 'calc(100cqi - var(--rail-width) - 50rem)',
+            }
+      }
     >
-      <Edge width={prefs.panel.width} />
+      <Edge
+        width={fit ? null : (prefs.panel.width as number)}
+        measured={() => aside.current?.getBoundingClientRect().width ?? PANEL_WIDTH.min}
+      />
       <header className="flex shrink-0 items-center justify-between gap-2 border-b border-rule px-3 py-2">
         {switcher ?? <h2 className="text-section font-semibold text-ink">{label}</h2>}
         <button
@@ -155,12 +185,14 @@ const KEY_STEP = 16;
  * The panel's edge: drag it, or focus it and use the arrow keys. A window
  * splitter in ARIA's own words, so a screen reader says how wide it is and
  * which way it moves. The width under a drag is the pointer's; it is written
- * to the preference once, when the drag ends.
+ * to the preference once, when the drag ends. A column that fits its record
+ * (`width` null) starts a drag from the width it has; a double-click, or
+ * Home, lets go of a set width, so the column fits its record again.
  */
-function Edge({ width }: { width: number }) {
+function Edge({ width, measured }: { width: number | null; measured: () => number }) {
   const [dragged, setDragged] = useState<number | null>(null);
   const from = useRef<{ x: number; width: number } | null>(null);
-  const shown = clampWidth(dragged ?? width);
+  const shown = clampWidth(dragged ?? width ?? measured());
   const move = (event: PointerEvent<HTMLDivElement>) => {
     if (from.current) setDragged(clampWidth(from.current.width + (from.current.x - event.clientX)));
   };
@@ -185,10 +217,12 @@ function Edge({ width }: { width: number }) {
       onPointerMove={move}
       onPointerUp={end}
       onPointerCancel={end}
+      onDoubleClick={() => setPanelWidth('auto')}
       onKeyDown={(event) => {
         const step = event.shiftKey ? KEY_STEP * 4 : KEY_STEP;
         if (event.key === 'ArrowLeft') setPanelWidth(shown + step);
         else if (event.key === 'ArrowRight') setPanelWidth(shown - step);
+        else if (event.key === 'Home') setPanelWidth('auto');
         else return;
         event.preventDefault();
       }}

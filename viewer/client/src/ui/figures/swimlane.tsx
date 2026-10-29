@@ -100,7 +100,29 @@ export type SwimlaneBar = {
    */
   rail?: boolean;
   title?: string;
+  /**
+   * What holds this span, drawn as a small shape hung under its start (#407): a
+   * `lock` is a working tree or a lane another holder has, a `person` is an act
+   * only a person can do. Each carries its own sentence — a title for a pointer
+   * and a name for a reader who cannot see the shape.
+   */
+  glyphs?: SwimlaneGlyph[];
   onSelect?: () => void;
+};
+
+/** One thing holding a bar, as a shape. */
+export type SwimlaneGlyph = { kind: 'lock' | 'person'; title: string };
+
+/**
+ * A thin line from the end of one bar to the start of another — a dependency
+ * (#407). Rows and bars are named by their keys; a tie whose ends are not both
+ * on the drawing is not drawn. `title` is its name, for a pointer and a reader.
+ */
+export type SwimlaneTie = {
+  key: string;
+  from: { row: string; bar: string };
+  to: { row: string; bar: string };
+  title: string;
 };
 
 /** A moment worth a glyph rather than a span. */
@@ -139,6 +161,47 @@ const FAINT = '[--state:var(--ink-faint)]';
  */
 const INERT = 'pointer-coarse:pointer-events-none';
 
+/** The side of a glyph's box, px. */
+const GLYPH = 10;
+
+/** A lock or a person, drawn in the ink (never a state's colour: it says what holds, not how it stands). */
+function HeldGlyph({
+  kind,
+  title,
+  role,
+  x,
+  y,
+}: {
+  kind: 'lock' | 'person';
+  title: string;
+  role: 'img' | 'group';
+  x: number;
+  y: number;
+}) {
+  const line = {
+    fill: 'none',
+    stroke: 'var(--ink)',
+    strokeWidth: 1.2,
+    vectorEffect: 'non-scaling-stroke' as const,
+  };
+  return (
+    <g data-glyph={kind} role={role} aria-label={title} className={INERT}>
+      {kind === 'lock' ? (
+        <>
+          <rect x={x + 1} y={y + 4.5} width={8} height={5.5} rx={1} {...line} />
+          <path d={`M${x + 2.8} ${y + 4.5}V${y + 3.2}a2.2 2.2 0 0 1 4.4 0V${y + 4.5}`} {...line} />
+        </>
+      ) : (
+        <>
+          <circle cx={x + 5} cy={y + 2.8} r={2.2} {...line} />
+          <path d={`M${x + 1} ${y + 10}a4 3.6 0 0 1 8 0`} {...line} />
+        </>
+      )}
+      <title>{title}</title>
+    </g>
+  );
+}
+
 export function Swimlane({
   rows,
   spanMs,
@@ -153,6 +216,7 @@ export function Swimlane({
   cursorMs,
   figure,
   below,
+  ties = [],
   className,
 }: {
   rows: readonly SwimlaneRow[];
@@ -195,6 +259,8 @@ export function Swimlane({
    * label for the label column and its height, so the two stay level.
    */
   below?: { node: ReactNode; label: ReactNode; height: number };
+  /** Dependency lines between bars, drawn over the rows and under the now line. */
+  ties?: readonly SwimlaneTie[];
   className?: string;
 }) {
   const box = useRef<HTMLDivElement>(null);
@@ -425,11 +491,52 @@ export function Swimlane({
                       </rect>
                     ),
                   )}
+                  {/* What holds a bar — a lock, a person — hung under its start. */}
+                  {one.bars.flatMap((span) =>
+                    span.endMs < v0 || span.startMs > v1
+                      ? []
+                      : (span.glyphs ?? []).map((glyph, at) => (
+                          <HeldGlyph
+                            key={`${span.key}:${glyph.kind}`}
+                            kind={glyph.kind}
+                            title={glyph.title}
+                            role={drawing}
+                            x={clampX(x(span.startMs)) + 1 + at * (GLYPH + 2)}
+                            y={y + row - 1 - GLYPH}
+                          />
+                        )),
+                  )}
                   {/* Hung from the bar's lower edge into the row's second
                       line, so the glyph marks the bar without hiding it. */}
                   {clusterMarks(one.marks ?? [], x, width).map((placed) =>
                     drawMark(placed, y + row - 2, FAINT),
                   )}
+                </g>
+              );
+            })}
+
+            {ties.map((tie) => {
+              const rowAt = rows.findIndex((one) => one.key === tie.from.row);
+              const toAt = rows.findIndex((one) => one.key === tie.to.row);
+              const from = rows[rowAt]?.bars.find((span) => span.key === tie.from.bar);
+              const to = rows[toAt]?.bars.find((span) => span.key === tie.to.bar);
+              if (!from || !to) return null;
+              const x1 = clampX(x(from.endMs));
+              const x2 = clampX(x(to.startMs));
+              const y1 = top + rowAt * row + row / 2;
+              const y2 = top + toAt * row + row / 2;
+              const bend = Math.max(6, Math.abs(x2 - x1) / 2);
+              return (
+                <g key={tie.key} data-tie={tie.key} role={drawing} aria-label={tie.title} className={INERT}>
+                  <path
+                    d={`M${x1} ${y1}C${x1 + bend} ${y1} ${x2 - bend} ${y2} ${x2} ${y2}`}
+                    fill="none"
+                    stroke="var(--ink-muted)"
+                    strokeWidth="1"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                  <circle cx={x2} cy={y2} r={2} fill="var(--ink-muted)" />
+                  <title>{tie.title}</title>
                 </g>
               );
             })}

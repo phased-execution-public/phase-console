@@ -2198,6 +2198,14 @@ export type LaneSignals = {
   tokens?: TokenCounters;
   /** The context window this lane's thresholds are judged against, once the runner knows the model. */
   contextWindow?: number;
+  /** The newest call's context — what a `PreCompact` hook reads as "before" (measured-console phase 12, A10). */
+  lastContext?: number;
+  /**
+   * A compaction the session's hooks reported (A10): `PreCompact` stamps
+   * `before`, `PostCompact` marks it `done`, and the first usage event after it
+   * supplies "after" and the re-cache tokens for `phase.compaction`.
+   */
+  compaction?: { trigger: string; before: number | null; at: string; done: boolean };
   /**
    * The stall reading's evidence (control-tower phase 44): the lane's LAST
    * output read as a person's turn (`suspectedStepOf`), and when (ms). Replaced

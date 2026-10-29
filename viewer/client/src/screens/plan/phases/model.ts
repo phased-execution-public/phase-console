@@ -27,6 +27,9 @@ import {
   phaseActions,
 } from '@shared/phase-model.js';
 import { hintedPhases, type HintedPhase } from '@shared/run-lifecycle.js';
+import type { UiState } from '@shared/status-vocab.js';
+import { describePhase } from '@shared/status-model.js';
+import type { WordOf } from '@/ui/status';
 import type {
   HandoffRow,
   LaneLiveness,
@@ -166,7 +169,7 @@ export type PhaseRecovery = {
 };
 
 /** Which page the grid is drawn on, and which reading of it. */
-export type PhaseTableContext = 'run' | 'plan' | 'plan-qa' | 'plan-handoffs';
+export type PhaseTableContext = 'run' | 'plan' | 'plan-record';
 
 /** What every cell of one render shares — one object, handed to every row. */
 export interface PhaseTableScope {
@@ -212,6 +215,20 @@ export const runningOf = (row: PhaseTableRow): boolean => {
   );
 };
 
+/**
+ * The hue of a phase's strip (2026-10-20, Tower strips) — its 4 px leading
+ * edge, and its ground while open: EXACTLY the paint of the row's lead badge,
+ * the State column's `PhaseMark` (`describePhase` over the board word it
+ * shows), so the edge and the word beside it are one colour. Never the
+ * board's line table (`BOARD_STATE_UI`), which paints a stuck or gated phase
+ * amber: amber is never derived from a status word (design.md §3.1), and a
+ * gate that waits on a person says so in its own badge on the row.
+ */
+export function stripPaintOf(row: PhaseTableRow): UiState {
+  const showing = displayState(row.p.state, { running: runningOf(row) });
+  return describePhase(null, { boardState: showing as WordOf<'board'> }).paint as UiState;
+}
+
 /** The need a row is in. */
 export const needOf = (row: PhaseTableRow): PhaseGroupId =>
   phaseGroupOf({ phase: row.p.phase, state: row.p.state, ...(row.p.record ? { record: row.p.record } : {}) });
@@ -245,15 +262,29 @@ export function mcpCallWords(calls: Record<string, number>): string {
 /* ---------------- the readings ---------------- */
 
 /**
- * The readings — one on the run page, three on the plan page — and the
+ * The readings — one on the run page, two on the plan page — and the
  * columns each leads with. A hidden column is still in every row's detail, and
  * the operator's own choice (the toolbar's columns), stored under `tableId`,
- * wins. The QA and Handoffs readings open in PLAN ORDER: their subject is
- * mostly finished phases, which grouping by need would fold away under Done.
+ * wins. The Handoffs & QA reading opens in PLAN ORDER: its subject is mostly
+ * finished phases, which grouping by need would fold away under Done.
+ *
+ * `plan-record` is ONE reading of a phase's record since 2026-10-20 (Tower
+ * strips): its handoff and its QA are halves of the same story — what the
+ * session said it did, and what the review found — so they stand side by
+ * side, and a row opens onto both. Its `tableId` is new on purpose: a column
+ * choice saved under the old QA-only or handoff-only reading would hide the
+ * other half here.
  */
 export const PHASE_TABLE_CONTEXTS: Record<
   PhaseTableContext,
-  { tableId: string; label: string; hidden: readonly string[]; groupBy?: string }
+  {
+    tableId: string;
+    label: string;
+    hidden: readonly string[];
+    groupBy?: string;
+    /** What an opened row leads with — `record`: its handoff and its QA, as two cards. */
+    lead?: 'record';
+  }
 > = {
   run: {
     tableId: 'phases.run',
@@ -267,28 +298,11 @@ export const PHASE_TABLE_CONTEXTS: Record<
     hidden: ['need', 'deps', 'lock', 'run', 'turns'],
     groupBy: 'need',
   },
-  'plan-qa': {
-    tableId: 'phases.plan-qa',
-    label: 'QA by phase',
-    hidden: ['need', 'scope', 'deps', 'lock', 'size', 'run', 'handoff', 'gate', 'spend', 'turns'],
-  },
-  'plan-handoffs': {
-    tableId: 'phases.plan-handoffs',
-    label: 'Handoffs by phase',
-    hidden: [
-      'need',
-      'scope',
-      'deps',
-      'lock',
-      'size',
-      'lane',
-      'run',
-      'qa',
-      'gate',
-      'spend',
-      'turns',
-      'actions',
-    ],
+  'plan-record': {
+    tableId: 'phases.plan-record',
+    label: 'Handoffs and QA by phase',
+    hidden: ['need', 'scope', 'deps', 'lock', 'size', 'run', 'gate', 'spend', 'turns'],
+    lead: 'record',
   },
 };
 

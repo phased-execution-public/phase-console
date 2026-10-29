@@ -13,7 +13,9 @@ intersect; same repo ⇒ serialized; `all` ⇒ exclusive against every unqualifi
 Repos column, and `phase-lock.sh <slug> conflicts <N> --scope "<csv>"` answers the question across every
 plan before you start — a working tree doesn't know which plan asked for it. Every boot prompt states
 its phase's scope and the command to check it. A phase that declares nothing counts as `all` and runs
-alone; still want to overlap two sessions on one repo? Give each its own checkout or `git worktree`.
+alone; still want to overlap two sessions on one repo? Give each its own checkout through
+`scripts/phase-lane.sh <slug> create <N>` (under `<root>/.worktrees/hand/`, locked, swept), or let the
+console run the plan with worktree lanes — a `git worktree add` by hand is a tree nothing sweeps.
 
 **Never stash to hand off.** A `git stash` lives in one working tree and is invisible to every other
 session and clone. Commit instead — even a WIP commit. The filesystem of a closed session is not a
@@ -32,6 +34,53 @@ it too, each naming itself in the line so a failure can be grepped for: **F14**
 directive whose type is not on the list), and **F25** `decision-outstanding-unowned`,
 `decision-key-unknown` and `decision-state-unknown` (a `## Decisions` row nobody owes, or a key or
 state outside the vocabulary). Run it before trusting a board.
+
+**A hook that fails blocks.** Every hook a run writes into a session's settings carries
+`onFailure: "block"` (Claude Code 2.1.295+): an approvals hook that cannot start, times out or
+answers garbage refuses the tool call instead of letting it through unasked. The cost is stated: while
+the console restarts, a running session's tool calls are refused until it is back, which is why the
+console restarts for an update only when idle. The CLI does not apply the field to `Stop`, so the
+closeout hook still fails open.
+
+**An unattended session loads what the console owns, and nothing else.** Under `autopilotLoads:
+console-set` (9.0's default) every session the runner starts carries the console's own skill tree for
+its revision (`--plugin-dir`), the curated seed (`CLAUDE_CODE_PLUGIN_SEED_DIR`) and only the personal
+plugins a person switched on for autopilot (`autopilotPlugins`, by `name@marketplace`), named in the
+run's settings as `enabledPlugins` — with the installed copy of the skill switched off, so two copies
+never load. It starts with `--setting-sources project,local`: the repository's settings and the run's
+own `--settings` (the deny wall, the hooks) still load, and the operator's user-level hooks, plugins
+and skills do not — but their user-level `permissions.deny` rules are carried into the run's settings,
+so a person's own deny rule is never lost with their plugins, and the hook events left out are named
+in `phase.plugins`. That is the one value of the one flag `sanitize()` lets through, for the runner's
+spawn door alone; `--bare`, `--safe-mode` and every other `--setting-sources` value stay stripped
+(`viewer/test/invariants.test.ts`). The console's presence hooks come from the tree's own
+`hooks/hooks.json`. `autopilotLoads: operator-config` is 8.0's behaviour — the config dir decides.
+
+**The bars a change is held to are not a session's to move.** A session never writes these files,
+whatever its permission profile, its plan's allow rules or a grant say (rule `protected-file`):
+
+```
+e2e/baseline.json
+status-ratchet.json
+known-reds.json
+scripts/quarantine.env
+**/__snapshots__/**
+**/*.snap
+```
+
+It deletes a `*.test.*` or `*.spec.*` file (`rm`, `git rm`, inside `bash -c` too) only when its
+phase's section says `- **May delete tests:** yes`; the baselines stay protected even then. The
+console's own classifier decides it, twice over: in the HTTP hook, and in a local command hook
+(`scripts/guard-hook.sh`) that asks the same classifier with no console running. It reads the call
+the way the shell would (redirections, `rm`, `cp`/`mv` targets, `sed -i`, `git rm`, `git
+checkout`/`restore`, `find -delete`, a recursive delete of a test directory, `bash -c` payloads), and
+it is a guardrail, not a sandbox: inside one OS user a determined program — a script it wrote, a path
+assembled at run time — can still write a file. What it stops is the careless edit that would move
+the bar a change is measured against.
+
+**A red finish is held once.** A session ending its work runs into the Stop hook, which runs the
+phase's fast verification lines on the tree it leaves and holds the exit once if any is red, naming
+the failing ids. A phase opts out with `- **Fast gate:** off`.
 
 **Explicit-path commits.** Never `git add -A` — a phase commits the files it touched, so unrelated
 work in your tree is not swept in.

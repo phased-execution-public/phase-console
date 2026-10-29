@@ -428,6 +428,9 @@ describe('the views', () => {
     expect(links.map((a) => a.textContent?.replace(/\d+$/, ''))).toEqual(TAB_IDS.map(tabLabel));
     expect(links.map((a) => a.getAttribute('href'))).toEqual(TAB_IDS.map((id) => `#/plan/demo/${id}`));
     expect(links[0]).toHaveTextContent(/3$/);
+    // A bay of tiles, each view its glyph before its name (2026-10-20, Tower strips).
+    for (const link of links)
+      expect(link.querySelector('svg[aria-hidden]'), link.textContent ?? '').not.toBeNull();
   });
 
   it('gives every frozen id a label and a body that is not the fallback', async () => {

@@ -17,15 +17,26 @@
  *   TCC-4  #377 — every title is at most 80 characters, starts upper-case
  *          (unless it leads with a name: a branch, a path, a slug),
  *          holds no path list and no errand ref (the ref is `errandRef`, a chip)
+ *   TCC-5  the packs' words (measured-console phase 29): a gstack
+ *          `decisions.jsonl` approval row and a `GSTACK_RESULT … gate_pending`
+ *          line, raised through the one door, are ONE whole card each — an
+ *          Approval and a Decision
  */
 import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const { buildInbox } = await import('../server/inbox.ts');
 const { turnView } = await import('../server/turn/index.ts');
 const { MACHINE_WORDS } = await import('../server/turn/compose.ts');
+const { closingAskOf, pendingApprovalsOf } = await import('../server/turn/packs.ts');
+const { raiseTurn } = await import('../server/turn/index.ts');
+const { HumanStepLedger } = await import('../server/human-steps.ts');
 const { HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_SETTLED_STATES, KIND_META } = await import('../shared/human-step-model.js');
 const {
   TURN_GROUPS, TURN_SOURCES, ITEM_TYPES, PERSON_STATUSES, PERSON_STATUS_LABEL, READINESS, ROUTE_TO, TYPE_META,
@@ -66,6 +77,9 @@ const BIRTHS = [
   // A phase's run request (turn-by-turn phase 6): ONE approval per run and act.
   { birth: 'console', source: { kind: 'run-request', ref: 'hold' }, phase: 9 },
   { birth: 'supervisor', source: { kind: 'supervisor', ref: 'turn-unopened' }, phase: 5 },
+  // What a session's closing words asked (measured-console phase 29): its prose questions, a pack's gate.
+  { birth: 'console', source: { kind: 'prose-question', ref: 'sess-closing' }, phase: 14 },
+  { birth: 'console', source: { kind: 'pack', ref: 'gstack:run-1-r2-p1' }, phase: 15 },
 ] as const;
 type Birth = (typeof BIRTHS)[number];
 
@@ -397,3 +411,46 @@ test('TCC-3: a card stripped of its check, its steps or its route fails the judg
   assert.match(cardMisses({ ...whole!, readiness: undefined } as never, 'free').join('\n'), /no readiness/);
   assert.match(cardMisses({ ...whole!, title: 'Wait for cmd:"gh auth status"' }, 'free').join('\n'), /machine word/);
 });
+
+/* ------------------------------------------------------------------ *
+ * TCC-5 — the packs' words
+ * ------------------------------------------------------------------ */
+
+test('TCC-5: a gstack approval row and a GSTACK_RESULT gate line each become ONE whole card — an Approval and a Decision', () => {
+  const packs = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'packs');
+  const read = (name: string) => readFileSync(join(packs, name), 'utf8');
+  const said = read('closing-gstack-gate.md').replace('RUN_DIR', '/tmp/run-1');
+  const row = closingAskOf(said, { ref: 'sess-a', readRun: () => pendingApprovalsOf(read('decisions.jsonl'), read('gate.json')) })!;
+  const line = closingAskOf(said, { ref: 'sess-b', readRun: () => [] })!;
+  const dir = mkdtempSync(join(tmpdir(), 'pc-tcc-packs-'));
+  try {
+    const ledger = new HumanStepLedger(join(dir, 'human-steps.ndjson'));
+    const door = { ledger, announce: () => true };
+    for (const [ask, phase] of [[row, 14], [line, 15]] as const) {
+      raiseTurn(door, { slug: 'demo', phase, birth: 'console', runId: 'r1', step: ask.step });
+      // The same source asked again is the same item.
+      raiseTurn(door, { slug: 'demo', phase, birth: 'console', runId: 'r1', step: ask.step });
+    }
+    const raised = ledger.all();
+    assert.equal(raised.length, 2, 'one item each');
+    for (const edition of EDITIONS) {
+      const { items } = walk(edition, (steps) => steps.push(...(raised as never[])));
+      const cards = items.filter((item) => raised.some((step) => step.id === item.item));
+      assert.equal(cards.length, 2, `${edition}: both reach the page`);
+      const approval = cards.find((card) => card.item === raised[0]!.id)!;
+      const decision = cards.find((card) => card.item === raised[1]!.id)!;
+      assert.equal(approval.type, 'approve', `${edition}: the approval row is an Approval`);
+      assert.equal(decision.type, 'decide', `${edition}: the gate line is a Decision`);
+      assert.equal(approval.source, 'session');
+      assert.deepEqual(approval.options?.filter((o) => o.recommended).map((o) => o.label), ['Approve with the recommended changes']);
+      assert.deepEqual(decision.options?.filter((o) => o.recommended).map((o) => o.label), ['Take every recommendation']);
+      for (const card of cards) {
+        assert.ok(card.steps.length >= 1, `${edition} ${card.item}: steps`);
+        assert.deepEqual(cardMisses(card, edition), [], `${edition} ${card.item}: a whole card`);
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

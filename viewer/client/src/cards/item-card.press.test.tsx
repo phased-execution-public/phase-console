@@ -14,7 +14,8 @@
  *   IP-6 an item being checked offers Undo, which takes the check back;
  *   IP-7 a ledger item of a phase offers Give back to Phase N — and nothing
  *        else does;
- *   IP-8 Goes to and Checked by, how a Done item settled, and the latest note;
+ *   IP-8 Goes to and Checked by — the record's folds since Tower strips (2026-10-20),
+ *        their heads saying each while folded — how a Done item settled, and the latest note;
  *   IP-9 (Pro) Ask the supervisor about this opens the chat with the item itself as its chip.
  */
 
@@ -340,7 +341,7 @@ describe('IP-6 Undo on a running check', () => {
 describe('IP-7 Give back to Phase N', () => {
   it('a ledger item of a phase is handed back to it', async () => {
     wrap(<ItemCard item={ledger('physical', 'notified')} perform={vi.fn()} />);
-    // Folded under *Hand it back* (turn-by-turn phase 8), with a question and "I can't" beside it.
+    // Folded under *Hand it back* (turn-by-turn phase 8), with a question beside it; "I can't" is one press from the card.
     fireEvent.click(screen.getByTestId('turn-hand-back'));
     const back = screen.getByTestId('turn-give-back');
     expect(back.textContent).toBe('Give back to Phase 3');
@@ -367,6 +368,11 @@ describe('IP-7 Give back to Phase N', () => {
 describe('IP-8 the routing words, the settlement and the note', () => {
   it('says where a press goes and who checks it', () => {
     wrap(<ItemCard item={ledger('physical', 'notified')} perform={vi.fn()} />);
+    // Folded, each head says it; one press in, the whole of it.
+    expect(screen.getByTestId('turn-route-fold').textContent).toContain('The phase');
+    expect(screen.getByTestId('turn-check-fold').textContent).toContain('The console runs a check');
+    fireEvent.click(screen.getByTestId('turn-route-fold'));
+    fireEvent.click(screen.getByTestId('turn-check-fold'));
     expect(screen.getByTestId('turn-goes-to').textContent).toContain(
       'The phase — its session picks up where it stopped.',
     );

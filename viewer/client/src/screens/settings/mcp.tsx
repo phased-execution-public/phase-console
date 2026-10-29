@@ -103,12 +103,23 @@ export function rowAct(server: McpServerView): 'switch-on' | 'fill' | 'sign-in' 
   return 'switch-off';
 }
 
-/** One server's facts on its row, in words: switched off, transport, tools. */
-export function serverFact(server: McpServerView): string {
+/**
+ * One server's facts on its row, in words: switched off, transport, tools — and,
+ * attached, what it costs every turn (`contextTokens`, `scripts/mcp.env`),
+ * the catalog's pin and an untrusted output (measured-console phase 27, D8).
+ */
+export function serverFact(server: McpServerView, contextTokens?: number): string {
   return [
     server.enabled ? null : 'Switched off',
     server.transport,
     server.toolCount ? `${server.toolCount} ${server.toolCount === 1 ? 'tool' : 'tools'}` : null,
+    server.enabled && contextTokens ? `~${contextTokens.toLocaleString('en-US')} tokens a turn` : null,
+    server.pin
+      ? server.pin.held
+        ? `pinned ≥ ${server.pin.min}`
+        : `not pinned — the catalog runs ≥ ${server.pin.min}`
+      : null,
+    server.untrustedOutput ? 'untrusted output' : null,
     server.needsConfig?.length ? `needs ${server.needsConfig.join(', ')}` : null,
   ]
     .filter(Boolean)
@@ -201,7 +212,12 @@ export function McpServersSection() {
         </div>
       ) : (
         <>
-          <Registry servers={servers} allowed={allowed} attached={attached.length} />
+          <Registry
+            servers={servers}
+            allowed={allowed}
+            attached={attached.length}
+            contextTokens={data?.contextTokens}
+          />
           <SettingsGroup
             id="mcp-policy"
             title="When a server cannot be reached"
@@ -225,10 +241,12 @@ function Registry({
   servers,
   allowed,
   attached,
+  contextTokens,
 }: {
   servers: McpServerView[];
   allowed: boolean;
   attached: number;
+  contextTokens?: number;
 }) {
   const { busy, run } = usePresses();
   const [manual, setManual] = useState(false);
@@ -286,7 +304,7 @@ function Registry({
           )}
           <div className="flex min-w-0 flex-col" data-testid="mcp-list">
             {servers.map((server) => (
-              <ServerRow key={server.id} server={server} allowed={allowed} />
+              <ServerRow key={server.id} server={server} allowed={allowed} contextTokens={contextTokens} />
             ))}
           </div>
           {allowed && (
@@ -313,7 +331,15 @@ function Registry({
   );
 }
 
-function ServerRow({ server, allowed }: { server: McpServerView; allowed: boolean }) {
+function ServerRow({
+  server,
+  allowed,
+  contextTokens,
+}: {
+  server: McpServerView;
+  allowed: boolean;
+  contextTokens?: number;
+}) {
   const { busy, run } = usePresses();
   const [signingIn, setSigningIn] = useState(false);
   const [filling, setFilling] = useState(false);
@@ -331,7 +357,7 @@ function ServerRow({ server, allowed }: { server: McpServerView; allowed: boolea
             <Mono value={server.id} className="min-w-0 truncate text-meta text-ink-muted" />
           </span>
         }
-        fact={serverFact(server)}
+        fact={serverFact(server, contextTokens)}
         clock={
           server.checkedAt ? (
             <>

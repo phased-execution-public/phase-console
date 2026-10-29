@@ -143,3 +143,91 @@ describe('the Schedule reading — from the run record', () => {
     expect(screen.getByTestId('plan-schedule')).toBeInTheDocument();
   });
 });
+
+describe('the Schedule’s money (measured-console phase 23)', () => {
+  it('carries each phase’s forecast, estimated, beside what it cost — through ui/money', () => {
+    const DETAIL = {
+      phases: INPUT.phases.map((p) => ({ ...p, size: 'M', weight: 1 })),
+      route: { nodes: [], edges: INPUT.edges, layers: 3, rows: 2 },
+      eta: { plan: null, perPhase: [...INPUT.estimates].map(([phase, estMs]) => ({ phase, estMs })) },
+      cost: { phases: [{ phase: 1, usd: 20, attempts: 1, partial: false, durationMs: H, runs: 1 }] },
+      forecastUsd: {
+        usd: 48.84,
+        word: 'estimated',
+        source: 'forecast',
+        unpricedPhases: 1,
+        phases: [
+          {
+            phase: 1,
+            usd: 24.42,
+            word: 'estimated',
+            source: 'forecast',
+            sessions: 1.66,
+            sessionsBasis: 'shipped',
+            size: 'M',
+            perSession: {
+              usd: 14.73,
+              basis: 'shipped',
+              samples: 0,
+              model: 'claude-opus-5-5',
+              effort: 'high',
+              kind: 'default',
+            },
+          },
+          {
+            phase: 2,
+            usd: 24.42,
+            word: 'estimated',
+            source: 'forecast',
+            sessions: 1.66,
+            sessionsBasis: 'shipped',
+            size: 'M',
+            perSession: {
+              usd: 14.73,
+              basis: 'shipped',
+              samples: 0,
+              model: 'claude-opus-5-5',
+              effort: 'high',
+              kind: 'default',
+            },
+          },
+          {
+            phase: 3,
+            usd: null,
+            word: 'unavailable',
+            source: 'forecast',
+            sessions: 1.66,
+            sessionsBasis: 'shipped',
+            size: 'M',
+            perSession: {
+              usd: null,
+              basis: 'unavailable',
+              samples: 0,
+              model: 'mystery',
+              effort: 'high',
+              kind: 'default',
+            },
+          },
+        ],
+      },
+    } as unknown as PlanDetail;
+    const input = scheduleInputOf(DETAIL, null, NOW);
+    const rows = scheduleOf(input).rows;
+    expect(rows.find((r) => r.phase === 1)).toMatchObject({ forecastUsd: 24.42, costUsd: 20 });
+    expect(rows.find((r) => r.phase === 3)?.forecastUsd).toBeNull();
+    expect(rows.find((r) => r.phase === 4)?.forecastUsd).toBeUndefined();
+    render(<ScheduleFigure input={input} />);
+    const figure = screen.getByTestId('plan-schedule');
+    fireEvent.click(within(figure).getByRole('button', { name: /The schedule/ }));
+    const row1 = within(figure)
+      .getAllByRole('row')
+      .find((r) => /^P1/.test(r.textContent ?? ''))!;
+    expect(row1).toHaveTextContent('$24.42 estimated');
+    expect(row1).toHaveTextContent('$20.00 estimated');
+    const row3 = within(figure)
+      .getAllByRole('row')
+      .find((r) => /^P3/.test(r.textContent ?? ''))!;
+    expect(row3).toHaveTextContent('unavailable');
+    expect(within(figure).getByRole('columnheader', { name: 'Forecast' })).toBeInTheDocument();
+  });
+});

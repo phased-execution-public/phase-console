@@ -11,6 +11,18 @@ import { ApiError } from './http';
 import { keys } from './keys';
 import { press } from './press';
 
+/**
+ * What `GET /api/locks` narrows to (`server/locks.ts` `parseLockFilter`): only
+ * the claims still held, only the lapsed ones, and only those whose scope
+ * names a repository. `held` and `lapsed` together answer nothing. A query,
+ * not a wire shape — `api.locks` spells it with `lockQuery`.
+ */
+export interface LockFilter {
+  held?: true;
+  lapsed?: true;
+  scope?: string;
+}
+
 /** Every Claude session the presence hook reported for this instance — a person's, an agent's, a lane's — with its presence. */
 export function useSessionRegistry(enabled = true) {
   return useQuery({ queryKey: keys.sessionRegistry(), queryFn: api.sessionRegistry, enabled });
@@ -34,6 +46,11 @@ export function useSessionEvents(id: string | undefined, enabled = true) {
 /** The session-presence hook's presence in `~/.claude/settings.json`. */
 export function useHooksStatus(enabled = true) {
   return useQuery({ queryKey: keys.hooksStatus(), queryFn: api.hooksStatus, enabled });
+}
+
+/** Every hook the console knows — the plugin's, the user's, the project's, a run's — and each plan's hookify rules (Settings ▸ Hooks, measured-console phase 28). */
+export function useHooks(enabled = true) {
+  return useQuery({ queryKey: keys.hooks(), queryFn: api.hooks, enabled });
 }
 
 /**

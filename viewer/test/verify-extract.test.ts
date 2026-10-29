@@ -652,3 +652,37 @@ test('VX-LEADS (#310): every lead the author\'s prompt names is one the runner r
     assert.ok(held(`${lead} a b`).some((one) => one.code === 'unknown-lead'), `${lead} is refused as an unknown lead`);
   }
 });
+
+test('ANSI-C quoting is one word to the reader, as it is to bash (#392)', () => {
+  // `$'a b'` is ONE word; the old reader split it at the space.
+  const read = verifyModule.segments("echo $'a b'");
+  assert.ok('parts' in read);
+  assert.deepEqual(read.parts, ["echo $'a b'"]);
+  assert.deepEqual(verifyModule.tokenize("echo $'a b'"), ['echo', 'a b']);
+  // Inside `$'…'` a backslash escapes the quote: `\'` does not end the word,
+  // so the `;` after it is data, not a second command.
+  assert.deepEqual(verifyModule.tokenize("echo $'x\\' ; rm -rf y'"), ['echo', "x' ; rm -rf y"]);
+  const quoted = verifyModule.segments("echo $'x\\' ; rm -rf y'");
+  assert.ok('parts' in quoted);
+  assert.equal(quoted.parts.length, 1);
+  // The locale form `$"…"` reads as `"…"`.
+  assert.deepEqual(verifyModule.tokenize('echo $"a b"'), ['echo', 'a b']);
+  // And the hole the issue names closes: the `;` AFTER the closing quote is a
+  // separator, so `rm -rf y` is judged — and refused — on its own.
+  assert.deepEqual(runs("echo $'x\\' ;' ; rm -rf y"), []);
+  assert.match(held("echo $'x\\' ;' ; rm -rf y")[0]?.reason ?? '(nothing held)', /mutates/);
+  // An unclosed ANSI-C quote cannot be read, so it is refused.
+  assert.deepEqual(runs("echo $'unclosed"), []);
+});
+
+test('the ANSI-C reader fails closed where it would read differently from bash (#392)', () => {
+  // An escape the reader does not decode exactly is refused, never guessed at.
+  for (const command of ["echo $'\\x27' ; rm -rf y", "echo $'\\047'", "echo $'\\u0027'", "echo $'\\cA'"]) {
+    assert.ok('refusal' in verifyModule.segments(command), command);
+    assert.deepEqual(runs(command), [], command);
+  }
+  // `$$` is the shell's pid: the quote after it is a plain single quote, so the
+  // `\'` inside does not escape it and `; rm -rf y` is a second command.
+  assert.deepEqual(verifyModule.tokenize("echo $$'a'"), ['echo', '$$a']);
+  assert.deepEqual(runs("echo $$'x\\' ; rm -rf y'"), []);
+});

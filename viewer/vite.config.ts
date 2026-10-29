@@ -1,8 +1,9 @@
+import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL } from 'node:url';
 // `vitest/config` re-exports Vite's own defineConfig and widens it with the
 // `test` block below — one config file, so the client tests resolve `@shared`
 // and `@` exactly the way the app does.
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { VitePWA } from 'vite-plugin-pwa';
@@ -10,12 +11,31 @@ import { VitePWA } from 'vite-plugin-pwa';
 // Settings Interface row compares the tab's baked rev against that stamp, and
 // the comparison is only honest while both come from one function.
 import { buildRev } from './scripts/build-rev.mjs';
+import { parseQuarantine, quarantinedPaths } from './shared/quarantine-model.js';
 
 // The Vite project lives in `client/`; its build output goes to `client/dist`,
 // the only client the server serves (see `server/index.ts` webRoot() — until a
 // build exists it answers with a page naming the build commands). One npm
 // package, one lockfile — the server stays plain Node; only the client is built.
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
+
+/**
+ * The client files `scripts/quarantine.env` sets aside today (measured-console
+ * phase 15, `shared/quarantine-model.js`), as globs under `client/` — the test
+ * root. A row past its expiry sets nothing aside: it runs, and `gates.sh`
+ * fails on it until it is fixed or renewed.
+ */
+function quarantinedClientTests(): string[] {
+  let text: string;
+  try {
+    text = readFileSync(here('../scripts/quarantine.env'), 'utf8');
+  } catch {
+    return [];
+  }
+  return quarantinedPaths(parseQuarantine(text), 'vitest', Date.now())
+    .filter((path) => path.startsWith('viewer/client/'))
+    .map((path) => path.slice('viewer/client/'.length));
+}
 
 // The real server. In dev, the React app runs on :5173 and proxies API + SSE to
 // the console on :4123. The console's CSRF guard requires a same-origin Origin on
@@ -150,6 +170,7 @@ export default defineConfig({
     // and must never be swept up here: it runs under `node --test`, imports
     // node: builtins and expects no DOM.
     include: ['src/**/*.test.{ts,tsx}'],
+    exclude: [...configDefaults.exclude, ...quarantinedClientTests()],
     environment: 'jsdom',
     globals: true,
     setupFiles: [here('client/src/test-setup.ts')],

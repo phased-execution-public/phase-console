@@ -10,7 +10,7 @@
  *   WB-3  the backstop passing first resumes it too, saying what it is: the
  *         date passed and the live ref has NOT landed, with what the ref last
  *         read — never "the thing you waited for happened".
- * The bash half (the door names the backstop) is `tests/unit/outcome.bats`.
+ * The bash half (the door names the backstop) is `tests/unit/outcome-probe.bats`.
  */
 import './state-sandbox.ts';
 
@@ -21,21 +21,7 @@ import type { PhaseRecord, RunState } from '../server/runner/state.ts';
 import { WatchScheduler } from '../server/watch-scheduler.ts';
 import { backstopOf, type WatchState } from '../server/watch-refs.ts';
 import { DEFAULT_WAIT_BUDGET, evaluateWait } from '../server/runner/wait-budget.ts';
-
-type Timer = { fn: () => void; ms: number; live: boolean };
-
-function fakeClock(start = Date.parse('2026-10-05T10:00:00Z')) {
-  let t = start;
-  const timers: Timer[] = [];
-  return {
-    advance: (ms: number) => { t += ms; },
-    clock: {
-      now: () => t,
-      setTimeout: (fn: () => void, ms: number) => { const timer = { fn, ms, live: true }; timers.push(timer); return timer; },
-      clearTimeout: (handle: unknown) => { if (handle) (handle as Timer).live = false; },
-    },
-  };
-}
+import { timerClock } from './fixtures/clock.ts';
 
 const LIVE = 'unit:build-box/nightly-build.service';
 const BACKSTOP = 'date:2026-10-05T16:00:00Z';
@@ -67,7 +53,7 @@ test('WB-1 — the backstop is the clock: a declaration naming a live ref and a 
 });
 
 test('WB-2 — the live ref lands first: the phase is offered early, and the date is never asked again', async () => {
-  const { clock, advance } = fakeClock();
+  const { clock, advance } = timerClock(Date.parse('2026-10-05T10:00:00Z'));
   const run = parked([LIVE, BACKSTOP]);
   const landed: WatchState[] = [];
   let unit: WatchState['state'] = 'pending';
@@ -91,7 +77,7 @@ test('WB-2 — the live ref lands first: the phase is offered early, and the dat
 });
 
 test('WB-3 — the backstop passes first: the phase resumes, told the date passed and the live ref has NOT landed', async () => {
-  const { clock, advance } = fakeClock();
+  const { clock, advance } = timerClock(Date.parse('2026-10-05T10:00:00Z'));
   const run = parked([LIVE, BACKSTOP]);
   const landed: WatchState[] = [];
   const scheduler = new WatchScheduler({

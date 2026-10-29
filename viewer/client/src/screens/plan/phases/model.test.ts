@@ -175,15 +175,31 @@ describe('a row', () => {
 });
 
 describe('the readings', () => {
-  it('the run and the plan group by need; QA and Handoffs open in plan order', () => {
+  it('the run and the plan group by need; Handoffs & QA opens in plan order', () => {
     expect(PHASE_TABLE_CONTEXTS.run.groupBy).toBe('need');
     expect(PHASE_TABLE_CONTEXTS.plan.groupBy).toBe('need');
-    // Their subject is mostly finished phases, which grouping by need would fold under Done.
-    expect(PHASE_TABLE_CONTEXTS['plan-qa'].groupBy).toBeUndefined();
-    expect(PHASE_TABLE_CONTEXTS['plan-handoffs'].groupBy).toBeUndefined();
+    // Its subject is mostly finished phases, which grouping by need would fold under Done.
+    expect(PHASE_TABLE_CONTEXTS['plan-record'].groupBy).toBeUndefined();
     // Each reading keeps its own view, so a column hidden on one is not hidden on another.
     const ids = Object.values(PHASE_TABLE_CONTEXTS).map((c) => c.tableId);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('Handoffs & QA is ONE reading of the record: both halves lead, and an opened row leads with them', () => {
+    // 2026-10-20 (Tower strips): the QA reading and the Handoffs reading were
+    // two halves of one record. The merged one shows both, in plan order…
+    expect(Object.keys(PHASE_TABLE_CONTEXTS).sort()).toEqual(['plan', 'plan-record', 'run']);
+    const record = PHASE_TABLE_CONTEXTS['plan-record'];
+    for (const id of ['phase', 'state', 'blockedBy', 'handoff', 'qa', 'lane', 'actions']) {
+      expect(record.hidden, `${id} leads`).not.toContain(id);
+    }
+    expect(record.lead).toBe('record');
+    expect(record.label).toBe('Handoffs and QA by phase');
+    // …under a table id of its own, so a column choice saved under the old
+    // QA-only or handoff-only reading cannot hide the other half here.
+    expect(record.tableId).toBe('phases.plan-record');
+    expect(PHASE_TABLE_CONTEXTS.plan.lead).toBeUndefined();
+    expect(PHASE_TABLE_CONTEXTS.run.lead).toBeUndefined();
   });
 
   it('folds Done until someone opens it, and windows a plan past forty phases', () => {

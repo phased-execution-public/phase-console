@@ -9,11 +9,17 @@ depends_on: [{{DEPENDS_ON}}]  # phases that had to finish before this one (from 
 blocks: [{{BLOCKS}}]          # phases that list this one as a dependency (auto-filled from the graph)
 parallel_safe: []             # phases safe to run in a SEPARATE session at the same time as this
 skills_used: []               # skills invoked this phase
+suggested_skills: []          # skills the NEXT session should call with the Skill tool (its boot prompt names them)
 key_files: []                 # repo-relative or absolute paths touched
 memory: {{MEMORY_KEY}}
 ---
 
 # Phase {{PHASE}} → next handoff: {{TITLE}}
+
+## Summary
+<!-- 2–5 lines the next session starts from: what is true now, and where to look. The brief
+     hands this section to every phase that depends on this one, so point at the plan, the
+     reports and the commits — copy none of them, and never a secret's value. -->
 
 ## What this phase did
 <!-- 1–3 sentences + bullets of what shipped. -->

@@ -30,13 +30,13 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { classify } from '../server/runner/errors.ts';
 import { Runner } from '../server/runner/runner.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const PINNED = 'claude-opus-5-5[1m]';
 
@@ -87,17 +87,11 @@ test('SG-1: a refusal with no banner still asks a person; a success that quotes 
 
 type Repo = { root: string; scripts: string; markDone: () => void; cleanup: () => void };
 
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-safeguard-'));
-  const scripts = join(root, 'scripts');
-  const stub = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(stub, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(stub, 'done'), '');
-  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
-  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-safeguard-',
+    scripts: ({ state: stub }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
 case "$mode" in
   --memory-block)
@@ -109,14 +103,12 @@ case "$mode" in
   --size) echo M ;;
   *) exit 0 ;;
 esac
-`);
-  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
-  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: () => writeFileSync(join(stub, 'done'), '1\n'),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, markDone: () => writeFileSync(join(made.state, 'done'), '1\n') };
 }
 
 const journalled = (events: { event: string; data: Record<string, unknown> }[], name: string) => events
@@ -150,7 +142,7 @@ function runner(r: Repo, spawn: SpawnFn) {
 }
 
 test('SG-2: the first remedy boards FRESH with the resume brief — never --resume of the flagged conversation', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance, events } = runner(r, flagging(r, 1, seen));
   try {
@@ -172,7 +164,7 @@ test('SG-2: the first remedy boards FRESH with the resume brief — never --resu
 });
 
 test('SG-2: under `ladder` the second remedy is the next model, fresh', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance, events } = runner(r, flagging(r, 2, seen));
   try {
@@ -188,7 +180,7 @@ test('SG-2: under `ladder` the second remedy is the next model, fresh', async ()
 });
 
 test('SG-3: under `pinned` the second remedy is a fresh session again, and the third flag asks a person, saying what was tried', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const seen: SpawnRequest[] = [];
   const { instance, events } = runner(r, flagging(r, 99, seen));
   try {

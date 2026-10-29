@@ -9,6 +9,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import type { UiState } from '@shared/status-vocab.js';
 import { cn } from '@/lib/cn';
 import { usePhone } from '@/lib/media';
 import { Button } from '../button';
@@ -48,6 +49,17 @@ import { useGridView, type GridView } from './view';
  * (`ui/everything.ts`); off, the columns marked `everything` fold and the rest
  * are cut to fit; on, every column is drawn and the wrapper scrolls with the
  * identity pinned. No datum removed: everything folded is one press away.
+ *
+ * ## Strips, when the rows are records in a state
+ *
+ * A table whose every row is ONE record in ONE state — a plan's phases —
+ * passes `rowPaint`, and its rows are flight strips (2026-10-20, Tower
+ * strips): the first cell carries the state's 4 px leading edge, an OPEN row
+ * and its detail sit on the state's tint with the edge running down through
+ * both, and the row's toggle is a chevron on a round plate in a 44 px target
+ * that turns as the row opens. Opt-in, because most tables' rows are not one
+ * thing in one state, and a hue on every row would be a hue that says nothing.
+ * The hue is a state class's (`state-<paint>`), never a page's.
  *
  * ## Never cover a row with an overlay
  *
@@ -105,6 +117,12 @@ export interface GridProps<T> {
   /** Revealed under a row, after the columns it folds. */
   detail?: (row: T) => ReactNode;
   rowClassName?: (row: T) => string | undefined;
+  /**
+   * The state each row is in, which makes the rows STRIPS (see the header):
+   * the state's leading edge, its tint while open, the plated toggle. Absent,
+   * or `undefined` for a row, and that row draws as any table's.
+   */
+  rowPaint?: (row: T) => UiState | undefined;
   /** Extra props for the row element — hover and focus handlers, data attributes. */
   rowProps?: (row: T) => Record<string, unknown>;
   /** Where this row goes: the identity cell becomes a real `<a>`, and the row follows it on a plain click. */
@@ -314,6 +332,7 @@ function GridBody<T>({
     label,
     detail,
     rowClassName,
+    rowPaint,
     rowProps,
     rowHref,
     activeSort,
@@ -500,6 +519,7 @@ function GridBody<T>({
         onToggleGroup={view.toggleGroup}
         {...(detail ? { detail } : {})}
         {...(rowClassName ? { rowClassName } : {})}
+        {...(rowPaint ? { rowPaint } : {})}
         {...(rowProps ? { rowProps } : {})}
         {...(rowHref ? { rowHref } : {})}
         {...(activeSort ? { activeSort } : {})}
@@ -521,6 +541,7 @@ function GridBody<T>({
     const record = (item: Extract<GridItem<T>, { kind: 'row' }>, rowIndex?: number) => {
       const href = rowHref?.(item.row);
       const extra = rowClassName?.(item.row);
+      const paint = rowPaint?.(item.row);
       return (
         <TableRecord
           key={item.key}
@@ -536,6 +557,7 @@ function GridBody<T>({
           {...(detail ? { detail } : {})}
           {...(href ? { href } : {})}
           {...(extra ? { className: extra } : {})}
+          {...(paint ? { paint } : {})}
           {...(rowIndex !== undefined ? { 'aria-rowindex': rowIndex } : {})}
           {...(rowProps?.(item.row) ?? {})}
         />
@@ -787,6 +809,7 @@ function TableRecord<T>({
   href,
   detail,
   className,
+  paint,
   ...rest
 }: {
   row: T;
@@ -803,9 +826,30 @@ function TableRecord<T>({
   href?: string;
   detail?: (row: T) => ReactNode;
   className?: string;
+  /** `GridProps.rowPaint` for this row, already resolved: the row is a strip. */
+  paint?: UiState;
   [key: string]: unknown;
 }) {
   const panelId = `row-${rowKey}-detail`;
+  const strip = paint !== undefined;
+  // The strip's leading edge: a 4 px rule in the state's vivid hue down the
+  // first cell's start side — an element of its own, not the cell's border,
+  // because a collapsed table spills half a start border outside the
+  // scroller that clips it. It runs the cell's whole height, and the open
+  // row's detail draws it again over the rule between the two, so the edge
+  // runs down through both unbroken.
+  const edge = (below: boolean) =>
+    strip ? (
+      <span
+        aria-hidden
+        data-strip-edge=""
+        className={cn(
+          'pointer-events-none absolute start-0 w-1 bg-state-vivid',
+          below ? '-top-px bottom-0' : 'inset-y-0',
+          `state-${paint}`,
+        )}
+      />
+    ) : null;
   const identityCell = (c: Column<T>) =>
     href ? (
       // A real link, not a target: the row's destination has to survive being
@@ -824,12 +868,18 @@ function TableRecord<T>({
   return (
     <>
       <TR
-        className={cn(href && 'cursor-pointer', className)}
+        className={cn(
+          href && 'cursor-pointer',
+          // An open strip sits on its state's tint, and stays on it under the pointer.
+          strip && isOpen && cn(`state-${paint}`, 'bg-state-tint hover:bg-state-tint'),
+          className,
+        )}
         data-open={isOpen ? '' : undefined}
+        {...(strip ? { 'data-strip': paint } : {})}
         {...(href ? { 'data-row-href': href, onClick: followRowLink } : {})}
         {...rest}
       >
-        {shown.map((c) => {
+        {shown.map((c, i) => {
           const pinnedAt = rail.get(c.id);
           return (
             <TD
@@ -837,6 +887,8 @@ function TableRecord<T>({
               className={cn(
                 c.align === 'end' && 'text-end tabular-nums',
                 c.cellClassName,
+                // The edge's anchor — a pinned cell is positioned already.
+                strip && i === 0 && pinnedAt === undefined && 'relative',
                 // Opaque, and still the row's own colour — `stickyIdentityCell`
                 // is where that is arranged, and why it takes two layers.
                 pinnedAt !== undefined && stickyIdentityCell,
@@ -846,6 +898,7 @@ function TableRecord<T>({
               // only for the rail's first column.
               {...(pinnedAt ? { style: { insetInlineStart: pinnedAt } } : {})}
             >
+              {i === 0 && edge(false)}
               {c === identity && expandable ? (
                 <span className="flex min-w-0 items-center gap-1.5">
                   <button
@@ -853,13 +906,41 @@ function TableRecord<T>({
                     aria-expanded={isOpen}
                     aria-controls={panelId}
                     onClick={() => onToggle(rowKey)}
-                    className="inline-flex min-h-6 min-w-6 shrink-0 items-center justify-center rounded-sm text-ink-faint hover:text-ink [@media(hover:none)]:min-h-(--tap-min)"
+                    className={
+                      strip
+                        ? // A strip's toggle: a chevron on a round plate, in a 44 px target.
+                          'group/toggle -my-2.5 -ms-2.5 inline-flex size-(--tap-min) shrink-0 items-center justify-center rounded-full'
+                        : 'inline-flex min-h-6 min-w-6 shrink-0 items-center justify-center rounded-sm text-ink-faint hover:text-ink [@media(hover:none)]:min-h-(--tap-min)'
+                    }
                   >
-                    <ChevronRight
-                      size={14}
-                      aria-hidden
-                      className={cn('transition-transform duration-fast ease-transit', isOpen && 'rotate-90')}
-                    />
+                    {strip ? (
+                      <span
+                        aria-hidden
+                        className={cn(
+                          'inline-grid size-6 place-items-center rounded-full transition-colors duration-fast ease-transit',
+                          isOpen
+                            ? 'bg-surface-raised text-ink'
+                            : 'bg-ground-deep text-ink-muted group-hover/toggle:text-ink',
+                        )}
+                      >
+                        <ChevronRight
+                          size={14}
+                          className={cn(
+                            'transition-transform duration-fast ease-transit',
+                            isOpen && 'rotate-90',
+                          )}
+                        />
+                      </span>
+                    ) : (
+                      <ChevronRight
+                        size={14}
+                        aria-hidden
+                        className={cn(
+                          'transition-transform duration-fast ease-transit',
+                          isOpen && 'rotate-90',
+                        )}
+                      />
+                    )}
                     <span className="sr-only">
                       {isOpen ? 'Hide' : 'Show'} the rest of this row
                       {folded.length
@@ -893,7 +974,13 @@ function TableRecord<T>({
       </TR>
       {isOpen && (
         <TR className="hover:bg-surface">
-          <TD colSpan={shown.length} id={panelId} className="bg-ground-deep">
+          <TD
+            colSpan={shown.length}
+            id={panelId}
+            // A strip's detail is the strip, open: on its state's tint, the edge running down.
+            className={strip ? cn('relative bg-state-tint', `state-${paint}`) : 'bg-ground-deep'}
+          >
+            {edge(true)}
             <div className="flex min-w-0 flex-col gap-2 py-1">
               {folded.length > 0 && <Facts columns={folded} row={row} />}
               {detail?.(row)}

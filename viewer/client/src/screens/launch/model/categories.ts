@@ -19,6 +19,7 @@ import { ISOLATED } from '@shared/worktree-model.js';
 import { parseAccounts, type RunSetupField, type RunSetupValues } from './schema';
 import type { Source } from './seed';
 import type { ControlStage } from './stages';
+import { formatUsd } from '@/ui/money';
 
 export type CategoryId =
   'scope' | 'engine' | 'safety' | 'git' | 'money' | 'review' | 'tools' | 'accounts' | 'decisions';
@@ -45,7 +46,8 @@ export const CATEGORIES: readonly Category[] = Object.freeze([
     id: 'engine',
     label: 'Engine',
     stage: 'how',
-    blurb: 'The model and its effort, whether the model may move, and the per-phase overrides.',
+    blurb:
+      'The model and its effort, whether the model may move, the per-phase overrides, and what every session is started with.',
   },
   {
     id: 'safety',
@@ -108,6 +110,17 @@ export const CATEGORY_OF: Readonly<Record<RunSetupField, CategoryId>> = Object.f
   // engine's — not about who reviews it.
   ultracode: 'engine',
   prompt: 'engine',
+  // The session's environment (measured-console phase 6): how the work is
+  // done, so the engine's.
+  cacheTtlAb: 'engine',
+  keepWarmSec: 'engine',
+  subagentModel: 'engine',
+  bashMaxOutput: 'engine',
+  // The platform's pieces (measured-console phase 12): how a session meets a
+  // person's step and who compacts it — the engine's too.
+  humanStepMode: 'engine',
+  compaction: 'engine',
+  compactionWindow: 'engine',
 
   permissionProfile: 'safety',
   permissionMode: 'safety',
@@ -199,7 +212,7 @@ export function tileShown(id: CategoryId, on: (field: RunSetupField) => boolean)
   return fieldsIn(id).some(on);
 }
 
-const money = (text: string) => `$${Number(text).toFixed(2).replace(/\.00$/, '')}`;
+const money = (text: string) => formatUsd(Number(text), 'trim');
 
 /**
  * A tile's glance: a few precise words, each a badge — what the category is
@@ -225,6 +238,13 @@ export function tileBadges(id: CategoryId, input: TileInput): string[] {
       say(on('modelPolicy') && v.modelPolicy === 'pinned', 'Pinned');
       say(on('phaseOptions') && Object.keys(v.phaseOptions).length > 0, 'Per-phase overrides');
       say(on('ultracode') && v.ultracode, 'Ultracode');
+      say(on('subagentModel') && Boolean(v.subagentModel), `Subagents on ${v.subagentModel}`);
+      say(on('cacheTtlAb') && v.cacheTtlAb === 'alternate', 'Cache lifetime test');
+      say(on('keepWarmSec') && Boolean(v.keepWarmSec.trim()) && Number(v.keepWarmSec) > 0, 'Cache kept warm');
+      say(on('humanStepMode') && v.humanStepMode === 'park', 'Parks for a person');
+      say(on('humanStepMode') && v.humanStepMode === 'defer', 'Waits for a person');
+      say(on('compaction') && v.compaction === 'native', 'The CLI compacts');
+      say(on('compaction') && v.compaction === 'alternate', 'Compaction test');
       break;
     case 'safety':
       say(on('permissionProfile'), input.permission(v.permissionProfile));

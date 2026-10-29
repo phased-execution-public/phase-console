@@ -5,7 +5,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from '@/ui/toast';
-import { api, type IssuesPayload, type RepoDiffParams, type RepoGraphParams } from './api';
+import { api, type IssuesPayload } from './api';
 import { keys } from './keys';
 
 /* ------------------------------------------------------------------ *
@@ -24,6 +24,32 @@ import { keys } from './keys';
  * commits), so it is deliberately the slowest to go stale.
  */
 const REPO_STALE = 30_000;
+
+/* ---- the query parameter bags — the client's own, not wire shapes ---- */
+
+/* A `type`, not an `interface`, and the same for `RepoDiffParams`: only a type
+ * alias is assignable to the `Record<string, …>` the query builder takes —
+ * an interface has no index signature, by design. */
+export type RepoGraphParams = {
+  repo?: string;
+  /** Repeatable. Naming none is the default walk; naming refs none of which resolve is a 400. */
+  ref?: string[];
+  all?: boolean;
+  limit?: number;
+  cursor?: string;
+};
+
+export type RepoDiffParams = {
+  repo?: string;
+  /** Neither given = the working tree against HEAD — what a phase has changed so far. */
+  base?: string;
+  tip?: string;
+  /** One file's patch. Absent = the file list only, with no patch at all. */
+  path?: string;
+  bytes?: number;
+  /** Context lines. Defaults to git's own 3; `0` is a real request. */
+  unified?: number;
+};
 
 export function useRepoTargets(enabled = true) {
   return useQuery({ queryKey: keys.repoTargets(), queryFn: api.repoTargets, enabled, staleTime: REPO_STALE });

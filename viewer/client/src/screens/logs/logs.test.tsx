@@ -147,6 +147,7 @@ const UNDATED: DebugEntry = {
   text: 'a file nobody will act on',
 };
 
+
 /** Every source read, but the supervisor's log, which this machine does not have. */
 const INDEX: DebugIndex = {
   entries: [ROUTE_THREW, BOARDED],
@@ -867,6 +868,7 @@ describe('a row opens in the panel', () => {
     expect(within(panel).queryByRole('link')).toBeNull();
   });
 });
+
 
 /* ------------------------------------------------------------------ *
  * Everything

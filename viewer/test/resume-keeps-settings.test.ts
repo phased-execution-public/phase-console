@@ -26,6 +26,7 @@
 
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
 import './state-sandbox.ts';
+import { readStoredRun } from '../server/runner/state.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -39,7 +40,7 @@ const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const { Runner } = await import('../server/runner/runner.ts');
 const { loadRun, newRun, saveRun } = await import('../server/runner/state.ts');
-const { journalFile, runFile } = await import('../server/runner/run-paths.ts');
+const { journalFile } = await import('../server/runner/run-paths.ts');
 const { pressActor } = await import('../server/actor.ts');
 type RunState = import('../server/runner/state.ts').RunState;
 
@@ -295,7 +296,7 @@ test('RS-2: a resume that names nothing keeps every stored setting — autonomy,
     const { instance, events } = stubRunner(r.scripts);
     const state = await instance.start({ slug: 'demo', root: r.root, resumeRunId: stored.id, actor: pressActor(PERSON as never) });
     await instance.wait();
-    const disk = JSON.parse(readFileSync(runFile(r.root, 'demo', state.id), 'utf8')) as RunState;
+    const disk = readStoredRun(r.root, 'demo', state.id)!;
     assert.deepEqual(settingsOf(disk), settingsOf(stored));
     assert.equal(journalled(events, 'run.resume-settings').length, 0, 'nothing was overridden, so nothing is journalled as one');
   } finally {
@@ -314,7 +315,7 @@ test('RS-3: a resume that names a setting applies it over the stored run, and jo
       resumeOnRestart: true, relay: 'off', accounts, permissionProfile: 'trusted', autonomy: 'keep-going',
     });
     await instance.wait();
-    const disk = JSON.parse(readFileSync(runFile(r.root, 'demo', state.id), 'utf8')) as RunState;
+    const disk = readStoredRun(r.root, 'demo', state.id)!;
     assert.equal(disk.resumeOnRestart, true, 'the answer that stops the next restart stranding this run');
     assert.equal(disk.relay, 'off');
     assert.deepEqual(disk.accounts, accounts, 'the relaunch\'s pool replaces the stored one');
@@ -355,7 +356,7 @@ test('RS-4: the settings verb stores resumeOnRestart, relay and accounts on a st
     const accounts = [{ id: 'default', minHeadroomPct: 5 }];
     const out = await call(svc, '/api/run/alpha/settings', { resumeOnRestart: true, relay: 'off', accounts });
     assert.equal(out.status, 200, JSON.stringify(out.body));
-    const disk = JSON.parse(readFileSync(runFile(root, 'alpha', run.id), 'utf8')) as RunState;
+    const disk = readStoredRun(root, 'alpha', run.id)!;
     assert.equal(disk.resumeOnRestart, true);
     assert.equal(disk.relay, 'off');
     assert.deepEqual(disk.accounts, accounts);
@@ -376,7 +377,7 @@ test('RS-4: the settings verb stores resumeOnRestart, relay and accounts on a st
     assert.match(String(refused.body.error), /accounts/);
     // A relay word off the vocabulary is dropped, the way every closed word is.
     await call(svc, '/api/run/alpha/settings', { relay: 'sometimes' });
-    assert.equal((JSON.parse(readFileSync(runFile(root, 'alpha', run.id), 'utf8')) as RunState).relay, 'off');
+    assert.equal((readStoredRun(root, 'alpha', run.id)!).relay, 'off');
   } finally {
     svc.close();
   }
@@ -400,7 +401,7 @@ test('RS-4: a live run takes the same three through `configure`, journalled as `
     release();
     const state = await starting;
     await instance.wait();
-    const disk = JSON.parse(readFileSync(runFile(r.root, 'demo', state.id), 'utf8')) as RunState;
+    const disk = readStoredRun(r.root, 'demo', state.id)!;
     assert.equal(disk.resumeOnRestart, true);
     assert.equal(disk.relay, 'off');
     assert.deepEqual(disk.accounts, [{ id: 'default', minHeadroomPct: 5 }]);

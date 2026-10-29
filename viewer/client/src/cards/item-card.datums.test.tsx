@@ -9,11 +9,13 @@
  * its card, and each datum is found:
  *
  *   ID-1 on the card as it opens: the why, every step with its command,
- *        expected result, warning and link (its full address), the fix, how it
- *        is checked, the effort, the timing grid (assigned, do it, deadline,
- *        open until, you sent it, checked), what it unblocks, where a press
- *        goes and who checks it, the verdict with the attempt and what to redo,
- *        the AI's note (turn-by-turn phase 8);
+ *        expected result, warning and link (its full address), the fix, the
+ *        effort, what it unblocks, the verdict with the attempt and what to
+ *        redo, the AI's note (turn-by-turn phase 8) — and, since the record
+ *        became fold strips after the act (Tower strips, 2026-10-20), one press
+ *        in each: how it is checked, the timing grid (assigned, do it,
+ *        deadline, open until, you sent it, checked), where a press goes and
+ *        who checks it, each fold's head saying its gist while folded;
  *   ID-2 one press in (the history): who raised it and when, every attempt
  *        side by side with its verdict and evidence, every move, the
  *        question and the answer;
@@ -205,6 +207,11 @@ describe('ID-1 on the card as it opens', () => {
 
   it('says how it is checked, the effort, the countdown and what it unblocks', () => {
     const card = mount();
+    // How it's checked and the timing are the record's folds: their heads say the gist, the whole one press in.
+    expect(within(card).getByTestId('turn-check-fold').textContent).toContain('The console runs a check');
+    expect(within(card).getByTestId('turn-timing-fold').textContent).toContain('No deadline set');
+    fireEvent.click(within(card).getByTestId('turn-check-fold'));
+    fireEvent.click(within(card).getByTestId('turn-timing-fold'));
     const check = within(card).getByTestId('turn-check-words').textContent ?? '';
     expect(check).toContain('security find-generic-password');
     expect(check).toContain('The keychain answers with the item.');

@@ -307,12 +307,16 @@ test('every type and status the seed holds is drawn in the card’s words, with 
       await expect(card.getByTestId(id).first(), `${shape.id} ${id}`).toBeVisible();
     if (shape.says) await expect(card, `${shape.id} says ${shape.says}`).toContainText(shape.says);
   }
-  // The timing grid on every open card.
+  // The timing on every open card: the record's Timing fold (Tower strips, 2026-10-20), its head
+  // saying the deadline, the grid one press in.
   for (const id of ['turn-upcoming', 'turn-now-secret', 'turn-run-request', 'turn-decide']) {
-    await expect(page.locator(`[data-item="${id}"] [data-testid="turn-timing"]`), `${id} timing`).toHaveCount(
-      1,
-    );
+    await expect(
+      page.locator(`[data-item="${id}"] [data-testid="turn-timing-fold"]`),
+      `${id} timing`,
+    ).toHaveCount(1);
   }
+  await page.locator('[data-item="turn-decide"] [data-testid="turn-timing-fold"]').click();
+  await expect(page.locator('[data-item="turn-decide"] [data-testid="turn-timing"]')).toHaveCount(1);
   // The Heads-up: a thing to know, in its own section, never counted.
   const heads = page.getByTestId('turn-heads-up');
   await expect(heads).toHaveCount(1);

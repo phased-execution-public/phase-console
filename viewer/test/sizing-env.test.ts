@@ -244,10 +244,15 @@ test('the engine and the console forecast the same sessions, weigh the same sum,
 test('the engine\'s batch check adds the floor once per session — the console\'s context model, per group', () => {
   const sizing = loadSizing(SCRIPTS);
   const model = shippedContextModel(sizing);
-  const out = sessionPlanOf('sizes', ['opus']);
-  const target = (5 * sizing.budgetBig * sizing.targetPct) / 100;
+  // Under the re-fit (measured-console phase 33: a 238K floor + 1.91 × weight)
+  // the whole 175K fixture fits one 1M session's 600K target, so the cut is
+  // shown at a 170K budget — a 510K target — where it still bites.
+  const budget = 170_000;
+  const out = sessionPlanOf('sizes', [String(budget)]);
+  const target = (5 * budget * sizing.targetPct) / 100;
   const groups = [...out.matchAll(/Session \d+\s+(?:batch|solo)\s+\(~(\d+)K\)/g)].map((m) => Number(m[1]) * 1000);
-  assert.ok(groups.length >= 2, 'the 175K fixture is two sessions by hand');
+  assert.ok(groups.length >= 2, 'the 175K fixture is two sessions by hand at this budget');
+  assert.ok(contextOf(model, 175_000) <= (5 * sizing.budgetBig * sizing.targetPct) / 100, 'and one at the big budget');
   for (const weight of groups) assert.ok(contextOf(model, weight) <= target, `a ${weight} group peaks under the target`);
   assert.ok(contextOf(model, groups.reduce((a, b) => a + b, 0)) > target, 'and all of it together would not');
 });

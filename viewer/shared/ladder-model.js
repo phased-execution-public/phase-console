@@ -83,6 +83,22 @@ export const RUNG_VEHICLES = Object.freeze(
      * answers (zero-touch-console phase 9, TRS-10/LFC-3).
      */
     'widen-rule',
+    /**
+     * Re-attempt the session the Agent SDK's door lost before its first event
+     * on the `claude` subprocess, once (measured-console phase 21, B1) — the
+     * door does it at once, journalled `phase.spawn-fallback`, and every later
+     * session of the phase takes the subprocess.
+     */
+    'reboard-subprocess',
+    /**
+     * Resume the session of the phase that OWNS a failure — not the failing
+     * phase's own — with the failure in the brief, before any generic fixer
+     * boards (measured-console phase 25). Not a table row: whether a rung
+     * names an owner, and whether that owner's session is worth resuming, is
+     * the failure's fact, so `ownerRung` builds it per owner and `nextRung`
+     * offers it first.
+     */
+    'resume-owner',
   ]),
 );
 
@@ -232,6 +248,14 @@ export const VEHICLE_DRIVERS = Object.freeze({
   'widen-rule': Object.freeze({
     by: 'console',
     how: 'the console offers the deny rule on a standing approval card; Allow strikes it for the plan and resumes the own session',
+  }),
+  'reboard-subprocess': Object.freeze({
+    by: 'console',
+    how: 'the spawn door re-attempts the session on the `claude` subprocess at once (`phase.spawn-fallback`); a phase found between the two re-boards fresh, and its sessions take the subprocess',
+  }),
+  'resume-owner': Object.freeze({
+    by: 'console',
+    how: "the runner resumes the OWNING phase's session — the one resume gate (`resumableSession`) having cleared it — with the failure and its evidence, and journals `phase.routed-to-owner`",
   }),
 });
 
@@ -548,6 +572,19 @@ export const RUNGS_BY_SITUATION = Object.freeze({
       { escalate: 'model' },
     ),
   ]),
+  /*
+   * The Agent SDK's door lost a session before its first event (measured-console
+   * phase 21, B1): one rung, the same session on the subprocess. Never the
+   * SDK again for that phase — a second SDK failure would be the same machine.
+   */
+  'spawn-sdk-failed': Object.freeze([
+    R(
+      'reboard-subprocess',
+      'Re-attempt on the subprocess',
+      "Runs the phase's session again through `claude -p`, once, and keeps the phase there for the rest of the run. Costs the phase itself.",
+      true,
+    ),
+  ]),
   'never-started': Object.freeze([
     R(
       'reboard-fresh',
@@ -585,6 +622,44 @@ export const RUNGS_BY_SITUATION = Object.freeze({
   'never-started:skill-missing': Object.freeze([]),
   unknown: Object.freeze([]),
 });
+
+/**
+ * The situations whose failure can name an owner other than the failing phase:
+ * a red §Verification (its inherited reds name the phase whose diff broke
+ * them), a QA verdict, and a reopened phase. The `resume-owner` rung may stand
+ * before the first row of exactly these tables.
+ */
+export const OWNER_ROUTED_SITUATIONS = Object.freeze(
+  /** @type {const} */ (['verify-red', 'verify-red:reopened', 'qa-failed']),
+);
+
+/**
+ * Does a failure in this situation have a rung that resumes its owner?
+ * @param {string} situationKeyOrId
+ */
+export function routesToOwner(situationKeyOrId) {
+  return /** @type {readonly string[]} */ (OWNER_ROUTED_SITUATIONS).includes(situationKeyOrId);
+}
+
+/**
+ * The `resume-owner` rung for one owner. `owner` rides the params, so the
+ * same-rung-once rule holds it per owner (and `from`, per failing phase): a
+ * second failure naming a DIFFERENT owner is a different rung, the same one
+ * naming the same owner is tried.
+ * @param {number} owner  The phase whose session is resumed.
+ * @param {number} [from]  The phase whose failure names it, when that is another phase.
+ * @returns {Rung}
+ */
+export function ownerRung(owner, from) {
+  return R(
+    'resume-owner',
+    `Resume phase ${owner}'s session with the failure`,
+    `Resumes the session of phase ${owner}, which owns the failure, with what failed and the evidence lines — before ` +
+      'any generic fixer boards. Taken once per failure; costs a session.',
+    true,
+    from !== undefined && from !== owner ? { owner, from } : { owner },
+  );
+}
 
 /**
  * The rung list for a situation, by `id:sub` first and then by `id`.
@@ -858,6 +933,11 @@ export function rungLabel(vehicle, params, situation) {
   const same = (/** @type {Rung} */ rung) =>
     rung.vehicle === vehicle && rungKey('x', { vehicle, params }) === rungKey('x', rung);
   const loose = (/** @type {Rung} */ rung) => rung.vehicle === vehicle;
+  // The owner rung is built per owner, so no table holds it.
+  if (vehicle === 'resume-owner') {
+    const owner = Number(params?.owner);
+    return Number.isInteger(owner) ? ownerRung(owner).label : 'Resume the owner’s session with the failure';
+  }
 
   // The caller's own situation is resolved COMPLETELY first — exact params, then
   // the vehicle alone — before any other table is consulted.

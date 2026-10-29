@@ -13,6 +13,10 @@
  *         waiting words" as a SUSPECTED human step, raises it with the link it
  *         saw, and never converts or opens it by itself — measured against a
  *         fixture corpus of real sign-in output and ordinary output with links.
+ *   HG-5  what a session's CLOSING words ask (measured-console phase 29) is
+ *         noticed by the console and raised as the console's — a session's
+ *         own declaration can never carry that source, so it cannot pass a
+ *         question it wrote off as the console's reading of one.
  */
 import './state-sandbox.ts';
 
@@ -33,6 +37,8 @@ const {
 } = await import('../shared/human-step-model.js');
 const { cmdRefProblem, parseWatchRef } = await import('../server/watch-refs.ts');
 const { Service } = await import('../server/service.ts');
+const { sanitiseStep } = await import('../server/human-steps.ts');
+const { closingAskOf } = await import('../server/turn/packs.ts');
 
 const VIEWER = fileURLToPath(new URL('..', import.meta.url));
 
@@ -397,7 +403,8 @@ test('HG-4: nothing converts or opens a suspected step by itself — only a pers
   // `birth: 'console'` — nowhere else does.
   const births = [...readdirSync(server)].filter((name) => name.endsWith('.ts'))
     .filter((name) => readFileSync(join(server, name), 'utf8').includes("birth: 'console'"));
-  assert.deepEqual(births, ['service-recovery.ts']);
+  const expected = ['service-recovery.ts'];
+  assert.deepEqual(births, expected);
 });
 
 test('HG-4: a person converts a suspicion ONCE — a second press answers the same step, and a lane that spoke refuses', () => {
@@ -450,4 +457,15 @@ test('the launch door\'s steps live as long as their turn: withdrawn once the ph
   assert.ok(!tick.dismissed.includes(owed.id), 'a step for a phase still to run keeps asking');
   assert.equal(service.humanStepsNow().get(done.id)?.note, 'the phase closed');
   service.close();
+});
+
+test('HG-5: a session\'s closing questions are the console\'s reading — a session cannot declare that source itself', () => {
+  const ask = closingAskOf('The reader is in.\n\nShould the export keep its old columns? I recommend keeping them.', { ref: 'sess-1' });
+  assert.ok(ask, 'the closing question is noticed');
+  assert.deepEqual(sanitiseStep(ask!.step, 'console')?.step.source, { kind: 'prose-question', ref: 'sess-1' });
+  const forged = sanitiseStep(ask!.step, 'session');
+  assert.equal(forged?.step.source, undefined, 'a session\'s declaration carries no console source');
+  assert.ok(forged?.dropped.includes('source'));
+  // Noticed only at the END: a question the session answered itself raises nothing.
+  assert.equal(closingAskOf('Should the export keep its old columns? Yes — I kept them, and the tests pass.', { ref: 'sess-1' }), null);
 });

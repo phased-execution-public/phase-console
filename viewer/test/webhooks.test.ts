@@ -339,23 +339,27 @@ test('a failing URL goes quiet, comes back, and a success clears the streak', as
   assert.equal(hooks.list()[0].failures, 1);
   assert.equal(hooks.list()[0].quietUntil, clock + WEBHOOK_BACKOFF_BASE_MS);
 
-  // Inside the quiet window: skipped entirely, not attempted and rejected.
+  // Inside the quiet window: not attempted — HELD (EI-24), never dropped.
   clock += WEBHOOK_BACKOFF_BASE_MS - 1;
   await fire();
   assert.equal(sent.length, 1, 'a quiet hook was attempted anyway');
+  assert.equal(hooks.list()[0].queued, 2, 'the failed event and the quiet one wait');
 
-  // Past it: attempted again, and the second failure backs off twice as far.
+  // Past it: the OLDEST owed event is attempted first, and the second failure backs off twice as far.
   clock += 2;
   await fire();
   assert.equal(sent.length, 2);
+  assert.equal(sent[1].body.notificationId, sent[0].body.notificationId, 'the head of the queue is retried first');
   assert.equal(hooks.list()[0].failures, 2);
   assert.equal(hooks.list()[0].quietUntil, clock + WEBHOOK_BACKOFF_BASE_MS * 2);
 
-  // A success ends it — no quiet window, no failure count, no stale rejection.
+  // A success ends it — the queue delivers in order, then the new one; no quiet window, no stale rejection.
   refuse = false;
   clock += WEBHOOK_BACKOFF_BASE_MS * 2 + 1;
   await fire();
-  assert.equal(sent.length, 3);
+  assert.equal(sent.length, 6, 'the three owed events, then the fourth');
+  assert.deepEqual(sent.slice(2).map((s) => s.body.notificationId), ['n1000000', `n${1_000_000 + WEBHOOK_BACKOFF_BASE_MS - 1}`, `n${1_000_000 + WEBHOOK_BACKOFF_BASE_MS + 1}`, `n${clock}`]);
+  assert.equal(hooks.list()[0].queued, 0);
   const [row] = hooks.list();
   assert.equal(row.failures, 0);
   assert.equal(row.quietUntil, undefined);
@@ -494,4 +498,64 @@ test('FLT-3: a machine-profile row is delivered to, listed as the profile\'s, ne
   const reread = new Webhooks({ enabled: true, instance: 'test-console', link: (url: string) => url });
   assert.deepEqual(reread.list().map((row) => row.label), ['own'], 'only the console\'s own row reached the file');
   for (const row of reread.list()) reread.remove(row.id);
+});
+
+test('EI-24 (measured-console phase 17): every delivery is signed — X-Phase-Console-Signature: sha256=<HMAC of the body under the destination\'s secret>', async () => {
+  const { createHmac } = await import('node:crypto');
+  const { webhookSignature, WEBHOOK_SIGNATURE_HEADER } = await import('../server/webhooks.ts');
+  const bodies: string[] = [];
+  const headers: Record<string, string>[] = [];
+  const signedFetch: WebhookFetch = async (_url, init) => { bodies.push(init.body); headers.push(init.headers); return { status: 204, ok: true }; };
+  const hooks = fresh({ fetch: signedFetch } as never);
+  const added = hooks.add(URL_A, 'signed', { halted: true }) as { id: string; secret?: string; secretHint: string | null };
+  assert.ok(added.secret && /^whsec_[0-9a-f]{48}$/.test(added.secret), 'the add answers the secret whole, once');
+  assert.equal(added.secretHint, `…${added.secret!.slice(-4)}`);
+  assert.equal(JSON.stringify(hooks.list()).includes(added.secret!), false, 'the list carries only the hint');
+  hooks.announce('halted', { title: 'Run halted', body: 'b', url: '/#/runs', notificationId: 'sig-1' });
+  await settle();
+  assert.equal(bodies.length, 1);
+  const expected = `sha256=${createHmac('sha256', added.secret!).update(bodies[0]!, 'utf8').digest('hex')}`;
+  assert.equal(headers[0]![WEBHOOK_SIGNATURE_HEADER], expected, 'the header is the HMAC-SHA256 of the exact body bytes');
+  assert.equal(webhookSignature(added.secret!, bodies[0]!), expected);
+  assert.notEqual(webhookSignature('another-secret-entirely', bodies[0]!), expected, 'and no other secret makes it');
+  for (const r of hooks.list()) hooks.remove(r.id);
+});
+
+test('EI-24: a destination in backoff QUEUES — every event delivered later, in order, when the backoff ends; nothing dropped (the test counts)', async () => {
+  let clock = 5_000_000;
+  let down = true;
+  const delivered: string[] = [];
+  let attempts = 0;
+  const timers: { run: () => void; ms: number }[] = [];
+  const hooks = new Webhooks({
+    enabled: true, instance: 'test-console', link: (url: string) => url, now: () => clock,
+    fetch: async (_url, init) => {
+      attempts += 1;
+      if (down) return { status: 503, ok: false };
+      delivered.push(String((JSON.parse(init.body) as { notificationId: string }).notificationId));
+      return { status: 204, ok: true };
+    },
+    schedule: (run, ms) => { timers.push({ run, ms }); },
+  });
+  for (const row of hooks.list()) hooks.remove(row.id);
+  const { id } = hooks.add(URL_B, 'queue', { halted: true }) as { id: string };
+  const SENT = 25;
+  for (let i = 0; i < SENT; i++) {
+    hooks.announce('halted', { title: 'Run halted', body: '', url: '/#/runs', notificationId: `q${i}` });
+    await settle();
+    clock += 1_000;
+  }
+  assert.equal(attempts, 1, 'one attempt, then the destination backs off and the rest wait');
+  assert.equal(hooks.queued(id), SENT, 'every event is held');
+  assert.ok(timers.length >= 1 && timers[0]!.ms > 0, 'a drain is scheduled for when the backoff ends');
+  // The destination comes back; the backoff ends; the scheduled drain runs.
+  down = false;
+  clock += WEBHOOK_BACKOFF_MAX_MS;
+  timers.shift()!.run();
+  await settle();
+  for (let i = 0; i < 5 && delivered.length < SENT; i++) await settle();
+  assert.equal(delivered.length, SENT, 'nothing was dropped');
+  assert.deepEqual(delivered, Array.from({ length: SENT }, (_, i) => `q${i}`), 'and in the order they happened');
+  assert.equal(hooks.queued(id), 0);
+  for (const r of hooks.list()) hooks.remove(r.id);
 });

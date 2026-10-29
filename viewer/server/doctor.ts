@@ -51,10 +51,11 @@ import { DELIVERY_ISSUE_ID, type EnvIssue } from './env-doctor.ts';
 import type { HooksStatus } from './hooks-install.ts';
 import type { ProbeVerdict } from './prelude.ts';
 import { spawnHelperFacts, type SpawnHelperFacts } from './pty/spawn-helper.ts';
+import { readSeed, seedVerdict, type SeedRead } from './seed.ts';
 import { skillCopyVerdict, type SkillCopyReport } from './skill-copy.ts';
 
 export type DoctorRowId =
-  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'presence' | 'skill' | 'unit' | 'node' | 'pty'
+  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'presence' | 'skill' | 'seed' | 'unit' | 'node' | 'pty'
   | 'cli' | 'gh' | 'publish' | 'issues' | 'git' | 'environment' | 'console';
 
 export type DoctorRow = {
@@ -103,6 +104,11 @@ export type DoctorDeps = {
    * older deps builder) is a `skip`, never a guess.
    */
   skillCopy?: () => SkillCopyReport | null;
+  /**
+   * The plugin seed this machine carries (measured-console phase 10) —
+   * `seed.ts`. Absent reads it from the state home, as every builder would.
+   */
+  seed?: () => SeedRead | null;
   /**
    * The launchd unit's state, or `null` when the platform has none / the
    * caller cannot read it (`skip`). Pro-only in the free tree, where no unit
@@ -212,6 +218,12 @@ export function atLeast(version: string | undefined, floor: string): boolean | n
 export function hooksVerdict(status: HooksStatus | null): ProbeVerdict {
   if (!status) return skipped('the hook installer could not read the settings file');
   if (status.parseError) return { status: 'fail', ok: false, reason: `${status.path} does not parse — ${status.parseError}` };
+  if (status.viaPlugin && !status.installed) {
+    return {
+      status: 'ok', ok: true,
+      reason: `carried by the installed plugin's hooks/hooks.json${status.partial ? ` — ${status.path} also holds a partial splice; phase-console uninstall-hooks takes it out` : ''}`,
+    };
+  }
   if (!status.installed) {
     return {
       status: 'fail', ok: false,
@@ -221,7 +233,11 @@ export function hooksVerdict(status: HooksStatus | null): ProbeVerdict {
   if (status.stale) {
     return { status: 'fail', ok: false, reason: `${status.path} points at another checkout's session-hook.sh — run phase-console install-hooks from this one` };
   }
-  return { status: 'ok', ok: true, reason: `installed in ${status.path}, pointing at this copy` };
+  return {
+    status: 'ok', ok: true,
+    reason: `installed in ${status.path}, pointing at this copy`,
+    ...(status.viaPlugin ? { warnings: [`the installed plugin carries the hooks too, and its copy steps aside for this splice — phase-console uninstall-hooks --settings ${status.path} leaves the plugin's alone`] } : {}),
+  };
 }
 
 /** One config dir sessions run from, the pooled accounts that use it, and its presence hook. */
@@ -260,7 +276,8 @@ export function presenceVerdict(dirs: readonly PresenceDir[] | null): ProbeVerdi
   if (!dirs) return skipped('the pooled accounts could not be read');
   if (!dirs.length) return skipped('no account is registered');
   const who = (one: PresenceDir) => one.accounts.join(', ');
-  const short = dirs.filter((one) => !one.status || one.status.parseError || !one.status.installed || one.status.stale);
+  const short = dirs.filter((one) => !one.status || one.status.parseError
+    || ((!one.status.installed || one.status.stale) && !one.status.viaPlugin));
   if (!short.length) {
     return {
       status: 'ok', ok: true,
@@ -512,6 +529,8 @@ export async function doctorReport(deps: DoctorDeps): Promise<DoctorReport> {
   // Never blocking: a skill at another commit still runs a console — it is
   // told (and the inbox and the boot prompt say so), not stopped.
   rows.push(row('skill', 'Skill copy', false, skillCopyVerdict(safeSkillCopy(deps))));
+  // Never blocking: a machine with no seed runs sessions on its config dirs' plugins.
+  rows.push(row('seed', 'Plugin seed', false, seedVerdict(safeSeed(deps))));
   let unit: UnitFacts | null = null;
   rows.push(row('node', 'Node arguments', false, nodeArgsVerdict(nodeArgsFacts(deps, unit))));
   rows.push(row('pty', 'Terminal helper', false, ptyHelperVerdict(safePtyHelper(deps))));
@@ -534,6 +553,10 @@ export async function doctorReport(deps: DoctorDeps): Promise<DoctorReport> {
     cliFloor: RELAY_CLI_FLOOR,
     at,
   };
+}
+
+function safeSeed(deps: DoctorDeps): SeedRead | null {
+  try { return deps.seed ? deps.seed() : readSeed(); } catch { return null; }
 }
 
 function safeIssues(deps: DoctorDeps): EnvIssue[] {

@@ -19,32 +19,21 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
 import { Scheduler } from '../server/runner/scheduler.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
+import { dateClock } from './fixtures/clock.ts';
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /** A linear three-phase plan whose board is a `done` file the fake session appends to. */
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-usage-brake-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(): Repo {
+  const made = stubRepo({
+    prefix: 'pc-usage-brake-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -66,17 +55,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -107,12 +91,6 @@ const journalled = (events: { event: string; data: Record<string, unknown> }[], 
   .filter((e) => e.event === 'run:journal' && e.data.event === name)
   .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
 
-/** A clock the test winds by hand, shaped as `RunnerDeps.now`. */
-function fakeClock(from: string) {
-  const state = { at: Date.parse(from) };
-  return { now: () => new Date(state.at), wind: (ms: number) => { state.at += ms; }, set: (iso: string) => { state.at = Date.parse(iso); } };
-}
-
 /** A session held open with its event sink captured. */
 function streamingSession(r: Repo, markDone = true) {
   let release!: () => void;
@@ -132,9 +110,9 @@ function streamingSession(r: Repo, markDone = true) {
 
 
 test('SB-1/SB-2 (#287): a reading from a session still live on the old account brakes and releases THAT account, never the one a boundary switch moved the run to', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const held = streamingSession(r);
-  const clock = fakeClock('2026-10-08T18:30:00Z');
+  const clock = dateClock('2026-10-08T18:30:00Z');
   const scheduler = new Scheduler({ now: () => clock.now().getTime(), locks: () => [] });
   const { instance, events } = runner(r, held.spawn, {
     now: clock.now, scheduler, pickAccount: () => null, autoAccountSwitch: () => false,

@@ -424,6 +424,30 @@ function exemptProblem(row: SurfaceRow, truth: SurfaceTruth): string | null {
 }
 
 /** The body of an export under `data/`: from its declaration to the next export. */
+/** Every `@typedef` of `shared/wire/` by name, with its declaration's text — read once, per edition. */
+const WIRE_TYPEDEFS = new Map<boolean, Map<string, string>>();
+function wireTypedefs(free: boolean): Map<string, string> {
+  let found = WIRE_TYPEDEFS.get(free);
+  if (found) return found;
+  found = new Map();
+  const dir = join(VIEWER, 'shared', 'wire');
+  for (const name of readdirSync(dir).filter((n) => n.endsWith('.js'))) {
+    const whole = readFileSync(join(dir, name), 'utf8');
+    for (const block of (free ? freeText(whole) : whole).matchAll(/\/\*\*([\s\S]*?)\*\//g)) {
+      for (const m of block[1].matchAll(/@typedef\s*\{[\s\S]*?\}\s*([A-Za-z_$][\w$]*)/g)) found.set(m[1], block[1]);
+    }
+  }
+  WIRE_TYPEDEFS.set(free, found);
+  return found;
+}
+
+/** The declarations of the wire types an export's text names — what its typed body can carry. */
+function wireTypesNamedIn(text: string, free: boolean): string {
+  const defs = wireTypedefs(free);
+  const named = new Set(text.match(/\b[A-Z][\w$]*\b/g) ?? []);
+  return [...named].map((name) => defs.get(name) ?? '').join('\n');
+}
+
 function exportBody(text: string, name: string): string | null {
   const declared = new RegExp(`^export (?:async )?(?:function|const|let) ${name}\\b`, 'm').exec(text);
   if (!declared) return null;
@@ -456,9 +480,12 @@ function optionProblems(row: SurfaceRow, truth: SurfaceTruth): string[] {
   const needle = member === undefined ? new RegExp(`\\b${name}\\b`) : new RegExp(`\\.${member}\\b`);
   const pages = truth.ui.filter((page) => needle.test(visible(page)));
   const out: string[] = [];
+  // Since measured-console phase 32 an export names its body by a wire type
+  // (`body: McpPatchBody`): the members that type declares are spelled by it.
+  const spelled = body + wireTypesNamedIn(body, free);
   for (const option of row.options) {
     const word = new RegExp(`\\b${option}\\b`);
-    if (!word.test(body)) {
+    if (!word.test(spelled)) {
       out.push(`names the option \`${option}\`, which \`${name}\` never spells — the export cannot send it`);
     } else if (!pages.some((page) => word.test(visible(page)))) {
       out.push(
@@ -970,13 +997,16 @@ test('the truths are read: the dispatcher, the hooks, the word lists, the events
       .sort(),
     [
       '/events',
+      '/hooks/compact',
       '/hooks/declaration',
       '/hooks/permission-request',
       '/hooks/pre-tool-use',
       '/hooks/session',
       '/hooks/stop',
+      '/otel/v1/logs',
+      '/otel/v1/metrics',
     ],
-    'the routes outside /api/ are the five hooks and the stream — teach pathRoutes the new shape',
+    'the routes outside /api/ are the six hooks, the OpenTelemetry receiver and the stream — teach pathRoutes the new shape',
   );
   for (const verb of ['check', 'grant', 'deny', 'convert'])
     assert.ok(stepVerbs(DISPATCHER).includes(verb), `the step verbs lost ${verb}`);

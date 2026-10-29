@@ -160,7 +160,8 @@ describe('CK-1 a decision item’s primary is its options', () => {
     expect(primary.getAttribute('data-move')).toBe('decide');
     expect(primary.textContent).toBe('Send my decision');
     expect(primary.disabled).toBe(true);
-    expect(within(card).queryByRole('button', { name: /check/i })).toBeNull();
+    // Never the check's press — *How it’s checked* is a fold of the record, not a press.
+    expect(within(card).queryByRole('button', { name: /done this — check|redone it/i })).toBeNull();
     const options = within(card).getAllByRole('radio');
     expect(options.map((o) => o.getAttribute('value'))).toEqual(['monday', 'today']);
     expect(within(card).getByTestId('decision-option-monday').textContent).toContain('Recommended');

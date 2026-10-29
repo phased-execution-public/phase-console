@@ -23,13 +23,17 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { judgeProofs, lineDirOf } from '../server/runner/proofs.ts';
 import { workingTreeOf } from '../server/runner/worktree.ts';
+import { repo } from './fixtures/repo.ts';
+
+/** A repository with one commit (`base`) holding `files`, on git's default branch. */
+const baseRepo = (dir: string, files: Record<string, string>): string => repo({ dir, files, branch: null, message: 'base' });
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const OUTCOME = join(REPO_ROOT, 'scripts', 'phase-outcome.sh');
@@ -43,24 +47,12 @@ function git(cwd: string, ...args: string[]): string {
   ], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
-function repo(dir: string, files: Record<string, string>): string {
-  mkdirSync(dir, { recursive: true });
-  git(dir, 'init', '-q');
-  for (const [path, text] of Object.entries(files)) {
-    mkdirSync(dirname(join(dir, path)), { recursive: true });
-    writeFileSync(join(dir, path), text);
-  }
-  git(dir, 'add', '-A');
-  git(dir, 'commit', '-q', '-m', 'base');
-  return dir;
-}
-
 /** The hub's shape: a superproject with docs of its own, mounting `sub`. */
 function hub(): { root: string; sub: string; ledger: string } {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'pc-pk-')));
   TRASH.push(base);
-  const origin = repo(join(base, 'origin'), { 'src/app.txt': 'the backend\n' });
-  const root = repo(join(base, 'root'), { 'README.md': '# hub\n', 'docs/audits/readiness.md': 'draft\n' });
+  const origin = baseRepo(join(base, 'origin'), { 'src/app.txt': 'the backend\n' });
+  const root = baseRepo(join(base, 'root'), { 'README.md': '# hub\n', 'docs/audits/readiness.md': 'draft\n' });
   git(root, 'submodule', 'add', '-q', origin, 'sub');
   git(root, 'commit', '-q', '-m', 'mount');
   return { root, sub: join(root, 'sub'), ledger: join(base, 'proofs.ndjson') };

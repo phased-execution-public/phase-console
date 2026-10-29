@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: start-sign-in-is-a-typed-step
+description: 'mode-phase-start, It''s working if: every act only a person can do is a typed human step (a browser sign-in).'
+tags: [phase-start, working-if, unattended, errand]
+context:
+  scaffold_script: fixture.sh

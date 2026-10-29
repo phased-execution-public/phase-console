@@ -474,6 +474,7 @@ export function Series({
   heads,
   tone = 'running',
   empty,
+  summed = true,
 }: {
   buckets: readonly SeriesBucket[];
   rows: readonly SeriesRow[];
@@ -488,6 +489,11 @@ export function Series({
   tone?: FigureTone;
   /** The one line drawn when no row has a value. */
   empty?: ReactNode;
+  /**
+   * Whether the values add up (dollars, tokens). A rate, a load or a delta does not, and gets no
+   * total: its strip is named with its newest value, and the numbers carry no Total column.
+   */
+  summed?: boolean;
 }) {
   const nonZero = rows.some((row) => row.values.some((value) => value > 0));
   if (!buckets.length || !rows.length || !nonZero) {
@@ -505,6 +511,7 @@ export function Series({
         valueText={format}
         timeText={timeText}
         label={label}
+        summed={summed}
       />
       {/* Only the buckets something was spent in: a day of five-minute bars is
           288 rows of which most are nothing, and the empty columns ARE the
@@ -524,7 +531,7 @@ export function Series({
             cell: (point: (typeof kept)[number]) => format(row.values[point.i] ?? 0),
             align: 'end' as const,
           })),
-          ...(rows.length > 1
+          ...(summed && rows.length > 1
             ? [
                 {
                   head: 'Total',

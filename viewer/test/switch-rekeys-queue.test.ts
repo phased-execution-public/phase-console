@@ -23,9 +23,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const { Runner } = await import('../server/runner/runner.ts');
 const { BRAKE_HOLDER, Scheduler } = await import('../server/runner/scheduler.ts');
@@ -45,26 +43,16 @@ const HOUR = 3_600_000;
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /**
  * A two-phase plan; each phase rides its own repository (`repo-N`). Linear by
  * default; `parallel` makes both ready at once.
  */
-function repo(parallel = false): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-rekey-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  if (parallel) writeFileSync(join(state, 'parallel'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(parallel = false): Repo {
+  const made = stubRepo({
+    prefix: 'pc-rekey-',
+    state: { ...(parallel ? { 'parallel': '' } : {}) },
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -87,17 +75,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -166,7 +149,7 @@ function queuedEntry(scheduler: Scheduler, runId: string) {
  * ------------------------------------------------------------------ */
 
 test('SW-1: a phase queued behind the old account\'s usage window boards on the new account the moment a person switches — not at the old reset', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const scheduler = new Scheduler({ locks: () => [] });
   const spawned: Spawned[] = [];
   // `acct-old` is walled for an hour: the run's first phase queues behind it.
@@ -206,7 +189,7 @@ test('SW-1: a phase queued behind the old account\'s usage window boards on the 
 });
 
 test('SW-1: the on-limit switch re-keys what is queued too — a phase held by the old account\'s brake boards on the new account at the wall, not when the lane ends', async () => {
-  const r = repo(true);
+  const r = stubbedPlan(true);
   const scheduler = new Scheduler({ locks: () => [] });
   // `acct-old` is nearly spent: its brake admits no second lane while one is live.
   scheduler.brake('acct-old', { untilMs: null, pct: 96 });
@@ -270,7 +253,7 @@ test('SW-1: the on-limit switch re-keys what is queued too — a phase held by t
  * ------------------------------------------------------------------ */
 
 test('SW-2: Retry on a queued phase re-requests it under the run\'s CURRENT account — a record reset alone left it held (#92)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const scheduler = new Scheduler({ locks: () => [] });
   const spawned: Spawned[] = [];
   scheduler.throttle(Date.now() + HOUR, 'acct-old', 'five_hour');

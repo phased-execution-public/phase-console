@@ -25,8 +25,9 @@ import {
   CHECKED_BY_LABEL, REASON_META, readinessOf, type ProofType, type StepsFrom, type TurnRecord, type TurnSource, type WhyPerson,
 } from '../../shared/turn-model.js';
 import { gateProofOf, proofPartsOf, proofWords, startAtOf, whenWords } from '../../shared/proof-words.js';
-import type { Guide } from '../../shared/guide-grammar.js';
+import { guideDirection, type Guide } from '../../shared/guide-grammar.js';
 import type { StepVerdict } from './verdict.ts';
+import { answerFileWords, answerLineFor, answerTargetOf } from './answer-target.ts';
 
 /** One step a person follows — the guide grammar's shape, so the page draws every source on one track. */
 export type ComposedStep = { text: string; code?: string; expect?: string; warn?: string; link?: { label: string; url: string } };
@@ -160,6 +161,8 @@ export type RowFacts = {
   supervisor?: { card: string; situation: string; verb: string | null; why: string; command?: string } | undefined;
   /** The situation's ASK words, on an errand row (turn-by-turn phase 4). */
   ask?: AskFacts | undefined;
+  /** What the parked phase asked a person for, in its session's words — an errand's first step. */
+  asked?: string | undefined;
   /** The ways on the row offers, bound. */
   options?: readonly TurnOption[] | undefined;
   /** The row's approval block. */
@@ -179,6 +182,12 @@ export type ComposeFacts = {
   step?: StepFacts;
   /** A projected item's row. */
   row?: RowFacts;
+  /**
+   * The ledger step an errand row names when no open item stands behind it
+   * (2026-10-20): its title, its guide and its options are the card's, each
+   * option answered through the errand's own verb with the choice.
+   */
+  named?: StepFacts;
   /** When the first read showed a projected item (`turn/first-seen.ts`). */
   firstSeen?: string | null;
   now: number;
@@ -302,10 +311,20 @@ export function metaWords(facts: Pick<ComposeFacts, 'slug' | 'phase' | 'step'>):
  * How the item is checked, as a sentence — the proof said in words, never as
  * its ref. The label map is `CHECKED_BY_LABEL`'s; this is the sentence under it.
  */
-export function checkWords(facts: { proofType: ProofType; proof?: string; proofWords?: string; hasOptions?: boolean }): string {
+export function checkWords(facts: {
+  proofType: ProofType; proof?: string; proofWords?: string; hasOptions?: boolean;
+  /** Where the press writes the answer its proof reads (`answeringOf`). */
+  answering?: Answering | null;
+}): string {
   const words = line(facts.proofWords, 300);
   switch (facts.proofType) {
     case 'probe':
+      if (facts.answering) {
+        const file = answerFileWords(facts.answering.file);
+        return facts.answering.key
+          ? `Your choice is written to ${file} as \`${facts.answering.key}: <your choice>\`, and the console checks the file holds it.`
+          : `Your answer is written to ${file}, and the console checks the file is there.`;
+      }
       // A proof no scheme reads is told by its label and words, never as
       // "the check the session named" (#368): that is the console's phrase
       // for a ref it cannot read, not a check a person can follow.
@@ -432,9 +451,78 @@ function rowTitle(row: RowFacts, scope: string): string {
  * The steps — by precedence
  * ------------------------------------------------------------------ */
 
+/** Where a decision's answer is written on the press: its file, and the key its line carries. */
+export type Answering = { key: string | null; file: string };
+
+/**
+ * A decision with options whose proof reads a line the console WRITES on the
+ * press (`answer-target.ts`, 2026-10-20) — every option's line accepted by the
+ * proof's own pattern — or null, when a person's hands are still the way.
+ */
+export function answeringOf(step: Pick<StepFacts, 'options' | 'proof'> | undefined): Answering | null {
+  if (!step?.options?.length) return null;
+  const target = answerTargetOf(step.proof);
+  if (!target) return null;
+  if (!step.options.every((option) => answerLineFor(target, { option: option.id, label: option.label }) !== null)) return null;
+  return { key: target.mode === 'append-line' ? target.key : null, file: target.file };
+}
+
+/** A guide's summary without the errands table's "Commands run from" clause, which a decision no longer needs. */
+function decidedWhat(summary: string | undefined): string {
+  return line(String(summary ?? '').replace(/\s*Commands run from `[^`]*`\.?\s*$/, ''), 400);
+}
+
+/**
+ * A decision the console answers where its proof reads (2026-10-20): the
+ * steps say what is decided, how to choose, and what the press writes — never
+ * the `printf` an errands row tells a person to run, which the press does.
+ * An authored guide keeps its steps, less any that writes the answer itself.
+ */
+function decisionSteps(step: StepFacts, answering: Answering): { steps: ComposedStep[]; from: StepsFrom; trouble: Composed['trouble'] } | null {
+  const guide = step.guide;
+  const trouble = (guide?.trouble ?? []).map((t) => ({ symptom: line(t.symptom), fix: line(t.fix) }));
+  const file = answerFileWords(answering.file);
+  const name = answering.file.slice(answering.file.lastIndexOf('/') + 1);
+  const writes = (code?: string): boolean => Boolean(code && /(>>|\btee\b)/.test(code) && code.includes(name));
+  const send = answering.key
+    ? `Choose one and press Send my decision. The console writes \`${answering.key}: <your choice>\` to ${file}, then checks it.`
+    : `Choose one and press Send my decision. The console writes your answer to ${file}, then checks it.`;
+  const expect = [...(guide?.steps ?? [])].reverse().find((s) => s.expect)?.expect;
+  if (guide?.steps?.length && step.guideFrom !== 'errands-table') {
+    const kept = guide.steps.filter((s) => !writes(s.code));
+    if (kept.length === guide.steps.length) return null;
+    return {
+      steps: [
+        ...kept.map((s) => ({
+          text: line(s.text), ...(s.code ? { code: s.code } : {}), ...(s.expect ? { expect: line(s.expect) } : {}),
+          ...(s.warn ? { warn: line(s.warn) } : {}), ...(s.link ? { link: s.link } : {}),
+        })),
+        { text: send },
+      ],
+      from: 'guide', trouble,
+    };
+  }
+  const what = decidedWhat(guide?.summary);
+  return {
+    steps: [
+      ...(what ? [{ text: sentence(`What you decide: ${what}`) }] : []),
+      { text: 'Read the options below — what each one does is written under it. Add a note if the AI should know something.' },
+      { text: send, ...(expect ? { expect: line(expect) } : {}) },
+    ],
+    from: step.guideFrom === 'errands-table' ? 'errand' : guide ? 'guide' : 'minimal',
+    trouble,
+  };
+}
+
 function stepsOf(facts: ComposeFacts): { steps: ComposedStep[]; from: StepsFrom; trouble: Composed['trouble'] } {
   const step = facts.step;
   const press = pressWords(facts.proofType, Boolean(step?.options?.length), step && facts.slug ? stepGateOf(step)?.phase : null);
+  // 0. A decision the press answers where its proof reads: the console's own steps.
+  const answering = answeringOf(step);
+  if (step && answering) {
+    const decided = decisionSteps(step, answering);
+    if (decided) return decided;
+  }
   // 1–2. An authored guide, or the errands row read into one.
   if (step?.guide?.steps?.length) {
     return {
@@ -453,11 +541,20 @@ function stepsOf(facts: ComposeFacts): { steps: ComposedStep[]; from: StepsFrom;
       from: 'lines', trouble: [],
     };
   }
-  // 4. The situation's ASK: the ladder table's steps for an errand, else a
-  // projected row's own lines, else its how.
+  // The step an errand names (2026-10-20): the session's own guide, or its
+  // lines, are the errand's steps — never "read its handoff".
+  const named = !step ? facts.named : undefined;
+  if (named?.guide?.steps?.length) return stepsOf({ ...facts, step: named, named: undefined });
+  if (named?.lines?.length) {
+    return { steps: [...openSteps(named), ...named.lines.map((text) => ({ text: sentence(line(text)) }))], from: 'lines', trouble: [] };
+  }
+  // 4. The situation's ASK: the ladder table's steps for an errand — after
+  // what the phase asked for, in its session's own words — else a projected
+  // row's own lines, else its how.
   const row = facts.row;
   if (!step && row?.ask?.steps.length) {
-    return { steps: row.ask.steps.map((text) => ({ text: sentence(line(text)) })), from: 'ask', trouble: [] };
+    const asked = row.asked ? [{ text: sentence(`What ${scopeWords(facts.slug, facts.phase)} asked for: ${line(row.asked, 400)}`) }] : [];
+    return { steps: [...asked, ...row.ask.steps.map((text) => ({ text: sentence(line(text)) }))], from: 'ask', trouble: [] };
   }
   if (!step && row) {
     const view = row.humanStep;
@@ -515,18 +612,22 @@ export function composeItem(facts: ComposeFacts): Composed {
   const step = facts.step;
   const row = facts.row;
   // The act's whole words, then its title by the one rule (#377): sentence
-  // case, at most TITLE_MAX characters, the errand ref a chip of its own.
-  const act = step ? actTitle(step.title) : row ? rowTitle(row, scope) : 'Something only you can do';
+  // case, at most TITLE_MAX characters, the errand ref a chip of its own. An
+  // errand that names a step says that step's act (2026-10-20).
+  const named = !step ? facts.named : undefined;
+  const act = step ? actTitle(step.title) : named ? actTitle(named.title) : row ? rowTitle(row, scope) : 'Something only you can do';
   const short = shortTitle(act);
   const title = short.title;
   const errandRef = step?.eref ?? errandRefOf(step?.title ?? row?.humanStep?.title ?? row?.title);
   const options = optionsOf(facts);
   const approval = approvalOf(row?.approval);
-  const check = row?.ask?.check ? sentence(line(row.ask.check, 300)) : checkWords({
+  const check = named?.options?.length ? checkWords({ proofType: 'answer', hasOptions: true })
+    : row?.ask?.check ? sentence(line(row.ask.check, 300)) : checkWords({
     proofType: facts.proofType,
     ...(step?.proof ?? row?.humanStep?.proof ? { proof: step?.proof ?? row?.humanStep?.proof } : {}),
     ...(step?.proofWords ? { proofWords: step.proofWords } : {}),
     hasOptions: options.length > 0,
+    answering: answeringOf(step),
   });
   const { steps, from, trouble } = stepsOf(facts);
   const timing = timingOf(facts);
@@ -559,11 +660,18 @@ export function composeItem(facts: ComposeFacts): Composed {
  * them. At most one is recommended — the first that says so — and none is
  * made the primary by its place.
  */
-export function optionsOf(facts: Pick<ComposeFacts, 'step' | 'row'> & Partial<Pick<ComposeFacts, 'slug'>>): TurnOption[] {
+export function optionsOf(
+  facts: Pick<ComposeFacts, 'step' | 'row'> & Partial<Pick<ComposeFacts, 'slug' | 'phase' | 'named'>>,
+): TurnOption[] {
   const step = facts.step;
   // A gate-bound item's one way on is the gate's own Approve (turn-by-turn
   // phase 5): an answer or a note would prove it while the gate stays shut.
   const gate = step && facts.slug ? stepGateOf(step) : null;
+  // The step an errand names, its own options answered through the errand
+  // (2026-10-20): the step no longer stands, the phase still waits on it.
+  const named = !step && facts.slug && facts.phase != null && facts.phase > 0 && facts.named?.options?.length
+    ? { slug: facts.slug, phase: facts.phase, options: facts.named.options }
+    : null;
   const raw: TurnOption[] = gate?.phase != null && facts.slug
     ? [gateOption(facts.slug, gate.phase)]
     : step?.options?.length
@@ -575,6 +683,18 @@ export function optionsOf(facts: Pick<ComposeFacts, 'step' | 'row'> & Partial<Pi
         method: 'POST' as const,
         endpoint: `/api/human-steps/${encodeURIComponent(step.id ?? '')}/answer`,
         body: { option: option.id },
+      },
+      says: { field: 'note', label: 'Note (optional)' },
+    }))
+    : named
+    ? named.options.map((option) => ({
+      id: option.id, label: option.label,
+      ...(option.consequence ? { consequence: option.consequence } : {}),
+      ...(option.recommended ? { recommended: true } : {}),
+      verb: {
+        method: 'POST' as const,
+        endpoint: `/api/run/${encodeURIComponent(named.slug)}/phase/${named.phase}/errand-answered`,
+        body: { choice: option.id },
       },
       says: { field: 'note', label: 'Note (optional)' },
     }))
@@ -839,3 +959,208 @@ export function haltedPushWords(
 /** How every cap headline opens — what tells a cap errand's own title from any other. */
 const CAP_TITLE_LEAD = 'Cap reached on ';
 
+
+/* ------------------------------------------------------------------ *
+ * The packs' words (measured-console phase 29, §Architecture 6 D7): what
+ * gstack, a wizard and a session's closing questions ask a person, said in
+ * the console's words. `turn/packs.ts` reads the shapes; these write them.
+ * ------------------------------------------------------------------ */
+
+/** One question a pack or a session put to a person — its choices, and the answer it recommended. */
+export type PackQuestion = { question: string; recommended?: string; choices: { label: string; recommended?: boolean }[] };
+
+/** A step offer for the one door (`raiseTurn` / `deps.humanStep`) — the declaration's own field names. */
+export type PackStep = {
+  kind: HumanStepKind;
+  title: string;
+  why: string;
+  lines: string[];
+  options: { id: string; label: string; consequence?: string }[];
+  recommended?: string;
+  source: { kind: string; ref?: string };
+};
+
+/** At most this many questions ride one Decision item — the ledger keeps twelve lines. */
+export const PACK_QUESTIONS_MAX = 8;
+
+const RESUMES = 'Your answer goes back to the same session, which carries on from it.';
+
+/**
+ * A session that ended on questions and declared no outcome (the prose-question
+ * rule, §Architecture 6 D7): ONE Decision item carrying every question with the
+ * answer the session recommended. One question with named choices offers those
+ * choices; otherwise the options are the session's recommended answers, taken
+ * together, and the person's own, written in the note.
+ */
+export function proseQuestionStep(questions: readonly PackQuestion[], ref: string): PackStep | null {
+  const asked = questions.slice(0, PACK_QUESTIONS_MAX);
+  if (!asked.length) return null;
+  const one = asked.length === 1 ? asked[0]! : null;
+  const title = one ? one.question : `Answer the ${asked.length} questions the session ended on`;
+  const lines = [
+    ...asked.map((q, i) => line(`${asked.length > 1 ? `${i + 1}. ` : ''}${q.question}${q.recommended ? ` — the session recommends: ${q.recommended}` : ' — the session recommended no answer'}`, 300)),
+    RESUMES,
+  ];
+  if (one && one.choices.length >= 2) {
+    const options = one.choices.slice(0, 8).map((choice, i) => ({ id: `c${i + 1}`, label: line(choice.label, 120) }));
+    const marked = one.choices.findIndex((choice) => choice.recommended);
+    return {
+      kind: 'decision', title, why: 'decision', lines, options,
+      ...(marked >= 0 ? { recommended: `c${marked + 1}` } : {}),
+      source: { kind: 'prose-question', ref },
+    };
+  }
+  const given = asked.filter((q) => q.recommended);
+  const options = [
+    ...(given.length ? [{
+      id: 'recommended',
+      label: given.length === asked.length ? 'Go with the recommended answers' : 'Go with the answers it recommended',
+      consequence: line(`The session carries on with: ${given.map((q) => q.recommended).join('; ')}`, 300),
+    }] : []),
+    {
+      id: 'my-answers', label: 'Answer them myself',
+      consequence: 'Write your answers in the note; the session carries on with them.',
+    },
+  ];
+  return {
+    kind: 'decision', title, why: 'decision', lines, options,
+    ...(given.length ? { recommended: 'recommended' } : {}),
+    source: { kind: 'prose-question', ref },
+  };
+}
+
+/** A gstack approval a run is stopped on — one pending `decisions.jsonl` row, its option texts from `gate.json`. */
+export type GstackApprovalFacts = {
+  skill: string;
+  id: string;
+  label?: string;
+  title: string;
+  options: readonly { key: string; text: string }[];
+  recommended: string | null;
+  pendingAfter: number;
+};
+
+/**
+ * A gstack approval as an Approval item: what is asked, each option in gstack's
+ * own words, the recommended one marked — and never approved for the owner;
+ * the answer goes back to the session, which relays it as the owner's reply.
+ */
+export function gstackApprovalStep(facts: GstackApprovalFacts): PackStep {
+  const options = facts.options.slice(0, 8).map((option) => ({
+    id: option.key.toLowerCase(), label: cap(line(option.text, 120)),
+  }));
+  const recommended = facts.recommended && options.some((o) => o.id === facts.recommended!.toLowerCase())
+    ? facts.recommended.toLowerCase() : undefined;
+  return {
+    kind: 'person-check',
+    title: line(`Approve ${facts.label ? `${facts.label} of ` : ''}the ${facts.skill} run: ${facts.title}`, 300),
+    why: 'decision',
+    lines: [
+      `gstack's ${facts.skill} run stopped at its gate and will not approve this for you.`,
+      ...(facts.pendingAfter ? [`${facts.pendingAfter} more ${facts.pendingAfter === 1 ? 'approval waits' : 'approvals wait'} after this one, each asked in turn.`] : []),
+      RESUMES,
+    ],
+    options, ...(recommended ? { recommended } : {}),
+    source: { kind: 'pack', ref: `gstack:${facts.id}` },
+  };
+}
+
+/**
+ * A gstack run stopped at `gate_pending` with no approval row to read (no run
+ * directory this console can open): a Decision on the gate as a whole —
+ * gstack's own default, every recommendation, or the gate read item by item.
+ */
+export function gstackGateStep(facts: { skill: string; run: string }): PackStep {
+  return {
+    kind: 'decision',
+    title: `Answer the gate the ${facts.skill} run stopped at`,
+    why: 'decision',
+    lines: [
+      `gstack's ${facts.skill} run is waiting at its gate and will not answer it for you.`,
+      `Its record is in ${line(facts.run, 200)}.`,
+      RESUMES,
+    ],
+    options: [
+      { id: 'rec', label: 'Take every recommendation', consequence: 'The session answers the gate with every recommendation, plan changes included.' },
+      { id: 'walk', label: 'Walk me through each item', consequence: 'The session shows the gate item by item and asks again before it answers.' },
+    ],
+    recommended: 'rec',
+    source: { kind: 'pack', ref: `gstack-gate:${line(facts.run, 200)}` },
+  };
+}
+
+/** One stage of a wizard (mattpocock's `wizard/template.sh`), as `turn/packs.ts` read it. */
+export type WizardStage = {
+  name: string;
+  /** What the stage says and the clicks it names, in order. */
+  says: string[];
+  opens: string[];
+  asks: { key: string; prompt: string; secret: boolean }[];
+  writesEnv: string[];
+  secrets: string[];
+  variables: string[];
+  confirms: string[];
+};
+
+/** Where a captured secret goes, said as places and the commands that take it hidden — never a field. */
+function secretPlace(key: string, stage: WizardStage, envFile: string): { text: string; codes: string[] } {
+  const places: string[] = [];
+  const codes: string[] = [];
+  if (stage.writesEnv.includes(key)) places.push(`${envFile} as ${key}, which the wizard writes from its hidden prompt`);
+  if (stage.secrets.includes(key)) {
+    places.push(`the repository's GitHub secret ${key}, which \`gh secret set ${key}\` asks for hidden`);
+    codes.push(`gh secret set ${key}`);
+  }
+  if (!places.length) {
+    places.push(`the login keychain as ${key}, which \`security add-generic-password\` asks for hidden`);
+    codes.push(`security add-generic-password -a "$USER" -s ${key} -w`);
+  }
+  return { text: `it goes to ${places.join(', and to ')}`, codes };
+}
+
+/**
+ * A Task guide in the wizard's shape (§Architecture 6 D7): one step per stage,
+ * "Stage 2 of 3 · <name>", each with its commands; a secret is entered hidden
+ * where it goes — `gh secret set`, the keychain, the env file — and the guide
+ * says so, never offering a field: Phase Console never takes the value. The
+ * first step runs the wizard itself, which asks for every value hidden.
+ */
+export function wizardGuide(wizard: { title: string; file: string; envFile: string; stages: readonly WizardStage[] }, lang = 'en'): Guide {
+  const total = wizard.stages.length;
+  const kept = wizard.stages.slice(0, 19);
+  const steps = kept.map((stage, i) => {
+    const said = stage.says.map((s) => s.replace(/[.:]?\s*$/, '')).filter(Boolean);
+    const secrets = stage.asks.filter((ask) => ask.secret);
+    const plain = stage.asks.filter((ask) => !ask.secret);
+    const places = secrets.map((ask) => ({ ask, place: secretPlace(ask.key, stage, wizard.envFile) }));
+    const commands = [
+      ...stage.opens.map((url) => `open ${url}`),
+      ...places.flatMap((p) => p.place.codes),
+      ...stage.variables.map((name) => `gh variable set ${name}`),
+    ];
+    const text = [
+      `Stage ${i + 1} of ${total} · ${stage.name}`,
+      ...said,
+      ...plain.map((ask) => `${ask.prompt.replace(/:\s*$/, '')} — it is not secret${stage.writesEnv.includes(ask.key) ? `, and goes to ${wizard.envFile} as ${ask.key}` : ''}`),
+      ...places.map((p) => `${p.ask.prompt.replace(/:\s*$/, '')} — a secret: ${p.place.text}`),
+    ].join('. ');
+    return {
+      text: line(sentence(text), 600),
+      ...(commands.length ? { code: commands.join('\n') } : {}),
+      ...(secrets.length ? { warn: 'Enter the secret only at a hidden prompt — never in Phase Console, a chat or a note.' } : {}),
+      ...(stage.confirms.length ? { expect: line(sentence(`Before it goes on, it asks: ${stage.confirms.join('; ')}`), 300) } : {}),
+    };
+  });
+  return {
+    lang, dir: guideDirection(lang), version: 1,
+    summary: line(`${wizard.title}: ${total} ${total === 1 ? 'stage' : 'stages'} only you can do. The wizard asks for every value at a hidden prompt and writes it where it goes; Phase Console never sees it.`, 400),
+    steps: [
+      { text: `Run the wizard on your machine — it walks every stage below and shows how many are left.`, code: `bash ${wizard.file}` },
+      ...steps,
+    ],
+    trouble: [
+      { symptom: 'A stage needs a value you do not have yet', fix: 'Stop with Ctrl-C; run it again later — it keeps the values already saved.' },
+      ...(total > kept.length ? [{ symptom: `The wizard has ${total} stages and this guide shows the first ${kept.length}`, fix: 'The wizard itself walks every stage.' }] : []),
+    ],
+  };
+}

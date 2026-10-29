@@ -987,3 +987,91 @@ test('turn-by-turn phase 6: a run request climbs nothing — its errand at once,
   assert.equal(options.filter((o) => o.recommended).length, 1);
   assert.equal(decisionKeyOfSituation('blocked-declared:run'), 'stop');
 });
+
+/* ------------------------------------------------------------------ *
+ * The resume-owner rung (measured-console phase 25)
+ * ------------------------------------------------------------------ */
+
+import { OWNER_SOURCES, ownerClaimOf } from '../shared/situation-model.js';
+import { ownerInstruction, ownerRung, routesToOwner } from '../server/runner/ladder.ts';
+
+const inheritedRed = { command: 'npm test', failures: ['server/test/plan.test.ts › parses'], owner: 7, how: 'commit' as const };
+
+test('phase 25: a sibling\'s inherited red names its owner, and an owner whose session is resumable is resumed first, with the failure carried', () => {
+  const claim = ownerClaimOf({ phase: 9, inherited: [inheritedRed] });
+  assert.ok(claim);
+  assert.equal(claim.owner, 7);
+  assert.equal(claim.from, 9);
+  assert.equal(claim.source, 'inherited-red');
+  assert.ok((OWNER_SOURCES as readonly string[]).includes(claim.source));
+  assert.match(claim.failure, /npm test/);
+  assert.deepEqual(claim.evidence, ['server/test/plan.test.ts › parses']);
+
+  const next = nextRung({ situation: 'verify-red', history: [], owner: { phase: 7, from: 9, resumable: true } });
+  assert.ok(next.ok && next.rung.vehicle === 'resume-owner', JSON.stringify(next));
+  assert.equal(next.ok && next.rung.params?.owner, 7);
+  assert.equal(next.ok && next.rung.params?.from, 9);
+  // The vehicle is in the vocabulary, has a driver, and a label for the card.
+  assert.ok((RUNG_VEHICLES as readonly string[]).includes('resume-owner'));
+  assert.equal(drivableBy('resume-owner'), 'console');
+  assert.match(SHARED_LADDER.rungLabel('resume-owner', { owner: 7 }), /phase 7/);
+  // The brief carries what failed and the evidence lines, and keeps the failing phase's files out of it.
+  const brief = ownerInstruction(claim);
+  assert.match(brief, /YOUR phase \(7\), not to phase 9/);
+  assert.match(brief, /server\/test\/plan\.test\.ts › parses/);
+  assert.match(brief, /Do not edit phase 9's files/);
+  // QA and a reopened phase may route to an owner too; a wait or a block never does.
+  assert.ok(routesToOwner('qa-failed') && routesToOwner('verify-red:reopened'));
+  assert.ok(!routesToOwner('work-in-progress') && !routesToOwner('blocked-declared:gate'));
+  const qa = nextRung({ situation: 'qa-failed', history: [], owner: { phase: 7, from: 9, resumable: true } });
+  assert.ok(qa.ok && qa.rung.vehicle === 'resume-owner');
+  const wip = nextRung({ situation: 'work-in-progress', history: [], owner: { phase: 7, from: 9, resumable: true } });
+  assert.ok(wip.ok && wip.rung.vehicle === 'resume-own-session', 'no owner rung outside the owned situations');
+});
+
+test('phase 25: an owner that cannot be resumed — or none named — leaves the table exactly as it was', () => {
+  const cold = nextRung({ situation: 'verify-red', history: [], owner: { phase: 7, from: 9, resumable: false } });
+  assert.ok(cold.ok && cold.rung.vehicle === 'resume-own-session' && cold.index === 0, JSON.stringify(cold));
+  const none = nextRung({ situation: 'verify-red', history: [] });
+  assert.ok(none.ok && none.rung.vehicle === 'resume-own-session' && none.index === 0);
+  // The available predicate is still the last word: a console that cannot drive it skips it.
+  const skipped = nextRung({
+    situation: 'verify-red', history: [], owner: { phase: 7, from: 9, resumable: true },
+    available: (rung) => rung.vehicle !== 'resume-owner',
+  });
+  assert.ok(skipped.ok && skipped.rung.vehicle === 'resume-own-session');
+  // Claims read what the console knows and never guess.
+  assert.equal(ownerClaimOf({ phase: 9, inherited: [{ command: 'npm test', failures: ['x'], candidates: [3, 4] }] }), null, 'several candidates name no one');
+  assert.equal(ownerClaimOf({ phase: 7, inherited: [inheritedRed] }), null, 'a failure naming the failing phase is its own');
+  assert.equal(ownerClaimOf({ phase: 9 }), null);
+  const evaluator = ownerClaimOf({ phase: 9, notMet: [{ phase: 5, id: 'E2', evidence: 'no row for the rung', dimension: 'spec' }] });
+  assert.ok(evaluator && evaluator.owner === 5 && evaluator.source === 'evaluator');
+  assert.match(evaluator.evidence[0], /E2.*no row for the rung/);
+});
+
+test('phase 25: the owner rung is taken once per failure, then the ladder climbs — and a second owner is a different failure', () => {
+  const owner = { phase: 7, from: 9, resumable: true };
+  const first = nextRung({ situation: 'verify-red', history: [], owner });
+  assert.ok(first.ok && first.rung.vehicle === 'resume-owner');
+  const routed = climbed('verify-red', 'resume-owner', 3, ownerRung(7, 9).params);
+  routed.outcome = 'work-in-progress';
+  const second = nextRung({ situation: 'verify-red', history: [routed], owner });
+  assert.ok(second.ok && second.rung.vehicle === 'resume-own-session' && second.index === 0, `climbs to the table: ${JSON.stringify(second)}`);
+  const third = nextRung({
+    situation: 'verify-red', history: [routed, climbed('verify-red', 'resume-own-session', 4, { mode: 'fix-verification' })], owner,
+  });
+  assert.ok(third.ok && third.rung.vehicle === 'fix-agent', 'the fixer boards only after the owner and the own session');
+  // A different owner for the same situation is a different rung.
+  const other = nextRung({ situation: 'verify-red', history: [routed], owner: { phase: 4, from: 9, resumable: true } });
+  assert.ok(other.ok && other.rung.vehicle === 'resume-owner' && other.rung.params?.owner === 4);
+  // The ladder's caps still bind: a spent phase climbs nothing, owner or not.
+  const spent = nextRung({
+    situation: 'verify-red',
+    history: [routed, climbed('verify-red', 'resume-own-session', 0), climbed('verify-red', 'fix-agent', 0)],
+    owner: { phase: 2, resumable: true },
+  });
+  assert.ok(!spent.ok && spent.exhausted && spent.refusal === 'ladder-budget-spent');
+  // The table itself is untouched by the owner rung.
+  assert.equal(rungsFor('verify-red')[0].vehicle, 'resume-own-session');
+  assert.ok(!Object.values(RUNGS_BY_SITUATION).some((rungs) => rungs.some((rung) => rung.vehicle === 'resume-owner')));
+});

@@ -150,6 +150,19 @@ export const ALERT_PCT = 95;
 export const WALL_PCT = 99;
 
 /**
+ * The spill's hysteresis (measured-console phase 24, #420). A run spills off an
+ * account at `ALERT_PCT` (`spillPct`), and never lands on one whose fullest
+ * shared window reads above `SPILL_LAND_MAX_PCT` (`spillLandMaxPct`): two runs on
+ * two accounts at 96 % moved onto each other's braked account at every
+ * boundary, and idled until a person moved one back. An account a run left is
+ * not re-entered by an automatic move for `SPILL_COOLDOWN_MIN` minutes
+ * (`spillCooldownMin`) — the reciprocal A→B→A pair turned round in minutes
+ * (ACT-5), and the gap between the two thresholds is the room a spill buys.
+ */
+export const SPILL_LAND_MAX_PCT = 85;
+export const SPILL_COOLDOWN_MIN = 60;
+
+/**
  * Why an account's credits are off, in words (control-tower phase 93, #146).
  * The usage endpoint's `extra_usage.disabled_reason` and the CLI's
  * `overageDisabledReason` speak one vocabulary (read in the CLI 2.1.283

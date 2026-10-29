@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: start-publishes-tasks
+description: 'mode-phase-start, It''s working if: the task list is published and current.'
+tags: [phase-start, working-if]
+context:
+  scaffold_script: fixture.sh

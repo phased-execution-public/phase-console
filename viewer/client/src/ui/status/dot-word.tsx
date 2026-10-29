@@ -99,8 +99,9 @@ export function DotWord({
   const quiet = isQuiet(view);
   const pulses = live && view.tense === 'live' && view.paint === 'running';
   const summons = view.attention !== 'none';
-  if (chrome === 'badge') {
+  if (chrome === 'badge' || chrome === 'tint') {
     const Icon = statusIcon(view.icon);
+    const tint = chrome === 'tint' && view.known;
     return (
       <TapTip content={() => <StatusTipBody view={view} context={title} />}>
         <span
@@ -111,17 +112,20 @@ export function DotWord({
           data-tense={view.tense}
           data-known={view.known ? undefined : 'false'}
           data-quiet={quiet ? '' : undefined}
-          data-chrome="badge"
+          data-chrome={chrome}
           className={cn(
             // An OUTLINED pill: the hue paints the border, the icon and the
-            // word — never a fill behind the text (design.md §1 rule 4).
+            // word (design.md §1 rule 4). The LEAD badge alone sits on its
+            // state's tint, the word still in the state's own AA hue (§3.2).
             'relative inline-flex items-center gap-1 rounded-full border px-2 py-px whitespace-nowrap tabular-nums',
             size === 'md' ? 'text-body' : 'text-meta',
             !view.known
               ? 'border-dashed border-ink-faint text-ink-muted'
-              : quiet
-                ? 'border-state/30 text-state'
-                : 'border-state/60 text-state',
+              : tint
+                ? 'border-state/40 bg-state-tint font-medium text-state'
+                : quiet
+                  ? 'border-state/30 text-state'
+                  : 'border-state/60 text-state',
             `state-${view.paint}`,
             className,
           )}
@@ -132,7 +136,7 @@ export function DotWord({
             data-icon
             size={size === 'md' ? 13 : 12}
             strokeWidth={2.25}
-            className={cn('shrink-0', pulses && 'animate-pulse-soft')}
+            className={cn('shrink-0', tint && 'text-state-vivid', pulses && 'animate-pulse-soft')}
           />
           <span>{view.label}</span>
           {note && (

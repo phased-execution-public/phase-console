@@ -9,7 +9,7 @@ session — as a dependency graph of right-sized sessions, with a local web cons
 
 **English** · [فارسی](README.fa.md)
 
-![Console ](https://raw.githubusercontent.com/phased-execution-public/phase-console/main/assets/console.gif)
+![Console ](https://raw.githubusercontent.com/phased-execution-public/phase-console/v8.0.0/assets/console.gif)
 
 </div>
 
@@ -148,9 +148,9 @@ The long version, including push notifications and exactly what is enforced → 
 [QA gating](docs/qa-gating.md) · [Safety rails](docs/safety-rails.md) · [Phase Console](docs/console.md) · [Metrics](docs/metrics.md) ·
 [Install by hand](docs/install.md) · [Versioning & releases](docs/releasing.md) · [Reference](docs/reference.md)
 
-8.0 makes **Your turn** (`#/turn`) a destination of its own and every plan's fourth view, gives a plan's map its tools,
-a Schedule and a Burn-up, and walls the console's own git off from what a session writes in its tree. What 7.1, 6.2
-and 6.1 added is in **[docs/console.md](docs/console.md)**, *What each release added*.
+9.0 makes a phase session **cheaper, measured**: a skill of a core and three mode files, a session told what it starts
+from, a gate that runs every suite once, a phase that verifies what it changed, and a boot of 55K tokens where 8.0's
+took 111K. What 8.0 (**Your turn**, `#/turn`), 7.1, 6.2 and 6.1 added is in **[docs/console.md](docs/console.md)**.
 
 
 Needs Claude Code, plus `bash` and `git`. The console adds Node 22.18+ (or 23.6+) and has **no runtime dependencies**.

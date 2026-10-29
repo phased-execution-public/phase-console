@@ -46,5 +46,7 @@ below is the long version, in the order it is worth reading.
 | [Reference](reference.md) | How Agent Skills work, requirements, and how to run the tests. |
 | [Versioning and releasing](releasing.md) | The two channels, how a change becomes an update, and what every change must carry with it. |
 | [viewer/README.md](../viewer/README.md) | The console's own technical documentation — architecture, API, deploy. |
+| [Architecture, the long form](../viewer/docs/architecture.md) | What `CLAUDE.md` points to: the three layers, the client's map and its vocabularies, accounts and the pool, MCP, the flags, packaging. |
+| [Invariants](invariants.md) | Every invariant a test enforces, a paragraph each, with the test that holds it. |
 | [USAGE.md](../USAGE.md) | The loop in operational detail. |
 

@@ -16,7 +16,7 @@ import { DESTINATIONS } from '@shared/route-meta.js';
  * (seven in 7.0, quiet-console phase 3; Your turn joined in 8.0, one-pool
  * phase 14, #366).
  *
- * The seven are the questions an operator actually has, in the order they have
+ * The eight are the questions an operator actually has, in the order they have
  * them; everything else in the URL space is a page one of these has absorbed,
  * a head one of them lights (`shell/routes.ts` `destinationFor`), or an overlay
  * that rides on top of whatever is on screen. Pro's two places are reached from

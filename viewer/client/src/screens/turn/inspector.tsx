@@ -16,7 +16,8 @@
 
 import { KIND_META } from '@shared/human-step-model.js';
 import { whyPersonWords } from '@shared/turn-model.js';
-import { BIRTH_WORDS, MoveLine, stamp } from '@/cards/human-step-card';
+import { MoveLine } from '@/cards/turn/step-parts';
+import { BIRTH_WORDS, stamp } from '@/cards/turn/step-words';
 import type { HumanStepRecord } from '@/data/human-steps';
 import { useTurnItem, type TurnItem } from '@/data/turn';
 import { ApiError } from '@/data/http';
@@ -209,7 +210,10 @@ export function approvalIdOf(item: Pick<TurnItem, 'actions' | 'permission'>): st
  * Show the item in the panel. `open: false` hands the panel the record without
  * opening it — what `#/turn/<id>` does where the panel would cover the card.
  * `card: true` is the list's selection (one-pool phase 14, #377): the panel's
- * Overview is the item's whole card, live, with its record folded under it.
+ * Overview is the item's whole card, live, with its record folded under it —
+ * and the card's head is the panel's only one (Tower strips, 2026-10-20): the
+ * frame draws no heading and no step-word status over it, so the item wears
+ * ONE title, the card's, and ONE status, the person's.
  */
 export function inspectItem(
   { item, record }: { item: TurnItem; record: HumanStepRecord | undefined },
@@ -217,21 +221,30 @@ export function inspectItem(
 ): void {
   const state = record?.state ?? item.step?.state ?? item.humanStep?.state ?? 'notified';
   const risk = item.permission?.risk ?? item.step?.permission?.risk ?? record?.permission?.risk;
-  const title = record?.title ?? item.step?.title ?? item.title;
+  // The card's own title (`cards/item-card.tsx`), when the card is the Overview.
+  const title = options.card
+    ? item.title || record?.title || item.step?.title || ''
+    : (record?.title ?? item.step?.title ?? item.title);
   const where = item.slug ? `${item.slug}${item.phase != null ? `, phase ${item.phase}` : ''}` : item.source;
   const card = approvalIdOf(item);
   inspect(
     {
       key: `turn:${item.item}`,
       title,
-      description: `${KIND_META[item.kind]?.label ?? item.kind} — ${where}.`,
-      meta: (
-        <>
-          <OpsStatus vocab="step" word={state} />
-          {risk && <OpsStatus vocab="risk" word={risk} />}
-          <Mono value={item.item} chars={16} copyable />
-        </>
-      ),
+      // A Your turn item is a form to act on: the panel may grow to a form's measure for it.
+      measure: 'form',
+      ...(options.card
+        ? { headless: true }
+        : {
+            description: `${KIND_META[item.kind]?.label ?? item.kind} — ${where}.`,
+            meta: (
+              <>
+                <OpsStatus vocab="step" word={state} />
+                {risk && <OpsStatus vocab="risk" word={risk} />}
+                <Mono value={item.item} chars={16} copyable />
+              </>
+            ),
+          }),
       overview: options.card ? <PanelCard id={item.item} /> : <ExplainOverview item={item} record={record} />,
       ...(card ? { actions: <ActionsTab kind="approval" args={{ id: card }} /> } : {}),
       ...(record ? { history: <ItemHistory record={record} /> } : {}),

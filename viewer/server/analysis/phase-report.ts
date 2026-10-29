@@ -27,7 +27,7 @@
  */
 import { PHASE_ETA_CONFIDENCES, SLOW_RULES } from '../../shared/ops-vocab.js';
 import { PHASE_IN_FLIGHT, PHASE_STATUSES } from '../../shared/run-lifecycle.js';
-import { scanBack } from '../runner/transcript.ts';
+import { scanBackChain } from '../runner/transcript.ts';
 import { foldCommand } from '../runner/verify.ts';
 
 type SlowRule = (typeof SLOW_RULES)[number];
@@ -396,7 +396,7 @@ function summaryOf(report: PhaseReport): string {
  */
 export function readPhaseJournal(file: string, phase: number): ReportJournalRow[] {
   const rows: ReportJournalRow[] = [];
-  scanBack(file, JOURNAL_BUDGET, (line) => {
+  scanBackChain(file, JOURNAL_BUDGET, (line) => {
     let row: ReportJournalRow;
     try {
       row = JSON.parse(line) as ReportJournalRow;

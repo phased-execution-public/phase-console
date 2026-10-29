@@ -11,7 +11,8 @@
  * `state.ts` re-exports them, so every existing importer keeps its spelling.
  */
 
-import { join } from 'node:path';
+import { readFileSync, readdirSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 import { instanceId } from '../../shared/instances.mjs';
 import { STATE_DIR } from '../config.ts';
@@ -52,8 +53,63 @@ export function runFile(root: string, slug: string, id: string): string {
   return join(runDir(root, slug), `run-${id}.json`);
 }
 
+/**
+ * The run record's delta log (measured-console phase 17, B5, `persistModel` 2):
+ * the records a save changed, one generation per line, folded over the base on read.
+ */
+export function runDeltaFile(target: string): string {
+  return `${target}.delta`;
+}
+
 export function journalFile(root: string, slug: string, id: string): string {
   return join(runDir(root, slug), `run-${id}.jsonl`);
+}
+
+/**
+ * The journal's chain (measured-console phase 17, B5): a journal that reached
+ * its cap was renamed to `run-<id>.jsonl.<n>` (n from 1, oldest first) and a
+ * fresh live file begun; `run-<id>.jsonl.index` records each segment's
+ * `{n, file, firstSeq, lastSeq, bytes, offset}` — `offset` the byte at which
+ * the segment starts in the run's whole journal.
+ */
+export type JournalSegment = { n: number; file: string; firstSeq: number; lastSeq: number; bytes: number; offset: number };
+export type JournalIndex = { version: 1; segments: JournalSegment[] };
+
+/** The live file's numbered segment `n`. */
+export function journalSegmentFile(live: string, n: number): string {
+  return `${live}.${n}`;
+}
+
+/** The live file's chain index. */
+export function journalIndexFile(live: string): string {
+  return `${live}.index`;
+}
+
+/**
+ * The chain's index — read from its file, else rebuilt from the numbered files
+ * on disk (a console that died between the rename and the index write).
+ */
+export function journalIndexOf(live: string): JournalIndex {
+  try {
+    const parsed = JSON.parse(readFileSync(journalIndexFile(live), 'utf8')) as Partial<JournalIndex>;
+    if (parsed?.version === 1 && Array.isArray(parsed.segments)) {
+      return { version: 1, segments: parsed.segments.filter((s) => Number.isInteger(s?.n)).sort((a, b) => a.n - b.n) };
+    }
+  } catch { /* absent or torn: rebuilt below */ }
+  const stem = basename(live);
+  let names: string[] = [];
+  try { names = readdirSync(dirname(live)); } catch { names = []; }
+  const segments: JournalSegment[] = [];
+  for (const name of names) {
+    const middle = name.startsWith(`${stem}.`) ? name.slice(stem.length + 1) : '';
+    if (/^\d+$/.test(middle)) segments.push({ n: Number(middle), file: name, firstSeq: 0, lastSeq: 0, bytes: 0, offset: 0 });
+  }
+  return { version: 1, segments: segments.sort((a, b) => a.n - b.n) };
+}
+
+/** Every file of a journal, oldest first — its segments, then the live file. What every reader follows. */
+export function journalChainOf(live: string): string[] {
+  return [...journalIndexOf(live).segments.map((segment) => join(dirname(live), segment.file)), live];
 }
 
 /**
@@ -88,12 +144,14 @@ export function transcriptPhase(name: string, id: string): number | null | undef
  * the replays (the run's and each phase's) and their archives, the folded git
  * trace, and each phase's task ledger and outcome.
  *
- * ONE pattern, read by retention's inventory, `pruneRuns` and the debug bundle.
+ * ONE pattern, read by retention's inventory, `pruneRuns` and the debug bundle —
+ * the journal's chain (`.jsonl.<n>`, `.jsonl.index`) and the record's delta log (`.json.delta`,
+ * measured-console phase 17) among them — suffixes no `.json$` or `.jsonl$` scan takes for a record or a journal.
  * Each used to spell its own, and none knew the archived names the 2026-09-25
  * workaround left when it moved full replays aside — so those were counted by
  * nobody and outlived their runs for ever.
  */
-const SIDECAR_TAIL = String.raw`(?:\.jsonl|(?:\.p\d+)?\.log\.jsonl(?:\.old|\.full-[0-9A-Za-z:._-]+)?|\.git\.ndjson|-p\d+-(?:tasks\.ndjson|outcome\.json))`;
+const SIDECAR_TAIL = String.raw`(?:\.jsonl|\.json\.delta|\.jsonl\.\d+|\.jsonl\.index|(?:\.p\d+)?\.log\.jsonl(?:\.old|\.full-[0-9A-Za-z:._-]+)?|\.git\.ndjson|-p\d+-(?:tasks\.ndjson|outcome\.json))`;
 const SIDECAR = new RegExp(`^run-([0-9a-f]{8,32})${SIDECAR_TAIL}$`);
 
 /** The run id a sidecar's name belongs to, or `null` when it is not one. */

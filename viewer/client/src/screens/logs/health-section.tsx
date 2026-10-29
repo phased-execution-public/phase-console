@@ -4,6 +4,8 @@
  * ```
  * This console's runtime   Heap ▬▬▬▬▬░░░ 812 MB of 6.0 GB   Event-loop delay 3 ms   Event streams 2
  * ───────────────────────────────────────────────────────────────────────────
+ * Over time                Full gate ▁▃▅▃  Load per core ▂▃▂▂  Save time ▁▁▂▁
+ * ───────────────────────────────────────────────────────────────────────────
  * Doctor                   [Run the doctor]
  * ───────────────────────────────────────────────────────────────────────────
  * This process             Generation 412   Booted 3 hours ago   Serving build af1cadb3 …
@@ -23,10 +25,13 @@
  * is a scrape every 15 s while the section is open, never a history, and the
  * start ceiling a read of the server's memory every 30 s; the stray consoles
  * are one `ps`, read on arrival. The doctor and the bundle cost a pass over
- * every source, so each runs when it is asked for. The console keeps no time
- * series — `/api/metrics` renders the current facts on every scrape — so the
- * metrics here are a snapshot and say so; the timeline this place has is the
- * run journal.
+ * every source, so each runs when it is asked for. Over time is the one place
+ * the console keeps a history of its own health (measured-console phase 31,
+ * F2): a bounded series per measure — the full gate's seconds per run, the
+ * machine's load per core, the mean milliseconds a run save took
+ * — read from `GET /api/health/series`, with the bounds said in words. `/api/metrics` still
+ * renders only the current facts on every scrape, so the metrics below are a
+ * snapshot and say so; the run's own timeline is the run journal.
  */
 
 import { useState, type ReactNode } from 'react';
@@ -34,14 +39,14 @@ import { RetirementEvidence, hasRetirementStory } from '@/cards/retirement-evide
 import { useAccounts } from '@/data/accounts';
 import { api, type DoctorRow, type MetricFamily } from '@/data/api';
 import { useConsoleState } from '@/data/console';
-import { useDebugBundle, useDoctor, useRuntime } from '@/data/logs';
+import { useDebugBundle, useDoctor, useHealthSeries, useRuntime, type HealthSeriesView } from '@/data/logs';
 import { consolePath } from '@/lib/base';
-import { bytes, plural } from '@/lib/format';
+import { bytes, duration, plural } from '@/lib/format';
 import type { Route } from '@/shell/routes';
 import { Banner, Button, KeyValue, Mono, SectionHeading, Skeleton, type KeyValueItem } from '@/ui';
 import { CopyButton } from '@/ui/copy-button';
 import { Disclosure } from '@/ui/disclosure';
-import { BarList } from '@/ui/figures/lazy';
+import { BarList, Series } from '@/ui/figures/lazy';
 import { OpsStatus } from '@/ui/status';
 import { LoadMeter } from '@/ui/track/meter';
 import { CeilingCounters } from './ceiling';
@@ -80,6 +85,106 @@ function HealthQuestion({
 function At({ at }: { at: string }) {
   const date = new Date(at);
   return <time dateTime={at}>{Number.isNaN(date.getTime()) ? at : date.toLocaleString()}</time>;
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** A point's instant as the axis writes it, in UTC: `Oct 17 14:05`. */
+function pointTime(at: string): string {
+  const date = new Date(at);
+  if (Number.isNaN(date.getTime())) return at;
+  const clock = `${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}`;
+  return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()} ${clock}`;
+}
+
+type SeriesMeasure = keyof HealthSeriesView['measures'];
+
+/** Each measure: its caption, the row's name, how a value is written, and what an empty strip says. */
+const SERIES_MEASURES: readonly {
+  id: SeriesMeasure;
+  caption: string;
+  name: string;
+  format: (value: number) => string;
+  empty: string;
+}[] = [
+  {
+    id: 'gate',
+    caption: 'The full gate, seconds per run',
+    name: 'Gate time',
+    format: (value) => duration(value * 1000),
+    empty: 'The full gate has not run on this machine.',
+  },
+  {
+    id: 'load',
+    caption: 'Load per core, the five-minute average',
+    name: 'Load per core',
+    format: (value) => value.toFixed(2),
+    empty: 'No load has been sampled yet.',
+  },
+  {
+    id: 'persist',
+    caption: 'Mean milliseconds a run save took',
+    name: 'Save time',
+    format: (value) => `${Math.round(value)} ms`,
+    empty: 'No run has been saved since sampling began.',
+  },
+];
+
+/**
+ * Health over time (measured-console phase 31, F2): one small figure per measure, a point each —
+ * and the bounds said in words, so a strip that stops short reads as the retention, not a fault.
+ */
+function OverTime() {
+  const { data, error, refetch } = useHealthSeries();
+  if (error && !data) {
+    return (
+      <Banner
+        severity="error"
+        action={
+          <Button size="sm" variant="ghost" onClick={() => void refetch()}>
+            Try again
+          </Button>
+        }
+      >
+        Health over time could not be read: {error.message}
+      </Banner>
+    );
+  }
+  if (!data) return <Skeleton className="h-40" aria-busy="true" />;
+  const { bounds } = data;
+  const minutes = Math.round(bounds.sampleMs / 60_000);
+  return (
+    <div className="flex min-w-0 flex-col gap-4">
+      <p className="max-w-(--measure) text-meta text-ink-muted" data-testid="health-series-bounds">
+        Kept for {plural(bounds.days, 'day')}, and at most {plural(bounds.maxPoints, 'point')} of each
+        measure, the newest. Load and save time are sampled every {plural(minutes, 'minute')}; the gate has a
+        point per run. Times are UTC.
+      </p>
+      {SERIES_MEASURES.map((measure) => {
+        const points = data.measures[measure.id] ?? [];
+        return (
+          <div
+            key={measure.id}
+            className="flex min-w-0 flex-col gap-2"
+            data-testid={`health-series-${measure.id}`}
+            data-points={points.length}
+          >
+            <h3 className="text-meta font-normal text-ink-muted">{measure.caption}</h3>
+            <Series
+              buckets={points.map((point) => ({ start: point.at, end: point.at }))}
+              rows={[{ name: measure.name, values: points.map((point) => point.v) }]}
+              format={measure.format}
+              timeText={pointTime}
+              label={measure.caption}
+              heads={{ time: 'Time (UTC)' }}
+              summed={false}
+              empty={measure.empty}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 /**
@@ -507,7 +612,8 @@ function BundleHealth() {
             <a className={LINK} href={consolePath('/api/metrics')}>
               /api/metrics
             </a>{' '}
-            renders them now. This console keeps no history; a chart over time is for whatever scrapes it.
+            renders them now: a snapshot, not a history. What this console does keep over time is under Over
+            time, above.
           </p>
         )}
         <div className="flex min-w-0 flex-col gap-5">
@@ -533,6 +639,9 @@ export default function HealthSection(_props: { route: Route }) {
     <div className="flex min-w-0 flex-col divide-y divide-rule" data-testid="health">
       <HealthQuestion id="runtime" title="This console’s runtime">
         <RuntimeStrip />
+      </HealthQuestion>
+      <HealthQuestion id="series" title="Over time" testId="health-series">
+        <OverTime />
       </HealthQuestion>
       <HealthQuestion id="doctor" title="Doctor">
         <Doctor />

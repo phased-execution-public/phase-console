@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: finish-notes-addressed
+description: 'mode-phase-finish, It''s working if: each note for a later phase is addressed.'
+tags: [phase-finish, working-if]
+context:
+  scaffold_script: fixture.sh

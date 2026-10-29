@@ -24,11 +24,12 @@
 # lock whose session has ENDED (debris, released at once) from one whose session
 # is live (queue behind it) — instead of waiting out the lease either way.
 #
-# A lock may also name the BRANCH the session's work rides (`branch=`). Unlike
-# `worktree=`, this one is acted on: two claims whose scopes intersect are
-# nevertheless disjoint when BOTH name a branch and the branches differ, because
-# their commits cannot land on top of each other. An unqualified claim collides
-# with everything, exactly like an unstated scope. See `claim_disjoint`.
+# A lock may also name the BRANCH the session's work rides (`branch=`) and the
+# working TREE it edits (`worktree=`). The PAIR is acted on: two claims whose
+# scopes intersect are nevertheless disjoint when BOTH name a branch AND a tree
+# and both differ (a tree nested inside another is the same ground). A claim
+# unqualified in either dimension collides with everything, exactly like an
+# unstated scope. See `claim_disjoint` in scripts/scope.sh.
 #
 # Usage:
 #   phase-lock.sh <slug> claim   <N> [--owner ID] [--lease SECS] [--scope CSV] [--session ID] [--branch NAME] [--worktree DIR] [--here] [--git] [--force]

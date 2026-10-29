@@ -40,6 +40,12 @@ const ENGINE_MESSAGE =
 const ENGINE_DOOR_MESSAGE =
   'The table engine is reached only through import() (ui/grid/grid.tsx): a static import puts TanStack Table on the path of ' +
   'every page that draws a table, and check-dist fails that build. A type import is erased — write `import type`.';
+const ONE_CLOCK_MESSAGE =
+  'One page clock: read the time through @/ui/clock (usePageNow, useNow, useWindowLeft) — lib/clock was folded into it ' +
+  '(measured-console phase 32), and a second clock is two figures that disagree by a tick.';
+const ONE_CARD_MESSAGE =
+  "One human-step card: cards/item-card.tsx draws every person's step — human-step-card was folded into it " +
+  '(measured-console phase 32).';
 /** A module whose last segment is `engine` — the table engine's file, by any path. */
 const ENGINE_SOURCE = String.raw`/(^|\/)engine$/`;
 const EVENT_SOURCE_MESSAGE =
@@ -81,6 +87,17 @@ function restrictedImports({ dotWord = true, dataDoor = true, engine = true } = 
           ? [{ group: ['@tanstack/react-table/*', '@tanstack/table-core/*'], message: ENGINE_MESSAGE }]
           : []),
         ...(dotWord ? [{ group: ['**/dot-word'], message: DOT_WORD_MESSAGE }] : []),
+        // The two folded modules: neither path may come back, from anywhere.
+        { group: ['**/lib/clock', '**/lib/clock.ts'], message: ONE_CLOCK_MESSAGE },
+        {
+          group: [
+            '**/cards/human-step-card',
+            '**/cards/human-step-card.tsx',
+            './human-step-card',
+            './human-step-card.tsx',
+          ],
+          message: ONE_CARD_MESSAGE,
+        },
       ],
     },
   ];
@@ -258,8 +275,47 @@ export default tseslint.config(
     },
   },
   {
+    // The node suite (measured-console phase 15): `viewer/test`, linted by
+    // `npm run lint:test`, never by `lint:client`. Node globals; a fake or a
+    // probe is allowed what a test double needs (`any`, a non-null assertion,
+    // an empty function, a `require` of a CommonJS fixture). What stays on is
+    // what finds real defects: unused names, unreachable code, duplicate keys,
+    // a misspelt global.
+    files: ['test/**/*.{ts,mts,mjs}'],
+    languageOptions: {
+      ecmaVersion: 2023,
+      sourceType: 'module',
+      globals: { ...globals.node },
+    },
+    rules: {
+      'no-console': 'off',
+      'no-empty': ['error', { allowEmptyCatch: true }],
+      'no-empty-pattern': 'off',
+      'no-control-regex': 'off',
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-non-null-assertion': 'off',
+      '@typescript-eslint/no-empty-function': 'off',
+      '@typescript-eslint/no-require-imports': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrors: 'none' },
+      ],
+      // Two idioms of a test, not defects: a runner declared with `let` before
+      // the closures that will read it are built, and a `let text = ''` a
+      // `try` overwrites when the file is there.
+      'prefer-const': 'off',
+      'no-useless-assignment': 'off',
+    },
+  },
+  {
     // The shared modules and the build scripts: plain ESM for node AND the browser.
-    files: ['shared/**/*.{js,mjs}', 'scripts/**/*.mjs', 'vite.config.ts', 'eslint.config.js'],
+    files: [
+      'shared/**/*.{js,mjs}',
+      'scripts/**/*.mjs',
+      'vite.config.ts',
+      'eslint.config.js',
+      'stryker.config.mjs',
+    ],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'module',

@@ -8,7 +8,7 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `service.ts` holds the concrete class.
  */
-import { parkOnStep, stepJournalFields, type HumanStep, type StepVerbResult } from './human-steps.ts';
+import { answeredInstruction, parkOnStep, stepJournalFields, type HumanStep, type StepVerbResult } from './human-steps.ts';
 import { readGuideFile } from './turn/guide-file.ts';
 import { itemOfErrand } from './turn/fold.ts';
 import { randomUUID } from 'node:crypto';
@@ -26,7 +26,13 @@ import {
   SessionRegistry, correlate, parseHookPayload, peersSentence,
   type ChangeMeta, type RegistryChange, type RunLink, type SessionEventName, type SessionRecord, type SessionView,
 } from './sessions/registry.ts';
-import { hooksStatus, installHooks, uninstallHooks, type HooksStatus, type HooksWrite } from './hooks-install.ts';
+import {
+  hookRowsOf, hookRowsOfFile, hooksStatus, installHooks, uninstallHooks, type HookRow, type HooksStatus, type HooksWrite,
+} from './hooks-install.ts';
+import { readHookify, writeHookify, type PlanHookify } from './hookify.ts';
+import { buildSettings } from './runner/approvals.ts';
+import { currentPluginDir } from './plugin-tree.ts';
+import { claudeHome } from './skills.ts';
 import { readSkillApi, sessionSkillCopy, skillApiVerdict } from './skill-copy.ts';
 import { Store, handoffFor, lockFor, qaFor, readLock, type PlanRecord } from './store.ts';
 import {
@@ -86,13 +92,13 @@ import {
   type PlanStats, type Portfolio, type PlanContext, type EtaEstimate, type EtaSample,
   type PhaseEta, type RateReading, type EtaShape, type RemainingFloor,
 } from './analysis/stats.ts';
-import { credentialsFor, humanStepsFor, mcpServersFor, personCheckFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
+import { humanStepsFor, personCheckFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
 import { wantsDefaultCheckout } from '../shared/worktree-model.js';
 import { phaseClocks } from '../shared/phase-clocks.js';
 import { wallReading, withWallWhy } from '../shared/situation-model.js';
 import { mergeDecisions, subKindOfNeed } from '../shared/decisions-model.js';
 import { resolvePolicy } from '../shared/policy-model.js';
-import { PreludeRefusal, doorOpens, itemOf, planStepInput, preludeFor, resolvedManifest, scopedSteps, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
+import { PreludeRefusal, doorOpens, doorPolicyFacts, itemOf, planStepInput, preludeFor, resolvedManifest, scopedSteps, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
 import type { PreludeStep, SkillApiFacts } from './prelude.ts';
 import { openUrlOnHost, type HostOpen } from './host-open.ts';
 import { GitStrategyRefusal, rereadManifest, type GitStrategyLine } from './prelude.ts';
@@ -209,7 +215,7 @@ import {
   accountPersonRung, accountRung, boardInPersonSlot, errandFor, forgiveRungs, ladderCaps, nextRung, personSituationOf,
   replenishedPayload, retryForgives, rungsFor, settleRung, switchRungDecision, LADDER_TIMED_PARK_MS, PERSON_SLOT_BY, type Rung,
 } from './runner/ladder.ts';
-import type { AccountRequirement, McpDegradation, PhaseRecord as RunPhaseRecord, QueueOrder } from './runner/state.ts';
+import type { AccountRequirement, McpDegradation, PhaseRecord as RunPhaseRecord, QueueOrder, ResumeCost } from './runner/state.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import { ISOLATED, isolationMode } from '../shared/worktree-model.js';
 import { branchHolderOf, readHolds, readTrees } from './runner/tree-state.ts';
@@ -233,6 +239,7 @@ import {
   checkAvailable, ensureErrandTree, mountsFromRepos, REFUSAL_FIX, REFUSAL_REASON, type RunGitView,
 } from './runner/worktree.ts';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
+import { isLiveStatus } from '../shared/status-vocab.js';
 // FREE: the four shared owners the launch defaults are read through (phase
 // 15) — the words are free vocabulary; only the engines behind them are Pro.
 import { CONFLICT_POLICIES, landPolicyOf, type ConflictPolicy, type LandPolicy } from '../shared/landing-model.js';
@@ -321,6 +328,24 @@ export function triggersFile(root: string, slug: string): string {
   return join(runDir(root, slug), 'triggers.json');
 }
 
+/**
+ * How long a press on a park waits for the loop the park landed in to let go
+ * (`answerIdentity`): the rest of one tick and the loop's teardown — seconds,
+ * unless a landing's remote half is still pushing.
+ */
+const IDENTITY_SETTLE_MS = 30_000;
+
+/** Did the runner's loop stop driving within `ms`? A loop that threw has stopped too. */
+async function settlesWithin(runner: { wait(): Promise<void> }, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const clock = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), ms); });
+  try {
+    return await Promise.race([runner.wait().then(() => true, () => true), clock]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** A long poll's answer: the predicate held, or the clock ran out. */
 export type WaitAnswer =
   | { status: 200; body: { held: boolean; timedOut: boolean; for: string; waitedMs: number; run: SlimRun | null } }
@@ -340,6 +365,16 @@ export type ResumeAnswer =
     resumed: { runId: string; from: 'pausing' | ResumableStatus; act: 'pause-cancelled' | 'relaunched' };
   }
   | { ok: false; status: number; error: string };
+
+/**
+ * A Retry's answer (measured-console phase 13, #424): a press's answer — or,
+ * when the phase is LIVE, the addendum delivered to its running session as an
+ * operator message (`delivered: 'message'`), since a second attempt cannot
+ * board over a running one and a 200 that dropped the words was the defect.
+ */
+export type RetryAnswer =
+  | PressAnswer
+  | { ok: true; run: RunState; delivered: 'message'; message: { id: string; state: string; via: string; to: string } };
 
 /**
  * The settled statuses Resume starts again through the one door: a settled
@@ -687,6 +722,9 @@ export abstract class ServiceRuns extends ServiceLive {
     // discovered inside the runner, after a run existed and the console had
     // already reported success.
     this.assertNotClaimed(slug, options.onlyPhases);
+    // The plan's hookify rules (measured-console phase 28, D3): a rule a person
+    // can read, beside — never instead of — the run's own PreToolUse hook.
+    this.writePlanHookify(record);
 
     // `auto` resolves here, once, against the cached meters — the run then
     // carries a concrete id, so the journal and the header say which account
@@ -1056,14 +1094,11 @@ export abstract class ServiceRuns extends ServiceLive {
         present: plan.decisions.length > 0 || record.decisionsTwin.length > 0,
       }),
       planAccounts: () => plan.sessionBudget.accounts.map((a) => ({ id: a.id, minHeadroomPct: a.minHeadroom ?? 0 })),
-      planCredentials: () => ({
-        ids: union((p) => credentialsFor(plan, p)),
-        policy: plan.sessionBudget.credentialPolicy ?? null,
-      }),
-      planMcp: () => ({
-        ids: union((p) => mcpServersFor(plan, p)),
-        policy: plan.sessionBudget.mcpPolicy ?? null,
-      }),
+      // Who declared each id rides with the union (measured-console phase 13,
+      // #379): the door honours each phase's own credential and MCP policy, so
+      // an optional key on a `continue` phase never blocks the start.
+      planCredentials: () => doorPolicyFacts(plan, 'credentials'),
+      planMcp: () => doorPolicyFacts(plan, 'mcp'),
       accounts: {
         defaultId: DEFAULT_ACCOUNT_ID,
         has: (id) => this.accounts.has(id),
@@ -1458,6 +1493,7 @@ export abstract class ServiceRuns extends ServiceLive {
     return out.sort((a, b) => a.slug.localeCompare(b.slug));
   }
 
+
   /**
    * The plan's whole ruling ledger, oldest first.
    *
@@ -1738,7 +1774,7 @@ export abstract class ServiceRuns extends ServiceLive {
    * the next boarding reads it without a restart.
    */
   noteRun(
-    slug: string, input: { text: string; pinned?: boolean; phase?: number }, actor: Actor,
+    slug: string, input: { text: string; pinned?: boolean; phase?: number; decisionId?: string }, actor: Actor,
   ): { ok: true; note: RunNote; run: RunState } | { ok: false; status: number; error: string } {
     const text = input.text.trim().slice(0, RUN_NOTE_MAX);
     if (!text) return { ok: false, status: 400, error: 'a note needs some text' };
@@ -1753,10 +1789,12 @@ export abstract class ServiceRuns extends ServiceLive {
       // The door it came through (phase 131, #208): the supervisor's pass
       // writes `supervisor`, and its notes reach a session as its reading.
       door: pressDoorOf(actor),
+      // The supervisor's decision it records (measured-console phase 25): a session reads the id beside the note.
+      ...(input.decisionId ? { decisionId: input.decisionId } : {}),
     };
     const run = this.editStoredRun(slug, (state) => {
       state.notes = keepNotes([...(state.notes ?? []), note]);
-      journalOf(state)('run.note', { id: note.id, text, pinned: note.pinned, ...actor }, note.phase);
+      journalOf(state)('run.note', { id: note.id, text, pinned: note.pinned, ...(note.decisionId ? { decisionId: note.decisionId } : {}), ...actor }, note.phase);
     });
     if (!run) return { ok: false, status: 409, error: `No run of ${slug} to write a note on — a note belongs to a run.` };
     return { ok: true, note, run };
@@ -3557,8 +3595,20 @@ export abstract class ServiceRuns extends ServiceLive {
     slug: string, choice: 'continue' | 'move', actor: StartActor, accountId?: string,
   ): Promise<{ ok: boolean; status?: number; reason?: string; accountId?: string; run?: RunState }> {
     if (!this.root?.ok) return { ok: false, status: 400, reason: 'No source directory is open.' };
-    if (this.liveRunner(slug)?.current()) {
-      return { ok: false, status: 409, reason: `${slug} is still draining its lanes — answer once the run has stopped` };
+    // A park reads `halted` — and its card is on the page — the moment it is
+    // written, while the loop it landed in may still be unwinding: the tick the
+    // service's identity door parked it in (`identityChanged` halts a run with
+    // no lane live straight to `halted`, mid board-read), or the loop's own
+    // `finally`. A press in that window was refused as "still draining" over a
+    // run that drained nothing, and applied to no run. So a run that already
+    // reads stopped waits, bounded, for its loop to let go; one still draining a
+    // live lane (`halting`) is refused, as before — never a press over a loop.
+    const loop = this.liveRunner(slug);
+    const looping = loop?.current();
+    if (loop && looping) {
+      if (isLiveStatus(looping.status) || !(await settlesWithin(loop, IDENTITY_SETTLE_MS)) || this.liveRunner(slug)?.current()) {
+        return { ok: false, status: 409, reason: `${slug} is still draining its lanes — answer once the run has stopped` };
+      }
     }
     const state = latestRun(this.root.path, slug, this.liveRunIds());
     if (!state || state.halt?.kind !== 'identity-changed') {
@@ -4103,7 +4153,18 @@ export abstract class ServiceRuns extends ServiceLive {
     slug: string, phase: number,
     override: { addendum?: string; options?: PhaseOptions; by?: string } | undefined,
     actor: StartActor,
-  ): Promise<PressAnswer> {
+  ): Promise<RetryAnswer> {
+    // A LIVE phase is not retried (measured-console phase 13, #424): its
+    // addendum goes to the running session as a message, or the press refuses
+    // naming the session. It used to reset the running record, hint a re-board
+    // no loop would queue while the lane stood, answer 200 — and drop the words.
+    const live = await this.retryOnLiveLane(slug, phase, override, actor);
+    if (live) return live;
+    // A DONE phase is not retried either (measured-console phase 13, #425):
+    // the loop never boards a phase the board reads done, so the reset and the
+    // Continue changed nothing while the press answered 200.
+    const done = await this.retryOnDonePhase(slug, phase);
+    if (done) return done;
     let run: RunState | null;
     try {
       run = await this.retryPhase(slug, phase, override, actor);
@@ -4114,6 +4175,80 @@ export abstract class ServiceRuns extends ServiceLive {
       return { ok: false, status: 409, error: `No run of ${slug} to retry phase ${phase} in — start the plan instead.` };
     }
     return this.pressVerdict(slug, run, { runId: run.id, phase, session: null, brief: 'fresh' });
+  }
+
+  /**
+   * A Retry pressed on a phase whose session is running in this console's
+   * live run (measured-console phase 13, #424) — or null when it is not, and
+   * the ordinary Retry answers.
+   *
+   * Live means the runner holds the phase's lane AND its record reads
+   * `running`: a lane winding down from a park, or between sessions, is not a
+   * running session, and a Retry there is the ordinary re-board it always was.
+   *
+   * With an addendum, the words go where they can still matter — to the
+   * running session, through the console's message bus (`phase:<slug>/<N>`,
+   * `deliver: next-turn`), answered `{delivered: 'message'}`. Nothing of the
+   * record is reset and no re-board is hinted, so the supervisor's
+   * `hinted-not-queued` has nothing to find. Without one — or with per-phase
+   * settings, which a running session cannot take — the press refuses 409
+   * naming the session. A Free tree has no message bus: it refuses too, and
+   * points at steer.
+   */
+  private async retryOnLiveLane(
+    slug: string, phase: number,
+    override: { addendum?: string; options?: PhaseOptions; by?: string } | undefined,
+    actor: StartActor,
+  ): Promise<RetryAnswer | null> {
+    const runner = this.liveRunner(slug);
+    const state = runner?.current();
+    if (!runner || !state || runIsOver(state)) return null;
+    const record = state.phases?.[String(phase)];
+    if (!record || record.status !== 'running' || !runner.laneHeld(phase)) return null;
+    const sessionId = record.sessionId ?? null;
+    const who = `Phase ${phase} of ${slug} is live${sessionId ? ` (session ${sessionId})` : ''}`;
+    const addendum = override?.addendum?.trim();
+    const options = override?.options && Object.keys(override.options).length ? override.options : undefined;
+    const refuse = (error: string): RetryAnswer => ({ ok: false, status: 409, error, ...(sessionId ? { sessionId } : {}) });
+    if (options) {
+      return refuse(`${who} — its settings cannot change under a running session, and a retry cannot board a second `
+        + 'attempt over it. Send the words as a message, or stop the phase first and retry it then.');
+    }
+    if (!addendum) {
+      return refuse(`${who} — a retry cannot board a second attempt over a running one, and there is no addendum to `
+        + 'deliver to it. Send it a message, or stop the phase first and retry it then.');
+    }
+    let answer: RetryAnswer = refuse(`${who} — a retry cannot board a second attempt over a running one; steer the `
+      + 'session with the addendum instead, or stop the phase first and retry it then.');
+    return answer;
+  }
+
+  /**
+   * A Retry pressed on a phase the board reads done (measured-console phase
+   * 13, #425) — a refusal naming why, or null when the phase is not done.
+   * The loop never boards a done phase, so a Retry there reset a record and
+   * continued a run that boarded nothing, behind a 200. There is no verb that
+   * re-opens a done phase by hand (the runner's own re-open is for a final
+   * §Verification gone red), so the refusal names the ways that exist.
+   *
+   * Both readings must agree: a run record that is not `done` (parked, failed,
+   * re-opened by the runner) is retried as before — the loop's own reconcile
+   * may still have something to close — and a board that does not read it done
+   * boards it. With no board to read, the record alone answers.
+   */
+  private async retryOnDonePhase(slug: string, phase: number): Promise<RetryAnswer | null> {
+    const state = this.liveRunner(slug)?.current()
+      ?? (this.root ? latestRun(this.root.path, slug, this.liveRunIds()) : null);
+    const record = state?.phases?.[String(phase)];
+    if (record && (record.status !== 'done' || record.reopened)) return null;
+    const board = await this.board(slug).catch(() => null);
+    if (board ? !board.done.includes(phase) : !record) return null;
+    return {
+      ok: false, status: 409,
+      error: `Phase ${phase} of ${slug} is done — its handoff closes it on the board, so a retry would board nothing `
+        + 'and change nothing. There is no verb that re-opens a done phase: for follow-up work, add a phase to the plan, '
+        + 'or retry a phase that is not done with the work in its addendum.',
+    };
   }
 
   /**
@@ -4447,12 +4582,33 @@ export abstract class ServiceRuns extends ServiceLive {
    * `pressResume` — it launches, queues at the next boundary, or refuses
    * exactly as a Resume does. The permission wall does not move.
    */
-  async answerErrand(slug: string, phase: number, note: string, actor: StartActor): Promise<PressAnswer> {
+  async answerErrand(slug: string, phase: number, note: string, actor: StartActor, choice?: string): Promise<PressAnswer> {
     const root = this.root?.path;
     if (!root) return { ok: false, status: 409, error: 'No repository is open.' };
     const target = listRuns(root, slug, this.liveRunIds()).find((run) => run.phases[String(phase)]);
     const errand = target?.recoveries?.[String(phase)]?.errand;
     const words = note.trim().slice(0, 4_000);
+    // One of the options of the step the errand names (2026-10-20): the card
+    // drew that step's own options once the step itself stood no longer, so the
+    // answer is the step's — the phase boards again told which option, in the
+    // words an answer to the step itself would have told it.
+    if (choice) {
+      const named = errand?.stepId ? this.humanStepsNow().get(errand.stepId) : undefined;
+      const option = named?.options?.find((one) => one.id === choice);
+      if (!named || !option) {
+        return {
+          ok: false, status: 400,
+          error: named?.options?.length
+            ? `Choose one of its options: ${named.options.map((one) => `${one.id} (${one.label})`).join(', ')}.`
+            : `Phase ${phase} of ${slug} asked no question with options — answer it with a note.`,
+        };
+      }
+      if (this.humanStepsNow().open().some((one) => one.id === named.id)) {
+        return { ok: false, status: 409, error: 'This decision is still open on its own card — answer it there.' };
+      }
+      const answer = { option: option.id, label: option.label, ...(words ? { note: words } : {}), at: new Date().toISOString(), by: actor.by };
+      return this.resumeAnsweredErrand(slug, phase, words, actor, undefined, answeredInstruction(named, answer));
+    }
     // The errand IS an item (control-tower phase 132, #209): "Done — continue"
     // is *I've done this — check* on it, so the step ends proven — or says what
     // its proof still reads — and is never withdrawn later as dismissed.
@@ -5630,7 +5786,18 @@ export abstract class ServiceRuns extends ServiceLive {
     }
     if (this.hookBucket.tokens < 1) throw new HookRateError('too many session events — try again in a moment');
     this.hookBucket.tokens -= 1;
-    return this.sessions.ingest(payload);
+    const record = this.sessions.ingest(payload);
+    // A resumed session's own account of what its resume cost (measured-console
+    // phase 12, A10/B2): handed to the phase whose session it is.
+    if (payload.event === 'SessionStart' && (payload.source === 'resume' || payload.source === 'fork')) {
+      const cost = resumeCostOf((body as { resume_cost?: unknown } | null)?.resume_cost);
+      if (cost) {
+        for (const runner of this.runners.values()) {
+          try { if (runner.noteResumeCost(payload.session_id, cost)) break; } catch { /* presence never fails on bookkeeping */ }
+        }
+      }
+    }
+    return record;
   }
 
   /**
@@ -5855,6 +6022,63 @@ export abstract class ServiceRuns extends ServiceLive {
       (settingsPath) => hooksStatus({ skillDir: SKILL_DIR, settingsPath }),
     );
   }
+
+  /**
+   * Every hook the console knows (measured-console phase 28, D3), read-only:
+   * the console's plugin's (`hooks/hooks.json` of the tree its boot built,
+   * else this checkout's), the user's (`settings.json` of the console's config
+   * dir), the project's (`.claude/settings{,.local}.json` of its root) and a
+   * run's own (`buildSettings`, the file a supervised session is handed —
+   * every conditional hook marked with the runs that carry it). And, per
+   * plan, the hookify rules its `permission.destructive` row and the never
+   * list write (`hookify.ts`).
+   */
+  hooksInventory(): { hooks: HookRow[]; hookify: PlanHookify[] } {
+    const pluginFile = join(currentPluginDir() ?? SKILL_DIR, 'hooks', 'hooks.json');
+    const hooks: HookRow[] = [
+      ...hookRowsOfFile(pluginFile, 'plugin'),
+      ...hookRowsOfFile(join(claudeHome(), 'settings.json'), 'user'),
+      ...(this.root?.ok
+        ? [
+          ...hookRowsOfFile(join(this.root.path, '.claude', 'settings.json'), 'project'),
+          ...hookRowsOfFile(join(this.root.path, '.claude', 'settings.local.json'), 'project'),
+        ]
+        : []),
+      ...hookRowsOf(
+        buildSettings({
+          runId: 'example', token: 'run-token', origin: 'http://127.0.0.1:<port>',
+          guardHook: join(SKILL_DIR, 'scripts', 'guard-hook.sh'), relay: true, compactionHooks: true,
+        }),
+        'run',
+        'run-<id>.json',
+        (event, hook) => event === 'PermissionRequest' ? 'a run whose relay is armed'
+          : event === 'PreCompact' || event === 'PostCompact' ? 'a run that measures compaction'
+            : hook.type === 'command' ? 'a run with the guard hook' : undefined,
+      ).map((row) => ({ ...row, runs: row.runs.replace(/^http:\/\/127\.0\.0\.1:<port>/, '<console>') })),
+    ];
+    const hookify = this.root?.ok
+      ? (this.store?.list() ?? []).map((record) => readHookify(this.root!.path, record.slug, this.destructiveValue(record)))
+      : [];
+    return { hooks, hookify };
+  }
+
+  /** A plan's answered `permission.destructive` value — the plan-wide row — or null for the shipped deny. */
+  protected destructiveValue(record: PlanRecord): string | null {
+    const row = (record.plan?.decisions ?? []).find((r) => r.key === 'permission.destructive' && r.state === 'answered');
+    return row?.value ?? null;
+  }
+
+  /** Write a plan's hookify rules into the root's `.claude/` — at a run's start; never red. */
+  protected writePlanHookify(record: PlanRecord): void {
+    if (!this.root?.ok) return;
+    try {
+      const out = writeHookify(this.root.path, record.slug, this.destructiveValue(record));
+      if (out.written.length || out.removed.length) log.info('hookify.written', { slug: record.slug, written: out.written, removed: out.removed });
+    } catch (error) {
+      log.warn('hookify.write', { slug: record.slug, error });
+    }
+  }
+
 
   /** Write the four entries (behind `--allow-writes` — the file is outside the console's own state). */
   installSessionHook(): HooksWrite {
@@ -7389,6 +7613,8 @@ export abstract class ServiceRuns extends ServiceLive {
     switch (rung.vehicle) {
       case 'reboard-fresh':
       case 'queue':
+      // The phase's record names the SDK's failure, so the door it boards through is the subprocess (phase 21).
+      case 'reboard-subprocess':
         return drive({ kind: 'retry' });
       // The permission wall's one rung (phase 9): drivable only from the
       // console's OWN denial — a deny-list rule on the record. A denial with
@@ -7738,4 +7964,22 @@ export abstract class ServiceRuns extends ServiceLive {
    * takes the operator's button away either.
    */
 
+}
+
+/**
+ * The four fields a resumed session's `SessionStart` carries (CLI 2.1.251+),
+ * as the presence hook forwards them under `resume_cost` — or null when none
+ * is a value of its kind (measured-console phase 12).
+ */
+export function resumeCostOf(raw: unknown): ResumeCost | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
+  const out: ResumeCost = {
+    ...(num(r.seconds_since_last_response) !== undefined ? { secondsSinceLastResponse: Math.round(num(r.seconds_since_last_response)!) } : {}),
+    ...(num(r.context_tokens) !== undefined ? { contextTokens: Math.round(num(r.context_tokens)!) } : {}),
+    ...(typeof r.prompt_cache_likely_expired === 'boolean' ? { cacheLikelyExpired: r.prompt_cache_likely_expired } : {}),
+    ...(num(r.estimated_cache_write_usd) !== undefined ? { estimatedCacheWriteUsd: num(r.estimated_cache_write_usd) } : {}),
+  };
+  return Object.keys(out).length ? out : null;
 }

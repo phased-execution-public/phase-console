@@ -79,6 +79,18 @@ export const ACCOUNT_COOLDOWN_MS = 30 * 60_000;
 export const SUSPECT_CLEAR_MS = ACCOUNT_COOLDOWN_MS;
 
 /**
+ * A dead token's quarantine (measured-console phase 24): the credential-class
+ * refusals that put a credential in quarantine, inside this window. One refusal
+ * retires it, and a green read later than that moves it to `suspect` and then
+ * `entitled` (#57) — a usage poll answers for a token the API refuses work to,
+ * so a dead token went round retire → suspect → entitled → refused, a session
+ * spent on each turn. The second refusal in a day ends the round: a quarantined
+ * credential stays retired until a person clears it.
+ */
+export const QUARANTINE_STRIKES = 2;
+export const QUARANTINE_WINDOW_MS = 24 * 60 * 60_000;
+
+/**
  * The walls that hold a whole ACCOUNT out, rather than one model: the shared
  * windows, and the nameless one a live wall files when the CLI named no
  * window (`scheduler.ts` `LEARNED_WALL_BUCKET`).
@@ -192,6 +204,10 @@ export type LearnedCredential = {
    * "and nothing worked in between" is half of what corroboration means.
    */
   certificateStrikes?: { at: string; session: string }[];
+  /** The credential-class refusals of the last `QUARANTINE_WINDOW_MS`, ISO, oldest first (phase 24). */
+  credentialStrikes?: string[];
+  /** Set at the `QUARANTINE_STRIKES`th refusal in a day; only a person's clearance ends it (phase 24). */
+  quarantine?: { at: string; strikes: number; reason: string };
   /** Set when the last registration naming this credential was removed. */
   tombstone?: { name: string; retiredAt: string };
   /** The newest one-turn check of whether the credential may run work, and how many there have been. */
@@ -258,10 +274,6 @@ export function hashedOrgId(orgId: string | undefined): string | undefined {
   return orgId ? createHash('sha256').update(orgId).digest('hex').slice(0, 8) : undefined;
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 function empty(): LearnedFile {
   return { version: LEARNED_VERSION, credentials: {}, orgs: {} };
 }
@@ -325,11 +337,22 @@ function narrowCredential(fingerprint: string, raw: unknown): LearnedCredential 
       ? { tombstone: { name: tomb.name, retiredAt: tomb.retiredAt } }
       : {}),
     ...(narrowStrikes(c.certificateStrikes) ?? {}),
+    ...(Array.isArray(c.credentialStrikes)
+      ? { credentialStrikes: c.credentialStrikes.filter((v): v is string => typeof v === 'string').slice(-QUARANTINE_STRIKES) }
+      : {}),
+    ...(narrowQuarantine(c.quarantine) ?? {}),
     ...(narrowProbe(c.probe) ?? {}),
     // Whose login the row learned under (control-tower phase 91) — kept, or a
     // re-login would never be seen past the next read of the file.
     ...(typeof c.identity === 'string' && /^[0-9a-f]{8,64}$/.test(c.identity) ? { identity: c.identity } : {}),
   };
+}
+
+/** A quarantine read from disk, or nothing. */
+function narrowQuarantine(raw: unknown): { quarantine: NonNullable<LearnedCredential['quarantine']> } | null {
+  const q = raw as Record<string, unknown> | undefined;
+  if (!q || typeof q.at !== 'string' || typeof q.reason !== 'string') return null;
+  return { quarantine: { at: q.at, strikes: typeof q.strikes === 'number' ? q.strikes : QUARANTINE_STRIKES, reason: q.reason } };
 }
 
 /** The corroboration ledger, or nothing when the row carries none worth reading. */
@@ -477,36 +500,43 @@ export class LearnedAccounts {
   /**
    * Run `mutate` with the file held and write back what it returns. `null`
    * means nothing to write. The lock is the registry's: `O_EXCL` wins for one
-   * process; a stale lock is reclaimed; a live holder is waited for, briefly,
-   * then written past — losing a wall to a race is a smaller failure than a
-   * console that cannot record one.
+   * process; a stale lock is reclaimed. A live holder is never waited for on
+   * the event loop and never written past (EI-23): the answer is `null`, and
+   * the same mutation is asked again off this call, every `LOCK_POLL_MS` for
+   * `LOCK_WAIT_MS`, then dropped with a warning.
    */
-  private withLock<T>(mutate: (data: LearnedFile) => T | null): T | null {
+  private withLock<T>(mutate: (data: LearnedFile) => T | null, deadline = Date.now() + LOCK_WAIT_MS): T | null {
+    const tried = this.tryLock(mutate);
+    if (tried.won) return tried.value;
+    if (Date.now() < deadline) setTimeout(() => { this.withLock(mutate, deadline); }, LOCK_POLL_MS).unref();
+    else log.warn('accounts.learned-lock-busy', { file: this.file });
+    return null;
+  }
+
+  /** One try at the lock: `won: false` when a live holder has it — the caller's refusal to handle. */
+  private tryLock<T>(mutate: (data: LearnedFile) => T | null): { won: false } | { won: true; value: T | null } {
     const lock = `${this.file}.lock`;
     let held = false;
     try {
       mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
-      for (let waited = 0; !held; waited += LOCK_POLL_MS) {
+      for (let attempt = 0; attempt < 2 && !held; attempt++) {
         try {
           closeSync(openSync(lock, 'wx', 0o600));
           held = true;
         } catch {
           let age = 0;
           try { age = Date.now() - statSync(lock).mtimeMs; } catch { age = LOCK_STALE_MS + 1; }
-          if (age > LOCK_STALE_MS) {
-            try { rmSync(lock, { force: true }); } catch { /* raced */ }
-            continue;
-          }
-          if (waited >= LOCK_WAIT_MS) break;
-          sleepSync(LOCK_POLL_MS);
+          if (age <= LOCK_STALE_MS) break;
+          try { rmSync(lock, { force: true }); } catch { /* raced */ }
         }
       }
+      if (!held) return { won: false };
       this.cached = null;
       const data = this.read();
       const out = mutate(data);
-      if (out === null) return null;
+      if (out === null) return { won: true, value: null };
       this.persist(data);
-      return out;
+      return { won: true, value: out };
     } finally {
       if (held) {
         try { rmSync(lock, { force: true }); } catch { /* released by expiry */ }
@@ -702,7 +732,8 @@ export class LearnedAccounts {
    */
   private demote(data: LearnedFile, row: LearnedCredential, c: { at: string; by: LeaveBy; reason: string }): boolean {
     let moved = false;
-    if (contradicts(row.entitlement, c.at)) {
+    // A quarantined credential's retirement is not argued with by a read (phase 24): only a person ends it.
+    if (!row.quarantine && contradicts(row.entitlement, c.at)) {
       row.entitlement = suspectOf(row.entitlement, c);
       log.info('accounts.retired.suspect', { fingerprint: row.fingerprint, by: c.by, class: row.entitlement.class ?? null, at: c.at });
       moved = true;
@@ -756,6 +787,34 @@ export class LearnedAccounts {
    * times against one blip; ten minutes because a blip is shorter than the
    * thing worth stopping for.
    */
+  /**
+   * A credential-class refusal (not a certificate) against this credential
+   * (measured-console phase 24). Answers the quarantine when this refusal is the
+   * `QUARANTINE_STRIKES`th inside `QUARANTINE_WINDOW_MS` — set now, or already
+   * standing — else null.
+   */
+  noteCredentialStrike(fingerprint: string, at: string, reason: string, label?: string): LearnedCredential['quarantine'] | null {
+    const written = this.withLock((data) => {
+      const row = this.row(data, fingerprint, label);
+      const kept = (row.credentialStrikes ?? []).filter((s) => Date.parse(at) - Date.parse(s) < QUARANTINE_WINDOW_MS);
+      kept.push(at);
+      row.credentialStrikes = kept.slice(-QUARANTINE_STRIKES);
+      if (!row.quarantine && kept.length >= QUARANTINE_STRIKES) {
+        row.quarantine = { at, strikes: kept.length, reason: reason.slice(0, 200) };
+        log.info('accounts.quarantined', { fingerprint, strikes: kept.length, at });
+      }
+      // Never null from here: null means "nothing to write", and the strike must be.
+      return { quarantine: row.quarantine ? { ...row.quarantine } : null };
+    });
+    return written?.quarantine ?? null;
+  }
+
+  /** The credential's quarantine, or undefined (measured-console phase 24). */
+  quarantineOf(fingerprint: string): LearnedCredential['quarantine'] | undefined {
+    const row = this.credential(fingerprint);
+    return row?.quarantine ? { ...row.quarantine } : undefined;
+  }
+
   noteCertificateStrike(
     fingerprint: string, strike: { at: string; session: string; reason: string }, label?: string,
   ): CertificateVerdict {
@@ -901,6 +960,8 @@ export class LearnedAccounts {
         return null;
       }
       row.entitlement = { ...next, at: next.at ?? new Date(this.now()).toISOString() };
+      // A clearance ends a quarantine and its strikes (phase 24): the person has looked at the token.
+      if (next.state === 'unknown') { delete row.quarantine; delete row.credentialStrikes; }
       if (next.state === 'retired' && orgId && opts.orgScoped) {
         data.orgs[orgId] = { entitlement: { ...row.entitlement } };
       }

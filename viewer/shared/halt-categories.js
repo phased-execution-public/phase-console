@@ -114,6 +114,7 @@ export const SITUATION_CATEGORY = Object.freeze({
   'verify-red': 'verification',
   'done-unrecorded': 'verification',
   'work-in-progress': 'verification',
+  'spawn-sdk-failed': 'environment',
   'never-started': 'environment',
   unknown: 'environment',
 });

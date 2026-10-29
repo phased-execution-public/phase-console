@@ -34,7 +34,7 @@ import { useId, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { GRANT_SCOPE_WORDS, type GrantScope, type RiskTier, type Wall } from '@shared/turn-model.js';
 import { CodeBlock } from '@/ui/code-block';
-import { stamp } from '@/cards/human-step-card';
+import { stamp } from '@/cards/turn/step-words';
 import type { InboxAction, InboxItem } from '@/data/api';
 import type { PermissionRecord } from '@/data/human-steps';
 import { keys } from '@/data/keys';
@@ -50,8 +50,9 @@ import { GRANTS_QUERY_KEY } from '@/data/permissions';
 import { PressRefusal, press, replayWords } from '@/data/press';
 import { ApiError } from '@/data/http';
 import type { TurnItem } from '@/data/turn';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
+import { PINNED_BAR } from '@/cards/turn/act';
 import { scrollIntoScroller } from '@/lib/scroll';
 import { Button, Input, toast } from '@/ui';
 import { RadioGroup, RadioItem } from '@/ui/radio-group';
@@ -307,6 +308,8 @@ export interface PermissionCardProps {
   live?: boolean;
   /** A grant went through, or was asked of the owner: the page holds the item until the `turn` event (#270). */
   onSettled?: ((words: string) => void) | undefined;
+  /** The card is the panel's: its moves are pinned to the foot of the scroller, as every type's are. */
+  pinned?: boolean;
 }
 
 export function PermissionCard({
@@ -317,6 +320,7 @@ export function PermissionCard({
   busy,
   live = true,
   onSettled,
+  pinned = false,
 }: PermissionCardProps) {
   const client = useQueryClient();
   const headingId = useId();
@@ -467,7 +471,7 @@ export function PermissionCard({
               data-testid="grant-scopes"
               value={scope}
               onValueChange={(next) => setChosen(next as GrantScope)}
-              className="sm:grid-cols-[repeat(auto-fit,minmax(11rem,1fr))]"
+              className="@md/card:grid-cols-[repeat(auto-fit,minmax(11rem,1fr))]"
             >
               {scopes.map((one) => (
                 <div
@@ -583,7 +587,11 @@ export function PermissionCard({
               />
             </label>
           )}
-          <div className="flex flex-wrap items-center gap-1.5" data-testid="turn-moves" data-print="hide">
+          <div
+            className={cn('flex flex-wrap items-center gap-1.5', pinned && PINNED_BAR)}
+            data-testid="turn-moves"
+            data-print="hide"
+          >
             <span data-testid="grant-risk">
               <OpsStatus vocab="risk" word={tier} />
             </span>

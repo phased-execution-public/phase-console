@@ -16,7 +16,7 @@ setup() {
   unset PE_SESSION_ID PE_OWNER PE_SCOPE PE_SESSION_KIND PHASE_CONSOLE_URL PHASE_CONSOLE_HOOK_OFF PHASE_CONSOLE_PROBE CLAUDE_CODE_SESSION_ID
   # The process and the login the running session reports are ITS facts; a
   # case about either sets its own.
-  unset CLAUDE_PID CLAUDE_CONFIG_DIR
+  unset CLAUDE_PID CLAUDE_CONFIG_DIR CLAUDE_PLUGIN_ROOT PE_PLUGIN_HOOKS
   # …and the rest of what a console exports into every session it spawns —
   # including the one running THIS suite under an autopilot. The hook honours
   # `$DOCS_ROOT` by design (a lane worktree's cwd is the wrong root), so with
@@ -24,6 +24,8 @@ setup() {
   # operator's hub instead of `$PROJ` and went red in exactly the run whose
   # verdict the supervisor reads (console-parallel-repaint P1, W13).
   unset DOCS_ROOT PE_WORKTREE PE_BRANCH PE_OUTCOME_FILE PE_TASKS_FILE PE_RULINGS_FILE
+  # The brief's inputs (measured-console phase 4): a case about it sets its own.
+  unset PE_SLUG PE_PHASE PE_BRIEF PE_BRIEF_MAX PE_LOCK_MIRROR
   # A project directory for the session to be standing in.
   export PROJ="$BATS_TEST_TMPDIR/proj"
   mkdir -p "$PROJ/docs/plans"
@@ -605,4 +607,155 @@ STUB
   [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]
   assert_contains "$output" '"systemMessage":"Phase Console: this session is holding alpha P2'
   assert_contains "$output" '"hookSpecificOutput":{"hookEventName":"SessionStart"'
+}
+
+# --- the brief (measured-console phase 4) ---------------------------------------
+# A supervised session (PE_OUTCOME_FILE set) is told what it starts from at
+# SessionStart: the engine's `--brief N`, stable content first, the presence
+# line and the session id LAST, the whole context at most 10,000 characters.
+
+brief_fixture() {
+  cp "$PE_DIR/tests/fixtures/plans/linear.md" "$PROJ/docs/plans/demo.md"
+  mkdir -p "$PROJ/docs/handoffs/demo" "$BATS_TEST_TMPDIR/runs/inst/demo"
+  cat > "$PROJ/docs/handoffs/demo/phase-01-alpha.md" <<'EOF'
+---
+plan: docs/plans/demo.md
+phase: 1
+title: alpha
+status: complete
+---
+# Phase 1 → next handoff: alpha
+
+## Summary
+Alpha built the package; beta starts from its dist folder.
+
+## What this phase did
+Shipped what the phase set out to.
+EOF
+  export BRIEF_OUTCOME="$BATS_TEST_TMPDIR/runs/inst/demo/run-r1-p2-outcome.json"
+}
+
+# The additionalContext, decoded (perl's core JSON::PP: node is stubbed here).
+context_of() {
+  printf '%s' "$1" | perl -MJSON::PP -0777 -ne 'binmode STDOUT, ":utf8"; print JSON::PP->new->utf8->decode($_)->{hookSpecificOutput}{additionalContext}'
+}
+
+@test "hook brief: under PE_OUTCOME_FILE the session is told the brief — mode file first, the id last, in order" {
+  brief_fixture
+  DOCS_ROOT="$PROJ" PE_OUTCOME_FILE="$BRIEF_OUTCOME" run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  ctx="$(context_of "$output")"
+  first="$(printf '%s\n' "$ctx" | head -1)"
+  last="$(printf '%s\n' "$ctx" | tail -1)"
+  assert_contains "$first" 'references/mode-phase-start.md'
+  assert_contains "$last" "this Claude session's id is s1"
+  [ "$(printf '%s' "$ctx" | wc -c)" -le 10000 ]
+  # the order: the section, the decisions, the scope and lock, the previous handoff's summary
+  sec="$(printf '%s\n' "$ctx" | grep -n '^### Phase 2' | head -1 | cut -d: -f1)"
+  dec="$(printf '%s\n' "$ctx" | grep -n '^## Decisions still open' | head -1 | cut -d: -f1)"
+  scope="$(printf '%s\n' "$ctx" | grep -n '^## Scope and lock' | head -1 | cut -d: -f1)"
+  hand="$(printf '%s\n' "$ctx" | grep -n '^## Phase 1 handed you' | head -1 | cut -d: -f1)"
+  [ -n "$sec" ] && [ -n "$dec" ] && [ -n "$scope" ] && [ -n "$hand" ]
+  [ "$sec" -lt "$dec" ] && [ "$dec" -lt "$scope" ] && [ "$scope" -lt "$hand" ]
+  assert_contains "$ctx" 'Alpha built the package; beta starts from its dist folder.'
+  # the brief is the engine's, byte for byte: everything before the presence line
+  brief="$(printf '%s\n' "$ctx" | sed '$d')"
+  [ "$brief" = "$(DOCS_ROOT="$PROJ" "$SYS_BASH" "$PE_SCRIPTS/phase-graph.sh" demo --brief 2)" ]
+}
+
+@test "hook brief: the cut keeps the whole context within 10,000 characters and the id on the last line" {
+  brief_fixture
+  mkdir -p "$PROJ/docs/memory/demo"
+  line="$(printf 'm%.0s' $(seq 1 400))"
+  for i in $(seq 1 40); do printf -- '- %s %s\n' "$i" "$line"; done > "$PROJ/docs/memory/demo/index.md"
+  DOCS_ROOT="$PROJ" PE_OUTCOME_FILE="$BRIEF_OUTCOME" run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  ctx="$(context_of "$output")"
+  [ "$(printf '%s' "$ctx" | wc -c)" -le 10000 ]
+  assert_contains "$ctx" 'the brief stops here'
+  assert_contains "$ctx" '## Memory (docs/memory/demo/index.md'
+  assert_contains "$(printf '%s\n' "$ctx" | tail -1)" "this Claude session's id is s1"
+}
+
+@test "hook brief: without PE_OUTCOME_FILE, and on a resume, the session is told its presence alone" {
+  brief_fixture
+  DOCS_ROOT="$PROJ" run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  ctx="$(context_of "$output")"
+  refute_contains "$ctx" 'mode-phase-start'
+  assert_contains "$ctx" "this Claude session's id is s1"
+  [ "$(printf '%s\n' "$ctx" | wc -l | tr -d ' ')" = 1 ]
+  DOCS_ROOT="$PROJ" PE_OUTCOME_FILE="$BRIEF_OUTCOME" run bash -c "printf '%s' '$(payload SessionStart ',"source":"resume"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  refute_contains "$(context_of "$output")" 'mode-phase-start'
+}
+
+# Stop's two refusals (measured-console phase 9). A supervised session's exit is refused — at most
+# twice — by the RUN's own HTTP Stop hook (`/hooks/stop`, `Service.decideStop`), never by this
+# presence hook: whatever the console answers here, a Stop prints no `decision` and exits 0, and the
+# event still reaches the console or, unanswered, the inbox.
+@test "hook: a Stop the console answers with a block refuses nothing here — the refusal is the run's HTTP hook's" {
+  export PE_OUTCOME_FILE="$BATS_TEST_TMPDIR/outcome.json"
+  export CURL_STUB_BODY='{"decision":"block","reason":"Phase 2 is not done on the board and no outcome is declared — finish the closeout, or declare the wait."}'
+  run bash -c "printf '%s' '$(payload Stop)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  refute_contains "$output" '"decision"'
+  [ -z "$output" ]
+  assert_contains "$(cat "$STUB/curl.body")" '"event":"Stop"'
+}
+
+@test "hook: the second refusal — a Stop with stop_hook_active, answered with a block again — still exits 0 and says nothing" {
+  export PE_OUTCOME_FILE="$BATS_TEST_TMPDIR/outcome.json"
+  export CURL_STUB_BODY='{"decision":"block","reason":"again"}'
+  run bash -c "printf '%s' '$(payload Stop ',"stop_hook_active":true')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "hook: a Stop no console answers lands in the inbox, exits 0 and prints nothing" {
+  export CURL_STUB_EXIT=7
+  run bash -c "printf '%s' '$(payload Stop)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  f="$(inbox_files "$BATS_TEST_TMPDIR/sd/sessions/inbox")"
+  [ -n "$f" ]
+  case "$(basename "$f")" in *-s1-Stop.json) : ;; *) echo "bad name: $f"; false ;; esac
+  assert_contains "$(cat "$f")" '"event":"Stop"'
+}
+
+@test "hook (measured-console phase 10): the plugin's copy steps aside while the user's settings still carry the spliced entry" {
+  plugin_root="$(cd "$PE_SCRIPTS/.." && pwd)"
+  export CLAUDE_CONFIG_DIR="$BATS_TEST_TMPDIR/cfg"
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /x/scripts/session-hook.sh"}]}]}}\n' > "$CLAUDE_CONFIG_DIR/settings.json"
+  CLAUDE_PLUGIN_ROOT="$plugin_root" run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -f "$STUB/curl.log" ]
+  # The console's word that the plugin's hooks are the only ones loaded: it answers.
+  CLAUDE_PLUGIN_ROOT="$plugin_root" PE_PLUGIN_HOOKS=1 run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  grep -q "/hooks/session" "$STUB/curl.log"
+  assert_contains "$output" '--session s1'
+  # No spliced entry left: the plugin's copy is the presence hook.
+  rm -f "$STUB/curl.log"
+  printf '{}\n' > "$CLAUDE_CONFIG_DIR/settings.json"
+  CLAUDE_PLUGIN_ROOT="$plugin_root" run bash -c "printf '%s' '$(payload Stop)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  grep -q "/hooks/session" "$STUB/curl.log"
+}
+
+@test "hook (measured-console phase 12): a resumed SessionStart carries the CLI's resume cost as resume_cost, in JSON node can read" {
+  CURL_STUB_EXIT=7 run bash -c "printf '%s' '$(payload SessionStart ',"source":"resume","seconds_since_last_response": 5400,"context_tokens":182340,"prompt_cache_likely_expired":true,"estimated_cache_write_usd":1.1396')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  f="$(inbox_files "$BATS_TEST_TMPDIR/sd/sessions/inbox")"
+  [ -n "$f" ]
+  assert_contains "$(cat "$f")" '"resume_cost":{"seconds_since_last_response":5400,"context_tokens":182340,"prompt_cache_likely_expired":true,"estimated_cache_write_usd":1.1396}'
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$f"
+  # A start with none of the four carries no key at all.
+  rm -f "$f"
+  CURL_STUB_EXIT=7 run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  f="$(inbox_files "$BATS_TEST_TMPDIR/sd/sessions/inbox")"
+  [[ "$(cat "$f")" != *resume_cost* ]]
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$f"
 }

@@ -32,7 +32,7 @@ import { OPERATOR_ISSUE_SCOPE } from '@shared/issue-modes.js';
 import { api, flagReason, splitActions, type InboxAction, type InboxItem } from '@/data/api';
 import { keys } from '@/data/keys';
 import { press, type Pressed } from '@/data/press';
-import { useWindowLeft } from '@/lib/clock';
+import { useWindowLeft } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { navigate, sessionsHref, toHash } from '@/shell/routes';
 import { Button, RelativeTime, toast } from '@/ui';
@@ -41,7 +41,7 @@ import { Disclosure } from '@/ui/disclosure';
 import { MicField } from '@/ui/mic-field';
 // By its own path, never the family's index: it reads no status table.
 import { SeverityMark } from '@/ui/status/severity';
-import { LazyHumanStepCard } from './human-step-lazy';
+import { LazyStepCard } from './lazy-step-card';
 import { nextStepOf, setNextStep } from './next-step';
 import { NextStepNote } from './next-step-note';
 import { TurnRowWords } from './turn/row-words';
@@ -74,9 +74,11 @@ const failed = (cause: unknown) =>
 export function useInboxActions(): {
   /**
    * `says` is the operator's own words, and it only goes anywhere when the
-   * ACTION declared a field for them (`InboxAction.says`).
+   * ACTION declared a field for them (`InboxAction.says`). Resolves `true`
+   * once the server did it — never for a press asked of the owner, a refusal
+   * or a flagged action — so a card can hold itself as sent.
    */
-  perform: (item: InboxItem, action: InboxAction, says?: string) => void;
+  perform: (item: InboxItem, action: InboxAction, says?: string) => Promise<boolean>;
   ack: (item: InboxItem) => void;
   /**
    * Acknowledge a whole selection, with an undo. Only what this press changed
@@ -104,15 +106,15 @@ export function useInboxActions(): {
   }, [client]);
 
   const perform = useCallback(
-    (item: InboxItem, action: InboxAction, says?: string) => {
-      if (action.flag) return;
+    (item: InboxItem, action: InboxAction, says?: string): Promise<boolean> => {
+      if (action.flag) return Promise.resolve(false);
       setBusy(`${item.id}:${action.verb}`);
-      press(() => api.inboxAct(action, says) as Promise<{ outcome?: string; detail?: string } | null>)
+      return press(() => api.inboxAct(action, says) as Promise<{ outcome?: string; detail?: string } | null>)
         .then((pressed: Pressed<{ outcome?: string; detail?: string } | null>) => {
           if (pressed.state === 'asked') {
             // A 2xx that did nothing yet: the owner confirms it on Your turn.
             toast(`${action.label} — asked of the owner.`, 'info', 8000);
-            return;
+            return false;
           }
           // The RESULT decides the word, not the status code. `/recover`
           // answers 200 for every outcome it has — including `errand` ("a
@@ -128,15 +130,20 @@ export function useInboxActions(): {
           if (next) {
             toast(next.words, stalled ? 'warn' : 'info', 8000);
             if (next.href) navigate(next.href);
-            return;
+            // A next step is more for the person to do, not a press the item is settled by.
+            return false;
           }
           toast(
             result?.detail ?? `${action.label} — done.`,
             stalled ? 'warn' : 'ok',
             stalled ? 8000 : undefined,
           );
+          return !stalled;
         })
-        .catch((cause: unknown) => toast(failed(cause), 'error'))
+        .catch((cause: unknown) => {
+          toast(failed(cause), 'error');
+          return false;
+        })
         .finally(() => {
           setBusy(undefined);
           reread();
@@ -351,7 +358,7 @@ export function InboxRow({
           {/* The card's words first (turn-by-turn phase 10): NOW or NOT YET, and the type. */}
           <TurnRowWords turn={item.turn} />
           {step ? (
-            <LazyHumanStepCard
+            <LazyStepCard
               item={item}
               variant="row"
               perform={perform}
@@ -418,6 +425,7 @@ export function InboxRow({
         <Disclosure
           label={item.tried?.length ? `How, and what was tried (${item.tried.length})` : 'How'}
           openLabel="Hide how"
+          variant="inline"
           bodyClassName="mt-1 flex max-w-prose flex-col gap-1.5 text-meta"
         >
           <p className="text-ink-muted">{item.how}</p>

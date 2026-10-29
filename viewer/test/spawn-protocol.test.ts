@@ -26,11 +26,16 @@ import { join } from 'node:path';
 
 process.env.PHASE_CONSOLE_LOG = '';
 
-const { spawnClaude, markFor } = await import('../server/runner/spawn.ts');
+const { spawnClaude, markFor, buildArgv, sideAgents } = await import('../server/runner/spawn.ts');
+const {
+  OTEL_LOGS_EXPORT_INTERVAL_MS, OTEL_METRIC_EXPORT_INTERVAL_MS, WATCHDOG_MAX_WAIT_MS, WATCHDOG_USAGE_RECHECK_MS,
+} = await import('../server/runner/errors.ts');
+const { DEFAULT_BASH_MAX_OUTPUT } = await import('../shared/run-settings.js');
 const { SPAWN_DEFAULT_CAPS, permissionPromptsFor, relayArmingFor } = await import('../server/runner/session-record.ts');
 const { PERMISSION_PROMPTS_CLI_FLOOR, RELAY_CLI_FLOOR } = await import('../shared/run-settings.js');
 const { RELAY_HOST_TOOL } = await import('../server/relay-host.ts');
 const { INT_GRACE_MS } = await import('../server/runner/signals.ts');
+const { sessionSchemaArg } = await import('../shared/outcome-schema.js');
 import type { SpawnHandle, StreamEvent } from '../server/runner/spawn.ts';
 // The REAL framing, not a copy of it. This file used to build its operator
 // messages by hand, and the hand-copy had already drifted from `frameQuestion`
@@ -61,6 +66,16 @@ if (process.env.PC_STUB_ENV) {
     // phase 4, SES-12 and DOC-2).
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ?? null,
     CLAUDE_CODE_MAX_RETRIES: process.env.CLAUDE_CODE_MAX_RETRIES ?? null,
+    // …and the session's environment (measured-console phase 6, A4 A5 E4).
+    BASH_MAX_OUTPUT_LENGTH: process.env.BASH_MAX_OUTPUT_LENGTH ?? null,
+    CLAUDE_CODE_FORK_SUBAGENT: process.env.CLAUDE_CODE_FORK_SUBAGENT ?? null,
+    CLAUDE_CODE_SUBAGENT_MODEL: process.env.CLAUDE_CODE_SUBAGENT_MODEL ?? null,
+    CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS: process.env.CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS ?? null,
+    CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS: process.env.CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS ?? null,
+    DISABLE_TELEMETRY: process.env.DISABLE_TELEMETRY ?? null,
+    // …and its telemetry block (measured-console phase 19): every OTEL_ variable it was handed.
+    otel: Object.fromEntries(Object.entries(process.env)
+      .filter(([k]) => k.startsWith('OTEL_') || k === 'CLAUDE_CODE_ENABLE_TELEMETRY' || k.startsWith('PE_OTEL_'))),
   }));
 }
 
@@ -128,6 +143,23 @@ if (hang) {
   if (process.env.PC_STUB_IGNORE_SIGINT === '1') process.on('SIGINT', () => {});
   process.stdin.resume(); setInterval(() => {}, 1000); return;
 }
+// What loaded, a hook, a Skill call (measured-console phase 11): the frames a
+// console-set session opens with — the shape CLI 2.1.310 printed on 2026-10-25.
+if (process.env.PC_STUB_LOADS === '1') {
+  say({ type: 'system', subtype: 'hook_response', hook_name: 'SessionStart:startup', hook_event: 'SessionStart', outcome: 'success', session_id: sid });
+  say({ type: 'system', subtype: 'init', session_id: sid, model: 'stub-1', tools: ['Skill', 'Bash'],
+        skills: ['phased-execution:phased-execution', 'superpowers:test-driven-development'],
+        slash_commands: ['phased-execution:phased-execution', 'superpowers:test-driven-development', 'clear'],
+        plugins: [
+          { name: 'phased-execution', path: '/state/plugin/abc', source: 'phased-execution@inline', version: 'abc123' },
+          { name: 'superpowers', path: '/state/seed/x/plugins/cache/s', source: 'superpowers@phased-execution-seed' },
+        ] });
+  say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_l1', role: 'assistant', content: [
+    { type: 'tool_use', id: 'toolu_skill', name: 'Skill', input: { skill: 'superpowers:test-driven-development', args: 'secret-ish words' } }] } });
+  say({ type: 'system', subtype: 'hook_response', hook_name: 'PreToolUse:Skill', hook_event: 'PreToolUse', outcome: 'success', session_id: sid });
+  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, total_cost_usd: 0, result: 'ok', session_id: sid }) + '\\n', () => process.exit(0));
+  return;
+}
 // Initialised, said one line on stderr, then wedged before its first result —
 // the stretch the first-event backstop cannot see (SES-10).
 if (process.env.PC_STUB_INIT_STDERR === '1') {
@@ -170,6 +202,16 @@ say({
 // The CLI asking its host over the stream (TRS-2), and a turn ended on \`defer\` (S3).
 if (process.env.PC_STUB_CONTROL_REQUEST === '1') {
   say({ type: 'control_request', request_id: 'req_1', request: { subtype: 'can_use_tool', tool_name: 'AskUserQuestion' } });
+}
+// A \`--json-schema\` session's result (measured-console phase 12, B4): the
+// outcome rides \`structured_output\`, and only when the flag was passed.
+if (process.env.PC_STUB_STRUCTURED) {
+  const schema = argv.includes('--json-schema');
+  say({ type: 'result', subtype: 'success', stop_reason: 'tool_use', terminal_reason: 'completed', is_error: false,
+    num_turns: 2, total_cost_usd: 0.0057, permission_denials: [], session_id: sid,
+    result: schema ? process.env.PC_STUB_STRUCTURED : 'done',
+    ...(schema ? { structured_output: JSON.parse(process.env.PC_STUB_STRUCTURED) } : {}) });
+  process.exit(0);
 }
 if (process.env.PC_STUB_DEFER === '1') {
   say({ type: 'result', subtype: 'success', stop_reason: 'tool_deferred', terminal_reason: 'tool_deferred', is_error: false,
@@ -1509,6 +1551,78 @@ test('the background-task ceiling is set explicitly on the child, and the tasks 
   } finally { b.cleanup(); }
 });
 
+test('the session environment phase 6 states reaches the child: bounded output, forks, the watchdog bounds — and never DISABLE_TELEMETRY=0', async () => {
+  const b = bench();
+  try {
+    const env: NodeJS.ProcessEnv = { ...b.env };
+    for (const name of ['BASH_MAX_OUTPUT_LENGTH', 'CLAUDE_CODE_FORK_SUBAGENT', 'CLAUDE_CODE_SUBAGENT_MODEL',
+      'CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS', 'CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS', 'DISABLE_TELEMETRY']) delete env[name];
+    await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env });
+    const seen = JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as Record<string, string | null>;
+    assert.equal(seen.BASH_MAX_OUTPUT_LENGTH, String(DEFAULT_BASH_MAX_OUTPUT));
+    assert.equal(seen.CLAUDE_CODE_FORK_SUBAGENT, '1');
+    assert.equal(seen.CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS, String(WATCHDOG_MAX_WAIT_MS));
+    assert.equal(seen.CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS, String(WATCHDOG_USAGE_RECHECK_MS));
+    assert.equal(seen.CLAUDE_CODE_SUBAGENT_MODEL, null, 'no console default: the CLI\'s own rule stands');
+    assert.equal(seen.DISABLE_TELEMETRY, null, 'any value of it opts out — `0` included — so it is never written');
+    // The run's values, stated by `sessionEnv`, win.
+    await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: {
+      ...env, BASH_MAX_OUTPUT_LENGTH: '40000', CLAUDE_CODE_SUBAGENT_MODEL: 'claude-sonnet-5-5',
+      CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS: '600000',
+    } });
+    const run = JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as Record<string, string | null>;
+    assert.equal(run.BASH_MAX_OUTPUT_LENGTH, '40000');
+    assert.equal(run.CLAUDE_CODE_SUBAGENT_MODEL, 'claude-sonnet-5-5');
+    assert.equal(run.CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS, '600000');
+  } finally { b.cleanup(); }
+});
+
+test('the telemetry block (phase 19): a run that armed a receiver exports to it over OTLP/HTTP JSON, with the phase\'s names', async () => {
+  const b = bench();
+  try {
+    const env: NodeJS.ProcessEnv = { ...b.env };
+    for (const name of Object.keys(env)) if (name.startsWith('OTEL_') || name === 'CLAUDE_CODE_ENABLE_TELEMETRY') delete env[name];
+    // What `runner-control.ts` `otelEnv` and `claimEnv` state for a phase session, and an
+    // inherited per-signal endpoint that would otherwise outrank the console's.
+    await spawnClaude({ prompt: 'BOOT phase 19', cwd: b.dir, sessionId: 'sess-19', env: {
+      ...env, PE_OTEL_ENDPOINT: 'http://127.0.0.1:4130/otel', PE_OTEL_TOKEN: 'tok-19', PE_SLUG: 'measured-console',
+      PE_PHASE: '19', PE_RUN_ID: 'a12a5c9be833', PE_ACCOUNT: 'anthropic-api', CLAUDE_CODE_PROMPT_CACHE_TTL: '1h',
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: 'https://collector.example/v1/logs', OTEL_EXPORTER_OTLP_COMPRESSION: 'gzip',
+    } });
+    const seen = (JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as { otel: Record<string, string> }).otel;
+    assert.deepEqual(seen, {
+      CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+      OTEL_METRICS_EXPORTER: 'otlp',
+      OTEL_LOGS_EXPORTER: 'otlp',
+      OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:4130/otel',
+      OTEL_EXPORTER_OTLP_HEADERS: 'Authorization=Bearer tok-19',
+      OTEL_METRIC_EXPORT_INTERVAL: String(OTEL_METRIC_EXPORT_INTERVAL_MS),
+      OTEL_LOGS_EXPORT_INTERVAL: String(OTEL_LOGS_EXPORT_INTERVAL_MS),
+      OTEL_RESOURCE_ATTRIBUTES: 'plan=measured-console,phase=19,run=a12a5c9be833,account=anthropic-api,session=sess-19,cache_ttl=1h',
+      PE_OTEL_ENDPOINT: 'http://127.0.0.1:4130/otel',
+    }, 'the per-signal override and an inherited compression are cleared, and the bearer leaves the environment once it is in the header');
+    assert.ok(OTEL_METRIC_EXPORT_INTERVAL_MS <= 15_000, 'a phase\'s last minute reaches the console');
+    // No receiver armed: no block, and an operator's own telemetry settings stand untouched.
+    await spawnClaude({ prompt: 'BOOT phase 19', cwd: b.dir, env: { ...env, OTEL_METRICS_EXPORTER: 'prometheus' } });
+    const bare = (JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as { otel: Record<string, string> }).otel;
+    assert.deepEqual(bare, { OTEL_METRICS_EXPORTER: 'prometheus' });
+  } finally { b.cleanup(); }
+});
+
+test('the side agents ride as one --agents JSON on the subagent model, read-only', () => {
+  const argv = buildArgv({ prompt: 'x', cwd: '/tmp', agents: JSON.stringify(sideAgents('claude-sonnet-5-5')) });
+  const at = argv.indexOf('--agents');
+  assert.ok(at > 0, 'the flag is on the argv');
+  const agents = JSON.parse(argv[at + 1]!) as Record<string, { model: string; tools: string[] }>;
+  assert.deepEqual(Object.keys(agents), ['Explore', 'log-reader', 'docs-reader']);
+  for (const agent of Object.values(agents)) {
+    assert.equal(agent.model, 'claude-sonnet-5-5');
+    assert.deepEqual(agent.tools, ['Read', 'Grep', 'Glob'], 'side work reads; the session edits');
+  }
+  assert.equal(buildArgv({ prompt: 'x', cwd: '/tmp' }).includes('--agents'), false);
+});
+
 test('ACC-8.11 (AC-13): the floor and the relay never share an argv — a relay-on session carries the host and no --permission-prompts, a relay-off one the reverse', async () => {
   for (const [shape, expectHost, expectFloor] of [
     [{ permissionPromptTool: RELAY_HOST_TOOL }, true, false],
@@ -1585,6 +1699,19 @@ test('ACC-8.4 (TRS-2): a control_request line is an event of its own — and a r
   } finally { d.cleanup(); }
 });
 
+test('a --json-schema session’s structured_output reaches the outcome, and only a schema session carries one (B4)', async () => {
+  const d = bench();
+  try {
+    const said = JSON.stringify({ status: 'partial', reason: 'context' });
+    const typed = await spawnClaude({ prompt: 'BOOT phase 1', cwd: d.dir, env: { ...d.env, PC_STUB_STRUCTURED: said }, jsonSchema: sessionSchemaArg() });
+    assert.deepEqual(typed.structuredOutput, { status: 'partial', reason: 'context' });
+    assert.ok(typed.argv.includes('--json-schema'));
+    const plain = await spawnClaude({ prompt: 'BOOT phase 1', cwd: d.dir, env: { ...d.env, PC_STUB_STRUCTURED: said } });
+    assert.equal(plain.structuredOutput, undefined);
+    assert.ok(!plain.argv.includes('--json-schema'));
+  } finally { d.cleanup(); }
+});
+
 /* ------------------------------------------------------------------ *
  * The session door's recipes (one-pool phase 5)
  * ------------------------------------------------------------------ */
@@ -1631,4 +1758,78 @@ test("the result line's own usage reaches the result event — the totals an end
     assert.deepEqual(result.usage, { input: 3003, output: 241, cacheRead: 5376, cacheWrite: 0, context: 8379 });
     assert.equal(outcome.tokens?.output, 0, 'the stream fold is what the stream said; the result event carries the rest');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+/* ------------------------------------------------------------------ *
+ * What loads (measured-console phase 11, §Architecture 6 D2)
+ * ------------------------------------------------------------------ */
+
+test('what loads: --plugin-dir and --setting-sources project,local reach the child, and its init names what loaded — never a path', async () => {
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_LOADS: '1' },
+      pluginDirs: ['/state/plugin/abc', '  '], settingSources: 'project,local',
+      onEvent: (event) => events.push(event),
+    });
+    const argv = b.argv();
+    const at = argv.indexOf('--plugin-dir');
+    assert.equal(argv[at + 1], '/state/plugin/abc');
+    assert.equal(argv.filter((a) => a === '--plugin-dir').length, 1, 'a blank path never becomes a bare flag');
+    assert.equal(argv[argv.indexOf('--setting-sources') + 1], 'project,local');
+    const init = events.find((e) => e.kind === 'init') as Extract<StreamEvent, { kind: 'init' }>;
+    assert.deepEqual(init.plugins, [
+      { name: 'phased-execution', source: 'phased-execution@inline', version: 'abc123' },
+      { name: 'superpowers', source: 'superpowers@phased-execution-seed' },
+    ]);
+    assert.ok(!JSON.stringify(init.plugins).includes('/state/'), 'a plugin path names the state directory and is never kept');
+    assert.deepEqual(init.skills, ['phased-execution:phased-execution', 'superpowers:test-driven-development']);
+    assert.ok(init.slashCommands?.includes('clear'));
+    const hooks = events.filter((e) => e.kind === 'hook') as Extract<StreamEvent, { kind: 'hook' }>[];
+    assert.deepEqual(hooks.map((h) => `${h.event}/${h.name}/${h.outcome}`), [
+      'SessionStart/SessionStart:startup/success', 'PreToolUse/PreToolUse:Skill/success',
+    ]);
+    const skill = events.find((e) => e.kind === 'tool' && e.name === 'Skill') as Extract<StreamEvent, { kind: 'tool' }>;
+    assert.equal(skill.skill, 'superpowers:test-driven-development');
+    assert.ok(!JSON.stringify(skill).includes('secret-ish'), 'the skill\'s name, never its arguments');
+  } finally { b.cleanup(); }
+});
+
+test('what loads: without the request\'s settingSources no --setting-sources reaches argv, and any other value is never built', () => {
+  assert.ok(!buildArgv({ prompt: 'x', cwd: '/tmp' }).includes('--setting-sources'));
+  assert.ok(!buildArgv({ prompt: 'x', cwd: '/tmp', settingSources: 'user' as never }).includes('--setting-sources'));
+  assert.ok(!buildArgv({ prompt: 'x', cwd: '/tmp', settingSources: 'user,project,local' as never }).includes('--setting-sources'));
+  const argv = buildArgv({ prompt: 'x', cwd: '/tmp', settingSources: 'project,local' });
+  assert.deepEqual(argv.slice(argv.indexOf('--setting-sources'), argv.indexOf('--setting-sources') + 2), ['--setting-sources', 'project,local']);
+});
+
+/* ------------------------------------------------------------------ *
+ * The shared transcript (measured-console phase 20, B1)
+ * ------------------------------------------------------------------ */
+
+test('the shared fixture transcript: the subprocess door reads it into the event union the SDK door is held to', async () => {
+  // `test/fixtures/spawn/transcript.ndjson` is the one session both doors read —
+  // this door from a stub `claude`, the SDK's from a fake `query()`
+  // (`spawn-sdk.test.ts` holds the two byte-equal). This is its subprocess half:
+  // the frames reach the union, and the session ends as one whose turn closed.
+  const { transcriptStub } = await import('./fixtures/spawn/transcript.ts');
+  const stub = transcriptStub();
+  const events: StreamEvent[] = [];
+  try {
+    const outcome = await spawnClaude({
+      prompt: 'BOOT', cwd: tmpdir(), partialMessages: true, subagentText: true, hookEvents: true,
+      env: { ...process.env, PATH: `${stub}:${process.env.PATH ?? ''}` },
+      onEvent: (event) => events.push(event),
+    });
+    assert.equal(outcome.signal.code, 0);
+    assert.equal(outcome.sessionId, '7a1c2e94-3b5d-4f60-8e21-9c0d4b6a5f13');
+    assert.deepEqual(outcome.structuredOutput, { status: 'complete', reason: 'the door is built' });
+    assert.equal(outcome.lastText, 'Phase 20 is done.');
+    assert.equal(outcome.turns, 3);
+    const denied = events.filter((event) => event.kind === 'permission-denied');
+    assert.equal(denied.length, 1, 'the announced denial, once — the result\'s ledger names the same call');
+    assert.deepEqual(events.filter((event) => event.kind === 'background').map((event) => (event as { op: string }).op), ['started', 'ended']);
+    assert.equal(events.filter((event) => event.kind === 'input-closed').length, 1);
+  } finally { rmSync(stub, { recursive: true, force: true }); }
 });

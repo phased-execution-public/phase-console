@@ -14,6 +14,9 @@
  *   env:NAME           the variable is set and non-empty in this process
  *   keychain:SERVICE   `security find-generic-password -s SERVICE` exits 0 (darwin)
  *   file:PATH          the path exists (`~` expands)
+ *   anthropic-admin    the Anthropic Admin API key the daily reconciliation reads (measured-console
+ *                      phase 18): the keychain item `ANTHROPIC_ADMIN_SERVICE`, probed by name like any
+ *                      `keychain:` id — its value is read in `pro/accounts/reconcile.ts` alone
  *
  * The prelude asks for the run-level union before a run starts; the runner
  * asks for a phase's own list before it spawns (`phase.credential-preflight`);
@@ -37,6 +40,17 @@ export const PROBE_CACHE_MS = 60_000;
 
 /** The one-word ids the registry knows besides the prefixed kinds. */
 export const CLI_LOGIN_IDS = Object.freeze(['claude', 'claude-login']);
+
+/**
+ * The keychain item the Anthropic Admin API key is stored under (errand E-4) — the name only.
+ * `credentials set anthropic-admin --stdin` writes it; `reconcile.ts` reads it.
+ */
+export const ANTHROPIC_ADMIN_SERVICE = 'phase-console-anthropic-admin';
+
+/** The named credentials: a one-word id → the keychain item it is. */
+export const NAMED_CREDENTIALS: Readonly<Record<string, string>> = Object.freeze({
+  'anthropic-admin': ANTHROPIC_ADMIN_SERVICE,
+});
 
 /** How the probes reach the world — swapped by tests and by `doctor` off-line. */
 export type ProbeDeps = {
@@ -75,7 +89,7 @@ function expandHome(path: string, home: string): string {
 
 /** Is `id` something the registry can answer, whatever the answer? */
 export function knownCredentialId(id: string): boolean {
-  return id === 'gh' || CLI_LOGIN_IDS.includes(id) || /^(env|keychain|file):.+/.test(id);
+  return id === 'gh' || CLI_LOGIN_IDS.includes(id) || Object.hasOwn(NAMED_CREDENTIALS, id) || /^(env|keychain|file):.+/.test(id);
 }
 
 /**
@@ -118,7 +132,7 @@ export async function probeCredential(id: string, deps: ProbeDeps = {}): Promise
       ? { id, status: 'ok', reason: `$${name} is set` }
       : { id, status: 'fail', reason: `$${name} is not set in the console's environment` };
   }
-  const keychain = /^keychain:(.+)$/.exec(id);
+  const keychain = Object.hasOwn(NAMED_CREDENTIALS, id) ? [id, NAMED_CREDENTIALS[id]!] : /^keychain:(.+)$/.exec(id);
   if (keychain) {
     if (platform !== 'darwin') return { id, status: 'skip', reason: 'keychain items can only be probed on macOS' };
     const { code } = await exec('security', ['find-generic-password', '-s', keychain[1]]);
@@ -134,7 +148,7 @@ export async function probeCredential(id: string, deps: ProbeDeps = {}): Promise
       ? { id, status: 'ok', reason: `${shown} exists` }
       : { id, status: 'fail', reason: `${shown} does not exist` };
   }
-  return { id, status: 'skip', reason: 'no probe for this credential id (known kinds: gh, claude, env:NAME, keychain:SERVICE, file:PATH)' };
+  return { id, status: 'skip', reason: 'no probe for this credential id (known kinds: gh, claude, anthropic-admin, env:NAME, keychain:SERVICE, file:PATH)' };
 }
 
 function firstLine(text: string): string {

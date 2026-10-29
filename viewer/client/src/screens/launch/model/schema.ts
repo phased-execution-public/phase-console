@@ -33,7 +33,23 @@
 
 import * as z from 'zod/mini';
 import type { Autonomy, McpPolicy, PermissionProfile, PhaseOptions, RelayMode } from '@/data/api';
-import { GIT_STRATEGY_ACKS, RELAY_MODES } from '@shared/run-settings.js';
+import {
+  BASH_MAX_OUTPUT_MAX,
+  BASH_MAX_OUTPUT_MIN,
+  CACHE_TTL_AB_MODES,
+  COMPACTION_MODES,
+  COMPACTION_WINDOW_MAX,
+  COMPACTION_WINDOW_MIN,
+  DEFAULT_CACHE_TTL_AB,
+  DEFAULT_COMPACTION,
+  GIT_STRATEGY_ACKS,
+  HUMAN_STEP_MODES,
+  KEEP_WARM_MAX_SEC,
+  RELAY_MODES,
+  type CacheTtlAb,
+  type CompactionMode,
+  type HumanStepMode,
+} from '@shared/run-settings.js';
 import { RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
 import {
   DEFAULT_RETENTION,
@@ -182,6 +198,26 @@ export interface RunSetupValues {
    */
   ladderPerRunRungs: string;
   ladderPerPhaseRungs: string;
+  /**
+   * The session's environment (measured-console phase 6). `cacheTtlAb` is a
+   * word — `off` is an answer; the other three are optional-by-emptiness:
+   * `''` is the default (no keep-warm, the plan's subagent model, the shipped
+   * Bash output ceiling), and on a run that exists `''` clears the run's word.
+   */
+  cacheTtlAb: CacheTtlAb;
+  keepWarmSec: string;
+  subagentModel: string;
+  bashMaxOutput: string;
+  /**
+   * The platform's pieces (measured-console phase 12). `humanStepMode` is
+   * `''` for "the console decides" — `defer` on a CLI that supports it, else
+   * `park` — so it is the one word here whose empty is an answer the server
+   * owns. `compaction` is a word, `console` the default; `compactionWindow`
+   * is optional-by-emptiness like the three above, `''` the console's window.
+   */
+  humanStepMode: '' | HumanStepMode;
+  compaction: CompactionMode;
+  compactionWindow: string;
   /** `"1,3,5-7"` — parsed at the payload boundary, so a half-typed range is not an error yet. */
   onlyPhases: string;
   phaseOptions: Record<string, PhaseOptions>;
@@ -266,6 +302,13 @@ export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freez
   maxConsecutiveFailures: 'maxConsecutiveFailures',
   ladderPerRunRungs: 'ladderPerRunRungs',
   ladderPerPhaseRungs: 'ladderPerPhaseRungs',
+  cacheTtlAb: 'cacheTtlAb',
+  keepWarmSec: 'keepWarmSec',
+  subagentModel: 'subagentModel',
+  bashMaxOutput: 'bashMaxOutput',
+  humanStepMode: 'humanStepMode',
+  compaction: 'compaction',
+  compactionWindow: 'compactionWindow',
   onlyPhases: 'onlyPhases',
   phaseOptions: 'phaseOptions',
   prompt: null,
@@ -366,6 +409,17 @@ export const runSetupSchema = z.object({
   // The doors' own ranges (`intProblem` in `api/routes.ts`), zero included.
   ladderPerRunRungs: whole('Recovery rungs per run', 0, 1000),
   ladderPerPhaseRungs: whole('Recovery rungs per phase', 0, 100),
+  // The session's environment (measured-console phase 6): the doors' own
+  // ranges, from the owner — `shared/run-settings.js` spells the bounds once.
+  cacheTtlAb: z.enum(CACHE_TTL_AB_MODES as unknown as [CacheTtlAb, ...CacheTtlAb[]]),
+  keepWarmSec: whole('Keep cache warm', 0, KEEP_WARM_MAX_SEC),
+  subagentModel: z.string(),
+  bashMaxOutput: whole('Bash output read back', BASH_MAX_OUTPUT_MIN, BASH_MAX_OUTPUT_MAX),
+  // The platform's pieces (measured-console phase 12), from the same owner.
+  // `''` is "the console decides" and rides beside the owner's two words.
+  humanStepMode: z.enum(['', ...HUMAN_STEP_MODES] as ['', ...HumanStepMode[]]),
+  compaction: z.enum(COMPACTION_MODES as unknown as [CompactionMode, ...CompactionMode[]]),
+  compactionWindow: whole('Compact at', COMPACTION_WINDOW_MIN, COMPACTION_WINDOW_MAX),
   onlyPhases: z.string().check(
     z.refine(
       (text) => text.trim() === '' || /^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/.test(text),
@@ -483,6 +537,17 @@ export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
   maxConsecutiveFailures: '',
   ladderPerRunRungs: '',
   ladderPerPhaseRungs: '',
+  // The session's environment at the shipped defaults: no cache test, no
+  // keep-warm, the plan's subagent model, the console's Bash output ceiling.
+  cacheTtlAb: DEFAULT_CACHE_TTL_AB,
+  keepWarmSec: '',
+  subagentModel: '',
+  bashMaxOutput: '',
+  // The platform's pieces: the console decides a person's step, the console
+  // compacts, and the CLI's window is the console's own.
+  humanStepMode: '',
+  compaction: DEFAULT_COMPACTION,
+  compactionWindow: '',
   onlyPhases: '',
   phaseOptions: {},
   prompt: '',

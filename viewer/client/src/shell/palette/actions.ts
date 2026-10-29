@@ -203,6 +203,7 @@ const SETTINGS_LABELS: Readonly<Record<string, string>> = {
   notifications: 'Notifications',
   accounts: 'Accounts',
   mcp: 'MCP servers',
+  hooks: 'Hooks',
   permissions: 'Permissions',
   instance: 'This instance',
   everything: 'Everything',

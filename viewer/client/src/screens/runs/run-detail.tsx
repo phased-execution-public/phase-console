@@ -24,7 +24,7 @@ import {
 } from '@shared/orchestration-model.js';
 import { waitNote } from '@shared/status-model.js';
 import { HaltCard } from '@/cards/halt-card';
-import { LazyHumanStepCard } from '@/cards/human-step-lazy';
+import { LazyStepCard } from '@/cards/lazy-step-card';
 import { RecoveryActions, type RecoveryCtx } from '@/cards/recovery-actions';
 import type { QueueEntry } from '@/data/api';
 import { runsApi, type RunState } from '@/data/api/runs';
@@ -94,7 +94,7 @@ export function RunDetail({
   return (
     <div className="flex min-w-0 flex-col gap-3 py-3" data-testid="strip-detail">
       {/* A person's turn, whole — the row's one action is its primary (phase 42). */}
-      {model.action.kind === 'step' && <LazyHumanStepCard item={model.action.item} />}
+      {model.action.kind === 'step' && <LazyStepCard item={model.action.item} />}
       {stop && (
         <HaltCard
           run={stop === folded.halt ? folded : { ...folded, halt: stop }}

@@ -14,14 +14,14 @@
  * sent it.
  */
 
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { BLOCKED_BY_ORDER, type HolderClass } from '@shared/run-lifecycle.js';
 import { ISOLATED, settleOf } from '@shared/worktree-model.js';
 import type { ConsoleState } from '@/data/api';
 import type { PhaseOptions, RunState } from '@/data/api/runs';
 import { countdown, duration, money, plural } from '@/lib/format';
 import { KeyValue, Money, Mono, RelativeTime, type KeyValueItem } from '@/ui';
-import { Disclosure } from '@/ui/disclosure';
+import { Accordion, AccordionItem } from '@/ui/accordion';
 import { useEverything } from '@/ui/everything';
 import { RunStatus } from '@/ui/status';
 import { HistoryTab, type HistoryEntry } from '@/shell/panel/history-tab';
@@ -102,6 +102,7 @@ function choicesOf(options: PhaseOptions): string {
     options.mcpServers?.length && `MCP ${options.mcpServers.join(', ')}`,
     options.mcpOff && 'without the run’s MCP servers',
     options.mcpPolicy && `an unreachable server: ${options.mcpPolicy}`,
+    options.plugins?.length && `plugins ${options.plugins.join(', ')}`,
     options.autoApprove != null &&
       (options.autoApprove ? 'the console answers its asks' : 'a person answers its asks'),
   ]
@@ -281,6 +282,38 @@ function context(run: RunState): KeyValueItem[] {
       options.length ? <Lines lines={options.map(([phase, words]) => `phase ${phase}: ${words}`)} /> : null,
     ),
     fact('Ultracode licence', run.ultracode ? 'in every prompt' : null),
+    // The session's environment (measured-console phase 6) — said only where the run has its own word.
+    fact('Model for side work', run.subagentModel ? <Mono value={run.subagentModel} /> : null),
+    fact(
+      'Bash output read back',
+      run.bashMaxOutput ? `${run.bashMaxOutput.toLocaleString('en-US')} characters` : null,
+    ),
+    fact(
+      'Cache lifetime test',
+      run.cacheTtlAb === 'alternate' ? 'alternate phases run the other cache lifetime' : null,
+    ),
+    fact('Cache kept warm', run.keepWarmSec ? plural(run.keepWarmSec, 'second') : null),
+    // The platform's pieces (measured-console phase 12) — the same rule: only the run's own word.
+    fact(
+      'When a phase needs a person',
+      run.humanStepMode === 'defer'
+        ? 'the session waits on the step'
+        : run.humanStepMode === 'park'
+          ? 'the phase parks'
+          : null,
+    ),
+    fact(
+      'Who compacts',
+      run.compaction === 'native'
+        ? 'the CLI'
+        : run.compaction === 'alternate'
+          ? 'odd phases the CLI, even phases the console'
+          : null,
+    ),
+    fact(
+      'The CLI compacts at',
+      run.compactionWindow ? `${run.compactionWindow.toLocaleString('en-US')} tokens` : null,
+    ),
     fact('Messaging', run.messaging),
     fact(
       'Pinned notes',
@@ -789,37 +822,47 @@ const present = (items: KeyValueItem[]) =>
   items.filter((item): item is readonly [string, ReactNode] => Boolean(item));
 
 /**
- * The eight sections. One with something to say folds behind its name and how
- * many facts it holds; one with nothing says so on its line and offers no fold.
+ * The eight sections, as ONE accordion of fold strips — the phase inspector's
+ * (2026-10-20, Tower strips). One with something to say folds behind its name
+ * and how many facts it holds; one with nothing says so on its line and offers
+ * no fold. The page's Everything opens every fold; the folds a person opened
+ * stay theirs when it goes off.
  */
 export function RunRecordSections({ run, state }: { run: RunState; state?: ConsoleState | undefined }) {
   const everything = useEverything('plan');
+  const [opened, setOpened] = useState<string[]>([]);
+  const sections = RUN_RECORD_SECTIONS.map((section) => ({
+    section,
+    items: present(section.facts(run, state)),
+  }));
+  const folds = sections.filter(({ items }) => items.length > 0).map(({ section }) => section.id);
   return (
-    <div className="flex min-w-0 flex-col gap-2" data-testid="run-record-sections">
-      {RUN_RECORD_SECTIONS.map((section) => {
-        const items = present(section.facts(run, state));
-        if (!items.length) {
-          return (
-            <p key={section.id} className="text-meta text-ink-muted" data-section={section.id}>
-              {section.label}: nothing recorded.
-            </p>
-          );
-        }
-        return (
-          <section key={section.id} data-section={section.id} className="min-w-0">
-            <Disclosure
+    <div className="min-w-0" data-testid="run-record-sections">
+      <Accordion value={everything.on ? folds : opened} onValueChange={setOpened}>
+        {sections.map(({ section, items }) =>
+          items.length ? (
+            <AccordionItem
+              key={section.id}
+              value={section.id}
+              section={section.id}
               label={section.label}
-              openLabel={section.label}
               count={items.length}
               testId={`run-section-${section.id}`}
-              {...(everything.on ? { open: true } : {})}
-              bodyClassName="pt-1.5 ps-4"
+              bodyClassName="pt-0.5"
             >
               <KeyValue items={items} />
-            </Disclosure>
-          </section>
-        );
-      })}
+            </AccordionItem>
+          ) : (
+            <p
+              key={section.id}
+              className="border-b border-rule py-2.5 ps-8 text-meta text-ink-muted last:border-b-0"
+              data-section={section.id}
+            >
+              {section.label}: nothing recorded.
+            </p>
+          ),
+        )}
+      </Accordion>
     </div>
   );
 }

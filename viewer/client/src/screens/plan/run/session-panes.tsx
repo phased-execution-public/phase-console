@@ -45,7 +45,7 @@ import {
 import { LANE_STATUSES, type NowLane } from '@/data/lanes';
 import { holderEvidenceText, holderLabel, sessionHolderText } from '@/data/queue-words';
 import { useRun, useTranscript } from '@/data/runs';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { clockTime, clockWords, etaPoint, plural } from '@/lib/format';
 import { Button, Mono } from '@/ui';
 import { RunStatus } from '@/ui/status';

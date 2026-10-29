@@ -33,6 +33,7 @@ import { reasonAllowed, type WhyPerson } from '../../shared/turn-model.js';
 import { parseDecisionsTable } from '../../shared/decisions-model.js';
 import { parseErrandsTable, type ErrandsTable } from './errands.ts';
 import { inPlanReviewers, PERMISSION_MODES, withWindowNote } from '../../shared/run-settings.js';
+import { pluginEntriesFor, pluginKindsOf, pluginWordsOf } from '../../shared/plugin-sets.js';
 import { MODELS_ENV_FALLBACK, type ModelsEnv } from '../runner/models.ts';
 import { MODEL_POLICIES, type ModelPolicy } from '../../shared/run-lifecycle.js';
 import type { DecisionRow } from '../../shared/decisions-model.js';
@@ -128,6 +129,26 @@ export type PhaseDetail = {
    */
   modelPolicy?: ModelPolicy;
   /**
+   * `- **Subagent model:** <model>` — the model this phase's subagents run
+   * (measured-console phase 6), OVERRIDING the plan's `**Subagent model:**`
+   * line (`subagentModelFor`). The first word, backticks stripped, the way
+   * `model` is read. Absent: no bullet, or one naming nothing.
+   */
+  subagentModel?: string;
+  /**
+   * `- **Fast gate:** on|off` — whether the run's Stop hook runs this phase's
+   * fast gate lines (measured-console phase 6; `fastGateFor`, default `on`). A
+   * phase bullet only, no plan level. Absent: no bullet, or a word that is not one.
+   */
+  fastGate?: 'on' | 'off';
+  /**
+   * `- **May delete tests:** yes|no` — whether this phase's session may delete
+   * a `*.test.*` / `*.spec.*` file, the guard's deny lifted (measured-console
+   * phase 6; `mayDeleteTestsFor`, default `no`). A phase bullet only. Absent:
+   * no bullet, or a word that is not one.
+   */
+  mayDeleteTests?: 'yes' | 'no';
+  /**
    * `**QA:** on|off` — this phase's OWN QA regime, overriding the plan's
    * `**QA gate:**` where it is stated, inheriting where it is silent.
    *
@@ -192,6 +213,13 @@ export type PhaseDetail = {
    */
   verifyTimeoutMinutes?: number;
   /**
+   * `- **Verification tier:** impact|full` — what this phase's HEAVY
+   * §Verification lines run as (measured-console phase 15,
+   * `verification_tier_for_phase()`): `impact` the selected form
+   * (`runner/verify-select.ts`), `full` as written. Overrides the plan's line.
+   */
+  verificationTier?: VerificationTier;
+  /**
    * `**MCP:**` — the MCP servers this phase needs, as registry ids.
    *
    * What a phase states is WHICH server it needs, never how to reach it: the
@@ -200,6 +228,20 @@ export type PhaseDetail = {
    * on one that does not (F15 at plan time, the preflight at boarding).
    */
   mcpServers?: string[];
+  /**
+   * `- **Skills:**` — the skills this phase's sessions call beyond the plan's
+   * `**Skills (every session):**` line (measured-console phase 11); UNIONED
+   * like `mcpServers` (`skillsFor`, held to `--skills N`). Absent when the
+   * bullet is missing or names none.
+   */
+  skills?: string[];
+  /**
+   * `- **Plugins:**` — the plugin kinds this phase's session is given beyond
+   * the plan's `**Plugins:**` line (measured-console phase 27), every word as
+   * written (lower-cased): a word that is no kind stays here for F48 and
+   * brings nothing. UNIONED like `skills` (`pluginKindsFor`, `pluginsFor`).
+   */
+  plugins?: string[];
   /**
    * `**MCP policy:**` — what THIS phase does when one of those will not connect.
    *
@@ -224,6 +266,24 @@ export type PhaseDetail = {
    * bullet is missing.
    */
   waitsOn?: { refs: string[]; maxMinutes?: number };
+  /**
+   * `- **Out of scope:** …` — what this phase is NOT to build: the bullet's own
+   * text and its continuation lines, one trimmed non-empty line each, joined
+   * with `\n` (`--out-of-scope N`, measured-console phase 30). The evaluator
+   * reads it to tell a missing piece from a refused one. Absent when none.
+   */
+  outOfScope?: string;
+  /**
+   * `- **Amendment:** K (YYYY-MM-DD) · from <id>` — this phase came in by
+   * `scripts/amend-plan.sh`; K numbers the amendment (`amendment_of_phase`).
+   */
+  amendment?: { number: number; date?: string; from?: string };
+  /**
+   * True when the graph names this phase and no `### Phase N` section exists
+   * yet (an amendment read between its writes, #416). A gated one then reads
+   * as a `manual` gate — `gateCheck` says so — never as the `ai` default.
+   */
+  sectionMissing?: boolean;
   /**
    * `- **Wait count:** <n>` — how many waits this phase may DECLARE, 1..99
    * (control-tower phase 121, #40; `wait_count_for_phase()`). Overrides the
@@ -257,6 +317,8 @@ export type SessionBudget = {
   budget?: string;
   branch?: string;
   skills: string[];
+  /** `**Plugins:**` — the plugin kinds every phase's set starts from (measured-console phase 27), words as written. */
+  plugins?: string[];
   /** `**MCP servers (every session):**` — attached to every phase of this plan. */
   mcpServers: string[];
   /**
@@ -310,6 +372,12 @@ export type SessionBudget = {
    */
   verifyTimeoutMinutes?: number;
   /**
+   * `**Verification tier:** impact|full` — what every phase's heavy
+   * §Verification lines run as (measured-console phase 15,
+   * `plan_verification_tier()`). Absent is silence: every line runs as written.
+   */
+  verificationTier?: VerificationTier;
+  /**
    * `**QA exhausted:** waive|halt|<owner>` — the plan's answer once the QA
    * round budget is spent (`plan_qa_exhausted()`; chapter 10 ZTD-9, the
    * `qa.exhausted` row). One lower-cased word; absent is silence and the
@@ -351,6 +419,8 @@ export type SessionBudget = {
   permissionMode?: PermissionMode;
   /** `**Model policy:**` — what a run may do to a model, for every phase with no bullet of its own (#91). */
   modelPolicy?: ModelPolicy;
+  /** `**Subagent model:**` — the model every phase's subagents run, for every phase with no bullet of its own (measured-console phase 6). */
+  subagentModel?: string;
   /** `**Clash zones:**` — paths two concurrent phases must never both touch. Empty when none. */
   clashZones: string[];
 };
@@ -360,6 +430,8 @@ export type DirectiveSource = 'phase' | 'plan' | 'default';
 
 /** A resolved directive: the word, and which level said it. */
 export type Resolved<T extends string> = { value: T; source: DirectiveSource };
+
+export type AmendmentNote = { number: number; date: string; phase?: number; text: string };
 
 export type Plan = {
   slug: string;
@@ -397,6 +469,17 @@ export type Plan = {
    */
   decisions: DecisionRow[];
   graph: PhaseRow[];
+  /**
+   * `## Not yet specified` — the plan's list of what is known to be missing,
+   * one trimmed non-empty line each (`--not-yet-specified`). `close-plan.sh`
+   * refuses `complete` while it holds a line. Empty when absent.
+   */
+  notYetSpecified: string[];
+  /**
+   * The dated amendment notes under the title, `> *(Amendment K, DATE)* Phase
+   * N — …` (`amendment_notes`); `phase` is absent when the note names none.
+   */
+  amendments: AmendmentNote[];
   /** Blocking / Independent callout lines under the graph table. */
   callouts: string[];
   /**
@@ -652,9 +735,107 @@ function firstBulletValue(block: string, pattern: RegExp): string | undefined {
   return undefined;
 }
 
+/**
+ * §Session budget lines carrying several directives, one per line (#419) —
+ * `_split_directives` in phase-graph.sh. The split is at a ` · ` that a bold
+ * label follows (`**Label:**` or `**Label**:`) and nowhere else, so every
+ * reader below, each anchored at the start of a line, reads every directive of
+ * `**Wait budget:** 8h · **Verify timeout:** 90m`. Spaces and tabs only, as
+ * the engine reads them under C.
+ */
+export function splitDirectives(text: string): string {
+  const one = /[ \t]*·[ \t]*\*\*[A-Za-z][^*:]*(?::\*\*|\*\*:)/;
+  return text.split('\n').map((whole) => {
+    let line = whole;
+    let out = '';
+    for (let m = one.exec(line); m; m = one.exec(line)) {
+      out += `${line.slice(0, m.index)}\n`;
+      line = m[0].replace(/^[ \t]*·[ \t]*/, '') + line.slice(m.index + m[0].length);
+    }
+    return out + line;
+  }).join('\n');
+}
+
+/**
+ * `phase-graph.sh --section N` (measured-console phase 2): the `### Phase N`
+ * section verbatim (trailing blank lines trimmed), its graph row under the
+ * table's header, and the §Session budget directives that bind it — those the
+ * phase does not override with a bullet of its own label (`Model:` overrides
+ * `Target model:`), each with its continuation lines. Read from the plan's
+ * text exactly as the engine's awks read it; engine-parity holds the two.
+ */
+export function phaseSection(text: string, phase: number): string {
+  const lines = text.split('\n');
+  const block: string[] = [];
+  let cur = false;
+  for (const line of lines) {
+    const h = /^###[ \t\v\f\r]+[Pp]hase[ \t\v\f\r]+([0-9]+)/.exec(line);
+    if (h) cur = Number(h[1]) === phase;
+    else if (/^##[ \t\v\f\r]/.test(line) && cur) cur = false;
+    if (cur) block.push(line);
+  }
+  while (block.length && /^[ \t]*$/.test(block[block.length - 1])) block.pop();
+
+  const row: string[] = [];
+  let inpg = false;
+  let seen = false;
+  let n = 0;
+  for (const line of lines) {
+    if (/^##[ \t\v\f\r]+phase graph/.test(line.toLowerCase())) { inpg = true; seen = false; continue; }
+    if (!inpg) continue;
+    const pipe = /^[ \t]*\|/.test(line);
+    if (seen && !pipe) break;
+    if (!pipe) continue;
+    seen = true; n++;
+    const cell = line.replace(/^[ \t]*\|/, '').replace(/\|.*$/, '').replace(/[*` \t]/g, '');
+    if (/^[0-9]+$/.test(cell)) { if (Number(cell) === phase) row.push(line); continue; }
+    if (n <= 2) row.push(line);
+  }
+
+  const own = new Set<string>();
+  for (const line of block) {
+    const m = /^[ \t]*[-*][ \t]+\*\*[^*]+(?::\*\*|\*\*:)/.exec(line);
+    if (m) own.add(m[0].replace(/^[ \t]*[-*][ \t]+\*\*/, '').replace(/(?::\*\*|\*\*:)$/, '').toLowerCase());
+  }
+  if (own.has('model')) own.add('target model');
+  const budget: string[] = [];
+  let inSb = false;
+  const sbLines: string[] = [];
+  for (const line of lines) {
+    if (/^##[ \t\v\f\r]+session budget/.test(line.toLowerCase())) { inSb = true; continue; }
+    if (inSb && /^##[ \t\v\f\r]/.test(line)) inSb = false;
+    if (inSb) sbLines.push(line);
+  }
+  let open = false;
+  for (const line of splitDirectives(sbLines.join('\n')).split('\n')) {
+    const s = line.replace(/^[ \t>]*/, '');
+    if (s === '') { open = false; continue; }
+    const m = /^(?:[-*][ \t]+)?\*\*[^*]+(?::\*\*|\*\*:)/.exec(s);
+    if (m) {
+      const label = m[0].replace(/^(?:[-*][ \t]+)?\*\*/, '').replace(/(?::\*\*|\*\*:)$/, '').toLowerCase();
+      open = !own.has(label);
+      if (open) budget.push(s);
+      continue;
+    }
+    if (open) budget.push(s);
+  }
+
+  return [
+    ...block,
+    '',
+    `## Phase graph — phase ${phase}'s row`,
+    ...row,
+    '',
+    `## Session budget — the lines that bind phase ${phase}`,
+    ...budget,
+  ].join('\n');
+}
+
 function parseSessionBudget(section?: Section): SessionBudget {
   const raw = section?.body ?? '';
-  const flat = raw.replace(/^[\s>]*/gm, '');
+  // Every reader below reads the split text; `raw` stays as written, for the page.
+  const split = splitDirectives(raw);
+  const flat = split.replace(/^[\s>]*/gm, '');
 
   // A "(1M window)" after the name is the window the plan asked for, and reads
   // as `[1m]` (control-tower phase 13, #91) — the bash twin is `plan_model`.
@@ -676,6 +857,9 @@ function parseSessionBudget(section?: Section): SessionBudget {
   // budget prose; strictness about the asterisks bought nothing and cost that.
   const skillsLine = /(?:\*\*)?Skills \(every session\):?(?:\*\*)?\s*(.+)/i.exec(flat)?.[1] ?? '';
   const skills = [...skillsLine.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim());
+  // `plan_plugins()`: the bold label is required (the strict phrase), the words
+  // after it up to the next directive — `splitDirectives` has already cut at ` · `.
+  const plugins = pluginWordsOf(/\*\*Plugins:?\*\*:?(.*)$/im.exec(flat)?.[1]);
 
   // Same phrase-decides rule as `Skills (every session)` above, and the same
   // `(.+)` terminator — `flat` keeps its newlines, so this is one line.
@@ -704,6 +888,8 @@ function parseSessionBudget(section?: Section): SessionBudget {
   const waitCount = countWord(/^\*{0,2}Wait[ \t]+count\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
   // `plan_verify_timeout()`: the same shape as the wait budget above.
   const verifyTimeoutMinutes = durationMinutes(/^\*{0,2}Verify[ \t]+timeout\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
+  // `plan_verification_tier()`: the same label shape, then the first word.
+  const verificationTier = tierWord(/^\*{0,2}Verification[ \t]+tier\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
   // `plan_qa_exhausted()`: the label at the start of a line (after the quote
   // marks), then the FIRST word after the colon.
   const qaExhausted = policyWord(/^\*{0,2}QA[ \t]+exhausted\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
@@ -714,7 +900,7 @@ function parseSessionBudget(section?: Section): SessionBudget {
   // rules and read as QA-on. The terminator is a space-or-end rather than
   // end-of-line, so a trailing note after the word still counts.
   let qaGate: 'on' | 'off' | undefined;
-  for (const line of raw.split('\n')) {
+  for (const line of split.split('\n')) {
     const m = /^[\s>]*(?:[-*]\s+)?\*{0,2}QA gate:?\*{0,2}\s*(on|off)(?:\s|$)/i.exec(line);
     if (m) { qaGate = m[1].toLowerCase() as 'on' | 'off'; break; }
   }
@@ -726,7 +912,7 @@ function parseSessionBudget(section?: Section): SessionBudget {
   // operator DID write is not a safety property, it is a bug that looks like
   // one.
   let worktrees: 'on' | 'off' | undefined;
-  for (const line of raw.split('\n')) {
+  for (const line of split.split('\n')) {
     const m = /^[\s>]*(?:[-*]\s+)?\*{0,2}Worktrees:?\*{0,2}\s*(on|off)(?:\s|$)/i.exec(line);
     if (m) { worktrees = m[1].toLowerCase() as 'on' | 'off'; break; }
   }
@@ -747,6 +933,10 @@ function parseSessionBudget(section?: Section): SessionBudget {
   );
   // control-tower phase 54 (#91): `_plan_directive 'Model[[:space:]]+policy'`.
   const modelPolicy = planWord(flat, MODEL_POLICY_LABEL, MODEL_POLICIES);
+  // measured-console phase 6: `_plan_directive 'Subagent[[:space:]]+model' | _model_token`.
+  const subagentModel = modelToken(
+    new RegExp(`^[\\s>]*\\*{0,2}${SUBAGENT_MODEL_LABEL}\\*{0,2}[ \\t]*:(.*)$`, 'im').exec(flat)?.[1],
+  );
   // The base branch is the one value that is not a vocabulary — two words are
   // special and everything else is a git ref, passed through whole — so it
   // takes the raw remainder rather than its first token.
@@ -758,12 +948,13 @@ function parseSessionBudget(section?: Section): SessionBudget {
   )];
 
   return {
-    raw, targetModel: model, budget, branch, skills, mcpServers, mcpPolicy, credentials, credentialPolicy, accounts, qaGate, worktrees,
+    raw, targetModel: model, budget, branch, skills, plugins, mcpServers, mcpPolicy, credentials, credentialPolicy, accounts, qaGate, worktrees,
     clashZones,
     ...(setupLine ? { setup: setupLine } : {}),
     ...(waitBudgetMinutes !== undefined ? { waitBudgetMinutes } : {}),
     ...(waitCount !== undefined ? { waitCount } : {}),
     ...(verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}),
+    ...(verificationTier !== undefined ? { verificationTier } : {}),
     ...(qaExhausted !== undefined ? { qaExhausted } : {}),
     ...(landing !== undefined ? { landing } : {}),
     ...(baseBranch !== undefined ? { baseBranch } : {}),
@@ -774,6 +965,7 @@ function parseSessionBudget(section?: Section): SessionBudget {
     ...(isolation !== undefined ? { isolation } : {}),
     ...(permissionMode !== undefined ? { permissionMode } : {}),
     ...(modelPolicy !== undefined ? { modelPolicy } : {}),
+    ...(subagentModel !== undefined ? { subagentModel } : {}),
   };
 }
 
@@ -797,6 +989,28 @@ const PERMISSION_MODE_LABEL = 'Permission[ \\t]+mode';
 
 /** `Model[[:space:]]+policy` in phase-graph.sh (control-tower phase 54). */
 const MODEL_POLICY_LABEL = 'Model[ \\t]+policy';
+
+/** The measured-console phase 6 labels — `Subagent[[:space:]]+model` and its siblings in phase-graph.sh. */
+const SUBAGENT_MODEL_LABEL = 'Subagent[ \\t]+model';
+const FAST_GATE_LABEL = 'Fast[ \\t]+gate';
+const MAY_DELETE_TESTS_LABEL = 'May[ \\t]+delete[ \\t]+tests';
+/** `FAST_GATE_WORDS` / `MAY_DELETE_TESTS_WORDS` in phase-graph.sh, and the default each falls to. */
+const FAST_GATE_WORDS = ['on', 'off'] as const;
+const MAY_DELETE_TESTS_WORDS = ['yes', 'no'] as const;
+const DEFAULT_FAST_GATE = 'on';
+const DEFAULT_MAY_DELETE_TESTS = 'no';
+
+/**
+ * `_after_colon | _model_token` in phase-graph.sh: the value's first word,
+ * emphasis and backticks stripped, case kept — a model id, never lower-cased.
+ * Undefined when the value names nothing.
+ */
+function modelToken(remainder: string | undefined): string | undefined {
+  if (remainder === undefined) return undefined;
+  // `[[:space:]]` under C, and awk's blank field split — never `\s`, which
+  // would also eat a no-break space the engine reads as text (#410).
+  return remainder.replace(/[*`]/g, '').replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, '').split(/[ \t]+/)[0] || undefined;
+}
 
 
 /**
@@ -936,6 +1150,10 @@ function mcpPolicyOf(value?: string): McpPolicy | undefined {
  * Same regexes as bash, same first-match-wins (`head -1`).
  */
 const MCP_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}MCP\*{0,2}[ \t]*:(.*)$/i;
+/** `skills_directive()` — the same shape as the MCP bullet (measured-console phase 11). */
+const SKILLS_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Skills\*{0,2}[ \t]*:(.*)$/i;
+/** `plugins_directive()` — the same shape again (measured-console phase 27). */
+const PLUGINS_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Plugins\*{0,2}[ \t]*:(.*)$/i;
 const MCP_POLICY_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}MCP[ \t]+policy\*{0,2}[ \t]*:(.*)$/i;
 /** `credentials_directive()` / `credential_policy_directive()` — the same shapes. */
 const CREDENTIALS_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Credentials\*{0,2}[ \t]*:(.*)$/i;
@@ -952,6 +1170,16 @@ const WAIT_COUNT_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Wait[ \t]+count\*{0,2}[ \t
 const WALL_CLOCK_FLOOR_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Wall-clock[ \t]+floor\*{0,2}[ \t]*:(.*)$/i;
 /** `verify_timeout_directive()` — the same shape again (control-tower phase 83, #95). */
 const VERIFY_TIMEOUT_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Verify[ \t]+timeout\*{0,2}[ \t]*:(.*)$/i;
+const VERIFICATION_TIER_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Verification[ \t]+tier\*{0,2}[ \t]*:(.*)$/i;
+
+/** What a phase's heavy §Verification lines run as (measured-console phase 15). */
+export type VerificationTier = 'impact' | 'full';
+
+/** `_tier_word()`: the first word after the label, lower-cased, if it is a tier. */
+function tierWord(text: string | undefined): VerificationTier | undefined {
+  const word = (text ?? '').replace(/^[*`\s]+/, '').split(/\s+/)[0]?.toLowerCase().replace(/[*`.,;]/g, '');
+  return word === 'impact' || word === 'full' ? word : undefined;
+}
 
 /**
  * `_policy_word()`: bold and backticks stripped, the FIRST token lower-cased
@@ -1004,6 +1232,22 @@ function mcpBullet(block: string): string[] | undefined {
 /** The phase's `- **MCP policy:** require|continue`, or undefined for silence. */
 function mcpPolicyBullet(block: string): McpPolicy | undefined {
   return mcpPolicyOf(firstMatch(block, MCP_POLICY_BULLET_RE));
+}
+
+/** The phase's `- **Skills:** \`a\`, \`b\`` names, or undefined when it names none — `mcpBullet`'s twin. */
+function skillsBullet(block: string): string[] | undefined {
+  const body = firstMatch(block, SKILLS_BULLET_RE);
+  if (body === undefined) return undefined;
+  const names = [...body.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim()).filter(Boolean);
+  return names.length ? [...new Set(names)] : undefined;
+}
+
+/** The phase's `- **Plugins:** review, ui` words, or undefined when it names none — backticks optional, `plugins_directive()`. */
+function pluginsBullet(block: string): string[] | undefined {
+  const body = firstMatch(block, PLUGINS_BULLET_RE);
+  if (body === undefined) return undefined;
+  const words = pluginWordsOf(body.replace(/\*/g, ''));
+  return words.length ? words : undefined;
 }
 
 /** The phase's `- **Credentials:** \`a\`, \`b\`` ids, or undefined when it names none — `mcpBullet`'s twin. */
@@ -1205,6 +1449,37 @@ function qaBullet(block: string): 'on' | 'off' | undefined {
   return word === 'on' || word === 'off' ? word : undefined;
 }
 
+/** `out_of_scope_directive`: trimmed non-empty lines of the bullet (and its continuations). */
+function outOfScopeOf(bullets: { label: string; body: string }[]): string | undefined {
+  const hit = bullets.find((b) => /^out[ \t]+of[ \t]+scope$/i.test(b.label.trim()));
+  const lines = (hit?.body ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  return lines.length ? lines.join('\n') : undefined;
+}
+
+/** `amendment_of_phase` (+ the date and `from` amend-plan.sh writes beside the number). */
+function amendmentOf(bullets: { label: string; body: string }[]): PhaseDetail['amendment'] {
+  const hit = bullets.find((b) => b.label.trim().toLowerCase() === 'amendment');
+  const m = /^(\d+)(?:\s*\(([^)]*)\))?(?:\s*·\s*from\s+(\S+))?/.exec((hit?.body ?? '').trim());
+  if (!m) return undefined;
+  return { number: Number(m[1]), ...(m[2] ? { date: m[2].trim() } : {}), ...(m[3] ? { from: m[3] } : {}) };
+}
+
+/** `amendment_notes`: the well-formed `> *(Amendment K, DATE)*` lines before the first `## `. */
+function amendmentNotes(body: string): AmendmentNote[] {
+  const out: AmendmentNote[] = [];
+  let fence = false;
+  for (const line of body.split('\n')) {
+    if (/^##\s/.test(line)) break;
+    if (/^[ \t]*(```|~~~)/.test(line)) { fence = !fence; continue; }
+    if (fence) continue;
+    const m = /^>[ \t]*\*\(Amendment (\d+), (\d{4}-\d{2}-\d{2})\)\*(.*)$/.exec(line);
+    if (!m) continue;
+    const phase = /^[ \t]*Phase (\d+)/.exec(m[3]!)?.[1];
+    out.push({ number: Number(m[1]), date: m[2]!, ...(phase ? { phase: Number(phase) } : {}), text: m[3]!.trim() });
+  }
+  return out;
+}
+
 function calloutLines(text: string): string[] {
   const graph = findSection(sections(text), 'Phase graph');
   if (!graph) return [];
@@ -1229,6 +1504,40 @@ export function mcpServersFor(plan: Plan | undefined, phase: number): string[] {
     ...(plan.sessionBudget.mcpServers ?? []),
     ...(plan.phases[phase]?.mcpServers ?? []),
   ])];
+}
+
+/**
+ * The skills a phase's sessions call (measured-console phase 11): the plan's
+ * `**Skills (every session):**` line UNIONED with the phase's `- **Skills:**`
+ * bullet, deduped, first-seen order — `skills_for_phase()`, which `--skills N`
+ * prints and engine-parity pins. The handoffs' `suggested_skills:` are the
+ * boot prompt's, not the plan's, and are not here.
+ */
+export function skillsFor(plan: Plan | undefined, phase: number): string[] {
+  if (!plan) return [];
+  return [...new Set([
+    ...(plan.sessionBudget.skills ?? []),
+    ...(plan.phases[phase]?.skills ?? []),
+  ])];
+}
+
+/**
+ * The plugin kinds a phase's session is given (measured-console phase 27): the
+ * plan's `**Plugins:**` line UNIONED with the phase's `- **Plugins:**` bullet,
+ * kinds only, deduped, first-seen order. No phase: the plan's line alone.
+ * Never a union across phases — a set is one phase's.
+ */
+export function pluginKindsFor(plan: Plan | undefined, phase?: number): string[] {
+  if (!plan) return [];
+  return pluginKindsOf([...new Set([
+    ...(plan.sessionBudget.plugins ?? []),
+    ...(phase === undefined ? [] : plan.phases[phase]?.plugins ?? []),
+  ])]);
+}
+
+/** The entries those kinds bring, by name — `plugins_for_phase()`, which `--plugins [N]` prints and engine-parity pins. */
+export function pluginsFor(plan: Plan | undefined, phase?: number): string[] {
+  return pluginEntriesFor(pluginKindsFor(plan, phase)).map((entry) => entry.name);
 }
 
 /**
@@ -1405,7 +1714,7 @@ export function permissionModeFor(plan: Plan | undefined, phase?: number): Resol
  * `**Target model:**` line's first token in the generic id grammar (`MODEL_ID_GRAMMAR`).
  */
 export function planModelFor(plan: Plan | undefined, env: ModelsEnv = MODELS_ENV_FALLBACK): string | undefined {
-  const lines = (plan?.sessionBudget.raw ?? '').split('\n');
+  const lines = splitDirectives(plan?.sessionBudget.raw ?? '').split('\n');
   const alts = [...new Set([...env.aliases, ...env.big])].join('|');
   const claude = new RegExp(`(claude-)?(${alts})(-[0-9a-z.]+)*(\\[1m\\])?`, 'i');
   for (const line of lines) {
@@ -1440,6 +1749,42 @@ export function modelPolicyFor(plan: Plan | undefined, phase?: number): Resolved
   if (own !== undefined) return { value: own, source: 'phase' };
   const planWide = plan?.sessionBudget.modelPolicy;
   return planWide !== undefined ? { value: planWide, source: 'plan' } : undefined;
+}
+
+/**
+ * The model a phase's subagents run — `subagent_model_for_phase()`
+ * (`--subagent-model [N]`; measured-console phase 6). The phase's
+ * `- **Subagent model:**` bullet beats the plan's `**Subagent model:**` line;
+ * with no phase, the plan line alone. Undefined when both are silent, because
+ * the session's own default answers then.
+ */
+export function subagentModelFor(
+  plan: Plan | undefined, phase?: number,
+): { model: string; source: 'phase' | 'plan' } | undefined {
+  const own = phase === undefined ? undefined : plan?.phases[phase]?.subagentModel;
+  if (own !== undefined) return { model: own, source: 'phase' };
+  const planWide = plan?.sessionBudget.subagentModel;
+  return planWide !== undefined ? { model: planWide, source: 'plan' } : undefined;
+}
+
+/**
+ * Whether the run's Stop hook runs a phase's fast gate lines — `fast_gate_for_phase()`
+ * (`--fast-gate N`; measured-console phase 6). A phase bullet only: its word,
+ * else `on` from the default.
+ */
+export function fastGateFor(plan: Plan | undefined, phase: number): { value: 'on' | 'off'; source: 'phase' | 'default' } {
+  const own = plan?.phases[phase]?.fastGate;
+  return own !== undefined ? { value: own, source: 'phase' } : { value: DEFAULT_FAST_GATE, source: 'default' };
+}
+
+/**
+ * Whether a phase's session may delete a test file — `may_delete_tests_for_phase()`
+ * (`--may-delete-tests N`; measured-console phase 6). A phase bullet only: its
+ * word, else `no` from the default.
+ */
+export function mayDeleteTestsFor(plan: Plan | undefined, phase: number): { value: 'yes' | 'no'; source: 'phase' | 'default' } {
+  const own = plan?.phases[phase]?.mayDeleteTests;
+  return own !== undefined ? { value: own, source: 'phase' } : { value: DEFAULT_MAY_DELETE_TESTS, source: 'default' };
 }
 
 
@@ -1499,6 +1844,21 @@ export function verifyTimeoutFor(
   if (own !== undefined) return { minutes: own, source: 'phase' };
   const planWide = plan.sessionBudget.verifyTimeoutMinutes;
   return planWide !== undefined ? { minutes: planWide, source: 'plan' } : undefined;
+}
+
+/**
+ * What a phase's heavy §Verification lines run as, and which line said so
+ * (measured-console phase 15) — `verification_tier_for_phase()`: the phase's
+ * bullet, else the plan's line, else undefined (every line as written).
+ */
+export function verificationTierFor(
+  plan: Plan | undefined, phase?: number,
+): { tier: VerificationTier; source: 'phase' | 'plan' } | undefined {
+  if (!plan) return undefined;
+  const own = phase === undefined ? undefined : plan.phases[phase]?.verificationTier;
+  if (own !== undefined) return { tier: own, source: 'phase' };
+  const planWide = plan.sessionBudget.verificationTier;
+  return planWide !== undefined ? { tier: planWide, source: 'plan' } : undefined;
 }
 
 /** The refs a phase's `- **Waits on:**` bullet names — `waits_on_refs()`. */
@@ -1582,12 +1942,17 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       // The first duration after the label, read off the RAW block like the
       // floor above (`verify_timeout_for_phase()`).
       verifyTimeoutMinutes: durationMinutes(firstMatch(block.raw, VERIFY_TIMEOUT_BULLET_RE)),
+      verificationTier: tierWord(firstMatch(block.raw, VERIFICATION_TIER_BULLET_RE)),
       // Backticked ids off the bullet, matching `mcp_directive()` in
       // phase-graph.sh — read from the RAW block, because the engine does not
       // require the bold and this side decides what actually gets attached.
       // Absent rather than empty when the bullet says nothing, so "no bullet"
       // and "a bullet naming nothing" read the same downstream.
       mcpServers: mcpBullet(block.raw),
+      // `skills_directive()`'s twin (measured-console phase 11).
+      skills: skillsBullet(block.raw),
+      // `plugins_directive()`'s twin (measured-console phase 27).
+      plugins: pluginsBullet(block.raw),
       // Same regex as `mcp_policy_directive()`, same optional asterisks.
       mcpPolicy: mcpPolicyBullet(block.raw),
       // The credential twins of the two above (`credentials_directive()`,
@@ -1613,9 +1978,18 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       ),
       // control-tower phase 54 (#91): `_phase_directive <N> 'Model[[:space:]]+policy'`.
       modelPolicy: phaseWord(block.raw, MODEL_POLICY_LABEL, MODEL_POLICIES),
+      // measured-console phase 6: `subagent_model_for_phase`, `fast_gate_for_phase`,
+      // `may_delete_tests_for_phase` — each `_phase_directive <N> '<label>'`.
+      subagentModel: modelToken(
+        new RegExp(`^[ \\t]*[-*][ \\t]*\\*{0,2}${SUBAGENT_MODEL_LABEL}\\*{0,2}[ \\t]*:(.*)$`, 'im').exec(block.raw)?.[1],
+      ),
+      fastGate: phaseWord(block.raw, FAST_GATE_LABEL, FAST_GATE_WORDS),
+      mayDeleteTests: phaseWord(block.raw, MAY_DELETE_TESTS_LABEL, MAY_DELETE_TESTS_WORDS),
       // What the phase waits on and its own parked-time allowance
       // (`waits_on_refs()` / `wait_budget_for_phase()`).
       waitsOn: waitsOnBullet(block.raw),
+      outOfScope: outOfScopeOf(bullets),
+      amendment: amendmentOf(bullets),
       waitCount: countWord(firstMatch(block.raw, WAIT_COUNT_BULLET_RE)),
       // Whether this phase states its own QA regime — see PhaseDetail.qa.
       qa: qaBullet(block.raw),
@@ -1628,8 +2002,13 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
   // A graph row without a `### Phase N` block still deserves a detail record.
   for (const row of graph) {
     if (phases[row.phase]) continue;
+    const gated = /GATED/.test(row.exitCriteria) || isGated(body, row.phase, '');
     phases[row.phase] = {
-      phase: row.phase, title: row.title, gated: /GATED/.test(row.exitCriteria) || isGated(body, row.phase, ''),
+      phase: row.phase, title: row.title, gated,
+      // #416: a gated row whose section is not written yet fails closed, as the
+      // engine's `gate_kind` does — a `manual` gate, never the `ai` default.
+      ...(gated ? { gateCheck: `manual phase ${row.phase}'s section is not written yet` } : {}),
+      sectionMissing: true,
       size: phaseSize(body, row.phase), bullets: [], raw: '',
     };
   }
@@ -1658,6 +2037,9 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
     // the separator row skipped, a fenced example ignored).
     decisions: parseDecisionsTable(findSection(secs, 'Decisions')?.body ?? ''),
     graph,
+    notYetSpecified: (findSection(secs, 'Not yet specified')?.body ?? '')
+      .split('\n').map((l) => l.trim()).filter(Boolean),
+    amendments: amendmentNotes(body),
     callouts: calloutLines(body),
     reviewers: inPlanReviewers(body),
     phases,

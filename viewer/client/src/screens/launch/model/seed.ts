@@ -19,6 +19,7 @@ import { type RunState, automationPrefs } from '@/data/api';
 import { runPriority } from '@shared/orchestration-model.js';
 import { isolationMode, settleOf } from '@shared/worktree-model.js';
 import { DEFAULT_MODEL_POLICY } from '@shared/run-lifecycle.js';
+import { DEFAULT_CACHE_TTL_AB, DEFAULT_COMPACTION } from '@shared/run-settings.js';
 import { DEFAULTS } from './defaults';
 import type { LaunchMemory } from './memory';
 import { REMEMBERED_FIELDS } from './memory';
@@ -279,6 +280,19 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   values.ladderPerRunRungs = typeof run?.ladderPerRunRungs === 'number' ? String(run.ladderPerRunRungs) : '';
   values.ladderPerPhaseRungs =
     typeof run?.ladderPerPhaseRungs === 'number' ? String(run.ladderPerPhaseRungs) : '';
+  // The session's environment (measured-console phase 6): a run answers for
+  // itself, each absent at its default — a live sheet that opened empty over a
+  // run's own word would clear it on Apply.
+  values.cacheTtlAb = run?.cacheTtlAb ?? DEFAULT_CACHE_TTL_AB;
+  values.keepWarmSec =
+    typeof run?.keepWarmSec === 'number' && run.keepWarmSec > 0 ? String(run.keepWarmSec) : '';
+  values.subagentModel = run?.subagentModel ?? '';
+  values.bashMaxOutput = typeof run?.bashMaxOutput === 'number' ? String(run.bashMaxOutput) : '';
+  // The platform's pieces (measured-console phase 12), the same way: a run
+  // with no word of its own leaves the console to decide.
+  values.humanStepMode = run?.humanStepMode ?? '';
+  values.compaction = run?.compaction ?? DEFAULT_COMPACTION;
+  values.compactionWindow = typeof run?.compactionWindow === 'number' ? String(run.compactionWindow) : '';
   // CLEARED for a continue, not seeded from the run — client-11.
   //
   // The dialog's own description promises "the scope is cleared — a continue
@@ -390,6 +404,13 @@ export const RUN_SEEDED = [
   'qaRoundBudgetUsd',
   'ladderPerRunRungs',
   'ladderPerPhaseRungs',
+  'cacheTtlAb',
+  'keepWarmSec',
+  'subagentModel',
+  'bashMaxOutput',
+  'humanStepMode',
+  'compaction',
+  'compactionWindow',
   'onlyPhases',
   'phaseOptions',
   'resumeOnRestart',

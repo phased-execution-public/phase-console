@@ -627,6 +627,17 @@ export const STATUS_MEANINGS = Object.freeze({
       'Install what is missing, or run the check yourself.',
     ),
   }),
+  evaluation: Object.freeze({
+    met: say('The independent evaluator read this criterion as met.', 'Nothing to do.'),
+    'not-met': say(
+      'The independent evaluator read this criterion as not met. It is advice: nothing is held unless the plan says hold.',
+      'Read its evidence line, then fix the phase or note why the evaluator is wrong.',
+    ),
+    unknown: say(
+      'The independent evaluator could not tell from what it read, or could not run.',
+      'Nothing to do, or check the criterion yourself.',
+    ),
+  }),
   'issue-category': Object.freeze({
     bug: say(
       'Something does not work as it should.',

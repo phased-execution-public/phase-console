@@ -33,7 +33,20 @@ import { Textarea } from '@/ui/textarea';
 import { SkillPicker } from './skill-picker';
 import { McpPicker } from './mcp-picker';
 import { PRIORITY_LABELS, RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
-import { PERMISSION_MODES, QA_FIX_STRATEGIES, QA_FIX_STRATEGY_LABELS } from '@shared/run-settings.js';
+import {
+  BASH_MAX_OUTPUT_MIN,
+  CACHE_TTL_AB_MODES,
+  COMPACTION_MODES,
+  COMPACTION_WINDOW_MIN,
+  DEFAULT_BASH_MAX_OUTPUT,
+  DEFAULT_COMPACTION_WINDOW,
+  DEFER_CLI_FLOOR,
+  HUMAN_STEP_MODES,
+  KEEP_WARM_MAX_SEC,
+  PERMISSION_MODES,
+  QA_FIX_STRATEGIES,
+  QA_FIX_STRATEGY_LABELS,
+} from '@shared/run-settings.js';
 import {
   DEFAULT_MAX_PER_REPO,
   ISOLATED,
@@ -217,6 +230,147 @@ function ModelPair() {
             ['pinned', 'pinned — this model or park'],
           ]}
           onChange={(next) => f.set('modelPolicy', next as RunSetupValues['modelPolicy'])}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * What every session is started with (measured-console phase 6): the model its
+ * subagents run, how much of a command's output it reads back, and the prompt
+ * cache's two measured knobs — a lifetime test across phases and a keep-warm
+ * for a parked session. Each lands on the next phase to board.
+ */
+export function SessionEnvSection() {
+  const f = useSetupForm();
+  const { values } = f;
+  if (!f.on('subagentModel') && !f.on('bashMaxOutput') && !f.on('cacheTtlAb') && !f.on('keepWarmSec')) {
+    return null;
+  }
+  return (
+    <div className={PAIR}>
+      {f.on('subagentModel') && (
+        <ModelChoice
+          label="Model for side work (subagents)"
+          hint="The model a session's subagents run — searches, reads, the work it hands off. Empty keeps the plan's Subagent model line, else the session's own choice."
+          source={f.src('subagentModel')}
+          effect={f.fx('subagentModel')}
+          value={values.subagentModel}
+          placeholder="the plan’s, else the session’s"
+          options={f.modelOptions}
+          onChange={(next) => f.set('subagentModel', next)}
+        />
+      )}
+      {f.on('bashMaxOutput') && (
+        <NumberField
+          label="Bash output read back (characters)"
+          hint={`How much of a command's output a session reads back before the middle is cut. Empty keeps the console's ${DEFAULT_BASH_MAX_OUTPUT.toLocaleString('en-US')}.`}
+          source={f.src('bashMaxOutput')}
+          effect={f.fx('bashMaxOutput')}
+          error={f.errors.bashMaxOutput}
+          value={values.bashMaxOutput}
+          min={BASH_MAX_OUTPUT_MIN}
+          step={1000}
+          placeholder={String(DEFAULT_BASH_MAX_OUTPUT)}
+          onChange={(next) => f.set('bashMaxOutput', next)}
+        />
+      )}
+      {f.on('cacheTtlAb') && (
+        <SelectField
+          label="Cache lifetime test"
+          hint="Alternate phases runs every other phase of an API-key account on the other prompt-cache lifetime, so the run can compare what each costs. Off keeps each account's own."
+          source={f.src('cacheTtlAb')}
+          effect={f.fx('cacheTtlAb')}
+          value={values.cacheTtlAb}
+          options={CACHE_TTL_AB_MODES.map(
+            (mode) => [mode, mode === 'alternate' ? 'Alternate phases' : 'Off'] as const,
+          )}
+          onChange={(next) => f.set('cacheTtlAb', next as RunSetupValues['cacheTtlAb'])}
+        />
+      )}
+      {f.on('keepWarmSec') && (
+        <NumberField
+          label="Keep cache warm (seconds)"
+          hint={`How long a parked session's prompt cache is kept warm, up to ${KEEP_WARM_MAX_SEC.toLocaleString('en-US')}. Empty or 0 is off.`}
+          source={f.src('keepWarmSec')}
+          effect={f.fx('keepWarmSec')}
+          error={f.errors.keepWarmSec}
+          value={values.keepWarmSec}
+          min={0}
+          step={60}
+          placeholder="off"
+          onChange={(next) => f.set('keepWarmSec', next)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** How each word of the two platform choices reads in its select. */
+const HUMAN_STEP_WORDS: Readonly<Record<(typeof HUMAN_STEP_MODES)[number], string>> = {
+  park: 'Park the phase until the step is done',
+  defer: 'Keep the session waiting on the step',
+};
+const COMPACTION_WORDS: Readonly<Record<RunSetupValues['compaction'], string>> = {
+  console: 'The console (its checkpoints)',
+  native: 'The CLI',
+  alternate: 'Alternate phases (odd phases the CLI)',
+};
+
+/**
+ * The platform's pieces (measured-console phase 12): how a session meets a
+ * person's step, and who compacts a long one — the console's checkpoints or
+ * the CLI's own compaction at a window. Each lands on the next phase to board.
+ */
+export function PlatformSection() {
+  const f = useSetupForm();
+  const { values } = f;
+  const anyOn = [
+    f.on('humanStepMode'),
+    f.on('compaction'),
+    f.on('compactionWindow'),
+  ].some(Boolean);
+  if (!anyOn) {
+    return null;
+  }
+  return (
+    <div className={PAIR}>
+      {f.on('humanStepMode') && (
+        <SelectField
+          label="When a phase needs a person"
+          hint={`Park ends the session and resumes it once the step is done. Defer keeps the session's call waiting and carries on with the answer — it needs CLI ${DEFER_CLI_FLOOR} or later. Automatic defers where the CLI can, else parks.`}
+          source={f.src('humanStepMode')}
+          effect={f.fx('humanStepMode')}
+          value={values.humanStepMode}
+          placeholder="Automatic (defer on a CLI that supports it)"
+          options={HUMAN_STEP_MODES.map((mode) => [mode, HUMAN_STEP_WORDS[mode]] as const)}
+          onChange={(next) => f.set('humanStepMode', next as RunSetupValues['humanStepMode'])}
+        />
+      )}
+      {f.on('compaction') && (
+        <SelectField
+          label="Who compacts a long session"
+          hint="The console checkpoints a session as its context fills. The CLI compacts it in place at the window below. Alternate phases runs odd phases on the CLI's, so the run can compare the two."
+          source={f.src('compaction')}
+          effect={f.fx('compaction')}
+          value={values.compaction}
+          options={COMPACTION_MODES.map((mode) => [mode, COMPACTION_WORDS[mode]] as const)}
+          onChange={(next) => f.set('compaction', next as RunSetupValues['compaction'])}
+        />
+      )}
+      {f.on('compactionWindow') && (
+        <NumberField
+          label="The CLI compacts at (tokens)"
+          hint={`Used only when the CLI compacts. Empty keeps the console's ${DEFAULT_COMPACTION_WINDOW.toLocaleString('en-US')}.`}
+          source={f.src('compactionWindow')}
+          effect={f.fx('compactionWindow')}
+          error={f.errors.compactionWindow}
+          value={values.compactionWindow}
+          min={COMPACTION_WINDOW_MIN}
+          step={10000}
+          placeholder={String(DEFAULT_COMPACTION_WINDOW)}
+          onChange={(next) => f.set('compactionWindow', next)}
         />
       )}
     </div>
@@ -1473,6 +1627,8 @@ export function CategorySection({ id }: { id: CategoryId }) {
       return (
         <div className="flex min-w-0 flex-col gap-4">
           <ModelSection />
+          <SessionEnvSection />
+          <PlatformSection />
           <PerPhaseSection />
           <PromptSection />
         </div>
@@ -1526,6 +1682,8 @@ export function FlatForm() {
       <DecisionsSection />
       <ScopeSection />
       <ModelSection />
+      <SessionEnvSection />
+      <PlatformSection />
       <AccountSection />
       <PermissionsSection />
       <MoneySection />

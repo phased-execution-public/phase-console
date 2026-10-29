@@ -11,9 +11,10 @@
  *
  * The ideas that hold the URL space together, unchanged since 3.0:
  *
- * 1. **Seven destinations, many heads.** `DESTINATIONS` is what the rail and
- *    the tab bar offer — the same seven in both editions since 7.0 (`runs plans
- *    sessions repo insights logs settings`). `ROUTE_HEADS` is every head that
+ * 1. **Eight destinations, many heads.** `DESTINATIONS` is what the rail and
+ *    the tab bar offer — the same eight in both editions since 8.0 (`runs turn
+ *    plans sessions repo insights logs settings`; 7.0 had seven, and Your turn
+ *    became the eighth in one-pool phase 14, #366). `ROUTE_HEADS` is every head that
  *    still resolves, which is a much longer list, because a head that ever
  *    appeared in a bookmark, a push payload or a handoff never stops working.
  *    `destinationFor()` is the mapping between them, and it is why `#/plan/x/run`

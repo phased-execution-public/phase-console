@@ -37,24 +37,35 @@ plan. The **Your turn** guide walks through the page and every item on it.
 
 ## Plans — where does each plan stand?
 
-**Plans** lists every plan in this source, one line each: its status, its name, its line of phases, the
-sessions left and when it last moved. Search it; **Filter**, **Group**, **Sort** and **View** narrow, group,
-order and draw it, as a **List** or as **Cards**; closed plans and documents wait in folds that give their
-counts. **New plan** offers three ways to begin one: **Write it with AI** (needs `--allow-agent`),
-**Scaffold from the template** (needs `--allow-writes`), and **Plan from issues**, which opens the Issues
-desk at the issues that need a plan.
+**Plans** lists every plan in this source, one line each: its status, its name, its line of phases, what
+is running now, what it waits on, the phases next up, its items on **Your turn**, the sessions left with the
+estimate, what its runs have spent, the account that pays and the model, and when it last moved. A desk that
+cannot fit them all scrolls the table sideways, and the status and the name stay put while it does. Search
+it; **Filter**, **Group**, **Sort** and **View** narrow, group, order and draw it, as a **List** or as
+**Cards**; closed plans and documents wait in folds that give their counts. **New plan** offers three ways
+to begin one: **Write it with AI** (needs `--allow-agent`), **Scaffold from the template** (needs
+`--allow-writes`), and **Plan from issues**, which opens the Issues desk at the issues that need a plan.
+
+Every status says why. Press **Why** beside a plan's status and the panel opens on the reasons behind the
+word: what needs you, each item with the way to it on **Your turn**; what stopped its run, as the stop's
+own card with its one recommended recovery; which phases are running, and since when; what it waits on, and
+until when — a usage window and its reset, its place in the queue, another session's claim, the phase before
+it, a gate that clears by itself; what can start next; and, for a plan that is over, how it ended. Under the
+reasons the plan's phases stand in their own order, and every fact about the plan follows.
 
 A plan opens on its glance: the title, its status, its line, what is left and what it costs, and the one
 act that fits, such as **Start phase 1** when nothing is running. Under it, four views, each an address:
-**Phases** (as a **Table**, a **Map**, **QA**, **Handoffs**, a **Schedule** or a **Burn-up**), **Run** (this plan's run, `#/plan/<slug>/run`:
+**Phases** (as a **Table**, a **Map**, **Handoffs & QA** — each phase's handoff and its QA side by side — a **Schedule** or a **Burn-up**), **Run** (this plan's run, `#/plan/<slug>/run`:
 start it, watch it and steer it — the console needs `--allow-run` — and **History**, its earlier runs),
 **Your turn** (this plan's acts only you can do, `#/plan/<slug>/turn`, with how many are open) and
 **Source** (the plan file and its handoffs). A phase's **Details** opens it in place, **Inspect phase N** puts it in the panel, and
 **Everything** shows every column of the table.
 
-A plan's line is drawn to scale, each stretch as wide as its share of the plan, and its legend counts it:
-*12 done · 1 held by QA · 2 in progress · 1 stuck · 3 next up · 9 waiting · 2 gated · 4 left · 35 %*. A
-closed plan's line says what never ran instead: *30 done · 4 never ran*. Where a plan's or a phase's status
+A plan's line is a pipeline drawn to scale: every phase a cell in its share's colour, each stretch as wide
+as its share of the plan, and the share done as a badge at its end, *35 %*. Under it every share is a badge
+in the colour of its stretch — *12 done*, *1 held by QA*, *2 in progress*, *1 stuck*, *3 next up*, *9
+waiting*, *2 gated* — and what is left is said in words, *4 left*. A closed plan's line says what never ran
+instead: *30 done*, *4 never ran*. Where a plan's or a phase's status
 is a row's headline — the Plans list and cards, the plan's header, the Phases table, the Run view's phase
 rows and Sessions — it is drawn as a badge: the status's icon and word in its colour, inside an outline,
 with no fill.

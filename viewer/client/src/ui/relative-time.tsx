@@ -1,5 +1,5 @@
 import type { HTMLAttributes } from 'react';
-import { useNow } from '@/lib/clock';
+import { useNow } from '@/ui/clock';
 import { cn } from '@/lib/cn';
 import { relativeTime } from '@/lib/format';
 

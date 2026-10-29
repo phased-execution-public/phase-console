@@ -1,26 +1,55 @@
 /**
- * The Logs destination's wire (Debug until 7.0, and its routes keep the name).
- *
- * Types are re-declared here by hand rather than imported from `server/` — the
- * house rule for every module in this directory. The client and the server are
- * two programs that agree on a JSON shape; importing the server's type would
- * make a server refactor silently retype the client, and the wire would stop
- * being a thing either side could see.
+ * The Logs destination's fetchers (Debug until 7.0, and its routes keep the
+ * name). The shapes are the wire's (`shared/wire/debug.js`, measured-console
+ * phase 32), one declaration the server's handlers import too.
  *
  * Everything here is a read. The bundle is a read too — `?download=1` only
  * changes the headers — so nothing in this module needs the CSRF header or the
  * write flag.
  */
 
-import type { ProbeStatus } from '@shared/ops-vocab.js';
 import { post, q, request } from '../http';
+import type { DebugIndexParams } from '../logs';
+import type {
+  DebugBundle,
+  DebugIndex,
+  DebugLevel,
+  DebugLevelBody,
+  DebugLevelState,
+  DebugRuns,
+  DebugSource,
+  DoctorReport,
+  RetentionReport,
+} from '@shared/wire/debug.js';
+
+export type {
+  DebugBundle,
+  DebugEntry,
+  DebugIndex,
+  DebugLevel,
+  DebugLevelBody,
+  DebugLevelState,
+  DebugRuns,
+  DebugSource,
+  DebugSourceStatus,
+  DeliveryTally,
+  DoctorReport,
+  DoctorRow,
+  MetricFamily,
+  MetricSample,
+  RetentionAction,
+  RetentionReport,
+  RetentionSinkReport,
+} from '@shared/wire/debug.js';
+export type { DebugIndexParams } from '../logs';
 
 /**
  * Where a row came from. The server's list, in the server's order.
  *
  * Kept as a `const` array rather than a bare union so the filter bar can render
- * the vocabulary without a second copy of it, and so a source the server adds
- * shows up here as a compile error rather than as a silently missing chip.
+ * the vocabulary without a second copy of it; held to the wire's `DebugSource`
+ * (`shared/wire/debug.js`) by `satisfies`, so a word the wire does not know is a
+ * compile error rather than a chip that filters nothing.
  */
 export const DEBUG_SOURCES = [
   'console',
@@ -30,129 +59,9 @@ export const DEBUG_SOURCES = [
   'ruling',
   'delivery',
   'health',
-] as const;
-export type DebugSource = (typeof DEBUG_SOURCES)[number];
+] as const satisfies readonly DebugSource[];
 
-export const DEBUG_LEVELS = ['info', 'warn', 'error'] as const;
-export type DebugLevel = (typeof DEBUG_LEVELS)[number];
-
-/** One row, whatever it came from. `at` is `''` when the source had no time. */
-export interface DebugEntry {
-  source: DebugSource;
-  at: string;
-  level: DebugLevel;
-  event: string;
-  text: string;
-  slug?: string;
-  runId?: string;
-  phase?: number;
-  /**
-   * The correlation ids the source line carried (envelope v2). Absent on a v1
-   * line and never invented — "this predates the ids" and "this was written
-   * outside every span" are both real answers.
-   */
-  traceId?: string;
-  spanId?: string;
-  data?: Record<string, unknown>;
-}
-
-/**
- * Whether a source could be read, and why not.
- *
- * `available: false` with a `note` is an ANSWER — "there is no supervisor log
- * on this machine" — and the page must render it as one. An absent note on an
- * unavailable source means the reason is structural and stated elsewhere.
- */
-export interface DebugSourceStatus {
-  source: DebugSource;
-  available: boolean;
-  path?: string;
-  count: number;
-  note?: string;
-}
-
-export interface DebugIndex {
-  entries: DebugEntry[];
-  sources: DebugSourceStatus[];
-  /** The limit cut the answer. The page says so rather than implying "all". */
-  truncated: boolean;
-  /** The plans this answer covers — bounded when no slug was named. */
-  slugs: string[];
-  /**
-   * Present when the read included the `delivery` source.
-   *
-   * The SERVER's tally, not a client re-derivation: `undelivered` counts an
-   * announcement no device took, which is a different question from how many
-   * rows said `failed`, and two implementations of that rule would be two
-   * answers.
-   */
-  delivery?: DeliveryTally;
-}
-
-export interface DebugRuns {
-  slug: string;
-  runs: string[];
-}
-
-export interface MetricSample {
-  labels: Record<string, string>;
-  value: number;
-}
-
-export interface MetricFamily {
-  name: string;
-  type: string;
-  help: string;
-  samples: MetricSample[];
-}
-
-export interface DeliveryTally {
-  /** One count per outcome word actually seen — `sent`, `quiet`, `failed`, … */
-  outcomes: Record<string, number>;
-  /** Announcements no device took. Not the same as the `failed` count. */
-  undelivered: number;
-  announcements: number;
-  devices: number;
-}
-
-export interface DebugBundle {
-  schema: string;
-  version: number;
-  generatedAt: string;
-  console: Record<string, unknown>;
-  root: string | null;
-  plans: { slug: string; runs: string[] }[];
-  health: {
-    environment: { kind: string; detail: string; fix: string }[];
-    watches: { passes: number; asked: string[]; open: boolean } | null;
-  };
-  metrics: MetricFamily[];
-  delivery: DeliveryTally;
-  entries: DebugEntry[];
-  sources: DebugSourceStatus[];
-  /** What was left out, and how to ask for it. */
-  notes: string[];
-}
-
-/**
- * The index's parameters.
- *
- * `type`, not `interface` — only a type alias is assignable to the
- * `Record<string, …>` the query builder takes, the same reason `repo.ts` gives.
- */
-export type DebugIndexParams = {
-  source?: DebugSource[];
-  level?: DebugLevel[];
-  slug?: string;
-  run?: string;
-  phase?: number;
-  /** One trace, exactly: the run's whole story and nothing that merely shares its clock. */
-  trace?: string;
-  q?: string;
-  since?: string;
-  until?: string;
-  limit?: number;
-};
+export const DEBUG_LEVELS = ['info', 'warn', 'error'] as const satisfies readonly DebugLevel[];
 
 /** Only the parameters that were actually given — an empty value is not a request. */
 function query(params: Readonly<Record<string, string | number | boolean | undefined>>): string {
@@ -187,70 +96,6 @@ export function debugTailPath(params: DebugIndexParams = {}): string {
   return debugIndexPath('/api/debug/tail', params);
 }
 
-/**
- * `GET /api/doctor` — the run-start prelude's probes and the machine checks,
- * the same report `phase-console doctor` prints (`server/doctor.ts`). A row
- * whose `blocking` is true fails the report; `firstFailing` is the one to fix
- * first, and the page leads with it.
- */
-export interface DoctorRow {
-  id: string;
-  label: string;
-  status: ProbeStatus;
-  blocking: boolean;
-  reason: string;
-  warnings?: string[];
-}
-
-export interface DoctorReport {
-  instance: { id: string; name: string; root: string | null; port: number; default: boolean } | null;
-  mode: 'console' | 'offline';
-  rows: DoctorRow[];
-  ok: boolean;
-  firstFailing: DoctorRow | null;
-  cliFloor: string;
-  at: string;
-}
-
-/**
- * `GET /api/debug/level` — how loud this console's own log is, and until when.
- * An override reverts by itself at `until`; `null` means the configured level.
- */
-export interface DebugLevelState {
-  level: string;
-  debug?: string | null;
-  /** `override` while a person's change stands; `env` once it reverted, or never was. */
-  source: 'override' | 'env';
-  /** Epoch ms the override reverts at — present only on `override`. */
-  until?: number;
-  levels: string[];
-}
-
-/** One sink's live size, its policy row, and how many files the next sweep would touch. */
-export type RetentionSinkReport = {
-  sink: string;
-  files: number;
-  bytes: number;
-  due: number;
-};
-
-export type RetentionAction = {
-  kind: 'delete' | 'rotate' | 'truncate' | 'oversized';
-  sink: string;
-  path: string;
-  bytes: number;
-  keepBytes?: number;
-  why: string;
-};
-
-export type RetentionReport = {
-  at: string;
-  policy: Record<string, number>;
-  sinks: RetentionSinkReport[];
-  bytes: number;
-  actions: RetentionAction[];
-};
-
 /* ------------------------------------------------------------------ *
  * The trace — the run on one axis, across all four sources (Pro)
  * ------------------------------------------------------------------ */
@@ -269,8 +114,7 @@ export const debugApi = {
    * the deadline. `debug` names the channels whose debug lines are written
    * whatever the level — a csv of event prefixes (`git, runner`) or `*`.
    */
-  setDebugLevel: (body: { level: string; debug?: string; ttlMs: number }) =>
-    post<DebugLevelState>('/api/debug/level', body),
+  setDebugLevel: (body: DebugLevelBody) => post<DebugLevelState>('/api/debug/level', body),
   revertDebugLevel: () => request<DebugLevelState>('/api/debug/level', { method: 'DELETE' }),
   /*
      A plain href, not a fetch: the browser's own download machinery names the

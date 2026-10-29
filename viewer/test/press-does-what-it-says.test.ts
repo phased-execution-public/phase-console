@@ -23,10 +23,11 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn as spawnProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { stubRepo, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
@@ -57,23 +58,13 @@ type Repo = {
   cleanup: () => void;
 };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
-function repo(): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-press-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
+function stubbedPlan(): Repo {
   // A linear 3-phase graph: phase N is ready once every earlier phase is done;
   // a phase listed in `inprog` has an in-progress handoff (the board says so).
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+  const made = stubRepo({
+    prefix: 'pc-press-',
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -95,19 +86,16 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
+`,
+      'phase-lock.sh': `#!/usr/bin/env bash
 set -u
 if [ "\${2:-}" = "status" ]; then echo "phase \${3:-?}: free"; fi
 exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    setInProgress: (phase) => writeFileSync(join(state, 'inprog'), `${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return { ...made, setInProgress: (phase) => writeFileSync(join(made.state, 'inprog'), `${phase}\n`) };
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -315,7 +303,7 @@ test('PR-1: a resume whose policy says fresh boards the resume brief plus the op
 });
 
 test('PR-1: the re-board boards the phase with the resume brief AND the words, through the loop (the runner half)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts: { phase: number; prompt: string }[] = [];
     const { instance } = runner(r, workingSession(r, prompts));
@@ -340,7 +328,7 @@ test('PR-1: the re-board boards the phase with the resume brief AND the words, t
 });
 
 test('PR-1: a person\'s recovery that finds it cannot resume after all leaves the phase hinted to board fresh with the words — a rung\'s does not', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     for (const person of [true, false]) {
       const { instance } = runner(r, async () => ok(), {
@@ -454,7 +442,7 @@ test('PR-3: a resume whose session is still running is refused naming it — not
  * ------------------------------------------------------------------ */
 
 test('PR-5: a person\'s Retry boards a phase whose ladder is spent — the loop does not climb it and park it again (#56)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     // The #36 shape: an in-progress handoff, three rungs spent on merit.
     r.setInProgress(1);
@@ -499,7 +487,7 @@ test('PR-5: a person\'s Retry boards a phase whose ladder is spent — the loop 
 });
 
 test('ID-5: a person\'s Retry survives a halt that withdrew it before it boarded — kept open, and re-armed first when the run resumes (#131)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     const prompts: { phase: number; prompt: string }[] = [];
     const { instance, events } = runner(r, workingSession(r, prompts));
@@ -603,7 +591,7 @@ test('PR-7: Delegate records a deviation ruling on human-acts naming the operato
  * ------------------------------------------------------------------ */
 
 test('PR-8: switch-account on a live runner is journalled, stored at once, and joins the run\'s pool', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   try {
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -635,7 +623,7 @@ test('PR-8: switch-account on a live runner is journalled, stored at once, and j
 });
 
 test('PR-8: a switch pressed while the run is still STARTING lands on the run the start persists', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const svc = service(r.root);
   try {
     let pass: () => void = () => {};
@@ -797,7 +785,7 @@ function closingSession(r: Repo, closing: 'none' | 'outcome' = 'none') {
 const tokenEnv = async (accountId: string | undefined) => (accountId ? { CLAUDE_CODE_OAUTH_TOKEN: `tok-${accountId}` } : null);
 
 test('SW-4: a switch does not checkpoint a lane whose handoff already reads complete — it answers deferred:[N] and the lane finishes where it is (#107)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const lane = closingSession(r);
   const { instance, events } = runner(r, lane.spawn, {
     accountEnv: tokenEnv,
@@ -829,7 +817,7 @@ test('SW-4: a switch does not checkpoint a lane whose handoff already reads comp
 });
 
 test('SW-4: a lane whose session has declared its outcome is closing too — deferred, never checkpointed; an ordinary live lane still is', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const lane = closingSession(r, 'outcome');
   const { instance } = runner(r, lane.spawn, { accountEnv: tokenEnv });
   try {
@@ -846,7 +834,7 @@ test('SW-4: a lane whose session has declared its outcome is closing too — def
   }
 
   // The control: nothing says it is closing, so "now" means now.
-  const r2 = repo();
+  const r2 = stubbedPlan();
   const busy = closingSession(r2);
   const second = runner(r2, busy.spawn, { accountEnv: tokenEnv });
   try {
@@ -863,7 +851,7 @@ test('SW-4: a lane whose session has declared its outcome is closing too — def
 });
 
 test('SW-5: switch-account {when: "boundary"} checkpoints nothing — every live lane finishes on the old account, and every later admission is on the new one', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const lane = closingSession(r);
   const svc = service(r.root);
   const { instance, events } = runner(r, lane.spawn, { accountEnv: tokenEnv });
@@ -1076,7 +1064,7 @@ test('RS-5: a live run\'s verdict — a pressed phase serial behind a live lane 
 });
 
 test('SW-6: switch-account {dry: true} previews the lanes it would checkpoint and acts on nothing (phase 25, #107 ask 2)', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const lane = closingSession(r);
   const svc = service(r.root);
   const { instance, events } = runner(r, lane.spawn, { accountEnv: tokenEnv });

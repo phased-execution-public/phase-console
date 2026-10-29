@@ -24,7 +24,16 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const VIEWER = dirname(dirname(fileURLToPath(import.meta.url)));
-const SCRATCH = '.dist-verify';
+// `--dir <name>` builds into `client/<name>` instead — the gate's one build per
+// commit, `client/.dist-<sha>` (scripts/gates.sh, measured-console phase 7). A
+// name only: a path would let the scratch build land somewhere `rmSync` below
+// should never reach.
+const dirAt = process.argv.indexOf('--dir');
+const SCRATCH = dirAt >= 0 ? (process.argv[dirAt + 1] ?? '') : '.dist-verify';
+if (!/^\.dist-[A-Za-z0-9-]+$/.test(SCRATCH)) {
+  process.stderr.write(`verify-dist: --dir wants a name like .dist-<id>, not ${JSON.stringify(SCRATCH)}\n`);
+  process.exit(2);
+}
 const keep = process.argv.includes('--keep');
 const env = { ...process.env, PC_DIST_DIR: SCRATCH };
 
@@ -45,7 +54,7 @@ function run(label, command, args) {
 
 const out = join(VIEWER, 'client', SCRATCH);
 let ok =
-  run('vite build → client/.dist-verify', 'npx', ['vite', 'build']) &&
+  run(`vite build → client/${SCRATCH}`, 'npx', ['vite', 'build']) &&
   run('stamp', process.execPath, [join(VIEWER, 'scripts', 'stamp-build.mjs')]) &&
   // Before check-dist, and not optional: the first-paint gate measures the
   // bytes the SERVER would send, so a scratch build with no `.br` siblings

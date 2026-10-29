@@ -24,10 +24,11 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repo } from './fixtures/repo.ts';
 
 import { Runner } from '../server/runner/runner.ts';
 import { verifyPhase } from '../server/runner/verify.ts';
@@ -41,16 +42,12 @@ const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 /** A repository with one commit: src/a.ts, CHANGELOG.md. */
-function repo(): { dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'pc-proof-'));
-  mkdirSync(join(dir, 'src'), { recursive: true });
-  git(dir, 'init', '-q', '-b', 'main');
-  git(dir, 'config', 'user.email', 't@example.invalid');
-  git(dir, 'config', 'user.name', 't');
-  writeFileSync(join(dir, 'src', 'a.ts'), 'export const a = 1;\n');
-  writeFileSync(join(dir, 'CHANGELOG.md'), '# changes\n');
-  git(dir, 'add', '-A');
-  git(dir, 'commit', '-qm', 'init');
+function seededRepo(): { dir: string; cleanup: () => void } {
+  const dir = repo({
+    prefix: 'pc-proof-',
+    files: { 'src/a.ts': 'export const a = 1;\n', 'CHANGELOG.md': '# changes\n' },
+    message: 'init',
+  });
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
@@ -67,7 +64,7 @@ function prove(dir: string, ledger: string, command: string, code: number, phase
  * ------------------------------------------------------------------ */
 
 test('VP-1: the tree the script records is the tree the console computes — uncommitted and untracked work included', async () => {
-  const r = repo();
+  const r = seededRepo();
   const ledger = join(r.dir, '..', `${Date.now()}-proofs.ndjson`);
   try {
     // What a session has when it runs its suite: an edit not yet committed and
@@ -93,7 +90,7 @@ test('VP-1: the tree the script records is the tree the console computes — unc
 });
 
 test('VP-1: a linked worktree answers too — the mirror every console run works in is one', async () => {
-  const r = repo();
+  const r = seededRepo();
   const lane = `${r.dir}-lane`;
   const ledger = `${r.dir}-proofs.ndjson`;
   try {
@@ -127,7 +124,7 @@ test('VP-1: a file rewritten at the same size in the second it was checked out i
   // re-reads such an entry only while it is not older than the INDEX FILE, so
   // the private copy keeps the index file's mtime; a copy without it named the
   // checkout's tree a second later — the flake this pins.
-  const r = repo();
+  const r = seededRepo();
   const lane = `${r.dir}-racy`;
   const ledger = `${r.dir}-proofs.ndjson`;
   try {
@@ -160,7 +157,7 @@ test('VP-2: paperwork is the handoffs, the locks and the changelog — nothing a
 });
 
 test('VP-2: a green proof holds at its own tree and across paperwork; a code change or a red proof does not', async () => {
-  const r = repo();
+  const r = seededRepo();
   const ledger = `${r.dir}-proofs.ndjson`;
   try {
     prove(r.dir, ledger, 'npm   test', 0);
@@ -198,7 +195,7 @@ test('VP-2: a green proof holds at its own tree and across paperwork; a code cha
 });
 
 test('VP-2: the last proof of a command wins, another phase\'s proofs are not this phase\'s, and nothing on file asks git nothing', async () => {
-  const r = repo();
+  const r = seededRepo();
   const ledger = `${r.dir}-proofs.ndjson`;
   try {
     prove(r.dir, ledger, 'npm test', 1);
@@ -254,7 +251,7 @@ test('VP-3: a proven command is not run — its row is green and names the proof
  * changes code after it did.
  */
 function runRepo() {
-  const r = repo();
+  const r = seededRepo();
   const scripts = join(r.dir, '.stub', 'scripts');
   const served = join(r.dir, '.stub', 'served');
   mkdirSync(scripts, { recursive: true });

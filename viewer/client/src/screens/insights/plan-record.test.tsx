@@ -59,7 +59,7 @@ describe('the QA verdicts list', () => {
     expect(screen.getByRole('link', { name: 'P4' })).toHaveAttribute('href', '#/plan/demo/handoff/4');
     expect(screen.getByTitle('docs/handoffs/demo/qa-4.md')).toHaveAttribute(
       'href',
-      '#/plan/demo/phases?view=qa&report=4',
+      '#/plan/demo/phases?view=handoffs&report=4',
     );
   });
 

@@ -65,7 +65,7 @@ test('a full request becomes exactly the argv the CLI needs, prompt last', () =>
     '--name', 'Claude: Fix the flaky auth tests and commit.',
   ]);
   assert.match(prompt, /^Fix the flaky auth tests and commit\./);
-  assert.match(prompt, /\/design-review/);
+  assert.match(prompt, /Call the Skill tool with "design-review"/);
   assert.equal(launch.args.filter((a) => a.startsWith('Fix the flaky auth')).length, 1,
     'the prompt appears exactly once, as the positional');
   assert.equal(launch.label, 'Claude: Fix the flaky auth tests and commit.');
@@ -183,7 +183,7 @@ test('the composed plan prompt walks Mode 1 end to end and carries the brief', (
   // The plan skill is the subject of the prompt, not a second, competing
   // directive; the extra skill still gets its line.
   assert.ok(!text.includes('): /phased-execution'), 'no directive re-names the plan skill');
-  assert.match(text, /\/design-review/);
+  assert.match(text, /Call the Skill tool with "design-review"/);
   assert.equal(built.launch.label, 'Plan: Add rate limiting to the public API.');
   assert.equal(built.launch.meta?.intent, 'plan');
   // The prompt matches the mode it is launched in: present first, write after
@@ -387,7 +387,7 @@ test('extra skills are shaped, deduped and capped — bad ids dropped, not fatal
   assert.equal(built.ok, true);
   if (!built.ok) return;
   const text = built.launch.args[built.launch.args.length - 1];
-  assert.match(text, /\/design-review, \/plug:tool\.x/);
+  assert.match(text, /Call the Skill tool with "design-review"\. Call the Skill tool with "plug:tool\.x"\./);
   assert.ok(!text.includes('bad id'));
 });
 
@@ -493,7 +493,7 @@ test('a recovery ticket honors model, effort and skills — the dialog depends o
   assert.equal(built.launch.args[built.launch.args.indexOf('--model') + 1], 'sonnet');
   assert.equal(built.launch.args[built.launch.args.indexOf('--effort') + 1], 'high');
   const prompt = built.launch.args[built.launch.args.length - 1];
-  assert.match(prompt, /\/design-review/, 'picked skills reach the recovery prompt');
+  assert.match(prompt, /Call the Skill tool with "design-review"/, 'picked skills reach the recovery prompt');
   assert.match(prompt, /plan-repair|Repair/i, 'and it is still the recovery briefing');
 });
 

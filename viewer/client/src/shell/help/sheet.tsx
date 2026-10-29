@@ -24,7 +24,6 @@
  */
 
 import { Suspense, lazy, useCallback } from 'react';
-import { usePhone } from '@/lib/media';
 import { useConsoleState } from '@/data/console';
 import { Mono, Spinner } from '@/ui';
 import { Sheet, SheetContent } from '@/ui/sheet';
@@ -57,7 +56,6 @@ function centreCurrent(strip: HTMLElement | null): void {
 
 export function HelpSheet({ route }: { route: Route }) {
   const navigate = useNavigate();
-  const phone = usePhone();
   const asked = route.query[OVERLAY_KEYS.help];
   const open = asked != null;
   const { section, cardLabel } = helpPlace(route, asked || undefined);
@@ -74,7 +72,8 @@ export function HelpSheet({ route }: { route: Route }) {
       }}
     >
       <SheetContent
-        side={phone ? 'bottom' : 'end'}
+        side="auto"
+        size="reading"
         title="Help"
         showTitle
         // Help is read before anything in it is pressed: open on its title,

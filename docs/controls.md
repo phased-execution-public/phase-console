@@ -62,6 +62,30 @@ plain language at plan time, or edit the file yourself afterwards.
 | Let the console push a finished phase's branch | start it with `--allow-publish` AND let the plan's `permission.destructive` row allow `git push` — both, or the landing parks with `phase.landing-push-refused`; `phase-console doctor` has a `publish` row saying whether a push is possible at all | the start command · the plan's `## Decisions` |
 
 
+
+
+
+Three more of a run's settings decide how its sessions live, each on the launch form and under Settings
+▸ Automation's defaults:
+
+- **Who compacts a long session** (`compaction`): `console` — the default — wraps a session up at 0.6×
+  of its window and checkpoints it at 0.8×; `native` lets Claude Code compact it at
+  `compactionWindow` (350,000 tokens), journalled `phase.compaction` with the tokens before and after;
+  `alternate` gives odd phases `native`, so one run measures both.
+- **What a person's step does to the session** (`humanStepMode`): `defer` — the default on a CLI at
+  2.1.306 or later — pauses the session at its `needs-human` call, and when your check passes the
+  same session carries on from that call (`phase.deferred`, `phase.deferred-resumed`); `park` ends the
+  turn and resumes the phase afterwards, as 8.0 did.
+- **What an unattended session loads** (`autopilotLoads`, a console preference): `console-set` — the
+  default — loads the console's own skill tree and the plugins you switched on for autopilot, never
+  your personal ones; `operator-config` loads whatever the session's config dir loads.
+
+The plan says the rest, each line optional: `**Subagent model:**` (the model of a session's
+subagents), `**Verification tier:** impact` (a heavy §Verification line runs the form its diff
+selects), and on a phase `- **Fast gate:** off` (the Stop hook does not run its fast lines) and `- **May
+delete tests:** yes` (the guard lets its session delete a test file). Their grammar is
+`references/plan-format.md`.
+
 ### Changing a run's settings mid-run
 
 `POST /api/run/<slug>/settings` patches a run in flight or a stored one, and each field lands when
@@ -369,8 +393,8 @@ stays a claim you can trust.
 
 ## Your turn: what only a person can do
 
-Everything a run asks of a person is one **item** on one page: `#/turn`, titled *Your turn* and lighting
-Runs. `#/approve` and `#/approve?step=<id>` land on it in one hop, a push opens `#/turn/<id>`
+Everything a run asks of a person is one **item** on one page: `#/turn`, *Your turn* — a destination of its
+own since 8.0 (one-pool phase 14, #366), second on the rail and on the phone's tab bar. `#/approve` and `#/approve?step=<id>` land on it in one hop, a push opens `#/turn/<id>`
 (`docs/phone.md` has the buttons a push carries), and the approval queue, a question, a gate and an errand each
 draw the same item with *Open on Your turn*. The Runs home's Your turn group keeps runs and one line linking here,
 and *Your turn (n)* in the situation line counts items. The guide's **Your turn** card is the person's account
@@ -378,8 +402,10 @@ of the page; this is the reference, and `references/turn.md` is the session's.
 
 ### The page, and what an item says
 
-Six sections in a fixed order: *Do now*, *Needs one detail from you*, *Coming up*, *Being checked*, *Done* and
-*Handled by the AI*. Each item is one card: **why only you** (one of ten reasons — `permission`, `identity`,
+Six groups in a fixed order (`TURN_GROUPS`, `shared/turn-model.js`, derived from each item's type and
+readiness, never stored): *Approve*, *Do now*, *Decide*, *Being checked*, *Coming up* and *Done*; *Handled by
+the AI* is a section of the page beside them, never a group, and the tabs *Open*, *Done*, *Handled by the AI*
+and *All* (`?tab=`) choose which you see. Each item is one card: **why only you** (one of ten reasons — `permission`, `identity`,
 `secret`, `money`, `legal`, `decision`, `physical`, `reach`, `third-party`, `reserved` — held to what its kind
 allows; an item that names none is given its kind's default, marked inferred), the plan, phase and run it belongs
 to, what it unblocks, the effort, its **guide** as steps (a why paragraph, `## Steps`, `## If it goes wrong`; at
@@ -402,7 +428,7 @@ shown it whole.
 
 | Route | What |
 |---|---|
-| `GET /api/turn[?seen=<ISO>]` | `{round, headline, groups, handled, counts, seen}`: the round that read it (`round.n` rises only when a round changed something), the one-sentence headline, the items in five groups (`now` · `decide` · `upcoming` · `checking` · `done` — *Done* holds what settled in the last day), the *Handled by the AI* rows, newest first, and the counts, with how many were handled since `seen` (the person's last look, echoed) or, with none, in the last day. |
+| `GET /api/turn[?seen=<ISO>]` | `{round, headline, groups, handled, counts, seen}`: the round that read it (`round.n` rises only when a round changed something), the one-sentence headline, the items in the six groups `TURN_GROUPS` names (`approve` · `now` · `decide` · `checking` · `upcoming` · `done` — *Done* holds what settled in the last day), the *Handled by the AI* rows, newest first, and the counts, with how many were handled since `seen` (the person's last look, echoed) or, with none, in the last day. |
 | `GET /api/turn/:id` | One item explained: what it asks, its guide, its attempts and why it is a person's. |
 | `GET /api/human-steps[?open=1]` | The human-step ledger itself. |
 
@@ -1051,6 +1077,20 @@ Run these from the repository that owns `docs/`, or set `DOCS_ROOT`.
 
 ```bash
 scripts/phase-graph.sh <slug>                    # the board (default)
+scripts/phase-graph.sh --help                    # every mode, one line — the engine's own catalogue
+scripts/phase-graph.sh --explain <F-code>        # one lint's paragraph (no plan needed)
+scripts/phase-graph.sh <slug> --section N        # N's plan section, its graph row and the §Session budget lines that bind it
+scripts/phase-graph.sh <slug> --brief N          # what a supervised session starts from (≤ 10,000 characters)
+scripts/phase-graph.sh <slug> --subagent-model [N]     # the subagents' model for the plan (or phase N)
+scripts/phase-graph.sh <slug> --verification-tier [N]  # impact | full
+scripts/phase-graph.sh <slug> --fast-gate N      # on | off
+scripts/phase-graph.sh <slug> --may-delete-tests N     # yes | no
+scripts/phase-graph.sh <slug> --skills [N]       # the skills the plan (or phase N) names
+scripts/phase-graph.sh <slug> --plugins [N]      # the plugin kinds the plan (or phase N) loads
+scripts/phase-graph.sh <slug> --evaluator [N]    # advisory | hold | off
+scripts/phase-graph.sh <slug> --canary           # on | off
+scripts/phase-graph.sh <slug> --out-of-scope N   # phase N's `- **Out of scope:**` lines
+scripts/phase-graph.sh <slug> --not-yet-specified       # the plan's `## Not yet specified` lines
 scripts/phase-graph.sh <slug> --lint             # structural validation; non-zero on a problem
 scripts/phase-graph.sh <slug> --ready            # ready phase numbers
 scripts/phase-graph.sh <slug> --ready-after N    # the ready set assuming N just completed

@@ -14,6 +14,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { HEAVY_CASE_TIMEOUT } from '@/test-heavy';
 import { queryClientConfig } from '@/data/keys';
 import { expectNoAxeViolations } from '@/test/axe';
 
@@ -260,36 +261,40 @@ beforeEach(() => {
 });
 
 describe('the quick view', () => {
-  it('opens on what runs, the finding that matters, a preset and the nine tiles', async () => {
-    await mount();
-    expect(
-      await screen.findByText(
-        'Runs alpha from phases 2 and 3, on opus at max effort, trusted, on the current branch.',
-      ),
-    ).toBeTruthy();
-    expect(tileLabels()).toEqual([
-      'Scope',
-      'Engine',
-      'Safety',
-      'Git',
-      'Money and stops',
-      'Review and QA',
-      'Tools',
-      'Accounts',
-      'Decisions',
-    ]);
-    // The boarding preflight is a banner with its own action, not a stage to visit.
-    expect(await screen.findByText('1 phase will park at boarding')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Narrow the scope' })).toBeTruthy();
-    // A fresh console IS the Balanced preset.
-    const presets = screen.getByRole('group', { name: 'Start from a preset' });
-    expect(within(presets).getByRole('button', { name: 'Balanced' }).getAttribute('aria-pressed')).toBe(
-      'true',
-    );
-    // No tile is open, so no control is drawn yet.
-    expect(screen.queryAllByRole('button', { expanded: true })).toEqual([]);
-    expect(screen.queryByLabelText('Model')).toBeNull();
-  });
+  it(
+    'opens on what runs, the finding that matters, a preset and the nine tiles',
+    async () => {
+      await mount();
+      expect(
+        await screen.findByText(
+          'Runs alpha from phases 2 and 3, on opus at max effort, trusted, on the current branch.',
+        ),
+      ).toBeTruthy();
+      expect(tileLabels()).toEqual([
+        'Scope',
+        'Engine',
+        'Safety',
+        'Git',
+        'Money and stops',
+        'Review and QA',
+        'Tools',
+        'Accounts',
+        'Decisions',
+      ]);
+      // The boarding preflight is a banner with its own action, not a stage to visit.
+      expect(await screen.findByText('1 phase will park at boarding')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Narrow the scope' })).toBeTruthy();
+      // A fresh console IS the Balanced preset.
+      const presets = screen.getByRole('group', { name: 'Start from a preset' });
+      expect(within(presets).getByRole('button', { name: 'Balanced' }).getAttribute('aria-pressed')).toBe(
+        'true',
+      );
+      // No tile is open, so no control is drawn yet.
+      expect(screen.queryAllByRole('button', { expanded: true })).toEqual([]);
+      expect(screen.queryByLabelText('Model')).toBeNull();
+    },
+    HEAVY_CASE_TIMEOUT,
+  );
 
   it('keeps the plan, its phases, the sessions and what will hold one fold away', async () => {
     await mount();

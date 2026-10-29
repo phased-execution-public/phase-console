@@ -24,24 +24,9 @@ import assert from 'node:assert/strict';
 import type { PhaseRecord, RunState } from '../server/runner/state.ts';
 import { WatchScheduler } from '../server/watch-scheduler.ts';
 import { parseWatchRef, probeWatchRef, watchRefProblem, WATCH_SCHEMES } from '../server/watch-refs.ts';
+import { timerClock } from './fixtures/clock.ts';
 
 const REF = 'phase:demo/43';
-
-type Timer = { fn: () => void; ms: number; live: boolean };
-
-function fakeClock(start = Date.parse('2026-09-27T10:00:00Z')) {
-  let t = start;
-  const timers: Timer[] = [];
-  return {
-    timers,
-    advance: (ms: number) => { t += ms; },
-    clock: {
-      now: () => t,
-      setTimeout: (fn: () => void, ms: number) => { const timer = { fn, ms, live: true }; timers.push(timer); return timer; },
-      clearTimeout: (handle: unknown) => { if (handle) (handle as Timer).live = false; },
-    },
-  };
-}
 
 function runWith(records: Partial<PhaseRecord>[]): RunState {
   const phases: Record<string, PhaseRecord> = {};
@@ -79,7 +64,7 @@ test('PW-1: phase:<slug>/<N> is a scheme — parsed, polled from state, landed o
 });
 
 test('PW-1: the scheduler lands a parked phase on its sibling\'s DONE record, refuses a phase naming itself, and the ingest probe answers at once', async () => {
-  const { clock, advance } = fakeClock();
+  const { clock, advance } = timerClock(Date.parse('2026-09-27T10:00:00Z'));
   let sibling = 'running';
   const landed: { phase: number; ref: string }[] = [];
   const run = runWith([parkedOn([REF, 'phase:demo/50'])]);
@@ -109,7 +94,7 @@ test('PW-1: the scheduler lands a parked phase on its sibling\'s DONE record, re
 });
 
 test('PW-2: a landed phase: ref UN-LANDS when its phase is re-opened — re-read, never re-delivered from memory', async () => {
-  const { clock } = fakeClock();
+  const { clock } = timerClock(Date.parse('2026-09-27T10:00:00Z'));
   let sibling = 'done';
   const journal: { kind: string; data: Record<string, unknown> }[] = [];
   const run = runWith([parkedOn([REF])]);
@@ -137,7 +122,7 @@ test('PW-2: a landed phase: ref UN-LANDS when its phase is re-opened — re-read
 });
 
 test('PW-3: a phase reaching done re-probes every ref naming it within one tick — not on the next timer', async () => {
-  const fake = fakeClock();
+  const fake = timerClock(Date.parse('2026-09-27T10:00:00Z'));
   let sibling = 'running';
   const asked: string[] = [];
   const handoff = 'cmd:"grep -q \'^status: complete\' /work/docs/handoffs/demo/phase-43-perf-ii.md"';

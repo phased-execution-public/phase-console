@@ -2,9 +2,9 @@
  * A person's turn in words — which act a step leads with, what its button
  * says, and where it is done (control-tower phase 42).
  *
- * Its own module, and deliberately tiny: the item card reads these words,
- * while the card that draws a step (`cards/human-step-card.tsx`) is loaded
- * lazily (`cards/human-step-lazy.tsx`) — first paint's budget (`check-dist`,
+ * Its own module, and deliberately tiny: a row reads these words, while the
+ * one card that draws a step (`cards/item-card.tsx`) is loaded lazily
+ * (`cards/lazy-step-card.tsx`) — first paint's budget (`check-dist`,
  * 170 KB) has no room for the card, its glyphs and the step model's tables.
  * Types only from the model.
  */

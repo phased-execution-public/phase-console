@@ -40,6 +40,7 @@ export type SituationId =
   | 'verify-red'
   | 'done-unrecorded'
   | 'work-in-progress'
+  | 'spawn-sdk-failed'
   | 'never-started'
   | 'unknown';
 

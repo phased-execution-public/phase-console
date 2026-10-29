@@ -14,6 +14,7 @@
  * wrap-up and checkpoint read their numbers from.
  */
 import { budgetClassOf, MODELS_ENV_FALLBACK, modelFamily, type ModelsEnv } from './models.ts';
+import { MEASURED_MODELS, UNPRICED, bookRowOf, priceAt, priceKeyOf, type BookPrice } from '../../shared/price-book.js';
 
 /** One API call's `message.usage`, and the context it read (input + cache write + cache read). */
 export type CallUsage = { input: number; cacheWrite: number; cacheRead: number; output: number; context: number };
@@ -67,6 +68,18 @@ export const CONTEXT_WRAPUP_FRACTION = 0.6;
 export const CONTEXT_CHECKPOINT_FRACTION = 0.8;
 
 export type ContextStage = 'ok' | 'wrap-up' | 'checkpoint';
+
+/**
+ * The stage a session's context has reached, under its phase's compaction arm
+ * (measured-console phase 12, A10): under `console` the two lines as they
+ * always were; under `native` the CLI compacts, so the 0.8 checkpoint is off —
+ * a session past it is still at `wrap-up`, whose steer is a notice there, not a
+ * hand-off.
+ */
+export function contextStageFor(context: number, window: number, arm: 'console' | 'native'): ContextStage {
+  const stage = contextStage(context, window);
+  return arm === 'native' && stage === 'checkpoint' ? 'wrap-up' : stage;
+}
 
 /**
  * One session's counters as the phase record keeps them (`PhaseRecord.tokens`,
@@ -227,63 +240,65 @@ export function resumePolicy(
 /* ---- what a session's own calls are worth (control-tower phase 46, #62, CC-5; phase 109, #202) ---- */
 
 /*
- * USD per token, by MODEL VERSION, for the four counters a call reports — each
- * version at its own list rates. Only what was MEASURED:
- *  - `claude-opus-5`: the audit week priced every non-resumed Opus 5 session
- *    (n = 126) at a median of exactly 1.000 × what the CLI reported — a cache
- *    write at twice input (the one-hour cache), a read at a tenth;
- *  - `claude-opus-5-5` (control-tower phase 109, #202): 389 fresh Opus 5.5
- *    sessions, 2026-09-25 → 10-03, at a median of 1.000 and 291 of them within
- *    ±2 % — a write at twice input, a read at a TWENTIETH. Until this row
- *    existed the one row was `opus`, found by substring, so every 5.5 session
- *    was priced as Opus 5 and read `under` at ≈ 0.54: 347 false findings, and a
- *    doubled booking on the default model read as agreement.
- * A version with no measured row is not priced — an alias (`opus`) names no
- * version at all — and an unpriced session is simply not corroborated: a
- * guessed price would journal a mismatch for every session it got wrong.
+ * USD per token for the four counters a call reports, from the price book
+ * (`shared/price-book.js`, measured-console phase 18) — the one owner of every
+ * rate. Corroborating what the CLI REPORTED reads only the book's `measured`
+ * rows (control-tower phase 109, #202): the audit week priced 126 Opus 5
+ * sessions at a median of exactly 1.000 × what the CLI reported, and 389 fresh
+ * Opus 5.5 sessions at 1.000 (291 within ±2 %). Until a 5.5 row existed every
+ * 5.5 session was priced as Opus 5 by a family substring and read `under` at
+ * ≈ 0.54: 347 false findings. A version with no measured row is not
+ * corroborated — an alias (`opus`) names no version at all — because a guessed
+ * price would journal a mismatch for every session it got wrong.
  */
-export const TOKEN_PRICES_USD: Readonly<Record<string, Readonly<{ input: number; cacheWrite: number; cacheRead: number; output: number }>>> = Object.freeze({
-  'claude-opus-5': Object.freeze({ input: 5e-6, cacheWrite: 10e-6, cacheRead: 0.5e-6, output: 25e-6 }),
-  'claude-opus-5-5': Object.freeze({ input: 4e-6, cacheWrite: 8e-6, cacheRead: 0.2e-6, output: 20e-6 }),
-});
 
 /**
- * The row of `TOKEN_PRICES_USD` a model id names, or null — matched by the
- * WHOLE id (#202), never by a family substring, which priced
- * `claude-opus-5-5[1m]` as `claude-opus-5`. Two spellings are the same model:
- * the window suffix (it selects a context window, and the measured sessions
- * show no long-context rate) and a trailing date stamp (`-20251001`, how the
- * CLI ships a dated id).
+ * The measured book row a model id names, or null — matched by the WHOLE id
+ * (#202), never by a family substring, which priced `claude-opus-5-5[1m]` as
+ * `claude-opus-5`. Two spellings are the same model: the window suffix (it
+ * selects a context window, and the measured sessions show no long-context
+ * rate) and a trailing date stamp (`-20251001`, how the CLI ships a dated id).
  */
 export function priceRowOf(model: string | null | undefined): string | null {
-  const id = (model ?? '').trim().toLowerCase();
-  const base = (id.endsWith(MODELS_ENV_FALLBACK.oneM) ? id.slice(0, -MODELS_ENV_FALLBACK.oneM.length) : id).replace(/-\d{8}$/, '');
-  return Object.prototype.hasOwnProperty.call(TOKEN_PRICES_USD, base) ? base : null;
+  const key = priceKeyOf(model);
+  return MEASURED_MODELS.includes(key) ? key : null;
 }
 
 /** USD per token for the four counters a call reports. */
 export type TokenRates = Readonly<{ input: number; cacheWrite: number; cacheRead: number; output: number }>;
 
+/** A measured row's rates, USD per token — what `priceUsage` corroborates the CLI with. */
+export function measuredRatesOf(model: string | null | undefined): TokenRates | null {
+  const key = priceRowOf(model);
+  const row = key ? bookRowOf(key) : null;
+  return row
+    ? { input: row.inPerM / 1e6, cacheWrite: row.cacheWrite1hPerM / 1e6, cacheRead: row.cacheReadPerM / 1e6, output: row.outPerM / 1e6 }
+    : null;
+}
+
 /**
- * What a model's tokens cost at an instant (one-pool phase 4), USD per token: a measured row
- * of `TOKEN_PRICES_USD` first — the rates a Claude session was found to book — then, in Pro,
- * the model catalog's price (`providers.priceOverrides` over a live list's and the seed's), at
- * `at` because a provider can price by the hour (DeepSeek halves its rates off-peak). Null when
- * nobody has priced the model. Corroborating what the CLI REPORTED stays on the measured rows
- * alone (`priceUsage`): a provider model is one the CLI prices at nothing.
+ * What a model's tokens cost at an instant, USD per token: the operator's
+ * `providers.priceOverrides` row (Pro) over the price book's row in force at
+ * `at` — a provider can price by the hour (DeepSeek halves its rates
+ * off-peak), and a book row is dated. Null when nobody prices the model: an
+ * unpriced model is never $0. Corroborating what the CLI REPORTED stays on the
+ * measured rows alone (`priceUsage`): a provider model is one the CLI prices at
+ * nothing.
  */
 export function priceOf(model: string | null | undefined, at: Date | number | string = Date.now()): TokenRates | null {
-  const row = priceRowOf(model);
-  if (row) return TOKEN_PRICES_USD[row];
-  void at;
-  return null;
+  let overrides: Readonly<Record<string, BookPrice>> | undefined;
+  const rate = priceAt(model, at, overrides);
+  if (rate === UNPRICED) return null;
+  return {
+    input: rate.inPerM / 1e6, cacheWrite: rate.cacheWritePerM / 1e6,
+    cacheRead: rate.cacheReadPerM / 1e6, output: rate.outPerM / 1e6,
+  };
 }
 
 /** A session's own calls, priced — null when its model has no measured row. */
 export function priceUsage(model: string | null | undefined, counters: Pick<TokenCounters, 'input' | 'cacheWrite' | 'cacheRead' | 'output'>): number | null {
-  const row = priceRowOf(model);
-  if (!row) return null;
-  const rate = TOKEN_PRICES_USD[row];
+  const rate = measuredRatesOf(model);
+  if (!rate) return null;
   return counters.input * rate.input + counters.cacheWrite * rate.cacheWrite
     + counters.cacheRead * rate.cacheRead + counters.output * rate.output;
 }

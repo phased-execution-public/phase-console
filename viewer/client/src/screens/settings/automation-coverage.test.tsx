@@ -75,6 +75,12 @@ const ELSEWHERE: Readonly<Record<string, string>> = {
   // A policy about servers belongs beside the servers, where a person sees
   // which ones it would apply to.
   mcpPolicy: 'Settings ▸ MCP servers',
+  // What an unattended session loads (measured-console phase 11): set through
+  // POST /api/prefs until Settings ▸ Skills & plugins draws them (phase 28) —
+  // the same reason `data/surface.ts` gives their rows.
+  autopilotLoads: 'Settings ▸ Skills & plugins (measured-console phase 28)',
+  autopilotPlugins: 'Settings ▸ Skills & plugins (measured-console phase 28)',
+  graphTool: 'Settings ▸ Skills & plugins (measured-console phase 28)',
 };
 
 /**

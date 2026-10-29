@@ -50,6 +50,7 @@ const REHEARSAL_PROJECTS = VIEWPORTS.filter((v) => v.name === 'phone-360' || v.n
 
 const WRITE_BASELINE = process.env.PHASE_CONSOLE_E2E_BASELINE === 'write';
 const DIST = Boolean(process.env.PHASE_CONSOLE_DIST_DIR);
+const PHASE_TIER = process.env.PE_VERIFY_TIER === 'phase';
 
 export default defineConfig({
   testDir: './e2e',
@@ -58,7 +59,13 @@ export default defineConfig({
   fullyParallel: true,
   workers: 6,
   forbidOnly: true,
-  retries: 0,
+  // Retries by tier (measured-console phase 15). Every run retries a failed
+  // test once, so a flake is SEEN as a flake rather than read as a red. A
+  // phase's selected run (PE_VERIFY_TIER=phase) accepts a test that passed on
+  // its retry; the release does not — `failOnFlakyTests` fails it, naming the
+  // flake, and the fix is the test or a quarantine row (scripts/quarantine.env).
+  retries: 1,
+  failOnFlakyTests: !PHASE_TIER,
   // A liveness bound, like the two below: a passing test never waits for it.
   // At load average 70–84 (control-tower phase 103: an emulator, a simulator
   // and another console's lanes on the same machine), with three workers,

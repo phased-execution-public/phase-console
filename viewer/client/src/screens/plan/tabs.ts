@@ -21,8 +21,8 @@ export const PLAN_VIEW_LABELS: Record<string, string> = {
   // Retired tab ids keep a word: a bookmarked `#/plan/x/raw` renders for the
   // instant before its redirect lands, and should name what it becomes.
   route: 'Map',
-  qa: 'QA',
-  handoffs: 'Handoffs',
+  qa: 'Handoffs & QA',
+  handoffs: 'Handoffs & QA',
   // The two short addresses (`PLAN_VIEW_ALIASES`), for the render before their hop lands.
   schedule: 'Schedule',
   burnup: 'Burn-up',
@@ -66,22 +66,42 @@ export function resolveTab(segment: string | undefined): string {
 
 /* ---------------- Phases: the one grid's readings, and the map ---------------- */
 
-export type PhasesViewId = 'table' | 'map' | 'qa' | 'handoffs' | 'schedule' | 'burnup';
+/**
+ * The readings of Phases, each with its word. An interface, so the Pro reading merges in from a
+ * region of its own rather than leaving a free tree with a dangling union member.
+ */
+interface PhasesViews {
+  table: string;
+  map: string;
+  handoffs: string;
+  schedule: string;
+  burnup: string;
+}
+
+export type PhasesViewId = keyof PhasesViews;
 
 export const PHASES_VIEW_IDS = PLAN_PHASE_VIEWS as readonly PhasesViewId[];
 
-export const PHASES_VIEW_LABELS: Record<PhasesViewId, string> = {
+export const PHASES_VIEW_LABELS: PhasesViews = {
   table: 'Table',
   map: 'Map',
-  qa: 'QA',
-  handoffs: 'Handoffs',
+  handoffs: 'Handoffs & QA',
   schedule: 'Schedule',
   burnup: 'Burn-up',
 };
 
+/**
+ * A reading's old name → the reading it is now. `qa` and `handoffs` were two
+ * readings of one record until 2026-10-20 (Tower strips); a bookmarked
+ * `?view=qa`, or a report link minted before then, opens the merged one.
+ */
+const PHASES_VIEW_RENAMED: Readonly<Record<string, PhasesViewId>> = { qa: 'handoffs' };
+
 /** Which reading `?view=` asks for. Anything unknown is the table — it answers every question the others ask, a column away. */
-export const phasesViewOf = (value: string | undefined): PhasesViewId =>
-  (PHASES_VIEW_IDS as readonly string[]).includes(value ?? '') ? (value as PhasesViewId) : 'table';
+export const phasesViewOf = (value: string | undefined): PhasesViewId => {
+  const id = PHASES_VIEW_RENAMED[value ?? ''] ?? value ?? '';
+  return (PHASES_VIEW_IDS as readonly string[]).includes(id) ? (id as PhasesViewId) : 'table';
+};
 
 /* ---------------- Run: the live run, and every run before it ---------------- */
 

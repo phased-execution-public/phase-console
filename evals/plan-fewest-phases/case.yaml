@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: plan-fewest-phases
+description: 'mode-plan, It''s working if: the plan has the fewest phases that each fit one session.'
+tags: [plan, working-if]
+context:
+  scaffold_script: fixture.sh

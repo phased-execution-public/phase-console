@@ -27,8 +27,7 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Runner } from '../server/runner/runner.ts';
@@ -40,6 +39,7 @@ import { LearnedAccounts, credentialFingerprint } from '../server/accounts/learn
 import type { Exec } from '../server/accounts/credentials.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
 import { STATE_SANDBOX } from './state-sandbox.ts';
+import { stubRepo, FREE_LOCK_SH, VALIDATE_OK_SH } from './fixtures/repo.ts';
 
 const HOUR = 3_600_000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -50,23 +50,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 type Repo = { root: string; scripts: string; markDone: (phase: number) => void; cleanup: () => void };
 
-function write(path: string, body: string): void {
-  writeFileSync(path, body, 'utf8');
-  chmodSync(path, 0o755);
-}
-
 /** Three phases whose board is a `done` file; with `parallel`, every open phase is ready at once. */
-function repo(parallel = false): Repo {
-  const root = mkdtempSync(join(tmpdir(), 'pc-wall-reprobe-'));
-  const scripts = join(root, 'scripts');
-  const state = join(root, '.stub');
-  mkdirSync(scripts, { recursive: true });
-  mkdirSync(state, { recursive: true });
-  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
-  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
-  writeFileSync(join(state, 'done'), '');
-  if (parallel) writeFileSync(join(state, 'parallel'), '');
-  write(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+function stubbedPlan(parallel = false): Repo {
+  const made = stubRepo({
+    prefix: 'pc-wall-reprobe-',
+    state: { ...(parallel ? { 'parallel': '' } : {}) },
+    scripts: ({ state }) => ({
+      'phase-graph.sh': `#!/usr/bin/env bash
 set -u
 S="${state}"
 slug="$1"; shift
@@ -88,17 +78,12 @@ case "$mode" in
   --size) echo M ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
-`);
-  write(join(scripts, 'phase-lock.sh'), `#!/usr/bin/env bash
-[ "\${2:-}" = "status" ] && echo "phase \${3:-?}: free"
-exit 0
-`);
-  write(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
-  return {
-    root, scripts,
-    markDone: (phase) => writeFileSync(join(state, 'done'), `${readFileSync(join(state, 'done'), 'utf8')}${phase}\n`),
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
-  };
+`,
+      'phase-lock.sh': FREE_LOCK_SH,
+      'validate.sh': VALIDATE_OK_SH,
+    }),
+  });
+  return made;
 }
 
 function ok(partial: Partial<SpawnOutcome> = {}): SpawnOutcome {
@@ -227,7 +212,7 @@ async function until(predicate: () => boolean, what: string, ms = 10_000): Promi
  * ------------------------------------------------------------------ */
 
 test('UW-1: a far-reset wall is "until at the latest" — the account is re-probed on a back-off, and the phase re-boards when it has headroom, before the reported reset', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const session = wallThenDone(r);
   const resetMs = Date.now() + 3 * HOUR;
   const account = facade();
@@ -291,7 +276,7 @@ test('UW-1: the back-off is 10, 20, 40, then every 60 minutes — gentle on an a
  * ------------------------------------------------------------------ */
 
 test('UW-2: a fresh reading shortens the park to an earlier reset, never lengthens it, and lifts it on headroom', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const session = wallThenDone(r);
   const resetMs = Date.now() + 3 * HOUR;
   const account = facade();
@@ -353,7 +338,7 @@ test('UW-2: a fresh reading shortens the park to an earlier reset, never lengthe
  * ------------------------------------------------------------------ */
 
 test('UW-3: a sibling\'s successful spend on the account lifts its walls and cooling, and re-arms the phase parked on them — at once', async () => {
-  const r = repo(true);
+  const r = stubbedPlan(true);
   const resetMs = Date.now() + 3 * HOUR;
   const account = facade();
   const spends: { accountId: string | undefined; model?: string }[] = [];
@@ -542,7 +527,7 @@ test('UW-4: the facade — a spend lifts the account\'s shared walls and its mod
  * ------------------------------------------------------------------ */
 
 test('UW-5: a wall ends with its park — a retried phase boards without it, and a reading never lifts the declared wait it parks on next', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const resetMs = Date.now() + 3 * HOUR;
   const account = facade();
   const events: { event: string; data: Record<string, unknown> }[] = [];
@@ -655,7 +640,7 @@ test('#109: meters earned under the previous identity never wall the new one —
  * ------------------------------------------------------------------ */
 
 test('CR-4: a phase parked on a plan window re-boards at the next reading once its account carries on credit — the park was for a window credits now pay past', async () => {
-  const r = repo();
+  const r = stubbedPlan();
   const session = wallThenDone(r);
   const resetMs = Date.now() + 3 * HOUR;
   const exec: Exec = async (file, args) =>
@@ -701,6 +686,123 @@ test('CR-4: a phase parked on a plan window re-boards at the next reading once i
     session.release();
     await instance.stop().catch(() => undefined);
     accounts.stop();
+    r.cleanup();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * UW-6 — #388: under `onLimit: switch` a wall moves the work when a pool
+ * account has room (measured-console phase 24)
+ * ------------------------------------------------------------------ */
+
+const { withSample } = await import('../server/accounts/usage.ts');
+
+test('UW-6 (#388): a weekly wall 25 h off no longer declines a pool account with hours of room — the move need carry the work two hours, not the whole wait', async () => {
+  const now = Date.parse('2026-10-18T01:03:00Z');
+  const accounts = new Accounts({
+    platform: 'linux', exec: (async () => ({ stdout: '' })) as Exec, now: () => now, usageBase: 'http://usage.invalid',
+    fetchFn: (async () => { throw new TypeError('fetch failed'); }) as typeof fetch,
+    learnedFile: join(mkdtempSync(join(STATE_SANDBOX, 'p24-')), 'learned.json'),
+  });
+  const walled = await accounts.addToken('account-4c23', 'sk-ant-oat01-p24walledweekly000');
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const plant = (id: string, buckets: Record<string, { utilization: number; resetsAt: string }>, burn: Record<string, number> = {}) => {
+    let samples: ReturnType<typeof withSample> | undefined;
+    for (const minutesAgo of [60, 30, 0]) {
+      const readings = Object.fromEntries(Object.entries(buckets).map(([name, b]) => [name, { ...b, utilization: Math.max(0, b.utilization - (burn[name] ?? 0) * minutesAgo / 60) }]));
+      samples = withSample(samples, readings, now - minutesAgo * 60_000);
+    }
+    (accounts as unknown as { poller: { cache: Map<string, unknown> } }).poller.cache.set(id, { buckets, fetchedAt: iso(now), samples });
+  };
+  try {
+    const reset = Date.parse('2026-10-19T02:00:00Z'); // the weekly wall, 25 h off
+    plant(walled.id, { five_hour: { utilization: 40, resetsAt: iso(now + 3 * HOUR) }, seven_day: { utilization: 100, resetsAt: iso(reset) } }, { five_hour: 20, seven_day: 4 });
+    // The pool's first account, as the hub read it: 5-hour 11 %, weekly 81 %.
+    plant('default', { five_hour: { utilization: 11, resetsAt: iso(now + 4 * HOUR) }, seven_day: { utilization: 81, resetsAt: iso(now + 80 * HOUR) } });
+    const plan = accounts.switchCandidates(walled.id, undefined, { until: reset, nowMs: now, pool: ['default', walled.id, 'account-6ffc'], floors: { default: 15 } });
+    assert.deepEqual(plan.ranked, ['default'], '19 % weekly at the measured 4 %/h is ~4.75 h of work — past the two hours a move must carry');
+  } finally {
+    await accounts.remove(walled.id);
+    accounts.stop();
+  }
+});
+
+test('UW-6 (#388): a switch moves the walls its phases are parked on — the park lifts at once when the new account has room, and the run\'s clock moves with it', async () => {
+  const r = stubbedPlan();
+  const session = wallThenDone(r);
+  const resetMs = Date.now() + 25 * HOUR;
+  const account = facade();
+  const events: { event: string; data: Record<string, unknown> }[] = [];
+  const instance = new Runner({
+    scriptsDir: r.scripts, spawn: session.spawn, verificationText: () => '`true`',
+    onEvent: (event, data) => events.push({ event, data }),
+    pickAccount: () => null, leaveAccount: account.leaveAccount,
+    // The walled account has no room; any other has.
+    accountHeadroom: (id) => ((id ?? 'default') === 'default' ? account.headroom(id) : { ok: true, accountId: id!, fiveHourPct: 11 }),
+    wallReprobeBackoffMs: [HOUR],
+  });
+  try {
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1], autonomy: 'keep-going', onLimit: 'switch' } as never);
+    await session.inSession;
+    hitWall(session.say, resetMs);
+    session.release();
+    const record = () => instance.current()!.phases['1'];
+    await until(() => !instance.liveness().some((lane) => lane.phase === 1), 'the walled lane to end');
+    assert.equal(record().status, 'waiting');
+    assert.equal(record().parkedUntil, new Date(resetMs).toISOString(), 'parked on the walled account\'s reset');
+
+    const moved = instance.switchAccount('account-spare', { by: 'operator', via: 'api', origin: '127.0.0.1', remoteUser: null });
+    assert.equal(moved.ok, true);
+    assert.ok(Date.parse(record().parkedUntil!) <= Date.now(), 'the park lifted with the switch, not at the walled reset');
+    assert.ok(Date.parse(waitClockOf(instance.current()!) ?? '') <= Date.now(), 'and the run\'s clock moved with it');
+    const lifted = journalled(events, 'phase.wall-lifted');
+    assert.deepEqual(lifted.map((line) => [line.by, line.account]), [['switch', 'account-spare']]);
+    await resumeWhenDue(instance, r.root, [1], () => record().status === 'done');
+    assert.equal(record().status, 'done', 'and the phase boarded on the new account');
+  } finally {
+    session.release();
+    await instance.stop().catch(() => undefined);
+    r.cleanup();
+  }
+});
+
+test('UW-6 (#388): a run whose loop settled `paused` on a usage window is re-read too — its clock comes to now when its account can pay; a person\'s pause is never read', async () => {
+  const r = stubbedPlan();
+  const session = wallThenDone(r);
+  const resetMs = Date.now() + 25 * HOUR;
+  const account = facade();
+  const events: { event: string; data: Record<string, unknown> }[] = [];
+  const instance = new Runner({
+    scriptsDir: r.scripts, spawn: session.spawn, verificationText: () => '`true`',
+    onEvent: (event, data) => events.push({ event, data }),
+    pickAccount: () => null, leaveAccount: account.leaveAccount, accountHeadroom: account.headroom,
+    wallReprobeBackoffMs: [HOUR],
+  });
+  try {
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1], autonomy: 'keep-going', onLimit: 'switch' } as never);
+    await session.inSession;
+    hitWall(session.say, resetMs);
+    session.release();
+    await until(() => !instance.liveness().some((lane) => lane.phase === 1), 'the walled lane to end');
+    await instance.wait();
+    // The reconciled shape the hub read: the run `paused` on the window, its clock the reset.
+    const state = instance.current()!;
+    state.status = 'paused';
+    state.waitReason = 'usage-limit';
+    state.waitUntil = new Date(resetMs).toISOString();
+    delete state.phases['1'].usageWall;
+    assert.equal(instance.rereadWalls('reading'), 0, 'walled still: nothing moves');
+
+    state.pause = { at: new Date().toISOString(), by: 'operator' } as never;
+    account.s.answer = { ok: true, accountId: 'default', fiveHourPct: 4 };
+    assert.equal(instance.rereadWalls('reading'), 0, 'a person\'s pause is a hold, not a window');
+    delete (state as { pause?: unknown }).pause;
+    assert.equal(instance.rereadWalls('reading'), 1, 'the account can pay: the paused run\'s clock is news');
+    assert.ok(Date.parse(state.waitUntil!) <= Date.now(), 'brought to now — the service resumes a paused run from its clock');
+    assert.deepEqual(journalled(events, 'run.window-lifted').map((line) => line.paused), [true]);
+  } finally {
+    session.release();
+    await instance.stop().catch(() => undefined);
     r.cleanup();
   }
 });
